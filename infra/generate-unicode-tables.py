@@ -6,7 +6,8 @@ library does not expose: the numeric types behind ``isdecimal``, ``isdigit`` and
 ``isnumeric``, the title-case letter category, Python's whitespace set, and the title-case
 mappings that differ from upper case. ``unicodedata`` does not expose Case_Ignorable, so the
 script observes it through ``str.lower``'s final-sigma rule, which is defined by it. The
-tables are sorted inclusive code point ranges.
+identifier classes are observed through ``str.isidentifier``. The tables are sorted inclusive
+code point ranges.
 
 Run it with the CPython release shellsim models so the Unicode version matches:
 
@@ -92,6 +93,16 @@ def main() -> None:
             "CASE_IGNORABLE",
             "Case_Ignorable, which the final-sigma rule skips.",
             case_ignorable,
+        ),
+        range_table(
+            "IDENTIFIER_START",
+            "XID_Start and `_`: characters that may begin `str.isidentifier`.",
+            str.isidentifier,
+        ),
+        range_table(
+            "IDENTIFIER_CONTINUE",
+            "XID_Continue: characters that may follow the first in `str.isidentifier`.",
+            lambda character: ("_" + character).isidentifier(),
         ),
         title_table(),
     ]

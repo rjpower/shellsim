@@ -5,6 +5,8 @@ runs; every other function here (``isin``, ``intersect1d``, ``union1d``, ``setdi
 ``setxor1d``) is a small composition of ``unique``, broadcasted comparison, and ``searchsorted``.
 """
 
+from collections import namedtuple
+
 import numpy as np
 
 __all__ = [
@@ -22,51 +24,9 @@ __all__ = [
 ]
 
 
-class _Result:
-    """A tuple-like object with named fields, used for NumPy's small structured return values.
-
-    Subclasses set a class-level ``_fields`` tuple naming each position, and instances are built
-    positionally, like ``collections.namedtuple``. NumPy's results are ``tuple`` subclasses;
-    shellsim cannot subclass ``tuple`` yet (Loom #776), so this keeps the values in a tuple and
-    provides iteration, indexing, length, unpacking, and equality over it.
-    """
-
-    _fields = ()
-
-    def __init__(self, *values):
-        self._values = values
-        for name, value in zip(self._fields, values):
-            setattr(self, name, value)
-
-    def __iter__(self):
-        return iter(self._values)
-
-    def __len__(self):
-        return len(self._values)
-
-    def __getitem__(self, index):
-        return self._values[index]
-
-    def __eq__(self, other):
-        if isinstance(other, _Result):
-            other = other._values
-        return self._values == other
-
-    def __repr__(self):
-        parts = ", ".join(f"{name}={value!r}" for name, value in zip(self._fields, self._values))
-        return f"{type(self).__name__}({parts})"
-
-
-class UniqueAllResult(_Result):
-    _fields = ("values", "indices", "inverse_indices", "counts")
-
-
-class UniqueCountsResult(_Result):
-    _fields = ("values", "counts")
-
-
-class UniqueInverseResult(_Result):
-    _fields = ("values", "inverse_indices")
+UniqueAllResult = namedtuple("UniqueAllResult", ["values", "indices", "inverse_indices", "counts"])
+UniqueCountsResult = namedtuple("UniqueCountsResult", ["values", "counts"])
+UniqueInverseResult = namedtuple("UniqueInverseResult", ["values", "inverse_indices"])
 
 
 def _unique_1d(values, equal_nan=True):

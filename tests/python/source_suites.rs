@@ -10,6 +10,7 @@ use std::time::Instant;
 use shellsim::{Environment, Limits};
 
 const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
+const COLLECTIONS: &[u8] = include_bytes!("test_collections.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
 const CONTEXTLIB: &[u8] = include_bytes!("test_contextlib.py");
 const INSPECT: &[u8] = include_bytes!("test_inspect.py");
@@ -70,6 +71,11 @@ fn builtins() {
 #[test]
 fn asyncio() {
     assert_source_suite("test_asyncio.py", ASYNCIO);
+}
+
+#[test]
+fn collections() {
+    assert_source_suite("test_collections.py", COLLECTIONS);
 }
 
 #[test]

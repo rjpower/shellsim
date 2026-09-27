@@ -306,58 +306,94 @@ impl Vm<'_> {
         star_index: Option<usize>,
     ) -> Result<(), String> {
         let value = self.pop()?;
+        let Some(star_index) = star_index else {
+            return self.unpack_exactly(value, expected);
+        };
         let values = self.iterable_values(&value)?;
         let mut outputs = Vec::new();
-        if let Some(star_index) = star_index {
-            if star_index >= expected || values.len() < expected.saturating_sub(1) {
-                return Err(self.raise_exception(
-                    "ValueError",
-                    format!(
-                        "not enough values to unpack (expected at least {}, got {})",
-                        expected.saturating_sub(1),
-                        values.len()
-                    ),
-                ));
-            }
-            let tail_start = star_index;
-            let tail_end = values.len() - (expected - star_index - 1);
-            for index in 0..expected {
-                if index == star_index {
-                    let mut tail = Vec::new();
-                    for value in values[tail_start..tail_end].iter().cloned() {
-                        self.push_materialized(&mut tail, value)?;
-                    }
-                    outputs.push(self.allocate_object(Object::List(tail))?);
-                } else {
-                    let source_index = if index < star_index {
-                        index
-                    } else {
-                        tail_end + (index - star_index - 1)
-                    };
-                    self.push_materialized(&mut outputs, values[source_index])?;
+        if star_index >= expected || values.len() < expected.saturating_sub(1) {
+            return Err(self.raise_exception(
+                "ValueError",
+                format!(
+                    "not enough values to unpack (expected at least {}, got {})",
+                    expected.saturating_sub(1),
+                    values.len()
+                ),
+            ));
+        }
+        let tail_start = star_index;
+        let tail_end = values.len() - (expected - star_index - 1);
+        for index in 0..expected {
+            if index == star_index {
+                let mut tail = Vec::new();
+                for value in values[tail_start..tail_end].iter().cloned() {
+                    self.push_materialized(&mut tail, value)?;
                 }
+                outputs.push(self.allocate_object(Object::List(tail))?);
+            } else {
+                let source_index = if index < star_index {
+                    index
+                } else {
+                    tail_end + (index - star_index - 1)
+                };
+                self.push_materialized(&mut outputs, values[source_index])?;
             }
-        } else {
-            if values.len() != expected {
-                let problem = if values.len() > expected {
+        }
+        // Store operations pop their input, so the leftmost target must be on top.
+        self.stack.extend(outputs.into_iter().rev());
+        Ok(())
+    }
+
+    /// Unpack `value` into exactly `expected` targets. As in CPython, only an exact list, tuple
+    /// or dict reports how many items it held when there are too many; any other iterable is
+    /// read one item past `expected`, so unpacking an infinite iterator still fails.
+    fn unpack_exactly(&mut self, value: Value, expected: usize) -> Result<(), String> {
+        let known_length = match value.object_id() {
+            Some(id) => match self.state.heap.get(id)? {
+                Object::List(values) | Object::Tuple(values) => Some(values.len()),
+                Object::Dict(entries) => Some(entries.len()),
+                _ => None,
+            },
+            None => None,
+        };
+        let values = match known_length {
+            Some(length) if length != expected => {
+                let problem = if length > expected {
                     "too many"
                 } else {
                     "not enough"
                 };
                 return Err(self.raise_exception(
                     "ValueError",
-                    format!(
-                        "{problem} values to unpack (expected {expected}, got {})",
-                        values.len()
-                    ),
+                    format!("{problem} values to unpack (expected {expected}, got {length})"),
                 ));
             }
-            for value in values {
-                self.push_materialized(&mut outputs, value)?;
+            Some(_) => self.iterable_values(&value)?,
+            None => {
+                let iterator = self.make_iterator(value)?;
+                let mut values = Vec::new();
+                while values.len() <= expected {
+                    let Some(item) = self.next_until_stop(&iterator)? else {
+                        break;
+                    };
+                    self.push_materialized(&mut values, item)?;
+                }
+                if values.len() != expected {
+                    let message = if values.len() < expected {
+                        format!(
+                            "not enough values to unpack (expected {expected}, got {})",
+                            values.len()
+                        )
+                    } else {
+                        format!("too many values to unpack (expected {expected})")
+                    };
+                    return Err(self.raise_exception("ValueError", message));
+                }
+                values
             }
-        }
+        };
         // Store operations pop their input, so the leftmost target must be on top.
-        self.stack.extend(outputs.into_iter().rev());
+        self.stack.extend(values.into_iter().rev());
         Ok(())
     }
 

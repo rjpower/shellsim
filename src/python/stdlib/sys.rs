@@ -61,11 +61,18 @@ fn buffer(runtime: &mut dyn PyRuntime, stream: Value) -> PyResult {
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "sys",
-    functions: &[FunctionDef {
-        module: "sys",
-        name: "exit",
-        call: exit,
-    }],
+    functions: &[
+        FunctionDef {
+            module: "sys",
+            name: "exit",
+            call: exit,
+        },
+        FunctionDef {
+            module: "sys",
+            name: "_getframemodulename",
+            call: getframemodulename,
+        },
+    ],
     values: &[
         ValueDef::Constant {
             name: "version",
@@ -123,6 +130,38 @@ fn exit(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             .unwrap_or(1),
     };
     Err(PyError::exit(status))
+}
+
+/// `sys._getframemodulename(depth=0)`: the module name of the caller `depth` frames up, which
+/// `collections.namedtuple` uses to set `__module__` on the classes it creates.
+fn getframemodulename(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    const NAME: &str = "_getframemodulename";
+    if let Some((name, _)) = args.keywords().iter().find(|(name, _)| name != "depth") {
+        return Err(PyError::type_error(format!(
+            "{NAME}() got an unexpected keyword argument '{name}'"
+        )));
+    }
+    let depth = match (args.positional(), args.keyword(NAME, "depth")?) {
+        ([], None) => 0,
+        ([value], None) | ([], Some(value)) => match runtime.int_value(value) {
+            Some(depth) => depth,
+            None => {
+                return Err(PyError::type_error(format!(
+                    "'{}' object cannot be interpreted as an integer",
+                    runtime.type_name(value)?
+                )))
+            }
+        },
+        (positional, keyword) => {
+            let given = positional.len() + usize::from(keyword.is_some());
+            return Err(PyError::type_error(format!(
+                "{NAME}() takes at most 1 argument ({given} given)"
+            )));
+        }
+    };
+    // CPython reads a negative depth as the innermost frame.
+    let depth = usize::try_from(depth.max(0)).unwrap_or(usize::MAX);
+    Ok(runtime.frame_module_name(depth)?.unwrap_or(Value::None))
 }
 
 fn argv(runtime: &mut dyn PyRuntime) -> PyResult {

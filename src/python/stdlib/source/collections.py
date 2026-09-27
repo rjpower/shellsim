@@ -1,5 +1,8 @@
 """Common container types implemented over ordinary Python protocols."""
 
+import sys
+from keyword import iskeyword as _iskeyword
+
 from _collections import defaultdict
 
 
@@ -179,3 +182,205 @@ class deque:
         else:
             for _ in range((-amount) % len(self._items)):
                 self.append(self._items.pop(0))
+
+
+class _tuplegetter:
+    """The read-only attribute for one namedtuple field.
+
+    It reads through subscription, so a subclass that overrides ``__getitem__`` also changes
+    what its fields return, which CPython's C descriptor does not do.
+    """
+
+    def __init__(self, index, doc):
+        self._index = index
+        self.__doc__ = doc
+
+    def __get__(self, instance, owner=None):
+        if instance is None:
+            return self
+        return instance[self._index]
+
+    def __set__(self, instance, value):
+        raise AttributeError("can't set attribute")
+
+    def __delete__(self, instance):
+        raise AttributeError("can't delete attribute")
+
+    def __repr__(self):
+        return f"_tuplegetter({self._index}, {self.__doc__!r})"
+
+
+def _quoted_names(names):
+    """``'a'``, ``'a' and 'b'`` or ``'a', 'b', and 'c'``, as CPython lists missing arguments."""
+
+    quoted = [repr(name) for name in names]
+    if len(quoted) <= 2:
+        return " and ".join(quoted)
+    return ", ".join(quoted[:-1]) + ", and " + quoted[-1]
+
+
+def _bind_fields(typename, fields, defaults, args, kwargs):
+    """The field values for one ``__new__`` call, with CPython's argument errors."""
+
+    count = len(fields)
+    values = dict(zip(fields, args))
+    for name, value in kwargs.items():
+        if name not in fields:
+            raise TypeError(f"{typename}.__new__() got an unexpected keyword argument {name!r}")
+        if name in values:
+            raise TypeError(f"{typename}.__new__() got multiple values for argument {name!r}")
+        values[name] = value
+    if len(args) > count:
+        required = count - len(defaults)
+        if defaults:
+            takes = f"from {required + 1} to {count + 1} positional arguments"
+        elif count == 0:
+            takes = "1 positional argument"
+        else:
+            takes = f"{count + 1} positional arguments"
+        raise TypeError(f"{typename}.__new__() takes {takes} but {len(args) + 1} were given")
+    missing = [name for name in fields if name not in values and name not in defaults]
+    if missing:
+        noun = "argument" if len(missing) == 1 else "arguments"
+        raise TypeError(
+            f"{typename}.__new__() missing {len(missing)} required positional {noun}: "
+            + _quoted_names(missing)
+        )
+    return [values[name] if name in values else defaults[name] for name in fields]
+
+
+def _field_names(typename, field_names, rename):
+    """Validated field names, with invalid ones replaced by ``_index`` when ``rename``."""
+
+    if isinstance(field_names, str):
+        field_names = field_names.replace(",", " ").split()
+    names = [str(name) for name in field_names]
+    if rename:
+        seen = set()
+        for index, name in enumerate(names):
+            if not name.isidentifier() or _iskeyword(name) or name.startswith("_") or name in seen:
+                names[index] = f"_{index}"
+            seen.add(name)
+    for name in [typename] + names:
+        if not name.isidentifier():
+            raise ValueError(f"Type names and field names must be valid identifiers: {name!r}")
+        if _iskeyword(name):
+            raise ValueError(f"Type names and field names cannot be a keyword: {name!r}")
+    seen = set()
+    for name in names:
+        if name.startswith("_") and not rename:
+            raise ValueError(f"Field names cannot start with an underscore: {name!r}")
+        if name in seen:
+            raise ValueError(f"Encountered duplicate field name: {name!r}")
+        seen.add(name)
+    return tuple(names)
+
+
+def namedtuple(typename, field_names, *, rename=False, defaults=None, module=None):
+    """A ``tuple`` subclass named ``typename`` whose items are also named attributes."""
+
+    typename = str(typename)
+    fields = _field_names(typename, field_names, rename)
+    field_defaults = {}
+    if defaults is not None:
+        defaults = tuple(defaults)
+        if len(defaults) > len(fields):
+            raise TypeError("Got more default values than field names")
+        field_defaults = dict(zip(fields[len(fields) - len(defaults) :], defaults))
+    if module is None:
+        module = sys._getframemodulename(1) or "__main__"
+
+    def __new__(_cls, *args, **kwargs):
+        values = _bind_fields(typename, fields, field_defaults, args, kwargs)
+        return tuple.__new__(_cls, values)
+
+    def _make(cls, iterable):
+        result = tuple.__new__(cls, iterable)
+        if len(result) != len(fields):
+            raise TypeError(f"Expected {len(fields)} arguments, got {len(result)}")
+        return result
+
+    def _replace(self, /, **changes):
+        result = self._make([changes.pop(name, value) for name, value in zip(fields, self)])
+        if changes:
+            raise TypeError(f"Got unexpected field names: {list(changes)!r}")
+        return result
+
+    def __repr__(self):
+        items = ", ".join(f"{name}={value!r}" for name, value in zip(fields, self))
+        return f"{self.__class__.__name__}({items})"
+
+    def _asdict(self):
+        return dict(zip(fields, self))
+
+    def __getnewargs__(self):
+        return tuple(self)
+
+    namespace = {
+        # The field tuple's repr without quotes, so one field reads `P(x,)`.
+        "__doc__": typename + repr(fields).replace("'", ""),
+        "__module__": module,
+        "__slots__": (),
+        "_fields": fields,
+        "_field_defaults": field_defaults,
+        "__new__": __new__,
+        "_make": classmethod(_make),
+        "_replace": _replace,
+        "__replace__": _replace,
+        "__repr__": __repr__,
+        "_asdict": _asdict,
+        "__getnewargs__": __getnewargs__,
+        "__match_args__": fields,
+    }
+    for index, name in enumerate(fields):
+        namespace[name] = _tuplegetter(index, f"Alias for field number {index}")
+    return type(typename, (tuple,), namespace)
+
+
+_NAMED_TUPLE_PROHIBITED = frozenset(
+    {
+        "__new__",
+        "__init__",
+        "__slots__",
+        "__getnewargs__",
+        "_fields",
+        "_field_defaults",
+        "_make",
+        "_replace",
+        "_asdict",
+        "_source",
+    }
+)
+_NAMED_TUPLE_SPECIAL = frozenset({"__module__", "__name__", "__qualname__", "__annotations__"})
+
+
+def _namedtuple_from_pairs(typename, fields, module):
+    """The class ``typing.NamedTuple(typename, fields)`` builds from ``(name, type)`` pairs."""
+
+    return namedtuple(typename, [name for name, _ in fields], module=module)
+
+
+def _namedtuple_from_class(typename, fields, namespace, module):
+    """The class ``class typename(typing.NamedTuple)`` defines in ``module``.
+
+    ``fields`` lists the class body's annotated names in order. A field the body also assigns
+    takes that value as its default; the body's other attributes are copied onto the class.
+    """
+
+    defaults = {}
+    for name in fields:
+        if name in namespace:
+            defaults[name] = namespace[name]
+        elif defaults:
+            plural = "s" if len(defaults) > 1 else ""
+            raise TypeError(
+                f"Non-default namedtuple field {name} cannot follow default field{plural} "
+                + ", ".join(defaults)
+            )
+    result = namedtuple(typename, fields, defaults=list(defaults.values()), module=module)
+    for key, value in namespace.items():
+        if key in _NAMED_TUPLE_PROHIBITED:
+            raise AttributeError("Cannot overwrite NamedTuple attribute " + key)
+        if key not in _NAMED_TUPLE_SPECIAL and key not in fields:
+            setattr(result, key, value)
+    return result

@@ -6,16 +6,19 @@ total, ``chi2_contingency`` is a Pearson chi-squared test (with Yates' continuit
 a 2x2 table) against that expectation, and ``association`` rescales its chi-squared statistic.
 """
 
+from collections import namedtuple
+
 import numpy as np
 
 from scipy import special
-from scipy.stats._stats import _Result, _scalarize
+from scipy.stats._stats import _scalarize
 
 __all__ = ["chi2_contingency", "margins", "expected_freq", "association"]
 
 
-class Chi2ContingencyResult(_Result):
-    _fields = ("statistic", "pvalue", "dof", "expected_freq")
+Chi2ContingencyResult = namedtuple(
+    "Chi2ContingencyResult", ["statistic", "pvalue", "dof", "expected_freq"]
+)
 
 
 def margins(a):

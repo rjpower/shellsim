@@ -123,6 +123,21 @@ crate, so their last bit can differ from CPython's. Poles and out-of-domain argu
 `math.floor`, `ceil`, and `trunc` defer to a class's `__round__`, `__floor__`, `__ceil__`, and
 `__trunc__`, and other `math` functions convert instances through `__float__`.
 
+The frozen `collections` module provides `namedtuple`, with `rename=`, `defaults=` and `module=`,
+CPython's argument and validation errors, and `_make`, `_replace`, `_asdict`, `_fields`,
+`_field_defaults` and `__match_args__`. `typing.NamedTuple` builds the same classes, called with
+`(name, type)` pairs or used as the base of a class whose annotated names become the fields and
+whose other attributes are copied onto the class; its deprecated keyword and field-less forms are
+not supported. A class records its caller's module through `sys._getframemodulename`. Two
+differences remain: `__slots__` is not enforced, so instances accept new attributes, and a field
+reads through `__getitem__`, so a subclass that overrides it changes what its fields return.
+`keyword` lists the hard and soft keywords, and `str.isidentifier` uses Unicode's identifier
+classes.
+
+Unpacking into a fixed number of targets reads at most one item more than it needs, so unpacking
+an infinite iterator fails with `ValueError` instead of running forever. As in CPython, only an
+exact list, tuple or dict reports how many items it held when there are too many.
+
 The frozen `fractions` module provides `Fraction`, built from integers, fractions, rational or
 decimal strings, and floats or other objects with `as_integer_ratio`. Arithmetic with integers and
 fractions is exact and metered like other integer work; mixing in a float or complex number gives a

@@ -892,6 +892,9 @@ pub(super) trait PyRuntime {
     /// The script path and source line executing `depth` Python frames below the innermost one,
     /// or `None` when the stack is shallower. Depth 0 is the innermost frame.
     fn caller_location(&self, depth: usize) -> Option<(String, u32)>;
+    /// The `__name__` of the module whose code runs `depth` Python frames below the innermost
+    /// one, as `sys._getframemodulename` reports it, or `None` when the stack is shallower.
+    fn frame_module_name(&mut self, depth: usize) -> PyResult<Option<PyValue>>;
     /// The parameters of a Python function, or of the function a bound method wraps without its
     /// bound first parameter. `None` for any other callable.
     fn function_parameters(&self, value: &PyValue) -> PyResult<Option<Vec<PyParameter>>>;

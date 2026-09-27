@@ -94,6 +94,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "islower", string_islower),
         method("str", "isupper", string_isupper),
         method("str", "istitle", string_istitle),
+        method("str", "isidentifier", string_isidentifier),
     ],
     getters: &[],
 };
@@ -570,6 +571,14 @@ fn string_istitle(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     Ok(PyValue::Bool(unicode::is_title(&value)))
+}
+
+fn string_isidentifier(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("str.isidentifier", 0, 0)?;
+    args.reject_keywords("str.isidentifier")?;
+    let OwnedPyString(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    Ok(PyValue::Bool(unicode::is_identifier(&value)))
 }
 
 fn string_islower(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

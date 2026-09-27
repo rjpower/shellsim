@@ -9,11 +9,17 @@ path documented in docs/scipy.md.
 
 import math
 import warnings
+from collections import namedtuple
 
 import numpy as np
 
 from scipy import special
-from scipy.stats._stats import ConstantInputWarning, _Result, _rankdata_1d, _scalarize
+from scipy.stats._stats import (
+    ConstantInputWarning,
+    _rankdata_1d,
+    _scalarize,
+    _tuple_bunch,
+)
 
 __all__ = [
     "pearsonr",
@@ -28,79 +34,84 @@ __all__ = [
 ]
 
 
-class SignificanceResult(_Result):
-    _fields = ("statistic", "pvalue")
+SignificanceResult = namedtuple("SignificanceResult", ["statistic", "pvalue"])
+Power_divergenceResult = namedtuple("Power_divergenceResult", ["statistic", "pvalue"])
+Ttest_indResult = namedtuple("Ttest_indResult", ["statistic", "pvalue"])
+LinregressResult = _tuple_bunch(
+    "LinregressResult",
+    ["slope", "intercept", "rvalue", "pvalue", "stderr"],
+    ["intercept_stderr"],
+)
 
 
-class Power_divergenceResult(_Result):
-    _fields = ("statistic", "pvalue")
+ConfidenceInterval = namedtuple("ConfidenceInterval", ["low", "high"])
 
 
-class Ttest_indResult(_Result):
-    _fields = ("statistic", "pvalue")
+def _pearson_confidence_interval(self, confidence_level=0.95, method=None):
+    r = np.asarray(self.statistic, dtype=float)
+    se = 1.0 / math.sqrt(self._n - 3)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = np.arctanh(r)
+    if self._alternative == "two-sided":
+        crit = special.ndtri(0.5 + confidence_level / 2.0)
+        lo, hi = z - crit * se, z + crit * se
+    elif self._alternative == "less":
+        crit = special.ndtri(confidence_level)
+        lo, hi = -np.inf, z + crit * se
+    else:
+        crit = special.ndtri(confidence_level)
+        lo, hi = z - crit * se, np.inf
+    # tanh saturates to +/-1 at infinite bounds, so a one-sided interval needs no special case.
+    return ConfidenceInterval(_scalarize(np.tanh(lo)), _scalarize(np.tanh(hi)))
 
 
-class LinregressResult(_Result):
-    _fields = ("slope", "intercept", "rvalue", "pvalue", "stderr")
-
-    def __init__(self, slope, intercept, rvalue, pvalue, stderr, intercept_stderr):
-        super().__init__(slope, intercept, rvalue, pvalue, stderr)
-        self.intercept_stderr = intercept_stderr
-
-
-class PearsonRResult(_Result):
-    _fields = ("statistic", "pvalue")
-
-    def __init__(self, statistic, pvalue, n, alternative):
-        super().__init__(statistic, pvalue)
-        self._n = n
-        self._alternative = alternative
-
-    @property
-    def correlation(self):
-        return self.statistic
-
-    def confidence_interval(self, confidence_level=0.95, method=None):
-        r = np.asarray(self.statistic, dtype=float)
-        se = 1.0 / math.sqrt(self._n - 3)
-        with np.errstate(invalid="ignore", divide="ignore"):
-            z = np.arctanh(r)
-        if self._alternative == "two-sided":
-            crit = special.ndtri(0.5 + confidence_level / 2.0)
-            lo, hi = z - crit * se, z + crit * se
-        elif self._alternative == "less":
-            crit = special.ndtri(confidence_level)
-            lo, hi = -np.inf, z + crit * se
-        else:
-            crit = special.ndtri(confidence_level)
-            lo, hi = z - crit * se, np.inf
-        # tanh saturates to +/-1 at infinite bounds, so a one-sided interval needs no special case.
-        return _scalarize(np.tanh(lo)), _scalarize(np.tanh(hi))
+PearsonRResult = _tuple_bunch(
+    "PearsonRResult",
+    ["statistic", "pvalue"],
+    methods={
+        "correlation": property(lambda self: self.statistic),
+        "confidence_interval": _pearson_confidence_interval,
+    },
+)
 
 
-class TtestResult(_Result):
-    _fields = ("statistic", "pvalue", "df")
+def _pearson_result(statistic, pvalue, n, alternative):
+    result = PearsonRResult(statistic, pvalue)
+    result._n = n
+    result._alternative = alternative
+    return result
 
-    def __init__(self, statistic, pvalue, df, *, center, standard_error, alternative):
-        super().__init__(statistic, pvalue, df)
-        self._center = center
-        self._se = standard_error
-        self._alternative = alternative
 
-    def confidence_interval(self, confidence_level=0.95):
-        df = np.asarray(self.df, dtype=float)
-        se = np.asarray(self._se, dtype=float)
-        center = np.asarray(self._center, dtype=float)
-        if self._alternative == "two-sided":
-            crit = special.stdtrit(df, 0.5 + confidence_level / 2.0)
-            lo, hi = center - crit * se, center + crit * se
-        elif self._alternative == "less":
-            crit = special.stdtrit(df, confidence_level)
-            lo, hi = np.full(center.shape, -np.inf) if center.ndim else -np.inf, center + crit * se
-        else:
-            crit = special.stdtrit(df, confidence_level)
-            lo, hi = center - crit * se, np.full(center.shape, np.inf) if center.ndim else np.inf
-        return _scalarize(np.asarray(lo)), _scalarize(np.asarray(hi))
+def _ttest_confidence_interval(self, confidence_level=0.95):
+    df = np.asarray(self.df, dtype=float)
+    se = np.asarray(self._se, dtype=float)
+    center = np.asarray(self._center, dtype=float)
+    if self._alternative == "two-sided":
+        crit = special.stdtrit(df, 0.5 + confidence_level / 2.0)
+        lo, hi = center - crit * se, center + crit * se
+    elif self._alternative == "less":
+        crit = special.stdtrit(df, confidence_level)
+        lo, hi = np.full(center.shape, -np.inf) if center.ndim else -np.inf, center + crit * se
+    else:
+        crit = special.stdtrit(df, confidence_level)
+        lo, hi = center - crit * se, np.full(center.shape, np.inf) if center.ndim else np.inf
+    return ConfidenceInterval(_scalarize(np.asarray(lo)), _scalarize(np.asarray(hi)))
+
+
+TtestResult = _tuple_bunch(
+    "TtestResult",
+    ["statistic", "pvalue"],
+    ["df"],
+    methods={"confidence_interval": _ttest_confidence_interval},
+)
+
+
+def _ttest_result(statistic, pvalue, df, *, center, standard_error, alternative):
+    result = TtestResult(statistic, pvalue, df=df)
+    result._center = center
+    result._se = standard_error
+    result._alternative = alternative
+    return result
 
 
 def _broadcast_df(df, like):
@@ -156,7 +167,7 @@ def pearsonr(x, y, *, alternative="two-sided", axis=0):
     r, p, constant = _pearson_core(x, y, axis, alternative)
     if np.any(constant):
         _warn_constant()
-    return PearsonRResult(_scalarize(r), _scalarize(p), n=x.shape[axis], alternative=alternative)
+    return _pearson_result(_scalarize(r), _scalarize(p), x.shape[axis], alternative)
 
 
 def spearmanr(a, b=None, axis=0, nan_policy="propagate", alternative="two-sided"):
@@ -208,7 +219,7 @@ def linregress(x, y=None, alternative="two-sided"):
     residuals = y - (intercept + slope * x)
     stderr = math.sqrt(np.sum(residuals**2) / df) / math.sqrt(sxx)
     intercept_stderr = stderr * math.sqrt(np.sum(x * x) / n)
-    return LinregressResult(slope, intercept, r, pvalue, stderr, intercept_stderr)
+    return LinregressResult(slope, intercept, r, pvalue, stderr, intercept_stderr=intercept_stderr)
 
 
 def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sided"):
@@ -221,7 +232,7 @@ def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sid
         t = (mean - popmean) / se
     df = n - 1
     p = _t_pvalue(t, df, alternative)
-    return TtestResult(
+    return _ttest_result(
         _scalarize(t), _scalarize(p), _broadcast_df(df, t),
         center=_scalarize(mean), standard_error=_scalarize(se), alternative=alternative,
     )
@@ -236,7 +247,7 @@ def ttest_rel(a, b, axis=0, nan_policy="propagate", alternative="two-sided"):
         t = mean / se
     df = n - 1
     p = _t_pvalue(t, df, alternative)
-    return TtestResult(
+    return _ttest_result(
         _scalarize(t), _scalarize(p), _broadcast_df(df, t),
         center=_scalarize(mean), standard_error=_scalarize(se), alternative=alternative,
     )
@@ -288,7 +299,7 @@ def ttest_ind(a, b, axis=0, equal_var=True, nan_policy="propagate", alternative=
     with np.errstate(invalid="ignore", divide="ignore"):
         t = diff / se
     p = _t_pvalue(t, df, alternative)
-    return TtestResult(
+    return _ttest_result(
         _scalarize(t), _scalarize(p), _broadcast_df(df, t),
         center=_scalarize(diff), standard_error=_scalarize(se), alternative=alternative,
     )

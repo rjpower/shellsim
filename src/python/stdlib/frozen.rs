@@ -47,6 +47,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "_io" => Some(include_str!("source/io.py")),
         "io" => Some(include_str!("source/io.py")),
         "json" => Some(include_str!("source/json.py")),
+        "keyword" => Some(include_str!("source/keyword.py")),
         "logging" => Some(include_str!("source/logging.py")),
         "numpy" => Some(include_str!("source/numpy/__init__.py")),
         "numpy._arraypad" => Some(include_str!("source/numpy/_arraypad.py")),

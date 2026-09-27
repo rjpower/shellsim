@@ -1418,6 +1418,23 @@ impl Vm<'_> {
             bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::EnumBase));
         let is_unittest =
             bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::UnitTestBase));
+        let named_tuple_bases = bases
+            .iter()
+            .filter(|base| {
+                matches!(
+                    base.native_value(),
+                    Some(NativeValue::NativeFunction(function))
+                        if super::super::stdlib::typing::is_named_tuple(function)
+                )
+            })
+            .count();
+        if named_tuple_bases > 0 && bases.len() > 1 {
+            return Err(self.raise_exception(
+                "TypeError",
+                "can only inherit from a NamedTuple type and Generic",
+            ));
+        }
+        let is_named_tuple = named_tuple_bases == 1;
         let has_object_base = bases.iter().any(|base| {
             matches!(
                 base.native_value(),
@@ -1437,7 +1454,7 @@ impl Vm<'_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let user_bases = if is_enum || is_unittest {
+        let user_bases = if is_enum || is_unittest || is_named_tuple {
             Vec::new()
         } else {
             bases
@@ -1648,6 +1665,11 @@ impl Vm<'_> {
             }
         }
         let mut attributes = self.state.heap.scope_values(scope)?;
+        if is_named_tuple {
+            let class = self.named_tuple_class(&name, fields, &bindings, attributes)?;
+            self.stack.push(class);
+            return Ok(());
+        }
         if is_unittest {
             attributes.insert("__shellsim_unittest__".into(), Value::Bool(true));
             for method in super::super::stdlib::unittest::TEST_CASE_TYPE.methods {
@@ -1767,6 +1789,54 @@ impl Vm<'_> {
         }
         self.stack.push(Value::Object(class_id));
         Ok(())
+    }
+
+    /// `class Name(typing.NamedTuple)`: `collections._namedtuple_from_class` builds the class
+    /// from the annotated fields and the class body's namespace, both in definition order.
+    fn named_tuple_class(
+        &mut self,
+        name: &str,
+        fields: &[ClassField],
+        bindings: &[String],
+        mut attributes: HashMap<String, Value>,
+    ) -> Result<Value, String> {
+        let module = match attributes.get("__module__") {
+            Some(module) => *module,
+            None => self.current_module_name()?.unwrap_or(Value::None),
+        };
+        // A name annotated twice keeps its first position, as in `__annotations__`.
+        let mut names = Vec::<&str>::with_capacity(fields.len());
+        for field in fields {
+            if !names.contains(&field.name.as_str()) {
+                names.push(&field.name);
+            }
+        }
+        let mut field_names = Vec::with_capacity(names.len());
+        for name in names {
+            field_names.push(self.allocate_string(name.to_string())?);
+        }
+        // Names bound by the class body keep their order; any others follow sorted, so the
+        // namespace never depends on hash order.
+        let mut entries = Vec::with_capacity(attributes.len());
+        for binding in bindings {
+            if let Some(value) = attributes.remove(binding) {
+                entries.push((self.allocate_string(binding.clone())?, value));
+            }
+        }
+        let mut rest = attributes.into_iter().collect::<Vec<_>>();
+        rest.sort_by(|left, right| left.0.cmp(&right.0));
+        for (key, value) in rest {
+            entries.push((self.allocate_string(key)?, value));
+        }
+        let class_name = self.allocate_string(name.to_string())?;
+        let field_names = self.allocate_object(Object::Tuple(field_names))?;
+        let namespace = self.allocate_object(Object::Dict(entries.into()))?;
+        let collections = PyRuntime::import_module(self, "collections")
+            .map_err(|error| self.record_native_error(error))?;
+        let build = PyRuntime::get_attribute(self, collections, "_namedtuple_from_class")
+            .map_err(|error| self.record_native_error(error))?
+            .ok_or("collections._namedtuple_from_class is missing")?;
+        self.invoke_value(build, vec![class_name, field_names, namespace, module])
     }
 
     /// Allocate and finish a class after metaclass policy has selected its layout and C3 MRO.
@@ -1951,7 +2021,10 @@ impl Vm<'_> {
 
     /// The `__name__` global of the module that owns `scope`; `None` is the main script's
     /// global namespace.
-    fn module_name_of(&mut self, scope: Option<super::ScopeId>) -> Result<Option<Value>, String> {
+    pub(super) fn module_name_of(
+        &mut self,
+        scope: Option<super::ScopeId>,
+    ) -> Result<Option<Value>, String> {
         if let Some(scope) = scope {
             let root = self.state.heap.scope_root(scope)?;
             if !self.state.heap.scope_uses_repl_globals(root)? {

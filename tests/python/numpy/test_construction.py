@@ -1,6 +1,8 @@
 # Portable NumPy semantics. Expectations checked against NumPy 2.5.3 on CPython 3.14.4.
 # Scope: array construction, dtype inference, copy semantics, constructors and basic attributes.
 
+from collections import namedtuple
+
 import numpy as np
 import pytest
 from numpy.testing import assert_allclose
@@ -324,6 +326,25 @@ def test_asarray_reads_user_sequences():
     assert iter_only.shape == ()
     with pytest.raises(ValueError, match="inhomogeneous"):
         np.asarray(_Pair(_Pair(1, 2), _Pair(3)))
+
+
+_Point = namedtuple("_Point", "x y")
+
+
+class _Doubled(tuple):
+    def __iter__(self):
+        return iter([2 * value for value in self[:]])
+
+
+def test_array_reads_tuple_subclasses_by_iterating_them():
+    points = np.array([_Point(1, 2), _Point(3, 4.5)])
+    assert (points.dtype, points.tolist()) == (np.dtype("float64"), [[1.0, 2.0], [3.0, 4.5]])
+    assert np.array(_Doubled((1, 2))).tolist() == [2, 4]
+    zeros = np.zeros(2)
+    with pytest.raises(ValueError, match="setting an array element with a sequence"):
+        zeros[0] = _Point(1, 2)
+    ragged = np.array([_Point(1, 2), (3,)], dtype=object)
+    assert ragged.shape == (2,) and type(ragged[0]) is _Point
 
 
 def test_arange_zero_step_raises():

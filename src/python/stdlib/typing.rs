@@ -1,10 +1,13 @@
 //! Static markers for the deliberately small :mod:`typing` compatibility surface.
 //!
 //! These values affect only Python syntax and representation. They do not consult host typing
-//! state or perform runtime type checking.
+//! state or perform runtime type checking. `NamedTuple` is the exception: it builds real
+//! `collections.namedtuple` classes, both when called and when a class statement names it as
+//! its base.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyConstant, PyMarker, PyResult, PyRuntime, ValueDef,
+    CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyMarker, PyResult, PyRuntime, PyValue,
+    ValueDef,
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
@@ -39,6 +42,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "typing",
             name: "get_args",
             call: get_args,
+        },
+        FunctionDef {
+            module: "typing",
+            name: "NamedTuple",
+            call: named_tuple,
         },
     ],
     values: &[
@@ -133,4 +141,34 @@ fn get_args(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("typing.get_args", 1, 1)?;
     args.reject_keywords("typing.get_args")?;
     runtime.new_tuple(Vec::new())
+}
+
+/// Whether `function` is `typing.NamedTuple`, which a class statement accepts as its only base.
+pub(in crate::python) fn is_named_tuple(function: &FunctionDef) -> bool {
+    function.module == "typing" && function.name == "NamedTuple"
+}
+
+/// `typing.NamedTuple(typename, fields)`: the `collections.namedtuple` class for a list of
+/// `(name, type)` pairs, recorded in the calling module. The keyword and field-less forms, which
+/// CPython 3.14 deprecates, are not modeled.
+fn named_tuple(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    if !args.keywords().is_empty() {
+        return Err(PyError::unsupported(
+            "typing.NamedTuple with keyword-argument fields is not supported",
+        ));
+    }
+    if args.positional().len() == 1 {
+        return Err(PyError::unsupported(
+            "typing.NamedTuple without a fields list is not supported",
+        ));
+    }
+    args.expect_positional("NamedTuple", 2, 2)?;
+    let module = runtime.frame_module_name(0)?.unwrap_or(PyValue::None);
+    let collections = runtime.import_module("collections")?;
+    let build = runtime
+        .get_attribute(collections, "_namedtuple_from_pairs")?
+        .ok_or_else(|| PyError::runtime_error("collections._namedtuple_from_pairs is missing"))?;
+    let (mut positional, _) = args.into_parts();
+    positional.push(module);
+    runtime.call_value(build, CallArgs::new(positional, Vec::new()))
 }

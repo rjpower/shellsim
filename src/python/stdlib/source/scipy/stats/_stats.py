@@ -11,6 +11,7 @@ than SciPy's (see docs/scipy.md).
 
 import math
 import warnings
+from collections import namedtuple
 
 import numpy as np
 
@@ -58,46 +59,52 @@ PRECISION_LOSS = (
 )
 
 
-class _Result:
-    """Base for SciPy-style result objects.
+def _tuple_bunch(name, fields, extra_fields=(), methods=None):
+    """A SciPy-style result class: a named tuple of ``fields`` that also carries the keyword-only
+    ``extra_fields`` as attributes, which its ``repr`` and ``_asdict`` include.
 
-    shellsim's object model cannot subclass the builtin ``tuple``, so these behave like SciPy's
-    result namedtuples for unpacking, indexing, length and ``repr`` without actually being
-    ``tuple`` instances (see docs/scipy.md).
+    The class derives from a ``namedtuple`` named ``name + "Base"``, as SciPy's ``TtestResult``
+    derives from ``TtestResultBase``, so instances keep an attribute dictionary. ``methods``
+    adds further class attributes.
     """
 
-    _fields = ()
+    base = namedtuple(name + "Base", fields)
 
-    def __init__(self, *values):
-        for name, value in zip(self._fields, values):
-            setattr(self, name, value)
-
-    def __iter__(self):
-        return iter(getattr(self, name) for name in self._fields)
-
-    def __len__(self):
-        return len(self._fields)
-
-    def __getitem__(self, index):
-        return tuple(self)[index]
-
-    def __eq__(self, other):
-        return tuple(self) == tuple(other)
+    def __new__(cls, *args, **kwargs):
+        extras = {}
+        for field in extra_fields:
+            if field not in kwargs:
+                raise TypeError(f"missing keyword argument {field!r}")
+            extras[field] = kwargs.pop(field)
+        result = base.__new__(cls, *args, **kwargs)
+        for field, value in extras.items():
+            setattr(result, field, value)
+        return result
 
     def _asdict(self):
-        return {name: getattr(self, name) for name in self._fields}
+        items = base._asdict(self)
+        for field in extra_fields:
+            items[field] = getattr(self, field)
+        return items
 
     def __repr__(self):
-        body = ", ".join(f"{name}={getattr(self, name)!r}" for name in self._fields)
-        return f"{type(self).__name__}({body})"
+        items = ", ".join(f"{field}={value!r}" for field, value in self._asdict().items())
+        return f"{type(self).__name__}({items})"
+
+    namespace = {
+        "__new__": __new__,
+        "_asdict": _asdict,
+        "__repr__": __repr__,
+        "_extra_fields": tuple(extra_fields),
+    }
+    namespace.update(methods or {})
+    return type(name, (base,), namespace)
 
 
-class DescribeResult(_Result):
-    _fields = ("nobs", "minmax", "mean", "variance", "skewness", "kurtosis")
-
-
-class ModeResult(_Result):
-    _fields = ("mode", "count")
+DescribeResult = namedtuple(
+    "DescribeResult", ["nobs", "minmax", "mean", "variance", "skewness", "kurtosis"]
+)
+ModeResult = namedtuple("ModeResult", ["mode", "count"])
 
 
 _NAN_POLICIES = ("propagate", "raise", "omit")

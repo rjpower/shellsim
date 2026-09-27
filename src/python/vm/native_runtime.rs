@@ -2469,6 +2469,18 @@ impl PyRuntime for Vm<'_> {
         Some((self.traceback_filename(), u32::try_from(span.line).ok()?))
     }
 
+    fn frame_module_name(&mut self, depth: usize) -> PyResult<Option<Value>> {
+        // Function calls, generator resumptions, class bodies and imported modules each push a
+        // scope; the main script runs beneath them all in the global namespace.
+        let frames = self.local_scopes.len();
+        let scope = match depth.cmp(&frames) {
+            std::cmp::Ordering::Less => Some(self.local_scopes[frames - 1 - depth]),
+            std::cmp::Ordering::Equal => None,
+            std::cmp::Ordering::Greater => return Ok(None),
+        };
+        self.module_name_of(scope).map_err(PyError::runtime_error)
+    }
+
     fn function_parameters(&self, value: &Value) -> PyResult<Option<Vec<PyParameter>>> {
         let heap = &self.state.heap;
         let Some(id) = value.object_id() else {

@@ -2,7 +2,7 @@
 //!
 //! Rust's `char` methods provide the Uppercase, Lowercase and full case-mapping data that
 //! CPython also uses, but not the numeric types, Python's whitespace set, the title-case
-//! category and mappings, or Case_Ignorable. [`tables`] records those from CPython's Unicode
+//! category and mappings, Case_Ignorable, or the identifier classes. [`tables`] records those from CPython's Unicode
 //! database; regenerate it with `infra/generate-unicode-tables.py`.
 //!
 //! The case transforms follow `Objects/unicodeobject.c`: `title` and `capitalize` title-case
@@ -48,6 +48,16 @@ pub(super) fn is_numeric(character: char) -> bool {
 /// Rust's White_Space-based `char::is_whitespace` does not.
 pub(super) fn is_space(character: char) -> bool {
     in_ranges(tables::SPACE, character)
+}
+
+/// `str.isidentifier`: an XID_Start character or `_`, then XID_Continue characters. Like
+/// CPython, this does not reject keywords.
+pub(super) fn is_identifier(text: &str) -> bool {
+    let mut characters = text.chars();
+    characters
+        .next()
+        .is_some_and(|first| in_ranges(tables::IDENTIFIER_START, first))
+        && characters.all(|character| in_ranges(tables::IDENTIFIER_CONTINUE, character))
 }
 
 /// `str.isalnum` for one character.

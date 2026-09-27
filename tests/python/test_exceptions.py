@@ -146,6 +146,30 @@ def test_unpacking_reports_the_counts():
     assert raised(starred) == (ValueError, "not enough values to unpack (expected at least 2, got 1)")
 
 
+def test_unpacking_an_iterator_reads_one_item_past_the_targets():
+    def endless():
+        count = 0
+        while True:
+            count += 1
+            yield count
+
+    def from_endless():
+        first, second = endless()
+        return first, second
+
+    items = iter([1, 2, 3, 4])
+
+    def from_items():
+        first, second = items
+        return first, second
+
+    first, second = (value * 2 for value in [1, 2])
+    assert (first, second) == (2, 4)
+    assert raised(from_endless) == (ValueError, "too many values to unpack (expected 2)")
+    assert raised(from_items) == (ValueError, "too many values to unpack (expected 2)")
+    assert list(items) == [4]
+
+
 def function(a, b=2, *, c):
     return a
 

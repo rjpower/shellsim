@@ -172,8 +172,6 @@ expectations were measured on the reference machine described above; see "Roundi
   `float32` precision of the true value, but can differ from each other in the last one or two
   bits, for example `expit` of a `float32` array disagreeing with SciPy in the last mantissa bit
   at one of eight sample points checked during development.
-- **`scipy.stats` result objects** unpack, index and compare like SciPy's named tuples, but
-  they are not `tuple` instances, because shellsim cannot subclass `tuple`.
 - **`scipy.stats` warning locations.** Each statistic calls its axis and NaN handling from a
   thin wrapper instead of a decorator, so a warning whose `stacklevel` SciPy chose for its
   decorated call, such as the precision-loss `RuntimeWarning` from `skew`, is attributed one
