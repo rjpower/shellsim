@@ -14,6 +14,7 @@ scientific notation; a second pass reformats each element with the resolved padd
 lines up. String and object elements are not column-aligned, matching NumPy.
 """
 
+import contextlib
 import math
 
 from _numpy_print import dragon4_positional, dragon4_scientific
@@ -84,25 +85,17 @@ def set_printoptions(
     _options["formatter"] = formatter
 
 
-class printoptions:
-    """A context manager that applies `set_printoptions` and restores the prior options on exit,
+@contextlib.contextmanager
+def printoptions(*args, **kwargs):
+    """Apply `set_printoptions` for the `with` body and restore the prior options afterwards,
     e.g. ``with np.printoptions(precision=3): ...``."""
-
-    def __init__(self, *args, **kwargs):
-        self._args = args
-        self._kwargs = kwargs
-        self._previous = None
-
-    def __enter__(self):
-        self._previous = get_printoptions()
-        set_printoptions(*self._args, **self._kwargs)
-        return get_printoptions()
-
-    def __exit__(self, *exc_info):
-        del exc_info
+    previous = get_printoptions()
+    try:
+        set_printoptions(*args, **kwargs)
+        yield get_printoptions()
+    finally:
         _options.clear()
-        _options.update(self._previous)
-        return False
+        _options.update(previous)
 
 
 # ---------------------------------------------------------------------------------------------

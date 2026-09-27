@@ -356,6 +356,17 @@ def test_printoptions_precision():
     assert repr(np.array([1 / 3])) == "array([0.33333333])"
 
 
+def test_printoptions_yields_the_options_and_restores_them_after_an_exception():
+    before = np.get_printoptions()["precision"]
+    try:
+        with np.printoptions(precision=2) as options:
+            assert options["precision"] == 2
+            raise ValueError("inside")
+    except ValueError:
+        pass
+    assert np.get_printoptions()["precision"] == before
+
+
 def test_printoptions_precision_does_not_change_scalar_repr():
     with np.printoptions(precision=3):
         assert repr(np.float64(1 / 3)) == "np.float64(0.3333333333333333)"
