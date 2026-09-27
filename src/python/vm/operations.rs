@@ -285,6 +285,31 @@ impl Vm<'_> {
             _ => false,
         };
         if direct {
+            if let Object::Bytes(value) | Object::ByteArray(value) = self.state.heap.get(id)? {
+                let length = value.len();
+                // A bytes needle is searched for in linear time; an int needle is one byte.
+                let needle_length = match protocol::bytes_ref(&self.state.heap, needle)? {
+                    Some(needle) => needle.len(),
+                    None => match protocol::int_value(&self.state.heap, needle) {
+                        Some(byte) if (0..256).contains(&byte) => 1,
+                        Some(_) => {
+                            return Err(
+                                self.raise_exception("ValueError", "byte must be in range(0, 256)")
+                            );
+                        }
+                        None => {
+                            let message = format!(
+                                "a bytes-like object is required, not '{}'",
+                                self.type_name_of(needle)?
+                            );
+                            return Err(self.raise_exception("TypeError", message));
+                        }
+                    },
+                };
+                self.charge_cpu(
+                    u64::try_from(length.saturating_add(needle_length)).unwrap_or(u64::MAX),
+                )?;
+            }
             return protocol::contains(&self.state.heap, container, needle);
         }
         let iterator = self.make_iterator(*container)?;

@@ -869,6 +869,7 @@ dependencies = [
  "glob",
  "libc",
  "md-5",
+ "memchr",
  "num-bigint",
  "num-traits",
  "regex",

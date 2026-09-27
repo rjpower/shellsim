@@ -136,6 +136,17 @@ pub fn bytes_value(heap: &Heap, value: &Value) -> Result<Option<Vec<u8>>, String
     })
 }
 
+/// Borrow the contents of a `bytes` or `bytearray` without copying them.
+pub fn bytes_ref<'heap>(heap: &'heap Heap, value: &Value) -> Result<Option<&'heap [u8]>, String> {
+    let Some(id) = value.object_id() else {
+        return Ok(None);
+    };
+    Ok(match heap.get(id)? {
+        Object::Bytes(value) | Object::ByteArray(value) => Some(value),
+        _ => None,
+    })
+}
+
 pub fn exception_parts(heap: &Heap, value: &Value) -> Result<Option<(String, String)>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
@@ -882,6 +893,9 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
                 Err("object is not a container".into())
             }
             Object::Bytes(value) | Object::ByteArray(value) => {
+                if let Some(needle) = bytes_ref(heap, needle)? {
+                    return Ok(memchr::memmem::find(value, needle).is_some());
+                }
                 let needle = int_value(heap, needle)
                     .and_then(|value| u8::try_from(value).ok())
                     .ok_or("bytes containment requires an integer in range(0, 256)")?;

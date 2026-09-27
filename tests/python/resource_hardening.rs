@@ -312,6 +312,22 @@ fn bytes_repetition_reserves_before_allocating() {
 }
 
 #[test]
+fn bytes_join_reserves_its_parts_and_result() {
+    // A thousand references to one 100 kB value would join into 100 MB.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "data = bytes(100_000)\nb''.join([b'ok'])\nprint('small')\nb''.join([data] * 1000)",
+        Limits {
+            memory: 2 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 2 * 1024 * 1024);
+    assert_eq!(stdout, b"small\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn zlib_rejects_expansion_before_materializing_the_result() {
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
     encoder.write_all(&vec![0; 1024 * 1024]).unwrap();

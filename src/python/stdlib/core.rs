@@ -105,6 +105,7 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "startswith", bytes_startswith),
         method("bytes", "endswith", bytes_endswith),
         method("bytes", "find", bytes_find),
+        method("bytes", "join", bytes_join),
         method("bytes", "count", bytes_count),
         method("bytes", "partition", bytes_partition),
         method("bytes", "rpartition", bytes_rpartition),
@@ -120,7 +121,10 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "extend", bytearray_extend),
         method("bytearray", "decode", bytes_decode),
         method("bytearray", "hex", bytes_hex),
+        method("bytearray", "startswith", bytes_startswith),
+        method("bytearray", "endswith", bytes_endswith),
         method("bytearray", "find", bytes_find),
+        method("bytearray", "join", bytes_join),
         method("bytearray", "count", bytes_count),
         method("bytearray", "partition", bytes_partition),
         method("bytearray", "rpartition", bytes_rpartition),
@@ -540,21 +544,93 @@ fn bytes_endswith(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     bytes_affix(runtime, receiver, args, false)
 }
 
+/// `bytes.startswith` and `bytes.endswith`: test one affix or each affix of a tuple against
+/// the bytes in `[start, end)`, which follow slice clamping.
 fn bytes_affix(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     args: CallArgs,
     prefix: bool,
 ) -> PyResult {
-    args.expect_positional("bytes affix test", 1, 1)?;
-    args.reject_keywords("bytes affix test")?;
+    let name = if prefix { "startswith" } else { "endswith" };
+    args.expect_positional(name, 1, 3)?;
+    args.reject_keywords(name)?;
     let PyBytes(value) = receiver.cast(runtime)?;
-    let PyBytes(needle) = args.positional()[0].cast(runtime)?;
-    Ok(PyValue::Bool(if prefix {
-        value.starts_with(&needle)
+    let affix = args.positional()[0];
+    let affixes = if runtime.kind(&affix)? == PyKind::Tuple {
+        affix.cast::<PyTuple>(runtime)?.items(runtime)?
+    } else if runtime.bytes_value(&affix)?.is_some() {
+        vec![affix]
     } else {
-        value.ends_with(&needle)
-    }))
+        let actual = runtime.type_name(&affix)?;
+        return Err(PyError::type_error(format!(
+            "{name} first arg must be bytes or a tuple of bytes, not {actual}"
+        )));
+    };
+    let (start, end) = string_bounds(runtime, args.positional(), value.len())?;
+    let window = value.get(start..end).unwrap_or_default();
+    for affix in affixes {
+        let Some(affix) = runtime.bytes_value(&affix)? else {
+            let actual = runtime.type_name(&affix)?;
+            return Err(PyError::type_error(format!(
+                "a bytes-like object is required, not '{actual}'"
+            )));
+        };
+        runtime.charge_cpu(u64::try_from(affix.len()).unwrap_or(u64::MAX))?;
+        let matched = start <= end
+            && if prefix {
+                window.starts_with(&affix)
+            } else {
+                window.ends_with(&affix)
+            };
+        if matched {
+            return Ok(Value::Bool(true));
+        }
+    }
+    Ok(Value::Bool(false))
+}
+
+/// `bytes.join(iterable)` and `bytearray.join`: the bytes-like items with the receiver between
+/// them, as an object of the receiver's type.
+fn bytes_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytes.join", 1, 1)?;
+    args.reject_keywords("bytes.join")?;
+    let PyBytes(separator) = receiver.cast(runtime)?;
+    let iterator = runtime.iterator(args.positional()[0])?;
+    let mut parts = Vec::new();
+    let mut length = 0usize;
+    while let Some(value) = runtime.iterator_next(iterator)? {
+        runtime.charge_cpu(1)?;
+        let Some(part) = runtime.bytes_value(&value)? else {
+            return Err(PyError::type_error(format!(
+                "sequence item {}: expected a bytes-like object, {} found",
+                parts.len(),
+                runtime.type_name(&value)?
+            )));
+        };
+        length = length
+            .checked_add(part.len())
+            .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+        // Each part is a host copy that lives until the join finishes, so repeating one large
+        // item must exhaust the budget as the copies accumulate.
+        runtime.reserve_memory(part.len())?;
+        parts.push(part);
+    }
+    length = length
+        .checked_add(
+            separator
+                .len()
+                .saturating_mul(parts.len().saturating_sub(1)),
+        )
+        .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+    runtime.reserve_memory(length)?;
+    runtime.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))?;
+    let joined = parts.join(separator.as_slice());
+    if runtime.kind(&receiver)? == PyKind::ByteArray {
+        runtime.new_bytearray(joined)
+    } else {
+        runtime.new_bytes(joined)
+    }
 }
 
 fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -562,43 +638,12 @@ fn bytes_find(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     args.reject_keywords("bytes.find")?;
     let PyBytes(value) = receiver.cast(runtime)?;
     let PyBytes(needle) = args.positional()[0].cast(runtime)?;
-    let optional_index = |value: Option<&PyValue>, default| -> PyResult<i64> {
-        value
-            .map(|value| {
-                runtime
-                    .int_value(value)
-                    .ok_or_else(|| PyError::type_error("slice indices must be integers"))
-            })
-            .transpose()
-            .map(|value| value.unwrap_or(default))
-    };
-    let start = optional_index(args.positional().get(1), 0)?;
-    let end = optional_index(
-        args.positional().get(2),
-        i64::try_from(value.len()).unwrap_or(i64::MAX),
-    )?;
-    let length = i64::try_from(value.len()).unwrap_or(i64::MAX);
-    let normalize = |index: i64| {
-        usize::try_from(if index < 0 {
-            index.saturating_add(length).max(0)
-        } else {
-            index
-        })
-        .unwrap_or(value.len())
-        .min(value.len())
-    };
-    let start = normalize(start);
-    let end = normalize(end);
-    runtime.charge_cpu(u64::try_from(end.saturating_sub(start)).unwrap_or(u64::MAX))?;
+    let (start, end) = string_bounds(runtime, args.positional(), value.len())?;
+    // Two-way search is linear in both lengths.
+    let work = end.saturating_sub(start).saturating_add(needle.len());
+    runtime.charge_cpu(u64::try_from(work).unwrap_or(u64::MAX))?;
     let found = if start <= end && needle.len() <= end - start {
-        if needle.is_empty() {
-            Some(start)
-        } else {
-            value[start..end]
-                .windows(needle.len())
-                .position(|window| window == needle)
-                .map(|position| start + position)
-        }
+        memchr::memmem::find(&value[start..end], &needle).map(|position| start + position)
     } else {
         None
     };

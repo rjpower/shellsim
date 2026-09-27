@@ -339,3 +339,31 @@ def test_percent_formatting_matches_cpython():
         assert str(error) == "%x format: an integer is required, not float"
     else:
         raise AssertionError("%x accepted a float")
+
+
+def test_bytes_affixes_membership_find_and_join():
+    for value in (b"abcab", bytearray(b"abcab")):
+        assert value.startswith((b"x", b"ab")) and not value.startswith(())
+        assert value.endswith(b"ab", 0, 5) and not value.endswith(b"ab", 0, 4)
+        assert value.startswith(b"ca", 2) and value.endswith(bytearray(b"bc"), None, -2)
+        assert b"bca" in value and b"" in value and b"cc" not in value
+        assert bytearray(b"ca") in value and 99 in value and 100 not in value
+        assert value.find(b"ab", 1) == 3 and value.find(b"ab", 1, 4) == -1
+        assert value.find(b"", 5) == 5 and value.find(b"", 9) == -1
+        joined = value.join([b"x", bytearray(b"y")])
+        assert joined == b"xabcaby" and type(joined) is type(value)
+    assert b", ".join(iter([b"a", b"b"])) == b"a, b"
+    assert b"-".join([]) == b""
+    _assert_raises(
+        lambda: b"".join([b"a", "b"]),
+        TypeError,
+        "sequence item 1: expected a bytes-like object, str found",
+    )
+    _assert_raises(
+        lambda: b"a".startswith("a"),
+        TypeError,
+        "startswith first arg must be bytes or a tuple of bytes, not str",
+    )
+    _assert_raises(lambda: b"a".endswith(("a",)), TypeError, "a bytes-like object is required, not 'str'")
+    _assert_raises(lambda: "a" in b"a", TypeError, "a bytes-like object is required, not 'str'")
+    _assert_raises(lambda: 256 in bytearray(b"a"), ValueError, "byte must be in range(0, 256)")
