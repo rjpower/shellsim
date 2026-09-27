@@ -6,6 +6,9 @@
 
 use std::ops::Range;
 
+/// A slice's start, stop and step as indices, `None` where the bound is omitted or `None`.
+pub(super) type SliceBounds = (Option<i64>, Option<i64>, Option<i64>);
+
 /// Python's `slice.indices(length)`: the start, stop, and step a slice selects in a sequence of
 /// `length` items. Omitted bounds take the step direction's defaults, negative bounds count from
 /// the end, and out-of-range bounds are clamped, so `slice(None, None, -1)` over 5 items gives

@@ -35,6 +35,40 @@ pub fn compile(program: Program) -> CodeRef {
     compiler.finish(Vec::new())
 }
 
+/// Code that evaluates one module-level expression and returns its value, for `eval()`.
+pub fn compile_expression(expression: Expression) -> CodeRef {
+    let mut compiler = Compiler {
+        instructions: Vec::new(),
+        loops: Vec::new(),
+        finalizers: Vec::new(),
+        protected_regions: Vec::new(),
+        in_function: false,
+        is_coroutine: false,
+        globals: HashSet::new(),
+        nonlocals: HashSet::new(),
+        named_expression: NamedExpressionContext::local(),
+        is_class_scope: false,
+        structural_depth: 0,
+    };
+    let span = expression.span;
+    compiler.expression(expression);
+    compiler.emit(Operation::Return, span);
+    // Names resolve when the code runs, so an `eval` inside a function reads its locals.
+    compiler.finish_resolving(Vec::new(), NameResolution::Dynamic)
+}
+
+/// How a finished code object's plain name operations resolve.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NameResolution {
+    /// Names assigned in the body are slots of the function's scope; others resolve dynamically.
+    Local,
+    /// Module code: every name is a global.
+    Global,
+    /// Names resolve at run time through the active scope chain, then globals and builtins, as
+    /// in a class body.
+    Dynamic,
+}
+
 struct Compiler {
     instructions: Vec<PendingInstruction>,
     loops: Vec<LoopContext>,
@@ -119,12 +153,23 @@ fn contains_star(target: &AssignmentTarget) -> bool {
 
 impl Compiler {
     fn finish(self, parameters: Vec<Parameter>) -> CodeRef {
+        let resolution = if self.is_class_scope {
+            NameResolution::Dynamic
+        } else if self.in_function {
+            NameResolution::Local
+        } else {
+            NameResolution::Global
+        };
+        self.finish_resolving(parameters, resolution)
+    }
+
+    fn finish_resolving(self, parameters: Vec<Parameter>, resolution: NameResolution) -> CodeRef {
         let mut instructions = self.instructions;
         let mut local_names = parameters
             .iter()
             .map(|parameter| parameter.name.clone())
             .collect::<Vec<_>>();
-        if self.in_function && !self.is_class_scope {
+        if resolution == NameResolution::Local {
             for instruction in &instructions {
                 if let Operation::StoreName(name) = &instruction.operation {
                     if !self.globals.contains(name)
@@ -155,7 +200,7 @@ impl Compiler {
                     instruction.operation = operation;
                 }
             }
-        } else if !self.is_class_scope {
+        } else if resolution == NameResolution::Global {
             for instruction in &mut instructions {
                 instruction.operation =
                     match std::mem::replace(&mut instruction.operation, Operation::Halt) {

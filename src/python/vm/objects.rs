@@ -507,7 +507,7 @@ impl Vm<'_> {
                         "step" => step,
                         _ => return Ok(None),
                     };
-                    return Ok(Some(component.map_or(Value::None, Value::Int)));
+                    return Ok(Some(component));
                 }
                 _ => {}
             }
@@ -932,10 +932,20 @@ impl Vm<'_> {
             return Ok(());
         }
         let owner = self.builtin_view(owner)?;
-        if let Some((start, stop, step)) = self.slice_parts(&index) {
-            let value = self.load_builtin_slice(owner, start, stop, step)?;
-            self.stack.push(value);
-            return Ok(());
+        // A slice is an ordinary key to a mapping; only sequences slice with it.
+        let mapping = match owner.object_id() {
+            Some(id) => matches!(
+                self.state.heap.get(id)?,
+                Object::Dict(_) | Object::DefaultDict { .. }
+            ),
+            None => false,
+        };
+        if !mapping {
+            if let Some((start, stop, step)) = self.slice_bounds(&index)? {
+                let value = self.load_builtin_slice(owner, start, stop, step)?;
+                self.stack.push(value);
+                return Ok(());
+            }
         }
         let index = self.sequence_index(&owner, index)?;
         let value = if matches!(owner.native_value(), Some(NativeValue::TypingList)) {
@@ -1334,29 +1344,66 @@ impl Vm<'_> {
             .map_err(|error| self.record_native_error(error))
     }
 
-    /// One `slice()` argument. Slices store machine-integer bounds read through `__index__`, so
-    /// other bound objects, which CPython keeps as-is, are rejected explicitly.
-    fn slice_bound(&mut self, value: &Value) -> Result<Option<i64>, String> {
-        if value.is_none() {
+    /// The indices a slice selects with, when `value` is a slice: each bound goes through
+    /// `__index__` (`None` stays open). Integers beyond the machine range clamp to it, as
+    /// CPython's `_PyEval_SliceIndex` does, since no sequence is that long.
+    pub(super) fn slice_bounds(
+        &mut self,
+        value: &Value,
+    ) -> Result<Option<super::super::slice::SliceBounds>, String> {
+        let Some(id) = value.object_id() else {
             return Ok(None);
+        };
+        let Object::Slice { start, stop, step } = self.state.heap.get(id)? else {
+            return Ok(None);
+        };
+        let (start, stop, step) = (*start, *stop, *step);
+        let bounds = (
+            self.slice_index(&start)?,
+            self.slice_index(&stop)?,
+            self.slice_index(&step)?,
+        );
+        if bounds.2 == Some(0) {
+            return Err(self.raise_exception("ValueError", "slice step cannot be zero"));
         }
-        self.index_value(value)?.map(Some).ok_or_else(|| {
-            "slice() bounds other than integers and None are not supported".to_string()
-        })
+        Ok(Some(bounds))
     }
 
-    /// Pop one slice bound. An explicit `None` bound is the same as an omitted one.
-    fn pop_slice_bound(&mut self, present: bool, name: &str) -> Result<Option<i64>, String> {
-        if !present {
+    fn slice_index(&mut self, bound: &Value) -> Result<Option<i64>, String> {
+        if bound.is_none() {
             return Ok(None);
         }
-        let value = self.pop()?;
-        if value.is_none() {
-            return Ok(None);
+        let integer =
+            if protocol::int_value(&self.state.heap, bound).is_some() || self.is_bigint(bound)? {
+                *bound
+            } else {
+                match self.int_by_method(bound, &["__index__"])? {
+                    Some(integer) => integer,
+                    None => {
+                        return Err(self.raise_exception(
+                            "TypeError",
+                            "slice indices must be integers or None or have an __index__ method",
+                        ))
+                    }
+                }
+            };
+        if let Some(index) = protocol::int_value(&self.state.heap, &integer) {
+            return Ok(Some(index));
         }
-        self.index_value(&value)?
-            .map(Some)
-            .ok_or_else(|| format!("slice {name} must be an integer"))
+        let negative = matches!(
+            super::number::view(&self.state.heap, &integer),
+            Some(super::number::NumberRef::BigInt(value)) if num_traits::Signed::is_negative(value)
+        );
+        Ok(Some(if negative { -i64::MAX } else { i64::MAX }))
+    }
+
+    /// Pop one slice bound; an omitted bound is `None`.
+    fn pop_slice_bound(&mut self, present: bool) -> Result<Value, String> {
+        if present {
+            self.pop()
+        } else {
+            Ok(Value::None)
+        }
     }
 
     pub(super) fn build_slice(
@@ -1365,9 +1412,9 @@ impl Vm<'_> {
         has_stop: bool,
         has_step: bool,
     ) -> Result<(), String> {
-        let step = self.pop_slice_bound(has_step, "step")?;
-        let stop = self.pop_slice_bound(has_stop, "stop")?;
-        let start = self.pop_slice_bound(has_start, "start")?;
+        let step = self.pop_slice_bound(has_step)?;
+        let stop = self.pop_slice_bound(has_stop)?;
+        let start = self.pop_slice_bound(has_start)?;
         let value = self.allocate_object(Object::Slice { start, stop, step })?;
         self.stack.push(value);
         Ok(())
@@ -3066,14 +3113,11 @@ impl Vm<'_> {
                         ),
                     ));
                 }
-                let mut bounds = arguments
-                    .iter()
-                    .map(|value| self.slice_bound(value))
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut bounds = arguments.clone();
                 if bounds.len() == 1 {
-                    bounds.insert(0, None);
+                    bounds.insert(0, Value::None);
                 }
-                bounds.resize(3, None);
+                bounds.resize(3, Value::None);
                 self.allocate_object(Object::Slice {
                     start: bounds[0],
                     stop: bounds[1],

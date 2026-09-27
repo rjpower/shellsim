@@ -914,12 +914,9 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
-    fn slice_parts(&self, value: &Value) -> Option<(Option<i64>, Option<i64>, Option<i64>)> {
-        let Object::Slice { start, stop, step } = self.state.heap.get(value.object_id()?).ok()?
-        else {
-            return None;
-        };
-        Some((*start, *stop, *step))
+    fn slice_parts(&mut self, value: &Value) -> PyResult<Option<super::super::slice::SliceBounds>> {
+        self.slice_bounds(value)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(Value, Value)>> {

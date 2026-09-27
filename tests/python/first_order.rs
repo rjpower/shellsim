@@ -349,6 +349,68 @@ except TypeError:
 }
 
 #[test]
+fn eval_returns_the_value_of_one_expression() {
+    let source = r#"
+x = 5
+print(eval("x * 2"), eval("  [i * i for i in range(x)]"), eval("eval('x') + 1"))
+def scaled(factor):
+    return eval("x * factor")
+print(scaled(3))
+for source in ("x = 1", "1; 2"):
+    try:
+        eval(source)
+    except SyntaxError:
+        print("SyntaxError")
+try:
+    eval(3)
+except TypeError as error:
+    print(error)
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "10 [0, 1, 4, 9, 16] 6\n15\nSyntaxError\nSyntaxError\n\
+             eval() arg 1 must be a string, bytes or code object\n"
+                .into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn slices_keep_any_bound_objects_and_convert_them_when_indexing() {
+    let source = r#"
+class Index:
+    def __index__(self):
+        return 2
+s = slice(0, 1, 5j)
+print(s, s.start, s.stop, s.step)
+print(slice("a", None) == slice("a", None), {slice(1, 2): "x"}[slice(1, 2)])
+print(hash(slice(1, 2, 3)), hash(slice(None)))
+print([1, 2, 3, 4][Index():], [1, 2, 3][:10 ** 30], slice(Index()).indices(10))
+for bad in ("[1, 2, 3][1.5:]", "[1, 2, 3][::0]"):
+    try:
+        exec(bad)
+    except (TypeError, ValueError) as error:
+        print(type(error).__name__, error)
+"#;
+    // Expected output from CPython 3.14.4.
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "slice(0, 1, 5j) 0 1 5j\nTrue x\n-2340833382717974474 4032618106351268893\n\
+             [3, 4] [1, 2, 3] (0, 2, 1)\n\
+             TypeError slice indices must be integers or None or have an __index__ method\n\
+             ValueError slice step cannot be zero\n"
+                .into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn exec_rejects_unimplemented_syntax_without_host_fallback() {
     let (status, stdout, stderr) = run("exec('match 1:\\n    case 1: pass')");
     assert_eq!(status, 2);

@@ -698,7 +698,9 @@ pub(super) trait PyRuntime {
     fn list_reverse(&mut self, list: PyList) -> PyResult<()>;
     fn list_clear(&mut self, list: PyList) -> PyResult<()>;
     fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<PyValue>>;
-    fn slice_parts(&self, value: &PyValue) -> Option<(Option<i64>, Option<i64>, Option<i64>)>;
+    /// The indices a slice selects with, each bound read through `__index__`, or `None` when
+    /// `value` is not a slice. Raises `TypeError` for a bound that is not an index.
+    fn slice_parts(&mut self, value: &PyValue) -> PyResult<Option<super::slice::SliceBounds>>;
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(PyValue, PyValue)>>;
     fn dict_get(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
     fn dict_insert(&mut self, dict: PyDict, key: PyValue, value: PyValue) -> PyResult<()>;

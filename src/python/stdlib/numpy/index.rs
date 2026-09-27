@@ -86,7 +86,7 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
     if runtime.is_ellipsis(&value) {
         return Ok(Item::Ellipsis);
     }
-    if let Some((start, stop, step)) = runtime.slice_parts(&value) {
+    if let Some((start, stop, step)) = runtime.slice_parts(&value)? {
         return Ok(Item::Slice(start, stop, step));
     }
     match runtime.kind(&value)? {

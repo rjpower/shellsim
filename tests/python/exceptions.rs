@@ -79,12 +79,12 @@ fn system_exit_keeps_its_status_and_message_semantics() {
 
 #[test]
 fn unmodeled_builtins_still_report_the_minimal_shim_diagnostic() {
-    let (status, stdout, stderr) = run_python_text("print(eval('1'))");
+    let (status, stdout, stderr) = run_python_text("print(memoryview(b'1'))");
     assert_eq!(status, 2);
     assert!(stdout.is_empty());
     assert!(stderr.contains("unsupported by minimal shim"), "{stderr}");
     assert!(
-        stderr.contains("builtin \"eval\" is not implemented"),
+        stderr.contains("builtin \"memoryview\" is not implemented"),
         "{stderr}"
     );
 }

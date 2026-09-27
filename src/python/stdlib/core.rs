@@ -2592,7 +2592,7 @@ fn slice_indices(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
         return Err(PyError::value_error("length should not be negative"));
     }
     let (start, stop, step) = runtime
-        .slice_parts(&receiver)
+        .slice_parts(&receiver)?
         .ok_or_else(|| PyError::type_error("descriptor 'indices' requires a 'slice' object"))?;
     let (start, stop, step) = super::super::slice::slice_indices(length, start, stop, step)
         .map_err(PyError::value_error)?;
@@ -4046,7 +4046,7 @@ pub(crate) fn slot_bytearray_set_item(
             .ok_or_else(|| PyError::value_error("byte must be in range(0, 256)"))?;
         let index = byte_index(index, items.len())?;
         items[index] = value;
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let replacement = collect_bytes(runtime, value)?;
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         assign_slice(runtime, &mut items, plan, replacement)?;
@@ -4067,7 +4067,7 @@ pub(crate) fn slot_bytearray_delete_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = byte_index(index, items.len())?;
         items.remove(index);
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         delete_slice(runtime, &mut items, plan)?;
     } else {
@@ -4160,7 +4160,7 @@ pub(crate) fn slot_list_delete_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = normalized_list_index(index, items.len())?;
         items.remove(index);
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         delete_slice(runtime, &mut items, plan)?;
     } else {
@@ -4181,7 +4181,7 @@ pub(crate) fn slot_list_set_item(
     if let Some(index) = runtime.int_value(&index) {
         let index = normalized_list_index(index, items.len())?;
         items[index] = value;
-    } else if let Some((start, stop, step)) = runtime.slice_parts(&index) {
+    } else if let Some((start, stop, step)) = runtime.slice_parts(&index)? {
         let replacement = collect_values(runtime, value)?;
         let plan = SlicePlan::new(items.len(), start, stop, step).map_err(PyError::value_error)?;
         assign_slice(runtime, &mut items, plan, replacement)?;

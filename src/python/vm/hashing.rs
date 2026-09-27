@@ -65,11 +65,7 @@ impl Vm<'_> {
                 let (start, stop, step) = (*start, *stop, *step);
                 return range_hash(start, stop, step);
             }
-            Object::Slice { start, stop, step } => {
-                let parts =
-                    [*start, *stop, *step].map(|bound| bound.map_or(hash::NONE, hash::integer));
-                return Ok(hash::tuple(&parts));
-            }
+            Object::Slice { start, stop, step } => (vec![*start, *stop, *step], hash::slice),
             Object::EnumMember { name, .. } => return Ok(hash::string(name)),
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))

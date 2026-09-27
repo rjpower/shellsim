@@ -123,10 +123,12 @@ pub enum Object {
     },
     List(Vec<Value>),
     Tuple(Vec<Value>),
+    /// `slice(start, stop, step)`. Bounds are any objects, as in CPython (`None` when
+    /// omitted); they become indices only when the slice subscripts a sequence.
     Slice {
-        start: Option<i64>,
-        stop: Option<i64>,
-        step: Option<i64>,
+        start: Value,
+        stop: Value,
+        step: Value,
     },
     Dict(OrderedMap),
     DefaultDict {
@@ -1589,13 +1591,13 @@ fn trace_object(
             trace_value(*receiver, object_work);
         }
         Object::Exception { args, .. } => trace_values(args.iter().copied(), object_work),
+        Object::Slice { start, stop, step } => trace_values([*start, *stop, *step], object_work),
         Object::Bare
         | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
         | Object::ArrayStorage(PyArrayBuffer::Bytes(_))
         | Object::WideValue { .. }
-        | Object::Slice { .. }
         | Object::BigInt(_)
         | Object::Complex { .. }
         | Object::Range { .. }

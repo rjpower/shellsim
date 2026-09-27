@@ -108,8 +108,9 @@ grouping. `from module import *` binds the names in a list or tuple `__all__`, o
 names without a leading underscore, and only at module level. The `__import__` builtin uses the
 simulated loader for absolute imports; relative
 `__import__` calls are explicitly unsupported. The `exec`
-builtin accepts one source string and executes it in the simulated namespace. Code objects and
-explicit globals or locals mappings are not supported.
+builtin accepts one source string and executes it in the module namespace. The `eval` builtin
+accepts one expression string and returns its value, reading the calling function's locals as
+CPython does. Code objects and explicit globals or locals mappings are not supported by either.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
 `partial`. The frozen `contextlib` module provides `contextmanager`, `suppress`, `nullcontext`,
 `closing`, and `ExitStack`. The frozen `inspect` module provides `signature`, `Signature`, and
@@ -166,7 +167,7 @@ attribute of a module, class, or instance raises `AttributeError`. Argument-bind
 function by `__name__`; CPython uses the qualified name for nested functions and methods.
 
 CPython behavior that shellsim does not model fails differently. An unimplemented builtin such as
-`eval`, an unimplemented standard-library module such as `threading`, or a missing method of a
+`memoryview`, an unimplemented standard-library module such as `threading`, or a missing method of a
 builtin value stops the program with exit status 2 and an "unsupported by minimal shim" diagnostic.
 These failures cannot be caught, so an `except ImportError` fallback cannot mistake a shellsim gap
 for functionality that is really absent.

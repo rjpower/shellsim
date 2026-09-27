@@ -170,13 +170,28 @@ const XXPRIME_5: u64 = 2_870_177_450_012_600_261;
 
 /// `hash(t)` for a tuple, from its items' hashes (CPython's xxHash-based `tuplehash`).
 pub(super) fn tuple(items: &[i64]) -> i64 {
+    let accumulator =
+        xxhash_lanes(items).wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    finish_xxhash(accumulator)
+}
+
+/// `hash(s)` for a slice, from the hashes of its start, stop and step: the tuple hash without
+/// its final length step, as CPython's `slice_hash` computes it.
+pub(super) fn slice(items: &[i64]) -> i64 {
+    finish_xxhash(xxhash_lanes(items))
+}
+
+fn xxhash_lanes(items: &[i64]) -> u64 {
     let mut accumulator = XXPRIME_5;
     for item in items {
         accumulator = accumulator.wrapping_add((*item as u64).wrapping_mul(XXPRIME_2));
         accumulator = accumulator.rotate_left(31);
         accumulator = accumulator.wrapping_mul(XXPRIME_1);
     }
-    accumulator = accumulator.wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    accumulator
+}
+
+fn finish_xxhash(accumulator: u64) -> i64 {
     if accumulator == u64::MAX {
         return 1_546_275_796;
     }

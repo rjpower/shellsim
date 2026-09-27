@@ -346,11 +346,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Slice { start, stop, step } => {
-                let bound = |bound: &Option<i64>| match bound {
-                    Some(value) => value.to_string(),
-                    None => "None".to_string(),
-                };
-                format!("slice({}, {}, {})", bound(start), bound(stop), bound(step))
+                format!(
+                    "slice({})",
+                    render_values(heap, &[*start, *stop, *step], active)?.join(", ")
+                )
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 let mut rendered = Vec::with_capacity(entries.len());
@@ -591,7 +590,12 @@ fn equals_inner(
                         stop: right_stop,
                         step: right_step,
                     },
-                ) => (left_start, left_stop, left_step) == (right_start, right_stop, right_step),
+                ) => sequence_equal(
+                    heap,
+                    &[*left_start, *left_stop, *left_step],
+                    &[*right_start, *right_stop, *right_step],
+                    active,
+                )?,
                 (
                     Object::Range {
                         start: left_start,

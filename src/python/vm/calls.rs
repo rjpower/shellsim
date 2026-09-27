@@ -1,5 +1,6 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
+use super::super::ast::{Program, Statement, StatementKind};
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
     BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
@@ -20,6 +21,43 @@ impl Vm<'_> {
             self.type_name_of(&value)?
         );
         Err(self.raise_exception("TypeError", message))
+    }
+
+    /// Parse the source string passed to `exec` or `eval` (`builtin`). Parsing is charged
+    /// before it runs, and nesting is bounded so dynamic source cannot recurse without limit.
+    /// `eval` ignores leading spaces and tabs, as CPython does.
+    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> Result<Program, String> {
+        let source = protocol::string_value(&self.state.heap, source)?.ok_or_else(|| {
+            self.record_native_error(PyError::type_error(format!(
+                "{builtin}() arg 1 must be a string, bytes or code object"
+            )))
+        })?;
+        let source = if builtin == "eval" {
+            source.trim_start_matches([' ', '\t'])
+        } else {
+            &source
+        };
+        if self.bytecode_frames.len() >= 256 {
+            return Err(format!("maximum {builtin} depth exceeded"));
+        }
+        let parse_memory = source
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| format!("{builtin} source is too large"))?;
+        self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
+        self.reserve_result(parse_memory)?;
+        let tokens = super::super::lexer::lex(source).map_err(|error| {
+            format!(
+                "{} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            )
+        })?;
+        super::super::parser::parse(tokens).map_err(|error| {
+            format!(
+                "{} at line {}, column {}",
+                error.message, error.span.line, error.span.column
+            )
+        })
     }
 
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
@@ -717,33 +755,7 @@ impl Vm<'_> {
             }
             Builtin::Exec => {
                 expect_arity(&arguments, 1, 1)?;
-                let source =
-                    protocol::string_value(&self.state.heap, &arguments[0])?.ok_or_else(|| {
-                        self.record_native_error(PyError::type_error(
-                            "exec() argument must be a string",
-                        ))
-                    })?;
-                if self.bytecode_frames.len() >= 256 {
-                    return Err("maximum exec depth exceeded".into());
-                }
-                let parse_memory = source
-                    .len()
-                    .checked_mul(4)
-                    .ok_or("exec source is too large")?;
-                self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
-                self.reserve_result(parse_memory)?;
-                let tokens = super::super::lexer::lex(&source).map_err(|error| {
-                    format!(
-                        "{} at line {}, column {}",
-                        error.message, error.span.line, error.span.column
-                    )
-                })?;
-                let program = super::super::parser::parse(tokens).map_err(|error| {
-                    format!(
-                        "{} at line {}, column {}",
-                        error.message, error.span.line, error.span.column
-                    )
-                })?;
+                let program = self.parse_dynamic_source("exec", &arguments[0])?;
                 let code = super::super::compiler::compile(program);
                 match self.execute_code(&code) {
                     Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
@@ -756,6 +768,32 @@ impl Vm<'_> {
                     ) => Err("exec source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in exec source at line {}, column {}",
+                        span.line, span.column
+                    )),
+                }
+            }
+            Builtin::Eval => {
+                expect_arity(&arguments, 1, 1)?;
+                let mut program = self.parse_dynamic_source("eval", &arguments[0])?;
+                let expression = match program.statements.pop() {
+                    Some(Statement {
+                        kind: StatementKind::Expression(expression),
+                        ..
+                    }) if program.statements.is_empty() => expression,
+                    _ => return Err(self.raise_exception("SyntaxError", "invalid syntax")),
+                };
+                let code = super::super::compiler::compile_expression(expression);
+                match self.execute_code(&code) {
+                    Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
+                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
+                    Ok(
+                        Execution::Halt
+                        | Execution::Pending
+                        | Execution::Blocked(_)
+                        | Execution::Yield(_, _),
+                    ) => Err("eval source did not finish normally".into()),
+                    Err((error, span)) => Err(format!(
+                        "{error} in eval source at line {}, column {}",
                         span.line, span.column
                     )),
                 }
