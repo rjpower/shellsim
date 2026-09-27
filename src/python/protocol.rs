@@ -1008,12 +1008,23 @@ fn is_printable(character: char) -> bool {
         ))
 }
 
+/// CPython's bytes repr: single quotes unless the value contains `'` but no `"`, escaping only
+/// the chosen quote.
 fn quote_bytes(value: &[u8]) -> String {
-    let mut rendered = String::from("b'");
+    let quote = if value.contains(&b'\'') && !value.contains(&b'"') {
+        b'"'
+    } else {
+        b'\''
+    };
+    let mut rendered = String::from("b");
+    rendered.push(char::from(quote));
     for byte in value {
         match byte {
             b'\\' => rendered.push_str("\\\\"),
-            b'\'' => rendered.push_str("\\'"),
+            byte if *byte == quote => {
+                rendered.push('\\');
+                rendered.push(char::from(quote));
+            }
             b'\n' => rendered.push_str("\\n"),
             b'\r' => rendered.push_str("\\r"),
             b'\t' => rendered.push_str("\\t"),
@@ -1021,7 +1032,7 @@ fn quote_bytes(value: &[u8]) -> String {
             _ => rendered.push_str(&format!("\\x{byte:02x}")),
         }
     }
-    rendered.push('\'');
+    rendered.push(char::from(quote));
     rendered
 }
 
@@ -1029,6 +1040,13 @@ fn quote_bytes(value: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::resources::{Limits, Resources};
+
+    #[test]
+    fn bytes_repr_switches_quotes_like_cpython() {
+        assert_eq!(quote_bytes(b"it's"), r#"b"it's""#);
+        assert_eq!(quote_bytes(br#"it's "x""#), r#"b'it\'s "x"'"#);
+        assert_eq!(quote_bytes(b"\"\\\n\x00"), r#"b'"\\\n\x00'"#);
+    }
 
     #[test]
     fn dict_and_set_equality_are_order_independent() {
