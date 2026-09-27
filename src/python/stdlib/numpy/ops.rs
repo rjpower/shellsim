@@ -146,73 +146,22 @@ pub(in crate::python) trait Real: Numeric {
     fn zip(self, other: Self, double: fn(f64, f64) -> f64, single: fn(f32, f32) -> f32) -> Self;
 }
 
-/// NumPy's pairwise summation (`pairwise_sum` in `loops_utils.h.src`). Runs shorter than 8
-/// add in order from `-0.0`; runs up to 128 use eight interleaved accumulators; longer runs split
-/// in half at a multiple of 8. Rounding error grows with `log n` instead of `n`, and matching the
-/// blocking exactly makes sums agree with NumPy bit for bit.
+/// The sum of `values` with rounding error that grows like `log n` rather than `n`, as NumPy's
+/// floating-point `add` reductions have. An empty slice sums to `-0.0`.
 pub(in crate::python) fn pairwise_sum<F>(values: &[F]) -> F
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    let n = values.len();
-    if n < 8 {
-        return values.iter().fold(F::from(-0.0), |sum, value| sum + *value);
-    }
-    if n <= PAIRWISE_BLOCK {
-        let mut partial: [F; 8] = values[..8].try_into().expect("eight values");
-        let whole = n - n % 8;
-        for block in values[8..whole].chunks_exact(8) {
-            for (sum, value) in partial.iter_mut().zip(block) {
-                *sum = *sum + *value;
-            }
-        }
-        let [a, b, c, d, e, f, g, h] = partial;
-        let sum = ((a + b) + (c + d)) + ((e + f) + (g + h));
-        return values[whole..].iter().fold(sum, |sum, value| sum + *value);
-    }
-    let half = n / 2 - (n / 2) % 8;
-    pairwise_sum(&values[..half]) + pairwise_sum(&values[half..])
+    todo!("clean-room rewrite: {}", values.len())
 }
 
-/// [`pairwise_sum`] for complex values. NumPy sums the interleaved real and imaginary parts as
-/// one run of scalars, so its blocks hold four complex values and it splits at a multiple of
-/// four.
+/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`.
 pub(in crate::python) fn pairwise_complex_sum<F>(values: &[Complex<F>]) -> (F, F)
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    let n = values.len();
-    let zero = F::from(-0.0);
-    if n < 4 {
-        return values.iter().fold((zero, zero), |(re, im), value| {
-            (re + value.re, im + value.im)
-        });
-    }
-    if n <= PAIRWISE_BLOCK / 2 {
-        let mut partial = [values[0], values[1], values[2], values[3]];
-        let whole = n - n % 4;
-        for block in values[4..whole].chunks_exact(4) {
-            for (sum, value) in partial.iter_mut().zip(block) {
-                sum.re = sum.re + value.re;
-                sum.im = sum.im + value.im;
-            }
-        }
-        let [a, b, c, d] = partial;
-        let sum = ((a.re + b.re) + (c.re + d.re), (a.im + b.im) + (c.im + d.im));
-        return values[whole..]
-            .iter()
-            .fold(sum, |(re, im), value| (re + value.re, im + value.im));
-    }
-    let half = (n - n % 8) / 2;
-    let (left, right) = (
-        pairwise_complex_sum(&values[..half]),
-        pairwise_complex_sum(&values[half..]),
-    );
-    (left.0 + right.0, left.1 + right.1)
+    todo!("clean-room rewrite: {}", values.len())
 }
-
-/// Longest run [`pairwise_sum`] adds without splitting (`PW_BLOCKSIZE`).
-const PAIRWISE_BLOCK: usize = 128;
 
 /// [`float_flags`] for a result computed from many inputs.
 fn lane_flags(result: f64, inputs: impl Iterator<Item = f64> + Clone, flags: &mut FpFlags) {
@@ -810,96 +759,20 @@ impl ComplexParts for C128 {
     }
 }
 
-/// Complex division as NumPy's `divide` loop computes it: Smith's algorithm, multiplying by the
-/// reciprocal of the denominator rather than dividing by it. NumPy's `power` divides by the same
-/// formula for negative integer exponents.
+/// `a / b` for complex values, as `np.divide` gives it for `complex128`.
 pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    let ((ar, ai), (br, bi)) = (a, b);
-    if br.abs() >= bi.abs() {
-        if br == 0.0 && bi == 0.0 {
-            return (ar / br.abs(), ai / br.abs());
-        }
-        let ratio = bi / br;
-        let scale = 1.0 / (br + bi * ratio);
-        ((ar + ai * ratio) * scale, (ai - ar * ratio) * scale)
-    } else {
-        let ratio = br / bi;
-        let scale = 1.0 / (bi + br * ratio);
-        ((ar * ratio + ai) * scale, (ai * ratio - ar) * scale)
-    }
+    todo!("clean-room rewrite: {a:?} / {b:?}")
 }
 
-/// NumPy's complex `reciprocal` loop: Smith's division of one by `a`, arranged so that the
-/// imaginary part is a negated quotient, which signs zeros differently from `1 / a` (`1 / (2+0j)`
-/// is `0.5-0j`). Each step raises the flags the C loop's operations would, so an intermediate
-/// overflow is reported even when the result is finite.
+/// `np.reciprocal` of a complex value, raising the floating-point flags NumPy reports for it.
 pub(in crate::python) fn complex_reciprocal(a: (f64, f64), flags: &mut FpFlags) -> (f64, f64) {
-    let (real, imag) = a;
-    let (small, large) = if imag.abs() <= real.abs() {
-        (imag, real)
-    } else {
-        (real, imag)
-    };
-    let ratio = small / large;
-    float_flags(ratio, &[small, large], flags);
-    let product = small * ratio;
-    float_flags(product, &[small, ratio], flags);
-    let denominator = large + product;
-    float_flags(denominator, &[large, product], flags);
-    let (first, second) = if imag.abs() <= real.abs() {
-        (1.0, -ratio)
-    } else {
-        (ratio, -1.0)
-    };
-    let parts = (first / denominator, second / denominator);
-    float_flags(parts.0, &[first, denominator], flags);
-    float_flags(parts.1, &[second, denominator], flags);
-    parts
+    let _ = flags;
+    todo!("clean-room rewrite: 1 / {a:?}")
 }
 
-/// `a ** b` for complex values, as NumPy's `nc_pow` computes it: integer exponents below 100 in
-/// magnitude by repeated multiplication, with the exponents 1, 2 and 3 unrolled so that they keep
-/// the sign of a zero part (`(1-0j) ** 2` is `1-0j`).
+/// `a ** b` for complex values, as `np.power` gives it for `complex128`.
 pub(in crate::python) fn complex_power(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
-    if b == (0.0, 0.0) {
-        return (1.0, 0.0);
-    }
-    if a == (0.0, 0.0) {
-        return if b.0 > 0.0 && b.1 == 0.0 {
-            (0.0, 0.0)
-        } else {
-            (f64::NAN, f64::NAN)
-        };
-    }
-    if b.1 == 0.0 && b.0.fract() == 0.0 && b.0.abs() < 100.0 {
-        match b.0 {
-            1.0 => return a,
-            2.0 => return complex_multiply(a, a),
-            3.0 => return complex_multiply(a, complex_multiply(a, a)),
-            _ => {}
-        }
-        let mut result = (1.0, 0.0);
-        let mut base = a;
-        let mut exponent = b.0.abs() as u32;
-        while exponent > 0 {
-            if exponent & 1 == 1 {
-                result = complex_multiply(result, base);
-            }
-            base = complex_multiply(base, base);
-            exponent >>= 1;
-        }
-        return if b.0 < 0.0 {
-            complex_divide((1.0, 0.0), result)
-        } else {
-            result
-        };
-    }
-    let magnitude = a.0.hypot(a.1);
-    let angle = a.1.atan2(a.0);
-    let log_magnitude = magnitude.ln();
-    let real = (b.0 * log_magnitude - b.1 * angle).exp();
-    let phase = b.1 * log_magnitude + b.0 * angle;
-    (real * phase.cos(), real * phase.sin())
+    todo!("clean-room rewrite: {a:?} ** {b:?}")
 }
 
 pub(in crate::python) fn complex_multiply(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {

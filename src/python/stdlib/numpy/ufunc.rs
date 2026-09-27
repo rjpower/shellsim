@@ -2326,93 +2326,9 @@ fn complex_fn(op: FloatOp) -> Option<ComplexFn> {
     })
 }
 
-/// The principal square root, rounded as the C library's `csqrt` that NumPy calls on Linux
-/// rounds it: the larger part from `sqrt((|re| + |x|) / 2)` and the smaller from
-/// `2 re im = Im x` (CACM Algorithm 312), C99 Annex G's special values, and scaling by powers of
-/// two near the ends of the exponent range.
+/// `np.sqrt` of a complex value: the principal square root.
 fn complex_sqrt((re, im): (f64, f64)) -> (f64, f64) {
-    const MIN: f64 = f64::MIN_POSITIVE;
-    if !re.is_finite() || !im.is_finite() {
-        return if im.is_infinite() {
-            (f64::INFINITY, im)
-        } else if re == f64::NEG_INFINITY {
-            let real = if im.is_nan() { f64::NAN } else { 0.0 };
-            (real, f64::INFINITY.copysign(im))
-        } else if re == f64::INFINITY {
-            (
-                re,
-                if im.is_nan() {
-                    f64::NAN
-                } else {
-                    0.0f64.copysign(im)
-                },
-            )
-        } else {
-            (f64::NAN, f64::NAN)
-        };
-    }
-    if im == 0.0 {
-        return if re < 0.0 {
-            (0.0, (-re).sqrt().copysign(im))
-        } else {
-            (re.sqrt().abs(), 0.0f64.copysign(im))
-        };
-    }
-    if re == 0.0 {
-        let root = if im.abs() >= 2.0 * MIN {
-            (0.5 * im.abs()).sqrt()
-        } else {
-            0.5 * (2.0 * im.abs()).sqrt()
-        };
-        return (root, root.copysign(im));
-    }
-    let (mut x, mut y, mut scale) = (re, im, 0i32);
-    if x.abs() > f64::MAX / 4.0 {
-        scale = 1;
-        (x, y) = (scale_by(x, -2), scale_by(y, -2));
-    } else if y.abs() > f64::MAX / 4.0 {
-        scale = 1;
-        x = if x.abs() >= 4.0 * MIN {
-            scale_by(x, -2)
-        } else {
-            0.0
-        };
-        y = scale_by(y, -2);
-    } else if x.abs() < 2.0 * MIN && y.abs() < 2.0 * MIN {
-        // Half of one more than the 53 bits of the significand.
-        scale = -27;
-        (x, y) = (scale_by(x, 54), scale_by(y, 54));
-    }
-    let d = x.hypot(y);
-    let (mut r, mut s);
-    if x > 0.0 {
-        r = (0.5 * (d + x)).sqrt();
-        if scale == 1 && y.abs() < 1.0 {
-            s = y / r;
-            r = scale_by(r, scale);
-            scale = 0;
-        } else {
-            s = 0.5 * (y / r);
-        }
-    } else {
-        s = (0.5 * (d - x)).sqrt();
-        if scale == 1 && y.abs() < 1.0 {
-            r = (y / s).abs();
-            s = scale_by(s, scale);
-            scale = 0;
-        } else {
-            r = (0.5 * (y / s)).abs();
-        }
-    }
-    if scale != 0 {
-        (r, s) = (scale_by(r, scale), scale_by(s, scale));
-    }
-    (r, s.copysign(im))
-}
-
-/// `scalbn`: `value × 2^exponent`, exact unless the result leaves the normal range.
-fn scale_by(value: f64, exponent: i32) -> f64 {
-    value * 2f64.powi(exponent)
+    todo!("clean-room rewrite: sqrt({re}, {im})")
 }
 
 fn predicate(op: PredicateOp, value: super::element::Number) -> bool {
@@ -2676,10 +2592,7 @@ operator_slots! {
     slot_right_shift, slot_reflected_right_shift => "right_shift";
 }
 
-/// `a ** b` for an array `a`. NumPy's `array_power` first tries `fast_scalar_power`, which
-/// applies `reciprocal`, `square` or `sqrt` to a float or complex array when `b` is exactly the
-/// Python int -1 or 2 or the Python float 0.5. Those ufuncs sign zeros and treat infinities
-/// differently from `power`: `np.array([-0.0]) ** 0.5` is `-0.0` where `np.power` gives `0.0`.
+/// `a ** b` for an array `a`.
 pub(in crate::python) fn slot_power(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
@@ -2711,32 +2624,14 @@ pub(in crate::python) fn slot_reflected_power(
     .map(Some)
 }
 
-/// The unary ufunc `fast_scalar_power` substitutes for `base ** exponent`, if any. NumPy
-/// scalars take scalar math instead, and `bool` and `float` subclasses are not exact.
+/// The unary ufunc NumPy applies instead of `power` for `base ** exponent`, if any.
 fn fast_power(
     runtime: &mut dyn PyRuntime,
     base: PyValue,
     exponent: PyValue,
 ) -> PyResult<Option<&'static str>> {
-    if super::scalar::unbox(runtime, &base).is_some() {
-        return Ok(None);
-    }
-    let Ok(array) = Array::from_value(runtime, base) else {
-        return Ok(None);
-    };
-    if !array.dtype.is_inexact() {
-        return Ok(None);
-    }
-    let name = match runtime.type_name(&exponent)?.as_str() {
-        "int" => match runtime.int_value(&exponent) {
-            Some(-1) => "reciprocal",
-            Some(2) => "square",
-            _ => return Ok(None),
-        },
-        "float" if exponent.float_value() == Some(0.5) => "sqrt",
-        _ => return Ok(None),
-    };
-    Ok(Some(name))
+    let _ = (runtime, base, exponent);
+    todo!("clean-room rewrite")
 }
 
 macro_rules! comparison_slots {
