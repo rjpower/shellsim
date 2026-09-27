@@ -10,6 +10,18 @@ use super::{
 use num_traits::{Signed, Zero};
 
 impl Vm<'_> {
+    /// The builtin `abs(value)`, through the `__abs__` slot.
+    pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
+        if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
+            return Ok(result);
+        }
+        let message = format!(
+            "bad operand type for abs(): '{}'",
+            self.type_name_of(&value)?
+        );
+        Err(self.raise_exception("TypeError", message))
+    }
+
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
         let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
@@ -1109,16 +1121,7 @@ impl Vm<'_> {
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                let Some(value) =
-                    self.invoke_slot(&arguments[0], Slot::Absolute, "__abs__", Vec::new())?
-                else {
-                    let message = format!(
-                        "bad operand type for abs(): '{}'",
-                        self.type_name_of(&arguments[0])?
-                    );
-                    return Err(self.raise_exception("TypeError", message));
-                };
-                Ok(CallResult::Value(value))
+                Ok(CallResult::Value(self.absolute(arguments[0])?))
             }
             Builtin::Power => {
                 expect_arity(&arguments, 2, 3)?;

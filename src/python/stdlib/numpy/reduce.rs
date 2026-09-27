@@ -697,19 +697,14 @@ fn reduce_objects(
     Ok(PyArrayBuffer::Values(output))
 }
 
-/// One step of an `object` reduction or accumulation. Logical ufuncs return an operand, as
-/// Python's `and` and `or` do.
+/// One step of an `object` reduction or accumulation.
 fn object_operation(
     runtime: &mut dyn PyRuntime,
     ufunc: &UfuncDef,
     left: PyValue,
     right: PyValue,
 ) -> PyResult {
-    match ufunc.family {
-        Family::Logical(LogicalOp::And) => Ok(if runtime.truth(&left)? { right } else { left }),
-        Family::Logical(LogicalOp::Or) => Ok(if runtime.truth(&left)? { left } else { right }),
-        _ => ufunc::object_element(runtime, ufunc, &[left, right]),
-    }
+    ufunc::object_element(runtime, ufunc, &[left, right])
 }
 
 /// Accumulate `array` along `axis` with binary ufunc `index`: element `i` of the result

@@ -405,6 +405,8 @@ pub(super) enum PyOperator {
     Unary(super::ast::UnaryOperator),
     Binary(super::ast::BinaryOperator),
     Compare(super::ast::ComparisonOperator),
+    /// The builtin `abs()`.
+    Absolute,
 }
 
 /// Interpreter-owned marker values exported by compatibility modules.

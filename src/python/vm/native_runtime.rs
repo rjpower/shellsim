@@ -1781,6 +1781,7 @@ impl PyRuntime for Vm<'_> {
                 self.stack.push(*right);
                 self.compare(operator).and_then(|()| self.pop())
             }
+            (PyOperator::Absolute, [operand]) => self.absolute(*operand),
             _ => return Err(PyError::runtime_error("operator received the wrong arity")),
         };
         result.map_err(|message| {

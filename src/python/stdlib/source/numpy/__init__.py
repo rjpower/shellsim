@@ -3,7 +3,8 @@
 Arrays, dtypes, ufuncs and most functions are native and live in the ``_numpy*`` modules; this
 package re-exports them and adds the parts written in Python: floating-point error state,
 ``flatiter``, ``ndarray.flags``, order statistics, histograms, set operations, and the
-``linalg``, ``fft``, ``random``, ``testing`` and ``exceptions`` submodules. The behavior targets NumPy 2.5.
+``linalg``, ``fft``, ``random``, ``strings``, ``testing`` and ``exceptions`` submodules. The
+behavior targets NumPy 2.5.
 """
 
 from _numpy import *
@@ -217,4 +218,5 @@ import numpy.linalg as linalg
 import numpy.fft as fft
 from numpy._arraypad import pad
 import numpy.random as random
+import numpy.strings as strings
 import numpy.testing as testing

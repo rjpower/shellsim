@@ -598,14 +598,15 @@ pub(in crate::python) fn cast_array(
     target: DType,
     copy: bool,
 ) -> PyResult<Array> {
-    let target =
-        if target.kind() == Kind::Str && target.chars() == 0 && array.dtype.kind() != Kind::Str {
-            DType::str(dtype::str_width_for(array.dtype).max(1))?
-        } else if target.kind() == Kind::Str && target.chars() == 0 {
-            array.dtype
-        } else {
-            target
-        };
+    let target = if target.kind() == Kind::Str && target.chars() == 0 {
+        match array.dtype.kind() {
+            Kind::Str => array.dtype,
+            Kind::Object => DType::str(object_str_width(runtime, array)?.max(1))?,
+            _ => DType::str(dtype::str_width_for(array.dtype).max(1))?,
+        }
+    } else {
+        target
+    };
     if target == array.dtype {
         return if copy {
             super::array::copy_array(runtime, array)
@@ -615,6 +616,16 @@ pub(in crate::python) fn cast_array(
     }
     let buffer = cast_buffer(runtime, array, target)?;
     new_array(runtime, buffer, target, array.shape().to_vec())
+}
+
+/// The longest `str()` of an `object` array's elements, which sizes an unsized `str` cast as
+/// NumPy's string discovery does.
+fn object_str_width(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<usize> {
+    let mut widest = 0;
+    for value in super::array::read_objects(runtime, array)? {
+        widest = widest.max(runtime.display(&value)?.chars().count());
+    }
+    Ok(widest)
 }
 
 /// Convert every element of `array`, in C order, into new storage of `target`.

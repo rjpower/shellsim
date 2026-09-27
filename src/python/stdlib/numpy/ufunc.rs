@@ -22,8 +22,8 @@ use std::cmp::Ordering;
 
 use super::super::super::ast::{BinaryOperator, ComparisonOperator, UnaryOperator};
 use super::super::super::native::{
-    CallArgs, GetterDef, MethodDef, PyArrayBuffer, PyArrayData, PyError, PyKind, PyOperator,
-    PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, MethodDef, PyArrayBuffer, PyArrayData, PyError, PyErrorKind, PyKind,
+    PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
 use super::super::super::Value;
 use super::array::{
@@ -183,12 +183,42 @@ pub(in crate::python) enum Family {
     Predicate(PredicateOp),
 }
 
+/// How a ufunc treats `object` elements. NumPy's `O` loops apply a Python operation, and its
+/// `P` loops call the element's method named after the ufunc.
+#[derive(Clone, Copy)]
+pub(in crate::python) enum ObjectLoop {
+    /// No object loop, so resolution rejects `object` operands.
+    Missing,
+    /// A Python operator or `abs()`, as `PyNumber_Add` or `PyNumber_Absolute` apply it.
+    Operator(PyOperator),
+    /// `x * x` (`Py_square`).
+    Square,
+    /// `1 / x` (`Py_reciprocal`).
+    Reciprocal,
+    /// The first operand if it compares `>=` to the second, else the second
+    /// (`npy_ObjectMax`).
+    Max,
+    /// The first operand if it compares `<=` to the second, else the second.
+    Min,
+    /// Python's `and`, which returns one of its operands.
+    And,
+    /// Python's `or`.
+    Or,
+    /// `not x`, as a `bool` object.
+    Not,
+    /// `-1`, `1` or `0` by comparison with `0`.
+    Sign,
+    /// A `math` module function, as `npy_ObjectFloor` calls `math.floor`.
+    Math(&'static str),
+    /// `x.name()` or `x.name(y)`, for the ufunc's `name`.
+    Method,
+}
+
 /// Static description of one ufunc.
 pub(in crate::python) struct UfuncDef {
     pub name: &'static str,
     pub family: Family,
-    /// Python operator applied per element for `object` arrays.
-    pub object: Option<PyOperator>,
+    pub object: ObjectLoop,
 }
 
 impl UfuncDef {
@@ -216,7 +246,7 @@ const fn arith(
     op: ArithOp,
     bools: BoolLoop,
     complex: bool,
-    object: Option<PyOperator>,
+    object: ObjectLoop,
 ) -> UfuncDef {
     UfuncDef {
         name,
@@ -225,23 +255,28 @@ const fn arith(
     }
 }
 
-const fn binary_operator(operator: BinaryOperator) -> Option<PyOperator> {
-    Some(PyOperator::Binary(operator))
+const fn binary_operator(operator: BinaryOperator) -> ObjectLoop {
+    ObjectLoop::Operator(PyOperator::Binary(operator))
+}
+
+const fn unary_operator(operator: UnaryOperator) -> ObjectLoop {
+    ObjectLoop::Operator(PyOperator::Unary(operator))
 }
 
 const fn compare(name: &'static str, op: CompareOp, operator: ComparisonOperator) -> UfuncDef {
     UfuncDef {
         name,
         family: Family::Compare(op),
-        object: Some(PyOperator::Compare(operator)),
+        object: ObjectLoop::Operator(PyOperator::Compare(operator)),
     }
 }
 
+/// A floating-point function; like NumPy's, its object loop calls the element's method.
 const fn float(name: &'static str, op: FloatOp, complex: bool) -> UfuncDef {
     UfuncDef {
         name,
         family: Family::Float { op, complex },
-        object: None,
+        object: ObjectLoop::Method,
     }
 }
 
@@ -250,7 +285,7 @@ const fn unary_def(
     op: UnaryOp,
     bools: BoolLoop,
     complex: bool,
-    object: Option<PyOperator>,
+    object: ObjectLoop,
 ) -> UfuncDef {
     UfuncDef {
         name,
@@ -259,7 +294,7 @@ const fn unary_def(
     }
 }
 
-const fn simple(name: &'static str, family: Family, object: Option<PyOperator>) -> UfuncDef {
+const fn simple(name: &'static str, family: Family, object: ObjectLoop) -> UfuncDef {
     UfuncDef {
         name,
         family,
@@ -309,7 +344,13 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         false,
         binary_operator(BinaryOperator::Remainder),
     ),
-    arith("fmod", ArithOp::Fmod, BoolLoop::Int8, false, None),
+    arith(
+        "fmod",
+        ArithOp::Fmod,
+        BoolLoop::Int8,
+        false,
+        ObjectLoop::Method,
+    ),
     arith(
         "power",
         ArithOp::Power,
@@ -317,10 +358,22 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         true,
         binary_operator(BinaryOperator::Power),
     ),
-    arith("maximum", ArithOp::Maximum, BoolLoop::Keep, true, None),
-    arith("minimum", ArithOp::Minimum, BoolLoop::Keep, true, None),
-    arith("fmax", ArithOp::Fmax, BoolLoop::Keep, true, None),
-    arith("fmin", ArithOp::Fmin, BoolLoop::Keep, true, None),
+    arith(
+        "maximum",
+        ArithOp::Maximum,
+        BoolLoop::Keep,
+        true,
+        ObjectLoop::Max,
+    ),
+    arith(
+        "minimum",
+        ArithOp::Minimum,
+        BoolLoop::Keep,
+        true,
+        ObjectLoop::Min,
+    ),
+    arith("fmax", ArithOp::Fmax, BoolLoop::Keep, true, ObjectLoop::Max),
+    arith("fmin", ArithOp::Fmin, BoolLoop::Keep, true, ObjectLoop::Min),
     compare("equal", CompareOp::Equal, ComparisonOperator::Equal),
     compare(
         "not_equal",
@@ -339,9 +392,17 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         CompareOp::GreaterEqual,
         ComparisonOperator::GreaterEqual,
     ),
-    simple("logical_and", Family::Logical(LogicalOp::And), None),
-    simple("logical_or", Family::Logical(LogicalOp::Or), None),
-    simple("logical_xor", Family::Logical(LogicalOp::Xor), None),
+    simple(
+        "logical_and",
+        Family::Logical(LogicalOp::And),
+        ObjectLoop::And,
+    ),
+    simple("logical_or", Family::Logical(LogicalOp::Or), ObjectLoop::Or),
+    simple(
+        "logical_xor",
+        Family::Logical(LogicalOp::Xor),
+        ObjectLoop::Method,
+    ),
     simple(
         "bitwise_and",
         Family::Bitwise(BitOp::And),
@@ -367,46 +428,108 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         Family::Bitwise(BitOp::RightShift),
         binary_operator(BinaryOperator::RightShift),
     ),
-    simple("arctan2", Family::Float2(Float2Op::Arctan2), None),
-    simple("hypot", Family::Float2(Float2Op::Hypot), None),
-    simple("copysign", Family::Float2(Float2Op::Copysign), None),
-    simple("logaddexp", Family::Float2(Float2Op::Logaddexp), None),
-    simple("logaddexp2", Family::Float2(Float2Op::Logaddexp2), None),
-    simple("heaviside", Family::Float2(Float2Op::Heaviside), None),
+    simple(
+        "arctan2",
+        Family::Float2(Float2Op::Arctan2),
+        ObjectLoop::Method,
+    ),
+    simple("hypot", Family::Float2(Float2Op::Hypot), ObjectLoop::Method),
+    simple(
+        "copysign",
+        Family::Float2(Float2Op::Copysign),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "logaddexp",
+        Family::Float2(Float2Op::Logaddexp),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "logaddexp2",
+        Family::Float2(Float2Op::Logaddexp2),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "heaviside",
+        Family::Float2(Float2Op::Heaviside),
+        ObjectLoop::Missing,
+    ),
     unary_def(
         "negative",
         UnaryOp::Negative,
         BoolLoop::Reject(BOOL_NEGATIVE),
         true,
-        Some(PyOperator::Unary(UnaryOperator::Negative)),
+        unary_operator(UnaryOperator::Negative),
     ),
     unary_def(
         "positive",
         UnaryOp::Positive,
         BoolLoop::Missing,
         true,
-        Some(PyOperator::Unary(UnaryOperator::Positive)),
+        unary_operator(UnaryOperator::Positive),
     ),
-    unary_def("absolute", UnaryOp::Absolute, BoolLoop::Keep, true, None),
-    unary_def("square", UnaryOp::Square, BoolLoop::Int8, true, None),
+    unary_def(
+        "absolute",
+        UnaryOp::Absolute,
+        BoolLoop::Keep,
+        true,
+        ObjectLoop::Operator(PyOperator::Absolute),
+    ),
+    unary_def(
+        "square",
+        UnaryOp::Square,
+        BoolLoop::Int8,
+        true,
+        ObjectLoop::Square,
+    ),
     unary_def(
         "reciprocal",
         UnaryOp::Reciprocal,
         BoolLoop::Int8,
         true,
-        None,
+        ObjectLoop::Reciprocal,
     ),
-    unary_def("sign", UnaryOp::Sign, BoolLoop::Missing, true, None),
-    unary_def("conjugate", UnaryOp::Conjugate, BoolLoop::Int8, true, None),
-    unary_def("floor", UnaryOp::Floor, BoolLoop::Keep, false, None),
-    unary_def("ceil", UnaryOp::Ceil, BoolLoop::Keep, false, None),
-    unary_def("trunc", UnaryOp::Trunc, BoolLoop::Keep, false, None),
+    unary_def(
+        "sign",
+        UnaryOp::Sign,
+        BoolLoop::Missing,
+        true,
+        ObjectLoop::Sign,
+    ),
+    unary_def(
+        "conjugate",
+        UnaryOp::Conjugate,
+        BoolLoop::Int8,
+        true,
+        ObjectLoop::Method,
+    ),
+    unary_def(
+        "floor",
+        UnaryOp::Floor,
+        BoolLoop::Keep,
+        false,
+        ObjectLoop::Math("floor"),
+    ),
+    unary_def(
+        "ceil",
+        UnaryOp::Ceil,
+        BoolLoop::Keep,
+        false,
+        ObjectLoop::Math("ceil"),
+    ),
+    unary_def(
+        "trunc",
+        UnaryOp::Trunc,
+        BoolLoop::Keep,
+        false,
+        ObjectLoop::Math("trunc"),
+    ),
     simple(
         "invert",
         Family::Invert,
-        Some(PyOperator::Unary(UnaryOperator::Invert)),
+        unary_operator(UnaryOperator::Invert),
     ),
-    simple("logical_not", Family::LogicalNot, None),
+    simple("logical_not", Family::LogicalNot, ObjectLoop::Not),
     float("sqrt", FloatOp::Sqrt, true),
     float("cbrt", FloatOp::Cbrt, false),
     float("exp", FloatOp::Exp, true),
@@ -432,10 +555,26 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
     float("rad2deg", FloatOp::Rad2deg, false),
     float("rint", FloatOp::Rint, false),
     float("fabs", FloatOp::Fabs, false),
-    simple("isnan", Family::Predicate(PredicateOp::IsNan), None),
-    simple("isinf", Family::Predicate(PredicateOp::IsInf), None),
-    simple("isfinite", Family::Predicate(PredicateOp::IsFinite), None),
-    simple("signbit", Family::Predicate(PredicateOp::Signbit), None),
+    simple(
+        "isnan",
+        Family::Predicate(PredicateOp::IsNan),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "isinf",
+        Family::Predicate(PredicateOp::IsInf),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "isfinite",
+        Family::Predicate(PredicateOp::IsFinite),
+        ObjectLoop::Missing,
+    ),
+    simple(
+        "signbit",
+        Family::Predicate(PredicateOp::Signbit),
+        ObjectLoop::Missing,
+    ),
 ];
 
 /// Module-level aliases NumPy exports for some ufuncs.
@@ -901,14 +1040,81 @@ fn class_name(dtype: DType) -> String {
     }
 }
 
+/// NumPy's error for a ufunc that mixes `str` with numbers, which share no loop. Comparisons
+/// name the operands' DType classes, since their promoter fails before a loop is chosen;
+/// arithmetic names concrete dtypes; and `multiply` by an integer points to `numpy.strings`.
+fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
+    let kind = |operand: &Operand| operand.dtype().map(DType::kind);
+    let strings = operands
+        .iter()
+        .filter(|operand| kind(operand) == Some(Kind::Str))
+        .count();
+    let objects = operands
+        .iter()
+        .any(|operand| kind(operand) == Some(Kind::Object));
+    if strings == 0 || strings == operands.len() || objects {
+        return None;
+    }
+    let integer = |operand: &Operand| match operand {
+        Operand::Array(array) => array.dtype.is_integer(),
+        Operand::Weak { weak, .. } => *weak == Weak::Int,
+    };
+    let multiply = matches!(
+        ufunc.family,
+        Family::Arith {
+            op: ArithOp::Multiply,
+            ..
+        }
+    );
+    if multiply && operands.iter().any(integer) {
+        return Some(PyError::type_error(
+            "The 'out' kwarg is necessary when using the string multiply ufunc directly. Use \
+             numpy.strings.multiply to multiply strings without specifying 'out'.",
+        ));
+    }
+    if matches!(ufunc.family, Family::Compare(_)) {
+        let classes = operands
+            .iter()
+            .map(|operand| {
+                let class = match operand {
+                    Operand::Array(array) => format!("{}DType", class_name(array.dtype)),
+                    Operand::Weak { weak, .. } => match weak {
+                        Weak::Bool => "BoolDType",
+                        Weak::Int => "_PyLongDType",
+                        Weak::Float => "_PyFloatDType",
+                        Weak::Complex => "_PyComplexDType",
+                    }
+                    .to_string(),
+                };
+                format!("<class 'numpy.dtypes.{class}'>")
+            })
+            .collect::<Vec<_>>();
+        return Some(PyError::exception(
+            "UFuncTypeError",
+            format!(
+                "ufunc '{}' did not contain a loop with signature matching types ({}) -> None",
+                ufunc.name,
+                classes.join(", ")
+            ),
+        ));
+    }
+    let dtypes = operands
+        .iter()
+        .map(|operand| match operand {
+            Operand::Array(array) => array.dtype,
+            Operand::Weak { weak, .. } => weak.default_dtype(),
+        })
+        .collect::<Vec<_>>();
+    Some(no_loop(ufunc.name, &dtypes))
+}
+
+/// NumPy's type-resolver error when no loop accepts the inputs. It is a plain `TypeError`,
+/// unlike the `UFuncTypeError` subclasses that casting and loop lookup raise.
 fn not_supported(name: &str) -> PyError {
-    PyError::exception(
-        "UFuncTypeError",
-        format!(
-            "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
+    PyError::type_error(format!(
+        "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
          coerced to any supported types according to the casting rule ''safe''"
-        ),
-    )
+    ))
 }
 
 /// Loop and output dtypes chosen for one call.
@@ -931,16 +1137,11 @@ pub(in crate::python) fn resolve(
     };
     let object = common.kind() == Kind::Object;
     if object {
-        if ufunc.object.is_none()
-            && !matches!(ufunc.family, Family::Logical(_) | Family::LogicalNot)
-        {
-            return Err(PyError::type_error(format!(
-                "loop of ufunc does not support argument 0 of type object which has no callable \
-                 {name} method"
-            )));
+        if matches!(ufunc.object, ObjectLoop::Missing) {
+            return Err(not_supported(name));
         }
         let output = match ufunc.family {
-            Family::Compare(_) | Family::Logical(_) | Family::LogicalNot => DType::BOOL,
+            Family::Compare(_) => DType::BOOL,
             _ => DType::OBJECT,
         };
         return Ok(Resolved {
@@ -1109,6 +1310,9 @@ pub(in crate::python) fn evaluate(
         let (operand, scalar) = operand(runtime, *value)?;
         all_scalars &= scalar;
         operands.push(operand);
+    }
+    if let Some(error) = string_mix_error(ufunc, &operands) {
+        return Err(error);
     }
     let common = comparison_safe_common(ufunc, &operands)?;
     let input_dtypes = operands
@@ -1883,21 +2087,93 @@ pub(in crate::python) fn object_element(
     ufunc: &UfuncDef,
     operands: &[PyValue],
 ) -> PyResult {
-    match ufunc.family {
-        Family::Logical(op) => {
-            let (a, b) = (runtime.truth(&operands[0])?, runtime.truth(&operands[1])?);
-            Ok(Value::Bool(match op {
-                LogicalOp::And => a && b,
-                LogicalOp::Or => a || b,
-                LogicalOp::Xor => a != b,
-            }))
+    match ufunc.object {
+        ObjectLoop::Missing => Err(not_supported(ufunc.name)),
+        ObjectLoop::Operator(operator) => runtime.apply_operator(operator, operands),
+        ObjectLoop::Square => runtime.apply_operator(
+            PyOperator::Binary(BinaryOperator::Multiply),
+            &[operands[0], operands[0]],
+        ),
+        ObjectLoop::Reciprocal => runtime.apply_operator(
+            PyOperator::Binary(BinaryOperator::Divide),
+            &[Value::Int(1), operands[0]],
+        ),
+        ObjectLoop::Max | ObjectLoop::Min => {
+            let operator = if matches!(ufunc.object, ObjectLoop::Max) {
+                ComparisonOperator::GreaterEqual
+            } else {
+                ComparisonOperator::LessEqual
+            };
+            let keep_first = runtime.apply_operator(PyOperator::Compare(operator), operands)?;
+            Ok(if runtime.truth(&keep_first)? {
+                operands[0]
+            } else {
+                operands[1]
+            })
         }
-        Family::LogicalNot => Ok(Value::Bool(!runtime.truth(&operands[0])?)),
-        _ => {
-            let operator = ufunc.object.expect("resolve checks object support");
-            runtime.apply_operator(operator, operands)
+        ObjectLoop::And => Ok(if runtime.truth(&operands[0])? {
+            operands[1]
+        } else {
+            operands[0]
+        }),
+        ObjectLoop::Or => Ok(if runtime.truth(&operands[0])? {
+            operands[0]
+        } else {
+            operands[1]
+        }),
+        ObjectLoop::Not => Ok(Value::Bool(!runtime.truth(&operands[0])?)),
+        ObjectLoop::Sign => object_sign(runtime, operands[0]),
+        ObjectLoop::Math(function) => {
+            let math = runtime.import_module("math")?;
+            let function = runtime
+                .get_attribute(math, function)?
+                .ok_or_else(|| PyError::runtime_error(format!("math.{function} is missing")))?;
+            runtime.call_value(function, CallArgs::new(vec![operands[0]], Vec::new()))
+        }
+        ObjectLoop::Method => object_method(runtime, ufunc.name, operands),
+    }
+}
+
+/// NumPy's `OBJECT_sign`: `-1`, `1` or `0` by comparing with `0`, and a `TypeError` for a value
+/// such as NaN that compares false every way.
+fn object_sign(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    for (operator, sign) in [
+        (ComparisonOperator::Less, -1),
+        (ComparisonOperator::Greater, 1),
+        (ComparisonOperator::Equal, 0),
+    ] {
+        let test =
+            runtime.apply_operator(PyOperator::Compare(operator), &[value, Value::Int(0)])?;
+        if runtime.truth(&test)? {
+            return Ok(Value::Int(sign));
         }
     }
+    Err(PyError::type_error("unorderable types for comparison"))
+}
+
+/// A `P` loop: call the first operand's method `name` with the other operands. A unary loop
+/// reports a missing method as NumPy's `TypeError`; a binary one lets the `AttributeError`
+/// through, as `PyObject_CallMethod` does.
+fn object_method(runtime: &mut dyn PyRuntime, name: &str, operands: &[PyValue]) -> PyResult {
+    let receiver = operands[0];
+    let method = runtime.get_attribute(receiver, name)?;
+    let method = match method {
+        Some(method) if operands.len() > 1 || runtime.is_callable(&method)? => method,
+        _ => {
+            let type_name = runtime.type_name(&receiver)?;
+            if operands.len() > 1 {
+                return Err(PyError::exception(
+                    "AttributeError",
+                    format!("'{type_name}' object has no attribute '{name}'"),
+                ));
+            }
+            return Err(PyError::type_error(format!(
+                "loop of ufunc does not support argument 0 of type {type_name} which has no \
+                 callable {name} method"
+            )));
+        }
+    };
+    runtime.call_value(method, CallArgs::new(operands[1..].to_vec(), Vec::new()))
 }
 
 /// `str` loops: concatenation, comparison, and `maximum`/`minimum` by code point order.
@@ -2016,9 +2292,58 @@ macro_rules! comparison_slots {
     };
 }
 
+pub(in crate::python) fn slot_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    equality(runtime, left, right, "equal", false)
+}
+
+pub(in crate::python) fn slot_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    equality(runtime, left, right, "not_equal", true)
+}
+
+/// `==` and `!=` on arrays. When the operands share no comparison loop, such as a string array
+/// and a number, NumPy's `array_richcompare` answers "unequal" everywhere instead of raising;
+/// operands that do not broadcast still raise.
+fn equality(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    name: &str,
+    unequal: bool,
+) -> PyResult<Option<PyValue>> {
+    let error = match apply(runtime, named(name), &[left, right], &Options::operator()) {
+        Ok(value) => return Ok(Some(value)),
+        Err(error) => error,
+    };
+    if !matches!(
+        error.kind,
+        PyErrorKind::Exception("UFuncTypeError" | "DTypePromotionError")
+    ) {
+        return Err(error);
+    }
+    let (left, right) = (
+        convert::as_array(runtime, left)?,
+        convert::as_array(runtime, right)?,
+    );
+    let shape = broadcast_shapes(&[left.shape(), right.shape()])?;
+    let count = element_count(&shape)?;
+    reserve_elements(runtime, DType::BOOL, count)?;
+    let result =
+        super::array::array_from_elements(runtime, DType::BOOL, shape, &vec![unequal; count])?;
+    if result.ndim() == 0 {
+        return convert::element_to_scalar(runtime, &result, result.view.offset).map(Some);
+    }
+    Ok(Some(result.value()))
+}
+
 comparison_slots! {
-    slot_equal => "equal";
-    slot_not_equal => "not_equal";
     slot_less_than => "less";
     slot_less_equal => "less_equal";
     slot_greater_than => "greater";

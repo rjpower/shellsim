@@ -207,3 +207,40 @@ def test_numeric_conversions_use_dunder_methods_in_cpython_order():
         TypeError,
         "float() argument must be a string or a real number, not 'object'",
     )
+
+
+def test_string_affix_tests_accept_bounds_and_tuples():
+    assert "abc".startswith(("x", "b"), 1)
+    assert "abc".startswith("b", 1, 2)
+    assert "abc".startswith("", 3)
+    assert not "abc".startswith("", 4)
+    assert "abc".endswith("b", None, -1)
+    assert "abc".removeprefix("ab") == "c"
+    assert "abc".removesuffix("x") == "abc"
+
+
+def test_string_case_transforms_use_unicode_title_case():
+    assert "hello wORLD 3rd".title() == "Hello World 3Rd"
+    assert "\u01c6a \ufb01x \u00df".title() == "\u01c5a Fix Ss"
+    assert "\u03a3\u0391\u03a3 x".capitalize() == "\u03a3\u03b1\u03c2 x"
+    assert "aB\u00df".swapcase() == "AbSS"
+    assert "Ab Cd".istitle() and not "AB".istitle()
+
+
+def test_string_numeric_and_space_predicates_follow_python():
+    assert "\u0663".isdecimal() and not "\u00b2".isdecimal()
+    assert "\u00b2".isdigit() and not "\u00bd".isdigit()
+    assert "\u00bd\u4e00".isnumeric()
+    assert "\x1c \u3000".isspace() and not "".isspace()
+    assert "abc".isascii() and not "\u00e9".isascii()
+
+
+def test_string_expandtabs_and_translate():
+    assert "ab\tc\n\tx".expandtabs() == "ab      c\n        x"
+    assert "a\tb".expandtabs(tabsize=3) == "a  b"
+    assert "abc".translate({97: "xy", 98: None, 99: 66}) == "xyB"
+    assert "abc".translate([None] * 98 + ["X"]) == "Xc"
+
+
+def test_ascii_escapes_non_ascii_characters():
+    assert ascii("caf\u00e9 \u4e00 \U0001f600") == "'caf\\xe9 \\u4e00 \\U0001f600'"

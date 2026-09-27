@@ -108,17 +108,31 @@ pub(in crate::python) fn copy(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
     Ok(convert::array_from_python(runtime, bound.required("a"), None, true)?.value())
 }
 
+/// What a new array's elements start as.
+#[derive(Clone, Copy)]
+enum Fill {
+    /// Zero bytes, which `object` arrays read as `None`, as `np.empty` leaves them.
+    Empty,
+    /// Zero, which `object` arrays hold as the int `0`, as `np.zeros` fills them.
+    Zero,
+    Value(PyValue),
+}
+
 /// An array of `shape` whose every element is `fill`, already converted to `dtype` storage.
 fn filled(
     runtime: &mut dyn PyRuntime,
     shape: Vec<usize>,
     dtype: DType,
-    fill: Option<PyValue>,
+    fill: Fill,
 ) -> PyResult<Array> {
     let count = array::element_count(&shape)?;
-    let Some(fill) = fill else {
-        let buffer = array::zeroed_buffer(runtime, dtype, count)?;
-        return array::new_array(runtime, buffer, dtype, shape);
+    let fill = match fill {
+        Fill::Zero if dtype.kind() == Kind::Object => Value::Int(0),
+        Fill::Empty | Fill::Zero => {
+            let buffer = array::zeroed_buffer(runtime, dtype, count)?;
+            return array::new_array(runtime, buffer, dtype, shape);
+        }
+        Fill::Value(fill) => fill,
     };
     let element = if dtype.kind() == Kind::Object {
         let buffer = super::super::super::native::PyArrayBuffer::Values(vec![fill]);
@@ -136,7 +150,7 @@ fn shaped(
     runtime: &mut dyn PyRuntime,
     args: &CallArgs,
     name: &'static str,
-    fill: Option<PyValue>,
+    fill: Fill,
 ) -> PyResult {
     static ZEROS: Signature =
         Signature::new("zeros", &["shape", "dtype", "order"], 1).keyword_only(&["like", "device"]);
@@ -156,15 +170,15 @@ fn shaped(
 }
 
 pub(in crate::python) fn zeros(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    shaped(runtime, &args, "zeros", None)
+    shaped(runtime, &args, "zeros", Fill::Zero)
 }
 
 pub(in crate::python) fn empty(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    shaped(runtime, &args, "empty", None)
+    shaped(runtime, &args, "empty", Fill::Empty)
 }
 
 pub(in crate::python) fn ones(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    shaped(runtime, &args, "ones", Some(Value::Int(1)))
+    shaped(runtime, &args, "ones", Fill::Value(Value::Int(1)))
 }
 
 /// `np.full(shape, fill_value, dtype=None)`: the dtype defaults to the fill value's.
@@ -179,11 +193,11 @@ pub(in crate::python) fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
         Some(dtype) => dtype,
         None => convert::array_from_python(runtime, fill, None, false)?.dtype,
     };
-    Ok(filled(runtime, shape, dtype, Some(fill))?.value())
+    Ok(filled(runtime, shape, dtype, Fill::Value(fill))?.value())
 }
 
 /// The `*_like` constructors: dtype and shape come from the prototype unless overridden.
-fn like(runtime: &mut dyn PyRuntime, bound: &args::Bound, fill: Option<PyValue>) -> PyResult {
+fn like(runtime: &mut dyn PyRuntime, bound: &args::Bound, fill: Fill) -> PyResult {
     let prototype = convert::as_array(runtime, bound.required("a"))?;
     let dtype = args::optional_dtype(runtime, bound.value("dtype"))?.unwrap_or(prototype.dtype);
     let shape = match bound.value("shape") {
@@ -198,7 +212,7 @@ pub(in crate::python) fn zeros_like(runtime: &mut dyn PyRuntime, args: CallArgs)
         Signature::new("zeros_like", &["a", "dtype", "order", "subok", "shape"], 1)
             .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
-    like(runtime, &bound, None)
+    like(runtime, &bound, Fill::Zero)
 }
 
 pub(in crate::python) fn empty_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -215,7 +229,7 @@ pub(in crate::python) fn empty_like(runtime: &mut dyn PyRuntime, args: CallArgs)
         Some(shape) => args::shape(runtime, shape)?,
         None => prototype.shape().to_vec(),
     };
-    Ok(filled(runtime, shape, dtype, None)?.value())
+    Ok(filled(runtime, shape, dtype, Fill::Empty)?.value())
 }
 
 pub(in crate::python) fn ones_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -223,7 +237,7 @@ pub(in crate::python) fn ones_like(runtime: &mut dyn PyRuntime, args: CallArgs) 
         Signature::new("ones_like", &["a", "dtype", "order", "subok", "shape"], 1)
             .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
-    like(runtime, &bound, Some(Value::Int(1)))
+    like(runtime, &bound, Fill::Value(Value::Int(1)))
 }
 
 pub(in crate::python) fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -235,7 +249,7 @@ pub(in crate::python) fn full_like(runtime: &mut dyn PyRuntime, args: CallArgs) 
     .keyword_only(&["device"]);
     let bound = SIGNATURE.bind(&args)?;
     let fill = bound.required("fill_value");
-    like(runtime, &bound, Some(fill))
+    like(runtime, &bound, Fill::Value(fill))
 }
 
 /// A float or int argument of a range constructor.
@@ -300,7 +314,7 @@ pub(in crate::python) fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> 
     };
     array::reserve_elements(runtime, dtype, length)?;
     runtime.charge_cpu(length as u64 + 1)?;
-    let integral = inferred == DType::INT64 && dtype.is_integer();
+    let integral = inferred == DType::INT64 && (dtype.is_integer() || dtype.kind() == Kind::Object);
     let values = (0..length).map(|index| {
         if integral {
             Number::Int(start as i64 + index as i64 * step as i64)
@@ -311,13 +325,24 @@ pub(in crate::python) fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> 
     Ok(numbers_array(runtime, dtype, vec![length], values)?.value())
 }
 
-/// A new array from numbers, cast into `dtype`.
+/// A new array from numbers, cast into `dtype`. An `object` array holds them as Python
+/// numbers, as `np.arange(3, dtype=object)` holds ints.
 pub(in crate::python) fn numbers_array(
     runtime: &mut dyn PyRuntime,
     dtype: DType,
     shape: Vec<usize>,
     values: impl Iterator<Item = Number>,
 ) -> PyResult<Array> {
+    if dtype.kind() == Kind::Object {
+        let count = array::element_count(&shape)?;
+        array::reserve_elements(runtime, dtype, count)?;
+        let mut objects = Vec::with_capacity(count);
+        for value in values.take(count) {
+            objects.push(super::scalar::number_to_python(runtime, value)?);
+        }
+        let buffer = super::super::super::native::PyArrayBuffer::Values(objects);
+        return array::new_array(runtime, buffer, dtype, shape);
+    }
     if !dtype.is_numeric() {
         return Err(PyError::unsupported(format!(
             "{} arrays cannot be built from numbers here",
@@ -515,9 +540,10 @@ fn eye_array(
 ) -> PyResult<Array> {
     let count = array::element_count(&[rows, columns])?;
     runtime.charge_cpu(count as u64 + 1)?;
+    // NumPy writes 1 into zeros, so an `object` identity holds ints.
     let values = (0..count).map(|flat| {
         let (row, column) = (flat / columns.max(1), flat % columns.max(1));
-        Number::Bool(column as i64 - row as i64 == k)
+        Number::Int(i64::from(column as i64 - row as i64 == k))
     });
     numbers_array(runtime, dtype, vec![rows, columns], values)
 }
@@ -545,7 +571,7 @@ pub(in crate::python) fn diag(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
             let size = length
                 .checked_add(k.unsigned_abs() as usize)
                 .ok_or_else(|| PyError::value_error("diagonal offset is too large"))?;
-            let result = filled(runtime, vec![size, size], source.dtype, None)?;
+            let result = filled(runtime, vec![size, size], source.dtype, Fill::Zero)?;
             let (row, column) = if k >= 0 {
                 (0, k as usize)
             } else {

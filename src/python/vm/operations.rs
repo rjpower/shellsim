@@ -3,8 +3,8 @@
 use super::super::native::KindNumber;
 use super::format::{format_float, format_integer, format_text, FormatSpec};
 use super::{
-    number, protocol, BigInt, BinaryOperator, ComparisonOperator, DisplayKind, NativeValue, Object,
-    Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
+    number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
+    NativeValue, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 impl Vm<'_> {
@@ -638,12 +638,74 @@ impl Vm<'_> {
                 return Ok(value);
             }
         }
-        let message = format!(
-            "unsupported operand type(s) for {symbol}: '{}' and '{}'",
-            self.type_name_of(&left)?,
-            self.type_name_of(&right)?
-        );
+        let message = match self.sequence_operator_message(&left, &right, symbol)? {
+            Some(message) => message,
+            None => format!(
+                "unsupported operand type(s) for {symbol}: '{}' and '{}'",
+                self.type_name_of(&left)?,
+                self.type_name_of(&right)?
+            ),
+        };
         Err(self.raise_exception("TypeError", message))
+    }
+
+    /// CPython's message when `+` or `*` reaches a builtin sequence's concatenation or
+    /// repetition with an operand it cannot combine, such as `"a" + 1`.
+    fn sequence_operator_message(
+        &mut self,
+        left: &Value,
+        right: &Value,
+        symbol: &str,
+    ) -> Result<Option<String>, String> {
+        let left_sequence = self.builtin_sequence(left)?;
+        match symbol.trim_end_matches('=') {
+            "+" => {
+                let Some(sequence) = left_sequence else {
+                    return Ok(None);
+                };
+                let other = self.type_name_of(right)?;
+                Ok(Some(match sequence {
+                    BuiltinType::Bytes => format!("can't concat {other} to bytes"),
+                    BuiltinType::ByteArray => format!("can't concat {other} to bytearray"),
+                    _ => {
+                        let name = builtin_sequence_name(sequence);
+                        format!("can only concatenate {name} (not \"{other}\") to {name}")
+                    }
+                }))
+            }
+            "*" => {
+                let other = if left_sequence.is_some() {
+                    right
+                } else if self.builtin_sequence(right)?.is_some() {
+                    left
+                } else {
+                    return Ok(None);
+                };
+                let other = self.type_name_of(other)?;
+                Ok(Some(format!(
+                    "can't multiply sequence by non-int of type '{other}'"
+                )))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The builtin sequence type (`str`, `bytes`, `bytearray`, `list` or `tuple`) that
+    /// `value`'s type derives from, if any.
+    fn builtin_sequence(&self, value: &Value) -> Result<Option<BuiltinType>, String> {
+        let type_id = self.type_id(value)?;
+        for sequence in [
+            BuiltinType::String,
+            BuiltinType::Bytes,
+            BuiltinType::ByteArray,
+            BuiltinType::List,
+            BuiltinType::Tuple,
+        ] {
+            if self.state.types.is_subclass(type_id, sequence.id())? {
+                return Ok(Some(sequence));
+            }
+        }
+        Ok(None)
     }
 
     pub(super) fn format_value(
@@ -805,6 +867,16 @@ impl Vm<'_> {
 }
 
 /// The source spelling of a binary operator, as CPython prints it in `TypeError` messages.
+fn builtin_sequence_name(sequence: BuiltinType) -> &'static str {
+    match sequence {
+        BuiltinType::String => "str",
+        BuiltinType::Bytes => "bytes",
+        BuiltinType::ByteArray => "bytearray",
+        BuiltinType::List => "list",
+        _ => "tuple",
+    }
+}
+
 fn binary_operator_symbol(operator: BinaryOperator) -> &'static str {
     match operator {
         BinaryOperator::Add => "+",

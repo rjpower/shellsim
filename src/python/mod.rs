@@ -28,6 +28,7 @@ mod source;
 mod stdlib;
 mod string;
 mod token;
+mod unicode;
 mod vm;
 
 use std::collections::HashMap;

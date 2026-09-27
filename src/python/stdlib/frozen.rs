@@ -43,6 +43,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy.fft" => Some(include_str!("source/numpy/fft.py")),
         "numpy.linalg" => Some(include_str!("source/numpy/linalg.py")),
         "numpy.random" => Some(include_str!("source/numpy/random.py")),
+        "numpy.strings" => Some(include_str!("source/numpy/strings.py")),
         "numpy.testing" => Some(include_str!("source/numpy/testing.py")),
         "operator" => Some(include_str!("source/operator.py")),
         "os" => Some(include_str!("source/os.py")),
