@@ -1,14 +1,14 @@
-//! The error function family and the standard normal distribution: `erf`, `erfc`, their
-//! inverses, `ndtr`, `ndtri`, and `log_ndtr`.
+//! The error function family and the standard normal distribution: `erf`, `erfc`, `erfcinv`,
+//! `ndtr`, `ndtri`, and `log_ndtr`.
 //!
-//! `erf`, `erfc`, `ndtr`, and `ndtri` are ports of Cephes (`xsf/cephes/{ndtr,ndtri}.h`), as
-//! SciPy uses. SciPy computes `erfinv` with Boost and `log_ndtr` with Faddeeva's `erfcx`; here
-//! `erfinv` and `erfcinv` refine Cephes' `ndtri` estimate with Newton steps, and `log_ndtr` uses
-//! the logarithm of `ndtr` with an asymptotic series in the far tail. Both agree with SciPy to
-//! within a few units in the last place.
+//! `erf`, `erfc`, `ndtr`, `ndtri` and `erfcinv` are ports of Cephes
+//! (`xsf/cephes/{ndtr,ndtri,erfinv}.h`), as SciPy uses. SciPy computes `erfinv` with Boost, in
+//! `erf_inv.rs`, and `log_ndtr` with Faddeeva's `erfcx`; here `log_ndtr` uses the logarithm of
+//! `ndtr` with an asymptotic series in the far tail, which agrees with SciPy to within a few
+//! units in the last place.
 #![allow(clippy::excessive_precision, clippy::unreadable_literal)]
 
-use std::f64::consts::{FRAC_1_SQRT_2, FRAC_2_SQRT_PI, PI};
+use std::f64::consts::{FRAC_1_SQRT_2, PI};
 
 use super::gamma::MAXLOG;
 use super::poly::{p1evl, polevl};
@@ -261,57 +261,11 @@ pub(super) fn ndtri(y0: f64) -> f64 {
     }
 }
 
-/// Newton steps from an estimate `x` toward `erf(x) = target`, or `erfc(x) = target` in the
-/// upper tail, where `erfc` keeps full relative precision.
-fn refine(mut x: f64, target: f64, complement: bool) -> f64 {
-    for _ in 0..3 {
-        let slope = FRAC_2_SQRT_PI * (-x * x).exp();
-        if slope == 0.0 || !x.is_finite() {
-            break;
-        }
-        let step = if complement {
-            (target - erfc(x)) / slope
-        } else {
-            (erf(x) - target) / slope
-        };
-        x -= step;
-        if step.abs() <= f64::EPSILON * x.abs() {
-            break;
-        }
-    }
-    x
-}
-
-/// The inverse error function on `[-1, 1]`.
-pub(super) fn erfinv(y: f64) -> f64 {
-    if y.is_nan() || !(-1.0..=1.0).contains(&y) {
-        return f64::NAN;
-    }
-    if y == 1.0 {
-        return f64::INFINITY;
-    }
-    if y == -1.0 {
-        return f64::NEG_INFINITY;
-    }
-    if y.abs() < 1e-7 {
-        // erf(x) = 2/sqrt(pi) (x - x^3/3 + ...); keep the linear term.
-        return y / FRAC_2_SQRT_PI;
-    }
-    if y < 0.0 {
-        return -erfinv(-y);
-    }
-    if y < 0.5 {
-        return refine(ndtri(0.5 * (y + 1.0)) * FRAC_1_SQRT_2, y, false);
-    }
-    // 1 - y is exact for y >= 0.5.
-    let q = 1.0 - y;
-    refine(-ndtri(0.5 * q) * FRAC_1_SQRT_2, q, true)
-}
-
-/// The inverse complementary error function on `[0, 2]`.
+/// The inverse complementary error function on `[0, 2]`, as SciPy's `erfcinv` computes it from
+/// Cephes' `ndtri` (`xsf/cephes/erfinv.h`).
 pub(super) fn erfcinv(y: f64) -> f64 {
-    if y.is_nan() || !(0.0..=2.0).contains(&y) {
-        return f64::NAN;
+    if y > 0.0 && y < 2.0 {
+        return -ndtri(0.5 * y) * FRAC_1_SQRT_2;
     }
     if y == 0.0 {
         return f64::INFINITY;
@@ -319,9 +273,5 @@ pub(super) fn erfcinv(y: f64) -> f64 {
     if y == 2.0 {
         return f64::NEG_INFINITY;
     }
-    if y >= 0.5 {
-        // 1 - y is exact here, and erfc(x) = y means erf(x) = 1 - y.
-        return erfinv(1.0 - y);
-    }
-    refine(-ndtri(0.5 * y) * FRAC_1_SQRT_2, y, true)
+    f64::NAN
 }

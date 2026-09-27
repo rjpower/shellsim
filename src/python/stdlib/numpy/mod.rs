@@ -263,6 +263,18 @@ pub(in crate::python) const fn named_ufunc_value(name: &'static str, ufunc: &str
     }
 }
 
+/// A module value naming the `scipy.special` ufunc at `position` in its function table.
+pub(in crate::python) const fn special_ufunc_value(
+    name: &'static str,
+    position: usize,
+) -> ValueDef {
+    ValueDef::Registered {
+        name,
+        kind: &ufunc::UFUNC,
+        payload: ufunc::special_index(position),
+    }
+}
+
 const fn bool_scalar(name: &'static str, value: bool) -> ValueDef {
     ValueDef::Registered {
         name,

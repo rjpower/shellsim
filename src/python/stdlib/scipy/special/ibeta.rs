@@ -13,51 +13,71 @@
 
 use std::f64::consts::{E, FRAC_PI_2, PI};
 
+use super::boost::{self, LOG_MAX, LOG_MIN};
 use super::erf::{erf, erfc};
-use super::gamma::{beta, gamma, lanczos_sum_expg_scaled, lgam, LANCZOS_G};
+use super::gamma::{beta, gamma, lgam, LANCZOS_G};
 use super::igam::igamc;
 use super::meter;
-use super::poly::ratevl;
 
 const EPSILON: f64 = f64::EPSILON;
-const LOG_MAX: f64 = 709.782712893384;
-const LOG_MIN: f64 = -708.3964185322641;
 const MAX_ITERATIONS: usize = 1_000_000;
 
+// Boost's `lanczos13m53` tables, lowest degree first. Both sums share the denominator.
 const LANCZOS_NUM: [f64; 13] = [
-    2.506628274631000270164908177133837338626,
-    210.8242777515793458725097339207133627117,
-    8071.672002365816210638002902272250613822,
-    186056.2653952234950402949897160456992822,
-    2876370.628935372441225409051620849613599,
-    31426415.58540019438061423162831820536287,
-    248874557.8620541565114603864132294232163,
-    1439720407.311721673663223072794912393972,
-    6039542586.35202800506429164430729792107,
-    17921034426.03720969991975575445893111267,
-    35711959237.35566804944018545154716670596,
-    42919803642.64909876895789904700198885093,
     23531376880.41075968857200767445163675473,
+    42919803642.64909876895789904700198885093,
+    35711959237.35566804944018545154716670596,
+    17921034426.03720969991975575445893111267,
+    6039542586.35202800506429164430729792107,
+    1439720407.311721673663223072794912393972,
+    248874557.8620541565114603864132294232163,
+    31426415.58540019438061423162831820536287,
+    2876370.628935372441225409051620849613599,
+    186056.2653952234950402949897160456992822,
+    8071.672002365816210638002902272250613822,
+    210.8242777515793458725097339207133627117,
+    2.506628274631000270164908177133837338626,
+];
+const LANCZOS_SUM_EXPG_SCALED_NUM: [f64; 13] = [
+    56906521.91347156388090791033559122686859,
+    103794043.1163445451906271053616070238554,
+    86363131.28813859145546927288977868422342,
+    43338889.32467613834773723740590533316085,
+    14605578.08768506808414169982791359218571,
+    3481712.15498064590882071018964774556468,
+    601859.6171681098786670226533699352302507,
+    75999.29304014542649875303443598909137092,
+    6955.999602515376140356310115515198987526,
+    449.9445569063168119446858607650988409623,
+    19.51992788247617482847860966235652136208,
+    0.5098416655656676188125178644804694509993,
+    0.006061842346248906525783753964555936883222,
 ];
 const LANCZOS_DENOM: [f64; 13] = [
-    1.0,
-    66.0,
-    1925.0,
-    32670.0,
-    357423.0,
-    2637558.0,
-    13339535.0,
-    45995730.0,
-    105258076.0,
-    150917976.0,
-    120543840.0,
-    39916800.0,
     0.0,
+    39916800.0,
+    120543840.0,
+    150917976.0,
+    105258076.0,
+    45995730.0,
+    13339535.0,
+    2637558.0,
+    357423.0,
+    32670.0,
+    1925.0,
+    66.0,
+    1.0,
 ];
 
-/// Boost's `lanczos13m53::lanczos_sum`.
+/// Boost's `lanczos13m53::lanczos_sum`. The limit is Boost's, found by experiment.
 fn lanczos_sum(z: f64) -> f64 {
-    ratevl(z, &LANCZOS_NUM, &LANCZOS_DENOM)
+    boost::lanczos_sum(&LANCZOS_NUM, &LANCZOS_DENOM, z, 4.31965e25)
+}
+
+/// Boost's `lanczos13m53::lanczos_sum_expG_scaled`. The Cephes functions evaluate the same sum
+/// with Cephes' Horner scheme, in `gamma.rs`.
+fn lanczos_sum_expg_scaled(z: f64) -> f64 {
+    boost::lanczos_sum(&LANCZOS_SUM_EXPG_SCALED_NUM, &LANCZOS_DENOM, z, 4.76886e25)
 }
 
 /// Correctly rounded `n!` for `n <= 170`, as Boost's `unchecked_factorial` tabulates them.
@@ -496,7 +516,7 @@ fn regularised_gamma_prefix(a: f64, z: f64) -> f64 {
         return z.powf(a) * (-z).exp() / gamma(a);
     } else if (d * d * a).abs() <= 100.0 && a > 150.0 {
         // Large a with a near z.
-        (a * super::unity::log1pmx(d) + z * (0.5 - LANCZOS_G) / agh).exp()
+        (a * boost::log1pmx(d) + z * (0.5 - LANCZOS_G) / agh).exp()
     } else {
         let alz = a * (z / agh).ln();
         let amz = a - z;
@@ -865,7 +885,8 @@ pub(super) fn ibeta_imp(a: f64, b: f64, x: f64, invert: bool) -> f64 {
             let mut powers = 0.0;
             let mut use_asym = false;
             let limit = if xa < saddle { 2.0 } else { 15.0 };
-            if ma > 1e-5 / EPSILON && ma / a.min(b) < limit {
+            // Boost writes `1e-5f`, a `float`.
+            if ma > f64::from(1e-5f32) / EPSILON && ma / a.min(b) < limit {
                 if a == b {
                     use_asym = true;
                 } else {
@@ -954,6 +975,37 @@ pub(super) fn ibeta_imp_derivative(a: f64, b: f64, x: f64) -> f64 {
     } else {
         terms / div
     }
+}
+
+/// Boost's public `ibeta_derivative`: the beta density `x^(a-1) (1-x)^(b-1) / B(a, b)`. Domain
+/// errors give NaN, as under SciPy's stats policy, and a density that is infinite at an endpoint
+/// gives `+inf`.
+pub(super) fn ibeta_derivative(a: f64, b: f64, x: f64) -> f64 {
+    if !a.is_finite() || !b.is_finite() || !(0.0..=1.0).contains(&x) || a <= 0.0 || b <= 0.0 {
+        return f64::NAN;
+    }
+    // At an endpoint the density is 0, 1 / B(a, b), or infinite as the exponent there is
+    // positive, zero, or negative. Boost's B(1, b) is 1 / b.
+    let endpoint = |exponent_base: f64, other: f64| {
+        if exponent_base > 1.0 {
+            0.0
+        } else if exponent_base == 1.0 {
+            1.0 / (1.0 / other)
+        } else {
+            f64::INFINITY
+        }
+    };
+    if x == 0.0 {
+        return endpoint(a, b);
+    }
+    if x == 1.0 {
+        return endpoint(b, a);
+    }
+    let y = (1.0 - x) * x;
+    if (1.0 / y).is_infinite() {
+        return endpoint(a, b);
+    }
+    ibeta_power_terms(a, b, x, 1.0 - x, 1.0 / y)
 }
 
 /// SciPy's limits shared by `betainc` and `betaincc`: `Some(I_x(a, b))` for the degenerate

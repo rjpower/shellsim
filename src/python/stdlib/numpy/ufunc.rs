@@ -634,10 +634,18 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
     special(SpecialFunction::Fdtri),
     special(SpecialFunction::Pdtr),
     special(SpecialFunction::Pdtrc),
+    special(SpecialFunction::Pdtrik),
     special(SpecialFunction::Bdtr),
     special(SpecialFunction::Bdtrc),
+    special(SpecialFunction::BinomPmf),
+    special(SpecialFunction::BinomCdf),
+    special(SpecialFunction::BinomSf),
+    special(SpecialFunction::BinomPpf),
+    special(SpecialFunction::BinomIsf),
     special(SpecialFunction::Boxcox),
     special(SpecialFunction::InvBoxcox),
+    special(SpecialFunction::Expm1),
+    special(SpecialFunction::Log1p),
     special(SpecialFunction::RiemannZeta),
     special(SpecialFunction::Zeta),
 ];
@@ -677,6 +685,18 @@ const fn same_text(left: &str, right: &str) -> bool {
         index += 1;
     }
     true
+}
+
+/// Index of the `scipy.special` ufunc at `position` in `SpecialFunction::ALL`, at compile time.
+/// The special ufuncs close the table in that order. Some, such as `expm1`, share a name with a
+/// NumPy ufunc, so they cannot be found by name.
+pub(in crate::python) const fn special_index(position: usize) -> u64 {
+    let index = UFUNCS.len() - SpecialFunction::ALL.len() + position;
+    assert!(
+        same_text(UFUNCS[index].name, SpecialFunction::ALL[position].name()),
+        "special ufuncs must close the table in SpecialFunction::ALL order"
+    );
+    index as u64
 }
 
 /// Index of a ufunc by name or alias, at compile time, for module value tables.

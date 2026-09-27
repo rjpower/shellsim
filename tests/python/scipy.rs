@@ -34,9 +34,8 @@ fn unsupported_scipy_features_fail_explicitly() {
             "reduce and accumulate of scipy.special.xlogy are not supported by shellsim's SciPy",
         ),
         (
-            "special.factorial(3, extend='complex')",
-            "NotImplementedError: factorial with extend='complex' is not supported by shellsim's \
-             SciPy",
+            "special.factorial(1 + 1j, extend='complex')",
+            "complex input to scipy.special.gamma is not supported by shellsim's SciPy",
         ),
         (
             "import scipy.sparse",

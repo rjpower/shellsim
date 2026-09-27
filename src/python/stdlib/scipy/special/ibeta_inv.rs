@@ -18,7 +18,8 @@ use std::cmp::Ordering;
 use std::f64::consts::{FRAC_PI_2, PI, SQRT_2};
 use std::mem::swap;
 
-use super::erf::erfcinv;
+use super::boost;
+use super::erf_inv::erfc_inv;
 use super::gamma::{beta, lgam};
 use super::ibeta::{ibeta_imp, ibeta_imp_derivative, tgamma_delta_ratio};
 use super::igam::{igamci, igami};
@@ -54,7 +55,9 @@ fn sign(x: f64) -> f64 {
     }
 }
 
-/// Horner evaluation with coefficients in increasing degree, Boost's `evaluate_polynomial`.
+/// Horner evaluation with coefficients in increasing degree, as Boost's `evaluate_polynomial`
+/// computes a table whose length is known only at run time. Fixed-size tables use
+/// `boost::polynomial`.
 fn polynomial(coefficients: &[f64], z: f64) -> f64 {
     let (last, rest) = coefficients
         .split_last()
@@ -523,7 +526,7 @@ fn temme_root(t: f64, a: f64) -> impl Fn(f64) -> (f64, f64) {
 /// Temme's first inversion (section 2), for `a` and `b` of similar size.
 fn temme_method_1(a: f64, b: f64, z: f64) -> f64 {
     let r2 = SQRT_2;
-    let eta0 = erfcinv(2.0 * z) / -(a / 2.0).sqrt();
+    let eta0 = erfc_inv(2.0 * z) / -(a / 2.0).sqrt();
     let big_b = b - a;
     let b_2 = big_b * big_b;
     let b_3 = b_2 * big_b;
@@ -574,7 +577,7 @@ fn temme_method_1(a: f64, b: f64, z: f64) -> f64 {
 
 /// Temme's second inversion (section 3), for `a / (a + b)` between 0.2 and 0.8.
 fn temme_method_2(z: f64, r: f64, theta: f64) -> f64 {
-    let eta0 = erfcinv(2.0 * z) / -(r / 2.0).sqrt();
+    let eta0 = erfc_inv(2.0 * z) / -(r / 2.0).sqrt();
     let s = theta.sin();
     let c = theta.cos();
     let sc = s * c;
@@ -1098,7 +1101,7 @@ fn find_ibeta_inv_from_t_dist(a: f64, p: f64) -> (f64, f64) {
 /// Hill's approximation to the Student's t quantile (Algorithm 396), for `u <= 0.5`.
 fn inverse_students_t_hill(ndf: f64, u: f64) -> f64 {
     if ndf > single(1e20) {
-        return -erfcinv(2.0 * u) * SQRT_2;
+        return -erfc_inv(2.0 * u) * SQRT_2;
     }
     let a = 1.0 / (ndf - 0.5);
     let b = 48.0 / (a * a);
@@ -1107,7 +1110,7 @@ fn inverse_students_t_hill(ndf: f64, u: f64) -> f64 {
     let mut y = (d * 2.0 * u).powf(2.0 / ndf);
     if y > single(0.05) + a {
         // Asymptotic inverse expansion about the normal.
-        let x = -erfcinv(2.0 * u) * SQRT_2;
+        let x = -erfc_inv(2.0 * u) * SQRT_2;
         y = x * x;
         if ndf < 5.0 {
             c += single(0.3) * (ndf - 4.5) * (x + single(0.6));
@@ -1184,7 +1187,7 @@ fn inverse_students_t_tail_series(df: f64, v: f64) -> f64 {
     let rn = df.sqrt();
     let div = (rn * w).powf(1.0 / df);
     let power = div * div;
-    -(polynomial(&d, power) * rn / div)
+    -(boost::polynomial(&d, power) * rn / div)
 }
 
 /// Shaw's body series for the Student's t quantile with small degrees of freedom.
@@ -1268,7 +1271,7 @@ fn inverse_students_t_body_series(df: f64, u: f64) -> f64 {
             + 0.00054229262813129686486,
     ];
     // An odd polynomial in v (Shaw, equation 56).
-    v * polynomial(&c, v * v)
+    v * boost::polynomial(&c, v * v)
 }
 
 /// Boost's `inverse_students_t`: an approximation to the Student's t quantile at `u`, with
@@ -1329,7 +1332,7 @@ fn inverse_students_t(df: f64, mut u: f64, mut v: f64) -> (f64, bool) {
         }
     }
     let result = if df > 268435456.0 {
-        return (signed(-erfcinv(2.0 * u) * SQRT_2), df >= 1e20);
+        return (signed(-erfc_inv(2.0 * u) * SQRT_2), df >= 1e20);
     } else if df < 3.0 {
         // A roughly linear crossover between Shaw's tail and body series.
         let crossover = single(0.2742) - df * single(0.0242143);

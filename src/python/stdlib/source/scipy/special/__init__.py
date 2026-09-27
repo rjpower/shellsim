@@ -2,8 +2,8 @@
 
 The special functions are ``numpy.ufunc`` values from the native ``_scipy_special`` module.
 This module adds the functions SciPy writes in Python: ``comb``, ``perm``, ``factorial``,
-``zeta``, ``softmax``, ``log_softmax`` and ``logsumexp``, following SciPy 1.18's code for NumPy
-inputs.
+``factorial2``, ``factorialk``, ``zeta``, ``softmax``, ``log_softmax`` and ``logsumexp``,
+following SciPy 1.18's code for NumPy inputs.
 """
 
 import math
@@ -109,99 +109,216 @@ def _gamma1p(vals):
     return res
 
 
-# The largest n whose factorial fits in int64 and int32.
-_FACTORIAL_LIMIT_64BITS = 20
-_FACTORIAL_LIMIT_32BITS = 12
+# The largest n whose multifactorial with step k fits in int64 and in int32.
+_FACTORIALK_LIMITS_64BITS = {1: 20, 2: 33, 3: 44, 4: 54, 5: 65, 6: 74, 7: 84, 8: 93, 9: 101}
+_FACTORIALK_LIMITS_32BITS = {1: 12, 2: 19, 3: 25, 4: 31, 5: 37, 6: 43, 7: 47, 8: 51, 9: 56}
 
 
-def _factorial_array_exact(n):
-    un = np.unique(n)
-    if un[-1] > _FACTORIAL_LIMIT_64BITS:
-        dt = object
+def _range_prod(lo, hi, k=1):
+    """The product ``lo * (lo + k) * ... * hi``, split in halves to keep the operands balanced."""
+    if lo == 1 and k == 1:
+        return math.factorial(hi)
+    if lo + k < hi:
+        mid = (hi + lo) // 2
+        if k > 1:
+            # Keep mid in the same residue class modulo k as hi.
+            mid = mid - (mid - hi) % k
+        return _range_prod(lo, mid, k) * _range_prod(mid + k, hi, k)
+    elif lo + k == hi:
+        return lo * hi
     else:
-        # SciPy picks int64 above the int32 limit and C long below it; both are int64 on
-        # the Linux systems shellsim simulates.
-        dt = np.int64
+        return hi
+
+
+def _factorialx_array_exact(n, k=1):
+    un = np.unique(n)
+    if k in _FACTORIALK_LIMITS_64BITS.keys():
+        if un[-1] > _FACTORIALK_LIMITS_64BITS[k]:
+            dt = object
+        else:
+            # SciPy picks int64 above the int32 limit and C long below it; both are int64 on
+            # the Linux systems shellsim simulates.
+            dt = np.int64
+    else:
+        dt = object
     out = np.empty_like(n, dtype=dt)
     un = un[un > 1]
     out[n < 2] = 1
     out[n < 0] = 0
-    if un.size:
-        val = math.factorial(int(un[0]))
-        out[n == un[0]] = val
-        for i in range(len(un) - 1):
-            prev = un[i]
-            current = un[i + 1]
-            for factor in range(int(prev) + 1, int(current) + 1):
-                val *= factor
-            out[n == current] = val
+    # Each residue class modulo k is its own chain of products.
+    for lane in range(0, k):
+        ul = un[un % k == lane] if k > 1 else un
+        if ul.size:
+            val = _range_prod(1, int(ul[0]), k=k)
+            out[n == ul[0]] = val
+            for i in range(len(ul) - 1):
+                prev = ul[i]
+                current = ul[i + 1]
+                val *= _range_prod(int(prev + 1), int(current), k=k)
+                out[n == current] = val
     return out
 
 
-def factorial(n, exact=False, extend="zero"):
-    """The factorial of ``n``, or ``gamma(n + 1)`` for non-integer ``n``."""
+def _factorialx_array_approx(n, k, extend):
+    if extend == "complex":
+        return _factorialx_approx_core(n, k=k, extend=extend)
+    result = np.zeros(n.shape)
+    np.place(result, np.isnan(n), np.nan)
+    cond = n >= 0
+    n_to_compute = np.extract(cond, n)
+    np.place(result, cond, _factorialx_approx_core(n_to_compute, k=k, extend=extend))
+    return result
+
+
+def _factorialx_approx_core(n, k, extend):
+    if k == 1:
+        result = _gamma1p(n)
+        if isinstance(n, np.ndarray):
+            result = np.array(result)
+        return result
+    if extend == "complex":
+        p_dtype = complex if (_is_subdtype(type(k), "c") or k < 0) else None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            result = np.power(k, n / k, dtype=p_dtype) * _gamma1p(n / k)
+            result *= rgamma(1 / k + 1) / np.power(k, 1 / k, dtype=p_dtype)
+        if isinstance(n, np.ndarray):
+            result = np.array(result)
+        return result
+    # For extend="zero", n % k selects the correction to the gamma-based approximation.
+    n_mod_k = n % k
+    if not isinstance(n, np.ndarray):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return (
+                np.power(k, (n - n_mod_k) / k)
+                * gamma(n / k + 1)
+                / gamma(n_mod_k / k + 1)
+                * max(n_mod_k, 1)
+            )
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        result = np.power(k, n / k) * gamma(n / k + 1)
+
+    def corr(k, r):
+        return np.power(k, -r / k) / gamma(r / k + 1) * r
+
+    for r in np.unique(n_mod_k):
+        if r == 0:
+            continue
+        result[n_mod_k == r] *= corr(k, int(r))
+    return result
+
+
+_DTYPE_CLASSES = {"i": np.integer, "f": np.floating, "c": np.complexfloating, "n": np.number}
+
+
+def _is_subdtype(dtype, dtypes):
+    dtypes = dtypes if isinstance(dtypes, list) else [dtypes]
+    dtypes = [_DTYPE_CLASSES.get(x, x) for x in dtypes]
+    return any(np.issubdtype(dtype, dt) for dt in dtypes)
+
+
+def _factorialx_wrapper(fname, n, k, exact, extend):
+    """SciPy's shared implementation of ``factorial``, ``factorial2`` and ``factorialk``."""
     if extend not in ("zero", "complex"):
         raise ValueError(
             f"argument `extend` must be either 'zero' or 'complex', received: {extend}"
         )
     if exact and extend == "complex":
         raise ValueError("Incompatible options: `exact=True` and `extend='complex'`")
-    if extend == "complex":
-        raise NotImplementedError(
-            "factorial with extend='complex' is not supported by shellsim's SciPy"
+
+    msg_unsup = "Unsupported data type for {vname} in {fname}: {dtype}\n"
+    if fname == "factorial":
+        msg_unsup += (
+            "Permitted data types are integers and floating point numbers, "
+            "as well as complex numbers if `extend='complex' is passed."
         )
-    unsupported = (
-        "Unsupported data type for `n` in factorial: {dtype}\n"
-        "Permitted data types are integers and floating point numbers, as well as complex "
-        "numbers if `extend='complex' is passed."
-    )
-    needs_complex = (
+    else:
+        msg_unsup += (
+            "Permitted data types are integers, as well as floating point "
+            "numbers and complex numbers if `extend='complex' is passed."
+        )
+    msg_exact_not_possible = "`exact=True` only supports integers, cannot use data type {dtype}"
+    msg_needs_complex = (
         "In order to use non-integer arguments, you must opt into this by passing "
-        "`extend='complex'`. Note that this changes the result for all negative arguments "
-        "(which by default return 0)."
+        "`extend='complex'`. Note that this changes the result for all negative "
+        "arguments (which by default return 0)."
     )
-    exact_not_possible = "`exact=True` only supports integers, cannot use data type {dtype}"
+
+    if fname == "factorial2":
+        msg_needs_complex += (
+            " Additionally, it will rescale the values of the double factorial at even "
+            "integers by a factor of sqrt(2/pi)."
+        )
+    elif fname == "factorialk":
+        msg_needs_complex += (
+            " Additionally, it will perturb the values of the multifactorial at most "
+            "positive integers `n`."
+        )
+        if not _is_subdtype(type(k), ["i", "f", "c"]):
+            raise ValueError(msg_unsup.format(vname="`k`", fname=fname, dtype=type(k)))
+        elif _is_subdtype(type(k), ["f", "c"]) and extend != "complex":
+            raise ValueError(msg_needs_complex)
+        if extend == "zero" and k < 1:
+            msg = f"For `extend='zero'`, k must be a positive integer, received: {k}"
+            raise ValueError(msg)
+        elif k == 0:
+            raise ValueError("Parameter k cannot be zero!")
+
+    # factorial allows floats also for extend="zero".
+    types_requiring_complex = "c" if fname == "factorial" else ["f", "c"]
 
     if np.ndim(n) == 0 and not isinstance(n, np.ndarray):
-        if n is not None and not _is_subdtype(type(n), ("i", "f", "c")):
-            raise ValueError(unsupported.format(dtype=type(n)))
-        if n is not None and _is_subdtype(type(n), ("c",)):
-            raise ValueError(needs_complex)
-        if n is None or np.isnan(n):
-            return np.float64("nan")
-        if n < 0:
+        # Scalars.
+        if n is not None and not _is_subdtype(type(n), ["i", "f", "c"]):
+            raise ValueError(msg_unsup.format(vname="`n`", fname=fname, dtype=type(n)))
+        elif n is not None and _is_subdtype(type(n), types_requiring_complex) and (
+            extend != "complex"
+        ):
+            raise ValueError(msg_needs_complex)
+        elif n is None or np.isnan(n):
+            complexify = extend == "complex" and n is not None and _is_subdtype(type(n), "c")
+            return np.complex128("nan+nanj") if complexify else np.float64("nan")
+        elif extend == "zero" and n < 0:
             return 0 if exact else np.float64(0)
-        if n in {0, 1}:
+        elif n in {0, 1}:
             return 1 if exact else np.float64(1)
-        if exact and _is_subdtype(type(n), ("i",)):
-            return math.factorial(int(n))
-        if exact:
-            raise ValueError(exact_not_possible.format(dtype=type(n)))
-        return _gamma1p(n)
+        elif exact and _is_subdtype(type(n), "i"):
+            return _range_prod(1, int(n), k=k)
+        elif exact:
+            raise ValueError(msg_exact_not_possible.format(dtype=type(n)))
+        return _factorialx_approx_core(n, k=k, extend=extend)
 
+    # Arrays.
     n = np.asarray(n)
-    if not _is_subdtype(n.dtype, ("i", "f", "c")):
-        raise ValueError(unsupported.format(dtype=n.dtype))
-    if _is_subdtype(n.dtype, ("c",)):
-        raise ValueError(needs_complex)
-    if exact and _is_subdtype(n.dtype, ("f",)):
-        raise ValueError(exact_not_possible.format(dtype=n.dtype))
+    if not _is_subdtype(n.dtype, ["i", "f", "c"]):
+        raise ValueError(msg_unsup.format(vname="`n`", fname=fname, dtype=n.dtype))
+    elif _is_subdtype(n.dtype, types_requiring_complex) and extend != "complex":
+        raise ValueError(msg_needs_complex)
+    elif exact and _is_subdtype(n.dtype, ["f"]):
+        raise ValueError(msg_exact_not_possible.format(dtype=n.dtype))
+
     if n.size == 0:
         return n
-    if exact:
-        return _factorial_array_exact(n)
-    result = np.zeros(n.shape)
-    result[np.isnan(n)] = np.nan
-    cond = n >= 0
-    result[cond] = _gamma1p(n[cond])
-    return result
+    elif exact:
+        return _factorialx_array_exact(n, k=k)
+    return _factorialx_array_approx(n, k=k, extend=extend)
 
 
-_DTYPE_CLASSES = {"i": np.integer, "f": np.floating, "c": np.complexfloating}
+def factorial(n, exact=False, extend="zero"):
+    """The factorial of ``n``, or ``gamma(n + 1)`` for non-integer ``n``."""
+    return _factorialx_wrapper("factorial", n, k=1, exact=exact, extend=extend)
 
 
-def _is_subdtype(dtype, codes):
-    return any(np.issubdtype(dtype, _DTYPE_CLASSES[code]) for code in codes)
+def factorial2(n, exact=False, extend="zero"):
+    """The double factorial ``n!! = n (n - 2) (n - 4) ...``."""
+    return _factorialx_wrapper("factorial2", n, k=2, exact=exact, extend=extend)
+
+
+def factorialk(n, k, exact=False, extend="zero"):
+    """The multifactorial ``n (n - k) (n - 2k) ...``."""
+    return _factorialx_wrapper("factorialk", n, k=k, exact=exact, extend=extend)
 
 
 def _promote_floating(*args):

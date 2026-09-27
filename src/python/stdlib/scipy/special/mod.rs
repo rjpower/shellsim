@@ -8,8 +8,10 @@
 //! work meter.
 //!
 //! Kernels are ports of the implementations SciPy 1.18 uses: Cephes (through SciPy's xsf
-//! library) for most functions and Boost.Math for the incomplete beta family and the t and F
-//! distributions. Like SciPy's loops, kernels never raise floating-point errors or warnings;
+//! library) for most functions and Boost.Math for `erfinv`, the incomplete beta family, the t,
+//! F and binomial distributions, and `pdtrik`. The binomial functions are SciPy's private ufuncs
+//! for `scipy.stats.binom`, so their names start with an underscore. Like SciPy's loops,
+//! kernels never raise floating-point errors or warnings;
 //! domain errors return NaN and poles return infinities. Complex loops are not implemented and
 //! fail explicitly.
 //!
@@ -17,19 +19,23 @@
 //! charged a flat [`ELEMENT_COST`] and every metered iteration (see [`meter`]) a further
 //! `STEP_COST`.
 
+mod binomial;
+mod boost;
 mod distributions;
 mod elementary;
 mod erf;
+mod erf_inv;
 mod gamma;
 mod ibeta;
 mod ibeta_inv;
 mod igam;
 mod meter;
 mod poly;
+mod roots;
 mod unity;
 
 use super::super::super::native::{ModuleDef, PyResult, PyRuntime, ValueDef};
-use super::super::numpy::named_ufunc_value;
+use super::super::numpy::special_ufunc_value;
 
 /// A `scipy.special` ufunc.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,10 +81,18 @@ pub(in crate::python) enum Function {
     Fdtri,
     Pdtr,
     Pdtrc,
+    Pdtrik,
     Bdtr,
     Bdtrc,
+    BinomPmf,
+    BinomCdf,
+    BinomSf,
+    BinomPpf,
+    BinomIsf,
     Boxcox,
     InvBoxcox,
+    Expm1,
+    Log1p,
     RiemannZeta,
     Zeta,
 }
@@ -129,7 +143,7 @@ pub(in crate::python) fn evaluate<T>(
 
 impl Function {
     /// Every function, in `numpy.ufunc` table order.
-    pub(in crate::python) const ALL: [Self; 47] = [
+    pub(in crate::python) const ALL: [Self; 55] = [
         Self::Erf,
         Self::Erfc,
         Self::Erfinv,
@@ -171,10 +185,18 @@ impl Function {
         Self::Fdtri,
         Self::Pdtr,
         Self::Pdtrc,
+        Self::Pdtrik,
         Self::Bdtr,
         Self::Bdtrc,
+        Self::BinomPmf,
+        Self::BinomCdf,
+        Self::BinomSf,
+        Self::BinomPpf,
+        Self::BinomIsf,
         Self::Boxcox,
         Self::InvBoxcox,
+        Self::Expm1,
+        Self::Log1p,
         Self::RiemannZeta,
         Self::Zeta,
     ];
@@ -223,10 +245,18 @@ impl Function {
             Self::Fdtri => "fdtri",
             Self::Pdtr => "pdtr",
             Self::Pdtrc => "pdtrc",
+            Self::Pdtrik => "pdtrik",
             Self::Bdtr => "bdtr",
             Self::Bdtrc => "bdtrc",
+            Self::BinomPmf => "_binom_pmf",
+            Self::BinomCdf => "_binom_cdf",
+            Self::BinomSf => "_binom_sf",
+            Self::BinomPpf => "_binom_ppf",
+            Self::BinomIsf => "_binom_isf",
             Self::Boxcox => "boxcox",
             Self::InvBoxcox => "inv_boxcox",
+            Self::Expm1 => "expm1",
+            Self::Log1p => "log1p",
             Self::RiemannZeta => "_riemann_zeta",
             Self::Zeta => "_zeta",
         }
@@ -251,6 +281,8 @@ impl Function {
             | Self::Logit
             | Self::LogExpit
             | Self::Entr
+            | Self::Expm1
+            | Self::Log1p
             | Self::RiemannZeta => 1,
             Self::Betainc
             | Self::Betaincc
@@ -259,7 +291,12 @@ impl Function {
             | Self::Fdtrc
             | Self::Fdtri
             | Self::Bdtr
-            | Self::Bdtrc => 3,
+            | Self::Bdtrc
+            | Self::BinomPmf
+            | Self::BinomCdf
+            | Self::BinomSf
+            | Self::BinomPpf
+            | Self::BinomIsf => 3,
             _ => 2,
         }
     }
@@ -276,6 +313,8 @@ impl Function {
             | Self::LogNdtr
             | Self::Xlogy
             | Self::Xlog1py
+            | Self::Expm1
+            | Self::Log1p
             | Self::RiemannZeta
             | Self::Zeta => Loops::Real { complex: true },
             Self::Logit => Loops::DoubleFirst,
@@ -290,7 +329,7 @@ impl Function {
         match self {
             Self::Erf => erf::erf(arg(0)),
             Self::Erfc => erf::erfc(arg(0)),
-            Self::Erfinv => erf::erfinv(arg(0)),
+            Self::Erfinv => erf_inv::erfinv(arg(0)),
             Self::Erfcinv => erf::erfcinv(arg(0)),
             Self::Gamma => gamma::gamma(arg(0)),
             Self::Rgamma => gamma::rgamma(arg(0)),
@@ -329,10 +368,18 @@ impl Function {
             Self::Fdtri => distributions::fdtri(arg(0), arg(1), arg(2)),
             Self::Pdtr => distributions::pdtr(arg(0), arg(1)),
             Self::Pdtrc => distributions::pdtrc(arg(0), arg(1)),
+            Self::Pdtrik => distributions::pdtrik(arg(0), arg(1)),
             Self::Bdtr => distributions::bdtr(arg(0), arg(1), arg(2)),
             Self::Bdtrc => distributions::bdtrc(arg(0), arg(1), arg(2)),
+            Self::BinomPmf => binomial::binom_pmf(arg(0), arg(1), arg(2)),
+            Self::BinomCdf => binomial::binom_cdf(arg(0), arg(1), arg(2)),
+            Self::BinomSf => binomial::binom_sf(arg(0), arg(1), arg(2)),
+            Self::BinomPpf => binomial::binom_ppf(arg(0), arg(1), arg(2)),
+            Self::BinomIsf => binomial::binom_isf(arg(0), arg(1), arg(2)),
             Self::Boxcox => elementary::boxcox(arg(0), arg(1)),
             Self::InvBoxcox => elementary::inv_boxcox(arg(0), arg(1)),
+            Self::Expm1 => unity::expm1(arg(0)),
+            Self::Log1p => unity::log1p(arg(0)),
             Self::RiemannZeta => gamma::riemann_zeta(arg(0)),
             Self::Zeta => gamma::zeta(arg(0), arg(1)),
         }
@@ -372,14 +419,15 @@ static VALUES: [ValueDef; Function::ALL.len() + 1] = values();
 
 /// One value per function under its own name, then `digamma`, SciPy's alias of `psi`.
 const fn values() -> [ValueDef; Function::ALL.len() + 1] {
-    let mut values =
-        [const { named_ufunc_value("digamma", Function::Psi.name()) }; Function::ALL.len() + 1];
+    let psi = Function::Psi as usize;
+    assert!(matches!(Function::ALL[psi], Function::Psi));
+    let mut values = [const { special_ufunc_value("digamma", 0) }; Function::ALL.len() + 1];
     let mut index = 0;
     while index < Function::ALL.len() {
-        let name = Function::ALL[index].name();
-        values[index] = named_ufunc_value(name, name);
+        values[index] = special_ufunc_value(Function::ALL[index].name(), index);
         index += 1;
     }
+    values[index] = special_ufunc_value("digamma", psi);
     values
 }
 

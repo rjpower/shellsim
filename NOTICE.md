@@ -16,7 +16,7 @@ below, which require these notices to accompany source and binary distributions.
 | SciPy | SciPy 1.18 Python and Cython sources | `src/python/stdlib/scipy/`, `src/python/stdlib/source/scipy/` | BSD-3-Clause |
 | xsf | SciPy's special-function library | `src/python/stdlib/scipy/special/` | BSD-3-Clause |
 | Cephes | Stephen L. Moshier's Cephes Math Library, as distributed in xsf | `src/python/stdlib/scipy/special/` | BSD-3-Clause |
-| Boost.Math | The incomplete beta function and its inverse, the Student's t and F distributions, the inverse incomplete gamma function and the Lanczos approximation, as used by SciPy and xsf | `src/python/stdlib/scipy/special/distributions.rs`, `gamma.rs`, `ibeta.rs`, `ibeta_inv.rs`, `igam.rs` | BSL-1.0 |
+| Boost.Math | The incomplete beta function and its inverse, the Student's t, F and binomial distributions, the inverse error function, the inverse incomplete gamma functions, the Lanczos approximation with its SSE2 evaluation, polynomial evaluation, and the TOMS 748 and discrete-quantile root finders, as used by SciPy and xsf | `src/python/stdlib/scipy/special/binomial.rs`, `boost.rs`, `distributions.rs`, `erf_inv.rs`, `gamma.rs`, `ibeta.rs`, `ibeta_inv.rs`, `igam.rs`, `roots.rs` | BSL-1.0 |
 
 ## NumPy
 

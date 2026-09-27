@@ -1,14 +1,18 @@
 //! Distribution functions built on the incomplete beta and gamma functions: Student's t
 //! (`stdtr`, `stdtrit`), F (`fdtr`, `fdtrc`, `fdtri`), chi-square (`chdtr`, `chdtrc`, `chdtri`),
-//! Poisson (`pdtr`, `pdtrc`) and binomial (`bdtr`, `bdtrc`).
+//! Poisson (`pdtr`, `pdtrc`, `pdtrik`) and binomial (`bdtr`, `bdtrc`).
 //!
-//! SciPy takes the t and F functions from Boost's distributions and the rest from Cephes. The
+//! SciPy takes the t and F functions and `pdtrik` from Boost and the rest from Cephes. The
 //! formulas and domain checks here follow those sources, including SciPy's handling of Boost's
 //! errors.
 
+use std::f64::consts::SQRT_2;
+
+use super::erf_inv::erfc_inv;
 use super::ibeta::{betainc, betaincc};
 use super::ibeta_inv::{ibeta_inv, students_t_quantile};
 use super::igam::{igam, igamc, igamci};
+use super::roots;
 
 /// Student's t cumulative distribution function with `df` degrees of freedom at `t`.
 pub(super) fn stdtr(df: f64, t: f64) -> f64 {
@@ -151,6 +155,103 @@ pub(super) fn pdtrc(k: f64, m: f64) -> f64 {
         return 0.0;
     }
     igam(k.floor() + 1.0, m)
+}
+
+/// Boost's `inverse_poisson_cornish_fisher`: a normal approximation with a skewness correction
+/// to the quantile at lower-tail probability `p` (`q = 1 - p`) of a Poisson distribution.
+fn inverse_poisson_cornish_fisher(lambda: f64, p: f64, q: f64) -> f64 {
+    let sigma = lambda.sqrt();
+    let skewness = 1.0 / sigma;
+    let mut x = erfc_inv(if p > q { 2.0 * q } else { 2.0 * p }) * SQRT_2;
+    if p < 0.5 {
+        x = -x;
+    }
+    let w = lambda + sigma * (x + skewness * (x * x - 1.0) / 6.0);
+    w.max(f64::MIN_POSITIVE)
+}
+
+/// Boost's `gamma_q_inva`: the `a` at which the regularized upper incomplete gamma function
+/// `Q(a, z)` equals `q`, for `0 < q < 1`, or `None` where Boost raises an error.
+///
+/// Boost brackets the root from a Cornish-Fisher guess and solves with TOMS 748 to four machine
+/// epsilons, as here. It evaluates Boost's own incomplete gamma function, where this uses the
+/// Cephes one, so results can differ in the last few places.
+fn gamma_q_inva(z: f64, q: f64) -> Option<f64> {
+    // SciPy's policy allows 400 iterations.
+    const MAX_ITERATIONS: u64 = 400;
+    let p = 1.0 - q;
+    if q == 0.0 {
+        return Some(f64::MIN_POSITIVE);
+    }
+    // Solve on the smaller tail, where the incomplete gamma function is accurate. Both forms
+    // decrease as `a` grows.
+    let mut objective = |a: f64| {
+        if p < q {
+            igam(a, z) - p
+        } else {
+            q - igamc(a, z)
+        }
+    };
+    // Boost writes most of these constants as `float` literals, which widen inexactly.
+    let mut factor = 8.0;
+    let guess = if z >= 1.0 {
+        let guess = 1.0 + inverse_poisson_cornish_fisher(z, q, p);
+        // Boost trusts the guess more for larger `z`.
+        if z > 5.0 {
+            factor = if guess < 1.1 {
+                8.0
+            } else if z > 1000.0 {
+                f64::from(1.01f32)
+            } else if z > 50.0 {
+                f64::from(1.1f32)
+            } else if guess > 10.0 {
+                1.25
+            } else {
+                2.0
+            };
+        }
+        guess
+    } else if z > 0.5 {
+        z * f64::from(1.2f32)
+    } else {
+        f64::from(-0.4f32) / z.ln()
+    };
+    let mut iterations = MAX_ITERATIONS;
+    let tolerance = roots::eps_tolerance(53);
+    let (low, high) = roots::bracket_and_solve_root(
+        &mut objective,
+        guess,
+        factor,
+        false,
+        &tolerance,
+        &mut iterations,
+    )?;
+    (iterations < MAX_ITERATIONS).then_some((low + high) / 2.0)
+}
+
+/// SciPy's `pdtrik`: the number of events `k`, as a real number, at which the Poisson
+/// distribution function with rate `m` reaches `p`. SciPy computes it as `gamma_q_inva(m, p) - 1`
+/// with Boost, clamped below at zero.
+pub(super) fn pdtrik(p: f64, m: f64) -> f64 {
+    if p.is_nan() || m.is_nan() || m < 0.0 || !(0.0..=1.0).contains(&p) {
+        return f64::NAN;
+    }
+    // As cdflib did, SciPy returns NaN at p = 1 and 0 at p = 0 or m = 0.
+    if p == 1.0 {
+        return f64::NAN;
+    }
+    if p == 0.0 || m == 0.0 {
+        return 0.0;
+    }
+    let Some(a) = gamma_q_inva(m, p) else {
+        return f64::NAN;
+    };
+    let k = a - 1.0;
+    if k < -1.0 {
+        f64::NAN
+    } else {
+        k.max(0.0)
+    }
 }
 
 /// The number of trials as Cephes receives it: a C `int`, so larger values wrap as the

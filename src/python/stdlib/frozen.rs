@@ -52,7 +52,8 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy.strings" => Some(include_str!("source/numpy/strings.py")),
         "numpy.testing" => Some(include_str!("source/numpy/testing.py")),
         "scipy" => Some(include_str!("source/scipy/__init__.py")),
-        "scipy.special" => Some(include_str!("source/scipy/special.py")),
+        "scipy.special" => Some(include_str!("source/scipy/special/__init__.py")),
+        "scipy.special._ufuncs" => Some(include_str!("source/scipy/special/_ufuncs.py")),
         "scipy.cluster"
         | "scipy.constants"
         | "scipy.datasets"

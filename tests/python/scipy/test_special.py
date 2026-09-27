@@ -139,6 +139,37 @@ def test_erf_inverses():
     close(special.erf(special.erfinv(x)), x)
 
 
+def test_expm1_and_log1p():
+    close(
+        special.expm1([-1e-300, -1e-10, 1e-5, 0.5, -0.75, 3.0, -40.0]),
+        [
+            -1e-300,
+            -9.9999999995000007e-11,
+            1.0000050000166668e-05,
+            0.6487212707001282,
+            -0.5276334472589853,
+            19.085536923187668,
+            -1.0,
+        ],
+    )
+    assert_array_equal(special.expm1([710.0, np.inf, -np.inf]), [np.inf, np.inf, -1.0])
+    close(
+        special.log1p([-1e-300, -1e-10, 1e-5, 0.5, -0.75, 3.0, 1e300]),
+        [
+            -1e-300,
+            -1.00000000005e-10,
+            9.999950000333332e-06,
+            0.4054651081081644,
+            -1.3862943611198906,
+            1.3862943611198906,
+            690.7755278982137,
+        ],
+    )
+    assert_array_equal(special.log1p([-1.0, -2.0, 0.0]), [-np.inf, np.nan, 0.0])
+    assert special.expm1(np.float32(0.5)).dtype == np.float32
+    assert special.log1p(np.int8(3)) == np.float32(1.3862944)
+
+
 def test_gamma():
     close(
         special.gamma([0.5, 1.0, 2.5, 5.0, 10.1, 171.5, -0.5, -2.5, 1e-8]),
@@ -411,6 +442,48 @@ def test_poisson_and_binomial_distribution_functions():
     )
 
 
+def test_poisson_quantile_in_the_rate():
+    close(
+        special.pdtrik([0.1, 0.5, 0.9, 0.999], [3.0, 3.0, 3.0, 50.0]),
+        [0.4206976115576928, 2.326737010766855, 4.791817705620666, 72.71304239410384],
+    )
+    # pdtrik inverts pdtr in k, continued to real k.
+    close(special.pdtrik(special.pdtr(np.arange(1.0, 6.0), 2.5), 2.5), np.arange(1.0, 6.0))
+    assert_array_equal(
+        special.pdtrik([1.0, 0.0, 0.5, 0.5, 1.5, np.nan], [2.0, 2.0, 0.0, -1.0, 2.0, 2.0]),
+        [np.nan, 0.0, 0.0, np.nan, np.nan, np.nan],
+    )
+    # The root falls below the smallest positive double, and SciPy clamps k at zero.
+    assert special.pdtrik(1e-300, 1e-5) == 0.0
+
+
+def test_private_binomial_ufuncs_for_stats():
+    from scipy.special import _ufuncs
+
+    close(
+        _ufuncs._binom_pmf([0, 3, 10], 10, 0.3),
+        [0.0282475249, 0.26682793199999982, 5.9048999999999975e-06],
+    )
+    assert np.isnan(_ufuncs._binom_pmf(11, 10, 0.3))
+    close(
+        _ufuncs._binom_cdf([0, 3, 9.5, np.inf, -np.inf], 10, 0.3),
+        [0.0282475249, 0.6496107184000002, 0.9999993467026342, 1.0, 0.0],
+    )
+    close(_ufuncs._binom_sf([0, 3], 10, 0.3), [0.9717524751, 0.3503892815999998])
+    assert _ufuncs._binom_sf(10, 10, 0.3) == 0.0
+    assert_array_equal(_ufuncs._binom_ppf([0.0, 0.1, 0.5, 0.9, 1.0], 10, 0.3), [0, 1, 3, 5, 10])
+    assert_array_equal(_ufuncs._binom_isf([0.0, 0.1, 0.5, 0.9, 1.0], 10, 0.3), [10, 5, 3, 1, 0])
+    # Boost's search, which SciPy calls, answers 0 at 1e-300 although cdf(0) < 1e-300.
+    assert_array_equal(
+        _ufuncs._binom_ppf([1e-300, 1e-250, 0.5, 1.5], 1000, 0.5), [0, 26, 500, np.nan]
+    )
+    assert_array_equal(_ufuncs._binom_pmf(3, 10, [0.0, 1.0, 1.5]), [0.0, 0.0, np.nan])
+    assert _ufuncs._binom_ppf(0.5, 10, 1.0) == 10.0
+    import scipy.special._ufuncs as scu
+
+    assert scu._binom_pmf is _ufuncs._binom_pmf
+
+
 def binomial_warnings(function, *args):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -538,3 +611,38 @@ def test_factorial():
     assert special.factorial(171) == np.inf
     with pytest.raises(ValueError, match="`exact=True` only supports integers"):
         special.factorial(0.5, exact=True)
+    # extend="complex" continues factorial through the gamma function to negative arguments.
+    close(special.factorial(-2.5, extend="complex"), 2.363271801207355)
+    close(special.factorial(np.array([3, 4.5, -2]), extend="complex"), [6.0, 52.34277778455352, np.nan])
+    assert np.isnan(special.factorial(np.array([-2.0]), extend="complex")[0])
+
+
+def test_double_factorial_and_multifactorial():
+    close(special.factorial2([7, 8, -1, 0]), [105.0, 384.0, 0.0, 1.0])
+    assert type(special.factorial2(7)) is np.float64
+    assert special.factorial2(7, exact=True) == 105
+    close(special.factorialk(10, 3), 280.0)
+    assert special.factorialk(10, 3, exact=True) == 280
+    exact = special.factorial2(np.array([5, 8]), exact=True)
+    assert exact.dtype == np.int64
+    assert_array_equal(exact, [15, 384])
+    # 34!! overflows int64, so the result holds Python integers.
+    exact = special.factorial2(np.array([33, 34]), exact=True)
+    assert exact.dtype == object
+    assert list(exact) == [6332659870762850625, 46620662575398912000]
+    assert_array_equal(special.factorialk(np.array([9, 10, 11]), 3, exact=True), [162, 280, 880])
+    close(special.factorialk([9, 10, 11], 3), [162.0, 280.0, 880.0])
+    close(special.factorial2(5.5, extend="complex"), 23.740417431378486)
+    result = special.factorialk(7, -2, extend="complex")
+    assert type(result) is np.complex128
+    close(result, 0.06666666666666667 + 2.4492935982947065e-17j)
+    with pytest.raises(ValueError, match="rescale the values of the double factorial"):
+        special.factorial2(5.0)
+    with pytest.raises(ValueError, match="rescale the values of the double factorial"):
+        special.factorial2(np.array([2.0]), exact=True)
+    with pytest.raises(ValueError, match="perturb the values of the multifactorial"):
+        special.factorialk(5, 2.0)
+    with pytest.raises(ValueError, match="Parameter k cannot be zero!"):
+        special.factorialk(5, 0, extend="complex")
+    with pytest.raises(ValueError, match="k must be a positive integer, received: -1"):
+        special.factorialk(5, -1)
