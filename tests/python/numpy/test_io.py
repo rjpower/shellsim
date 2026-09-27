@@ -325,3 +325,72 @@ def test_genfromtxt_leading_missing_value_and_explicit_float_dtype():
 def test_genfromtxt_skips_comments():
     loaded = np.genfromtxt(io.StringIO("# x\n1,2\n3,4\n"), delimiter=",")
     assert loaded.tolist() == [[1.0, 2.0], [3.0, 4.0]]
+
+
+def test_tobytes_uses_the_dtype_byte_order():
+    values = np.arange(3, dtype=np.int32)
+    assert values.tobytes() == b"\x00\x00\x00\x00\x01\x00\x00\x00\x02\x00\x00\x00"
+    assert values.astype(">i4").tobytes() == b"\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02"
+    assert np.array([1 + 2j], dtype=">c8").tobytes() == b"?\x80\x00\x00@\x00\x00\x00"
+
+
+def test_tobytes_order():
+    grid = np.arange(4, dtype=np.int16).reshape(2, 2)
+    assert grid.tobytes() == b"\x00\x00\x01\x00\x02\x00\x03\x00"
+    assert grid.tobytes(order="F") == b"\x00\x00\x02\x00\x01\x00\x03\x00"
+    assert grid.T.tobytes(order="A") == b"\x00\x00\x01\x00\x02\x00\x03\x00"
+    assert grid.T.tobytes() == b"\x00\x00\x02\x00\x01\x00\x03\x00"
+
+
+def test_frombuffer_reads_the_dtype_byte_order():
+    assert np.frombuffer(b"\x00\x00\x00\x01\x00\x00\x01\x00", dtype=">i4").tolist() == [1, 256]
+    assert np.frombuffer(b"\x01\x00\x00\x00", dtype="<i4").tolist() == [1]
+    assert np.frombuffer(b"\x01\x00\x02\x00\x03\x00", dtype="<i2", count=2, offset=2).tolist() == [2, 3]
+    assert np.frombuffer(b"\x00\x00\xc0?", dtype=np.float32).tolist() == [1.5]
+    assert np.frombuffer(b"\x01\x00", dtype=bool).tolist() == [True, False]
+
+
+def test_frombuffer_is_read_only():
+    values = np.frombuffer(b"\x01\x00", dtype="<i2")
+    assert not values.flags.writeable
+    with pytest.raises(ValueError):
+        values[0] = 2
+
+
+@pytest.mark.parametrize(
+    "data, count, offset",
+    [
+        (b"\x01\x00\x02", -1, 0),
+        (b"\x01\x00\x02\x00", 3, 0),
+        (b"\x01\x00", -1, 3),
+        (b"\x01\x00", -1, -1),
+    ],
+)
+def test_frombuffer_rejects_mismatched_sizes(data, count, offset):
+    with pytest.raises(ValueError):
+        np.frombuffer(data, dtype="<i2", count=count, offset=offset)
+
+
+def test_frombuffer_rejects_object_dtype_and_non_buffers():
+    with pytest.raises(ValueError):
+        np.frombuffer(b"\x00" * 8, dtype=object)
+    with pytest.raises(TypeError):
+        np.frombuffer([1, 2], dtype=np.int8)
+
+
+def test_byteswap_changes_values_but_not_dtype():
+    values = np.array([1, 256], dtype=np.int16)
+    swapped = values.byteswap()
+    assert swapped.dtype == np.int16
+    assert swapped.tolist() == [256, 1]
+    assert values.tolist() == [1, 256]
+    assert values.byteswap(inplace=True) is values
+    assert values.tolist() == [256, 1]
+
+
+def test_astype_to_the_other_byte_order_keeps_values_and_swaps_bytes():
+    values = np.array([1.5, -2.0])
+    converted = values.astype(values.dtype.newbyteorder())
+    assert converted.dtype.str == ">f8"
+    assert converted.tolist() == [1.5, -2.0]
+    assert converted.tobytes() == values.byteswap().tobytes()

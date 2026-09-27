@@ -507,3 +507,83 @@ def test_result_type_with_python_scalars():
 )
 def test_can_cast(source, target, casting, expected):
     assert np.can_cast(np.dtype(source), np.dtype(target), casting=casting) is expected
+
+
+def test_big_endian_dtype_attributes():
+    big = np.dtype(">i4")
+    assert big.str == ">i4"
+    assert big.name == "int32"
+    assert big.byteorder == ">"
+    assert not big.isnative
+    assert big.kind == "i"
+    assert big.itemsize == 4
+    assert big.type is np.int32
+    assert repr(big) == "dtype('>i4')"
+    assert big != np.dtype("<i4")
+    assert big == ">i4"
+    assert np.dtype("<i4").byteorder == "="
+    assert np.dtype("=i4").isnative
+
+
+@pytest.mark.parametrize("spec", [">u1", ">?", ">O", "<u1"])
+def test_single_byte_dtypes_have_no_byte_order(spec):
+    dtype = np.dtype(spec)
+    assert dtype.byteorder == "|"
+    assert dtype.str[0] == "|"
+
+
+@pytest.mark.parametrize(
+    "spec, order, expected",
+    [
+        (">i4", None, "<i4"),
+        ("<f8", ">", ">f8"),
+        (">i4", "=", "<i4"),
+        (">i4", "S", "<i4"),
+        ("<c16", "S", ">c16"),
+        ("<f2", "big", ">f2"),
+    ],
+)
+def test_newbyteorder(spec, order, expected):
+    dtype = np.dtype(spec)
+    swapped = dtype.newbyteorder() if order is None else dtype.newbyteorder(order)
+    assert swapped.str == expected
+
+
+def test_newbyteorder_rejects_unknown_codes():
+    with pytest.raises(ValueError):
+        np.dtype("<i4").newbyteorder("x")
+
+
+def test_big_endian_operands_promote_to_native_results():
+    values = np.arange(3).astype(">i4")
+    assert values.dtype.str == ">i4"
+    assert values.tolist() == [0, 1, 2]
+    assert (values + 1).dtype.str == "<i4"
+    assert (values * values).tolist() == [0, 1, 4]
+    assert np.promote_types(">i4", ">i4").str == "<i4"
+    assert np.promote_types(">i4", "<i2").str == "<i4"
+    assert np.result_type(values).str == "<i4"
+    assert values.sum() == 3
+
+
+def test_big_endian_arrays_keep_their_dtype_through_copies_and_indexing():
+    values = np.array([3.5, -1.0, 2.0], dtype=">f8")
+    assert values.copy().dtype.str == ">f8"
+    assert values[::2].dtype.str == ">f8"
+    assert values[[0, 2]].dtype.str == ">f8"
+    assert np.sort(values).dtype.str == ">f8"
+    assert np.sort(values).tolist() == [-1.0, 2.0, 3.5]
+    assert values.astype("<f8").dtype.str == "<f8"
+
+
+@pytest.mark.parametrize(
+    "source, target, casting, expected",
+    [
+        (">i4", "<i4", "no", False),
+        (">i4", "<i4", "equiv", True),
+        (">i4", ">i8", "safe", True),
+        (">f8", "<i4", "same_kind", False),
+    ],
+)
+def test_can_cast_between_byte_orders(source, target, casting, expected):
+    assert np.can_cast(source, target, casting=casting) is expected

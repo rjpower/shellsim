@@ -520,6 +520,54 @@ fn unsupported_or_invalid_array_operations_fail_explicitly() {
     }
 }
 
+/// Storage is little-endian whatever the dtype's byte order, so operations that would expose
+/// the difference are rejected rather than answered with wrong bytes.
+#[test]
+fn byte_order_frontier_fails_explicitly() {
+    for (source, expected) in [
+        (
+            "import numpy as np\nnp.arange(2.0).view('>f8')",
+            "ndarray.view between byte orders is not supported",
+        ),
+        (
+            "import numpy as np\nnp.array([1j], dtype='>c8').view('>f8')",
+            "ndarray.view between byte orders is not supported",
+        ),
+        (
+            "import numpy as np\nnp.dtype('>U3')",
+            "big-endian dtype '>U3' is not supported",
+        ),
+        (
+            "import numpy as np\nnp.array([1, 'a'], dtype=object).tobytes()",
+            "ndarray.tobytes of an object array is not supported",
+        ),
+    ] {
+        assert_fails_with(source, expected);
+    }
+}
+
+/// `frombuffer` copies because arrays cannot share a `bytearray`'s storage; the copy is
+/// read-only so a write NumPy would pass through fails instead of silently diverging.
+#[test]
+fn frombuffer_over_a_bytearray_is_a_read_only_copy() {
+    let source = r#"import numpy as np
+data = bytearray(b"\x01\x00\x02\x00")
+values = np.frombuffer(data, dtype="<i2")
+data[0] = 9
+print(values.tolist(), values.flags.writeable)
+try:
+    values[0] = 5
+except ValueError as error:
+    print(error)
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "[1, 2] False\nassignment destination is read-only\n"
+    );
+}
+
 #[test]
 fn array_allocation_obeys_the_modeled_memory_limit() {
     let environment = Environment::with_limits(Limits {

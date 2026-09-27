@@ -549,3 +549,22 @@ fn numpy_random_reserves_and_charges_before_drawing() {
     assert_eq!(stdout, b"seeded\n");
     assert!(stderr.is_empty());
 }
+
+#[test]
+fn numpy_byte_copies_reserve_memory_before_copying() {
+    // Bytes are charged at their length, and each copy reserves its host buffer before it is
+    // made. Peak use is about 20 MB after `frombuffer` and 26 MB during `tobytes`.
+    let limits = Limits {
+        cpu: 50_000_000,
+        memory: 22 * 1024 * 1024,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\ndata = bytes(6_000_000)\nvalues = np.frombuffer(data, np.uint8)\nprint('copied')\nvalues.tobytes()",
+        limits,
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 22 * 1024 * 1024);
+    assert_eq!(stdout, b"copied\n");
+    assert!(stderr.is_empty());
+}

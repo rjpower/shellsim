@@ -521,6 +521,17 @@ fn method_view(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
                 "ndarray.view with a dtype of a different item size is not supported",
             ));
         }
+        // Storage is little-endian whatever the dtype says, so reinterpreting it is faithful
+        // only between dtypes of one byte order, and not when big-endian complex parts would
+        // be split or joined.
+        let complex =
+            dtype.category() == Category::Complex || array.dtype.category() == Category::Complex;
+        let big_endian = !dtype.is_native() || !array.dtype.is_native();
+        if big_endian && (dtype.is_native() != array.dtype.is_native() || complex) {
+            return Err(PyError::unsupported(
+                "ndarray.view between byte orders is not supported",
+            ));
+        }
     }
     let view = array::new_view(
         runtime,

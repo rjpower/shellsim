@@ -2,8 +2,13 @@
 //!
 //! Every dtype is a [`DType`]: a [`Kind`] discriminant plus a character width for `str` arrays.
 //! Metadata comes from a `const` table indexed by the discriminant, so lookups never scan.
-//! Byte order is always little-endian; big-endian dtypes, bytes, structured, and datetime types
-//! are explicit frontiers.
+//!
+//! Storage is always little-endian. A multi-byte numeric dtype may still be big-endian (`>i4`):
+//! the byte order is an attribute of the descriptor that applies only where NumPy exposes raw
+//! bytes, such as `tobytes`, `frombuffer`, and `.npy` files. Computation reads the native
+//! storage, and every computed dtype (promotion, ufunc and reduction results, scalars) is
+//! native, as NumPy's `ensure_dtype_nbo` makes it. Big-endian strings, bytes, structured, and
+//! datetime types are explicit frontiers.
 //!
 //! Promotion follows NumPy 2 (NEP 50): arrays and NumPy scalars are *strong* and promote by
 //! [`promote`]; Python `bool`, `int`, `float`, and `complex` operands are *weak* and adopt the
@@ -127,12 +132,17 @@ impl Kind {
     }
 }
 
-/// One NumPy dtype. `chars` is meaningful only for [`Kind::Str`].
+/// One NumPy dtype. `chars` is meaningful only for [`Kind::Str`], and `big_endian` only for
+/// numeric kinds wider than one byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(in crate::python) struct DType {
     kind: Kind,
     chars: u32,
+    big_endian: bool,
 }
+
+/// Bit of a packed dtype that marks big-endian byte order; kinds use the bits below it.
+const BIG_ENDIAN_BIT: u32 = 0x80;
 
 /// Largest `str` width accepted, which keeps `itemsize` and the storage tag in range.
 pub(in crate::python) const MAX_STR_CHARS: u32 = (1 << 24) - 1;
@@ -156,7 +166,11 @@ impl DType {
 
     /// The dtype of a fixed-size kind. Use [`DType::str`] for strings.
     pub(in crate::python) const fn of(kind: Kind) -> Self {
-        Self { kind, chars: 0 }
+        Self {
+            kind,
+            chars: 0,
+            big_endian: false,
+        }
     }
 
     /// A `<U{chars}` string dtype.
@@ -168,7 +182,48 @@ impl DType {
         Ok(Self {
             kind: Kind::Str,
             chars,
+            big_endian: false,
         })
+    }
+
+    /// This dtype in big-endian byte order. Kinds without a byte order (one-byte numbers,
+    /// strings, and objects) are unchanged.
+    pub(in crate::python) fn big_endian(self) -> Self {
+        Self {
+            big_endian: self.has_byte_order(),
+            ..self
+        }
+    }
+
+    /// This dtype in the host's (little-endian) byte order.
+    pub(in crate::python) fn native(self) -> Self {
+        Self {
+            big_endian: false,
+            ..self
+        }
+    }
+
+    /// Whether elements are in the host's byte order, NumPy's `dtype.isnative`.
+    pub(in crate::python) fn is_native(self) -> bool {
+        !self.big_endian
+    }
+
+    /// Whether byte order means anything for this dtype. NumPy also gives `str` a byte order,
+    /// which is not modeled.
+    fn has_byte_order(self) -> bool {
+        self.is_numeric() && self.itemsize() > 1
+    }
+
+    /// NumPy's `dtype.byteorder`: `|` when byte order does not apply, `>` for big-endian, and
+    /// `=` for native.
+    pub(in crate::python) fn byte_order(self) -> char {
+        if self.big_endian {
+            '>'
+        } else if self.itemsize() == 1 || self.kind == Kind::Object {
+            '|'
+        } else {
+            '='
+        }
     }
 
     pub(in crate::python) fn kind(self) -> Kind {
@@ -235,16 +290,20 @@ impl DType {
             Kind::Str => format!("<U{}", self.chars),
             Kind::Object => "|O".to_string(),
             _ => {
-                let order = if self.itemsize() == 1 { '|' } else { '<' };
+                let order = match self.byte_order() {
+                    '=' => '<',
+                    order => order,
+                };
                 format!("{order}{}{}", self.kind_char(), self.itemsize())
             }
         }
     }
 
-    /// `str(dtype)`: the name for numbers and object, the descriptor for strings.
+    /// `str(dtype)`: the name for native numbers and object, the descriptor otherwise.
     pub(in crate::python) fn display(self) -> String {
         match self.kind {
             Kind::Str => self.descr(),
+            _ if self.big_endian => self.descr(),
             kind => kind.name().to_string(),
         }
     }
@@ -259,7 +318,7 @@ impl DType {
 
     /// The opaque storage description handed to the runtime.
     pub(in crate::python) fn storage(self) -> PyArrayDtype {
-        let tag = self.kind as u32 | self.chars << 8;
+        let tag = self.pack() as u32;
         if self.kind == Kind::Object {
             PyArrayDtype::values(tag)
         } else {
@@ -274,25 +333,37 @@ impl DType {
 
     /// Payload of a `numpy.dtype` value.
     pub(in crate::python) fn pack(self) -> u64 {
-        u64::from(self.kind as u32 | self.chars << 8)
+        let order = if self.big_endian { BIG_ENDIAN_BIT } else { 0 };
+        u64::from(self.kind as u32 | order | self.chars << 8)
     }
 
     pub(in crate::python) fn unpack(payload: u64) -> Option<Self> {
-        let kind = Kind::from_index((payload & 0xff) as u8)?;
+        let kind = Kind::from_index((payload & u64::from(BIG_ENDIAN_BIT - 1)) as u8)?;
         let chars = u32::try_from(payload >> 8).ok()?;
-        (kind == Kind::Str || chars == 0).then_some(Self { kind, chars })
+        let dtype = Self {
+            kind,
+            chars,
+            big_endian: payload & u64::from(BIG_ENDIAN_BIT) != 0,
+        };
+        let valid =
+            (kind == Kind::Str || chars == 0) && (!dtype.big_endian || dtype.has_byte_order());
+        valid.then_some(dtype)
     }
 
     /// Parse a dtype string such as `int8`, `<i8`, `f`, `U5`, or `object`.
     pub(in crate::python) fn parse(text: &str) -> PyResult<Self> {
         let not_understood = || PyError::type_error(format!("data type '{text}' not understood"));
-        let body = match text.as_bytes().first() {
-            Some(b'<' | b'=' | b'|') => &text[1..],
-            Some(b'>') if text.len() > 1 => {
+        if let Some(body) = text.strip_prefix('>').filter(|body| !body.is_empty()) {
+            let dtype = Self::parse(body)?;
+            if dtype.kind == Kind::Str {
                 return Err(PyError::unsupported(format!(
                     "big-endian dtype '{text}' is not supported"
-                )))
+                )));
             }
+            return Ok(dtype.big_endian());
+        }
+        let body = match text.as_bytes().first() {
+            Some(b'<' | b'=' | b'|') => &text[1..],
             _ => text,
         };
         if let Some(width) = body.strip_prefix('U') {
@@ -399,6 +470,7 @@ fn wider(left: DType, right: DType) -> DType {
 /// with a number raises NumPy's `DTypePromotionError`-style `TypeError`.
 pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<DType> {
     use Category::*;
+    let (left, right) = (left.native(), right.native());
     let (a, b) = if left.category() <= right.category() {
         (left, right)
     } else {
@@ -476,6 +548,7 @@ impl Weak {
 /// NEP 50: the result dtype of a strong dtype combined with a weak Python scalar.
 pub(in crate::python) fn promote_weak(strong: DType, weak: Weak) -> PyResult<DType> {
     use Category::*;
+    let strong = strong.native();
     Ok(match (strong.category(), weak) {
         (Object, _) => DType::OBJECT,
         (Str, _) => return promote(strong, weak.default_dtype()),
@@ -498,7 +571,7 @@ pub(in crate::python) fn result_type(strong: &[DType], weak: &[Weak]) -> PyResul
             .max()
             .map_or(DType::FLOAT64, |weak| weak.default_dtype()));
     };
-    let mut result = *first;
+    let mut result = first.native();
     for dtype in rest {
         result = promote(result, *dtype)?;
     }
@@ -564,9 +637,10 @@ pub(in crate::python) fn str_width_for(dtype: DType) -> usize {
     }
 }
 
-/// Whether every value of `from` converts to `to` without loss.
+/// Whether every value of `from` converts to `to` without loss. Byte order never loses values.
 fn safe_cast(from: DType, to: DType) -> bool {
     use Category::*;
+    let (from, to) = (from.native(), to.native());
     if from == to || to.category() == Object {
         return true;
     }
@@ -581,7 +655,8 @@ fn safe_cast(from: DType, to: DType) -> bool {
 /// `np.can_cast(from, to, casting)`.
 pub(in crate::python) fn can_cast(from: DType, to: DType, casting: Casting) -> bool {
     match casting {
-        Casting::No | Casting::Equiv => from == to,
+        Casting::No => from == to,
+        Casting::Equiv => from.native() == to.native(),
         Casting::Safe => safe_cast(from, to),
         Casting::SameKind => {
             safe_cast(from, to)

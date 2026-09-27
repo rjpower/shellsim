@@ -1134,6 +1134,9 @@ pub(in crate::python) fn resolve(
     inputs: &[DType],
     requested: Option<DType>,
 ) -> PyResult<Resolved> {
+    // Loops run in native byte order, so results are native even for big-endian operands.
+    let common = common.native();
+    let requested = requested.map(DType::native);
     let name = ufunc.name;
     let same = |dtype: DType| Resolved {
         input: dtype,
@@ -1567,6 +1570,12 @@ pub(in crate::python) fn prepare(
         Operand::Array(array) if dtype.kind() == Kind::Str && array.dtype.kind() == Kind::Str => {
             Ok(array.clone())
         }
+        // Storage is native whatever the dtype's byte order, so a big-endian operand reads as
+        // its native twin without a copy.
+        Operand::Array(array) if array.dtype.native() == dtype => Ok(Array {
+            dtype,
+            ..array.clone()
+        }),
         Operand::Array(array) => convert::cast_array(runtime, array, dtype, false),
         Operand::Weak { value, leaf, .. } => convert::weak_array(runtime, *value, leaf, dtype),
     }

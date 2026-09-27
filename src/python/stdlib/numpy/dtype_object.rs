@@ -5,7 +5,8 @@
 //! hold, while an operand that is not a dtype specification compares unequal.
 
 use super::super::super::native::{
-    CallArgs, GetterDef, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, MethodDef, PyError, PyResult, PyRuntime, PyValue, ValueKindDef,
+    ValueKindSlots,
 };
 use super::super::super::Value;
 use super::dtype::{DType, Kind};
@@ -21,7 +22,11 @@ pub(in crate::python) static DTYPE: ValueKindDef = ValueKindDef {
         not_equal: Some(slot_not_equal),
         ..NO_SLOTS
     },
-    methods: &[],
+    methods: &[MethodDef {
+        type_name: "numpy.dtype",
+        name: "newbyteorder",
+        call: method_newbyteorder,
+    }],
     getters: &[
         getter("name", get_name),
         getter("kind", get_kind),
@@ -149,12 +154,7 @@ fn get_itemsize(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
 
 fn get_byteorder(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     let dtype = receiver(runtime, &value);
-    let order = if dtype.itemsize() == 1 || dtype.kind() == Kind::Object {
-        "|"
-    } else {
-        "="
-    };
-    runtime.new_string(order.to_string())
+    runtime.new_string(dtype.byte_order().to_string())
 }
 
 fn get_type(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
@@ -192,13 +192,50 @@ fn get_base(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     Ok(value)
 }
 
-fn get_isbuiltin(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
-    Ok(Value::Int(1))
+/// Native dtypes are NumPy's builtin descriptors; a big-endian one is a derived instance.
+fn get_isbuiltin(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(Value::Int(i64::from(receiver(runtime, &value).is_native())))
 }
 
-/// Every modeled dtype stores elements in the host's byte order.
-fn get_isnative(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
-    Ok(Value::Bool(true))
+fn get_isnative(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+    Ok(Value::Bool(receiver(runtime, &value).is_native()))
+}
+
+/// `dtype.newbyteorder(new_order='S')`: `S` swaps, `<`/`L`/`=`/`N`/`I`/`|` select native order,
+/// and `>`/`B` big-endian.
+fn method_newbyteorder(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    static SIGNATURE: super::args::Signature =
+        super::args::Signature::new("newbyteorder", &["new_order"], 0);
+    let bound = SIGNATURE.bind(&args)?;
+    let dtype = receiver(runtime, &receiver_value);
+    // `PyArray_ByteorderConverter` reads only the first character, so "big" and "swap" work.
+    let order = match bound.value("new_order") {
+        Some(value) => match runtime.string_value(&value)? {
+            Some(text) => text,
+            None => {
+                return Err(PyError::type_error(format!(
+                    "byteorder must be str, not {}",
+                    runtime.type_name(&value)?
+                )))
+            }
+        },
+        None => "S".to_string(),
+    };
+    let dtype = match order.chars().next() {
+        Some('S' | 's') if dtype.is_native() => dtype.big_endian(),
+        Some('S' | 's' | '<' | 'L' | 'l' | '=' | 'N' | 'n' | 'I' | 'i' | '|') => dtype.native(),
+        Some('>' | 'B' | 'b') => dtype.big_endian(),
+        _ => {
+            return Err(PyError::value_error(format!(
+                "byteorder not recognized (got {order:?})"
+            )))
+        }
+    };
+    new(runtime, dtype)
 }
 
 fn get_hasobject(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
