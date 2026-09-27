@@ -61,6 +61,12 @@ pub(super) fn frozen_module(name: &str) -> Option<&'static str> {
     frozen::module_source(name)
 }
 
+/// True when `name` is a frozen package rather than a plain module (see
+/// [`frozen::is_package`]).
+pub(super) fn frozen_module_is_package(name: &str) -> bool {
+    frozen::is_package(name)
+}
+
 /// Resolve a builtin implemented by a frozen module without preloading that module into the VFS.
 pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)> {
     match name {

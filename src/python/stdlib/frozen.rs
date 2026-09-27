@@ -3,6 +3,25 @@
 //! Frozen modules execute through the same lexer, compiler, object model, and resource accounting
 //! as user code. They receive no VFS or host capabilities merely by being part of the stdlib.
 
+/// True when `name` is a frozen *package* (its source is an `__init__.py`), rather than a plain
+/// module. The importer needs this to set `__package__` correctly for relative imports inside a
+/// package's own `__init__.py`: unlike a plain module `a.b`, whose `__package__` is its parent
+/// `a`, a package `a.b`'s `__package__` is `a.b` itself. Kept as an explicit list, in step with
+/// [`module_source`], rather than derived from it, since the embedded source string no longer
+/// carries its original file path once compiled in.
+pub(super) fn is_package(name: &str) -> bool {
+    matches!(
+        name,
+        "numpy"
+            | "numpy.lib"
+            | "scipy"
+            | "scipy._lib"
+            | "scipy.linalg"
+            | "scipy.special"
+            | "scipy.stats"
+    )
+}
+
 /// Return source for a bundled module. Keep this registry closed and explicit so adding a module
 /// cannot accidentally expose build-machine files at runtime.
 pub(super) fn module_source(name: &str) -> Option<&'static str> {
