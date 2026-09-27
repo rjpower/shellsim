@@ -5,8 +5,7 @@
 //! `inspect.Parameter` kind. A bound method omits its bound first parameter, as
 //! `inspect.signature` does. Any other callable gives `None`. The helper reads only what the
 //! compiler recorded for the function; no frame, local variable or host state crosses this
-//! boundary. `scipy.stats` uses it to infer distribution shape parameters, where SciPy uses
-//! `inspect.signature`.
+//! boundary. The frozen `inspect` module builds `inspect.signature` on it.
 
 use super::super::bytecode::ParameterKind;
 use super::super::native::{CallArgs, FunctionDef, ModuleDef, PyResult, PyRuntime};

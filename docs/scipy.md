@@ -27,11 +27,10 @@ raise `NotImplementedError` when imported.
   statistics, and the correlation and hypothesis tests, computing with NumPy and
   `scipy.special`. Each distribution supplies `_pdf`/`_pmf` and `_cdf` (and, where a closed form
   exists, `_ppf`, `_stats`, `_entropy` and `_rvs`); generic methods derived from whichever of
-  those a subclass defines cover the rest, the way SciPy's do. SciPy uses `inspect` to find a
-  distribution's shape parameters from the signatures of `_pdf` and `_cdf`, and to add `axis`,
-  `nan_policy` and `keepdims` to its statistics. shellsim has no `inspect`, so this reads
-  parameters through a private module, `_shellsim_introspect`, and each statistic declares
-  SciPy's full signature itself.
+  those a subclass defines cover the rest, the way SciPy's do. As in SciPy, `inspect.signature`
+  of `_pdf` and `_cdf` gives a distribution's shape parameters. Each statistic declares SciPy's
+  full signature, including `axis`, `nan_policy` and `keepdims`, rather than having a decorator
+  add them.
 - **`scipy.linalg`** is frozen Python that follows SciPy's modules over a native module,
   `_scipy_linalg`, which plays the parts of SciPy's compiled code: the C++ `_batched_linalg`
   loops behind `solve`, `inv`, `det`, `lu`, `cholesky` and `qr`, the `expm` kernel, and the f2py

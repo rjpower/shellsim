@@ -1007,3 +1007,16 @@ def test_center_puts_the_odd_padding_unit_where_cpython_does():
     assert "".center(3, "*") == "***"
     assert b"ab".center(5, b"*") == b"**ab*"
     assert bytearray(b"a").center(4, b"*") == bytearray(b"*a**")
+
+
+def test_callable_recognizes_call_methods_and_native_methods():
+    class Callable:
+        def __call__(self):
+            return 1
+
+    class Inherits(Callable):
+        pass
+
+    assert callable(Callable()) and callable(Inherits())
+    assert not callable(object())
+    assert callable(str.upper) and callable("a".upper) and callable(dict.fromkeys)

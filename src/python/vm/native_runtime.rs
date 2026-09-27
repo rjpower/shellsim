@@ -1279,6 +1279,8 @@ impl PyRuntime for Vm<'_> {
                         | NativeValue::BuiltinType(_)
                         | NativeValue::ValueKind(_)
                         | NativeValue::NativeFunction(_)
+                        | NativeValue::NativeMethod(_)
+                        | NativeValue::NativeClassMethod(_)
                         | NativeValue::ExceptionType(_)
                 )
             ) || self
@@ -1287,12 +1289,29 @@ impl PyRuntime for Vm<'_> {
             {
                 true
             } else if let Some(id) = value.object_id() {
-                matches!(
-                    self.state.heap.get(id).map_err(PyError::runtime_error)?,
+                match self.state.heap.get(id).map_err(PyError::runtime_error)? {
                     Object::Function { .. }
-                        | Object::Class { .. }
-                        | Object::DescriptorBoundMethod { .. }
-                )
+                    | Object::Class { .. }
+                    | Object::DescriptorBoundMethod { .. } => true,
+                    // An instance is callable when its class or an ancestor defines `__call__`.
+                    Object::Instance { class, .. } => {
+                        let heap = &self.state.heap;
+                        let defines_call = |class: &crate::python::heap::ObjectId| {
+                            matches!(
+                                heap.get(*class),
+                                Ok(Object::Class { attributes, .. })
+                                    if attributes.contains_key("__call__")
+                            )
+                        };
+                        match heap.get(*class).map_err(PyError::runtime_error)? {
+                            Object::Class { mro, .. } => {
+                                defines_call(class) || mro.iter().any(defines_call)
+                            }
+                            _ => false,
+                        }
+                    }
+                    _ => false,
+                }
             } else {
                 false
             },

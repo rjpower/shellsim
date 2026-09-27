@@ -81,7 +81,9 @@ builtin accepts one source string and executes it in the simulated namespace. Co
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
 `partial`. The frozen `contextlib` module provides `contextmanager`, `suppress`, `nullcontext`,
-`closing`, and `ExitStack`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
+`closing`, and `ExitStack`. The frozen `inspect` module provides `signature`, `Signature`, and
+`Parameter` for Python functions, bound methods, classes with a Python `__init__`, and instances
+with a Python `__call__`; builtin callables have no signature and raise `ValueError`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
 `attrgetter`, and `methodcaller`.
 
 `math` includes `isclose`, the hyperbolic functions and their inverses, and `gamma` and

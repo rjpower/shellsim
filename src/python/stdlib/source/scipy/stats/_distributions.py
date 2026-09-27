@@ -10,14 +10,13 @@ a generic implementation derived from whichever of ``_pdf``/``_cdf``/``_ppf`` *i
 (numerical differentiation, integration or bisection), mirroring SciPy's own fallbacks but with a
 single simple implementation of each instead of SciPy's layered dispatch.
 
-shellsim has no ``inspect.signature``, so a subclass's shape parameters are read from the
-declared parameters of its ``_pdf``/``_pmf`` and ``_cdf`` methods through the private
-``_shellsim_introspect`` module (see that module's docstring), the same information SciPy reads
-with ``inspect``. The public methods themselves are generated once per instance with ``exec`` so
+A subclass's shape parameters are read from the declared parameters of its ``_pdf``/``_pmf``
+and ``_cdf`` methods with ``inspect.signature``, as in SciPy. The public methods themselves are generated once per instance with ``exec`` so
 that shellsim's own CPython-compatible argument binding produces SciPy's argument-count and
 keyword-argument error messages, instead of this module reproducing that text by hand.
 """
 
+import inspect
 import math
 
 import numpy as np
@@ -25,7 +24,6 @@ import numpy as np
 from scipy import special
 from scipy.special._ufuncs import _binom_cdf, _binom_isf, _binom_pmf, _binom_ppf
 from scipy._lib._util import check_random_state
-import _shellsim_introspect
 
 __all__ = [
     "rv_continuous",
@@ -121,16 +119,16 @@ class rv_generic:
         for method_name in self._shape_methods:
             if getattr(cls, method_name, None) is self._generic_method(method_name):
                 continue
-            params = _shellsim_introspect.parameters(getattr(self, method_name))
+            params = list(inspect.signature(getattr(self, method_name)).parameters.values())
             if not params:
                 continue
             names = []
-            for pname, kind, has_default, _default in params[1:]:
-                if kind in ("VAR_POSITIONAL", "VAR_KEYWORD"):
+            for param in params[1:]:
+                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
                     raise TypeError("*args are not allowed w/out explicit shapes")
-                if has_default:
-                    raise TypeError(f"defaults are not allowed for shapes: {pname}=...")
-                names.append(pname)
+                if param.default is not inspect.Parameter.empty:
+                    raise TypeError(f"defaults are not allowed for shapes: {param.name}=...")
+                names.append(param.name)
             candidates.append(names)
 
         nonempty = [names for names in candidates if names]

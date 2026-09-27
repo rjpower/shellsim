@@ -24,6 +24,7 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "http" => Some(include_str!("source/http.py")),
         "http.client" => Some(include_str!("source/http_client.py")),
         "importlib" | "importlib.util" => Some(include_str!("source/importlib.py")),
+        "inspect" => Some(include_str!("source/inspect.py")),
         "_io" => Some(include_str!("source/io.py")),
         "io" => Some(include_str!("source/io.py")),
         "json" => Some(include_str!("source/json.py")),
