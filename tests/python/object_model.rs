@@ -291,3 +291,27 @@ print(hasattr(sys.stdin, 'buffer'))
         )
     );
 }
+
+#[test]
+fn functions_report_their_names() {
+    let source = r#"def outer():
+    def inner():
+        pass
+    return inner
+
+class C:
+    def method(self):
+        pass
+
+print(outer.__name__, outer().__name__, (lambda: 0).__name__, C.method.__name__)
+print(getattr(outer, "__name__"), hasattr(outer, "__name__"))
+"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "outer inner <lambda> method\nouter True\n".into(),
+            String::new()
+        )
+    );
+}

@@ -363,6 +363,14 @@ impl Vm<'_> {
                     let name = self.allocate_string(name.to_string())?;
                     return self.invoke_value(hook, vec![name]).map(Some);
                 }
+                Object::Function {
+                    name: function_name,
+                    ..
+                } => {
+                    if name == "__name__" {
+                        return Ok(Some(self.allocate_string(function_name)?));
+                    }
+                }
                 Object::Class {
                     name: class_name, ..
                 } => {
