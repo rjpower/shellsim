@@ -226,7 +226,12 @@ impl NativeValue {
         match self {
             Self::BuiltinType(builtin_type) => format!("<class '{}'>", builtin_type.name()),
             Self::ValueKind(kind) => format!("<class '{}'>", kind.name),
-            Self::ExceptionType(ExceptionType(name)) => format!("<class '{name}'>"),
+            Self::ExceptionType(ExceptionType(name)) => {
+                match exception_types::exception_type(name).map(|definition| definition.module) {
+                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
+                    _ => format!("<class '{name}'>"),
+                }
+            }
             Self::NativeGetter(getter) => format!("{getter:?}"),
             Self::Ellipsis => "Ellipsis".into(),
             Self::NotImplemented => "NotImplemented".into(),
@@ -317,6 +322,7 @@ pub(super) enum Builtin {
     ClassMethod,
     Super,
     SetAttribute,
+    DeleteAttribute,
 }
 
 /// The builtin functions the VM implements itself, by Python name. `exit` and `quit` share one.
@@ -357,6 +363,7 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
     ("classmethod", Builtin::ClassMethod),
     ("super", Builtin::Super),
     ("setattr", Builtin::SetAttribute),
+    ("delattr", Builtin::DeleteAttribute),
 ];
 
 impl Builtin {
@@ -1418,7 +1425,6 @@ enum SequenceKind {
 struct ClassDefinition {
     name: String,
     bases: Vec<Value>,
-    user_bases: Vec<super::heap::ObjectId>,
     mro: Vec<super::heap::ObjectId>,
     metaclass: Value,
     layout: ClassLayout,

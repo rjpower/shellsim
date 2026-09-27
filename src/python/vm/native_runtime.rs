@@ -656,6 +656,16 @@ impl PyRuntime for Vm<'_> {
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
+    fn delete_attribute_default(&mut self, value: Value, name: &str) -> PyResult<()> {
+        let symbol = self
+            .state
+            .heap
+            .intern_symbol(name, &mut self.interp.resources)
+            .map_err(PyError::runtime_error)?;
+        Vm::delete_attribute_default(self, value, symbol, name)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn list_len(&self, list: PyList) -> PyResult<usize> {
         match self
             .state
@@ -1215,7 +1225,6 @@ impl PyRuntime for Vm<'_> {
         self.allocate_class(ClassDefinition {
             name,
             bases,
-            user_bases,
             mro,
             metaclass,
             layout,

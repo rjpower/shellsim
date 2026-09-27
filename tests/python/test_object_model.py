@@ -394,3 +394,161 @@ def test_setattr_receives_every_assignment_and_object_setattr_stores():
     with_property = WithProperty()
     with_property.x = 1
     assert with_property.x == 101
+
+
+class PlainClass:
+    pass
+
+
+class MixedChild(PlainClass, ValueError):
+    pass
+
+
+class MixedGrandchild(MixedChild):
+    pass
+
+
+class Relocated:
+    __module__ = "elsewhere"
+
+
+class Movable:
+    pass
+
+
+class Unwritable:
+    @property
+    def fixed(self):
+        return 1
+
+
+def test_classes_record_their_module_bases_and_mro():
+    assert PlainClass.__module__ == __name__ and PlainClass().__module__ == __name__
+    assert repr(PlainClass) == f"<class '{__name__}.PlainClass'>"
+    assert PlainClass.__bases__ == (object,)
+    assert MixedChild.__bases__ == (PlainClass, ValueError)
+    assert MixedGrandchild.__mro__ == (
+        MixedGrandchild,
+        MixedChild,
+        PlainClass,
+        ValueError,
+        Exception,
+        BaseException,
+        object,
+    )
+    assert MixedGrandchild.mro() == list(MixedGrandchild.__mro__)
+    assert UserId.__mro__ == (UserId, int, object)
+    assert Relocated.__module__ == "elsewhere"
+    assert repr(Relocated) == "<class 'elsewhere.Relocated'>"
+    Movable.__module__ = "moved"
+    assert repr(Movable) == "<class 'moved.Movable'>"
+
+    def local():
+        pass
+
+    assert local.__module__ == __name__
+
+
+def test_builtin_types_report_their_module_bases_and_mro():
+    assert (int.__module__, ValueError.__module__, len.__module__) == ("builtins", "builtins", "builtins")
+    assert bool.__bases__ == (int,) and bool.__mro__ == (bool, int, object)
+    assert object.__bases__ == () and object.__mro__ == (object,)
+    assert KeyError.__bases__ == (LookupError,)
+    assert KeyError.__mro__ == (KeyError, LookupError, Exception, BaseException, object)
+    assert int.mro() == [int, object]
+
+
+def test_class_attributes_can_change_after_the_class_statement():
+    class Counter:
+        pass
+
+    class Derived(Counter):
+        pass
+
+    counter, derived = Counter(), Derived()
+    Counter.limit = 3
+    assert (Counter.limit, counter.limit, Derived.limit, derived.limit) == (3, 3, 3, 3)
+
+    # Special methods assigned later take effect for the class and its subclasses.
+    Counter.__eq__ = lambda self, other: other == "any"
+    assert counter == "any" and derived == "any"
+    del Counter.__eq__
+    assert counter != "any"
+    del Counter.limit
+    assert not hasattr(derived, "limit")
+    try:
+        del Counter.limit
+    except AttributeError as error:
+        assert str(error) == "type object 'Counter' has no attribute 'limit'"
+    else:
+        raise AssertionError("deleting a missing class attribute succeeded")
+
+    # A data descriptor added to the class takes precedence over an instance attribute that
+    # was already read.
+    def read(instance):
+        return instance.value
+
+    counter.value = 1
+    assert read(counter) == 1
+    Counter.value = property(lambda self: 99)
+    assert read(counter) == 99
+
+
+def test_del_and_delattr_remove_attributes_through_the_protocol():
+    class Recorder:
+        def __init__(self):
+            self.log = []
+
+        def __delattr__(self, name):
+            self.log.append(name)
+            object.__delattr__(self, name)
+
+    recorder = Recorder()
+    recorder.temporary = 1
+    del recorder.temporary
+    assert recorder.log == ["temporary"] and not hasattr(recorder, "temporary")
+    try:
+        delattr(recorder, "temporary")
+    except AttributeError as error:
+        assert str(error) == "'Recorder' object has no attribute 'temporary'"
+    else:
+        raise AssertionError("deleting a missing attribute succeeded")
+    assert recorder.log == ["temporary", "temporary"]
+
+    wide = PlainClass()
+    for index in range(20):
+        setattr(wide, f"field{index}", index)
+    del wide.field3
+    assert not hasattr(wide, "field3") and wide.field4 == 4
+
+    class Deletable:
+        def __init__(self):
+            self.deleted = []
+
+        def __get__(self, instance, owner=None):
+            return 7
+
+        def __set__(self, instance, value):
+            pass
+
+        def __delete__(self, instance):
+            self.deleted.append(instance)
+
+    descriptor = Deletable()
+
+    class Holder:
+        slot = descriptor
+
+    holder = Holder()
+    del holder.slot
+    assert descriptor.deleted == [holder]
+    for statement, message in [
+        (lambda: delattr(Unwritable(), "fixed"), "property 'fixed' of 'Unwritable' object has no deleter"),
+        (lambda: delattr(1, "x"), "'int' object has no attribute 'x' and no __dict__ for setting new attributes"),
+    ]:
+        try:
+            statement()
+        except AttributeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(message)

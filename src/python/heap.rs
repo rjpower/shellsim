@@ -154,8 +154,8 @@ pub enum Object {
         /// Semantic type identity used by instances of this class.
         instance_type: TypeId,
         name: String,
-        /// Direct user-defined bases in source order.
-        bases: Vec<ObjectId>,
+        /// Every direct base in source order, native bases included: `__bases__`.
+        bases: Vec<Value>,
         /// C3-linearized user-defined ancestors, excluding this class.
         mro: Vec<ObjectId>,
         /// The callable type object responsible for this class.
@@ -720,6 +720,45 @@ impl Heap {
         Ok(())
     }
 
+    /// Remove one instance attribute and return its value, or `None` when the instance does
+    /// not have it. A shaped instance first converts to dictionary storage, because shapes only
+    /// grow; attribute caches never match dictionary instances, so they stay valid.
+    pub fn remove_attribute_by_symbol(
+        &mut self,
+        id: ObjectId,
+        symbol: SymbolId,
+        resources: &mut Resources,
+    ) -> Result<Option<Value>, String> {
+        let shaped = match &self
+            .objects
+            .get(id.0)
+            .and_then(Option::as_ref)
+            .ok_or("invalid object reference")?
+            .payload
+        {
+            Object::Instance {
+                attributes: InstanceAttributes::Shaped { shape, .. },
+                ..
+            } => Some(*shape),
+            Object::Instance { .. } => None,
+            _ => return Err("object does not have instance attributes".into()),
+        };
+        if let Some(shape) = shaped {
+            if self.shape_slot(shape, symbol).is_none() {
+                return Ok(None);
+            }
+            self.convert_to_dictionary(id, 0, resources)?;
+        }
+        let Object::Instance {
+            attributes: InstanceAttributes::Dictionary(values),
+            ..
+        } = self.get_mut(id)?
+        else {
+            unreachable!("instance was converted to dictionary storage")
+        };
+        Ok(values.remove(&symbol))
+    }
+
     fn insert_dictionary_attribute(
         &mut self,
         id: ObjectId,
@@ -727,6 +766,28 @@ impl Heap {
         value: Value,
         resources: &mut Resources,
     ) -> Result<(), String> {
+        if !self.convert_to_dictionary(id, INSTANCE_DICT_ENTRY_BYTES, resources)? {
+            return self.insert_attribute_by_symbol(id, symbol, value, resources);
+        }
+        let Object::Instance {
+            attributes: InstanceAttributes::Dictionary(values),
+            ..
+        } = self.get_mut(id)?
+        else {
+            unreachable!("instance was converted to dictionary storage")
+        };
+        values.insert(symbol, value);
+        Ok(())
+    }
+
+    /// Move a shaped instance's attributes into dictionary storage, reserving `extra` more
+    /// bytes. Returns `false` when the instance already uses a dictionary.
+    fn convert_to_dictionary(
+        &mut self,
+        id: ObjectId,
+        extra: u64,
+        resources: &mut Resources,
+    ) -> Result<bool, String> {
         let (shape, shaped_len) = match &self
             .objects
             .get(id.0)
@@ -741,17 +802,13 @@ impl Heap {
             Object::Instance {
                 attributes: InstanceAttributes::Dictionary(_),
                 ..
-            } => return self.insert_attribute_by_symbol(id, symbol, value, resources),
+            } => return Ok(false),
             _ => return Err("object does not have instance attributes".into()),
         };
         let existing = u64::try_from(shaped_len)
             .unwrap_or(u64::MAX)
             .saturating_mul(INSTANCE_DICT_ENTRY_BYTES.saturating_sub(INSTANCE_SLOT_BYTES));
-        self.reserve_object_growth(
-            id,
-            existing.saturating_add(INSTANCE_DICT_ENTRY_BYTES),
-            resources,
-        )?;
+        self.reserve_object_growth(id, existing.saturating_add(extra), resources)?;
         let shaped_values = match &self
             .objects
             .get(id.0)
@@ -772,7 +829,6 @@ impl Heap {
                 .ok_or("invalid instance shape slot")?;
             values.insert(attribute, value);
         }
-        values.insert(symbol, value);
         let Object::Instance { attributes, .. } = &mut self
             .objects
             .get_mut(id.0)
@@ -783,7 +839,7 @@ impl Heap {
             unreachable!("instance was validated before dictionary conversion")
         };
         *attributes = InstanceAttributes::Dictionary(values);
-        Ok(())
+        Ok(true)
     }
 
     fn shape_slot(&self, mut shape: ShapeId, attribute: SymbolId) -> Option<usize> {
@@ -1423,7 +1479,7 @@ fn trace_object(
             enum_members,
             ..
         } => {
-            object_work.extend(bases.iter().copied());
+            trace_values(bases.iter().copied(), object_work);
             object_work.extend(mro.iter().copied());
             trace_value(*metaclass, object_work);
             trace_values(attributes.values().copied(), object_work);

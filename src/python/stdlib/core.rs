@@ -260,6 +260,7 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
         method("object", "__eq__", object_eq),
         method("object", "__ne__", object_ne),
         method("object", "__setattr__", object_setattr),
+        method("object", "__delattr__", object_delattr),
     ],
     getters: &[],
 };
@@ -281,7 +282,10 @@ pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
 
 pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
-    methods: &[method("type", "__new__", type_new)],
+    methods: &[
+        method("type", "__new__", type_new),
+        method("type", "mro", type_mro),
+    ],
     getters: &[],
 };
 
@@ -3607,6 +3611,25 @@ fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     Ok(Value::Int(super::super::hash::identity(identity)))
 }
 
+/// `object.__delattr__(name)`: the default deletion, which a class's own `__delattr__` calls.
+fn object_delattr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("object.__delattr__")?;
+    let [name] = args.positional() else {
+        return Err(PyError::type_error(format!(
+            "expected 1 argument, got {}",
+            args.positional().len()
+        )));
+    };
+    let Some(name) = runtime.string_value(name)? else {
+        return Err(PyError::type_error(format!(
+            "attribute name must be string, not '{}'",
+            runtime.type_name(name)?
+        )));
+    };
+    runtime.delete_attribute_default(receiver, &name)?;
+    Ok(Value::None)
+}
+
 /// `object.__setattr__(name, value)`: the default assignment, which a class's own
 /// `__setattr__` calls to store a value after checking or transforming it.
 fn object_setattr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -3691,6 +3714,17 @@ fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     args.reject_keywords("type.__new__")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     runtime.new_type(receiver, name, args.positional()[1], args.positional()[2])
+}
+
+/// `cls.mro()`: the method resolution order as a list.
+fn type_mro(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("type.mro", 0, 0)?;
+    args.reject_keywords("type.mro")?;
+    let order = runtime
+        .get_attribute(receiver, "__mro__")?
+        .ok_or_else(|| PyError::type_error("descriptor 'mro' requires a type"))?;
+    let items = order.cast::<PyTuple>(runtime)?.items(runtime)?;
+    runtime.new_list(items)
 }
 
 pub(crate) fn slot_string_add(

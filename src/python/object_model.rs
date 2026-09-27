@@ -764,18 +764,7 @@ impl TypeRegistry {
         attributes: &HashMap<String, Value>,
     ) -> Result<TypeId, String> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
-        let mut slots = TypeSlots::from_attributes(attributes);
-        for slot in Slot::ALL {
-            if slots.get(slot).is_some() {
-                continue;
-            }
-            if let Some(value) = mro
-                .iter()
-                .find_map(|ancestor| self.get(*ancestor).ok()?.slots.get(slot).cloned())
-            {
-                slots.set(slot, value);
-            }
-        }
+        let slots = self.inherit_slots(TypeSlots::from_attributes(attributes), &mro);
         let ty = PyType {
             name,
             bases,
@@ -787,6 +776,61 @@ impl TypeRegistry {
         self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
         self.types.push(ty);
         Ok(TypeId(index))
+    }
+
+    /// Fill the slots a type does not define from the first ancestor in `mro` that does.
+    fn inherit_slots(&self, mut slots: TypeSlots, mro: &[TypeId]) -> TypeSlots {
+        for slot in Slot::ALL {
+            if slots.get(slot).is_some() {
+                continue;
+            }
+            if let Some(value) = mro
+                .iter()
+                .find_map(|ancestor| self.get(*ancestor).ok()?.slots.get(slot).cloned())
+            {
+                slots.set(slot, value);
+            }
+        }
+        slots
+    }
+
+    /// The number of registered types, which bounds the work of [`TypeRegistry::subtypes`].
+    pub fn len(&self) -> usize {
+        self.types.len()
+    }
+
+    /// `id` and the types that derive from it, in registration order, which places every base
+    /// before its subclasses.
+    pub fn subtypes(&self, id: TypeId) -> Vec<TypeId> {
+        (0..self.types.len())
+            .filter_map(|index| u32::try_from(index).ok().map(TypeId))
+            .filter(|candidate| {
+                *candidate == id || self.types[candidate.0 as usize].mro.contains(&id)
+            })
+            .collect()
+    }
+
+    /// Recompute a user type's slots from its class attributes after one of them changed,
+    /// inheriting the rest through its MRO as [`TypeRegistry::register`] does.
+    pub fn replace_slots(
+        &mut self,
+        id: TypeId,
+        attributes: &HashMap<String, Value>,
+    ) -> Result<(), String> {
+        let mro = self.get(id)?.mro.clone();
+        let slots = self.inherit_slots(TypeSlots::from_attributes(attributes), &mro);
+        let ty = self
+            .types
+            .get_mut(id.0 as usize)
+            .ok_or("invalid type reference")?;
+        let before = modeled_type_bytes(ty);
+        ty.slots = slots;
+        let after = modeled_type_bytes(ty);
+        self.modeled_bytes = self
+            .modeled_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        Ok(())
     }
 
     pub fn finish(&mut self, id: TypeId, value: Value) -> Result<(), String> {

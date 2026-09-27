@@ -138,6 +138,13 @@ impl Vm<'_> {
                     ))
                 }
                 Opcode::StoreSubscript => dispatch_next(self.store_subscript()),
+                Opcode::DeleteAttribute(name) => {
+                    let symbol = self
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.delete_attribute_by_symbol(owner, symbol, code.name(name)))
+                }
                 Opcode::DeleteName(name) => {
                     let symbol = self
                         .symbol_for(code, code_cache, name)

@@ -880,17 +880,18 @@ impl Compiler {
                 self.expression(index);
                 self.emit(Operation::DeleteSubscript, span);
             }
+            AssignmentTarget::Attribute { value, name } => {
+                self.expression(value);
+                self.emit(Operation::DeleteAttribute(name), span);
+            }
             AssignmentTarget::Sequence(targets) => {
                 for target in targets {
                     self.delete(target, span);
                 }
             }
-            AssignmentTarget::Attribute { .. } | AssignmentTarget::Star(_) => {
+            AssignmentTarget::Star(_) => {
                 self.emit(
-                    Operation::RuntimeError(
-                        "this deletion target is not implemented; names and subscripts are supported"
-                            .into(),
-                    ),
+                    Operation::RuntimeError("cannot delete starred".into()),
                     span,
                 );
             }

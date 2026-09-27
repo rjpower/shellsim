@@ -7,12 +7,14 @@
 //! not modeled. A user class that derives from one of these records it as its exception base, and
 //! its subclass checks start from that base.
 
-/// One exception class: its name, its parent, and whether `builtins` binds the name.
+/// One exception class: its name, its parent, whether `builtins` binds the name, and the
+/// `__module__` CPython reports for it.
 pub(super) struct ExceptionTypeDef {
     pub(super) name: &'static str,
     /// `None` only for `BaseException`.
     pub(super) parent: Option<&'static str>,
     pub(super) builtin: bool,
+    pub(super) module: &'static str,
 }
 
 const fn builtin(name: &'static str, parent: &'static str) -> ExceptionTypeDef {
@@ -20,14 +22,20 @@ const fn builtin(name: &'static str, parent: &'static str) -> ExceptionTypeDef {
         name,
         parent: Some(parent),
         builtin: true,
+        module: "builtins",
     }
 }
 
-const fn native(name: &'static str, parent: &'static str) -> ExceptionTypeDef {
+const fn native(
+    name: &'static str,
+    parent: &'static str,
+    module: &'static str,
+) -> ExceptionTypeDef {
     ExceptionTypeDef {
         name,
         parent: Some(parent),
         builtin: false,
+        module,
     }
 }
 
@@ -37,6 +45,7 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
         name: "BaseException",
         parent: None,
         builtin: true,
+        module: "builtins",
     },
     builtin("GeneratorExit", "BaseException"),
     builtin("KeyboardInterrupt", "BaseException"),
@@ -105,17 +114,17 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     // The pytest runner's wrapper catches `Skipped` by name and reports `Failed` like any other
     // `Exception`, so both stay below `Exception` rather than pytest's `BaseException`.
     builtin("Skipped", "Exception"),
-    native("Failed", "Exception"),
-    native("SubprocessError", "Exception"),
-    native("CalledProcessError", "SubprocessError"),
-    native("TimeoutExpired", "SubprocessError"),
+    native("Failed", "Exception", "builtins"),
+    native("SubprocessError", "Exception", "subprocess"),
+    native("CalledProcessError", "SubprocessError", "subprocess"),
+    native("TimeoutExpired", "SubprocessError", "subprocess"),
     // NumPy's AxisError also derives from IndexError; one parent is modeled, and ValueError is
     // the one NumPy's own documentation leads with.
-    native("AxisError", "ValueError"),
-    native("LinAlgError", "ValueError"),
-    native("UFuncTypeError", "TypeError"),
-    native("DTypePromotionError", "TypeError"),
-    native("ComplexWarning", "RuntimeWarning"),
+    native("AxisError", "ValueError", "numpy.exceptions"),
+    native("LinAlgError", "ValueError", "numpy.linalg"),
+    native("UFuncTypeError", "TypeError", "numpy._core._exceptions"),
+    native("DTypePromotionError", "TypeError", "numpy.exceptions"),
+    native("ComplexWarning", "RuntimeWarning", "numpy.exceptions"),
 ];
 
 /// Look up a modeled exception class by name.

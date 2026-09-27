@@ -60,7 +60,15 @@ testing `NotImplemented` for truth raises `TypeError`. Lists, tuples, dictionari
 elements, find keys, and answer `in` with `x is y or x == y`, so a class's `__eq__` holds inside
 containers and an equal key of another type, such as `0.5` for `Fraction(1, 2)`, finds a dict entry.
 `object` provides `__hash__`, `__eq__`, and `__ne__`, so a class that defines `__eq__` can keep
-identity hashing with `__hash__ = object.__hash__`. Builtin functions, native methods and bound
+identity hashing with `__hash__ = object.__hash__`.
+
+Classes record their defining module as `__module__` and report `__bases__`, `__mro__`, and
+`mro()`, including native bases such as `int` and the exception hierarchy; `repr` qualifies the
+class name with its module. Class attributes, special methods included, may be assigned or deleted
+after the class statement, and the change applies to existing instances and subclasses. `del
+obj.attr` and `delattr` delete through the descriptor protocol: a class's `__delattr__`, a
+descriptor's `__delete__`, then the instance's own attribute. Classes and functions have no
+`__qualname__` or `__doc__`, so a nested class's `repr` omits its enclosing scope. Builtin functions, native methods and bound
 methods report `__name__`, and bound methods expose `__self__` and `__func__`. A subclass of `int`
 inherits the native `int` methods such as `bit_length` and `to_bytes`, and `from_bytes` called on
 the subclass returns an instance of it.

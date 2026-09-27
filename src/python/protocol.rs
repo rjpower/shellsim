@@ -330,7 +330,15 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
             }
             Object::Function { name, .. } => format!("<function {name}>"),
-            Object::Class { name, .. } => format!("<class '{name}'>"),
+            Object::Class {
+                name, attributes, ..
+            } => match attributes.get("__module__") {
+                Some(module) => match string_value(heap, module)? {
+                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
+                    _ => format!("<class '{name}'>"),
+                },
+                None => format!("<class '{name}'>"),
+            },
             Object::Instance { class, payload, .. } => match payload {
                 InstancePayload::Int(value) => value.to_string(),
                 InstancePayload::Object => match heap.get(*class)? {

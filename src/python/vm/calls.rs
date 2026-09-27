@@ -1213,6 +1213,25 @@ impl Vm<'_> {
                 self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
                 Ok(CallResult::Value(Value::None))
             }
+            Builtin::DeleteAttribute => {
+                if arguments.len() != 2 {
+                    let message = format!("delattr expected 2 arguments, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                    let message = format!(
+                        "attribute name must be string, not '{}'",
+                        self.type_name_of(&arguments[1])?
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                };
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
+                Ok(CallResult::Value(Value::None))
+            }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
                 let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
