@@ -1703,8 +1703,12 @@ fn build_pytest_item(
         test.name,
         arguments.join(", ")
     ));
+    // As in pytest, teardown resumes each yield fixture past its `yield`; a second `yield` is an
+    // error rather than a place to stop.
     for generator in teardown.into_iter().rev() {
-        item.push_str(&format!("{generator}.close()\n"));
+        item.push_str(&format!(
+            "for _ in {generator}:\n    raise RuntimeError(\"fixture function has more than one 'yield'\")\n"
+        ));
     }
     Ok(item)
 }

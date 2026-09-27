@@ -1442,6 +1442,8 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
+    /// `generator.close()`: raise `GeneratorExit` at the suspended `yield`. The generator may run
+    /// cleanup code, but yielding another value is an error.
     fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
         let id = generator.object_id();
         if !matches!(
@@ -1450,18 +1452,41 @@ impl PyRuntime for Vm<'_> {
         ) {
             return Err(PyError::type_error("expected a generator"));
         }
-        // A compact approximation of GeneratorExit: drive the bounded frame through its
-        // cleanup path and discard values yielded while closing.
-        while self
-            .resume_generator(id)
-            .map_err(PyError::runtime_error)?
-            .is_some()
-        {}
-        Ok(())
+        let value = self
+            .allocate_exception("GeneratorExit".into(), String::new())
+            .map_err(PyError::resource_error)?;
+        let exit = RaisedException {
+            kind: "GeneratorExit".into(),
+            value,
+        };
+        match self.throw_into_generator(id, exit) {
+            Ok(Some(_)) => Err(PyError::runtime_error("generator ignored GeneratorExit")),
+            Ok(None) => Ok(()),
+            Err(error) => match self.pending_exception.take() {
+                Some(exception)
+                    if matches!(exception.kind.as_str(), "GeneratorExit" | "StopIteration") =>
+                {
+                    Ok(())
+                }
+                Some(exception) => {
+                    self.pending_exception = Some(exception);
+                    Err(PyError::new(PyErrorKind::Raised, error))
+                }
+                None => Err(PyError::runtime_error(error)),
+            },
+        }
     }
 
+    /// `generator.throw(exception)`: raise `exception`, an instance or an exception class, at the
+    /// suspended `yield` and return the next value the generator yields.
     fn generator_throw(&mut self, generator: PyIterator, exception: Value) -> PyResult {
-        self.generator_close(generator)?;
+        let id = generator.object_id();
+        if !matches!(
+            self.state.heap.get(id).map_err(PyError::runtime_error)?,
+            Object::Generator { .. }
+        ) {
+            return Err(PyError::type_error("expected a generator"));
+        }
         let raised = if let Some((kind, _)) =
             protocol::exception_parts(&self.state.heap, &exception)
                 .map_err(PyError::runtime_error)?
@@ -1481,13 +1506,20 @@ impl PyRuntime for Vm<'_> {
                 value,
             }
         } else {
-            return Err(PyError::type_error("generator.throw expects an exception"));
+            return Err(PyError::type_error(
+                "exceptions must be classes or instances deriving from BaseException, not "
+                    .to_string()
+                    + &self.type_name(&exception)?,
+            ));
         };
-        self.pending_exception = Some(raised);
-        Err(PyError::new(
-            PyErrorKind::Raised,
-            "generator exception raised",
-        ))
+        match self.throw_into_generator(id, raised) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(PyError::exception("StopIteration", "")),
+            Err(error) if self.pending_exception.is_some() => {
+                Err(PyError::new(PyErrorKind::Raised, error))
+            }
+            Err(error) => Err(PyError::runtime_error(error)),
+        }
     }
 
     fn new_iterator(&mut self, values: Vec<Value>) -> PyResult<Value> {

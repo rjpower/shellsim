@@ -32,8 +32,10 @@ The runtime supports functions and closures, classes and descriptors, exceptions
 managers, comprehensions and lazy generators, arbitrary-precision integers, mutable containers,
 f-strings, VFS imports, and the common language protocols needed by real scripts. Generators
 support `yield`, `yield from`, `send`, `throw`, and `close`, including suspension in `try` and
-`with` regions. Generator shutdown uses a deliberately simple bounded drain through pending
-cleanup code.
+`with` regions. `throw` raises the exception at the suspended `yield`, so the generator's
+`except`, `finally`, and `with` blocks handle it, and `close` raises `GeneratorExit` there. `yield
+from` re-yields the items of its iterable; it does not forward `send`, `throw`, or `close` to a
+subgenerator, and it evaluates to `None`.
 
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
@@ -78,7 +80,8 @@ simulated loader for absolute imports; relative
 builtin accepts one source string and executes it in the simulated namespace. Code objects and
 explicit globals or locals mappings are not supported.
 The frozen `functools` module provides `reduce` and positional and keyword argument binding with
-`partial`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
+`partial`. The frozen `contextlib` module provides `contextmanager`, `suppress`, `nullcontext`,
+`closing`, and `ExitStack`. The frozen `operator` module provides CPython's operator functions, `itemgetter`,
 `attrgetter`, and `methodcaller`.
 
 `math` includes `isclose`, the hyperbolic functions and their inverses, and `gamma` and

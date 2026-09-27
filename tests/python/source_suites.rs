@@ -11,6 +11,7 @@ use shellsim::{Environment, Limits};
 
 const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
+const CONTEXTLIB: &[u8] = include_bytes!("test_contextlib.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const FRACTIONS: &[u8] = include_bytes!("test_fractions.py");
@@ -68,6 +69,11 @@ fn builtins() {
 #[test]
 fn asyncio() {
     assert_source_suite("test_asyncio.py", ASYNCIO);
+}
+
+#[test]
+fn contextlib() {
+    assert_source_suite("test_contextlib.py", CONTEXTLIB);
 }
 
 #[test]

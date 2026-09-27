@@ -311,6 +311,98 @@ def test_generators_suspend_with_persistent_lexical_state():
     assert thrown_cleanup == ["closed"]
 
 
+def test_generator_throw_raises_at_the_suspended_yield():
+    def recovering():
+        try:
+            yield "first"
+        except ValueError as error:
+            yield f"handled {error}"
+        yield "last"
+
+    generator = recovering()
+    assert next(generator) == "first"
+    assert generator.throw(ValueError("bad")) == "handled bad"
+    assert next(generator) == "last"
+
+    def finishing():
+        try:
+            yield
+        except KeyError:
+            return
+
+    finished = finishing()
+    next(finished)
+    try:
+        finished.throw(KeyError)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("a generator that returns after throw() must raise StopIteration")
+
+    exits = []
+
+    class Recorder:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, kind, value, traceback):
+            exits.append(kind.__name__)
+            return kind is ValueError
+
+    def managed():
+        with Recorder():
+            yield "inside"
+        yield "after"
+
+    inside = managed()
+    assert next(inside) == "inside"
+    assert inside.throw(ValueError("swallowed")) == "after"
+    assert exits == ["ValueError"]
+
+    def unstarted():
+        yield "never"
+
+    fresh = unstarted()
+    try:
+        fresh.throw(ValueError("early"))
+    except ValueError as error:
+        assert str(error) == "early"
+    assert next(fresh, "done") == "done"
+
+
+def test_generator_close_raises_generator_exit_without_resuming():
+    events = []
+
+    def steps():
+        try:
+            yield 1
+            events.append("resumed")
+            yield 2
+        finally:
+            events.append("cleanup")
+
+    generator = steps()
+    assert next(generator) == 1
+    assert generator.close() is None
+    assert events == ["cleanup"]
+    assert next(generator, "done") == "done"
+
+    def stubborn():
+        try:
+            yield 1
+        except GeneratorExit:
+            yield 2
+
+    ignoring = stubborn()
+    next(ignoring)
+    try:
+        ignoring.close()
+    except RuntimeError as error:
+        assert str(error) == "generator ignored GeneratorExit"
+    else:
+        raise AssertionError("close() must reject a generator that yields again")
+
+
 def test_numeric_literals_and_arithmetic_match_python():
     values = [1.2, 0.5, 1.0, 1_000.50_0, 1_2e-1, 1_2e1]
     assert values == [1.2, 0.5, 1.0, 1000.5, 1.2, 120.0]

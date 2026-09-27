@@ -5,6 +5,13 @@ use super::{
     PyErrorKind, PyRuntime, PyStreamRead, Stream, Value, Vm,
 };
 
+/// How a suspended generator resumes: with the value of its `yield` expression, or with an
+/// exception raised at that `yield`.
+enum GeneratorResume {
+    Send(Value),
+    Throw(super::RaisedException),
+}
+
 /// An iterator classified by [`Vm::advance_iterator`] whose advance needs a second, unborrowed
 /// pass over `self` (a heap lookup for a sequence, or a descriptor read for a stream).
 enum SlowPathAdvance {
@@ -348,6 +355,28 @@ impl Vm<'_> {
         id: super::super::heap::ObjectId,
         sent: Value,
     ) -> Result<Option<Value>, String> {
+        self.resume_generator_frame(id, GeneratorResume::Send(sent))
+    }
+
+    /// Raise `exception` at the generator's suspended `yield`, as `generator.throw` does.
+    ///
+    /// The frame's innermost active handler receives it, so `except`, `finally` and `with`
+    /// blocks run as they would for an exception raised there. The result is the next yielded
+    /// value, or `None` once the generator returns. An exception the generator does not handle,
+    /// including one thrown before it starts or after it finishes, stays pending and closes it.
+    pub(super) fn throw_into_generator(
+        &mut self,
+        id: super::super::heap::ObjectId,
+        exception: super::RaisedException,
+    ) -> Result<Option<Value>, String> {
+        self.resume_generator_frame(id, GeneratorResume::Throw(exception))
+    }
+
+    fn resume_generator_frame(
+        &mut self,
+        id: super::super::heap::ObjectId,
+        resume: GeneratorResume,
+    ) -> Result<Option<Value>, String> {
         const MAX_GENERATOR_DEPTH: usize = 256;
         if self.call_depth >= MAX_GENERATOR_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
@@ -384,31 +413,60 @@ impl Vm<'_> {
             ),
             _ => return Err("object is not a generator".into()),
         };
-        if exhausted {
-            return Ok(None);
-        }
-        if instruction_pointer == 0 && !sent.is_none() {
-            return Err("can't send non-None value to a just-started generator".into());
-        }
         if running {
             return Err("generator already executing".into());
+        }
+        let handler = match &resume {
+            GeneratorResume::Send(sent) => {
+                if exhausted {
+                    return Ok(None);
+                }
+                if instruction_pointer == 0 && !sent.is_none() {
+                    return Err("can't send non-None value to a just-started generator".into());
+                }
+                None
+            }
+            GeneratorResume::Throw(_) if exhausted => None,
+            GeneratorResume::Throw(_) => handlers.pop(),
+        };
+        if let GeneratorResume::Throw(exception) = &resume {
+            if handler.is_none() {
+                // Nothing at the suspension point handles it, so it leaves the generator at once.
+                if let Object::Generator { exhausted, .. } = self.state.heap.get_mut(id)? {
+                    *exhausted = true;
+                }
+                self.pending_exception = Some(exception.clone());
+                return Err(format!("{} thrown into generator", exception.kind));
+            }
         }
         if let Object::Generator { running, .. } = self.state.heap.get_mut(id)? {
             *running = true;
         }
         let outer_stack = std::mem::take(&mut self.stack);
         self.stack = frame_stack;
-        if instruction_pointer != 0 {
-            self.stack.push(sent);
-        }
         let generator_exceptions = exceptions
             .into_iter()
             .map(|(kind, value)| super::RaisedException { kind, value })
             .collect();
         let outer_exceptions = std::mem::replace(&mut self.exception_stack, generator_exceptions);
+        let start = match (resume, handler) {
+            (GeneratorResume::Send(sent), _) => {
+                if instruction_pointer != 0 {
+                    self.stack.push(sent);
+                }
+                instruction_pointer
+            }
+            (GeneratorResume::Throw(exception), Some((target, depth))) => {
+                self.stack.truncate(depth);
+                self.stack.push(exception.value);
+                self.exception_stack.push(exception);
+                target
+            }
+            (GeneratorResume::Throw(_), None) => unreachable!("an unhandled throw returned above"),
+        };
         self.local_scopes.push(scope);
         self.call_depth += 1;
-        let result = self.execute_code_from(&code, instruction_pointer, &mut handlers, 0);
+        let result = self.execute_code_from(&code, start, &mut handlers, 0);
         self.call_depth -= 1;
         self.local_scopes.pop();
         let generator_exceptions = std::mem::replace(&mut self.exception_stack, outer_exceptions)
