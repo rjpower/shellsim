@@ -246,6 +246,21 @@ def test_ascii_escapes_non_ascii_characters():
     assert ascii("caf\u00e9 \u4e00 \U0001f600") == "'caf\\xe9 \\u4e00 \\U0001f600'"
 
 
+def test_float_hex_matches_cpython():
+    cases = [
+        (1.0, "0x1.0000000000000p+0"),
+        (-3.5, "-0x1.c000000000000p+1"),
+        (0.1, "0x1.999999999999ap-4"),
+        (1e300, "0x1.7e43c8800759cp+996"),
+        (5e-324, "0x0.0000000000001p-1022"),
+        (-0.0, "-0x0.0p+0"),
+        (float("-inf"), "-inf"),
+        (float("nan"), "nan"),
+    ]
+    for value, text in cases:
+        assert value.hex() == text
+
+
 def test_id_matches_identity():
     first = []
     second = []

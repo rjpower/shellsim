@@ -193,6 +193,11 @@ pub(super) static FLOAT_TYPE: NativeTypeDef = NativeTypeDef {
             name: "as_integer_ratio",
             call: float_as_integer_ratio,
         },
+        MethodDef {
+            type_name: "float",
+            name: "hex",
+            call: float_hex,
+        },
     ],
     ..real_number_type!("float")
 };
@@ -242,6 +247,51 @@ fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: Cal
     let numerator = runtime.new_integer(&numerator.to_string())?;
     let denominator = runtime.new_integer(&denominator.to_string())?;
     runtime.new_tuple(vec![numerator, denominator])
+}
+
+/// `float.hex()`: the exact value in C99 hexadecimal notation, with all 13 fraction digits.
+///
+/// ```text
+/// (0.1).hex() == '0x1.999999999999ap-4'
+/// (5e-324).hex() == '0x0.0000000000001p-1022'
+/// ```
+fn float_hex(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+    args.reject_keywords("float.hex")?;
+    if !args.positional().is_empty() {
+        return Err(PyError::type_error(format!(
+            "float.hex() takes no arguments ({} given)",
+            args.positional().len()
+        )));
+    }
+    let Some(NumberRef::Float(value)) = runtime.number(&value) else {
+        return Err(PyError::type_error(
+            "descriptor 'hex' requires a 'float' object",
+        ));
+    };
+    runtime.new_string(float_hex_text(value))
+}
+
+fn float_hex_text(value: f64) -> String {
+    if value.is_nan() {
+        return "nan".to_string();
+    }
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value.is_infinite() {
+        return format!("{sign}inf");
+    }
+    if value == 0.0 {
+        return format!("{sign}0x0.0p+0");
+    }
+    let bits = value.to_bits();
+    let biased = (bits >> 52) & 0x7ff;
+    let fraction = bits & ((1u64 << 52) - 1);
+    // Subnormals keep the minimum exponent with a leading 0 digit.
+    let (leading, exponent) = if biased == 0 {
+        (0, -1022)
+    } else {
+        (1, biased as i64 - 1023)
+    };
+    format!("{sign}0x{leading}.{fraction:013x}p{exponent:+}")
 }
 
 /// `float.is_integer()`: whether a finite float has no fractional part.
