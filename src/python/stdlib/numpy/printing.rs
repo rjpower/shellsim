@@ -13,8 +13,8 @@ use super::super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyError, PyKind, PyResult, PyRuntime, PyValue,
 };
 use super::args::{float_arg, index_int, Bound, Signature};
-use super::float_digits::{self, Options, Trim};
 use super::element::Number;
+use super::float_digits::{self, Options, Trim};
 use super::format::Precision;
 use super::scalar::{precision, unbox_number};
 

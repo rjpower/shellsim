@@ -23,8 +23,9 @@ use std::cmp::Ordering;
 use super::super::super::ast::{BinaryOperator, ComparisonOperator, UnaryOperator};
 use super::super::super::native::{
     CallArgs, GetterDef, MethodDef, PyArray, PyArrayBuffer, PyArrayData, PyError, PyErrorKind,
-    PyKind, PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    PyKind, PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
+use super::super::super::number::NumberRef;
 use super::super::super::Value;
 use super::super::scipy::special::{
     evaluate as evaluate_special, Function as SpecialFunction, Loops as SpecialLoops,
@@ -2326,9 +2327,70 @@ fn complex_fn(op: FloatOp) -> Option<ComplexFn> {
     })
 }
 
-/// `np.sqrt` of a complex value: the principal square root.
+/// `np.sqrt` of a complex value: the principal square root, with a nonnegative real part and
+/// the branch cut along the negative real axis.
+///
+/// Special values (any operand `inf`, `nan`, or signed zero) follow C99 Annex G's `csqrt`,
+/// confirmed black-box against the reference interpreter's `np.sqrt` across every sign and
+/// `{finite, 0, inf, nan}` combination of the real and imaginary parts. The finite case uses
+/// the classic half-angle formula (Abramowitz & Stegun 3.7.27: for `z = x + yi` with modulus
+/// `m`, `re(sqrt z) = sqrt((m + x) / 2)` and `im(sqrt z) = y / (2 re(sqrt z))` when `x >= 0`,
+/// mirrored through `im` when `x < 0`), which is exact on the real and imaginary axes and needs
+/// only one `hypot` and one `sqrt`, unlike `exp(0.5 * log(z))`.
+///
+/// `re` and `im` are prescaled by a power of ten when either magnitude is extreme enough that
+/// `hypot(re, im)` could overflow (or underflow to zero) even though the true square root is
+/// representable, for example `sqrt(1.7e308 + 1.7e308i) ≈ 1.4e154 + 5.9e153i`: the identity
+/// `sqrt(z) == k * sqrt(z / k^2)` recovers the true result from the rescaled inputs.
 fn complex_sqrt((re, im): (f64, f64)) -> (f64, f64) {
-    todo!("clean-room rewrite: sqrt({re}, {im})")
+    if im.is_infinite() {
+        return (f64::INFINITY, im);
+    }
+    if re.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
+    if re == f64::INFINITY {
+        return if im.is_nan() {
+            (f64::INFINITY, f64::NAN)
+        } else {
+            (f64::INFINITY, 0.0_f64.copysign(im))
+        };
+    }
+    if re == f64::NEG_INFINITY {
+        return if im.is_nan() {
+            (f64::NAN, f64::INFINITY)
+        } else {
+            (0.0, f64::INFINITY.copysign(im))
+        };
+    }
+    if im.is_nan() {
+        return (f64::NAN, f64::NAN);
+    }
+    if re == 0.0 && im == 0.0 {
+        return (0.0, im);
+    }
+
+    const HUGE: f64 = 1e150;
+    const TINY: f64 = 1e-150;
+    let largest = re.abs().max(im.abs());
+    let (x, y, unscale) = if largest > HUGE {
+        (re * 1e-200, im * 1e-200, 1e100)
+    } else if largest < TINY {
+        (re * 1e200, im * 1e200, 1e-100)
+    } else {
+        (re, im, 1.0)
+    };
+
+    let modulus = x.hypot(y);
+    let (u, v) = if x >= 0.0 {
+        let u = ((modulus + x) / 2.0).sqrt();
+        let v = if u == 0.0 { 0.0 } else { y / (2.0 * u) };
+        (u, v)
+    } else {
+        let t = ((modulus - x) / 2.0).sqrt();
+        (y.abs() / (2.0 * t), t.copysign(y))
+    };
+    (u * unscale, v * unscale)
 }
 
 fn predicate(op: PredicateOp, value: super::element::Number) -> bool {
@@ -2625,13 +2687,48 @@ pub(in crate::python) fn slot_reflected_power(
 }
 
 /// The unary ufunc NumPy applies instead of `power` for `base ** exponent`, if any.
+///
+/// `array ** scalar` fast-paths three literal Python scalar exponents on a float or complex
+/// base to a dedicated unary ufunc instead of the general binary `power`: `-1` (an exact Python
+/// `int`) to `"reciprocal"`, `0.5` (an exact Python `float`) to `"sqrt"`, and `2` (an exact
+/// Python `int` or `float`) to `"square"`. Eligibility is about the exponent's own Python type,
+/// not its numeric value: a NumPy scalar or array holding the same value, such as
+/// `np.float64(0.5)`, always takes the general `power` ufunc. This was confirmed black-box by
+/// comparing the floating-point warning `np.array([-np.inf]) ** x` raises for each `x`: a bare
+/// `0.5` warns "invalid value encountered in **sqrt**", while `np.float64(0.5)` warns
+/// "...in **power**". Integer and boolean bases are never fast-pathed, matching NumPy's
+/// restriction of the optimization to inexact loops.
 fn fast_power(
     runtime: &mut dyn PyRuntime,
     base: PyValue,
     exponent: PyValue,
 ) -> PyResult<Option<&'static str>> {
-    let _ = (runtime, base, exponent);
-    todo!("clean-room rewrite")
+    let name = match runtime.kind(&exponent)? {
+        PyKind::Int => match runtime.int_value(&exponent) {
+            Some(-1) => "reciprocal",
+            Some(2) => "square",
+            _ => return Ok(None),
+        },
+        PyKind::Float => match runtime.number(&exponent) {
+            Some(NumberRef::Float(0.5)) => "sqrt",
+            Some(NumberRef::Float(2.0)) => "square",
+            _ => return Ok(None),
+        },
+        _ => return Ok(None),
+    };
+    // A NumPy scalar (`np.float64(-0.0) ** 0.5`) shares this slot with arrays but is not one:
+    // `**` between two scalars is "scalar math", which skips this fast path entirely (NumPy
+    // calls `pow` directly, confirmed black-box by `np.float64(-0.0) ** 0.5` giving `+0.0`
+    // where the array loop's constant-exponent case would keep `-0.0`), so only an actual array
+    // base is eligible here.
+    if runtime.native_kind(&base)? != Some(PyNativeKind::Array) {
+        return Ok(None);
+    }
+    let base = Array::from_value(runtime, base)?;
+    match base.dtype.category() {
+        Category::Float | Category::Complex => Ok(Some(name)),
+        _ => Ok(None),
+    }
 }
 
 macro_rules! comparison_slots {
