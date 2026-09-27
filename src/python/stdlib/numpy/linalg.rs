@@ -1,33 +1,35 @@
-//! The native module `_numpy_linalg`, which plays the part of NumPy's `_umath_linalg`: one
-//! function per LAPACK-backed generalized ufunc that `numpy/linalg.py` calls, such as `inv`,
-//! `solve1`, `eigh_lo`, `svd_f`, and `lstsq`.
+//! `numpy.linalg`'s native primitives: `_numpy_linalg`.
 //!
-//! Each function converts its operands to float64, loops over the leading (batch) axes, runs a
-//! kernel from [`dense`] on each matrix, and returns float64 results that the Python layer
-//! casts back to the input's precision, as NumPy computes `float32` input in double precision.
-//! A 0-d result is a NumPy scalar, as a ufunc returns. Operand checks and their messages
-//! follow NumPy's gufunc machinery; the Python layer checks squareness and rank first, so most
-//! callers see the `numpy.linalg` messages instead.
+//! This module is the thin runtime-facing layer over [`dense`], the shared kernel module: it
+//! reads operand arrays, batches over stacked leading dimensions, charges CPU for the cubic (or,
+//! for the Jacobi solvers, per-sweep) work before running it, calls into [`dense`], and writes
+//! results back into new arrays. `source/numpy/linalg.py` composes these primitives (plus
+//! ordinary NumPy array operations) into the full `numpy.linalg` surface: functions such as
+//! `matrix_power`, `matrix_rank`, `pinv`, `lstsq` and `norm` are plain Python built from `inv`,
+//! `solve`, `svd` and `eigh` here, so this module exposes only the eight primitives that need
+//! their own factorization: `inv`, `solve`, `det`, `slogdet`, `cholesky`, `qr`, `eigh`, `svd`.
 //!
-//! Complex operands are rejected explicitly for now, and `eig` and `eigvals`, which return
-//! complex results, are not provided. Kernels are charged before they run: cubic work per
-//! matrix for the direct methods, and per sweep inside the Jacobi methods. Working copies are
-//! reserved once per call, since each batch element reuses the same amount.
+//! Every primitive computes in `f64` regardless of the input's integer or floating dtype, and
+//! casts the result to `float32` only when every real operand was `float32`, rounding once. This
+//! is simpler than running parallel single- and double-precision kernels and, because it uses
+//! more precision than the target rather than less, cannot make results less accurate; see
+//! `docs/numpy.md` for the resulting (deliberate) difference from NumPy's own single-precision
+//! LAPACK calls. `float16` is rejected with NumPy's own message, and complex input is rejected
+//! as an explicit unsupported feature, both as real NumPy's `numpy.linalg` module does or as
+//! `docs/numpy.md` documents.
 
-mod dense;
+pub(in crate::python) mod dense;
 
-pub(in crate::python) use dense::norm2;
+use dense::{Mat, Trans};
 
 use super::super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyError, PyResult, PyRuntime, PyValue,
+    CallArgs, FunctionDef, ModuleDef, PyArrayBuffer, PyError, PyResult, PyRuntime,
 };
-use super::args::{self, Signature};
-use super::array;
+use super::super::super::Value;
+use super::args::Signature;
+use super::array::{self, Array};
 use super::convert;
-use super::dtype::{self, Casting, Category, DType};
-use super::element::Element;
-use super::ops::FpFlags;
-use dense::{Matrix, SvdVectors};
+use super::dtype::{Category, DType, Kind};
 
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_numpy_linalg",
@@ -40,7 +42,7 @@ const fn function(
     call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
 ) -> FunctionDef {
     FunctionDef {
-        module: "numpy.linalg._umath_linalg",
+        module: "numpy.linalg",
         name,
         call,
     }
@@ -49,640 +51,543 @@ const fn function(
 static FUNCTIONS: &[FunctionDef] = &[
     function("inv", inv),
     function("solve", solve),
-    function("solve1", solve1),
     function("det", det),
     function("slogdet", slogdet),
-    function("cholesky_lo", cholesky_lo),
-    function("cholesky_up", cholesky_up),
-    function("eigh_lo", eigh_lo),
-    function("eigh_up", eigh_up),
-    function("eigvalsh_lo", eigvalsh_lo),
-    function("eigvalsh_up", eigvalsh_up),
-    function("svd", svd_values),
-    function("svd_s", svd_s),
-    function("svd_f", svd_f),
-    function("qr_r_raw", qr_r_raw),
-    function("qr_reduced", qr_reduced),
-    function("qr_complete", qr_complete),
-    function("lstsq", lstsq),
+    function("cholesky", cholesky),
+    function("qr", qr),
+    function("eigh", eigh),
+    function("svd", svd),
 ];
 
-/// A generalized ufunc's name, input count, and the signature its errors print.
-struct Gufunc {
-    name: &'static str,
-    inputs: usize,
-    signature: &'static str,
+/// Whether every real operand was `float32`, the one case where a result narrows from the
+/// `f64` working precision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Precision {
+    Single,
+    Double,
 }
 
-const fn gufunc(name: &'static str, inputs: usize, signature: &'static str) -> Gufunc {
-    Gufunc {
-        name,
-        inputs,
-        signature,
+impl Precision {
+    fn combine(self, other: Precision) -> Precision {
+        if self == Precision::Single && other == Precision::Single {
+            Precision::Single
+        } else {
+            Precision::Double
+        }
     }
 }
 
-static INV: Gufunc = gufunc("inv", 1, "(m, m)->(m, m)");
-static SOLVE: Gufunc = gufunc("solve", 2, "(m,m),(m,n)->(m,n)");
-static SOLVE1: Gufunc = gufunc("solve1", 2, "(m,m),(m)->(m)");
-static DET: Gufunc = gufunc("det", 1, "(m,m)->()");
-static SLOGDET: Gufunc = gufunc("slogdet", 1, "(m,m)->(),()");
-static CHOLESKY_LO: Gufunc = gufunc("cholesky_lo", 1, "(m,m)->(m,m)");
-static CHOLESKY_UP: Gufunc = gufunc("cholesky_up", 1, "(m,m)->(m,m)");
-static EIGH_LO: Gufunc = gufunc("eigh_lo", 1, "(m,m)->(m),(m,m)");
-static EIGH_UP: Gufunc = gufunc("eigh_up", 1, "(m,m)->(m),(m,m)");
-static EIGVALSH_LO: Gufunc = gufunc("eigvalsh_lo", 1, "(m,m)->(m)");
-static EIGVALSH_UP: Gufunc = gufunc("eigvalsh_up", 1, "(m,m)->(m)");
-static SVD: Gufunc = gufunc("svd", 1, "(m,n)->(p)");
-static SVD_S: Gufunc = gufunc("svd_s", 1, "(m,n)->(m,p),(p),(p,n)");
-static SVD_F: Gufunc = gufunc("svd_f", 1, "(m,n)->(m,m),(p),(n,n)");
-static QR_R_RAW: Gufunc = gufunc("qr_r_raw", 1, "(m,n)->(p)");
-static QR_REDUCED: Gufunc = gufunc("qr_reduced", 2, "(m,n),(k)->(m,k)");
-static QR_COMPLETE: Gufunc = gufunc("qr_complete", 2, "(m,n),(n)->(m,m)");
-static LSTSQ: Gufunc = gufunc("lstsq", 3, "(m,n),(m,nrhs),()->(n,nrhs),(nrhs),(),(p)");
-
-static ONE_ARGUMENT: Signature = Signature::new("_umath_linalg", &["a"], 1);
-static TWO_ARGUMENTS: Signature = Signature::new("_umath_linalg", &["a", "b"], 2);
-static LSTSQ_ARGUMENTS: Signature = Signature::new("lstsq", &["a", "b", "rcond"], 3);
-
-/// One operand read as float64 in C order: a stack of matrices over its batch axes. A 1-d core
-/// operand, such as `solve1`'s right-hand side, is a stack of single-column matrices.
-struct Stack {
-    shape: Vec<usize>,
-    batch: Vec<usize>,
-    rows: usize,
-    columns: usize,
-    data: Vec<f64>,
+fn square_error() -> PyError {
+    PyError::exception(
+        "LinAlgError",
+        "Last 2 dimensions of the array must be square",
+    )
 }
 
-impl Stack {
-    fn count(&self) -> usize {
-        self.batch.iter().product()
-    }
-
-    fn values(&self, index: usize) -> &[f64] {
-        let size = self.rows * self.columns;
-        &self.data[index * size..(index + 1) * size]
-    }
-
-    fn matrix(&self, index: usize) -> Matrix {
-        Matrix::new(self.rows, self.columns, self.values(index).to_vec())
-    }
+fn need_2d(ndim: usize) -> PyError {
+    PyError::exception(
+        "LinAlgError",
+        format!("{ndim}-dimensional array given. Array must be at least two-dimensional"),
+    )
 }
 
-/// Read input `position` of `gufunc`, which has `core` core axes, as float64.
-fn operand(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-    gufunc: &Gufunc,
-    position: usize,
-    core: usize,
-) -> PyResult<Stack> {
-    let array = convert::as_array(runtime, value)?;
-    let ndim = array.ndim();
-    if ndim < core {
-        return Err(PyError::value_error(format!(
-            "{}: Input operand {position} does not have enough dimensions (has {ndim}, gufunc \
-             core with signature {} requires {core})",
-            gufunc.name, gufunc.signature
-        )));
+/// Check that a real operand's dtype is usable, and report whether it is `float32`.
+fn check_dtype(array: &Array, function: &str) -> PyResult<Precision> {
+    if array.dtype.kind() == Kind::Float16 {
+        return Err(PyError::type_error(
+            "array type float16 is unsupported in linalg",
+        ));
     }
     if array.dtype.category() == Category::Complex {
         return Err(PyError::unsupported(format!(
-            "numpy.linalg does not support complex arrays yet ({} input)",
-            gufunc.name
+            "complex input to numpy.linalg.{function} is not supported by shellsim's NumPy"
         )));
     }
-    if !dtype::can_cast(array.dtype, DType::FLOAT64, Casting::SameKind) {
-        let position = if gufunc.inputs == 1 {
-            String::new()
-        } else {
-            format!("{position} ")
-        };
-        return Err(PyError::exception(
-            "UFuncTypeError",
-            format!(
-                "Cannot cast ufunc '{}' input {position}from {} to {} with casting rule \
-                 'same_kind'",
-                gufunc.name,
-                array.dtype.repr(),
-                DType::FLOAT64.repr()
-            ),
-        ));
-    }
-    let cast = convert::cast_array(runtime, &array, DType::FLOAT64, false)?;
-    let data = array::read_elements::<f64>(runtime, &cast)?;
-    let shape = array.shape().to_vec();
-    let (rows, columns) = match core {
-        2 => (shape[ndim - 2], shape[ndim - 1]),
-        1 => (shape[ndim - 1], 1),
-        _ => (1, 1),
-    };
-    Ok(Stack {
-        batch: shape[..ndim - core].to_vec(),
-        shape,
-        rows,
-        columns,
-        data,
+    Ok(if array.dtype == DType::FLOAT32 {
+        Precision::Single
+    } else {
+        Precision::Double
     })
 }
 
-/// NumPy's error when two core axes with the same name have different sizes.
-fn core_mismatch(
-    gufunc: &Gufunc,
-    position: usize,
-    axis: usize,
-    size: usize,
-    expected: usize,
-) -> PyError {
-    PyError::value_error(format!(
-        "{}: Input operand {position} has a mismatch in its core dimension {axis}, with gufunc \
-         signature {} (size {size} is different from {expected})",
-        gufunc.name, gufunc.signature
-    ))
+/// `array`'s elements as `f64`, gathered in C order (works for any strided view).
+fn as_f64(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<f64>> {
+    let cast = convert::cast_array(runtime, array, DType::FLOAT64, false)?;
+    array::read_elements::<f64>(runtime, &cast)
 }
 
-/// Read a stack of square matrices, the `(m,m)` operand every square gufunc takes first.
-fn square_operand(runtime: &mut dyn PyRuntime, value: PyValue, gufunc: &Gufunc) -> PyResult<Stack> {
-    let stack = operand(runtime, value, gufunc, 0, 2)?;
-    if stack.rows != stack.columns {
-        return Err(core_mismatch(gufunc, 0, 1, stack.columns, stack.rows));
-    }
-    Ok(stack)
-}
-
-/// Charge `per_matrix` CPU units for each of `count` matrices and reserve `working` bytes.
-fn charge(
+/// `array` broadcast to `batch_shape ++ core_shape` and read as `f64` in C order. `array`'s own
+/// shape must already end with `core_shape`.
+fn broadcast_f64(
     runtime: &mut dyn PyRuntime,
-    count: usize,
-    per_matrix: u64,
-    working: usize,
-) -> PyResult<()> {
-    runtime.reserve_memory(working)?;
-    runtime.charge_cpu((count as u64).saturating_mul(per_matrix).saturating_add(1))
+    array: &Array,
+    batch_shape: &[usize],
+    core_shape: &[usize],
+) -> PyResult<Vec<f64>> {
+    let mut shape = batch_shape.to_vec();
+    shape.extend_from_slice(core_shape);
+    let buffer = array::broadcast_buffer(runtime, array, DType::FLOAT64, &shape)?;
+    let PyArrayBuffer::Bytes(bytes) = buffer else {
+        return Err(PyError::runtime_error("linalg operand is not numeric"));
+    };
+    Ok(bytes
+        .chunks_exact(8)
+        .map(|chunk| f64::from_le_bytes(chunk.try_into().expect("8-byte chunk")))
+        .collect())
 }
 
-fn cube(size: usize) -> u64 {
-    (size as u64).saturating_pow(3)
+fn batch_count(batch_shape: &[usize]) -> usize {
+    batch_shape.iter().product()
 }
 
-/// Bytes of `copies` float64 matrices of `rows × columns`.
-fn matrices(rows: usize, columns: usize, copies: usize) -> usize {
-    rows.saturating_mul(columns)
-        .saturating_mul(copies)
-        .saturating_mul(std::mem::size_of::<f64>())
+fn chunks(flat: &[f64], rows: usize, cols: usize) -> Vec<Mat> {
+    flat.chunks_exact(rows * cols)
+        .map(|chunk| Mat::from_row_major(rows, cols, chunk.to_vec()))
+        .collect()
 }
 
-/// A result of shape `batch + core` built from typed values; a 0-d result is a NumPy scalar.
-fn output<T: Element>(
-    runtime: &mut dyn PyRuntime,
-    dtype: DType,
-    batch: &[usize],
-    core: &[usize],
-    values: &[T],
-) -> PyResult {
-    let mut shape = batch.to_vec();
-    shape.extend_from_slice(core);
-    let result = array::array_from_elements(runtime, dtype, shape, values)?;
-    if result.ndim() == 0 {
-        return convert::element_to_scalar(runtime, &result, result.view.offset);
+/// `array`'s shape split into leading batch dimensions and a trailing square `n x n` core,
+/// requiring at least two dimensions and an equal last two.
+fn square_shape(array: &Array) -> PyResult<(Vec<usize>, usize)> {
+    if array.ndim() < 2 {
+        return Err(need_2d(array.ndim()));
     }
+    let n = array.shape()[array.ndim() - 1];
+    if array.shape()[array.ndim() - 2] != n {
+        return Err(square_error());
+    }
+    Ok((array.shape()[..array.ndim() - 2].to_vec(), n))
+}
+
+fn rect_shape(array: &Array) -> PyResult<(Vec<usize>, usize, usize)> {
+    if array.ndim() < 2 {
+        return Err(need_2d(array.ndim()));
+    }
+    let (rows, cols) = (
+        array.shape()[array.ndim() - 2],
+        array.shape()[array.ndim() - 1],
+    );
+    Ok((array.shape()[..array.ndim() - 2].to_vec(), rows, cols))
+}
+
+/// Build a new array from batched `n x n`-shaped `f64` matrices, casting to `precision`.
+fn array_from_batches(
+    runtime: &mut dyn PyRuntime,
+    batch_shape: &[usize],
+    rows: usize,
+    cols: usize,
+    mats: &[Mat],
+    precision: Precision,
+) -> PyResult<Array> {
+    let mut flat = Vec::with_capacity(mats.len() * rows * cols);
+    for mat in mats {
+        flat.extend_from_slice(&mat.data);
+    }
+    let mut shape = batch_shape.to_vec();
+    shape.push(rows);
+    shape.push(cols);
+    let array = array::array_from_elements::<f64>(runtime, DType::FLOAT64, shape, &flat)?;
+    match precision {
+        Precision::Double => Ok(array),
+        Precision::Single => convert::cast_array(runtime, &array, DType::FLOAT32, false),
+    }
+}
+
+/// Build a new array from batched length-`n` `f64` vectors, casting to `precision`.
+fn array_from_vectors(
+    runtime: &mut dyn PyRuntime,
+    batch_shape: &[usize],
+    n: usize,
+    vectors: &[Vec<f64>],
+    precision: Precision,
+) -> PyResult<Array> {
+    let mut flat = Vec::with_capacity(vectors.len() * n);
+    for vector in vectors {
+        flat.extend_from_slice(vector);
+    }
+    let mut shape = batch_shape.to_vec();
+    shape.push(n);
+    let array = array::array_from_elements::<f64>(runtime, DType::FLOAT64, shape, &flat)?;
+    match precision {
+        Precision::Double => Ok(array),
+        Precision::Single => convert::cast_array(runtime, &array, DType::FLOAT32, false),
+    }
+}
+
+/// A 0-d result unboxes to a NumPy scalar, as `det` and the like return; other shapes stay
+/// arrays.
+fn scalar_or_array(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult {
+    if array.ndim() == 0 {
+        return convert::element_to_scalar(runtime, array, array.view.offset);
+    }
+    Ok(array.value())
+}
+
+fn singular_error() -> PyError {
+    PyError::exception("LinAlgError", "Singular matrix")
+}
+
+// ---------------------------------------------------------------------------------------------
+// inv
+// ---------------------------------------------------------------------------------------------
+
+fn inv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("inv", &["a"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let precision = check_dtype(&a, "inv")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(n as u64, n as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let mut results = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let factorization = dense::lu_factor(mat);
+        if factorization.singular_at.is_some() {
+            return Err(singular_error());
+        }
+        results.push(dense::lu_invert(&factorization.lu, &factorization.piv));
+    }
+    let result = array_from_batches(runtime, &batch_shape, n, n, &results, precision)?;
     Ok(result.value())
 }
 
-fn float_output(
-    runtime: &mut dyn PyRuntime,
-    batch: &[usize],
-    core: &[usize],
-    values: &[f64],
-) -> PyResult {
-    output(runtime, DType::FLOAT64, batch, core, values)
-}
+// ---------------------------------------------------------------------------------------------
+// solve
+// ---------------------------------------------------------------------------------------------
 
-fn linalg_error(message: &str) -> PyError {
-    PyError::exception("LinAlgError", message)
-}
-
-/// `inv(a)`: each matrix's inverse, from `dgesv` against the identity.
-fn inv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = square_operand(runtime, bound.required("a"), &INV)?;
-    let n = a.rows;
-    let per_matrix = cube(n).saturating_mul(2);
-    charge(runtime, a.count(), per_matrix, matrices(n, n, 3))?;
-    let mut values = Vec::with_capacity(a.data.len());
-    for index in 0..a.count() {
-        let factors = dense::lu(a.matrix(index));
-        if factors.singular {
-            return Err(linalg_error("Singular matrix"));
-        }
-        let mut inverse = Matrix::identity(n);
-        factors.solve(&mut inverse);
-        values.extend(inverse.data);
-    }
-    float_output(runtime, &a.batch, &[n, n], &values)
-}
-
-/// `solve(a, b)` for a stack of right-hand-side matrices.
 fn solve(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    solve_with(runtime, args, &SOLVE, 2)
-}
-
-/// `solve1(a, b)` for a stack of right-hand-side vectors.
-fn solve1(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    solve_with(runtime, args, &SOLVE1, 1)
-}
-
-fn solve_with(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
-    gufunc: &Gufunc,
-    b_core: usize,
-) -> PyResult {
-    let bound = TWO_ARGUMENTS.bind(&args)?;
-    let a = square_operand(runtime, bound.required("a"), gufunc)?;
-    let b = operand(runtime, bound.required("b"), gufunc, 1, b_core)?;
-    if b.rows != a.rows {
-        return Err(core_mismatch(gufunc, 1, 0, b.rows, a.rows));
+    static SIGNATURE: Signature = Signature::new("solve", &["a", "b"], 2);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let b = convert::as_array(runtime, bound.required("b"))?;
+    let precision = check_dtype(&a, "solve")?.combine(check_dtype(&b, "solve")?);
+    let (a_batch, n) = square_shape(&a)?;
+    if b.ndim() == 0 {
+        return Err(need_2d(0));
     }
-    let output_core = if b_core == 2 {
-        vec![b.rows, b.columns]
+    // NumPy 2's gufunc solve: `b` is a batch of vectors when its rank is one less than `a`'s
+    // (signature `(m,m),(m)->(m)`), else a batch of matrices (`(m,m),(m,k)->(m,k)`).
+    let vector_rhs = b.ndim() < a.ndim();
+    let (b_batch, k): (Vec<usize>, usize) = if vector_rhs {
+        if b.shape().last().copied() != Some(n) {
+            return Err(PyError::value_error(format!(
+                "solve: Input operand 1 has a mismatch in its core dimension 0, with gufunc \
+                 signature (m,m),(m)->(m) (size {} is different from {n})",
+                b.shape().last().copied().unwrap_or(0)
+            )));
+        }
+        (b.shape()[..b.ndim() - 1].to_vec(), 1)
     } else {
-        vec![b.rows]
-    };
-    let batch = broadcast_batches(&a, &b, &output_core)?;
-    let count = batch.iter().product::<usize>();
-    let n = a.rows;
-    let per_matrix = cube(n).saturating_add((n as u64).pow(2).saturating_mul(b.columns as u64));
-    let working = matrices(n, n + b.columns, 1).saturating_add(matrices(n, b.columns, count));
-    charge(runtime, count, per_matrix, working)?;
-    let mut values = Vec::with_capacity(count.saturating_mul(n * b.columns));
-    for index in 0..count {
-        let factors = dense::lu(a.matrix(batch_index(index, &batch, &a.batch)));
-        if factors.singular {
-            return Err(linalg_error("Singular matrix"));
+        let bn = b.shape()[b.ndim() - 2];
+        if bn != n {
+            return Err(PyError::value_error(format!(
+                "solve: Input operand 1 has a mismatch in its core dimension 0, with gufunc \
+                 signature (m,m),(m,n)->(m,n) (size {bn} is different from {n})"
+            )));
         }
-        let mut solution = b.matrix(batch_index(index, &batch, &b.batch));
-        factors.solve(&mut solution);
-        values.extend(solution.data);
-    }
-    float_output(runtime, &batch, &output_core, &values)
-}
-
-/// Broadcast the batch axes of two operands, with NumPy's gufunc error on a mismatch. The
-/// error lists each operand's batch axes followed by one `newaxis` per output core axis.
-fn broadcast_batches(a: &Stack, b: &Stack, output_core: &[usize]) -> PyResult<Vec<usize>> {
-    array::broadcast_shapes(&[&a.batch, &b.batch]).map_err(|_| {
-        let remapped = |stack: &Stack| {
-            let parts = stack
-                .batch
-                .iter()
-                .map(ToString::to_string)
-                .chain(std::iter::repeat_n(
-                    "newaxis".to_string(),
-                    output_core.len(),
-                ))
-                .collect::<Vec<_>>();
-            format!(
-                "{}->({})",
-                array::format_shape(&stack.shape),
-                parts.join(",")
-            )
-        };
-        let requested = output_core
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>();
-        PyError::value_error(format!(
-            "operands could not be broadcast together with remapped shapes \
-             [original->remapped]: {} {}  and requested shape ({})",
-            remapped(a),
-            remapped(b),
-            requested.join(",")
-        ))
-    })
-}
-
-/// The index into `operand`'s batch of the `flat`-th position of the broadcast `batch`.
-fn batch_index(mut flat: usize, batch: &[usize], operand: &[usize]) -> usize {
-    let leading = batch.len() - operand.len();
-    let (mut index, mut stride) = (0, 1);
-    for axis in (0..batch.len()).rev() {
-        let coordinate = flat % batch[axis];
-        flat /= batch[axis];
-        if axis >= leading {
-            let size = operand[axis - leading];
-            if size != 1 {
-                index += coordinate * stride;
-            }
-            stride *= size;
-        }
-    }
-    index
-}
-
-/// `(sign, log|det|)` of each matrix. Input containing NaN reports an invalid operation under
-/// the gufunc's name, as LAPACK's pivot search raises the hardware flag NumPy checks.
-fn signed_logdets(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
-    gufunc: &Gufunc,
-) -> PyResult<(Vec<usize>, Vec<f64>, Vec<f64>)> {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = square_operand(runtime, bound.required("a"), gufunc)?;
-    let n = a.rows;
-    charge(runtime, a.count(), cube(n), matrices(n, n, 1))?;
-    let count = a.count();
-    let (mut signs, mut logdets) = (Vec::with_capacity(count), Vec::with_capacity(count));
-    for index in 0..count {
-        let (sign, logdet) = dense::lu(a.matrix(index)).slogdet();
-        signs.push(sign);
-        logdets.push(logdet);
-    }
-    let flags = FpFlags {
-        invalid: a.data.iter().any(|value| value.is_nan()),
-        ..FpFlags::default()
+        (b.shape()[..b.ndim() - 2].to_vec(), b.shape()[b.ndim() - 1])
     };
-    super::errstate::report(runtime, gufunc.name, flags)?;
-    Ok((a.batch, signs, logdets))
+    let batch_shape = array::broadcast_shapes(&[&a_batch, &b_batch])?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(
+        dense::factor_cost(n as u64, n as u64).saturating_add((n * n * k) as u64) * count as u64,
+    )?;
+    let a_flat = broadcast_f64(runtime, &a, &batch_shape, &[n, n])?;
+    let b_core: Vec<usize> = if vector_rhs { vec![n] } else { vec![n, k] };
+    let b_flat = broadcast_f64(runtime, &b, &batch_shape, &b_core)?;
+    let a_mats = chunks(&a_flat, n, n);
+    let b_mats = chunks(&b_flat, n, k);
+    let mut results = Vec::with_capacity(a_mats.len());
+    for (a_mat, b_mat) in a_mats.iter().zip(&b_mats) {
+        let factorization = dense::lu_factor(a_mat);
+        if factorization.singular_at.is_some() {
+            return Err(singular_error());
+        }
+        results.push(dense::lu_solve(
+            &factorization.lu,
+            &factorization.piv,
+            b_mat,
+            Trans::No,
+        ));
+    }
+    let result = if vector_rhs {
+        array_from_vectors(
+            runtime,
+            &batch_shape,
+            n,
+            &results.iter().map(|m| m.data.clone()).collect::<Vec<_>>(),
+            precision,
+        )?
+    } else {
+        array_from_batches(runtime, &batch_shape, n, k, &results, precision)?
+    };
+    scalar_or_array(runtime, &result)
 }
 
-/// `det(a)`: `sign * exp(log|det|)`, which is where NumPy's rounding comes from.
+// ---------------------------------------------------------------------------------------------
+// det / slogdet
+// ---------------------------------------------------------------------------------------------
+
 fn det(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let (batch, signs, logdets) = signed_logdets(runtime, args, &DET)?;
-    let values = signs
+    static SIGNATURE: Signature = Signature::new("det", &["a"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let precision = check_dtype(&a, "det")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(n as u64, n as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let values: Vec<f64> = mats
         .iter()
-        .zip(&logdets)
-        .map(|(sign, logdet)| sign * logdet.exp())
-        .collect::<Vec<_>>();
-    float_output(runtime, &batch, &[], &values)
+        .map(|mat| dense::lu_det(&dense::lu_factor(mat)))
+        .collect();
+    let result = array_from_vectors(runtime, &batch_shape, 1, &wrap(&values), precision)?;
+    let result = drop_last_axis(runtime, &result)?;
+    scalar_or_array(runtime, &result)
 }
 
 fn slogdet(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let (batch, signs, logdets) = signed_logdets(runtime, args, &SLOGDET)?;
-    let sign = float_output(runtime, &batch, &[], &signs)?;
-    let logdet = float_output(runtime, &batch, &[], &logdets)?;
-    runtime.new_tuple(vec![sign, logdet])
-}
-
-fn cholesky_lo(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    cholesky(runtime, args, &CHOLESKY_LO, false)
-}
-
-fn cholesky_up(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    cholesky(runtime, args, &CHOLESKY_UP, true)
-}
-
-/// `L` with `A = L Lᵀ` from the lower triangle, or `U = Lᵀ` with `A = Uᵀ U` from the upper
-/// triangle; the other triangle of the result is zero.
-fn cholesky(runtime: &mut dyn PyRuntime, args: CallArgs, gufunc: &Gufunc, upper: bool) -> PyResult {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = square_operand(runtime, bound.required("a"), gufunc)?;
-    let n = a.rows;
-    charge(runtime, a.count(), cube(n), matrices(n, n, 2))?;
-    let mut values = Vec::with_capacity(a.data.len());
-    for index in 0..a.count() {
-        let matrix = if upper {
-            a.matrix(index).transpose()
-        } else {
-            a.matrix(index)
-        };
-        let lower = dense::cholesky(&matrix)
-            .ok_or_else(|| linalg_error("Matrix is not positive definite"))?;
-        values.extend(if upper { lower.transpose() } else { lower }.data);
+    static SIGNATURE: Signature = Signature::new("slogdet", &["a"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let precision = check_dtype(&a, "slogdet")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(n as u64, n as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let mut signs = Vec::with_capacity(mats.len());
+    let mut logs = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let (sign, log_det) = dense::lu_slogdet(&dense::lu_factor(mat));
+        signs.push(sign);
+        logs.push(log_det);
     }
-    float_output(runtime, &a.batch, &[n, n], &values)
+    let sign_array = array_from_vectors(runtime, &batch_shape, 1, &wrap(&signs), precision)?;
+    let log_array = array_from_vectors(runtime, &batch_shape, 1, &wrap(&logs), Precision::Double)?;
+    let sign_array = drop_last_axis(runtime, &sign_array)?;
+    let log_array = drop_last_axis(runtime, &log_array)?;
+    let sign_value = scalar_or_array(runtime, &sign_array)?;
+    let log_value = scalar_or_array(runtime, &log_array)?;
+    runtime.new_tuple(vec![sign_value, log_value])
 }
 
-fn eigh_lo(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    eigh(runtime, args, &EIGH_LO, false, true)
+fn wrap(values: &[f64]) -> Vec<Vec<f64>> {
+    values.iter().map(|v| vec![*v]).collect()
 }
 
-fn eigh_up(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    eigh(runtime, args, &EIGH_UP, true, true)
+fn drop_last_axis(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Array> {
+    let shape = array.shape()[..array.ndim() - 1].to_vec();
+    let strides = array.strides()[..array.ndim() - 1].to_vec();
+    array::new_view(
+        runtime,
+        array,
+        array.dtype,
+        shape,
+        strides,
+        array.view.offset,
+    )
 }
 
-fn eigvalsh_lo(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    eigh(runtime, args, &EIGVALSH_LO, false, false)
+// ---------------------------------------------------------------------------------------------
+// cholesky
+// ---------------------------------------------------------------------------------------------
+
+fn cholesky(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("cholesky", &["a"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let precision = check_dtype(&a, "cholesky")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(n as u64, n as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let mut results = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        results.push(
+            dense::cholesky_lower(mat).map_err(|_| {
+                PyError::exception("LinAlgError", "Matrix is not positive definite")
+            })?,
+        );
+    }
+    let result = array_from_batches(runtime, &batch_shape, n, n, &results, precision)?;
+    Ok(result.value())
 }
 
-fn eigvalsh_up(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    eigh(runtime, args, &EIGVALSH_UP, true, false)
-}
+// ---------------------------------------------------------------------------------------------
+// qr
+// ---------------------------------------------------------------------------------------------
 
-/// Eigenvalues, and eigenvectors if `vectors`, of symmetric matrices read from one triangle.
-/// A matrix with a non-finite element in that triangle gives NaN eigenvalues and identity
-/// eigenvectors, as NumPy's `dsyevd` call does for infinite input.
-fn eigh(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
-    gufunc: &Gufunc,
-    upper: bool,
-    vectors: bool,
-) -> PyResult {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = square_operand(runtime, bound.required("a"), gufunc)?;
-    let n = a.rows;
-    let count = a.count();
-    let result_bytes = if vectors { a.data.len() * 8 } else { 0 };
-    let working = matrices(n, n, 3).saturating_add(result_bytes);
-    charge(runtime, count, (n as u64).saturating_pow(2), working)?;
-    let mut eigenvalues = Vec::with_capacity(count.saturating_mul(n));
-    let mut eigenvectors = Vec::with_capacity(if vectors { a.data.len() } else { 0 });
-    for index in 0..count {
-        let matrix = if upper {
-            a.matrix(index).transpose()
-        } else {
-            a.matrix(index)
+fn qr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("qr", &["a", "mode"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let mode = match bound.value("mode") {
+        Some(value) => runtime.string_value(&value)?.unwrap_or_default(),
+        None => "reduced".to_string(),
+    };
+    if !["reduced", "complete", "r", "raw"].contains(&mode.as_str()) {
+        return Err(PyError::value_error(format!("Unrecognized mode '{mode}'")));
+    }
+    let precision = check_dtype(&a, "qr")?;
+    let (batch_shape, rows, cols) = rect_shape(&a)?;
+    let k = rows.min(cols);
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(rows as u64, cols as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, rows, cols);
+    if mode == "raw" {
+        let mut h = Vec::with_capacity(mats.len());
+        let mut taus = Vec::with_capacity(mats.len());
+        for mat in &mats {
+            let factorization = dense::householder_qr(mat);
+            h.push(factorization.factored.data.clone());
+            taus.push(factorization.tau.clone());
+        }
+        let mut shape = batch_shape.clone();
+        shape.push(cols);
+        shape.push(rows);
+        let mut flat_h = Vec::with_capacity(h.len() * rows * cols);
+        for m in &h {
+            flat_h.extend_from_slice(m);
+        }
+        let h_array =
+            array::fortran_array_from_elements::<f64>(runtime, DType::FLOAT64, shape, &flat_h)?;
+        let h_array = match precision {
+            Precision::Double => h_array,
+            Precision::Single => convert::cast_array(runtime, &h_array, DType::FLOAT32, false)?,
         };
-        let finite = (0..n).all(|row| (0..=row).all(|column| matrix.get(row, column).is_finite()));
-        if !finite {
-            eigenvalues.extend(std::iter::repeat_n(f64::NAN, n));
-            if vectors {
-                eigenvectors.extend(Matrix::identity(n).data);
+        let tau_values: Vec<Vec<f64>> = taus;
+        let tau_array = array_from_vectors(runtime, &batch_shape, k, &tau_values, precision)?;
+        return runtime.new_tuple(vec![h_array.value(), tau_array.value()]);
+    }
+    let full = mode == "complete";
+    let mut rs = Vec::with_capacity(mats.len());
+    let mut qs = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let factorization = dense::householder_qr(mat);
+        if full {
+            rs.push(dense::qr_explicit_r_full(&factorization));
+        } else {
+            rs.push(dense::qr_explicit_r(&factorization));
+        }
+        if mode != "r" {
+            qs.push(dense::qr_explicit_q(&factorization, full));
+        }
+    }
+    let r_rows = if full { rows } else { k };
+    let r_array = array_from_batches(runtime, &batch_shape, r_rows, cols, &rs, precision)?;
+    if mode == "r" {
+        return runtime.new_tuple(vec![r_array.value()]);
+    }
+    let q_width = if full { rows } else { k };
+    let q_array = array_from_batches(runtime, &batch_shape, rows, q_width, &qs, precision)?;
+    runtime.new_tuple(vec![q_array.value(), r_array.value()])
+}
+
+// ---------------------------------------------------------------------------------------------
+// eigh
+// ---------------------------------------------------------------------------------------------
+
+fn eigh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("eigh", &["a", "UPLO", "compute_vectors"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let lower = match bound.value("UPLO") {
+        Some(value) => runtime.string_value(&value)?.unwrap_or_default() != "U",
+        None => true,
+    };
+    let compute_vectors = match bound.value("compute_vectors") {
+        Some(value) => runtime.truth(&value)?,
+        None => true,
+    };
+    let precision = check_dtype(&a, "eigh")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let mut values = Vec::with_capacity(mats.len());
+    let mut vectors = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let symmetric = symmetrize(mat, lower);
+        let (w, v) =
+            dense::jacobi_eigh(&symmetric, compute_vectors, |cost| runtime.charge_cpu(cost))?;
+        values.push(w);
+        if let Some(v) = v {
+            vectors.push(v);
+        }
+    }
+    let w_array = array_from_vectors(runtime, &batch_shape, n, &values, precision)?;
+    if !compute_vectors {
+        return runtime.new_tuple(vec![w_array.value(), Value::None]);
+    }
+    let v_array = array_from_batches(runtime, &batch_shape, n, n, &vectors, precision)?;
+    runtime.new_tuple(vec![w_array.value(), v_array.value()])
+}
+
+/// Mirror the trusted triangle of `mat` into the other, so the Jacobi kernel (which reads both)
+/// sees a genuinely symmetric matrix regardless of what the untrusted triangle holds.
+fn symmetrize(mat: &Mat, lower: bool) -> Mat {
+    let n = mat.rows;
+    let mut result = mat.clone();
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if lower {
+                result.set(i, j, mat.get(j, i));
+            } else {
+                result.set(j, i, mat.get(i, j));
             }
-            continue;
-        }
-        let (values, basis) =
-            dense::symmetric_eigen(&matrix, vectors, &mut |cost| runtime.charge_cpu(cost))?;
-        eigenvalues.extend(values);
-        if let Some(basis) = basis {
-            eigenvectors.extend(basis.data);
         }
     }
-    let eigenvalues = float_output(runtime, &a.batch, &[n], &eigenvalues)?;
-    if !vectors {
-        return Ok(eigenvalues);
-    }
-    let eigenvectors = float_output(runtime, &a.batch, &[n, n], &eigenvectors)?;
-    runtime.new_tuple(vec![eigenvalues, eigenvectors])
+    result
 }
 
-fn svd_values(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    svd(runtime, args, &SVD, SvdVectors::None)
-}
+// ---------------------------------------------------------------------------------------------
+// svd
+// ---------------------------------------------------------------------------------------------
 
-fn svd_s(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    svd(runtime, args, &SVD_S, SvdVectors::Reduced)
-}
-
-fn svd_f(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    svd(runtime, args, &SVD_F, SvdVectors::Full)
-}
-
-/// Singular values, and `(U, S, Vh)` unless `mode` is [`SvdVectors::None`]. Non-finite input
-/// does not converge, as in LAPACK.
-fn svd(runtime: &mut dyn PyRuntime, args: CallArgs, gufunc: &Gufunc, mode: SvdVectors) -> PyResult {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = operand(runtime, bound.required("a"), gufunc, 0, 2)?;
-    let (m, n) = (a.rows, a.columns);
-    let k = m.min(n);
-    let (u_columns, v_rows) = match mode {
-        SvdVectors::Full => (m, n),
-        SvdVectors::Reduced | SvdVectors::None => (k, k),
+fn svd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("svd", &["a", "full_matrices", "compute_uv"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let full_matrices = match bound.value("full_matrices") {
+        Some(value) => runtime.truth(&value)?,
+        None => true,
     };
-    let count = a.count();
-    let results = if mode == SvdVectors::None {
-        0
-    } else {
-        matrices(m, u_columns, count).saturating_add(matrices(v_rows, n, count))
+    let compute_uv = match bound.value("compute_uv") {
+        Some(value) => runtime.truth(&value)?,
+        None => true,
     };
-    let square = m.max(n);
-    let working = matrices(square, square, 4).saturating_add(results);
-    charge(runtime, count, 1, working)?;
-    let mut singular_values = Vec::with_capacity(count.saturating_mul(k));
-    let (mut left, mut right) = (Vec::new(), Vec::new());
-    for index in 0..count {
-        if !a.values(index).iter().all(|value| value.is_finite()) {
-            return Err(linalg_error("SVD did not converge"));
+    let precision = check_dtype(&a, "svd")?;
+    let (batch_shape, rows, cols) = rect_shape(&a)?;
+    let k = rows.min(cols);
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, rows, cols);
+    let mut singular = Vec::with_capacity(mats.len());
+    let mut us = Vec::with_capacity(mats.len());
+    let mut vts = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let (u, s, vt) = dense::jacobi_svd(mat, full_matrices, compute_uv, |cost| {
+            runtime.charge_cpu(cost)
+        })?;
+        singular.push(s);
+        if let Some(u) = u {
+            us.push(u);
         }
-        let result = dense::svd(&a.matrix(index), mode, &mut |cost| runtime.charge_cpu(cost))?;
-        singular_values.extend(result.values);
-        if let Some((u, vt)) = result.vectors {
-            left.extend(u.data);
-            right.extend(vt.data);
+        if let Some(vt) = vt {
+            vts.push(vt);
         }
     }
-    let values = float_output(runtime, &a.batch, &[k], &singular_values)?;
-    if mode == SvdVectors::None {
-        return Ok(values);
+    let s_array = array_from_vectors(runtime, &batch_shape, k, &singular, precision)?;
+    if !compute_uv {
+        return scalar_or_array(runtime, &s_array);
     }
-    let u = float_output(runtime, &a.batch, &[m, u_columns], &left)?;
-    let vh = float_output(runtime, &a.batch, &[v_rows, n], &right)?;
-    runtime.new_tuple(vec![u, values, vh])
-}
-
-/// `qr_r_raw(a)`: `dgeqrf`'s output as `(factors, tau)`. NumPy's gufunc overwrites `a` with
-/// the factors in place; this one returns them, and `numpy/linalg.py` rebinds `a`.
-fn qr_r_raw(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = ONE_ARGUMENT.bind(&args)?;
-    let a = operand(runtime, bound.required("a"), &QR_R_RAW, 0, 2)?;
-    let (m, n) = (a.rows, a.columns);
-    let k = m.min(n);
-    let per_matrix = (m as u64).saturating_mul((n as u64).saturating_pow(2));
-    charge(runtime, a.count(), per_matrix, matrices(m, n, 1))?;
-    let mut factors = Vec::with_capacity(a.data.len());
-    let mut taus = Vec::with_capacity(a.count().saturating_mul(k));
-    for index in 0..a.count() {
-        let (factored, tau) = dense::householder_qr(a.matrix(index));
-        factors.extend(factored.data);
-        taus.extend(tau);
-    }
-    let factors = float_output(runtime, &a.batch, &[m, n], &factors)?;
-    let tau = float_output(runtime, &a.batch, &[k], &taus)?;
-    runtime.new_tuple(vec![factors, tau])
-}
-
-fn qr_reduced(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    qr_q(runtime, args, &QR_REDUCED, false)
-}
-
-fn qr_complete(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    qr_q(runtime, args, &QR_COMPLETE, true)
-}
-
-/// `Q` from [`qr_r_raw`]'s factors: its first `min(m, n)` columns, or all `m` if `complete`.
-fn qr_q(runtime: &mut dyn PyRuntime, args: CallArgs, gufunc: &Gufunc, complete: bool) -> PyResult {
-    let bound = TWO_ARGUMENTS.bind(&args)?;
-    let a = operand(runtime, bound.required("a"), gufunc, 0, 2)?;
-    let tau = operand(runtime, bound.required("b"), gufunc, 1, 1)?;
-    let (m, n) = (a.rows, a.columns);
-    let k = m.min(n);
-    if tau.rows != k || tau.batch != a.batch {
-        return Err(core_mismatch(gufunc, 1, 0, tau.rows, k));
-    }
-    let columns = if complete { m } else { k };
-    let count = a.count();
-    let per_matrix = (m as u64)
-        .saturating_mul(columns as u64)
-        .saturating_mul(k.max(1) as u64);
-    charge(runtime, count, per_matrix, matrices(m, columns, count))?;
-    let mut values = Vec::with_capacity(count.saturating_mul(m * columns));
-    for index in 0..count {
-        let q = dense::householder_q(&a.matrix(index), tau.values(index), columns);
-        values.extend(q.data);
-    }
-    float_output(runtime, &a.batch, &[m, columns], &values)
-}
-
-/// `lstsq(a, b, rcond)` for one matrix pair, since `numpy.linalg.lstsq` requires 2-d
-/// operands: `(x, residuals, rank, singular_values)` with `rank` an `int32` scalar.
-fn lstsq(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let bound = LSTSQ_ARGUMENTS.bind(&args)?;
-    let a = operand(runtime, bound.required("a"), &LSTSQ, 0, 2)?;
-    let b = operand(runtime, bound.required("b"), &LSTSQ, 1, 2)?;
-    let rcond = args::float_arg(runtime, &bound.required("rcond"))?;
-    if !a.batch.is_empty() || !b.batch.is_empty() {
-        return Err(PyError::unsupported(
-            "numpy.linalg.lstsq does not support stacked matrices",
-        ));
-    }
-    if b.rows != a.rows {
-        return Err(core_mismatch(&LSTSQ, 1, 0, b.rows, a.rows));
-    }
-    let (m, n) = (a.rows, a.columns);
-    let square = m.max(n);
-    let working = matrices(square, square, 4).saturating_add(matrices(n, b.columns, 1));
-    let per_matrix = (m as u64)
-        .saturating_mul(n as u64)
-        .saturating_mul(b.columns as u64);
-    charge(runtime, 1, per_matrix, working)?;
-    let finite = |stack: &Stack| stack.data.iter().all(|value| value.is_finite());
-    if !finite(&a) || !finite(&b) {
-        return Err(linalg_error("SVD did not converge in Linear Least Squares"));
-    }
-    let fit = dense::least_squares(&a.matrix(0), &b.matrix(0), rcond, &mut |cost| {
-        runtime.charge_cpu(cost)
-    })?;
-    let solution = float_output(runtime, &[], &[n, b.columns], &fit.solution.data)?;
-    let residuals = float_output(runtime, &[], &[b.columns], &fit.residuals)?;
-    let rank = i32::try_from(fit.rank)
-        .map_err(|_| PyError::overflow_error("lstsq rank does not fit in int32"))?;
-    let rank = output(runtime, DType::INT32, &[], &[], &[rank])?;
-    let singular_values = float_output(runtime, &[], &[m.min(n)], &fit.singular_values)?;
-    runtime.new_tuple(vec![solution, residuals, rank, singular_values])
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn batch_index_broadcasts_length_one_and_missing_axes() {
-        // Output batch (2, 3) against operand batches (3,), (2, 1), and ().
-        let positions = (0..6).collect::<Vec<_>>();
-        let along_last = positions
-            .iter()
-            .map(|flat| batch_index(*flat, &[2, 3], &[3]))
-            .collect::<Vec<_>>();
-        assert_eq!(along_last, [0, 1, 2, 0, 1, 2]);
-        let along_first = positions
-            .iter()
-            .map(|flat| batch_index(*flat, &[2, 3], &[2, 1]))
-            .collect::<Vec<_>>();
-        assert_eq!(along_first, [0, 0, 0, 1, 1, 1]);
-        assert!(positions
-            .iter()
-            .all(|flat| batch_index(*flat, &[2, 3], &[]) == 0));
-    }
+    let u_width = if full_matrices { rows } else { k };
+    let vt_height = if full_matrices { cols } else { k };
+    let u_array = array_from_batches(runtime, &batch_shape, rows, u_width, &us, precision)?;
+    let vt_array = array_from_batches(runtime, &batch_shape, vt_height, cols, &vts, precision)?;
+    runtime.new_tuple(vec![u_array.value(), s_array.value(), vt_array.value()])
 }

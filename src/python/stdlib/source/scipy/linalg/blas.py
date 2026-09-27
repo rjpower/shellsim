@@ -1,179 +1,97 @@
-"""shellsim's ``scipy.linalg.blas``, following SciPy 1.18's ``scipy/linalg/blas.py``.
+"""shellsim's ``scipy.linalg.blas``: f2py-style wrappers over BLAS routines.
 
-SciPy exposes its f2py-compiled BLAS wrappers here, one per precision prefix (``s``, ``d``,
-``c``, ``z``). shellsim provides ``snrm2`` and ``dnrm2``, computed by the native
-``_scipy_linalg`` module. The other routines, and every complex routine, raise
-``NotImplementedError`` when fetched through ``get_blas_funcs`` or read as module attributes.
-
-Each routine is an ``_Routine`` object that stands in for an f2py ``fortran`` object: it takes
-f2py's keyword arguments, casts array arguments to its precision, and carries the ``dtype``,
-``typecode``, ``prefix``, ``module_name`` and ``int_dtype`` attributes that ``_get_funcs`` sets.
-Results are C-ordered where f2py returns Fortran-ordered arrays with the same values.
+Only the real single- and double-precision ``nrm2`` (Euclidean norm) is modeled, through the
+native ``_scipy_linalg.nrm2`` kernel. Every other BLAS routine name, and the complex (`c`/`z`)
+forms of the modeled one, raises ``NotImplementedError`` on attribute access or through
+:func:`get_blas_funcs`, matching the unsupported frontier ``docs/scipy.md`` documents.
 """
 
 import numpy as np
-import _scipy_linalg as _native
+from _scipy_linalg import nrm2 as _nrm2
 
-__all__ = ["find_best_blas_type", "get_blas_funcs"]
+__all__ = ["get_blas_funcs", "find_best_blas_type"]
 
-HAS_LP64 = True
-HAS_ILP64 = False
-
-_PREFIX_DTYPES = {"s": np.dtype("float32"), "d": np.dtype("float64")}
-
-
-class _Routine:
-    """One precision of a BLAS or LAPACK routine, called with f2py's arguments."""
-
-    def __init__(self, name, function, module_name):
-        prefix = name[0]
-        # f2py names its routine objects "function dnrm2".
-        self.__name__ = f"function {name}"
-        self._function = function
-        self.module_name = module_name
-        self.typecode = prefix
-        self.prefix = prefix
-        self.dtype = _PREFIX_DTYPES[prefix]
-        self.int_dtype = np.dtype(np.intc)
-
-    def __call__(self, *args, **kwargs):
-        return self._function(self.dtype, *args, **kwargs)
-
-    def __repr__(self):
-        return f"<fortran {self.__name__}>"
-
-
-def _as(value, dtype):
-    """An f2py array argument: ``value`` as an array of ``dtype``."""
-    return np.asarray(value, dtype=dtype)
-
-
-def _nrm2(dtype, x, n=None, offx=0, incx=1):
-    if offx < 0:
-        raise ValueError("offx must be nonnegative")
-    if incx <= 0:
-        raise NotImplementedError("nrm2 with incx <= 0 is not supported by shellsim's SciPy")
-    x = _as(x, dtype)
-    if n is None:
-        # f2py's default, which can leave out the last element of a strided vector.
-        n = (len(x) - offx) // incx
-    return _native.nrm2(x[offx::incx][:n])
-
-
-def _define(functions, module_name):
-    """The ``s`` and ``d`` routines for each of ``functions``, by name."""
-    routines = {}
-    for name, function in functions.items():
-        for prefix in "sd":
-            routines[prefix + name] = _Routine(prefix + name, function, module_name)
-    return routines
-
-
-_ROUTINES = _define({"nrm2": _nrm2}, "fblas")
-
-
-def _unsupported(kind, name):
-    return NotImplementedError(f"{kind} routine {name} is not supported by shellsim's SciPy")
-
-
-def __getattr__(name):
-    # The routines are served from here because shellsim has no `globals()` to define them with.
-    if name in _ROUTINES:
-        return _ROUTINES[name]
-    if len(name) > 1 and name[0] in "sdcz":
-        raise _unsupported("BLAS", name)
-    raise AttributeError(f"module 'scipy.linalg.blas' has no attribute '{name}'")
-
-
-_type_score = {x: 1 for x in "?bBhHef"}
-_type_score.update({x: 2 for x in "iIlLqQd"})
-_type_score.update({"F": 3, "D": 4, "g": 2, "G": 4})
-
-_type_conv = {
-    1: ("s", np.dtype("float32")),
-    2: ("d", np.dtype("float64")),
-    3: ("c", np.dtype("complex64")),
-    4: ("z", np.dtype("complex128")),
+_TYPECODES = {
+    np.dtype(np.float32): "s",
+    np.dtype(np.float64): "d",
+    np.dtype(np.complex64): "c",
+    np.dtype(np.complex128): "z",
 }
+_RANK = {"s": 0, "d": 1, "c": 2, "z": 3}
+_SUPPORTED = {"snrm2", "dnrm2"}
 
-_blas_alias = {
-    "cnrm2": "scnrm2",
-    "znrm2": "dznrm2",
-    "cdot": "cdotc",
-    "zdot": "zdotc",
-    "cger": "cgerc",
-    "zger": "zgerc",
-    "sdotc": "sdot",
-    "sdotu": "sdot",
-    "ddotc": "ddot",
-    "ddotu": "ddot",
-}
+
+def _resolve_dtype(dtype):
+    """The BLAS-modeled dtype nearest `dtype`: itself if it is one of the four BLAS types,
+    else `complex128` for another complex type or `float64` for anything else (real SciPy
+    resolves through the same four kinds, widening integers and `float16` to `float64`)."""
+    dtype = np.dtype(dtype)
+    if dtype in _TYPECODES:
+        return dtype
+    if np.issubdtype(dtype, np.complexfloating):
+        return np.dtype(np.complex128)
+    return np.dtype(np.float64)
 
 
 def find_best_blas_type(arrays=(), dtype=None):
-    """The BLAS prefix, dtype and preferred memory order for ``arrays`` or ``dtype``.
+    """The BLAS type prefix, resolved dtype, and whether Fortran order is preferred.
 
-    ``float32`` and smaller types give ``'s'``, ``float64`` and the integers ``'d'``, and the
-    complex types ``'c'`` and ``'z'``; a mix of ``float64`` and ``complex64`` gives ``'z'``.
+    Scans `arrays` (converted with :func:`numpy.asarray`) for the highest-priority dtype among
+    `float32 < float64 < complex64 < complex128`, starting from `dtype` if given. Fortran order
+    is preferred if any array is Fortran-contiguous (as a 0-d or 1-D array always is).
     """
-    dtype = np.dtype(dtype)
-    max_score = _type_score.get(dtype.char, 5)
+    best = _resolve_dtype(dtype) if dtype is not None else np.dtype(np.float32)
+    best_rank = _RANK[_TYPECODES[best]] if dtype is not None else -1
     prefer_fortran = False
-    if arrays:
-        if len(arrays) == 1:
-            max_score = _type_score.get(arrays[0].dtype.char, 5)
-            prefer_fortran = arrays[0].flags["FORTRAN"]
-        else:
-            scores = [_type_score.get(x.dtype.char, 5) for x in arrays]
-            max_score = max(scores)
-            ind_max_score = scores.index(max_score)
-            if max_score == 3 and (2 in scores):
-                max_score = 4
-            if arrays[ind_max_score].flags["FORTRAN"]:
-                prefer_fortran = True
-    prefix, dtype = _type_conv.get(max_score, ("d", np.dtype("float64")))
-    return prefix, dtype, prefer_fortran
+    for value in arrays:
+        array = np.asarray(value)
+        candidate = _resolve_dtype(array.dtype)
+        rank = _RANK[_TYPECODES[candidate]]
+        if rank > best_rank:
+            best_rank = rank
+            best = candidate
+        if array.flags.f_contiguous:
+            prefer_fortran = True
+    return _TYPECODES[best], best, prefer_fortran
 
 
-def _get_funcs(names, arrays, dtype, lib_name, fmodule, fmodule_name, alias, ilp64="preferred"):
-    """The routines ``names`` of ``fmodule`` for the precision ``arrays`` or ``dtype`` need."""
-    funcs = []
-    unpack = False
-    dtype = np.dtype(dtype)
-    if isinstance(names, str):
-        names = (names,)
-        unpack = True
-    prefix, dtype, _ = find_best_blas_type(arrays, dtype)
-    for name in names:
-        func_name = prefix + name
-        func_name = alias.get(func_name, func_name)
-        func = fmodule.get(func_name)
-        if func is None:
-            raise _unsupported(lib_name, func_name)
-        funcs.append(func)
-    return funcs[0] if unpack else funcs
+class _FortranFunction:
+    """A callable that looks and prints like an f2py-wrapped Fortran routine."""
+
+    def __init__(self, label, typecode, dtype, module_name, call):
+        self.__name__ = f"function {label}"
+        self.typecode = typecode
+        self.prefix = typecode
+        self.dtype = dtype
+        self.module_name = module_name
+        self._label = label
+        self._call = call
+
+    def __call__(self, *args, **kwargs):
+        return self._call(*args, **kwargs)
+
+    def __repr__(self):
+        return f"<fortran function {self._label}>"
 
 
-def _resolve_ilp64(kind, ilp64):
-    if isinstance(ilp64, str):
-        if ilp64 == "preferred":
-            return HAS_ILP64
-        raise ValueError(f"Invalid value for {ilp64 = }.")
-    if ilp64:
-        raise RuntimeError(
-            f"{kind} ILP64 routine requested, but Scipy compiled only with 32-bit {kind}"
-        )
-    return False
+def __getattr__(name):
+    if name in _SUPPORTED:
+        prefix = name[0]
+        dtype = np.dtype(np.float32 if prefix == "s" else np.float64)
+        return _FortranFunction(name, prefix, dtype, "fblas", _nrm2)
+    if len(name) > 1 and name[0] in "sdcz":
+        raise NotImplementedError(f"BLAS routine {name} is not supported by shellsim's SciPy")
+    raise AttributeError(f"module 'scipy.linalg.blas' has no attribute '{name}'")
 
 
-def get_blas_funcs(names, arrays=(), dtype=None, ilp64="preferred"):
-    """BLAS routines by name, in the precision that ``arrays`` or ``dtype`` call for.
+def get_blas_funcs(names, arrays=(), dtype=None):
+    """Real single/double BLAS wrappers for `names`, resolved from `arrays`' dtypes.
 
-    A single name gives a single routine; a sequence of names gives a list.
-
-    >>> nrm2 = get_blas_funcs("nrm2", (np.array([3.0, 4.0]),))
-    >>> nrm2.typecode, nrm2(np.array([3.0, 4.0]))
-    ('d', 5.0)
+    `names` is either one routine's short name (returning one wrapper) or a sequence of them
+    (returning a list, in order).
     """
-    _resolve_ilp64("BLAS", ilp64)
-    return _get_funcs(names, arrays, dtype, "BLAS", _ROUTINES, "fblas", _blas_alias)
+    prefix, resolved, _ = find_best_blas_type(arrays, dtype)
+    single = isinstance(names, str)
+    requested = [names] if single else list(names)
+    functions = [__getattr__(f"{prefix}{name}") for name in requested]
+    return functions[0] if single else functions

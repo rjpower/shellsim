@@ -77,21 +77,6 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "scipy._lib" => Some(include_str!("source/scipy/_lib/__init__.py")),
         "scipy._lib._util" => Some(include_str!("source/scipy/_lib/_util.py")),
         "scipy.linalg" => Some(include_str!("source/scipy/linalg/__init__.py")),
-        "scipy.linalg._basic" => Some(include_str!("source/scipy/linalg/_basic.py")),
-        "scipy.linalg._decomp" => Some(include_str!("source/scipy/linalg/_decomp.py")),
-        "scipy.linalg._decomp_cholesky" => {
-            Some(include_str!("source/scipy/linalg/_decomp_cholesky.py"))
-        }
-        "scipy.linalg._decomp_lu" => Some(include_str!("source/scipy/linalg/_decomp_lu.py")),
-        "scipy.linalg._decomp_polar" => Some(include_str!("source/scipy/linalg/_decomp_polar.py")),
-        "scipy.linalg._decomp_qr" => Some(include_str!("source/scipy/linalg/_decomp_qr.py")),
-        "scipy.linalg._decomp_svd" => Some(include_str!("source/scipy/linalg/_decomp_svd.py")),
-        "scipy.linalg._matfuncs" => Some(include_str!("source/scipy/linalg/_matfuncs.py")),
-        "scipy.linalg._misc" => Some(include_str!("source/scipy/linalg/_misc.py")),
-        "scipy.linalg._procrustes" => Some(include_str!("source/scipy/linalg/_procrustes.py")),
-        "scipy.linalg._special_matrices" => {
-            Some(include_str!("source/scipy/linalg/_special_matrices.py"))
-        }
         "scipy.linalg.blas" => Some(include_str!("source/scipy/linalg/blas.py")),
         "scipy.linalg.lapack" => Some(include_str!("source/scipy/linalg/lapack.py")),
         "scipy.special" => Some(include_str!("source/scipy/special/__init__.py")),

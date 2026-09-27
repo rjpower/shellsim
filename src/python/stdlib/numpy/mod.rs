@@ -29,7 +29,7 @@ mod format;
 mod index;
 mod io;
 mod layout;
-mod linalg;
+pub(in crate::python) mod linalg;
 mod math;
 mod ndarray;
 mod ops;
@@ -50,10 +50,8 @@ pub(in crate::python) use args::{flag, float_arg, index_int, Bound, Signature};
 pub(in crate::python) use array::{
     array_from_elements, fortran_array_from_elements, read_elements, Array,
 };
-pub(in crate::python) use convert::as_array;
-pub(in crate::python) use dtype::DType;
-pub(in crate::python) use element::Element;
-pub(in crate::python) use linalg::norm2;
+pub(in crate::python) use convert::{as_array, cast_array};
+pub(in crate::python) use dtype::{Category, DType};
 pub(in crate::python) use ndarray::{
     slot_bool, slot_get_item, slot_iter, slot_length, slot_matrix_multiply,
     slot_reflected_matrix_multiply, slot_repr, slot_set_item, slot_str,
