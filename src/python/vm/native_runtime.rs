@@ -619,8 +619,14 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn get_attribute(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
-        self.resolve_attribute(value, name)
-            .map_err(PyError::runtime_error)
+        self.resolve_optional_attribute(value, name)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::runtime_error(message)
+                }
+            })
     }
 
     fn list_len(&self, list: PyList) -> PyResult<usize> {

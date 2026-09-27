@@ -629,7 +629,7 @@ impl Vm<'_> {
     /// else the submodule `module.name`, else raise CPython's `ImportError`.
     pub(super) fn import_from(&mut self, name: &str) -> Result<(), String> {
         let module = *self.stack.last().ok_or("import stack underflow")?;
-        if let Some(value) = self.resolve_attribute(module, name)? {
+        if let Some(value) = self.resolve_optional_attribute(module, name)? {
             self.stack.push(value);
             return Ok(());
         }

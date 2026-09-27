@@ -153,6 +153,59 @@ fn package_initializers_and_relative_imports_share_module_identity() {
 }
 
 #[test]
+fn module_getattr_supplies_missing_names_and_lazy_submodules() {
+    let mut environment = Environment::new();
+    for (path, source) in [
+        (
+            "/app/lazy/__init__.py",
+            "def __getattr__(name):\n    if name == 'sub':\n        import lazy.sub as sub\n        return sub\n    if name == 'computed':\n        return 42\n    if name == 'broken':\n        raise ValueError('hook failed')\n    raise AttributeError(f'module {__name__!r} has no attribute {name!r}')\n",
+        ),
+        ("/app/lazy/sub.py", "print('loading sub')\nVALUE = 7\n"),
+        (
+            "/app/main.py",
+            r#"import lazy
+print("imported")
+print(lazy.computed, lazy.sub.VALUE, lazy.sub is lazy.sub)
+from lazy import computed
+print(computed, hasattr(lazy, "missing"), getattr(lazy, "missing", "default"))
+try:
+    lazy.missing
+except AttributeError as error:
+    print(error)
+try:
+    from lazy import missing
+except ImportError as error:
+    print(type(error).__name__)
+try:
+    hasattr(lazy, "broken")
+except ValueError as error:
+    print(error)
+"#,
+        ),
+    ] {
+        environment
+            .vfs
+            .put_file(path, source.as_bytes().to_vec(), 0o644)
+            .unwrap();
+    }
+
+    // Expected output recorded from CPython 3.14 running the same files.
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /app/main.py");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&stdout),
+        "imported\nloading sub\n42 7 True\n42 False default\n\
+         module 'lazy' has no attribute 'missing'\nImportError\nhook failed\n"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn computed_string_allocation_is_bounded_before_allocation() {
     let mut environment = Environment::with_limits(Limits {
         memory: 40 * 1024,

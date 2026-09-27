@@ -237,6 +237,31 @@ impl Vm<'_> {
         self.resolve_attribute_inner(owner, symbol, name)
     }
 
+    /// Resolve an attribute where an `AttributeError` raised during the lookup means the
+    /// attribute is absent, as in CPython's `PyObject_GetOptionalAttr`. `getattr` defaults,
+    /// `hasattr` and `from module import name` use this, so a module `__getattr__` or property
+    /// that raises `AttributeError` reads as a missing name while other exceptions propagate.
+    pub(super) fn resolve_optional_attribute(
+        &mut self,
+        owner: Value,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let error = match self.resolve_attribute(owner, name) {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let Some(exception) = self.pending_exception.take() else {
+            return Err(error);
+        };
+        let attribute_error =
+            Value::Native(NativeValue::ExceptionType(ExceptionType("AttributeError")));
+        if self.exception_type_matches(attribute_error, &exception)? {
+            return Ok(None);
+        }
+        self.pending_exception = Some(exception);
+        Err(error)
+    }
+
     fn resolve_attribute_by_symbol(
         &mut self,
         owner: Value,
@@ -310,7 +335,17 @@ impl Vm<'_> {
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::Module { scope, .. } => {
-                    return Ok(self.state.heap.scope_get(scope, name).copied());
+                    if let Some(value) = self.state.heap.scope_get(scope, name).copied() {
+                        return Ok(Some(value));
+                    }
+                    // PEP 562: a module-level `__getattr__` supplies names the module does not
+                    // define, which is how packages import submodules lazily.
+                    let Some(hook) = self.state.heap.scope_get(scope, "__getattr__").copied()
+                    else {
+                        return Ok(None);
+                    };
+                    let name = self.allocate_string(name.to_string())?;
+                    return self.invoke_value(hook, vec![name]).map(Some);
                 }
                 Object::Class {
                     name: class_name, ..
