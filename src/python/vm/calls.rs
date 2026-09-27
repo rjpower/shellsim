@@ -1235,29 +1235,6 @@ impl Vm<'_> {
                 };
                 Ok(CallResult::Value(value))
             }
-            Builtin::Range => {
-                expect_arity(&arguments, 1, 3)?;
-                let mut integers = Vec::with_capacity(arguments.len());
-                for value in &arguments {
-                    integers.push(self.index_argument(value)?);
-                }
-                let (start, stop, step) = match integers.as_slice() {
-                    [stop] => (0, *stop, 1),
-                    [start, stop] => (*start, *stop, 1),
-                    [start, stop, step] => (*start, *stop, *step),
-                    _ => unreachable!(),
-                };
-                if step == 0 {
-                    return Err(
-                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
-                    );
-                }
-                Ok(CallResult::Value(self.allocate_object(Object::Range {
-                    start,
-                    stop,
-                    step,
-                })?))
-            }
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;

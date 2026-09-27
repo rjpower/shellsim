@@ -133,3 +133,30 @@ def test_json_uses_ordinary_runtime_values():
     assert value["small"] + value["large"] == 9223372036854775809
     assert value["items"] == [1, 2]
     assert json.loads(json.dumps(value))["large"] == 9223372036854775808
+
+
+def test_class_attribute_falls_back_to_the_runtime_type():
+    value = Child(1)
+    assert value.__class__ is Child
+    assert value.__class__.__name__ == "Child"
+    assert (3).__class__ is int
+    assert "x".__class__ is str
+    assert json.__class__.__name__ == "module"
+
+
+def test_range_is_a_type():
+    values = range(1, 7, 2)
+    assert isinstance(values, range)
+    assert type(values) is range
+    assert not isinstance([1, 3, 5], range)
+    assert list(values) == [1, 3, 5]
+    for arguments, message in [
+        ((), "range expected at least 1 argument, got 0"),
+        ((1, 2, 3, 4), "range expected at most 3 arguments, got 4"),
+    ]:
+        try:
+            range(*arguments)
+        except TypeError as error:
+            assert str(error) == message
+        else:
+            raise AssertionError(arguments)

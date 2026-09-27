@@ -277,6 +277,21 @@ impl Vm<'_> {
         symbol: Option<SymbolId>,
         name: &str,
     ) -> Result<Option<Value>, String> {
+        let found = self.lookup_attribute(owner, symbol, name)?;
+        if found.is_none() && name == "__class__" {
+            // Every object inherits `object.__class__`, which reports its type unless the
+            // class defines its own `__class__`.
+            return self.type_of(&owner).map(Some);
+        }
+        Ok(found)
+    }
+
+    fn lookup_attribute(
+        &mut self,
+        owner: Value,
+        symbol: Option<SymbolId>,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
             if let Some(function) = module.function(name) {
                 return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
@@ -339,9 +354,10 @@ impl Vm<'_> {
                         return Ok(Some(value));
                     }
                     // PEP 562: a module-level `__getattr__` supplies names the module does not
-                    // define, which is how packages import submodules lazily.
-                    let Some(hook) = self.state.heap.scope_get(scope, "__getattr__").copied()
-                    else {
+                    // define, which is how packages import submodules lazily. It runs after
+                    // the type's attributes, of which modules model only `__class__`.
+                    let hook = self.state.heap.scope_get(scope, "__getattr__").copied();
+                    let Some(hook) = hook.filter(|_| name != "__class__") else {
                         return Ok(None);
                     };
                     let name = self.allocate_string(name.to_string())?;
@@ -2132,6 +2148,33 @@ impl Vm<'_> {
                     step: bounds[2],
                 })?
             }
+            BuiltinType::Range => {
+                let bound = match arguments.len() {
+                    0 => Some("least 1 argument"),
+                    1..=3 => None,
+                    _ => Some("most 3 arguments"),
+                };
+                if let Some(bound) = bound {
+                    let message = format!("range expected at {bound}, got {}", arguments.len());
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                let mut integers = Vec::with_capacity(arguments.len());
+                for value in &arguments {
+                    integers.push(self.index_argument(value)?);
+                }
+                let (start, stop, step) = match integers.as_slice() {
+                    [stop] => (0, *stop, 1),
+                    [start, stop] => (*start, *stop, 1),
+                    [start, stop, step] => (*start, *stop, *step),
+                    _ => unreachable!(),
+                };
+                if step == 0 {
+                    return Err(
+                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
+                    );
+                }
+                self.allocate_object(Object::Range { start, stop, step })?
+            }
             BuiltinType::None => {
                 expect_arity(&arguments, 0, 0)?;
                 Value::None
@@ -2362,7 +2405,6 @@ impl Vm<'_> {
                 self.allocate_object(Object::Dict(entries.into()))?
             }
             BuiltinType::Function
-            | BuiltinType::Range
             | BuiltinType::Module
             | BuiltinType::Iterator
             | BuiltinType::Generator

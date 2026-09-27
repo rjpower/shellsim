@@ -283,7 +283,6 @@ pub(super) enum Builtin {
     Power,
     Divmod,
     Callable,
-    Range,
     Enumerate,
     Zip,
     Any,

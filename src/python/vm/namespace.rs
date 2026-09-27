@@ -101,6 +101,7 @@ impl Vm<'_> {
                 "set" => Some(BuiltinType::Set),
                 "frozenset" => Some(BuiltinType::FrozenSet),
                 "slice" => Some(BuiltinType::Slice),
+                "range" => Some(BuiltinType::Range),
                 _ => None,
             };
             if let Some(builtin_type) = builtin_type {
@@ -139,7 +140,6 @@ impl Vm<'_> {
                 "pow" => Builtin::Power,
                 "divmod" => Builtin::Divmod,
                 "callable" => Builtin::Callable,
-                "range" => Builtin::Range,
                 "enumerate" => Builtin::Enumerate,
                 "zip" => Builtin::Zip,
                 "any" => Builtin::Any,
