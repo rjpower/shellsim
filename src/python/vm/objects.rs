@@ -2046,20 +2046,16 @@ impl Vm<'_> {
                 return Ok((class, *value, accessed_class));
             }
         }
-        if name == "__new__"
-            && matches!(
-                self.state.heap.get(start_class)?,
-                Object::Class {
-                    layout: ClassLayout::Type,
-                    ..
-                }
-            )
-        {
-            if let Some(descriptor) = self
-                .state
-                .types
-                .attribute(BuiltinType::Type.id(), "__new__")?
-            {
+        // Past the last user class, the MRO continues through builtin ancestors such as `type`,
+        // `BaseException` and `object`, whose methods live in the type registry. User types
+        // register no attributes there, so only builtin ancestors can match.
+        let Object::Class { instance_type, .. } = self.state.heap.get(accessed_class)? else {
+            return Err("super() receiver has an invalid class".into());
+        };
+        let ancestors = self.state.types.get(*instance_type)?.mro.clone();
+        for ancestor in ancestors {
+            self.charge_cpu(1)?;
+            if let Some(descriptor) = self.state.types.attribute(ancestor, name)? {
                 return Ok((start_class, descriptor, accessed_class));
             }
         }

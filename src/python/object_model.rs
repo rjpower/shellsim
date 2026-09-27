@@ -620,8 +620,16 @@ impl Default for TypeRegistry {
             });
         }
         install_native_attributes(
+            &mut types[BuiltinType::Object as usize],
+            &super::stdlib::core::OBJECT_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Type as usize],
             &super::stdlib::core::TYPE_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::Exception as usize],
+            &super::stdlib::core::EXCEPTION_TYPE,
         );
         install_native_attributes(
             &mut types[BuiltinType::String as usize],

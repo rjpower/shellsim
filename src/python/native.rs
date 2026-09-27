@@ -662,6 +662,8 @@ pub(super) trait PyRuntime {
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
+    /// Assign an attribute through the runtime's descriptor protocol, as `setattr` does.
+    fn set_attribute(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
     fn list_len(&self, list: PyList) -> PyResult<usize>;
     fn list_items(&mut self, list: PyList) -> PyResult<Vec<PyValue>>;
     fn list_append(&mut self, list: PyList, value: PyValue) -> PyResult<()>;

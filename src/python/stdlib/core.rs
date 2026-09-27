@@ -196,6 +196,18 @@ pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
+pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "object",
+    methods: &[method("object", "__init__", object_init)],
+    getters: &[],
+};
+
+pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "BaseException",
+    methods: &[method("BaseException", "__init__", exception_init)],
+    getters: &[],
+};
+
 pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
     methods: &[method("type", "__new__", type_new)],
@@ -2880,6 +2892,31 @@ fn property_setter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
     let property = receiver.cast::<PyProperty>(runtime)?;
     let getter = runtime.property_getter(property)?;
     runtime.new_property(getter, Some(args.positional()[0]))
+}
+
+/// `object.__init__`, which ends an initializer chain reached through `super().__init__()`.
+/// It accepts only the instance.
+fn object_init(_runtime: &mut dyn PyRuntime, _receiver: PyValue, args: CallArgs) -> PyResult {
+    if !args.positional().is_empty() || !args.keywords().is_empty() {
+        return Err(PyError::type_error(
+            "object.__init__() takes exactly one argument (the instance to initialize)",
+        ));
+    }
+    Ok(Value::None)
+}
+
+/// `BaseException.__init__`, which replaces the exception's `args` with its positional
+/// arguments.
+fn exception_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    if !args.keywords().is_empty() {
+        let type_name = runtime.type_name(&receiver)?;
+        return Err(PyError::type_error(format!(
+            "{type_name}() takes no keyword arguments"
+        )));
+    }
+    let items = runtime.new_tuple(args.positional().to_vec())?;
+    runtime.set_attribute(receiver, "args", items)?;
+    Ok(Value::None)
 }
 
 fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

@@ -154,6 +154,47 @@ fn zero_argument_super_works_in_initializers_run_by_instantiation() {
 }
 
 #[test]
+fn super_init_continues_into_object_and_base_exception() {
+    // After the last user class, `super().__init__` reaches `object.__init__`, which takes no
+    // arguments, or `BaseException.__init__`, which replaces `args`.
+    let source = r#"class Plain:
+    def __init__(self):
+        super().__init__()
+        self.ready = True
+class Extra:
+    def __init__(self, value):
+        super().__init__(value)
+class Tagged(ValueError):
+    def __init__(self, a, b):
+        super().__init__(a, b)
+        self.extra = 1
+class Keyword(Exception):
+    def __init__(self):
+        super().__init__(x=1)
+class Late(Exception):
+    def __init__(self, value):
+        super().__init__()
+        self.args = ("late", value)
+print(Plain().ready)
+error = Tagged(1, 2)
+print(error.args, str(error), repr(error), error.extra)
+print(str(Late(4)), Late(4).args)
+for build in (lambda: Extra(1), Keyword):
+    try:
+        build()
+    except TypeError as error:
+        print(error)"#;
+    assert_eq!(
+        run_python_text(source),
+        (
+            0,
+            "True\n(1, 2) (1, 2) Tagged(1, 2) 1\n('late', 4) ('late', 4)\nobject.__init__() takes exactly one argument (the instance to initialize)\nKeyword() takes no keyword arguments\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
 fn user_descriptors_follow_precedence_and_receive_set_name() {
     assert_eq!(
         run_shell(
