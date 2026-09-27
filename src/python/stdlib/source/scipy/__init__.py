@@ -1,13 +1,16 @@
-"""shellsim's SciPy.
+"""shellsim's ``scipy``.
 
-Submodules load on first access, as in SciPy. ``scipy.linalg``, ``scipy.special`` and
-``scipy.stats`` are implemented; the other SciPy submodules raise ``NotImplementedError`` on
-import. The behavior targets SciPy 1.18.
+Real SciPy loads each subpackage lazily on first attribute access instead of importing all of
+them up front. shellsim reproduces that with a module ``__getattr__`` (PEP 562): touching
+``scipy.stats`` imports the ``scipy.stats`` submodule the first time and caches it as a module
+attribute afterwards, exactly as ``import scipy.stats`` would. Only ``special``, ``stats`` and
+``linalg`` do anything; the rest resolve to ``scipy._unsupported``, whose import always raises
+``NotImplementedError``.
 """
 
-__version__ = "1.18.1"
+import importlib
 
-_SUBMODULES = (
+__all__ = [
     "cluster",
     "constants",
     "datasets",
@@ -26,16 +29,12 @@ _SUBMODULES = (
     "spatial",
     "special",
     "stats",
-)
+]
 
 
 def __getattr__(name):
-    if name in _SUBMODULES:
-        import importlib
-
-        return importlib.import_module(f"scipy.{name}")
-    raise AttributeError(f"Module 'scipy' has no attribute '{name}'")
-
-
-def __dir__():
-    return [*globals(), *_SUBMODULES]
+    if name not in __all__:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module = importlib.import_module(f"scipy.{name}")
+    globals()[name] = module
+    return module

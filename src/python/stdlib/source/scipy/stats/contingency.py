@@ -1,136 +1,71 @@
-"""Contingency table functions, following SciPy 1.18's ``scipy/stats/contingency.py``.
+"""Contingency table statistics: ``chi2_contingency``, ``margins``, ``expected_freq`` and
+``association``.
 
-shellsim implements ``margins``, ``expected_freq``, ``chi2_contingency`` and ``association``.
-``crosstab``, ``relative_risk`` and ``odds_ratio`` are not implemented, and
-``chi2_contingency`` rejects the resampling ``method`` argument because the resampling method
-classes do not exist.
+All are elementary: ``expected_freq`` is an outer product of the table's margins divided by the
+total, ``chi2_contingency`` is a Pearson chi-squared test (with Yates' continuity correction for
+a 2x2 table) against that expectation, and ``association`` rescales its chi-squared statistic.
 """
 
-import math
-from functools import reduce
-
 import numpy as np
-from scipy._lib._bunch import _make_tuple_bunch
-from scipy.stats._stats_py import power_divergence
 
-__all__ = ["margins", "expected_freq", "chi2_contingency", "association"]
+from scipy import special
+from scipy.stats._stats import _Result, _scalarize
+
+__all__ = ["chi2_contingency", "margins", "expected_freq", "association"]
+
+
+class Chi2ContingencyResult(_Result):
+    _fields = ("statistic", "pvalue", "dof", "expected_freq")
 
 
 def margins(a):
-    """Return a list of the marginal sums of the array ``a``.
-
-    Each marginal sum keeps the dimensions of ``a``, so the sums broadcast against each other.
-    """
-    margsums = []
-    ranged = list(range(a.ndim))
-    for k in ranged:
-        marg = np.apply_over_axes(np.sum, a, [j for j in ranged if j != k])
-        margsums.append(marg)
-    return margsums
+    """The sum of `a` over every axis but one, for each axis, keeping that axis's dimension."""
+    a = np.asarray(a)
+    return [np.sum(a, axis=tuple(i for i in range(a.ndim) if i != k), keepdims=True) for k in range(a.ndim)]
 
 
 def expected_freq(observed):
-    """Compute the expected frequencies from a contingency table under independence."""
-    # Typically `observed` is an integer array. If `observed` has a large
-    # number of dimensions or holds large values, some of the following
-    # computations may overflow, so we first switch to floating point.
-    observed = np.asarray(observed, dtype=np.float64)
-
-    # Create a list of the marginal sums.
-    margsums = margins(observed)
-
-    # Create the array of expected frequencies. The shapes of the
-    # marginal sums returned by apply_over_axes() are just what we
-    # need for broadcasting in the following product.
-    d = observed.ndim
-    expected = reduce(np.multiply, margsums) / observed.sum() ** (d - 1)
-    return expected
+    """The independence-model expected counts: the outer product of `observed`'s margins."""
+    observed = np.asarray(observed, dtype=float)
+    total = observed.sum()
+    if total == 0:
+        return np.zeros_like(observed)
+    expected = np.ones_like(observed)
+    for margin in margins(observed):
+        expected = expected * margin
+    return expected / total ** (observed.ndim - 1)
 
 
-Chi2ContingencyResult = _make_tuple_bunch(
-    "Chi2ContingencyResult", ["statistic", "pvalue", "dof", "expected_freq"], []
-)
-
-
-def chi2_contingency(observed, correction=True, lambda_=None, *, method=None):
-    """Chi-square test of independence of variables in a contingency table.
-
-    With one degree of freedom and ``correction=True``, Yates' continuity correction moves each
-    observed count 0.5 towards its expected value.
-    """
-    observed = np.asarray(observed)
-    if np.any(observed < 0):
-        raise ValueError("All values in `observed` must be nonnegative.")
-    if observed.size == 0:
-        raise ValueError("No data; `observed` has size 0.")
-
+def chi2_contingency(observed, correction=True, lambda_=None, method=None):
+    if method is not None:
+        raise NotImplementedError("chi2_contingency(..., method=...) is not supported by shellsim's SciPy")
+    observed = np.asarray(observed, dtype=float)
     expected = expected_freq(observed)
     if np.any(expected == 0):
-        # Include one of the positions where expected is zero in
-        # the exception message.
-        zeropos = list(zip(*np.nonzero(expected == 0)))[0]
-        raise ValueError(
-            "The internally computed table of expected "
-            f"frequencies has a zero element at {zeropos}."
-        )
-
-    if method is not None:
-        raise NotImplementedError(
-            "chi2_contingency(..., method=...) is not supported by shellsim's SciPy"
-        )
-
-    # The degrees of freedom
+        index = tuple(int(i) for i in np.argwhere(expected == 0)[0])
+        raise ValueError(f"The internally computed table of expected frequencies has a zero element at {index}.")
     dof = expected.size - sum(expected.shape) + expected.ndim - 1
-
     if dof == 0:
-        # Degenerate case; this occurs when `observed` is 1D (or, more
-        # generally, when it has only one nontrivial dimension).  In this
-        # case, we also have observed == expected, so chi2 is 0.
-        chi2 = 0.0
-        p = 1.0
-    else:
-        if dof == 1 and correction:
-            # Adjust `observed` according to Yates' correction for continuity.
-            # Magnitude of correction no bigger than difference; see gh-13875
-            diff = expected - observed
-            direction = np.sign(diff)
-            magnitude = np.minimum(0.5, np.abs(diff))
-            observed = observed + magnitude * direction
-
-        chi2, p = power_divergence(
-            observed, expected, ddof=observed.size - 1 - dof, axis=None, lambda_=lambda_
-        )
-
-    return Chi2ContingencyResult(chi2, p, dof, expected)
+        return Chi2ContingencyResult(0.0, 1.0, 0, expected)
+    diff = observed - expected
+    if dof == 1 and correction:
+        diff = np.sign(diff) * np.clip(np.abs(diff) - 0.5, 0.0, None)
+    statistic = float(np.sum(diff**2 / expected))
+    pvalue = float(special.chdtrc(dof, statistic))
+    return Chi2ContingencyResult(statistic, pvalue, dof, expected)
 
 
 def association(observed, method="cramer", correction=False, lambda_=None):
-    """Calculate the degree of association between two nominal variables.
-
-    ``method`` is 'cramer' (Cramér's V), 'tschuprow' (Tschuprow's T) or 'pearson' (Pearson's
-    contingency coefficient).
-    """
-    arr = np.asarray(observed)
-    if not np.issubdtype(arr.dtype, np.integer):
-        raise ValueError("`observed` must be an integer array.")
-
-    if len(arr.shape) != 2:
-        raise ValueError("method only accepts 2d arrays")
-
-    chi2_stat = chi2_contingency(arr, correction=correction, lambda_=lambda_)
-
-    phi2 = chi2_stat.statistic / arr.sum()
-    n_rows, n_cols = arr.shape
+    observed = np.asarray(observed, dtype=float)
+    statistic = chi2_contingency(observed, correction=correction, lambda_=lambda_).statistic
+    n = observed.sum()
+    r, c = observed.shape
     if method == "cramer":
-        value = phi2 / min(n_cols - 1, n_rows - 1)
+        value = np.sqrt(statistic / (n * min(r - 1, c - 1)))
     elif method == "tschuprow":
-        value = phi2 / math.sqrt((n_rows - 1) * (n_cols - 1))
+        value = np.sqrt(statistic / (n * np.sqrt((r - 1) * (c - 1))))
     elif method == "pearson":
-        value = phi2 / (1 + phi2)
+        value = np.sqrt(statistic / (statistic + n))
     else:
-        raise ValueError(
-            "Invalid argument value: 'method' argument must "
-            "be 'cramer', 'tschuprow', or 'pearson'"
-        )
-
-    return math.sqrt(value)
+        raise ValueError("Invalid argument value: 'method' argument must be 'cramer', 'tschuprow', or 'pearson'")
+    return _scalarize(value)

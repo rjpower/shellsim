@@ -54,7 +54,6 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy.testing" => Some(include_str!("source/numpy/testing.py")),
         "scipy" => Some(include_str!("source/scipy/__init__.py")),
         "scipy._lib" => Some(include_str!("source/scipy/_lib/__init__.py")),
-        "scipy._lib._bunch" => Some(include_str!("source/scipy/_lib/_bunch.py")),
         "scipy._lib._util" => Some(include_str!("source/scipy/_lib/_util.py")),
         "scipy.linalg" => Some(include_str!("source/scipy/linalg/__init__.py")),
         "scipy.linalg._basic" => Some(include_str!("source/scipy/linalg/_basic.py")),
@@ -77,26 +76,9 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "scipy.special" => Some(include_str!("source/scipy/special/__init__.py")),
         "scipy.special._ufuncs" => Some(include_str!("source/scipy/special/_ufuncs.py")),
         "scipy.stats" => Some(include_str!("source/scipy/stats/__init__.py")),
-        "scipy.stats._axis_nan_policy" => {
-            Some(include_str!("source/scipy/stats/_axis_nan_policy.py"))
-        }
-        "scipy.stats._continuous_distns" => {
-            Some(include_str!("source/scipy/stats/_continuous_distns.py"))
-        }
-        "scipy.stats._discrete_distns" => {
-            Some(include_str!("source/scipy/stats/_discrete_distns.py"))
-        }
-        "scipy.stats._distn_infrastructure" => {
-            Some(include_str!("source/scipy/stats/_distn_infrastructure.py"))
-        }
-        "scipy.stats._entropy" => Some(include_str!("source/scipy/stats/_entropy.py")),
-        "scipy.stats._finite_differences" => {
-            Some(include_str!("source/scipy/stats/_finite_differences.py"))
-        }
-        "scipy.stats._stats_py" => Some(include_str!("source/scipy/stats/_stats_py.py")),
-        "scipy.stats._warnings_errors" => {
-            Some(include_str!("source/scipy/stats/_warnings_errors.py"))
-        }
+        "scipy.stats._distributions" => Some(include_str!("source/scipy/stats/_distributions.py")),
+        "scipy.stats._stats" => Some(include_str!("source/scipy/stats/_stats.py")),
+        "scipy.stats._tests" => Some(include_str!("source/scipy/stats/_tests.py")),
         "scipy.stats.contingency" => Some(include_str!("source/scipy/stats/contingency.py")),
         "scipy.cluster"
         | "scipy.constants"

@@ -22,14 +22,16 @@ raise `NotImplementedError` when imported.
   holds every ufunc, including the private `_binom_pmf`, `_binom_cdf`, `_binom_sf`, `_binom_ppf`
   and `_binom_isf` that `scipy.stats` calls. The `scipy` package loads subpackages on first
   access, as SciPy does.
-- **`scipy.stats`** is frozen Python ported from SciPy's own modules: the `rv_continuous` and
-  `rv_discrete` framework, `_axis_nan_policy`, `_stats_py`, `_entropy` and `contingency`,
-  computing with NumPy and `scipy.special`. SciPy writes the statistics against the array API;
-  the port keeps their NumPy branch. SciPy uses `inspect` to find a distribution's shape
-  parameters from the signatures of `_pdf` and `_cdf`, and to add `axis`, `nan_policy` and
-  `keepdims` to its statistics. shellsim has no `inspect`, so the port reads parameters through
-  a private module, `_shellsim_introspect`, and each statistic declares SciPy's full signature
-  itself.
+- **`scipy.stats`** is frozen Python that reimplements SciPy's observable behavior directly:
+  a shared `rv_generic` base with `rv_continuous` and `rv_discrete` subclasses, the summary
+  statistics, and the correlation and hypothesis tests, computing with NumPy and
+  `scipy.special`. Each distribution supplies `_pdf`/`_pmf` and `_cdf` (and, where a closed form
+  exists, `_ppf`, `_stats`, `_entropy` and `_rvs`); generic methods derived from whichever of
+  those a subclass defines cover the rest, the way SciPy's do. SciPy uses `inspect` to find a
+  distribution's shape parameters from the signatures of `_pdf` and `_cdf`, and to add `axis`,
+  `nan_policy` and `keepdims` to its statistics. shellsim has no `inspect`, so this reads
+  parameters through a private module, `_shellsim_introspect`, and each statistic declares
+  SciPy's full signature itself.
 - **`scipy.linalg`** is frozen Python that follows SciPy's modules over a native module,
   `_scipy_linalg`, which plays the parts of SciPy's compiled code: the C++ `_batched_linalg`
   loops behind `solve`, `inv`, `det`, `lu`, `cholesky` and `qr`, the `expm` kernel, and the f2py
@@ -168,6 +170,18 @@ order-70 cases differently.
   thin wrapper instead of a decorator, so a warning whose `stacklevel` SciPy chose for its
   decorated call, such as the precision-loss `RuntimeWarning` from `skew`, is attributed one
   frame deeper than in SciPy.
+- **`scipy.stats` log and complement methods.** `sf` computes `1 - cdf(x)`, `isf` computes
+  `ppf(1 - q)`, and `logpdf`/`logpmf`, `logcdf` and `logsf` take the logarithm of the
+  corresponding non-log method, rather than SciPy's separate closed forms for each. Values agree
+  with SciPy's well within the tested tolerances, but deep in a tail, where SciPy's dedicated
+  formulas avoid cancellation, shellsim's can lose precision that SciPy's would not.
+- **Generic distribution methods.** A user subclass of `rv_continuous` or `rv_discrete` that
+  defines only `_cdf` gets a generic `_pdf`/`_pmf` (a central difference for continuous
+  distributions, a first difference of `_cdf` for discrete ones), a generic `_ppf` (bisection
+  on `_cdf`), and generic `_stats`/`_entropy`, the way SciPy derives the methods it can from
+  whichever of `_pdf`, `_cdf` and `_ppf` a subclass provides. The specific numerical methods are
+  shellsim's own, not SciPy's, so results can differ from SciPy's in the last several digits
+  even though both approximate the same quantity.
 - **Eigenvalues and singular values.** `eigh`, `eigvalsh`, `svd` and `svdvals` use Jacobi
   methods where SciPy calls LAPACK's `syevr` and `gesdd`. Their values agree with SciPy's to
   about `1e-15` relatively, and eigenvectors and singular vectors can differ in sign. `lstsq`
