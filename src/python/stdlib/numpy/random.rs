@@ -448,8 +448,13 @@ fn bounded_int_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         let mut buffer = integers::NarrowBuffer::new();
         for (lo, count) in low.iter().zip(count.iter()) {
             let range_incl = (*count as u128 - 1) as u32;
-            let offset =
-                integers::draw_bounded_buffered(&mut bitgen, &mut buffer, range_incl, legacy, chunk_bits);
+            let offset = integers::draw_bounded_buffered(
+                &mut bitgen,
+                &mut buffer,
+                range_incl,
+                legacy,
+                chunk_bits,
+            );
             values.push(lo.wrapping_add(i64::from(offset)));
         }
     } else {
@@ -483,6 +488,19 @@ fn normal_source(gauss: &mut Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitGen) 
     }
 }
 
+/// `dtype=np.float32`'s own source: `Generator`'s ziggurat has a narrower, 32-bit-word variant
+/// (see `ziggurat::next_gauss_f32`'s doc); legacy `RandomState`'s polar method has no narrower
+/// form (NumPy's own legacy Gaussian is always double precision), so it reuses `normal_source`
+/// and only the *result* narrows to `f32`.
+fn normal_source_f32(gauss: &mut Option<(bool, f64)>) -> Box<dyn FnMut(&mut BitGen) -> f64 + '_> {
+    match gauss {
+        Some((has_gauss, cached)) => {
+            Box::new(move |bitgen: &mut BitGen| legacy::gauss(bitgen, has_gauss, cached))
+        }
+        None => Box::new(ziggurat::next_gauss_f32),
+    }
+}
+
 fn standard_normal_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_normal_fill", 3, 3)?;
     let positional = args.positional().to_vec();
@@ -495,7 +513,7 @@ fn standard_normal_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
         reserve_and_charge(runtime, DType::FLOAT32, count, 4)?;
         let mut values = Vec::with_capacity(count);
         {
-            let mut source = normal_source(&mut gauss);
+            let mut source = normal_source_f32(&mut gauss);
             for _ in 0..count {
                 values.push(source(&mut bitgen) as f32);
             }
@@ -537,8 +555,18 @@ fn standard_exponential_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyR
     let out = if single {
         reserve_and_charge(runtime, DType::FLOAT32, count, 2)?;
         let mut values = Vec::with_capacity(count);
-        for _ in 0..count {
-            values.push(draw(&mut bitgen) as f32);
+        // `method="zig"` has its own narrower-word `f32` path (see
+        // `ziggurat::next_exponential_zig_f32`'s doc); inversion and the legacy generator have
+        // no narrower form (both are a single `next_double()`-driven formula), so they reuse
+        // `draw` and only the *result* narrows to `f32`.
+        if !legacy && !inversion {
+            for _ in 0..count {
+                values.push(ziggurat::next_exponential_zig_f32(&mut bitgen) as f32);
+            }
+        } else {
+            for _ in 0..count {
+                values.push(draw(&mut bitgen) as f32);
+            }
         }
         wrap_f32(runtime, shape, &values)?
     } else {
@@ -571,7 +599,14 @@ fn standard_gamma_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult 
     reserve_and_charge(runtime, dtype, shapes.len(), 8)?;
     let mut values = Vec::with_capacity(shapes.len());
     {
-        let mut source = normal_source(&mut gauss);
+        // `shape >= 1` draws normal deviates behind the scenes (Marsaglia-Tsang); matching
+        // `standard_normal_fill`'s own dtype split keeps that source's word width consistent
+        // with what a bare `standard_normal(dtype=...)` call would have consumed.
+        let mut source = if single {
+            normal_source_f32(&mut gauss)
+        } else {
+            normal_source(&mut gauss)
+        };
         for shape in &shapes {
             values.push(gamma::standard_gamma(&mut bitgen, *shape, &mut *source));
         }

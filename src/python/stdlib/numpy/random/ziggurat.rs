@@ -63,21 +63,24 @@
 //! exactly saturates the freedom needed to choose one raw word — choosing a second, consecutive
 //! one as well is a harder inversion this module does not solve. `tests/python/numpy/test_random.py`'s
 //! `test_generator_normal_matches_numpy_ziggurat` therefore still fails on two of its three exact
-//! assertions (the third, the 200,000-draw min/max, passes): this is the one place in
-//! `numpy.random` this crate could not black-box its way to full exactness despite the above
-//! effort. The exponential ziggurat (`method="zig"`, the default) is derived the same way but was
-//! not independently reverified to the same exhaustive standard — see `docs/numpy.md` for its
-//! status. Downstream distributions built on the normal (`Generator.standard_gamma` for
-//! `shape >= 1`, and therefore `.gamma`, `.chisquare`, `.f`, and `.standard_t`) inherit whichever
-//! of these is exact. Legacy `RandomState`'s Gaussian (the polar method, see `legacy_gauss` in
-//! `gamma.rs`) uses a different, unrelated algorithm and already matched NumPy exactly.
+//! assertions (the third, the 200,000-draw min/max, passes). The exponential ziggurat
+//! (`method="zig"`, the default) was independently re-derived and probed to the same standard
+//! (see `build_exponential`'s doc) and landed on the same kind of finding: its bit layout and
+//! control flow are exact, but its table is not, for the same reason (a hard-coded table, not a
+//! bug this module's construction can find and fix). These are the two places in `numpy.random`
+//! this crate could not black-box its way to full exactness despite the above effort. Downstream
+//! distributions built on either table (`Generator.standard_gamma` for `shape >= 1`, and therefore
+//! `.gamma`, `.chisquare`, `.f`, and `.standard_t`, all via the normal; `standard_exponential`,
+//! `.exponential`, and `standard_gamma` for `shape < 1` via the exponential) inherit whichever of
+//! these is exact — which for `method="zig"`/`shape >= 1` is neither. Legacy `RandomState`'s
+//! Gaussian (the polar method, see `legacy_gauss` in `gamma.rs`) uses a different, unrelated
+//! algorithm and already matched NumPy exactly.
 
 use std::sync::OnceLock;
 
 use super::bitgen::BitGen;
 
 const LAYERS: usize = 256;
-const MANTISSA_BITS: u32 = 55;
 
 struct NormalTables {
     /// Layer boundaries `x[1] = 0.2152...` (adjoining the peak) up to `x[255] = R` (adjoining
@@ -361,6 +364,54 @@ pub(in crate::python) fn next_gauss(bitgen: &mut BitGen) -> f64 {
     }
 }
 
+/// One standard normal draw at `dtype=np.float32`'s own precision: the same 256-layer table as
+/// `next_gauss`, but sampled from a 32-bit word instead of a 64-bit one (`idx` in bits 0-7,
+/// `sign` at bit 8, and a 23-bit fraction in bits 9-31, `f32`'s own mantissa width, mirroring
+/// `next_gauss`'s bit positions at half the word width). Recovered the same way as `next_gauss`'s
+/// layout (see the module doc): single-bit word scans on `next_u32()` placed `sign` at bit 8 and
+/// the fraction's low bit at 9 (bits below that always drew `0.0`, both alone and combined,
+/// ruling out a narrower `idx`); forcing a wedge rejection (a maximal mantissa on an inner layer)
+/// showed the next word came from a *fresh* `next_u64()` `next_double()` call, not a second
+/// `next_u32()` — it left the first word's cached upper half still pending for the following
+/// draw, confirmed by four consecutive core-accepted draws consuming only two raw 64-bit words
+/// between them (one per pair, low half then cached high half). So the wedge and tail machinery
+/// below is `next_gauss`'s, unchanged; only the word supplying `idx`/`sign`/fraction is narrower.
+/// Returns `f64` (the caller truncates to `f32`); inherits `next_gauss`'s table-precision caveat
+/// (see this module's `Accuracy` section) since it draws from the same table.
+pub(in crate::python) fn next_gauss_f32(bitgen: &mut BitGen) -> f64 {
+    let tables = normal_tables();
+    loop {
+        let word = bitgen.next_u32();
+        let idx = (word & 0xff) as usize;
+        let sign = if (word >> 8) & 1 != 0 { -1.0 } else { 1.0 };
+        let mag = (word >> 9) & ((1u32 << 23) - 1);
+        let frac = f64::from(mag) / f64::from(1u32 << 23);
+        if idx == 0 {
+            let x = frac * tables.wn0;
+            if x < tables.r {
+                return sign * x;
+            }
+            let tail_sign = if (word >> 17) & 1 != 0 { -1.0 } else { 1.0 };
+            return tail_sign * sample_tail(bitgen, tables.r);
+        }
+        let x = frac * tables.x[idx];
+        if x < tables.x[idx - 1] {
+            return sign * x;
+        }
+        let u = bitgen.next_double();
+        if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < normal_pdf(x) {
+            return sign * x;
+        }
+    }
+}
+
+/// A 53-bit mantissa (one bit wider than the normal ziggurat's 50-bit fraction, since the
+/// exponential ziggurat has no sign bit to make room for).
+const EXP_MANTISSA_BITS: u32 = 53;
+/// `next_exponential_zig_f32`'s mantissa width: `f32`'s own 23-bit mantissa, the same width
+/// `next_gauss_f32` uses.
+const EXP_MANTISSA_BITS_F32: u32 = 23;
+
 struct ExponentialTables {
     /// See `NormalTables::x`: kept for documentation, unused by sampling.
     #[allow(dead_code)]
@@ -368,6 +419,10 @@ struct ExponentialTables {
     f: [f64; LAYERS],
     k: [u64; LAYERS],
     w: [f64; LAYERS],
+    /// `k`/`w` rescaled for `next_exponential_zig_f32`'s narrower 23-bit mantissa (`dtype`
+    /// `np.float32`'s own word width, see that function's doc), built from the same `x[]`.
+    k32: [u32; LAYERS],
+    w32: [f64; LAYERS],
     r: f64,
 }
 
@@ -375,9 +430,38 @@ fn exp_pdf(x: f64) -> f64 {
     (-x).exp()
 }
 
+/// Builds the exponential ziggurat's layer tables the same way `build_normal` builds the
+/// Gaussian's: bisect the balance equations for the tail cutoff `r`, then recurse the layer
+/// boundaries in from `x[255] = r`. Unlike the Gaussian tail, `exp(-x)`'s tail integral beyond
+/// `r` has the closed form `exp(-r)` (no numerical integration needed), so `area = exp(-r) * (r +
+/// 1)` is exact up to `f64` rounding of that one expression — this table does not need `Dd`
+/// double-double carrying the way `build_normal`'s does.
+///
+/// **Accuracy**: this recursion and the bit layout below were confirmed against NumPy 2.5.3 the
+/// same way as the normal ziggurat's (see this module's doc): cloning `bit_generator.state`
+/// around single draws, and directly constructing raw PCG64 words (the `hi = 0` inversion trick)
+/// to probe specific `idx`/mantissa combinations. That probing places every recovered structural
+/// fact beyond doubt — `idx = (word >> 3) & 0xff`, mantissa = the top 53 bits (`word >> 11`), and
+/// layer `1`'s core is provably empty (`k[1] = 0`: bisecting the accept/reject mantissa boundary
+/// for layer `0`'s catch-all, and separately confirming layer `1` never accepts in one word at
+/// any mantissa from `0` to `2**53 - 1`, both point at an inner boundary of exactly `x = 0`, not a
+/// recursion-computed value, for the peak-adjoining layer) — but it did *not* converge on a
+/// bit-exact `x[]`/`w[]` table. Random core-accept draws (single raw word, no wedge fallback, so
+/// the returned value is exactly `mantissa * w[idx]` with no other floating-point step involved)
+/// mismatch NumPy's own output by 1-4 ULPs on the large majority of layers, including layer `0`'s
+/// closed-form `w[0] = (r + 1) / 2**53`. Sweeping `r` across its neighboring `f64` values (`0.5`
+/// ULP steps) does not find one that fixes more than a fraction of the mismatches at once, so this
+/// is not a simple bisection-convergence or last-bit-of-`r` gap: it is the same shape of finding
+/// as the normal ziggurat's table (see that section of this module's doc), evidence this table is
+/// independently hard-coded in NumPy rather than reproducible from the published balance equations
+/// by any construction this module tried, including plain `f64`, Kahan-style accumulation, and
+/// `Decimal`-at-50-digits re-derivation of the whole recursion. `next_exponential_zig`'s bit
+/// layout and control flow (which word decides what, the core/wedge split, the tail's closed-form
+/// fallback) is exact; the table values it multiplies by are not, so
+/// `test_generator_exponential_and_gamma_streams` and
+/// `test_generator_single_precision_and_inverse_exponentials` still fail on their `method="zig"`
+/// assertions (their `method="inv"` assertions, which never touch this table, do pass).
 fn build_exponential() -> ExponentialTables {
-    // The same balance equations, with f(x) = exp(-x) instead of the Gaussian density; the
-    // inverse of f is `-ln`, and the tail integral of `exp(-x)` beyond `r` is `exp(-r)`.
     let residual = |r: f64| -> Option<f64> {
         let area = r * exp_pdf(r) + exp_pdf(r);
         let mut x = [0.0f64; LAYERS];
@@ -403,32 +487,55 @@ fn build_exponential() -> ExponentialTables {
     }
     let r = hi;
     let area = r * exp_pdf(r) + exp_pdf(r);
-    let mut x_asc = [0.0f64; LAYERS];
-    x_asc[LAYERS - 1] = r;
+    let mut x = [0.0f64; LAYERS];
+    x[LAYERS - 1] = r;
     let mut prev_f = exp_pdf(r);
     for i in (0..LAYERS - 1).rev() {
-        let value = prev_f + area / x_asc[i + 1];
-        x_asc[i] = -value.ln();
+        let value = prev_f + area / x[i + 1];
+        x[i] = -value.ln();
         prev_f = value;
-    }
-    let mut x = [0.0f64; LAYERS];
-    for i in 0..LAYERS {
-        x[i] = x_asc[LAYERS - 1 - i];
     }
     let mut f = [0.0f64; LAYERS];
     for i in 0..LAYERS {
         f[i] = exp_pdf(x[i]);
     }
-    let scale = (1u64 << MANTISSA_BITS) as f64;
+    let scale = (1u64 << EXP_MANTISSA_BITS) as f64;
     let mut w = [0.0f64; LAYERS];
     let mut k = [0u64; LAYERS];
-    w[0] = (area / exp_pdf(r)) / scale;
-    k[0] = (scale * r * exp_pdf(r) / area) as u64;
+    w[0] = (r + 1.0) / scale;
+    k[0] = (scale * r / (r + 1.0)) as u64;
+    // Layer 1's inner boundary is the peak itself (`x = 0`), not a table entry: its core is
+    // empty, confirmed by black-box observation (see this function's doc), not derived from the
+    // general `x[i - 1] / x[i]` ratio below (which would wrongly give a large core here since
+    // `x[0]`, computed above only to close the bisection, is a nonzero recursion artifact).
+    k[1] = 0;
     for i in 1..LAYERS {
         w[i] = x[i] / scale;
+    }
+    for i in 2..LAYERS {
         k[i] = (scale * x[i - 1] / x[i]) as u64;
     }
-    ExponentialTables { x, f, k, w, r }
+    let scale32 = (1u32 << EXP_MANTISSA_BITS_F32) as f64;
+    let mut w32 = [0.0f64; LAYERS];
+    let mut k32 = [0u32; LAYERS];
+    w32[0] = (r + 1.0) / scale32;
+    k32[0] = (scale32 * r / (r + 1.0)) as u32;
+    k32[1] = 0;
+    for i in 1..LAYERS {
+        w32[i] = x[i] / scale32;
+    }
+    for i in 2..LAYERS {
+        k32[i] = (scale32 * x[i - 1] / x[i]) as u32;
+    }
+    ExponentialTables {
+        x,
+        f,
+        k,
+        w,
+        k32,
+        w32,
+        r,
+    }
 }
 
 static EXPONENTIAL: OnceLock<ExponentialTables> = OnceLock::new();
@@ -437,15 +544,48 @@ fn exponential_tables() -> &'static ExponentialTables {
     EXPONENTIAL.get_or_init(build_exponential)
 }
 
-/// One standard exponential draw by the ziggurat method (`method="zig"`, the default).
+/// One standard exponential draw by the ziggurat method (`method="zig"`, the default). See
+/// `build_exponential`'s doc for the bit layout's black-box provenance and the table's remaining
+/// (unrecovered) ULP-level imprecision.
 pub(in crate::python) fn next_exponential_zig(bitgen: &mut BitGen) -> f64 {
     let tables = exponential_tables();
     loop {
         let word = bitgen.next_u64();
-        let idx = (word & 0xff) as usize;
-        let mantissa = word >> 8;
+        let idx = ((word >> 3) & 0xff) as usize;
+        let mantissa = word >> 11;
         let x = mantissa as f64 * tables.w[idx];
         if mantissa < tables.k[idx] {
+            return x;
+        }
+        if idx == 0 {
+            return tables.r - bitgen.next_double().ln();
+        }
+        let u = bitgen.next_double();
+        if u * (tables.f[idx - 1] - tables.f[idx]) + tables.f[idx] < exp_pdf(x) {
+            return x;
+        }
+    }
+}
+
+/// One standard exponential draw at `dtype=np.float32`'s own precision, mirroring
+/// `next_gauss_f32`'s relationship to `next_gauss`: the same table (rescaled to `k32`/`w32`, see
+/// `ExponentialTables`'s doc), sampled from a 32-bit word. Recovered the same way as
+/// `next_exponential_zig`'s layout (see `build_exponential`'s doc): single-bit word scans on
+/// `next_u32()` found the fraction's low bit at 9 (bits 0-8 always drew `0.0`), and an idx-value
+/// scan (fixing the fraction at its own low bit and sweeping candidate idx values through 0..511)
+/// showed every *pair* of adjacent candidates mapped to the same output, i.e. `idx = (word >> 1) &
+/// 0xff`, not `word & 0xff` — one unused low bit, unlike `next_gauss_f32`'s zero unused low bits,
+/// an asymmetry this module found but cannot otherwise justify. `next_exponential_zig`'s
+/// table-precision caveat (see `build_exponential`'s doc) applies here too, since it draws from
+/// the same `x[]`.
+pub(in crate::python) fn next_exponential_zig_f32(bitgen: &mut BitGen) -> f64 {
+    let tables = exponential_tables();
+    loop {
+        let word = bitgen.next_u32();
+        let idx = ((word >> 1) & 0xff) as usize;
+        let mantissa = word >> 9;
+        let x = f64::from(mantissa) * tables.w32[idx];
+        if mantissa < tables.k32[idx] {
             return x;
         }
         if idx == 0 {
