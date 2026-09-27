@@ -157,6 +157,12 @@ fn loop_dtype(ufunc: &UfuncDef, input: DType, requested: Option<DType>) -> PyRes
             "reduce only supported for binary functions",
         ));
     }
+    if matches!(ufunc.family, Family::Special(_)) {
+        return Err(PyError::unsupported(format!(
+            "reduce and accumulate of scipy.special.{} are not supported by shellsim's SciPy",
+            ufunc.name
+        )));
+    }
     let accumulates = matches!(
         ufunc.family,
         Family::Arith {

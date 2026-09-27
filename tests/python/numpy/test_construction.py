@@ -412,6 +412,12 @@ def test_fromiter_consumes_iterable():
     assert np.fromiter([], dtype=float).shape == (0,)
 
 
+def test_iterable_reports_whether_iter_succeeds():
+    assert np.iterable([1, 2]) and np.iterable("ab") and np.iterable(np.arange(2))
+    assert not np.iterable(3) and not np.iterable(np.float64(1.5))
+    assert not np.iterable(np.array(5))
+
+
 def test_fromiter_count_limits_items():
     a = np.fromiter(range(10), dtype=np.int8, count=3)
     assert a.dtype == np.dtype("int8")

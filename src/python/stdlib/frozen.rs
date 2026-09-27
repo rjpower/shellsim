@@ -50,6 +50,25 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "numpy.random" => Some(include_str!("source/numpy/random.py")),
         "numpy.strings" => Some(include_str!("source/numpy/strings.py")),
         "numpy.testing" => Some(include_str!("source/numpy/testing.py")),
+        "scipy" => Some(include_str!("source/scipy/__init__.py")),
+        "scipy.special" => Some(include_str!("source/scipy/special.py")),
+        "scipy.cluster"
+        | "scipy.constants"
+        | "scipy.datasets"
+        | "scipy.differentiate"
+        | "scipy.fft"
+        | "scipy.fftpack"
+        | "scipy.integrate"
+        | "scipy.interpolate"
+        | "scipy.io"
+        | "scipy.linalg"
+        | "scipy.ndimage"
+        | "scipy.odr"
+        | "scipy.optimize"
+        | "scipy.signal"
+        | "scipy.sparse"
+        | "scipy.spatial"
+        | "scipy.stats" => Some(include_str!("source/scipy/_unsupported.py")),
         "operator" => Some(include_str!("source/operator.py")),
         "os" => Some(include_str!("source/os.py")),
         "pathlib" => Some(include_str!("source/pathlib.py")),

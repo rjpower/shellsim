@@ -22,10 +22,14 @@ use std::cmp::Ordering;
 
 use super::super::super::ast::{BinaryOperator, ComparisonOperator, UnaryOperator};
 use super::super::super::native::{
-    CallArgs, GetterDef, MethodDef, PyArrayBuffer, PyArrayData, PyError, PyErrorKind, PyKind,
-    PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, MethodDef, PyArray, PyArrayBuffer, PyArrayData, PyError, PyErrorKind,
+    PyKind, PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
 use super::super::super::Value;
+use super::super::scipy::special::{
+    evaluate as evaluate_special, Function as SpecialFunction, Loops as SpecialLoops,
+    ELEMENT_COST as SPECIAL_ELEMENT_COST,
+};
 use super::array::{
     broadcast_shapes, broadcast_strides, element_count, reserve_elements, Array, Offsets,
 };
@@ -182,6 +186,8 @@ pub(in crate::python) enum Family {
     Invert,
     LogicalNot,
     Predicate(PredicateOp),
+    /// A `scipy.special` function, computed in `float32` or `float64`.
+    Special(SpecialFunction),
 }
 
 /// How a ufunc treats `object` elements. NumPy's `O` loops apply a Python operation, and its
@@ -231,6 +237,7 @@ impl UfuncDef {
             | Family::Logical(_)
             | Family::Bitwise(_)
             | Family::Float2(_) => 2,
+            Family::Special(function) => function.nin(),
             _ => 1,
         }
     }
@@ -300,6 +307,15 @@ const fn simple(name: &'static str, family: Family, object: ObjectLoop) -> Ufunc
         name,
         family,
         object,
+    }
+}
+
+/// A `scipy.special` ufunc; SciPy registers no object loops.
+const fn special(function: SpecialFunction) -> UfuncDef {
+    UfuncDef {
+        name: function.name(),
+        family: Family::Special(function),
+        object: ObjectLoop::Missing,
     }
 }
 
@@ -576,6 +592,54 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
         Family::Predicate(PredicateOp::Signbit),
         ObjectLoop::Missing,
     ),
+    // scipy.special, exported by `_scipy_special` rather than NumPy.
+    special(SpecialFunction::Erf),
+    special(SpecialFunction::Erfc),
+    special(SpecialFunction::Erfinv),
+    special(SpecialFunction::Erfcinv),
+    special(SpecialFunction::Gamma),
+    special(SpecialFunction::Rgamma),
+    special(SpecialFunction::Gammaln),
+    special(SpecialFunction::Loggamma),
+    special(SpecialFunction::Psi),
+    special(SpecialFunction::Beta),
+    special(SpecialFunction::Betaln),
+    special(SpecialFunction::Betainc),
+    special(SpecialFunction::Betaincc),
+    special(SpecialFunction::Betaincinv),
+    special(SpecialFunction::Gammainc),
+    special(SpecialFunction::Gammaincc),
+    special(SpecialFunction::Gammaincinv),
+    special(SpecialFunction::Gammainccinv),
+    special(SpecialFunction::Ndtr),
+    special(SpecialFunction::LogNdtr),
+    special(SpecialFunction::Ndtri),
+    special(SpecialFunction::Expit),
+    special(SpecialFunction::Logit),
+    special(SpecialFunction::LogExpit),
+    special(SpecialFunction::Xlogy),
+    special(SpecialFunction::Xlog1py),
+    special(SpecialFunction::Entr),
+    special(SpecialFunction::RelEntr),
+    special(SpecialFunction::KlDiv),
+    special(SpecialFunction::Binom),
+    special(SpecialFunction::Poch),
+    special(SpecialFunction::Stdtr),
+    special(SpecialFunction::Stdtrit),
+    special(SpecialFunction::Chdtr),
+    special(SpecialFunction::Chdtrc),
+    special(SpecialFunction::Chdtri),
+    special(SpecialFunction::Fdtr),
+    special(SpecialFunction::Fdtrc),
+    special(SpecialFunction::Fdtri),
+    special(SpecialFunction::Pdtr),
+    special(SpecialFunction::Pdtrc),
+    special(SpecialFunction::Bdtr),
+    special(SpecialFunction::Bdtrc),
+    special(SpecialFunction::Boxcox),
+    special(SpecialFunction::InvBoxcox),
+    special(SpecialFunction::RiemannZeta),
+    special(SpecialFunction::Zeta),
 ];
 
 /// Module-level aliases NumPy exports for some ufuncs.
@@ -1244,7 +1308,50 @@ pub(in crate::python) fn resolve(
                 output: DType::BOOL,
             })
         }
+        Family::Special(function) => resolve_special(function, common, requested).map(same),
     }
+}
+
+/// The loop dtype of a `scipy.special` function. SciPy registers `float32` and `float64`
+/// loops, and NumPy takes the first one every input casts to safely, unless one matches the
+/// inputs exactly: `int16` computes in `float32`, `int32` in `float64`.
+fn resolve_special(
+    function: SpecialFunction,
+    common: DType,
+    requested: Option<DType>,
+) -> PyResult<DType> {
+    let name = function.name();
+    let complex = matches!(function.loops(), SpecialLoops::Real { complex: true });
+    let complex_error = || {
+        PyError::unsupported(format!(
+            "complex input to scipy.special.{name} is not supported by shellsim's SciPy"
+        ))
+    };
+    if let Some(dtype) = requested {
+        return match dtype.category() {
+            Category::Float if dtype.kind() != Kind::Float16 => Ok(dtype),
+            Category::Complex if complex => Err(complex_error()),
+            _ => Err(PyError::type_error(format!(
+                "No loop matching the specified signature and casting was found for ufunc {name}"
+            ))),
+        };
+    }
+    match common.category() {
+        Category::Bool | Category::Signed | Category::Unsigned | Category::Float => {}
+        Category::Complex if complex => return Err(complex_error()),
+        Category::Complex | Category::Str | Category::Object => return Err(not_supported(name)),
+    }
+    let single = match function.loops() {
+        SpecialLoops::DoubleFirst => common == DType::FLOAT32,
+        SpecialLoops::Real { .. } | SpecialLoops::Binomial => {
+            dtype::can_cast(common, DType::FLOAT32, Casting::Safe)
+        }
+    };
+    Ok(if single {
+        DType::FLOAT32
+    } else {
+        DType::FLOAT64
+    })
 }
 
 fn bool_loop(name: &str, dtype: DType, bools: BoolLoop, inputs: &[DType]) -> PyResult<DType> {
@@ -1364,6 +1471,15 @@ pub(in crate::python) fn evaluate(
         Some(out) => out.shape().to_vec(),
         None => shape,
     };
+    if let Family::Special(function) = ufunc.family {
+        if function.loops() == SpecialLoops::Binomial
+            && element_count(&shape)? > 0
+            && (resolved.input == DType::FLOAT32 || !integer_operand(&operands[1]))
+        {
+            // SciPy warns once per element; one warning per call is what default filters show.
+            super::errstate::call_warning(runtime, "scipy.special", "_warn_non_integer_n")?;
+        }
+    }
     if let (
         Family::Arith {
             op: ArithOp::Power, ..
@@ -1415,6 +1531,15 @@ pub(in crate::python) fn evaluate(
         flags,
         scalar_math,
     })
+}
+
+/// Whether an operand selects an integer loop argument: an integer or boolean array that casts
+/// safely to `int64`, or a Python `int` or `bool`.
+fn integer_operand(operand: &Operand) -> bool {
+    match operand {
+        Operand::Array(array) => dtype::can_cast(array.dtype, DType::INT64, Casting::Safe),
+        Operand::Weak { weak, .. } => matches!(weak, Weak::Int | Weak::Bool),
+    }
 }
 
 /// The memory order of an allocated output of `shape`, as NumPy's iterator applies `order`:
@@ -1585,6 +1710,7 @@ pub(in crate::python) fn prepare(
 fn element_cost(family: Family) -> u64 {
     match family {
         Family::Float { .. } | Family::Float2(_) => 4,
+        Family::Special(_) => SPECIAL_ELEMENT_COST,
         Family::Arith {
             op: ArithOp::Power, ..
         } => 4,
@@ -1619,6 +1745,27 @@ fn run(
     let handles = inputs.iter().map(|input| input.handle).collect::<Vec<_>>();
     let kind = resolved.input.kind();
     let family = ufunc.family;
+    if let Family::Special(function) = family {
+        let offsets = inputs
+            .iter()
+            .zip(&strides)
+            .map(|(input, strides)| Offsets::new(shape, strides, input.view.offset))
+            .collect();
+        match kind {
+            Kind::Float32 => special_loop::<f32>(runtime, &handles, offsets, &mut bytes, |args| {
+                function.eval_f32(args)
+            })?,
+            Kind::Float64 => special_loop::<f64>(runtime, &handles, offsets, &mut bytes, |args| {
+                function.eval(args)
+            })?,
+            _ => {
+                return Err(PyError::runtime_error(
+                    "ufunc loop has no kernel for its dtype",
+                ))
+            }
+        }
+        return Ok((PyArrayBuffer::Bytes(bytes), output, flags));
+    }
     runtime.read_arrays(&handles, &mut |arrays| {
         let data = arrays
             .iter()
@@ -1735,7 +1882,47 @@ fn numeric_loop(
         Family::Predicate(op) => dispatch_numeric!(kind, T => {
             unary_loop::<T, bool>(data, &mut offsets, output, flags, move |a: T, _| predicate(op, a.to_number()))
         }, _ => unsupported()),
+        Family::Special(_) => unsupported(),
     }
+}
+
+/// Elements whose arguments a `scipy.special` loop copies out of its operands at a time.
+const SPECIAL_CHUNK: usize = 1024;
+
+/// A loop over any number of inputs of one element type, for `scipy.special` kernels, which
+/// raise no floating-point flags. Arguments are copied out a chunk at a time so that kernels run
+/// outside the operand borrow, where each element can be charged for the work it reports.
+fn special_loop<T: Element>(
+    runtime: &mut dyn PyRuntime,
+    handles: &[PyArray],
+    mut offsets: Vec<Offsets>,
+    output: &mut [u8],
+    kernel: impl Fn(&[T]) -> T,
+) -> PyResult<()> {
+    let nin = handles.len();
+    let mut args = Vec::with_capacity(SPECIAL_CHUNK * nin);
+    for chunk in output.chunks_mut(SPECIAL_CHUNK * T::SIZE) {
+        let elements = chunk.len() / T::SIZE;
+        args.clear();
+        runtime.read_arrays(handles, &mut |arrays| {
+            for _ in 0..elements {
+                for (array, offsets) in arrays.iter().zip(offsets.iter_mut()) {
+                    let PyArrayData::Bytes(bytes) = array.data else {
+                        return Err(PyError::runtime_error("numeric loop saw objects"));
+                    };
+                    let offset = offsets
+                        .next()
+                        .ok_or_else(|| PyError::runtime_error("ufunc operand ended early"))?;
+                    args.push(T::read(&bytes[offset..]));
+                }
+            }
+            Ok(())
+        })?;
+        for (element, out) in args.chunks_exact(nin).zip(chunk.chunks_exact_mut(T::SIZE)) {
+            evaluate_special(runtime, || kernel(element))?.write(out);
+        }
+    }
+    Ok(())
 }
 
 /// Complex magnitude with the matching real element type.

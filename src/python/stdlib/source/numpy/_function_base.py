@@ -174,6 +174,15 @@ def cross(a, b, axisa=-1, axisb=-1, axisc=-1, axis=None):
 _HAS_REAL_AND_IMAG = (ndarray, generic, int, float, complex)
 
 
+def iterable(y):
+    """Whether ``iter(y)`` succeeds."""
+    try:
+        iter(y)
+    except TypeError:
+        return False
+    return True
+
+
 def real(val):
     if isinstance(val, _HAS_REAL_AND_IMAG):
         return val.real

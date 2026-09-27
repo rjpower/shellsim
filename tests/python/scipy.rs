@@ -1,0 +1,64 @@
+//! Shellsim-specific `scipy` behavior that the portable suites in `tests/python/scipy` cannot
+//! check against SciPy: the explicit unsupported frontier and CPU metering of kernels whose
+//! work depends on their arguments.
+
+use shellsim::{python, Environment, Limits};
+
+fn run(cpu: u64, source: &str) -> (i32, String) {
+    let mut environment = Environment::with_limits(Limits {
+        cpu,
+        ..Limits::default()
+    });
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let source = format!("import numpy as np\nfrom scipy import special\n{source}");
+    let status = python::run_python(
+        &mut environment,
+        &["python3.14".into(), "-c".into(), source],
+        Vec::new(),
+        &mut stdout,
+        &mut stderr,
+    );
+    (status, String::from_utf8_lossy(&stderr).into_owned())
+}
+
+#[test]
+fn unsupported_scipy_features_fail_explicitly() {
+    for (source, expected) in [
+        (
+            "special.erf(np.array([1j]))",
+            "complex input to scipy.special.erf is not supported by shellsim's SciPy",
+        ),
+        (
+            "special.xlogy.reduce(np.array([1.0, 2.0]))",
+            "reduce and accumulate of scipy.special.xlogy are not supported by shellsim's SciPy",
+        ),
+        (
+            "special.factorial(3, extend='complex')",
+            "NotImplementedError: factorial with extend='complex' is not supported by shellsim's \
+             SciPy",
+        ),
+        (
+            "import scipy.sparse",
+            "NotImplementedError: scipy.sparse is not supported by shellsim's SciPy",
+        ),
+    ] {
+        let (status, stderr) = run(Limits::default().cpu, source);
+        assert_ne!(status, 0, "{source} unexpectedly succeeded");
+        assert!(stderr.contains(expected), "{source}: {stderr:?}");
+    }
+}
+
+#[test]
+fn iterative_kernels_are_charged_for_the_iterations_they_run() {
+    let cpu = 20_000_000;
+    // Incomplete beta evaluations at small parameters converge in a few iterations.
+    let light = "a = np.full(2000, 2.0)\nassert special.betainc(a, 3.0, 0.5)[0] == 0.6875";
+    assert_eq!(run(cpu, light), (0, String::new()));
+    // At a = b = 3e10 each takes about 17,700 iterations, which the same budget cannot cover.
+    let heavy = "a = np.full(2000, 3e10)\nspecial.betainc(a, a, 0.5)";
+    assert_eq!(run(cpu, heavy), (137, String::new()));
+    // The Hurwitz zeta sum for a negative q runs about |q| terms, here 4e15, as SciPy's does.
+    let unbounded = "special.zeta(2.0, -4e15 + 0.5)";
+    assert_eq!(run(cpu, unbounded), (137, String::new()));
+}

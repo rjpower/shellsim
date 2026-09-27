@@ -250,10 +250,16 @@ const fn constant(name: &'static str, value: f64) -> ValueDef {
 }
 
 const fn ufunc_value(name: &'static str) -> ValueDef {
+    named_ufunc_value(name, name)
+}
+
+/// A module value named `name` for the ufunc named `ufunc`, which may be an alias; SciPy's
+/// modules export their ufuncs through this.
+pub(in crate::python) const fn named_ufunc_value(name: &'static str, ufunc: &str) -> ValueDef {
     ValueDef::Registered {
         name,
         kind: &ufunc::UFUNC,
-        payload: ufunc::index_of(name),
+        payload: ufunc::index_of(ufunc),
     }
 }
 

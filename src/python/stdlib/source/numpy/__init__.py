@@ -77,6 +77,7 @@ from numpy._function_base import (
     isposinf,
     isreal,
     isrealobj,
+    iterable,
     nan_to_num,
     polyfit,
     polyval,

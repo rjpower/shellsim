@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Build the pinned NumPy/SciPy environment that re-checks shellsim's scientific suites.
 
-The portable suites under ``tests/python/numpy`` state literal expectations taken from the
-releases pinned in ``tests/python/scientific-requirements.txt``. ``cargo test`` always runs them
-under shellsim offline; this optional step confirms the expectations against real NumPy. It
+The portable suites under ``tests/python/numpy`` and ``tests/python/scipy`` state literal
+expectations taken from the releases pinned in ``tests/python/scientific-requirements.txt``.
+``cargo test`` always runs them under shellsim offline; this optional step confirms the
+expectations against real NumPy and SciPy. It
 creates a uv-managed virtual environment, runs the suites there with pytest, and prints the
 interpreter path. Export that path as ``SHELLSIM_SCIENTIFIC_PYTHON`` to make ``cargo test`` run
 the same check.
@@ -19,7 +20,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 REQUIREMENTS = REPOSITORY_ROOT / "tests/python/scientific-requirements.txt"
-SUITES = (REPOSITORY_ROOT / "tests/python/numpy",)
+SUITES = (REPOSITORY_ROOT / "tests/python/numpy", REPOSITORY_ROOT / "tests/python/scipy")
 PYTHON_VERSION = "3.14"
 
 

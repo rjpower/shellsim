@@ -25,6 +25,7 @@ mod operator;
 pub mod os;
 pub mod pytest;
 pub mod re;
+mod scipy;
 pub mod string;
 mod r#struct;
 pub mod subprocess;
@@ -100,6 +101,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "unittest" => Some(&unittest::MODULE),
         "_shellsim_warnings" => Some(&warnings::MODULE),
         _ if name.starts_with("_numpy") => numpy::native_module(name),
+        _ if name.starts_with("_scipy") => scipy::native_module(name),
         _ => None,
     }
 }

@@ -53,13 +53,21 @@ pub(in crate::python) fn warn_where_without_out(runtime: &mut dyn PyRuntime) -> 
     warn(runtime, "_warn_where_without_out")
 }
 
-/// Call the warning function `name` of `numpy._errstate`, which issues the warning from
-/// Python so filters and `stacklevel` apply.
 fn warn(runtime: &mut dyn PyRuntime, name: &str) -> PyResult<()> {
-    let module = runtime.import_module("numpy._errstate")?;
+    call_warning(runtime, "numpy._errstate", name)
+}
+
+/// Call the no-argument warning function `name` of the frozen module `module`, which issues
+/// the warning from Python so filters and `stacklevel` apply.
+pub(in crate::python) fn call_warning(
+    runtime: &mut dyn PyRuntime,
+    module: &str,
+    name: &str,
+) -> PyResult<()> {
+    let module_value = runtime.import_module(module)?;
     let warn = runtime
-        .get_attribute(module, name)?
-        .ok_or_else(|| PyError::runtime_error(format!("numpy._errstate.{name} is missing")))?;
+        .get_attribute(module_value, name)?
+        .ok_or_else(|| PyError::runtime_error(format!("{module}.{name} is missing")))?;
     runtime.call_value(warn, CallArgs::new(Vec::new(), Vec::new()))?;
     Ok(())
 }
