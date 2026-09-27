@@ -120,7 +120,9 @@ differences, the unsupported frontier, and resource limits.
 - **FFT.** `numpy.fft` on a port of pocketfft, with NumPy's single- and double-precision
   dispatch.
 - **Random.** `numpy.random` implements `SeedSequence`, `MT19937`, `PCG64`, `Generator`, and the
-  legacy `RandomState`. Seeded streams match NumPy 2.5.3 bit for bit.
+  legacy `RandomState`. Both draw uniforms, integers, normals, exponentials, and gamma,
+  chi-square, F, Student's t, binomial and Poisson variates, and choose, shuffle and permute.
+  Seeded streams match NumPy 2.5.3 bit for bit.
 - **Text.** `str` arrays, `numpy.strings`, and object arrays with Python-level element operations.
 - **Printing.** Array `repr` and `str` use a port of NumPy's `arrayprint` and its Dragon4
   formatter, so output, print options, and line wrapping match NumPy.

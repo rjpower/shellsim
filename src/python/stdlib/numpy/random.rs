@@ -13,6 +13,7 @@
 //! output arrays are reserved before they are filled.
 
 mod bitgen;
+mod distributions;
 mod ziggurat;
 
 use super::super::super::native::{
@@ -24,6 +25,7 @@ use super::array::{self, Array};
 use super::dtype::{DType, Kind};
 use super::element::Element;
 use bitgen::{BitGen, Engine, Mt19937, Pcg64, Stream, MT_N};
+use distributions::{Continuous, Family};
 use ziggurat::{
     FI_DOUBLE, FI_FLOAT, KI_DOUBLE, KI_FLOAT, NOR_INV_R, NOR_INV_R_F, NOR_R, NOR_R_F, WI_DOUBLE,
     WI_FLOAT,
@@ -61,6 +63,11 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("standard_uniform", standard_uniform),
     function("standard_normal", standard_normal),
     function("legacy_gauss", legacy_gauss),
+    function("standard_exponential", standard_exponential),
+    function("legacy_standard_exponential", legacy_standard_exponential),
+    function("continuous", continuous),
+    function("standard_gamma_f32", standard_gamma_f32),
+    function("discrete", discrete),
     function("bounded_integers", bounded_integers),
     function("shuffle_indices", shuffle_indices),
     function("floyd_sample", floyd_sample),
@@ -307,6 +314,138 @@ fn legacy_gauss(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let [state, count] = positional(&args, "legacy_gauss")?;
     let count = length(runtime, &count)?;
     fill(runtime, state, DType::FLOAT64, count, polar_gauss)
+}
+
+/// `standard_exponential(state, count, single, inverse)`: `Generator`'s exponentials, by the
+/// ziggurat or, with `inverse`, by inversion.
+fn standard_exponential(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let [state, count, single, inverse] = positional(&args, "standard_exponential")?;
+    let count = length(runtime, &count)?;
+    let single = flag(runtime, &single)?;
+    match (single, flag(runtime, &inverse)?) {
+        (false, false) => fill(runtime, state, DType::FLOAT64, count, |stream| {
+            distributions::standard_exponential(stream, Family::Generator)
+        }),
+        (false, true) => fill(
+            runtime,
+            state,
+            DType::FLOAT64,
+            count,
+            distributions::inverse_exponential,
+        ),
+        (true, false) => fill(
+            runtime,
+            state,
+            DType::FLOAT32,
+            count,
+            distributions::ziggurat_exponential_f32,
+        ),
+        (true, true) => fill(
+            runtime,
+            state,
+            DType::FLOAT32,
+            count,
+            distributions::inverse_exponential_f32,
+        ),
+    }
+}
+
+/// `legacy_standard_exponential(state, count)`: `RandomState`'s exponentials by inversion.
+fn legacy_standard_exponential(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let [state, count] = positional(&args, "legacy_standard_exponential")?;
+    let count = length(runtime, &count)?;
+    fill(runtime, state, DType::FLOAT64, count, |stream| {
+        distributions::standard_exponential(stream, Family::Legacy)
+    })
+}
+
+fn family(runtime: &mut dyn PyRuntime, legacy: &PyValue) -> PyResult<Family> {
+    Ok(if flag(runtime, legacy)? {
+        Family::Legacy
+    } else {
+        Family::Generator
+    })
+}
+
+/// A parameter array for `count` draws: one value for every draw, or one value per draw.
+fn parameter<T: Element>(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+    dtype: DType,
+    count: usize,
+) -> PyResult<Vec<T>> {
+    let values = elements(runtime, value, dtype)?;
+    if values.len() != 1 && values.len() != count {
+        return Err(PyError::value_error(
+            "a distribution parameter does not match the draw count",
+        ));
+    }
+    Ok(values)
+}
+
+fn at<T: Copy>(values: &[T], index: usize) -> T {
+    values[if values.len() == 1 { 0 } else { index }]
+}
+
+/// `continuous(state, name, legacy, count, a, b)`: `count` draws of the distribution `name` (see
+/// [`Continuous`]) with `float64` parameter arrays `a` and `b`, in C order.
+fn continuous(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let [state, name, legacy, count, a, b] = positional(&args, "continuous")?;
+    let name = runtime.string_value(&name)?.unwrap_or_default();
+    let distribution = Continuous::from_name(&name)
+        .ok_or_else(|| PyError::value_error(format!("unknown distribution {name:?}")))?;
+    let family = family(runtime, &legacy)?;
+    let count = length(runtime, &count)?;
+    let a = parameter::<f64>(runtime, a, DType::FLOAT64, count)?;
+    let b = parameter::<f64>(runtime, b, DType::FLOAT64, count)?;
+    let mut index = 0;
+    fill(runtime, state, DType::FLOAT64, count, |stream| {
+        let value = distribution.sample(stream, family, at(&a, index), at(&b, index));
+        index += 1;
+        value
+    })
+}
+
+/// `standard_gamma_f32(state, count, shape)`: `Generator.standard_gamma` with `dtype=float32`.
+fn standard_gamma_f32(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let [state, count, shape] = positional(&args, "standard_gamma_f32")?;
+    let count = length(runtime, &count)?;
+    let shape = parameter::<f32>(runtime, shape, DType::FLOAT32, count)?;
+    let mut index = 0;
+    fill(runtime, state, DType::FLOAT32, count, |stream| {
+        let value = distributions::standard_gamma_f32(stream, at(&shape, index));
+        index += 1;
+        value
+    })
+}
+
+/// `discrete(state, name, legacy, count, a, b)`: `count` draws of `binomial` (`a` is `p`, and
+/// `b` the `int64` trial counts `n`) or `poisson` (`a` is `lam`; `b` is ignored), as `int64`.
+fn discrete(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let [state, name, legacy, count, a, b] = positional(&args, "discrete")?;
+    let name = runtime.string_value(&name)?.unwrap_or_default();
+    let family = family(runtime, &legacy)?;
+    let count = length(runtime, &count)?;
+    let a = parameter::<f64>(runtime, a, DType::FLOAT64, count)?;
+    let mut index = 0;
+    match name.as_str() {
+        "binomial" => {
+            let n = parameter::<i64>(runtime, b, DType::INT64, count)?;
+            fill(runtime, state, DType::INT64, count, |stream| {
+                let value = distributions::binomial(stream, family, at(&a, index), at(&n, index));
+                index += 1;
+                value
+            })
+        }
+        "poisson" => fill(runtime, state, DType::INT64, count, |stream| {
+            let value = distributions::poisson(stream, at(&a, index));
+            index += 1;
+            value
+        }),
+        _ => Err(PyError::value_error(format!(
+            "unknown distribution {name:?}"
+        ))),
+    }
 }
 
 /// `random_standard_normal`: 52 bits of magnitude, a sign bit and an 8-bit layer index from

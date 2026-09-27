@@ -546,3 +546,128 @@ def test_distribution_parameter_errors():
         values = np.arange(3)
         values.setflags(write=False)
         rng.shuffle(values)
+
+
+def test_generator_exponential_and_gamma_streams():
+    rng = np.random.default_rng(12345)
+    assert rng.standard_exponential(4).tolist() == [
+        0.18413256735377503,
+        0.6450270693873458,
+        4.690218692461341,
+        0.4185586661538189,
+    ]
+    assert rng.exponential([0.5, 2.0], size=(2, 2)).tolist() == [
+        [0.25552372206434737, 2.645608513542529],
+        [0.7271540468558736, 0.39866300558055573],
+    ]
+    # Shapes below 1 use rejection from the exponential; above 1, Marsaglia and Tsang.
+    assert rng.standard_gamma(0.3, 3).tolist() == [
+        0.2668038100283782,
+        0.009614776660842888,
+        0.06569752471329031,
+    ]
+    assert rng.standard_gamma([2.5, 100.0]).tolist() == [3.5475905768350997, 105.5268819117015]
+    assert rng.gamma(3.0, 2.0, 2).tolist() == [10.922463334055482, 8.859155392065684]
+
+
+def test_generator_chisquare_f_and_t_streams():
+    rng = np.random.default_rng(7)
+    assert rng.chisquare([1.0, 50.0]).tolist() == [0.8293904490318487, 46.66008573980642]
+    assert rng.f(3.0, [7.0, 20.0]).tolist() == [0.5281338185443447, 0.42095518115438546]
+    assert rng.standard_t([1.0, 30.0]).tolist() == [0.16747494601466173, 0.8474464134087695]
+
+
+def test_generator_binomial_and_poisson_streams():
+    rng = np.random.default_rng(3)
+    # Inversion for a mean of at most 30, BTPE above, on either side of p = 0.5.
+    assert rng.binomial(10, 0.3, 5).tolist() == [1, 2, 4, 3, 1]
+    assert rng.binomial([1000, 5000], [0.4, 0.55]).tolist() == [405, 2789]
+    rng = np.random.default_rng(4)
+    # Multiplication of uniforms below lam = 10, transformed rejection from 10.
+    assert rng.poisson([0.5, 9.9, 10.0, 1e6]).tolist() == [1, 16, 11, 1002093]
+
+
+def test_degenerate_binomial_draws_only_in_the_legacy_stream():
+    rng = np.random.default_rng(3)
+    assert rng.binomial([0, 5], [0.5, 0.0]).tolist() == [0, 0]
+    assert rng.random() == np.random.default_rng(3).random()
+    legacy = np.random.RandomState(1)
+    assert legacy.binomial(5, 0.0) == 0
+    assert legacy.random_sample() == np.random.RandomState(1).random_sample(2)[1]
+
+
+def test_generator_single_precision_and_inverse_exponentials():
+    rng = np.random.default_rng(5)
+    values = rng.standard_exponential(3, dtype=np.float32)
+    assert values.dtype == np.float32
+    assert values.tolist() == [2.142340898513794, 4.171111583709717, 0.1283617615699768]
+    assert rng.standard_exponential(2, method="inv").tolist() == [
+        0.7242778733211445,
+        0.33659417617893683,
+    ]
+    values = rng.standard_gamma([0.4, 3.3], dtype=np.float32)
+    assert values.dtype == np.float32
+    assert values.tolist() == [0.7545587420463562, 2.917715072631836]
+
+
+def test_legacy_distribution_streams():
+    rs = np.random.RandomState(99)
+    assert rs.standard_exponential(3).tolist() == [
+        1.1155912955453395,
+        0.669583789183997,
+        1.7458028817673252,
+    ]
+    assert rs.standard_gamma([0.3, 2.5]).tolist() == [9.815276649129864e-06, 0.47209584409374594]
+    assert rs.chisquare(3.0, 2).tolist() == [3.7946030732640663, 1.1419588440027002]
+    assert rs.f(3.0, 7.0, 2).tolist() == [2.077965567296253, 1.1061800372715582]
+    assert rs.standard_t(4.0, 2).tolist() == [0.4749392466856027, -0.5068920511897095]
+    assert rs.binomial([10, 1000], [0.3, 0.4]).tolist() == [3, 400]
+    assert rs.poisson([3.0, 250.0]).tolist() == [2, 237]
+    np.random.seed(5)
+    assert np.random.exponential(2.0, 2).tolist() == [0.5020399546453052, 4.091739757699749]
+    assert np.random.poisson(3.0) == 4
+    assert np.random.binomial(20, 0.5) == 10
+
+
+def test_distribution_result_types():
+    rng = np.random.default_rng(0)
+    assert type(rng.gamma(2.0)) is float
+    assert type(rng.poisson(2.0)) is int
+    assert type(rng.binomial(3, 0.5)) is int
+    assert type(rng.standard_gamma(2.0, dtype=np.float32)) is float
+    assert rng.binomial(5, 0.5, size=2).dtype == np.int64
+    assert np.random.RandomState(0).poisson(2.0, 2).dtype == np.int64
+    out = np.empty((2, 2))
+    assert rng.standard_gamma([1.5, 2.0], out=out) is out
+
+
+@pytest.mark.parametrize(
+    ("method", "args", "message"),
+    [
+        ("gamma", (-1,), "shape < 0"),
+        ("gamma", ([1], [-1]), "scale < 0"),
+        ("chisquare", (0,), "df <= 0"),
+        ("f", ([1, 2], [0]), "dfden <= 0"),
+        ("binomial", (10, 1.5), "p < 0, p > 1 or p is NaN"),
+        ("binomial", ([10], [1.5]), "p < 0, p > 1 or p contains NaNs"),
+        ("binomial", (-1, 0.5), "n < 0"),
+        ("poisson", (-1,), "lam < 0 or lam is NaN"),
+        ("poisson", (1e19,), "lam value too large"),
+    ],
+)
+def test_distribution_parameter_constraints(method, args, message):
+    with pytest.raises(ValueError, match=message):
+        getattr(np.random.default_rng(1), method)(*args)
+
+
+def test_distribution_argument_errors():
+    rng = np.random.default_rng(1)
+    # The upper bound is checked first, and NaN fails it.
+    with pytest.raises(ValueError, match="lam value too large"):
+        rng.poisson([np.nan])
+    with pytest.raises(TypeError, match="Cannot cast array data"):
+        rng.binomial(np.array([10.5]), 0.5)
+    with pytest.raises(TypeError, match="Unsupported dtype"):
+        rng.standard_gamma(2, dtype=np.int32)
+    with pytest.raises(ValueError, match="shape mismatch"):
+        rng.exponential([1, 2], size=3)

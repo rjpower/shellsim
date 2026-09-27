@@ -3,9 +3,9 @@
 This ports the parts of ``numpy/random`` that ordinary code uses from ``bit_generator.pyx``,
 ``_mt19937.pyx``, ``_pcg64.pyx``, ``_generator.pyx``, ``mtrand.pyx`` and
 ``_bounded_integers.pyx.in``: ``SeedSequence``, the ``MT19937`` and ``PCG64`` bit generators,
-``Generator`` (``random``, ``integers``, ``uniform``, ``standard_normal``, ``normal``,
-``choice``, ``shuffle`` and ``permutation``), and the legacy ``RandomState`` with the
-module-level functions bound to its global instance. Seeding and every draw run in the native
+``Generator`` and the legacy ``RandomState`` with the module-level functions bound to its
+global instance. Both draw uniforms, integers, normals, exponentials, gamma, chi-square, F,
+Student's t, binomial and Poisson variates, and choose, shuffle and permute. Seeding and every draw run in the native
 module ``_numpy_random``, so seeded streams match NumPy bit for bit. Each bit generator keeps
 its state in a ``uint64`` array, ``_state``, whose layout the native module defines.
 
@@ -27,12 +27,18 @@ __all__ = [
     "PCG64",
     "RandomState",
     "SeedSequence",
+    "binomial",
+    "chisquare",
     "choice",
     "default_rng",
+    "exponential",
+    "f",
+    "gamma",
     "get_bit_generator",
     "get_state",
     "normal",
     "permutation",
+    "poisson",
     "rand",
     "randint",
     "randn",
@@ -45,7 +51,10 @@ __all__ = [
     "set_bit_generator",
     "set_state",
     "shuffle",
+    "standard_exponential",
+    "standard_gamma",
     "standard_normal",
+    "standard_t",
     "uniform",
 ]
 
@@ -421,6 +430,173 @@ def _affine(draw, a, b, size, b_name, b_check):
     return a_arr + b_arr * draw(count).reshape(shape)
 
 
+# Parameter constraints of numpy/random/_common.pyx.
+_NON_NEGATIVE = "non-negative"
+_POSITIVE = "positive"
+_BOUNDED_0_1 = "bounded 0 1"
+_POISSON = "poisson"
+_LEGACY_LONG = "legacy long"
+_INT64_MAX = np.iinfo(np.int64).max
+# `POISSON_LAM_MAX`, and `LEGACY_POISSON_LAM_MAX`, which is the same where C `long` has 64 bits.
+_POISSON_LAM_MAX = float(_INT64_MAX) - float(np.sqrt(_INT64_MAX)) * 10
+
+
+def _check_constraint(value, name, constraint):
+    """``check_constraint``: validate a scalar parameter."""
+    if constraint == _NON_NEGATIVE:
+        _check_non_negative(value, name)
+    elif constraint == _POSITIVE:
+        if value <= 0:
+            raise ValueError(f"{name} <= 0")
+    elif constraint == _BOUNDED_0_1:
+        if not value >= 0 or not value <= 1:
+            raise ValueError(f"{name} < 0, {name} > 1 or {name} is NaN")
+    elif constraint == _POISSON:
+        if not value >= 0:
+            raise ValueError(f"{name} < 0 or {name} is NaN")
+        if not value <= _POISSON_LAM_MAX:
+            raise ValueError(f"{name} value too large")
+    elif constraint == _LEGACY_LONG:
+        if value < 0:
+            raise ValueError(f"{name} < 0")
+        if value > float(_INT64_MAX):
+            raise ValueError(
+                f"{name} is out of bounds for long, consider using the new generator API for "
+                "64bit integers."
+            )
+
+
+def _check_array_constraint(values, name, constraint):
+    """``check_array_constraint``: validate an array parameter."""
+    if constraint == _NON_NEGATIVE:
+        _check_array_non_negative(values, name)
+    elif constraint == _POSITIVE:
+        if np.any(np.less_equal(values, 0)):
+            raise ValueError(f"{name} <= 0")
+    elif constraint == _BOUNDED_0_1:
+        if not np.all(np.greater_equal(values, 0)) or not np.all(np.less_equal(values, 1)):
+            raise ValueError(f"{name} < 0, {name} > 1 or {name} contains NaNs")
+    elif constraint == _POISSON:
+        if not np.all(np.less_equal(values, _POISSON_LAM_MAX)):
+            raise ValueError(f"{name} value too large")
+        if not np.all(np.greater_equal(values, 0.0)):
+            raise ValueError(f"{name} < 0 or {name} contains NaNs")
+    elif constraint == _LEGACY_LONG:
+        if not np.all(values >= 0):
+            raise ValueError(f"{name} < 0")
+        if not np.all(values <= _INT64_MAX):
+            raise ValueError(
+                f"{name} is out of bounds for long, consider using the new generator API for "
+                "64bit integers."
+            )
+
+
+def _draw_parameters(arrays, shape):
+    """Each parameter broadcast to ``shape`` and flattened in C order, as NumPy's multi-iterator
+    visits them."""
+    return [np.ascontiguousarray(np.broadcast_to(array, shape)).reshape(-1) for array in arrays]
+
+
+def _parametric(kernel, dtype, size, out, parameters, require_c_array=True):
+    """NumPy's ``cont``, ``cont_f`` and ``disc`` for one or two parameters.
+
+    ``parameters`` holds ``(array, value, name, constraint)`` for each parameter, where ``array``
+    is the parameter converted to the kernel's dtype and ``value`` the scalar the kernel would
+    receive if every parameter is 0-d. ``kernel(count, *flat_parameters)`` draws ``count``
+    values. Scalar parameters with neither ``size`` nor ``out`` give one Python number.
+    """
+    _check_output(out, dtype, size, require_c_array)
+    arrays = [array for array, _, _, _ in parameters]
+    if any(array.ndim > 0 for array in arrays):
+        for array, _, name, constraint in parameters:
+            _check_array_constraint(array, name, constraint)
+        target = size if out is None else out.shape
+        shape = _broadcast_shape(target, *arrays)
+        draws = kernel(int(np.prod(shape)), *_draw_parameters(arrays, shape)).reshape(shape)
+    else:
+        for _, value, name, constraint in parameters:
+            _check_constraint(value, name, constraint)
+        flat = [np.array([value], dtype=array.dtype) for array, value, _, _ in parameters]
+        if size is None and out is None:
+            return kernel(1, *flat)[0].item()
+        shape, count = _normalize_size(size) if out is None else (out.shape, out.size)
+        draws = kernel(count, *flat).reshape(shape)
+    if out is None:
+        return draws
+    out[...] = draws
+    return out
+
+
+def _float_parameter(value, name, constraint):
+    return (np.asarray(value, dtype=np.float64), value, name, constraint)
+
+
+def _cont(state, name, legacy, size, out, *parameters):
+    """Draws of the continuous distribution ``name`` with ``float64`` parameters."""
+    parameters = [_float_parameter(*parameter) for parameter in parameters]
+    for index, (array, value, pname, constraint) in enumerate(parameters):
+        if array.ndim == 0:
+            parameters[index] = (array, float(value), pname, constraint)
+
+    def kernel(count, a, b=None):
+        return _native.continuous(state, name, legacy, count, a, a if b is None else b)
+
+    return _parametric(kernel, np.float64, size, out, parameters)
+
+
+def _standard_gamma_f32(state, shape, size, out):
+    """``Generator.standard_gamma`` with ``dtype=float32``: ``cont_f``, which force-casts the shape
+    to single precision."""
+    array = np.asarray(shape).astype(np.float32)
+    value = float(np.float32(float(shape))) if array.ndim == 0 else shape
+
+    def kernel(count, shapes):
+        return _native.standard_gamma_f32(state, count, shapes)
+
+    return _parametric(kernel, np.float32, size, out, [(array, value, "shape", _NON_NEGATIVE)])
+
+
+def _poisson(state, legacy, lam, size):
+    array = np.asarray(lam, dtype=np.float64)
+    value = float(lam) if array.ndim == 0 else lam
+
+    def kernel(count, lams):
+        return _native.discrete(state, "poisson", legacy, count, lams, lams)
+
+    return _parametric(kernel, np.int64, size, None, [(array, value, "lam", _POISSON)])
+
+
+def _trial_counts(n):
+    """``n`` as ``PyArray_FROM_OTF(n, NPY_INT64)`` converts it: arrays must cast safely, and
+    Python numbers and sequences convert as ``np.array`` does."""
+    if isinstance(n, (np.ndarray, np.generic)):
+        array = np.asarray(n)
+        if not np.can_cast(array.dtype, np.int64):
+            raise TypeError(
+                f"Cannot cast array data from {array.dtype!r} to dtype('int64') according to "
+                "the rule 'safe'"
+            )
+        return array.astype(np.int64)
+    return np.array(n, dtype=np.int64)
+
+
+def _binomial(state, legacy, n, p, size):
+    """``Generator.binomial`` and ``RandomState.binomial``, which check ``p`` before ``n``."""
+    p_array = np.asarray(p, dtype=np.float64)
+    n_array = _trial_counts(n)
+    scalar = p_array.ndim == 0 and n_array.ndim == 0
+    n_constraint = _LEGACY_LONG if legacy else _NON_NEGATIVE
+    parameters = [
+        (p_array, float(p) if scalar else p, "p", _BOUNDED_0_1),
+        (n_array, int(n) if scalar else n, "n", n_constraint),
+    ]
+
+    def kernel(count, ps, ns):
+        return _native.discrete(state, "binomial", legacy, count, ps, ns)
+
+    return _parametric(kernel, np.int64, size, None, parameters)
+
+
 def _format_bounds_error(closed, low):
     # Special case low == 0 to provide a better exception for users since low = 0 is the
     # default single-argument case.
@@ -601,6 +777,74 @@ class Generator:
     def normal(self, loc=0.0, scale=1.0, size=None):
         """Draw random samples from a normal (Gaussian) distribution."""
         return _affine(self._normal_draws, loc, scale, size, "scale", True)
+
+    def standard_exponential(self, size=None, dtype=np.float64, method="zig", out=None):
+        """Draw samples from the standard exponential distribution."""
+        _dtype = np.dtype(dtype)
+        if _dtype == np.float64:
+            single = False
+        elif _dtype == np.float32:
+            single = True
+        else:
+            raise TypeError(f"Unsupported dtype {_dtype!r} for standard_exponential")
+        # NumPy uses the ziggurat for "zig" and inversion for any other method.
+        inverse = method != "zig"
+
+        def kernel(state, count, single):
+            return _native.standard_exponential(state, count, single, inverse)
+
+        return _fill(kernel, self._bit_generator._state, size, out, single)
+
+    def exponential(self, scale=1.0, size=None):
+        """Draw samples from an exponential distribution."""
+        return _cont(
+            self._bit_generator._state, "exponential", False, size, None,
+            (scale, "scale", _NON_NEGATIVE),
+        )
+
+    def standard_gamma(self, shape, size=None, dtype=np.float64, out=None):
+        """Draw samples from a standard Gamma distribution."""
+        _dtype = np.dtype(dtype)
+        state = self._bit_generator._state
+        if _dtype == np.float64:
+            return _cont(state, "standard_gamma", False, size, out, (shape, "shape", _NON_NEGATIVE))
+        if _dtype == np.float32:
+            return _standard_gamma_f32(state, shape, size, out)
+        raise TypeError(f"Unsupported dtype {_dtype!r} for standard_gamma")
+
+    def gamma(self, shape, scale=1.0, size=None):
+        """Draw samples from a Gamma distribution."""
+        return _cont(
+            self._bit_generator._state, "gamma", False, size, None,
+            (shape, "shape", _NON_NEGATIVE), (scale, "scale", _NON_NEGATIVE),
+        )
+
+    def f(self, dfnum, dfden, size=None):
+        """Draw samples from an F distribution."""
+        return _cont(
+            self._bit_generator._state, "f", False, size, None,
+            (dfnum, "dfnum", _POSITIVE), (dfden, "dfden", _POSITIVE),
+        )
+
+    def chisquare(self, df, size=None):
+        """Draw samples from a chi-square distribution."""
+        return _cont(
+            self._bit_generator._state, "chisquare", False, size, None, (df, "df", _POSITIVE)
+        )
+
+    def standard_t(self, df, size=None):
+        """Draw samples from a standard Student's t distribution with ``df`` degrees of freedom."""
+        return _cont(
+            self._bit_generator._state, "standard_t", False, size, None, (df, "df", _POSITIVE)
+        )
+
+    def binomial(self, n, p, size=None):
+        """Draw samples from a binomial distribution."""
+        return _binomial(self._bit_generator._state, False, n, p, size)
+
+    def poisson(self, lam=1.0, size=None):
+        """Draw samples from a Poisson distribution."""
+        return _poisson(self._bit_generator._state, False, lam, size)
 
     def choice(self, a, size=None, replace=True, p=None, axis=0, shuffle=True):
         """Generates a random sample from a given array."""
@@ -911,6 +1155,62 @@ class RandomState:
     def _uniform_draws(self, count):
         return _native.standard_uniform(self._bit_generator._state, count, False)
 
+    def standard_exponential(self, size=None):
+        """Draw samples from the standard exponential distribution."""
+        state = self._bit_generator._state
+        if size is None:
+            return float(_native.legacy_standard_exponential(state, 1)[0])
+        shape, count = _normalize_size(size)
+        return _native.legacy_standard_exponential(state, count).reshape(shape)
+
+    def exponential(self, scale=1.0, size=None):
+        """Draw samples from an exponential distribution."""
+        return _cont(
+            self._bit_generator._state, "exponential", True, size, None,
+            (scale, "scale", _NON_NEGATIVE),
+        )
+
+    def standard_gamma(self, shape, size=None):
+        """Draw samples from a standard Gamma distribution."""
+        return _cont(
+            self._bit_generator._state, "standard_gamma", True, size, None,
+            (shape, "shape", _NON_NEGATIVE),
+        )
+
+    def gamma(self, shape, scale=1.0, size=None):
+        """Draw samples from a Gamma distribution."""
+        return _cont(
+            self._bit_generator._state, "gamma", True, size, None,
+            (shape, "shape", _NON_NEGATIVE), (scale, "scale", _NON_NEGATIVE),
+        )
+
+    def f(self, dfnum, dfden, size=None):
+        """Draw samples from an F distribution."""
+        return _cont(
+            self._bit_generator._state, "f", True, size, None,
+            (dfnum, "dfnum", _POSITIVE), (dfden, "dfden", _POSITIVE),
+        )
+
+    def chisquare(self, df, size=None):
+        """Draw samples from a chi-square distribution."""
+        return _cont(
+            self._bit_generator._state, "chisquare", True, size, None, (df, "df", _POSITIVE)
+        )
+
+    def standard_t(self, df, size=None):
+        """Draw samples from a standard Student's t distribution with ``df`` degrees of freedom."""
+        return _cont(
+            self._bit_generator._state, "standard_t", True, size, None, (df, "df", _POSITIVE)
+        )
+
+    def binomial(self, n, p, size=None):
+        """Draw samples from a binomial distribution."""
+        return _binomial(self._bit_generator._state, True, n, p, size)
+
+    def poisson(self, lam=1.0, size=None):
+        """Draw samples from a Poisson distribution."""
+        return _poisson(self._bit_generator._state, True, lam, size)
+
     def randint(self, low, high=None, size=None, dtype=int):
         """Return random integers from ``low`` (inclusive) to ``high`` (exclusive)."""
         if high is None:
@@ -1082,10 +1382,16 @@ class RandomState:
 
 _rand = RandomState()
 
+binomial = _rand.binomial
+chisquare = _rand.chisquare
 choice = _rand.choice
+exponential = _rand.exponential
+f = _rand.f
+gamma = _rand.gamma
 get_state = _rand.get_state
 normal = _rand.normal
 permutation = _rand.permutation
+poisson = _rand.poisson
 rand = _rand.rand
 randint = _rand.randint
 randn = _rand.randn
@@ -1094,7 +1400,10 @@ random_integers = _rand.random_integers
 random_sample = _rand.random_sample
 set_state = _rand.set_state
 shuffle = _rand.shuffle
+standard_exponential = _rand.standard_exponential
+standard_gamma = _rand.standard_gamma
 standard_normal = _rand.standard_normal
+standard_t = _rand.standard_t
 uniform = _rand.uniform
 
 
