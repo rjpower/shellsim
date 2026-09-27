@@ -106,6 +106,8 @@ pub struct ScopeId(usize);
 
 #[derive(Clone, Debug)]
 pub enum Object {
+    /// A direct `object()` instance: identity only, with no attributes.
+    Bare,
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
@@ -1123,6 +1125,7 @@ impl Heap {
 
     fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
         Ok(match object {
+            Object::Bare => BuiltinType::Object.id(),
             Object::String(_) => BuiltinType::String.id(),
             Object::Bytes(_) => BuiltinType::Bytes.id(),
             Object::ByteArray(_) => BuiltinType::ByteArray.id(),
@@ -1514,7 +1517,8 @@ fn trace_object(
             object_work.push(*start_class);
             trace_value(*receiver, object_work);
         }
-        Object::String(_)
+        Object::Bare
+        | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
         | Object::ArrayStorage(PyArrayBuffer::Bytes(_))
@@ -1548,6 +1552,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         | Object::Tuple(values)
         | Object::Set(values)
         | Object::FrozenSet(values) => values.len(),
+        Object::Bare => 0,
         Object::Slice { .. } => 3,
         Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
             .map_err(|_| "modeled big integer size overflow")?,

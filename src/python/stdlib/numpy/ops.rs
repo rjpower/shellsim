@@ -15,6 +15,7 @@
 use std::cmp::Ordering;
 
 use super::element::{Complex, Element, C128, C64, F16};
+use super::underflow;
 
 /// Floating-point exception flags raised by one loop, mirroring NumPy's FPE flags.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -624,7 +625,10 @@ trait RealBinary: Sized {
 }
 
 macro_rules! real {
-    ($type:ty, $wide:ty, $to:expr, $from:expr) => {
+    (
+        $type:ty, $wide:ty, $to:expr, $from:expr,
+        product: $product:expr, quotient: $quotient:expr, narrow: $narrow:expr
+    ) => {
         impl Numeric for $type {
             fn add(self, other: Self, flags: &mut FpFlags) -> Self {
                 self.binary(other, flags, |a, b| a + b)
@@ -633,7 +637,9 @@ macro_rules! real {
                 self.binary(other, flags, |a, b| a - b)
             }
             fn multiply(self, other: Self, flags: &mut FpFlags) -> Self {
-                self.binary(other, flags, |a, b| a * b)
+                let result = self.binary(other, flags, |a, b| a * b);
+                flags.underflow |= $product(self, other, result);
+                result
             }
             fn divide(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (a, b) = (self.to_f64(), other.to_f64());
@@ -641,7 +647,9 @@ macro_rules! real {
                     flags.divide = true;
                     return Self::from_f64(a / b);
                 }
-                self.binary(other, flags, |a, b| a / b)
+                let result = self.binary(other, flags, |a, b| a / b);
+                flags.underflow |= $quotient(self, other, result);
+                result
             }
             fn floor_divide(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (a, b) = (self.to_f64(), other.to_f64());
@@ -723,19 +731,35 @@ macro_rules! real {
             ) -> Self {
                 let a: $wide = $to(self);
                 let b: $wide = $to(other);
-                let result = Self::from_f64(f64::from(operation(a, b)));
+                let wide = operation(a, b);
+                let result = Self::from_f64(f64::from(wide));
                 float_flags(result.to_f64(), &[f64::from(a), f64::from(b)], flags);
+                flags.underflow |= $narrow(wide);
                 result
             }
         }
     };
 }
 
-real!(f64, f64, |value: f64| value, |value: f64| value);
-real!(f32, f32, |value: f32| value, |value: f32| value);
-real!(F16, f32, |value: F16| value.to_f32(), |value: f32| {
-    F16::from_f32(value)
-});
+real!(
+    f64, f64, |value: f64| value, |value: f64| value,
+    product: underflow::product_f64,
+    quotient: underflow::quotient_f64,
+    narrow: |_: f64| false
+);
+real!(
+    f32, f32, |value: f32| value, |value: f32| value,
+    product: underflow::product_f32,
+    quotient: underflow::quotient_f32,
+    narrow: |_: f32| false
+);
+// Half arithmetic runs in single precision; the rounding back to half raises underflow.
+real!(
+    F16, f32, |value: F16| value.to_f32(), |value: f32| F16::from_f32(value),
+    product: |_: F16, _: F16, _: F16| false,
+    quotient: |_: F16, _: F16, _: F16| false,
+    narrow: underflow::to_half
+);
 
 impl Real for f64 {
     fn to_f64(self) -> f64 {

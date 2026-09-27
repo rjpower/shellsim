@@ -182,6 +182,8 @@ pub struct TypeSlots {
     pub reflected_floor_divide: Option<SlotValue>,
     pub remainder: Option<SlotValue>,
     pub reflected_remainder: Option<SlotValue>,
+    pub divmod: Option<SlotValue>,
+    pub reflected_divmod: Option<SlotValue>,
     pub left_shift: Option<SlotValue>,
     pub reflected_left_shift: Option<SlotValue>,
     pub right_shift: Option<SlotValue>,
@@ -248,6 +250,8 @@ pub enum Slot {
     ReflectedFloorDivide,
     Remainder,
     ReflectedRemainder,
+    DivMod,
+    ReflectedDivMod,
     LeftShift,
     ReflectedLeftShift,
     RightShift,
@@ -269,7 +273,7 @@ pub enum Slot {
 }
 
 impl Slot {
-    const ALL: [Self; 52] = [
+    const ALL: [Self; 54] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -304,6 +308,8 @@ impl Slot {
         Self::ReflectedFloorDivide,
         Self::Remainder,
         Self::ReflectedRemainder,
+        Self::DivMod,
+        Self::ReflectedDivMod,
         Self::LeftShift,
         Self::ReflectedLeftShift,
         Self::RightShift,
@@ -363,6 +369,8 @@ impl TypeSlots {
             reflected_floor_divide: get("__rfloordiv__"),
             remainder: get("__mod__"),
             reflected_remainder: get("__rmod__"),
+            divmod: get("__divmod__"),
+            reflected_divmod: get("__rdivmod__"),
             left_shift: get("__lshift__"),
             reflected_left_shift: get("__rlshift__"),
             right_shift: get("__rshift__"),
@@ -420,6 +428,8 @@ impl TypeSlots {
             &self.reflected_floor_divide,
             &self.remainder,
             &self.reflected_remainder,
+            &self.divmod,
+            &self.reflected_divmod,
             &self.left_shift,
             &self.reflected_left_shift,
             &self.right_shift,
@@ -480,6 +490,8 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => self.reflected_floor_divide.as_ref(),
             Slot::Remainder => self.remainder.as_ref(),
             Slot::ReflectedRemainder => self.reflected_remainder.as_ref(),
+            Slot::DivMod => self.divmod.as_ref(),
+            Slot::ReflectedDivMod => self.reflected_divmod.as_ref(),
             Slot::LeftShift => self.left_shift.as_ref(),
             Slot::ReflectedLeftShift => self.reflected_left_shift.as_ref(),
             Slot::RightShift => self.right_shift.as_ref(),
@@ -537,6 +549,8 @@ impl TypeSlots {
             Slot::ReflectedFloorDivide => &mut self.reflected_floor_divide,
             Slot::Remainder => &mut self.remainder,
             Slot::ReflectedRemainder => &mut self.reflected_remainder,
+            Slot::DivMod => &mut self.divmod,
+            Slot::ReflectedDivMod => &mut self.reflected_divmod,
             Slot::LeftShift => &mut self.left_shift,
             Slot::ReflectedLeftShift => &mut self.reflected_left_shift,
             Slot::RightShift => &mut self.right_shift,
@@ -917,6 +931,8 @@ fn value_kind_slots(slots: super::native::ValueKindSlots) -> TypeSlots {
         reflected_floor_divide: slots.reflected_floor_divide.map(binary),
         remainder: slots.remainder.map(binary),
         reflected_remainder: slots.reflected_remainder.map(binary),
+        divmod: slots.divmod.map(binary),
+        reflected_divmod: slots.reflected_divmod.map(binary),
         power: slots.power.map(binary),
         reflected_power: slots.reflected_power.map(binary),
         left_shift: slots.left_shift.map(binary),
@@ -1030,6 +1046,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_floor_divide = Some(intrinsic(super::number::slot_reflected_floor_divide));
         slots.remainder = Some(intrinsic(super::number::slot_remainder));
         slots.reflected_remainder = Some(intrinsic(super::number::slot_reflected_remainder));
+        slots.divmod = Some(intrinsic(super::number::slot_divmod));
+        slots.reflected_divmod = Some(intrinsic(super::number::slot_reflected_divmod));
         slots.left_shift = Some(intrinsic(super::number::slot_left_shift));
         slots.reflected_left_shift = Some(intrinsic(super::number::slot_left_shift));
         slots.right_shift = Some(intrinsic(super::number::slot_right_shift));
@@ -1131,6 +1149,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_floor_divide = Some(intrinsic(np::slot_reflected_floor_divide));
         slots.remainder = Some(intrinsic(np::slot_remainder));
         slots.reflected_remainder = Some(intrinsic(np::slot_reflected_remainder));
+        slots.divmod = Some(intrinsic(np::slot_divmod));
+        slots.reflected_divmod = Some(intrinsic(np::slot_reflected_divmod));
         slots.left_shift = Some(intrinsic(np::slot_left_shift));
         slots.reflected_left_shift = Some(intrinsic(np::slot_reflected_left_shift));
         slots.right_shift = Some(intrinsic(np::slot_right_shift));

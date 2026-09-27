@@ -69,7 +69,7 @@ impl Vm<'_> {
             Some(Ok(Object::Class {
                 name: class_name, ..
             })) => format!("type object '{class_name}' has no attribute '{name}'"),
-            Some(Ok(Object::Instance { .. })) => match self.type_name_of(owner) {
+            Some(Ok(Object::Instance { .. } | Object::Bare)) => match self.type_name_of(owner) {
                 Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
                 Err(error) => return error,
             },
@@ -493,26 +493,35 @@ impl Vm<'_> {
         Ok(())
     }
 
-    /// Explain why a receiver without an instance dictionary rejects an attribute store.
+    /// Raise CPython's `AttributeError` for a store on a receiver without an instance
+    /// dictionary: data descriptors are not writable, other type attributes are read-only, and
+    /// new names have nowhere to go.
     fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> String {
-        let getter = self
+        let attribute = self
             .type_id(&owner)
             .and_then(|owner_type| self.state.types.attribute(owner_type, name))
             .ok()
-            .flatten()
-            .and_then(|value| value.native_value());
-        match getter {
-            Some(NativeValue::NativeGetter(getter)) => {
-                self.record_native_error(PyError::exception(
-                    "AttributeError",
-                    format!(
-                        "attribute '{}' of '{}' objects is not writable",
-                        getter.name, getter.owner
-                    ),
-                ))
+            .flatten();
+        let type_name = match self.type_name_of(&owner) {
+            Ok(type_name) => type_name,
+            Err(error) => return error,
+        };
+        let message = match attribute.and_then(|value| value.native_value()) {
+            Some(NativeValue::NativeGetter(getter)) => format!(
+                "attribute '{}' of '{}' objects is not writable",
+                getter.name, getter.owner
+            ),
+            _ if attribute.is_some()
+                || matches!(self.resolve_attribute(owner, name), Ok(Some(_))) =>
+            {
+                format!("'{type_name}' object attribute '{name}' is read-only")
             }
-            _ => "object does not support attribute assignment".into(),
-        }
+            _ => format!(
+                "'{type_name}' object has no attribute '{name}' and no __dict__ for setting new \
+                 attributes"
+            ),
+        };
+        self.raise_exception("AttributeError", message)
     }
 
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {
@@ -613,7 +622,8 @@ impl Vm<'_> {
                     factory: Some(*factory),
                 },
                 Object::Set(_) => BuiltinSubscript::Set,
-                Object::String(_)
+                Object::Bare
+                | Object::String(_)
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Slice { .. }
@@ -2014,7 +2024,7 @@ impl Vm<'_> {
             },
             BuiltinType::Object => {
                 expect_arity(&arguments, 0, 0)?;
-                return Err("direct object() instances are not implemented".into());
+                self.allocate_object(Object::Bare)?
             }
             BuiltinType::None => {
                 expect_arity(&arguments, 0, 0)?;

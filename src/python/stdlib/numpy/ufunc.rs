@@ -658,7 +658,7 @@ fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Call
 }
 
 /// Keyword options shared by every ufunc call.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(in crate::python) struct Options {
     pub out: Option<Array>,
     pub dtype: Option<DType>,
@@ -694,10 +694,23 @@ pub(in crate::python) fn call(
             positional.len()
         )));
     }
+    let (mut options, out) = keyword_options(runtime, ufunc.name, &args, positional.get(nin))?;
+    options.out = out_array(runtime, out)?;
+    apply(runtime, index, &positional[..nin], &options)
+}
+
+/// Parse a ufunc call's keywords. Returns the options and the `out` argument, positional or
+/// keyword, still unparsed.
+fn keyword_options(
+    runtime: &mut dyn PyRuntime,
+    name: &str,
+    args: &CallArgs,
+    positional_out: Option<&PyValue>,
+) -> PyResult<(Options, Option<PyValue>)> {
     let mut options = Options::default();
-    let mut out = positional.get(nin).copied();
-    for (name, value) in args.keywords() {
-        match name.as_str() {
+    let mut out = positional_out.copied();
+    for (keyword, value) in args.keywords() {
+        match keyword.as_str() {
             "out" => {
                 if out.is_some() {
                     return Err(PyError::type_error(
@@ -714,21 +727,54 @@ pub(in crate::python) fn call(
             "where" if value.bool_value() == Some(true) => {}
             "where" => {
                 return Err(PyError::unsupported(format!(
-                    "{}() with a where= mask is not supported",
-                    ufunc.name
+                    "{name}() with a where= mask is not supported"
                 )))
             }
             "subok" | "order" => {}
             _ => {
                 return Err(PyError::type_error(format!(
-                    "{}() got an unexpected keyword argument '{name}'",
-                    ufunc.name
+                    "{name}() got an unexpected keyword argument '{keyword}'"
                 )))
             }
         }
     }
-    options.out = out_array(runtime, out)?;
-    apply(runtime, index, &positional[..nin], &options)
+    Ok((options, out))
+}
+
+/// `np.divmod(x1, x2[, out1, out2], /, *, out=(None, None), dtype=None, casting='same_kind')`.
+pub(in crate::python) fn call_divmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    let positional = args.positional();
+    if !(2..=4).contains(&positional.len()) {
+        return Err(PyError::type_error(format!(
+            "divmod() takes from 2 to 4 positional arguments but {} were given",
+            positional.len()
+        )));
+    }
+    let positional_outs = (positional.len() > 2).then(|| positional[2..].to_vec());
+    let (options, keyword_out) = keyword_options(runtime, "divmod", &args, None)?;
+    let outs = match (positional_outs, keyword_out) {
+        (Some(_), Some(_)) => {
+            return Err(PyError::type_error(
+                "cannot specify 'out' as both a positional and keyword argument",
+            ))
+        }
+        (Some(values), None) => values,
+        (None, Some(value)) if !value.is_none() => {
+            let tuple = value.cast(runtime)?;
+            runtime.tuple_items(tuple)?
+        }
+        (None, _) => Vec::new(),
+    };
+    if !outs.is_empty() && outs.len() != 2 {
+        return Err(PyError::value_error(
+            "The 'out' tuple must have exactly one entry per ufunc output",
+        ));
+    }
+    let mut arrays = [None, None];
+    for (slot, value) in arrays.iter_mut().zip(outs) {
+        *slot = out_array(runtime, Some(value))?;
+    }
+    divmod(runtime, &positional[..2], &options, arrays)
 }
 
 /// Accept `out=array`, `out=(array,)`, or `out=None`.
@@ -995,13 +1041,54 @@ fn bool_loop(name: &str, dtype: DType, bools: BoolLoop, inputs: &[DType]) -> PyR
     }
 }
 
-/// Run ufunc `index` on `inputs`.
+/// Run ufunc `index` on `inputs` and report its floating-point errors.
 pub(in crate::python) fn apply(
     runtime: &mut dyn PyRuntime,
     index: usize,
     inputs: &[PyValue],
     options: &Options,
 ) -> PyResult {
+    let evaluated = evaluate(runtime, index, inputs, options)?;
+    evaluated.report(runtime, UFUNCS[index].name)?;
+    Ok(evaluated.value)
+}
+
+/// A ufunc result whose floating-point errors are not reported yet.
+pub(in crate::python) struct Evaluated {
+    pub value: PyValue,
+    /// Flags to report; integer overflow is already dropped where NumPy ignores it.
+    pub flags: FpFlags,
+    /// Every operand was a scalar and the call came from an operator, so NumPy's scalar math
+    /// names the operation `scalar <name>`.
+    pub scalar_math: bool,
+}
+
+impl Evaluated {
+    pub(in crate::python) fn report(
+        &self,
+        runtime: &mut dyn PyRuntime,
+        name: &str,
+    ) -> PyResult<()> {
+        if !self.flags.any() {
+            return Ok(());
+        }
+        let name = if self.scalar_math {
+            format!("scalar {name}")
+        } else {
+            name.to_string()
+        };
+        super::errstate::report(runtime, &name, self.flags)
+    }
+}
+
+/// Run ufunc `index` on `inputs`, storing into `out=` when given, and return the flags its
+/// loop raised without reporting them.
+pub(in crate::python) fn evaluate(
+    runtime: &mut dyn PyRuntime,
+    index: usize,
+    inputs: &[PyValue],
+    options: &Options,
+) -> PyResult<Evaluated> {
     let ufunc = &UFUNCS[index];
     let mut operands = Vec::with_capacity(inputs.len());
     let mut all_scalars = true;
@@ -1077,30 +1164,80 @@ pub(in crate::python) fn apply(
         .iter()
         .map(|operand| prepare(runtime, operand, resolved.input))
         .collect::<PyResult<Vec<_>>>()?;
-    let (buffer, output_dtype, flags) = run(runtime, ufunc, &resolved, &prepared, &shape)?;
-    if flags.any() {
-        let scalar_math = options.operator && all_scalars;
-        let mut flags = flags;
-        if resolved.input.is_integer() && !scalar_math {
-            // Integer loops wrap silently; only scalar operators report overflow.
-            flags.overflow = false;
+    let (buffer, output_dtype, mut flags) = run(runtime, ufunc, &resolved, &prepared, &shape)?;
+    let scalar_math = options.operator && all_scalars;
+    let division = matches!(
+        ufunc.family,
+        Family::Arith {
+            op: ArithOp::FloorDivide,
+            ..
         }
-        let name = if scalar_math {
-            format!("scalar {}", ufunc.name)
-        } else {
-            ufunc.name.to_string()
-        };
-        super::errstate::report(runtime, &name, flags)?;
+    );
+    if resolved.input.is_integer() && !scalar_math && !division {
+        // Integer loops wrap silently; scalar operators and integer division, whose only
+        // overflow is `MIN // -1`, report it.
+        flags.overflow = false;
     }
     let result = new_array(runtime, buffer, output_dtype, shape)?;
-    if let Some(out) = &options.out {
+    let value = if let Some(out) = &options.out {
         super::array::assign(runtime, out, &result)?;
-        return Ok(out.value());
-    }
-    if result.ndim() == 0 {
-        return convert::element_to_scalar(runtime, &result, result.view.offset);
-    }
-    Ok(result.value())
+        out.value()
+    } else if result.ndim() == 0 {
+        convert::element_to_scalar(runtime, &result, result.view.offset)?
+    } else {
+        result.value()
+    };
+    Ok(Evaluated {
+        value,
+        flags,
+        scalar_math,
+    })
+}
+
+/// `np.divmod(x1, x2)`: `(floor_divide(x1, x2), remainder(x1, x2))` from one pass of NumPy's
+/// divmod loop, so floating-point errors are reported once under the name `divmod`.
+pub(in crate::python) fn divmod(
+    runtime: &mut dyn PyRuntime,
+    inputs: &[PyValue],
+    options: &Options,
+    outs: [Option<Array>; 2],
+) -> PyResult {
+    let [quotient_out, remainder_out] = outs;
+    let quotient_options = Options {
+        out: quotient_out,
+        ..options.clone()
+    };
+    let remainder_options = Options {
+        out: remainder_out,
+        ..options.clone()
+    };
+    let quotient = evaluate(runtime, named("floor_divide"), inputs, &quotient_options)?;
+    let remainder = evaluate(runtime, named("remainder"), inputs, &remainder_options)?;
+    let mut merged = quotient.flags;
+    merged.merge(remainder.flags);
+    let combined = Evaluated {
+        value: runtime.new_tuple(vec![quotient.value, remainder.value])?,
+        flags: merged,
+        scalar_math: quotient.scalar_math,
+    };
+    combined.report(runtime, "divmod")?;
+    Ok(combined.value)
+}
+
+pub(in crate::python) fn slot_divmod(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod(runtime, &[left, right], &Options::operator(), [None, None]).map(Some)
+}
+
+pub(in crate::python) fn slot_reflected_divmod(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod(runtime, &[right, left], &Options::operator(), [None, None]).map(Some)
 }
 
 /// Comparisons with Python ints outside the array's integer range compare exactly instead of

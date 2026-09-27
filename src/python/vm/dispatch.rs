@@ -489,11 +489,26 @@ impl Vm<'_> {
     #[inline(never)]
     fn dispatch_with_enter(&mut self) -> Result<DispatchControl, String> {
         let context = self.pop()?;
+        // CPython looks up `__exit__` first, then `__enter__`.
+        for method in ["__exit__", "__enter__"] {
+            if self.resolve_attribute(context, method)?.is_none() {
+                let message = format!(
+                    "'{}' object does not support the context manager protocol (missed {method} \
+                     method)",
+                    self.type_name_of(&context)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+        }
         self.stack.push(context);
-        self.with_contexts.push(context);
         self.load_attribute("__enter__")?;
         match self.call(0, &[], &[], CallMode::Immediate)? {
-            CallResult::Value(value) => self.stack.push(value),
+            // The context joins the cleanup stack only once `__enter__` has succeeded, so an
+            // exception from `__enter__` reaches the enclosing handler, not this `__exit__`.
+            CallResult::Value(value) => {
+                self.with_contexts.push(context);
+                self.stack.push(value);
+            }
             CallResult::Exit(status) => {
                 return Ok(DispatchControl::Complete(Execution::Exit(status)))
             }

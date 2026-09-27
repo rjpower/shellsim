@@ -577,6 +577,43 @@ impl Vm<'_> {
                 "__ror__",
             ),
         };
+        let symbol = match (operator, inplace) {
+            (BinaryOperator::Power, true) => "**=".to_string(),
+            (operator, true) => format!("{}=", binary_operator_symbol(operator)),
+            (operator, false) => binary_operator_symbol(operator).to_string(),
+        };
+        self.binary_slot_protocol(
+            left,
+            right,
+            (slot, name, reflected_slot, reflected_name),
+            &symbol,
+        )
+    }
+
+    /// `divmod(left, right)`: the binary protocol over `__divmod__` and `__rdivmod__`.
+    pub(super) fn divmod_value(&mut self, left: Value, right: Value) -> Result<Value, String> {
+        self.binary_slot_protocol(
+            left,
+            right,
+            (
+                Slot::DivMod,
+                "__divmod__",
+                Slot::ReflectedDivMod,
+                "__rdivmod__",
+            ),
+            "divmod()",
+        )
+    }
+
+    /// CPython's `binary_op1`: try the left operand's method, then the right operand's
+    /// reflected method, and raise `TypeError` naming `symbol` when both decline.
+    fn binary_slot_protocol(
+        &mut self,
+        left: Value,
+        right: Value,
+        (slot, name, reflected_slot, reflected_name): (Slot, &str, Slot, &str),
+        symbol: &str,
+    ) -> Result<Value, String> {
         // As in CPython, a right operand whose type is a proper subclass of the left operand's
         // type gets its reflected method first, so `1.0 + np.float64(2)` stays a NumPy scalar.
         let left_type = self.type_id(&left)?;
@@ -601,11 +638,6 @@ impl Vm<'_> {
                 return Ok(value);
             }
         }
-        let symbol = match (operator, inplace) {
-            (BinaryOperator::Power, true) => "**=".to_string(),
-            (operator, true) => format!("{}=", binary_operator_symbol(operator)),
-            (operator, false) => binary_operator_symbol(operator).to_string(),
-        };
         let message = format!(
             "unsupported operand type(s) for {symbol}: '{}' and '{}'",
             self.type_name_of(&left)?,

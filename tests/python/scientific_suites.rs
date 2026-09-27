@@ -99,7 +99,6 @@ numpy_suites! {
     indexing => "test_indexing.py";
     #[ignore = "pending: NumPy ufunc table (phase 3)"]
     ufuncs => "test_ufuncs.py";
-    #[ignore = "pending: NumPy errstate and warnings (phase 3)"]
     errstate => "test_errstate.py";
     #[ignore = "pending: NumPy surface completion (phase 4)"]
     reductions => "test_reductions.py";

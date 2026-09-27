@@ -5,7 +5,9 @@
 //! Functions are exported through the native module `_numpy_math`, which the frozen `numpy`
 //! package re-exports.
 
-use super::super::super::native::{FunctionDef, ModuleDef, NativeTypeDef};
+use super::super::super::native::{
+    CallArgs, FunctionDef, ModuleDef, NativeFn, NativeTypeDef, PyResult, PyRuntime,
+};
 use super::dtype::{Category, DType};
 use super::element::Number;
 
@@ -15,7 +17,19 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-static FUNCTIONS: &[FunctionDef] = &[];
+static FUNCTIONS: &[FunctionDef] = &[function("divmod", divmod)];
+
+const fn function(name: &'static str, call: NativeFn) -> FunctionDef {
+    FunctionDef {
+        module: "numpy",
+        name,
+        call,
+    }
+}
+
+fn divmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    super::ufunc::call_divmod(runtime, args)
+}
 
 /// Methods this area installs on `numpy.ndarray`.
 pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {

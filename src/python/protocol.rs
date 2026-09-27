@@ -42,6 +42,13 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     repr(heap, value)
 }
 
+/// The stand-in for a CPython object address in default reprs such as
+/// `<object object at 0x7f0000000010>`: derived from the arena slot, so it is stable across runs
+/// and distinct for live objects.
+pub fn address(id: super::heap::ObjectId) -> String {
+    format!("0x{:x}", 0x7f00_0000_0000_u64 + (id.as_raw() as u64) * 16)
+}
+
 pub fn repr(heap: &Heap, value: &Value) -> Result<String, String> {
     render(heap, value, &mut BTreeSet::new())
 }
@@ -206,6 +213,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
     if let Some(id) = value.object_id() {
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
+                Object::Bare => "<object ...>",
                 Object::String(_) => "<str ...>",
                 Object::Bytes(_) => "<bytes ...>",
                 Object::ByteArray(_) => "<bytearray ...>",
@@ -247,6 +255,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             .into());
         }
         let rendered = match heap.get(id)? {
+            Object::Bare => format!("<object object at {}>", address(id)),
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
@@ -403,6 +412,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         return Err("invalid Python value tag".into());
     };
     Ok(match heap.get(id)? {
+        Object::Bare => true,
         Object::String(value) => !value.is_empty(),
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
@@ -851,7 +861,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
     }
     match container.object_id() {
         Some(id) => match heap.get(id)? {
-            Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
+            Object::Bare | Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
                 Err("object is not a container".into())
             }
             Object::Bytes(value) | Object::ByteArray(value) => {

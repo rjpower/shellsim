@@ -41,6 +41,7 @@ mod shape;
 mod sort;
 mod strings;
 mod ufunc;
+mod underflow;
 
 pub(in crate::python) use ndarray::{
     slot_bool, slot_get_item, slot_iter, slot_length, slot_matrix_multiply,
@@ -48,13 +49,14 @@ pub(in crate::python) use ndarray::{
 };
 pub(in crate::python) use ufunc::{
     slot_absolute, slot_add, slot_bitwise_and, slot_bitwise_or, slot_bitwise_xor, slot_divide,
-    slot_equal, slot_floor_divide, slot_greater_equal, slot_greater_than, slot_invert,
+    slot_divmod, slot_equal, slot_floor_divide, slot_greater_equal, slot_greater_than, slot_invert,
     slot_left_shift, slot_less_equal, slot_less_than, slot_multiply, slot_negative, slot_not_equal,
     slot_positive, slot_power, slot_reflected_add, slot_reflected_bitwise_and,
     slot_reflected_bitwise_or, slot_reflected_bitwise_xor, slot_reflected_divide,
-    slot_reflected_floor_divide, slot_reflected_left_shift, slot_reflected_multiply,
-    slot_reflected_power, slot_reflected_remainder, slot_reflected_right_shift,
-    slot_reflected_subtract, slot_remainder, slot_right_shift, slot_subtract,
+    slot_reflected_divmod, slot_reflected_floor_divide, slot_reflected_left_shift,
+    slot_reflected_multiply, slot_reflected_power, slot_reflected_remainder,
+    slot_reflected_right_shift, slot_reflected_subtract, slot_remainder, slot_right_shift,
+    slot_subtract,
 };
 
 use super::super::native::{

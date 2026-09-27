@@ -565,6 +565,47 @@ pub(super) fn slot_reflected_remainder(
     slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
+/// `int.__divmod__` and `float.__divmod__`: the pair `(left // right, left % right)`.
+pub(super) fn slot_divmod(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod_numbers(runtime, left, right)
+}
+
+pub(super) fn slot_reflected_divmod(
+    runtime: &mut dyn PyRuntime,
+    right: PyValue,
+    left: PyValue,
+) -> PyResult<Option<PyValue>> {
+    divmod_numbers(runtime, left, right)
+}
+
+fn divmod_numbers(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (try_number(runtime, left)?, try_number(runtime, right)?)
+    else {
+        return Ok(None);
+    };
+    let quotient = binary_numbers(
+        runtime,
+        left.clone(),
+        right.clone(),
+        BinaryOperator::FloorDivide,
+    )?;
+    let remainder = binary_numbers(runtime, left, right, BinaryOperator::Remainder)?;
+    match (quotient, remainder) {
+        (Some(quotient), Some(remainder)) => {
+            Ok(Some(runtime.new_tuple(vec![quotient, remainder])?))
+        }
+        _ => Ok(None),
+    }
+}
+
 pub(super) fn slot_bitwise_and(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
@@ -700,13 +741,7 @@ fn binary_numbers(
             BinaryOperator::Divide | BinaryOperator::FloorDivide | BinaryOperator::Remainder
         ) && right == 0.0
         {
-            return Err(PyError::zero_division_error(
-                if matches!(operation, BinaryOperator::Divide) {
-                    "division by zero"
-                } else {
-                    "float division or modulo by zero"
-                },
-            ));
+            return Err(PyError::zero_division_error("division by zero"));
         }
         return Ok(Some(PyValue::Float(match operation {
             BinaryOperator::Add => left + right,
@@ -714,9 +749,7 @@ fn binary_numbers(
             BinaryOperator::Multiply => left * right,
             BinaryOperator::Power => {
                 if left == 0.0 && right < 0.0 {
-                    return Err(PyError::zero_division_error(
-                        "0.0 cannot be raised to a negative power",
-                    ));
+                    return Err(PyError::zero_division_error("zero to a negative power"));
                 }
                 if left < 0.0 && right.is_finite() && right.fract() != 0.0 {
                     let magnitude = (-left).powf(right);
@@ -773,9 +806,7 @@ fn binary_numbers(
                 .to_f64()
                 .ok_or_else(|| PyError::overflow_error("power exponent is too large"))?;
             if left == 0.0 {
-                return Err(PyError::zero_division_error(
-                    "0.0 cannot be raised to a negative power",
-                ));
+                return Err(PyError::zero_division_error("zero to a negative power"));
             }
             return Ok(Some(PyValue::Float(left.powf(right))));
         }

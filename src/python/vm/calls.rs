@@ -897,6 +897,7 @@ impl Vm<'_> {
                     Some(length)
                 } else if let Some(id) = arguments[0].object_id() {
                     match self.state.heap.get(id)? {
+                        Object::Bare => None,
                         Object::List(values)
                         | Object::Tuple(values)
                         | Object::Set(values)
@@ -1106,13 +1107,9 @@ impl Vm<'_> {
             }
             Builtin::Divmod => {
                 expect_arity(&arguments, 2, 2)?;
-                let quotient =
-                    self.binary_value(BinaryOperator::FloorDivide, arguments[0], arguments[1])?;
-                let remainder =
-                    self.binary_value(BinaryOperator::Remainder, arguments[0], arguments[1])?;
-                Ok(CallResult::Value(self.allocate_object(Object::Tuple(
-                    vec![quotient, remainder],
-                ))?))
+                Ok(CallResult::Value(
+                    self.divmod_value(arguments[0], arguments[1])?,
+                ))
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;

@@ -58,6 +58,8 @@ pub(super) struct ValueKindSlots {
     pub reflected_floor_divide: Option<BinarySlotFn>,
     pub remainder: Option<BinarySlotFn>,
     pub reflected_remainder: Option<BinarySlotFn>,
+    pub divmod: Option<BinarySlotFn>,
+    pub reflected_divmod: Option<BinarySlotFn>,
     pub power: Option<BinarySlotFn>,
     pub reflected_power: Option<BinarySlotFn>,
     pub left_shift: Option<BinarySlotFn>,

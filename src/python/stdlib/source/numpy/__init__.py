@@ -14,7 +14,7 @@ from _numpy_products import *
 from _numpy_math import *
 from _numpy_io import *
 from _numpy_print import *
-from numpy._errstate import errstate, geterr, seterr
+from numpy._errstate import errstate, geterr, geterrcall, seterr, seterrcall
 from numpy._numeric import allclose, array_equal, array_equiv, isclose
 from numpy._methods import average, count_nonzero, mean, ptp, std, var
 from numpy._nanfunctions import (

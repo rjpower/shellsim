@@ -420,6 +420,7 @@ impl PyRuntime for Vm<'_> {
                 .get(value.object_id().expect("tag checked"))
                 .map_err(PyError::runtime_error)?
             {
+                Object::Bare => PyKind::Native,
                 Object::String(_) => PyKind::String,
                 Object::Bytes(_) => PyKind::Bytes,
                 Object::ByteArray(_) => PyKind::ByteArray,

@@ -713,3 +713,144 @@ def test_sum_compensates_float_and_complex_totals():
         assert str(error) == "int too large to convert to float"
     else:
         raise AssertionError("sum() did not overflow")
+
+
+def test_with_enter_failure_reaches_the_enclosing_context_only():
+    events = []
+
+    class Outer:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, kind, value, traceback):
+            events.append(("outer", kind.__name__, str(value)))
+            return True
+
+    class Inner:
+        def __enter__(self):
+            raise ValueError("boom")
+
+        def __exit__(self, *args):
+            events.append(("inner",))
+
+    with Outer():
+        with Inner():
+            events.append(("body",))
+    assert events == [("outer", "ValueError", "boom")]
+
+    class NoEnter:
+        def __exit__(self, *args):
+            pass
+
+    class NoExit:
+        def __enter__(self):
+            return self
+
+    # CPython names user classes by module and qualified name, which shellsim does not model, so
+    # only the builtin type's message is compared in full.
+    for context, method in [(NoEnter(), "__enter__"), (NoExit(), "__exit__"), (1, "__exit__")]:
+        try:
+            with context:
+                pass
+        except TypeError as error:
+            assert str(error).endswith(
+                f"object does not support the context manager protocol (missed {method} method)"
+            )
+        else:
+            raise AssertionError(f"{context!r} was accepted as a context manager")
+    try:
+        with 1:
+            pass
+    except TypeError as error:
+        assert str(error) == (
+            "'int' object does not support the context manager protocol (missed __exit__ method)"
+        )
+
+
+def test_object_instances_are_identity_sentinels():
+    sentinel = object()
+    other = object()
+    assert type(sentinel) is object
+    assert sentinel is sentinel and sentinel != other
+    assert {sentinel: 1}[sentinel] == 1
+    assert repr(sentinel).startswith("<object object at 0x")
+    try:
+        sentinel.name = 1
+    except AttributeError as error:
+        assert str(error) == (
+            "'object' object has no attribute 'name' and no __dict__ for setting new attributes"
+        )
+    else:
+        raise AssertionError("object() accepted an attribute")
+    try:
+        sentinel.name
+    except AttributeError as error:
+        assert str(error) == "'object' object has no attribute 'name'"
+    else:
+        raise AssertionError("object() has an attribute")
+
+
+def test_divmod_uses_dunder_methods_and_cpython_messages():
+    class Pair:
+        def __divmod__(self, other):
+            return ("divmod", other)
+
+        def __rdivmod__(self, other):
+            return ("rdivmod", other)
+
+    class FloorOnly:
+        def __floordiv__(self, other):
+            return 1
+
+        def __mod__(self, other):
+            return 2
+
+    assert divmod(Pair(), 3) == ("divmod", 3)
+    assert divmod(3, Pair()) == ("rdivmod", 3)
+    assert divmod(7, -2) == (-4, -1)
+    assert divmod(-7.5, 2) == (-4.0, 0.5)
+    try:
+        divmod(FloorOnly(), 1)
+    except TypeError as error:
+        assert str(error) == "unsupported operand type(s) for divmod(): 'FloorOnly' and 'int'"
+    else:
+        raise AssertionError("divmod() fell back to // and %")
+    for operation in [lambda: 1.0 // 0.0, lambda: 1.0 % 0.0, lambda: divmod(1.0, 0), lambda: 1 // 0.0]:
+        try:
+            operation()
+        except ZeroDivisionError as error:
+            assert str(error) == "division by zero"
+        else:
+            raise AssertionError("division by zero succeeded")
+    try:
+        0.0 ** -1
+    except ZeroDivisionError as error:
+        assert str(error) == "zero to a negative power"
+    else:
+        raise AssertionError("0.0 ** -1 succeeded")
+
+
+def test_attribute_stores_on_builtin_values_raise_attribute_error():
+    def store(target):
+        target.upper = 1
+
+    try:
+        store("text")
+    except AttributeError as error:
+        assert str(error) == "'str' object attribute 'upper' is read-only"
+    else:
+        raise AssertionError("str accepted an attribute")
+    try:
+        (1.5).real = 2
+    except AttributeError as error:
+        assert str(error) == "attribute 'real' of 'float' objects is not writable"
+    else:
+        raise AssertionError("float.real was writable")
+    try:
+        (1).name = 2
+    except AttributeError as error:
+        assert str(error) == (
+            "'int' object has no attribute 'name' and no __dict__ for setting new attributes"
+        )
+    else:
+        raise AssertionError("int accepted an attribute")
