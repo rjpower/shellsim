@@ -51,7 +51,16 @@ fn reference_python_passes_every_suite() {
         return;
     };
     let output = Command::new(&python)
-        .args(["-m", "pytest", "-q", "-p", "no:cacheprovider"])
+        .args([
+            "-m",
+            "pytest",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            // numpy/ and scipy/ both hold a test_linalg.py; importlib mode imports each file
+            // by path so the two basenames do not collide.
+            "--import-mode=importlib",
+        ])
         .args(SUITE_DIRECTORIES.map(suite_directory))
         .output()
         .unwrap_or_else(|error| panic!("could not run {python:?}: {error}"));

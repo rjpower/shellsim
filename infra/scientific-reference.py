@@ -55,7 +55,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
         run(["uv", "venv", "--python", PYTHON_VERSION, str(venv)])
     run(["uv", "pip", "install", "--python", str(python), "-r", str(REQUIREMENTS)])
     if not options.no_run:
-        run([str(python), "-m", "pytest", "-q", "-p", "no:cacheprovider", *map(str, SUITES)])
+        run([str(python), "-m", "pytest", "-q", "-p", "no:cacheprovider", "--import-mode=importlib", *map(str, SUITES)])
     print(f"export SHELLSIM_SCIENTIFIC_PYTHON={python}")
     return 0
 
