@@ -13,6 +13,7 @@ include = [
     "/rust-toolchain.toml",
     "/README.md",
     "/LICENSE",
+    "/NOTICE.md",
 ]
 
 [[bin]]

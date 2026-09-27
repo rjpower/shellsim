@@ -22,6 +22,10 @@ The package has two layers.
 Larger submodules (`fft`, `random`, `testing`, `lib` and the file I/O functions) load on first
 access through a module-level `__getattr__`, as in NumPy.
 
+Much of this code is ported from NumPy, pocketfft, Dragon4, and NumPy's random generators.
+`NOTICE.md` lists the ported components and reproduces their licenses; source and binary
+distributions ship it alongside `LICENSE`.
+
 ### Storage
 
 An array is a view over storage owned by the VM:
