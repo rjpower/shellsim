@@ -9,6 +9,9 @@ use super::super::hash;
 use super::super::number::{self, NumberRef};
 use super::{Object, Slot, Value, ValueTag, Vm};
 
+/// Combines the hashes of a container's items into the container's hash.
+type Combine = fn(&[i64]) -> i64;
+
 /// Nesting bound for tuples and frozensets, matching the VM's call-depth limit.
 const MAX_HASH_DEPTH: usize = 256;
 
@@ -50,7 +53,7 @@ impl Vm<'_> {
             return Err(format!("hash() does not support {value:?}"));
         };
         let object = self.state.heap.get(id)?;
-        let (items, combine): (Vec<Value>, fn(&[i64]) -> i64) = match object {
+        let (items, combine): (Vec<Value>, Combine) = match object {
             Object::Bytes(bytes) => {
                 let bytes = bytes.clone();
                 self.charge_cpu(u64::try_from(bytes.len() / 32).unwrap_or(u64::MAX))?;

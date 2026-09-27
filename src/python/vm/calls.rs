@@ -1045,12 +1045,8 @@ impl Vm<'_> {
             Builtin::Sum => {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
-                let mut total = arguments.get(1).cloned().unwrap_or(Value::Int(0));
-                for value in values {
-                    self.charge_cpu(1)?;
-                    total = self.add_numbers(total, value)?;
-                }
-                Ok(CallResult::Value(total))
+                let start = arguments.get(1).copied().unwrap_or(Value::Int(0));
+                Ok(CallResult::Value(self.builtin_sum(values, start)?))
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;

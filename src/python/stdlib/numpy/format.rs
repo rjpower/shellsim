@@ -5,6 +5,7 @@
 //! half, single, and double precision, as in NumPy. So `np.float32(0.1)` prints `0.1` although
 //! its `float()` value is `0.10000000149011612`, and `np.float16(2048)` prints `2.048e+03`.
 
+use super::super::super::float_text;
 use super::element::{Number, F16};
 
 /// Floating-point precision of a value being printed.
@@ -19,21 +20,25 @@ pub(in crate::python) enum Precision {
 /// `value == 0.{digits} × 10^(exponent + 1)`, i.e. `digits[0]` is the units digit at
 /// `10^exponent`.
 fn shortest_digits(value: f64, precision: Precision) -> (String, i32) {
-    let text = match precision {
-        Precision::Double => format!("{:e}", value.abs()),
-        Precision::Single => format!("{:e}", (value as f32).abs()),
-        Precision::Half => {
-            let target = F16::from_f64(value).0 & 0x7fff;
-            let magnitude = value.abs();
-            (1..=5)
-                .map(|digits| format!("{:.*e}", digits - 1, magnitude))
-                .find(|text| {
-                    text.parse::<f64>()
-                        .is_ok_and(|parsed| F16::from_f64(parsed).0 & 0x7fff == target)
-                })
-                .unwrap_or_else(|| format!("{magnitude:e}"))
-        }
+    let decimal = match precision {
+        Precision::Double => float_text::shortest(value),
+        Precision::Single => float_text::shortest_f32(value as f32),
+        Precision::Half => return half_shortest_digits(value),
     };
+    (decimal.digits, decimal.exponent)
+}
+
+/// Shortest digits that round-trip through `float16`, found by trying one to five digits.
+fn half_shortest_digits(value: f64) -> (String, i32) {
+    let target = F16::from_f64(value).0 & 0x7fff;
+    let magnitude = value.abs();
+    let text = (1..=5)
+        .map(|digits| format!("{:.*e}", digits - 1, magnitude))
+        .find(|text| {
+            text.parse::<f64>()
+                .is_ok_and(|parsed| F16::from_f64(parsed).0 & 0x7fff == target)
+        })
+        .unwrap_or_else(|| format!("{magnitude:e}"));
     let (mantissa, exponent) = text.split_once('e').expect("exponent notation");
     let digits = mantissa.replace('.', "");
     let digits = digits.trim_end_matches('0');

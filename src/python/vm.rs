@@ -49,6 +49,7 @@ mod namespace;
 mod native_runtime;
 mod objects;
 mod operations;
+mod summation;
 const VM_POLL_QUANTUM: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

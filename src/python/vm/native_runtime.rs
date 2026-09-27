@@ -38,7 +38,7 @@ fn validate_array_view(view: &PyArrayView, buffer: &PyArrayBuffer) -> PyResult<(
     }
     if view.dtype.is_values() {
         let aligned = |value: isize| value % PyArrayDtype::VALUE_ITEMSIZE as isize == 0;
-        if view.offset % PyArrayDtype::VALUE_ITEMSIZE != 0
+        if !view.offset.is_multiple_of(PyArrayDtype::VALUE_ITEMSIZE)
             || !view.strides.iter().all(|stride| aligned(*stride))
         {
             return invalid("object array view is not aligned to its elements");

@@ -671,3 +671,45 @@ def test_hash_follows_cpython_numeric_and_container_rules():
             assert str(error) == f"unhashable type: '{name}'"
         else:
             raise AssertionError(f"hash({value!r}) did not raise")
+
+
+def test_float_repr_is_shortest_round_trip_with_ties_to_even():
+    assert repr(0.1) == "0.1"
+    assert repr(1e16) == "1e+16"
+    assert repr(1e15) == "1000000000000000.0"
+    assert repr(0.0001) == "0.0001"
+    assert repr(0.00001) == "1e-05"
+    assert repr(5e-324) == "5e-324"
+    assert repr(-0.0) == "-0.0"
+    # 16.5042266845703125 lies halfway between two 17-digit strings; the even one wins.
+    assert repr(16.5042266845703125) == "16.504226684570312"
+    assert str(-28.182485580444336) == "-28.182485580444336"
+    assert repr(complex(1e16, 16.5042266845703125)) == "(1e+16+16.504226684570312j)"
+
+
+def test_sum_compensates_float_and_complex_totals():
+    assert sum([0.1] * 10) == 1.0
+    assert sum([1e100, 1.0, -1e100]) == 1.0
+    assert sum([0.1 + 0.2j] * 10) == 1 + 2j
+    assert sum(x / 7 for x in range(1000)) == 71357.14285714286
+    assert repr(sum([-0.0], -0.0)) == "-0.0"
+    assert sum([float("inf"), 1.0]) == float("inf")
+    assert sum([1, 2.5, 3]) == 6.5
+    assert sum([2**63 - 1, 1]) == 2**63
+    assert sum([], True) is True
+    assert sum([[1], [2]], []) == [1, 2]
+    for start, name in [("", "strings [use ''.join(seq) instead]"),
+                        (b"", "bytes [use b''.join(seq) instead]"),
+                        (bytearray(), "bytearray [use b''.join(seq) instead]")]:
+        try:
+            sum([], start)
+        except TypeError as error:
+            assert str(error) == f"sum() can't sum {name}"
+        else:
+            raise AssertionError(f"sum() accepted start {start!r}")
+    try:
+        sum([1.0, 10**400])
+    except OverflowError as error:
+        assert str(error) == "int too large to convert to float"
+    else:
+        raise AssertionError("sum() did not overflow")

@@ -368,40 +368,7 @@ fn repr_component(value: f64, signed: bool) -> String {
     } else {
         ""
     };
-    if value.is_nan() {
-        return format!("{sign}nan");
-    }
-    if value.is_infinite() {
-        return format!("{sign}inf");
-    }
-    // `{:e}` yields the shortest round-trip digits as `d[.ddd]e<exponent>`.
-    let scientific = format!("{:e}", value.abs());
-    let (mantissa, exponent) = scientific
-        .split_once('e')
-        .expect("scientific formatting has an exponent");
-    let exponent: i32 = exponent.parse().expect("scientific exponent is an integer");
-    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
-    let body = if !(-4..16).contains(&exponent) {
-        let (first, remainder) = digits.split_at(1);
-        let fraction = if remainder.is_empty() {
-            String::new()
-        } else {
-            format!(".{remainder}")
-        };
-        let exponent_sign = if exponent < 0 { '-' } else { '+' };
-        format!("{first}{fraction}e{exponent_sign}{:02}", exponent.abs())
-    } else if exponent < 0 {
-        let zeros = "0".repeat(usize::try_from(-exponent - 1).expect("negative exponent"));
-        format!("0.{zeros}{digits}")
-    } else {
-        let point = usize::try_from(exponent + 1).expect("non-negative exponent");
-        if digits.len() <= point {
-            format!("{digits}{}", "0".repeat(point - digits.len()))
-        } else {
-            format!("{}.{}", &digits[..point], &digits[point..])
-        }
-    };
-    format!("{sign}{body}")
+    format!("{sign}{}", super::float_text::magnitude_repr(value, false))
 }
 
 /// CPython's `hash(complex)`: `hash(real) + 1000003 * hash(imag)` with wrapping arithmetic.

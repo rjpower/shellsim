@@ -185,23 +185,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         return Ok(value.immediate_int().expect("tag checked").to_string());
     }
     if let Some(value) = value.float_value() {
-        if value.is_nan() {
-            return Ok("nan".into());
-        }
-        if value.is_infinite() {
-            return Ok(if value.is_sign_negative() {
-                "-inf"
-            } else {
-                "inf"
-            }
-            .into());
-        }
-        let text = value.to_string();
-        return Ok(if text.contains(['.', 'e', 'E']) {
-            text
-        } else {
-            format!("{text}.0")
-        });
+        return Ok(super::float_text::repr(value));
     }
     if let Some(value) = value.bool_value() {
         return Ok(if value { "True" } else { "False" }.into());
