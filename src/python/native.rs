@@ -671,6 +671,13 @@ pub(super) trait PyRuntime {
     /// Assign an attribute without consulting a class's `__setattr__`, as `object.__setattr__`
     /// does: data descriptors still apply, and other names go to the instance.
     fn set_attribute_default(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
+    /// Raise the builtin exception `kind` with constructor arguments `args`, such as the key of
+    /// a `KeyError`, and return the error that carries it.
+    fn exception_with_args(&mut self, kind: &'static str, args: Vec<PyValue>) -> PyError;
+    /// Raise the `StopIteration` that ends `generator`, carrying its return value.
+    fn generator_stop(&mut self, generator: PyIterator) -> PyError;
+    /// The class name and constructor arguments of a builtin exception instance.
+    fn exception_args(&mut self, value: &PyValue) -> PyResult<Option<(String, Vec<PyValue>)>>;
     /// Delete an attribute without consulting a class's `__delattr__`, as
     /// `object.__delattr__` does.
     fn delete_attribute_default(&mut self, value: PyValue, name: &str) -> PyResult<()>;

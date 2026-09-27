@@ -552,15 +552,16 @@ impl Vm<'_> {
                 .map_err(|error| self.record_native_error(error));
         }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
-            expect_arity(&arguments, 0, 1)?;
-            let message = arguments
-                .first()
-                .map(|value| protocol::display(&self.state.heap, value))
-                .transpose()?
-                .unwrap_or_default();
-            return Ok(CallResult::Value(
-                self.allocate_exception(exception_type.0.to_string(), message)?,
-            ));
+            if !keyword_arguments.is_empty() {
+                let message = format!("{}() takes no keyword arguments", exception_type.0);
+                return Err(self.raise_exception("TypeError", message));
+            }
+            return Ok(CallResult::Value(self.allocate_object(
+                Object::Exception {
+                    kind: exception_type.0.to_string(),
+                    args: arguments,
+                },
+            )?));
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
             if arguments.is_empty() {
@@ -1270,7 +1271,7 @@ impl Vm<'_> {
                     Some(value) => value,
                     None => match arguments.get(1) {
                         Some(default) => *default,
-                        None => return Err(self.raise_exception("StopIteration", "")),
+                        None => return Err(self.raise_stop_iteration(&arguments[0])),
                     },
                 };
                 Ok(CallResult::Value(value))

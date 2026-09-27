@@ -20,24 +20,8 @@ pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     if let Some((_, message)) = exception_parts(heap, value)? {
         return Ok(message);
     }
-    if let Some((_, args)) = user_exception_parts(heap, value)? {
-        return match args.as_slice() {
-            [] => Ok(String::new()),
-            [only] => {
-                if let Some(value) = string_value(heap, only)? {
-                    Ok(value)
-                } else {
-                    repr(heap, only)
-                }
-            }
-            _ => {
-                let values = args
-                    .iter()
-                    .map(|value| repr(heap, value))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(format!("({})", values.join(", ")))
-            }
-        };
+    if let Some(exception) = user_exception_parts(heap, value)? {
+        return exception_message(heap, exception.base, &exception.args);
     }
     repr(heap, value)
 }
@@ -147,37 +131,65 @@ pub fn bytes_ref<'heap>(heap: &'heap Heap, value: &Value) -> Result<Option<&'hea
     })
 }
 
+/// The class name and `str()` of a builtin exception instance.
 pub fn exception_parts(heap: &Heap, value: &Value) -> Result<Option<(String, String)>, String> {
+    let Some((kind, args)) = exception_args(heap, value)? else {
+        return Ok(None);
+    };
+    let message = exception_message(heap, &kind, &args)?;
+    Ok(Some((kind, message)))
+}
+
+/// The class name and constructor arguments of a builtin exception instance.
+pub fn exception_args(heap: &Heap, value: &Value) -> Result<Option<(String, Vec<Value>)>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
     };
     Ok(match heap.get(id)? {
-        Object::Exception { kind, message } => Some((kind.clone(), message.clone())),
+        Object::Exception { kind, args } => Some((kind.clone(), args.clone())),
         _ => None,
     })
 }
 
-fn user_exception_parts(
-    heap: &Heap,
-    value: &Value,
-) -> Result<Option<(String, Vec<Value>)>, String> {
+/// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
+/// `args`: empty without arguments, the `str()` of a single argument, whose `repr()` a
+/// `KeyError` shows because the argument is a key, and otherwise the `repr()` of the tuple.
+fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, String> {
+    match args {
+        [] => Ok(String::new()),
+        [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
+            repr(heap, only)
+        }
+        [only] => display(heap, only),
+        _ => {
+            let values = args
+                .iter()
+                .map(|value| repr(heap, value))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(format!("({})", values.join(", ")))
+        }
+    }
+}
+
+/// An instance of a user exception class: its closest builtin exception ancestor and `args`.
+struct UserException {
+    base: &'static str,
+    args: Vec<Value>,
+}
+
+fn user_exception_parts(heap: &Heap, value: &Value) -> Result<Option<UserException>, String> {
     let Some(id) = value.object_id() else {
         return Ok(None);
     };
     let Object::Instance { class, .. } = heap.get(id)? else {
         return Ok(None);
     };
-    let Object::Class {
-        name,
-        exception_base,
-        ..
-    } = heap.get(*class)?
-    else {
+    let Object::Class { exception_base, .. } = heap.get(*class)? else {
         return Ok(None);
     };
-    if exception_base.is_none() {
+    let Some(base) = *exception_base else {
         return Ok(None);
-    }
+    };
     let args = if let Some(symbol) = heap.symbol_id("args") {
         heap.attribute_by_symbol(id, symbol)?
             .and_then(|value| value.object_id())
@@ -189,7 +201,7 @@ fn user_exception_parts(
     } else {
         Vec::new()
     };
-    Ok(Some((name.clone(), args)))
+    Ok(Some(UserException { base, args }))
 }
 
 fn bigint_value<'a>(heap: &'a Heap, value: &Value) -> Option<&'a BigInt> {
@@ -218,13 +230,6 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
     }
     if let Some(value) = value.native_value() {
         return Ok(value.repr());
-    }
-    if let Some((kind, message)) = exception_parts(heap, value)? {
-        if message.is_empty() {
-            return Ok(kind);
-        } else {
-            return Ok(format!("{kind}: {message}"));
-        }
     }
     if let Some(id) = value.object_id() {
         if !active.insert(id) {
@@ -275,12 +280,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
-            Object::Exception { kind, message } => {
-                if message.is_empty() {
-                    kind.clone()
-                } else {
-                    format!("{kind}: {message}")
-                }
+            Object::Exception { kind, args } => {
+                format!("{kind}({})", render_values(heap, args, active)?.join(", "))
             }
             Object::List(values) => {
                 format!("[{}]", render_values(heap, values, active)?.join(", "))
@@ -347,7 +348,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                         exception_base: Some(_),
                         ..
                     } => {
-                        let (_, args) = user_exception_parts(heap, value)?
+                        let UserException { args, .. } = user_exception_parts(heap, value)?
                             .ok_or("exception instance lost its native base")?;
                         format!("{name}({})", render_values(heap, &args, active)?.join(", "))
                     }
@@ -524,16 +525,6 @@ fn equals_inner(
                 (Object::Bytes(left), Object::ByteArray(right))
                 | (Object::ByteArray(left), Object::Bytes(right))
                 | (Object::ByteArray(left), Object::ByteArray(right)) => left == right,
-                (
-                    Object::Exception {
-                        kind: lk,
-                        message: lm,
-                    },
-                    Object::Exception {
-                        kind: rk,
-                        message: rm,
-                    },
-                ) => lk == rk && lm == rm,
                 (Object::List(left), Object::List(right))
                 | (Object::Tuple(left), Object::Tuple(right)) => {
                     sequence_equal(heap, left, right, active)?

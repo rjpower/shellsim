@@ -358,6 +358,24 @@ impl Vm<'_> {
         self.resume_generator_frame(id, GeneratorResume::Send(sent))
     }
 
+    /// Raise the `StopIteration` that ends iteration over `iterator`. A generator that has just
+    /// returned passes its return value as the exception's `value`, once; later calls, and
+    /// other iterators, raise it without arguments.
+    pub(super) fn raise_stop_iteration(&mut self, iterator: &Value) -> String {
+        let returned = match iterator.object_id().map(|id| self.state.heap.get_mut(id)) {
+            Some(Ok(Object::Generator { return_value, .. })) => {
+                std::mem::replace(return_value, Value::None)
+            }
+            _ => Value::None,
+        };
+        let args = if returned.is_none() {
+            Vec::new()
+        } else {
+            vec![returned]
+        };
+        self.raise_exception_args("StopIteration", args)
+    }
+
     /// Raise `exception` at the generator's suspended `yield`, as `generator.throw` does.
     ///
     /// The frame's innermost active handler receives it, so `except`, `finally` and `with`

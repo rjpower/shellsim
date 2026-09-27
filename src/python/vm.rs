@@ -977,8 +977,36 @@ impl<'a> Vm<'a> {
         self.allocate_object(Object::ByteArray(value))
     }
 
+    /// A builtin exception whose only argument is `message`, or with no arguments when the
+    /// message is empty, as the VM and native code raise them.
     fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value, String> {
-        self.allocate_object(Object::Exception { kind, message })
+        let args = if message.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.allocate_string(message)?]
+        };
+        self.allocate_object(Object::Exception { kind, args })
+    }
+
+    /// Raise a builtin exception with the constructor arguments `args`.
+    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> String {
+        let value = match self.allocate_object(Object::Exception {
+            kind: kind.to_string(),
+            args,
+        }) {
+            Ok(value) => value,
+            Err(error) => return error,
+        };
+        let message = protocol::exception_parts(&self.state.heap, &value)
+            .ok()
+            .flatten()
+            .map(|(_, message)| message)
+            .unwrap_or_default();
+        self.pending_exception = Some(RaisedException {
+            kind: kind.to_string(),
+            value,
+        });
+        message
     }
 
     /// Raise a builtin Python exception from VM code and return the error string that carries

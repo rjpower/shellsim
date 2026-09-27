@@ -11,9 +11,9 @@ use num_traits::{Signed, Zero};
 
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray, PyBytes,
-    PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult, PyRuntime,
-    PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
+    PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult,
+    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::{index_argument, PyNumber};
 use super::super::protocol;
@@ -277,8 +277,43 @@ pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
     name: "BaseException",
     methods: &[method("BaseException", "__init__", exception_init)],
-    getters: &[],
+    getters: &[
+        GetterDef {
+            owner: "BaseException",
+            name: "args",
+            get: exception_args,
+        },
+        GetterDef {
+            owner: "BaseException",
+            name: "value",
+            get: stop_iteration_value,
+        },
+    ],
 };
+
+/// `exception.args`: the constructor arguments of a builtin exception.
+fn exception_args(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (_, args) = runtime
+        .exception_args(&receiver)?
+        .ok_or_else(|| PyError::type_error("descriptor 'args' requires an exception"))?;
+    runtime.new_tuple(args)
+}
+
+/// `StopIteration.value`: the first argument, which is a generator's return value, or `None`.
+fn stop_iteration_value(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    match runtime.exception_args(&receiver)? {
+        Some((kind, args)) if kind == "StopIteration" => {
+            Ok(args.first().copied().unwrap_or(Value::None))
+        }
+        Some((kind, _)) => Err(PyError::exception(
+            "AttributeError",
+            format!("'{kind}' object has no attribute 'value'"),
+        )),
+        None => Err(PyError::type_error(
+            "descriptor 'value' requires an exception",
+        )),
+    }
+}
 
 pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
@@ -316,18 +351,20 @@ fn generator_next(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) 
     args.expect_positional("generator.__next__", 0, 0)?;
     args.reject_keywords("generator.__next__")?;
     let generator = receiver.cast::<PyIterator>(runtime)?;
-    runtime
-        .generator_send(generator, Value::None)?
-        .ok_or_else(|| PyError::exception("StopIteration", ""))
+    match runtime.generator_send(generator, Value::None)? {
+        Some(value) => Ok(value),
+        None => Err(runtime.generator_stop(generator)),
+    }
 }
 
 fn generator_send(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("generator.send", 1, 1)?;
     args.reject_keywords("generator.send")?;
     let generator = receiver.cast::<PyIterator>(runtime)?;
-    runtime
-        .generator_send(generator, args.positional()[0])?
-        .ok_or_else(|| PyError::exception("StopIteration", ""))
+    match runtime.generator_send(generator, args.positional()[0])? {
+        Some(value) => Ok(value),
+        None => Err(runtime.generator_stop(generator)),
+    }
 }
 
 fn generator_close(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
@@ -2123,9 +2160,10 @@ pub(crate) fn slot_string_remainder(
             used_mapping = true;
             let mapping = right.cast::<PyDict>(runtime)?;
             let key_value = runtime.new_string(key.clone())?;
-            runtime
-                .dict_get(mapping, &key_value)?
-                .ok_or_else(|| PyError::exception("KeyError", key))?
+            match runtime.dict_get(mapping, &key_value)? {
+                Some(value) => value,
+                None => return Err(runtime.exception_with_args("KeyError", vec![key_value])),
+            }
         } else {
             let value = arguments
                 .get(argument)
@@ -2372,12 +2410,13 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                         .get(index)
                         .ok_or_else(|| PyError::value_error("replacement index out of range"))?
                 } else {
-                    *args
-                        .keywords()
-                        .iter()
-                        .find(|(name, _)| name == field)
-                        .map(|(_, value)| value)
-                        .ok_or_else(|| PyError::exception("KeyError", field))?
+                    match args.keywords().iter().find(|(name, _)| name == field) {
+                        Some((_, value)) => *value,
+                        None => {
+                            let key = runtime.new_string(field.to_string())?;
+                            return Err(runtime.exception_with_args("KeyError", vec![key]));
+                        }
+                    }
                 };
                 result.push_str(&runtime.format_value(&value, conversion, specification)?);
             }
@@ -2764,9 +2803,7 @@ fn dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     if let Some(default) = args.positional().get(1) {
         return Ok(*default);
     }
-    // CPython's KeyError carries the key, and `str()` shows its repr.
-    let key = runtime.repr(&args.positional()[0])?;
-    Err(PyError::exception("KeyError", key))
+    Err(runtime.exception_with_args("KeyError", vec![args.positional()[0]]))
 }
 
 /// Remove and return the most recently inserted `(key, value)` pair.
@@ -2776,11 +2813,8 @@ fn dict_popitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     let dict = receiver.cast::<PyDict>(runtime)?;
     let mut entries = dict.items(runtime)?;
     let Some((key, value)) = entries.pop() else {
-        // The message is the `str()` of CPython's KeyError, which quotes its argument.
-        return Err(PyError::exception(
-            "KeyError",
-            "'popitem(): dictionary is empty'",
-        ));
+        let message = runtime.new_string("popitem(): dictionary is empty".into())?;
+        return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
     // Committing the shorter snapshot rebuilds the key index in time linear in the size.
     runtime.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
@@ -2859,8 +2893,7 @@ fn set_modify(
         }
         SetOperation::Remove => {
             if !runtime.set_remove(set, &value)? {
-                let element = runtime.repr(&value)?;
-                return Err(PyError::exception("KeyError", element));
+                return Err(runtime.exception_with_args("KeyError", vec![value]));
             }
         }
         SetOperation::Discard => {
@@ -2906,8 +2939,8 @@ fn set_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> Py
     let set = mutable_set(runtime, receiver, "pop")?;
     let members = set.items(runtime)?;
     let Some(&value) = members.first() else {
-        // The message is the `str()` of CPython's KeyError, which quotes its argument.
-        return Err(PyError::exception("KeyError", "'pop from an empty set'"));
+        let message = runtime.new_string("pop from an empty set".into())?;
+        return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
     // Removing the first member shifts the rest of the member vector.
     runtime.charge_cpu(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
@@ -4164,8 +4197,7 @@ pub(crate) fn slot_dict_delete_item(
         }
     }
     let Some(index) = found else {
-        let key = runtime.repr(&key)?;
-        return Err(PyError::exception("KeyError", key));
+        return Err(runtime.exception_with_args("KeyError", vec![key]));
     };
     items.remove(index);
     runtime.replace_dict_items(dict, items)?;

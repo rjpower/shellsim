@@ -576,8 +576,27 @@ impl Vm<'_> {
         };
         let Some((id, class)) = class else {
             if let Some(id) = owner.object_id() {
-                if matches!(self.state.heap.get(id)?, Object::Class { .. }) {
-                    return self.set_class_attribute(id, name, Some(value));
+                match self.state.heap.get(id)? {
+                    Object::Class { .. } => return self.set_class_attribute(id, name, Some(value)),
+                    // `BaseException.args` is writable and stores any iterable as a tuple.
+                    Object::Exception { args, .. } if name == "args" => {
+                        let current = args.len();
+                        let items = self.iterable_values(&value)?;
+                        let bytes = u64::try_from(items.len().saturating_sub(current))
+                            .unwrap_or(u64::MAX)
+                            .saturating_mul(super::MODELED_VALUE_BYTES);
+                        self.state.heap.reserve_object_growth(
+                            id,
+                            bytes,
+                            &mut self.interp.resources,
+                        )?;
+                        let Object::Exception { args, .. } = self.state.heap.get_mut(id)? else {
+                            unreachable!("checked above")
+                        };
+                        *args = items;
+                        return Ok(());
+                    }
+                    _ => {}
                 }
             }
             return Err(self.reject_builtin_attribute_store(owner, name));
@@ -989,9 +1008,7 @@ impl Vm<'_> {
                         entries.push((index, value));
                         value
                     } else {
-                        // CPython's KeyError carries the key, and `str()` shows its repr.
-                        let key = protocol::repr(&self.state.heap, &index)?;
-                        return Err(self.raise_exception("KeyError", key));
+                        return Err(self.raise_exception_args("KeyError", vec![index]));
                     }
                 }
                 BuiltinSubscript::Set | BuiltinSubscript::Unsupported => {

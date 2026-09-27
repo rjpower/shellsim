@@ -656,6 +656,19 @@ impl PyRuntime for Vm<'_> {
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
+    fn exception_with_args(&mut self, kind: &'static str, args: Vec<Value>) -> PyError {
+        PyError::new(PyErrorKind::Raised, self.raise_exception_args(kind, args))
+    }
+
+    fn generator_stop(&mut self, generator: PyIterator) -> PyError {
+        let generator = Value::Object(generator.object_id());
+        PyError::new(PyErrorKind::Raised, self.raise_stop_iteration(&generator))
+    }
+
+    fn exception_args(&mut self, value: &Value) -> PyResult<Option<(String, Vec<Value>)>> {
+        protocol::exception_args(&self.state.heap, value).map_err(PyError::runtime_error)
+    }
+
     fn delete_attribute_default(&mut self, value: Value, name: &str) -> PyResult<()> {
         let symbol = self
             .state
@@ -1546,7 +1559,10 @@ impl PyRuntime for Vm<'_> {
         };
         match self.throw_into_generator(id, raised) {
             Ok(Some(value)) => Ok(value),
-            Ok(None) => Err(PyError::exception("StopIteration", "")),
+            Ok(None) => Err(PyError::new(
+                PyErrorKind::Raised,
+                self.raise_stop_iteration(&Value::Object(id)),
+            )),
             Err(error) if self.pending_exception.is_some() => {
                 Err(PyError::new(PyErrorKind::Raised, error))
             }

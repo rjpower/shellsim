@@ -254,3 +254,57 @@ def test_string_repr_chooses_quotes_like_cpython():
     assert repr("tab\there") == "'tab\\there'"
     assert repr("\x00\x7f") == "'\\x00\\x7f'"
     assert repr("é中") == "'é中'"
+
+
+def test_builtin_exceptions_keep_their_constructor_arguments():
+    pair = ValueError(1, "two")
+    assert pair.args == (1, "two")
+    assert str(pair) == "(1, 'two')" and repr(pair) == "ValueError(1, 'two')"
+    assert (ValueError().args, str(ValueError()), repr(ValueError())) == ((), "", "ValueError()")
+    assert (str(ValueError("a")), repr(ValueError("a"))) == ("a", "ValueError('a')")
+    assert (str(KeyError("k")), KeyError("k").args) == ("'k'", ("k",))
+    assert ValueError("a") != ValueError("a")
+    renamed = ValueError("old")
+    renamed.args = ["new", 2]
+    assert (renamed.args, str(renamed)) == (("new", 2), "('new', 2)")
+    assert raised(lambda: ValueError(message="x")) == (TypeError, "ValueError() takes no keyword arguments")
+    try:
+        int("x")
+    except ValueError as error:
+        assert error.args == ("invalid literal for int() with base 10: 'x'",)
+
+
+def test_key_errors_from_lookups_carry_the_key():
+    for operation, key in [
+        (lambda: {}["missing"], "missing"),
+        (lambda: {}.pop(("a", 1)), ("a", 1)),
+        (lambda: set().remove(3), 3),
+        (lambda: "{name}".format(), "name"),
+        (lambda: "%(name)s" % {}, "name"),
+    ]:
+        try:
+            operation()
+        except KeyError as error:
+            assert error.args == (key,) and str(error) == repr(key)
+        else:
+            raise AssertionError(f"no KeyError for {key!r}")
+    assert raised(lambda: set().pop()) == (KeyError, "'pop from an empty set'")
+
+
+def test_stop_iteration_carries_a_generator_return_value_once():
+    def counted():
+        yield 1
+        return "done"
+
+    generator = counted()
+    next(generator)
+    try:
+        next(generator)
+    except StopIteration as stop:
+        assert (stop.value, stop.args) == ("done", ("done",))
+    try:
+        generator.send(None)
+    except StopIteration as stop:
+        assert (stop.value, stop.args) == (None, ())
+    assert StopIteration(5).value == 5 and StopIteration().value is None
+    assert not hasattr(ValueError(1), "value")

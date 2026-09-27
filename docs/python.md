@@ -113,8 +113,12 @@ The frozen `warnings` module implements `warn`, `warn_explicit`, `filterwarnings
 `always`, `ignore`, and `error` actions. A warning names the line executing `stacklevel` frames up.
 Every frame reports the script path, as tracebacks do, and `module=` filters match `__main__`.
 
-User-defined exception subclasses preserve inherited constructor arguments, including compatible
-`args`, `str`, and `repr` behavior.
+Exceptions keep their constructor arguments in `args`, which is writable, and derive `str` and
+`repr` from them as CPython does: a `KeyError` shows its key's `repr`, and a generator's return
+value becomes the `value` of the `StopIteration` that ends it. User-defined exception subclasses
+inherit the same behavior. Builtin exception instances do not accept other attributes, and
+`OSError`'s `errno`, `strerror`, and `filename`, `with_traceback`, and `add_note` are not
+modeled.
 
 Builtin operations raise ordinary Python exceptions with CPython 3.14's types, hierarchy, and
 messages, so `except LookupError` catches a missing dictionary key and an uncaught error exits with

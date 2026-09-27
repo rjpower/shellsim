@@ -111,9 +111,10 @@ pub enum Object {
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
+    /// An instance of a builtin exception class, with the constructor arguments `args`.
     Exception {
         kind: String,
-        message: String,
+        args: Vec<Value>,
     },
     List(Vec<Value>),
     Tuple(Vec<Value>),
@@ -1573,13 +1574,13 @@ fn trace_object(
             object_work.push(*start_class);
             trace_value(*receiver, object_work);
         }
+        Object::Exception { args, .. } => trace_values(args.iter().copied(), object_work),
         Object::Bare
         | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
         | Object::ArrayStorage(PyArrayBuffer::Bytes(_))
         | Object::WideValue { .. }
-        | Object::Exception { .. }
         | Object::Slice { .. }
         | Object::BigInt(_)
         | Object::Complex { .. }
@@ -1607,9 +1608,9 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     let slots = match object {
         Object::String(value) => return packed(value.len()),
         Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
-        Object::Exception { kind, message } => kind
+        Object::Exception { kind, args } => kind
             .len()
-            .checked_add(message.len())
+            .checked_add(args.len())
             .ok_or("modeled object size overflow")?,
         Object::List(values)
         | Object::Tuple(values)
