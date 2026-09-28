@@ -12,8 +12,8 @@ use num_traits::{Signed, Zero};
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
-    PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult,
-    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    PyBytes, PyCallable, PyDict, PyError, PyGlobals, PyIterator, PyKind, PyList, PyProperty,
+    PyResult, PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::{index_argument, PyNumber};
 use super::super::object_model::BuiltinType;
@@ -219,6 +219,26 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
 
 /// `dict` methods bound to the type, so `dict.fromkeys(...)` and `{}.fromkeys(...)` agree.
 pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys", dict_fromkeys)];
+
+/// `globals()`'s named methods. Subscript access, `del`, `len`, `in` and `iter` are builtin-slot
+/// behavior (see `object_model::install_builtin_slots`) rather than methods here, matching how
+/// `dict`'s own bytecode-level operations bypass its dunder methods below. `repr` is handled
+/// directly in `Vm::repr_nested`, alongside `dict`, `list` and `set`, so it shares their
+/// cycle-tracking rather than starting a fresh one per nested call.
+pub(crate) static GLOBALS_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "shellsim.globals",
+    methods: &[
+        method("shellsim.globals", "get", globals_get_method),
+        method("shellsim.globals", "keys", globals_keys),
+        method("shellsim.globals", "values", globals_values),
+        method("shellsim.globals", "items", globals_items_method),
+        method("shellsim.globals", "setdefault", globals_setdefault),
+        method("shellsim.globals", "update", globals_update),
+        method("shellsim.globals", "pop", globals_pop),
+        method("shellsim.globals", "copy", globals_copy),
+    ],
+    getters: &[],
+};
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
@@ -3016,6 +3036,204 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     args.reject_keywords("dict.copy")?;
     let dict = receiver.cast::<PyDict>(runtime)?;
     runtime.dict_copy(dict)
+}
+
+fn globals_get_method(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_lookup(runtime, receiver, args, false)
+}
+
+fn globals_setdefault(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_lookup(runtime, receiver, args, true)
+}
+
+fn globals_lookup(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    insert: bool,
+) -> PyResult {
+    args.expect_positional("globals lookup", 1, 2)?;
+    args.reject_keywords("globals lookup")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    if let Some(value) = runtime.globals_get(globals, &name)? {
+        return Ok(value);
+    }
+    let default = args.positional().get(1).copied().unwrap_or(Value::None);
+    if insert {
+        runtime.globals_insert(globals, name, default)?;
+    }
+    Ok(default)
+}
+
+fn globals_keys(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_projection(runtime, receiver, args, 0)
+}
+
+fn globals_values(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    globals_projection(runtime, receiver, args, 1)
+}
+
+fn globals_items_method(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    globals_projection(runtime, receiver, args, 2)
+}
+
+/// `globals()` views its contents as plain lists rather than dict-style live views: nothing in
+/// the required surface needs `keys()`/`values()`/`items()` to track later mutation, and a list
+/// keeps this consistent with how a snapshot already has to work for the REPL/script table.
+fn globals_projection(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+    projection: u8,
+) -> PyResult {
+    args.expect_positional("globals view", 0, 0)?;
+    args.reject_keywords("globals view")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let entries = runtime.globals_items(globals)?;
+    let mut values = Vec::with_capacity(entries.len());
+    for (key, value) in entries {
+        runtime.charge_cpu(1)?;
+        values.push(match projection {
+            0 => key,
+            1 => value,
+            _ => runtime.new_tuple(vec![key, value])?,
+        });
+    }
+    runtime.new_list(values)
+}
+
+fn globals_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.update", 0, 1)?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let mut additions = Vec::new();
+    if let Some(source) = args.positional().first() {
+        if runtime.kind(source)? == PyKind::Dict {
+            additions.extend(source.cast::<PyDict>(runtime)?.items(runtime)?);
+        } else {
+            let iterator = runtime.iterator(*source)?;
+            while let Some(item) = runtime.iterator_next(iterator)? {
+                let pair = item.cast::<PySequence>(runtime)?.items(runtime)?;
+                if pair.len() != 2 {
+                    return Err(PyError::value_error(
+                        "dictionary update sequence element has length other than 2",
+                    ));
+                }
+                additions.push((pair[0], pair[1]));
+            }
+        }
+    }
+    for (name, value) in args.keywords() {
+        additions.push((runtime.new_string(name.clone())?, *value));
+    }
+    for (key, value) in additions {
+        let OwnedPyString(name) = key.cast(runtime)?;
+        runtime.globals_insert(globals, name, value)?;
+    }
+    Ok(Value::None)
+}
+
+fn globals_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.pop", 1, 2)?;
+    args.reject_keywords("globals.pop")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    if let Some(value) = runtime.globals_remove(globals, &name)? {
+        return Ok(value);
+    }
+    if let Some(default) = args.positional().get(1) {
+        return Ok(*default);
+    }
+    Err(runtime.exception_with_args("KeyError", vec![args.positional()[0]]))
+}
+
+/// `globals().copy()` returns a plain `dict` snapshot rather than another live `globals()`
+/// handle: CPython's own `globals().copy()` is already a plain dict, and a mutable copy backed by
+/// the same module scope would make "copy" a misnomer.
+fn globals_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("globals.copy", 0, 0)?;
+    args.reject_keywords("globals.copy")?;
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let entries = runtime.globals_items(globals)?;
+    runtime.new_dict(entries)
+}
+
+pub(crate) fn slot_globals_get_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    match runtime.globals_get(globals, &name)? {
+        Some(value) => Ok(Some(value)),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+pub(crate) fn slot_globals_set_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    runtime.globals_insert(globals, name, value)?;
+    Ok(Some(Value::None))
+}
+
+pub(crate) fn slot_globals_delete_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    match runtime.globals_remove(globals, &name)? {
+        Some(_) => Ok(Some(Value::None)),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    }
+}
+
+pub(crate) fn slot_globals_length(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let length = runtime.globals_items(globals)?.len();
+    let length =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("globals is too large"))?;
+    Ok(Some(Value::Int(length)))
+}
+
+pub(crate) fn slot_globals_contains(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    key: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let OwnedPyString(name) = key.cast(runtime)?;
+    Ok(Some(Value::Bool(
+        runtime.globals_get(globals, &name)?.is_some(),
+    )))
+}
+
+pub(crate) fn slot_globals_iter(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let globals = receiver.cast::<PyGlobals>(runtime)?;
+    let keys = runtime
+        .globals_items(globals)?
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    Ok(Some(runtime.new_iterator(keys)?))
 }
 
 fn set_add(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {

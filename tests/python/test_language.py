@@ -1361,3 +1361,107 @@ def test_slice_builtin_builds_slices():
         assert str(error) == "slice expected at least 1 argument, got 0"
     else:
         raise AssertionError("slice() accepted no arguments")
+
+
+_globals_test_marker = "module-level"
+
+
+def test_globals_reads_writes_and_deletes_module_names():
+    assert globals()["_globals_test_marker"] == "module-level"
+
+    globals()["_globals_written_name"] = 41
+    assert _globals_written_name == 41  # noqa: F821
+    globals()["_globals_written_name"] = 42
+    assert _globals_written_name == 42  # noqa: F821
+
+    del globals()["_globals_written_name"]
+    assert "_globals_written_name" not in globals()
+    try:
+        _ = _globals_written_name  # noqa: F821
+    except NameError:
+        pass
+    else:
+        raise AssertionError("deleting through globals() left the name bound")
+
+
+def test_globals_missing_key_raises_key_error():
+    try:
+        globals()["_globals_definitely_missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("reading a missing key did not raise KeyError")
+    try:
+        del globals()["_globals_definitely_missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("deleting a missing key did not raise KeyError")
+
+
+def test_globals_iteration_contains_known_names():
+    names = list(globals())
+    assert "_globals_test_marker" in names
+    assert all(isinstance(name, str) for name in names)
+    assert len(names) == len(globals())
+    assert set(iter(globals())) == set(globals().keys())
+
+
+def test_globals_get_setdefault_update_and_pop():
+    view = globals()
+    assert view.get("_globals_missing_get", "fallback") == "fallback"
+    assert view.get("_globals_test_marker") == "module-level"
+
+    assert view.setdefault("_globals_default_name", 7) == 7
+    assert _globals_default_name == 7  # noqa: F821
+    assert view.setdefault("_globals_default_name", 99) == 7
+
+    view.update({"_globals_update_name": 1}, _globals_update_kw=2)
+    assert _globals_update_name == 1  # noqa: F821
+    assert _globals_update_kw == 2  # noqa: F821
+
+    assert view.pop("_globals_update_name") == 1
+    assert "_globals_update_name" not in view
+    assert view.pop("_globals_missing_pop", "default") == "default"
+    try:
+        view.pop("_globals_missing_pop")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("pop of a missing key did not raise")
+
+
+def test_globals_in_a_function_ignores_the_callers_locals():
+    def callee():
+        return "caller_only_local" in globals()
+
+    def caller():
+        caller_only_local = "value"  # noqa: F841
+        return callee()
+
+    assert caller() is False
+
+
+def test_globals_in_a_class_body_is_the_enclosing_modules_namespace():
+    enclosing_only_local = "value"  # noqa: F841
+
+    class Marker:
+        sees_module_globals = "_globals_test_marker" in globals()
+        sees_enclosing_local = "enclosing_only_local" in globals()
+
+    assert Marker.sees_module_globals is True
+    assert Marker.sees_enclosing_local is False
+
+
+def test_sorted_over_globals_and_type_name_are_sensible():
+    names = sorted(globals())
+    assert names == sorted(globals().keys())
+    assert all(isinstance(name, str) for name in names)
+    assert "_globals_test_marker" in names
+
+    view = globals()
+    assert isinstance(type(view).__name__, str) and type(view).__name__
+    assert isinstance(repr(view), str)
+    snapshot = view.copy()
+    assert isinstance(snapshot, dict)
+    assert snapshot["_globals_test_marker"] == "module-level"

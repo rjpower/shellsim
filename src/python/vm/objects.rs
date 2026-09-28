@@ -1067,7 +1067,8 @@ impl Vm<'_> {
                 | Object::ArgumentParser { .. }
                 | Object::Namespace { .. }
                 | Object::EnumMember { .. }
-                | Object::RaisesContext { .. } => BuiltinSubscript::Unsupported,
+                | Object::RaisesContext { .. }
+                | Object::Globals(_) => BuiltinSubscript::Unsupported,
                 Object::Property { .. }
                 | Object::StaticMethod { .. }
                 | Object::ClassMethod { .. }
@@ -2740,6 +2741,11 @@ impl Vm<'_> {
             return protocol::string_value(&self.state.heap, &result)?
                 .ok_or_else(|| "__repr__ should return str".into());
         }
+        if let Some(id) = value.object_id() {
+            if let Object::Globals(target) = *self.state.heap.get(id)? {
+                return self.repr_globals(id, target, active);
+            }
+        }
         let Some((id, container)) = self.container_items(value)? else {
             return protocol::repr(&self.state.heap, value);
         };
@@ -2771,6 +2777,29 @@ impl Vm<'_> {
         };
         active.remove(&id);
         Ok(rendered)
+    }
+
+    /// `repr(globals())`: rendered like a dict literal, sharing `active` with `repr_nested` so a
+    /// namespace that holds its own `globals()` handle (`g = globals(); g["g"] = g`) prints
+    /// `{...}` for the cycle instead of recursing without limit.
+    fn repr_globals(
+        &mut self,
+        id: ObjectId,
+        target: super::super::heap::GlobalsTarget,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        if !active.insert(id) {
+            return Ok("{...}".into());
+        }
+        let entries = self.globals_snapshot(target)?;
+        self.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
+        let mut parts = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            let value = self.repr_nested(&value, active)?;
+            parts.push(format!("{}: {value}", protocol::quote_string(&name)));
+        }
+        active.remove(&id);
+        Ok(format!("{{{}}}", parts.join(", ")))
     }
 
     fn repr_items(
@@ -3413,6 +3442,7 @@ impl Vm<'_> {
             | BuiltinType::Native
             | BuiltinType::Stream
             | BuiltinType::Environment
+            | BuiltinType::Globals
             | BuiltinType::ArgumentParser
             | BuiltinType::RaisesContext
             | BuiltinType::Property

@@ -5,12 +5,12 @@ use super::{
     ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
     PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
     PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef, PyArrayView, PyByteArray, PyCallable,
-    PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient,
-    PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
-    PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet,
-    PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
-    RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_VALUE_BYTES,
+    PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyGlobals,
+    PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule,
+    PyNativeKind, PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult,
+    PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject,
+    PyValueCast, RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm,
+    MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::native::PyParameter;
@@ -442,6 +442,7 @@ impl PyRuntime for Vm<'_> {
                 | Object::CallableIterator { .. } => PyKind::Iterator,
                 Object::Generator { .. } => PyKind::Generator,
                 Object::Module { .. } => PyKind::Module,
+                Object::Globals(_) => PyKind::Native,
                 Object::Array { .. } => PyKind::Array,
                 Object::ArrayStorage(_) | Object::WideValue { .. } => PyKind::Native,
                 Object::Regex { .. }
@@ -491,6 +492,7 @@ impl PyRuntime for Vm<'_> {
                 Object::RaisesContext { .. } => Some(PyNativeKind::RaisesContext),
                 Object::Property { .. } => Some(PyNativeKind::Property),
                 Object::Array { .. } => Some(PyNativeKind::Array),
+                Object::Globals(_) => Some(PyNativeKind::Globals),
                 _ => None,
             },
         )
@@ -1043,6 +1045,46 @@ impl PyRuntime for Vm<'_> {
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
         Vm::allocate_object(self, copy).map_err(PyError::resource_error)
+    }
+
+    fn globals_items(&mut self, globals: PyGlobals) -> PyResult<Vec<(Value, Value)>> {
+        let target = self
+            .globals_target(globals.object_id())
+            .map_err(PyError::runtime_error)?;
+        let entries = self
+            .globals_snapshot(target)
+            .map_err(PyError::runtime_error)?;
+        let mut items = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            let key = self
+                .allocate_string(name)
+                .map_err(PyError::resource_error)?;
+            items.push((key, value));
+        }
+        Ok(items)
+    }
+
+    fn globals_get(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<Value>> {
+        let target = self
+            .globals_target(globals.object_id())
+            .map_err(PyError::runtime_error)?;
+        Ok(self.globals_lookup(target, name))
+    }
+
+    fn globals_insert(&mut self, globals: PyGlobals, name: String, value: Value) -> PyResult<()> {
+        let target = self
+            .globals_target(globals.object_id())
+            .map_err(PyError::runtime_error)?;
+        self.globals_store(target, name, value)
+            .map_err(PyError::resource_error)
+    }
+
+    fn globals_remove(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<Value>> {
+        let target = self
+            .globals_target(globals.object_id())
+            .map_err(PyError::runtime_error)?;
+        self.globals_delete(target, name)
+            .map_err(PyError::runtime_error)
     }
 
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<Value>> {

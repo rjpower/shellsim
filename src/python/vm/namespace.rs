@@ -2,8 +2,8 @@
 
 use super::{
     cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
-    HashMap, NameId, NativeValue, Object, PyModuleLoader, PyRuntime, RaisedException, ScopeId,
-    SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
+    GlobalsTarget, HashMap, NameId, NativeValue, Object, ObjectId, PyModuleLoader, PyRuntime,
+    RaisedException, ScopeId, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 
 impl Vm<'_> {
@@ -372,6 +372,102 @@ impl Vm<'_> {
             self.state.heap.scope_remove(root, code.name(name))?;
         }
         Ok(())
+    }
+
+    /// The target a fresh `globals()` call should reference for the code currently running: an
+    /// imported module's own scope, or the REPL/script's flat table when no scope roots the call
+    /// (the entry-point program) or the root scope defers to it (a function or class body defined
+    /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
+    /// exactly, so `globals()` always names the same namespace a bare name lookup would.
+    pub(super) fn current_globals_target(&self) -> Result<GlobalsTarget, String> {
+        let Some(scope) = self.local_scopes.last().copied() else {
+            return Ok(GlobalsTarget::Repl);
+        };
+        let root = self.state.heap.scope_root(scope)?;
+        if self.state.heap.scope_uses_repl_globals(root)? {
+            Ok(GlobalsTarget::Repl)
+        } else {
+            Ok(GlobalsTarget::Scope(root))
+        }
+    }
+
+    /// The target a live `globals()` handle refers to.
+    pub(super) fn globals_target(&self, id: ObjectId) -> Result<GlobalsTarget, String> {
+        match self.state.heap.get(id)? {
+            Object::Globals(target) => Ok(*target),
+            _ => Err("value is not a globals() mapping".into()),
+        }
+    }
+
+    /// Every binding a `globals()` target currently holds, sorted by name for a deterministic
+    /// order.
+    ///
+    /// Neither backing store can supply Python's per-dict insertion order cheaply: a module's own
+    /// scope keeps its dynamic bindings in a `HashMap`, and the REPL/script table is indexed by
+    /// interned symbol, not by name. Sorting by name keeps iteration, `keys()`, `values()`,
+    /// `items()` and `repr` deterministic instead.
+    pub(super) fn globals_snapshot(
+        &self,
+        target: GlobalsTarget,
+    ) -> Result<Vec<(String, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = match target {
+            GlobalsTarget::Scope(scope) => {
+                self.state.heap.scope_values(scope)?.into_iter().collect()
+            }
+            GlobalsTarget::Repl => self.state.globals.entries(&self.state.heap),
+        };
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        Ok(entries)
+    }
+
+    pub(super) fn globals_lookup(&self, target: GlobalsTarget, name: &str) -> Option<Value> {
+        match target {
+            GlobalsTarget::Scope(scope) => self.state.heap.scope_get(scope, name).copied(),
+            GlobalsTarget::Repl => {
+                let symbol = self.state.heap.symbol_id(name)?;
+                self.state.globals.get(symbol)
+            }
+        }
+    }
+
+    pub(super) fn globals_store(
+        &mut self,
+        target: GlobalsTarget,
+        name: String,
+        value: Value,
+    ) -> Result<(), String> {
+        match target {
+            GlobalsTarget::Scope(scope) => {
+                self.state
+                    .heap
+                    .scope_insert(scope, name, value, &mut self.interp.resources)
+            }
+            GlobalsTarget::Repl => {
+                let symbol = self
+                    .state
+                    .heap
+                    .intern_symbol(&name, &mut self.interp.resources)?;
+                self.state
+                    .globals
+                    .insert(symbol, value, &mut self.interp.resources)
+            }
+        }
+    }
+
+    pub(super) fn globals_delete(
+        &mut self,
+        target: GlobalsTarget,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        match target {
+            GlobalsTarget::Scope(scope) => self.state.heap.scope_remove(scope, name),
+            GlobalsTarget::Repl => {
+                let Some(symbol) = self.state.heap.symbol_id(name) else {
+                    return Ok(None);
+                };
+                Ok(self.state.globals.remove(symbol))
+            }
+        }
     }
 
     fn import_roots(&mut self) -> Result<Vec<String>, String> {

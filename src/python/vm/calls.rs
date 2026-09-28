@@ -1069,7 +1069,8 @@ impl Vm<'_> {
                             | Object::Property { .. }
                             | Object::StaticMethod { .. }
                             | Object::ClassMethod { .. }
-                            | Object::Super { .. } => None,
+                            | Object::Super { .. }
+                            | Object::Globals(_) => None,
                         }
                     } else {
                         None
@@ -1474,6 +1475,13 @@ impl Vm<'_> {
                     start_class,
                     receiver,
                 })?))
+            }
+            Builtin::Globals => {
+                expect_arity(&arguments, 0, 0)?;
+                let target = self.current_globals_target()?;
+                Ok(CallResult::Value(
+                    self.allocate_object(Object::Globals(target))?,
+                ))
             }
         }
     }
