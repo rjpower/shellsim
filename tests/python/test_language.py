@@ -1217,6 +1217,60 @@ def test_with_enter_failure_reaches_the_enclosing_context_only():
         assert str(error) == ("'int' object does not support the context manager protocol (missed __exit__ method)")
 
 
+def test_with_several_items_nests_them_in_order():
+    events = []
+
+    class Context:
+        def __init__(self, name):
+            self.name = name
+
+        def __enter__(self):
+            events.append("enter " + self.name)
+            return self.name
+
+        def __exit__(self, kind, value, traceback):
+            events.append("exit " + self.name)
+
+    with Context("a") as a, Context("b") as b:
+        events.append(a + b)
+    with (
+        Context("c") as c,
+        Context("d") as d,
+    ):
+        events.append(c + d)
+    with Context("e"):
+        pass
+    with Context("f") as f:
+        events.append(f)
+    try:
+        with Context("g"), Context("h"):
+            raise ValueError("boom")
+    except ValueError:
+        events.append("caught")
+    assert events == [
+        "enter a",
+        "enter b",
+        "ab",
+        "exit b",
+        "exit a",
+        "enter c",
+        "enter d",
+        "cd",
+        "exit d",
+        "exit c",
+        "enter e",
+        "exit e",
+        "enter f",
+        "f",
+        "exit f",
+        "enter g",
+        "enter h",
+        "exit h",
+        "exit g",
+        "caught",
+    ]
+
+
 def test_with_suppressing_an_exception_inside_loops_keeps_the_loop_running():
     class Suppress:
         def __enter__(self):

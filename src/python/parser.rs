@@ -149,26 +149,50 @@ impl Parser {
                 finalbody,
             }
         } else if self.take(|kind| matches!(kind, TokenKind::With)).is_some() {
-            let context = self.expression()?;
-            let target = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
-                Some(assignment_target(self.tuple_expression()?)?)
-            } else {
-                None
-            };
-            let body = self.suite()?;
-            if is_async {
-                StatementKind::AsyncWith {
-                    context,
-                    target,
-                    body,
-                }
-            } else {
-                StatementKind::With {
-                    context,
-                    target,
-                    body,
-                }
+            // `with a as x, b as y: body` means `with a as x: with b as y: body`, so several
+            // items parse into nested statements, innermost last.
+            let parenthesized = self.parenthesized_with_items();
+            if parenthesized {
+                self.advance();
             }
+            let mut items = vec![self.with_item()?];
+            while self.take(|kind| matches!(kind, TokenKind::Comma)).is_some() {
+                if parenthesized && self.at(|kind| matches!(kind, TokenKind::RightParen)) {
+                    break;
+                }
+                items.push(self.with_item()?);
+            }
+            if parenthesized {
+                self.expect(
+                    |kind| matches!(kind, TokenKind::RightParen),
+                    "expected ')' after with items",
+                )?;
+            }
+            let mut body = self.suite()?;
+            let span = start.through(self.previous().span);
+            let with_kind = |context, target, body| {
+                if is_async {
+                    StatementKind::AsyncWith {
+                        context,
+                        target,
+                        body,
+                    }
+                } else {
+                    StatementKind::With {
+                        context,
+                        target,
+                        body,
+                    }
+                }
+            };
+            let (context, target) = items.remove(0);
+            for (inner_context, inner_target) in items.into_iter().rev() {
+                body = vec![Statement {
+                    kind: with_kind(inner_context, inner_target, body),
+                    span,
+                }];
+            }
+            with_kind(context, target, body)
         } else if self.take(|kind| matches!(kind, TokenKind::While)).is_some() {
             let test = self.expression()?;
             let body = self.suite()?;
@@ -2032,6 +2056,46 @@ impl Parser {
         } else {
             Err(self.error("expected an annotation"))
         }
+    }
+
+    /// One `with` item: a context expression and an optional `as` target.
+    fn with_item(&mut self) -> Result<(Expression, Option<AssignmentTarget>), ParseError> {
+        let context = self.expression()?;
+        // A bare comma after the target starts the next item, so a tuple target needs
+        // parentheses, as in CPython.
+        let target = if self.take(|kind| matches!(kind, TokenKind::As)).is_some() {
+            Some(assignment_target(self.expression()?)?)
+        } else {
+            None
+        };
+        Ok((context, target))
+    }
+
+    /// Whether a `with` statement's items are wrapped in parentheses, as in
+    /// `with (open(a) as f, open(b) as g):`. That is the case when the parenthesis opening the
+    /// statement closes directly before its `:`; otherwise it belongs to the first expression.
+    fn parenthesized_with_items(&self) -> bool {
+        if !self.at(|kind| matches!(kind, TokenKind::LeftParen)) {
+            return false;
+        }
+        let mut depth = 0usize;
+        for (index, token) in self.tokens.iter().enumerate().skip(self.current) {
+            match token.kind {
+                TokenKind::LeftParen | TokenKind::LeftBracket | TokenKind::LeftBrace => depth += 1,
+                TokenKind::RightParen | TokenKind::RightBracket | TokenKind::RightBrace => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return self
+                            .tokens
+                            .get(index + 1)
+                            .is_some_and(|next| matches!(next.kind, TokenKind::Colon));
+                    }
+                }
+                TokenKind::Newline | TokenKind::Eof => return false,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn expect(
