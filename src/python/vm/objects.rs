@@ -7,8 +7,8 @@ use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
     CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, LoadAttributeCache,
-    NameId, NativeValue, Object, Ordering, PyError, PyErrorKind, PyRuntime, SlicePlan, Slot,
-    SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    NameId, NativeValue, Object, Ordering, PyError, PyRuntime, SlicePlan, Slot, SlotValue,
+    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Items of a builtin container whose `repr` the VM renders item by item.
@@ -49,7 +49,13 @@ impl ContainerItems {
 pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
     matches!(
         builtin,
-        BuiltinType::Int | BuiltinType::Tuple | BuiltinType::Dict
+        BuiltinType::Int
+            | BuiltinType::Tuple
+            | BuiltinType::Dict
+            | BuiltinType::String
+            | BuiltinType::Bytes
+            | BuiltinType::Float
+            | BuiltinType::Complex
     )
 }
 
@@ -223,7 +229,10 @@ impl Vm<'_> {
             return Ok(None);
         };
         let class = *class;
-        if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
+        let class_type = self
+            .class_type_id(&Value::Object(class))?
+            .ok_or("instance has no registered class")?;
+        if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if self.is_data_descriptor(&descriptor)? {
                 return Ok(None);
             }
@@ -288,13 +297,74 @@ impl Vm<'_> {
         symbol: Option<SymbolId>,
         name: &str,
     ) -> Result<Option<Value>, String> {
+        let getattribute: Result<Option<Value>, String> = if owner.object_id().is_some_and(|id| {
+            matches!(
+                self.state.heap.get(id),
+                Ok(Object::Instance { .. } | Object::Class { .. })
+            )
+        }) && self
+            .state
+            .types
+            .slot(self.type_id(&owner)?, Slot::GetAttribute)?
+            .is_some()
+        {
+            let name = self.allocate_string(name.to_string())?;
+            self.invoke_slot(&owner, Slot::GetAttribute, "__getattribute__", vec![name])
+        } else {
+            self.lookup_attribute_default(owner, symbol, name)
+        };
+        let found = match getattribute {
+            Ok(found) => found,
+            Err(error) => {
+                let Some(exception) = self.pending_exception.take() else {
+                    return Err(error);
+                };
+                let attribute_error =
+                    Value::Native(NativeValue::ExceptionType(ExceptionType("AttributeError")));
+                if self.exception_type_matches(attribute_error, &exception)? {
+                    if let Some(value) = self.call_type_getattr_hook(owner, name)? {
+                        return Ok(Some(value));
+                    }
+                }
+                self.pending_exception = Some(exception);
+                return Err(error);
+            }
+        };
+        match found {
+            Some(value) => Ok(Some(value)),
+            None => self.call_type_getattr_hook(owner, name),
+        }
+    }
+
+    /// The default object lookup without the outer `__getattr__` fallback. Direct calls to
+    /// `object.__getattribute__` and ordinary attribute reads share this descriptor algorithm.
+    pub(super) fn lookup_attribute_default(
+        &mut self,
+        owner: Value,
+        symbol: Option<SymbolId>,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
         let found = self.lookup_attribute(owner, symbol, name)?;
         if found.is_none() && name == "__class__" {
-            // Every object inherits `object.__class__`, which reports its type unless the
-            // class defines its own `__class__`.
             return self.type_of(&owner).map(Some);
         }
         Ok(found)
+    }
+
+    fn call_type_getattr_hook(
+        &mut self,
+        owner: Value,
+        name: &str,
+    ) -> Result<Option<Value>, String> {
+        let owner_type = self.type_id(&owner)?;
+        let Some((defining_type, hook)) = self.type_lookup(owner_type, "__getattr__")? else {
+            return Ok(None);
+        };
+        let hook = self
+            .bind_type_attribute(hook, Some(owner), owner_type, defining_type)?
+            .ok_or("__getattr__ descriptor has no value")?;
+        let name = self.allocate_string(name.to_string())?;
+        self.invoke_value(hook, vec![name]).map(Some)
     }
 
     fn lookup_attribute(
@@ -317,7 +387,7 @@ impl Vm<'_> {
             }
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
-            if let Some(value) = self.state.types.attribute(builtin.id(), name)? {
+            if let Some((_, value)) = self.type_lookup(builtin.id(), name)? {
                 if let Some(NativeValue::NativeClassMethod(method)) = value.native_value() {
                     return self.bind_native_class_method(owner, method).map(Some);
                 }
@@ -334,34 +404,42 @@ impl Vm<'_> {
         }
         if let Some(NativeValue::ValueKind(kind)) = owner.native_value() {
             if let Some(type_id) = self.state.types.value_kind_type_id(kind) {
-                if let Some(value) = self.state.types.attribute(type_id, name)? {
+                if let Some((_, value)) = self.type_lookup(type_id, name)? {
                     return Ok(Some(value));
                 }
             }
         }
         let owner_type = self.type_id(&owner)?;
-        // A class's own MRO, builtin ancestors included, precedes the methods of its metaclass,
-        // so those wait until the `Object::Class` arm below has searched it.
-        let owner_is_class = owner
-            .object_id()
-            .is_some_and(|id| matches!(self.state.heap.get(id), Ok(Object::Class { .. })));
-        match self
-            .state
-            .types
-            .attribute(owner_type, name)?
-            .and_then(|value| value.native_value())
-        {
-            Some(NativeValue::NativeMethod(_) | NativeValue::NativeClassMethod(_))
-                if owner_is_class => {}
-            Some(NativeValue::NativeMethod(_) | NativeValue::NativeClassMethod(_)) => {
-                return self.type_method(owner, owner_type, name);
+        // These objects apply their own MRO or proxy lookup in the arms below.
+        let owner_has_custom_lookup = owner.object_id().is_some_and(|id| {
+            matches!(
+                self.state.heap.get(id),
+                Ok(Object::Class { .. } | Object::Instance { .. } | Object::Super { .. })
+            )
+        });
+        if !owner_has_custom_lookup {
+            if let Some((defining_type, descriptor)) = self.type_lookup(owner_type, name)? {
+                match descriptor.native_value() {
+                    Some(
+                        NativeValue::NativeMethod(_)
+                        | NativeValue::NativeClassMethod(_)
+                        | NativeValue::SlotWrapper { .. },
+                    ) => {
+                        return self.bind_type_attribute(
+                            descriptor,
+                            Some(owner),
+                            owner_type,
+                            defining_type,
+                        );
+                    }
+                    // Native getters are data descriptors. Builtin receivers have no instance
+                    // dictionary, so reaching the type table first gives CPython precedence.
+                    Some(NativeValue::NativeGetter(getter)) => {
+                        return self.call_native_getter(getter, owner);
+                    }
+                    _ => {}
+                }
             }
-            // Native getters are data descriptors. Builtin receivers have no instance
-            // dictionary, so reaching the type table first already gives CPython precedence.
-            Some(NativeValue::NativeGetter(getter)) => {
-                return self.call_native_getter(getter, owner);
-            }
-            _ => {}
         }
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
@@ -402,6 +480,20 @@ impl Vm<'_> {
                 Object::Class {
                     name: class_name, ..
                 } => {
+                    let class_type = self
+                        .class_type_id(&owner)?
+                        .ok_or("class has no registered type")?;
+                    let metaclass_entry = self.type_lookup(owner_type, name)?;
+                    if let Some((defining_type, descriptor)) = metaclass_entry {
+                        if self.is_data_descriptor(&descriptor)? {
+                            return self.bind_type_attribute(
+                                descriptor,
+                                Some(owner),
+                                owner_type,
+                                defining_type,
+                            );
+                        }
+                    }
                     if name == "__name__" {
                         return Ok(Some(self.allocate_string(class_name)?));
                     }
@@ -414,24 +506,23 @@ impl Vm<'_> {
                     if let Some(value) = self.class_metadata(id, name)? {
                         return Ok(Some(value));
                     }
-                    let mut entry = self.class_attribute_entry(id, name)?;
-                    if entry.is_none() {
-                        if let Some(value) = self.builtin_base_attribute(id, None, name)? {
-                            return Ok(Some(value));
-                        }
-                        let Object::Class { metaclass, .. } = self.state.heap.get(id)? else {
-                            unreachable!()
-                        };
-                        let metaclass = *metaclass;
-                        if let Some(metaclass) = metaclass.object_id() {
-                            entry = self.class_attribute_entry(metaclass, name)?;
-                        }
+                    if let Some((defining_type, descriptor)) = self.type_lookup(class_type, name)? {
+                        return self.bind_type_attribute(
+                            descriptor,
+                            None,
+                            class_type,
+                            defining_type,
+                        );
                     }
-                    let Some((defining_class, descriptor)) = entry else {
-                        return self.type_method(owner, owner_type, name);
-                    };
-                    let value = self.bind_descriptor(descriptor, None, id, defining_class)?;
-                    return Ok(Some(value));
+                    if let Some((defining_type, descriptor)) = metaclass_entry {
+                        return self.bind_type_attribute(
+                            descriptor,
+                            Some(owner),
+                            owner_type,
+                            defining_type,
+                        );
+                    }
+                    return Ok(None);
                 }
                 Object::EnumMember {
                     name: member_name,
@@ -451,16 +542,18 @@ impl Vm<'_> {
                         let namespace = Object::NamespaceDict(NamespaceTarget::Instance(id));
                         return self.allocate_object(namespace).map(Some);
                     }
-                    let class_entry = self.class_attribute_entry(class, name)?;
-                    if let Some((defining_class, descriptor)) = class_entry {
+                    let class_type = self
+                        .class_type_id(&Value::Object(class))?
+                        .ok_or("instance has no registered class")?;
+                    let class_entry = self.type_lookup(class_type, name)?;
+                    if let Some((defining_type, descriptor)) = class_entry {
                         if self.is_data_descriptor(&descriptor)? {
-                            let value = self.bind_descriptor(
+                            return self.bind_type_attribute(
                                 descriptor,
                                 Some(owner),
-                                class,
-                                defining_class,
-                            )?;
-                            return Ok(Some(value));
+                                class_type,
+                                defining_type,
+                            );
                         }
                     }
                     let instance_value = match symbol {
@@ -470,31 +563,28 @@ impl Vm<'_> {
                     if let Some(value) = instance_value {
                         return Ok(Some(value));
                     }
-                    let Some((defining_class, descriptor)) = class_entry else {
-                        if let Some(value) =
-                            self.builtin_base_attribute(class, Some(owner), name)?
-                        {
-                            return Ok(Some(value));
-                        }
-                        return self.call_getattr_hook(owner, class, name);
+                    let Some((defining_type, descriptor)) = class_entry else {
+                        return Ok(None);
                     };
-                    let value =
-                        self.bind_descriptor(descriptor, Some(owner), class, defining_class)?;
-                    return Ok(Some(value));
+                    return self.bind_type_attribute(
+                        descriptor,
+                        Some(owner),
+                        class_type,
+                        defining_type,
+                    );
                 }
                 Object::Super {
                     start_class,
                     receiver,
                 } => {
-                    let (defining_class, descriptor, accessed_class) =
+                    let (defining_type, descriptor, accessed_type) =
                         self.super_attribute(start_class, &receiver, name)?;
-                    let value = self.bind_descriptor(
+                    return self.bind_type_attribute(
                         descriptor,
                         Some(receiver),
-                        accessed_class,
-                        defining_class,
-                    )?;
-                    return Ok(Some(value));
+                        accessed_type,
+                        defining_type,
+                    );
                 }
                 // A bound method exposes its receiver and function and reads other attributes,
                 // such as `__name__`, from the function, as CPython's method objects do.
@@ -646,7 +736,10 @@ impl Vm<'_> {
         if name == "__dict__" {
             return self.replace_instance_attributes(id, value);
         }
-        if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
+        let class_type = self
+            .class_type_id(&Value::Object(class))?
+            .ok_or("instance has no registered class")?;
+        if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if let Some(descriptor_id) = descriptor.object_id() {
                 match self.state.heap.get(descriptor_id)?.clone() {
                     Object::Property {
@@ -682,6 +775,17 @@ impl Vm<'_> {
                     }
                     _ => {}
                 }
+            }
+            if matches!(
+                descriptor.native_value(),
+                Some(NativeValue::NativeGetter(_))
+            ) && !(name == "args" && self.user_exception_base(&owner)?.is_some())
+            {
+                let type_name = self.type_name_of(&owner)?;
+                return Err(self.raise_exception(
+                    "AttributeError",
+                    format!("attribute '{name}' of '{type_name}' objects is not writable"),
+                ));
             }
         }
         self.state.heap.insert_attribute_by_symbol(
@@ -791,7 +895,10 @@ impl Vm<'_> {
             }
             _ => return Err(self.reject_builtin_attribute_store(owner, name)),
         };
-        if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
+        let class_type = self
+            .class_type_id(&Value::Object(class))?
+            .ok_or("instance has no registered class")?;
+        if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if let Some(descriptor_id) = descriptor.object_id() {
                 match self.state.heap.get(descriptor_id)?.clone() {
                     Object::Property { .. } => {
@@ -820,6 +927,16 @@ impl Vm<'_> {
                     }
                     _ => {}
                 }
+            }
+            if matches!(
+                descriptor.native_value(),
+                Some(NativeValue::NativeGetter(_))
+            ) {
+                let type_name = self.type_name_of(&owner)?;
+                return Err(self.raise_exception(
+                    "AttributeError",
+                    format!("attribute '{name}' of '{type_name}' objects is not deletable"),
+                ));
             }
         }
         if self
@@ -966,9 +1083,10 @@ impl Vm<'_> {
     fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> String {
         let attribute = self
             .type_id(&owner)
-            .and_then(|owner_type| self.state.types.attribute(owner_type, name))
+            .and_then(|owner_type| self.type_lookup(owner_type, name))
             .ok()
-            .flatten();
+            .flatten()
+            .map(|(_, value)| value);
         let type_name = match self.type_name_of(&owner) {
             Ok(type_name) => type_name,
             Err(error) => return error,
@@ -1727,7 +1845,9 @@ impl Vm<'_> {
         }
         builtin_layouts.dedup();
         if builtin_layouts.len() > 1 {
-            return Err("multiple bases have instance lay-out conflict".into());
+            return Err(
+                self.raise_exception("TypeError", "multiple bases have instance lay-out conflict")
+            );
         }
         let builtin_layout = builtin_layouts.first().copied();
         let inherited_exception_bases = user_bases
@@ -2161,8 +2281,8 @@ impl Vm<'_> {
         Ok(order)
     }
 
-    /// `__module__`, `__bases__` and `__mro__` of builtin types, native value kinds and
-    /// exception classes, and `__module__` of builtin and native functions.
+    /// Fixed namespace and type metadata of builtin types, native value kinds and exception
+    /// classes, plus the defining module of builtin and native functions.
     fn native_type_metadata(&mut self, owner: Value, name: &str) -> Result<Option<Value>, String> {
         let Some(native) = owner.native_value() else {
             return Ok(None);
@@ -2177,6 +2297,20 @@ impl Vm<'_> {
             NativeValue::BuiltinType(_) | NativeValue::ValueKind(_) | NativeValue::ExceptionType(_)
         );
         match name {
+            "__dict__" if is_type => {
+                let type_id = match native {
+                    NativeValue::BuiltinType(builtin) => builtin.id(),
+                    NativeValue::ValueKind(kind) => self
+                        .state
+                        .types
+                        .value_kind_type_id(kind)
+                        .ok_or("value kind is not registered")?,
+                    NativeValue::ExceptionType(_) => BuiltinType::Exception.id(),
+                    _ => unreachable!("checked by is_type"),
+                };
+                self.allocate_object(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
+                    .map(Some)
+            }
             "__module__" => {
                 let module = match native {
                     NativeValue::BuiltinType(builtin) => qualified_module(builtin.name()),
@@ -2274,6 +2408,9 @@ impl Vm<'_> {
             if let Some(module) = self.current_module_name()? {
                 attributes.insert("__module__".into(), module);
             }
+        }
+        if attributes.contains_key("__eq__") && !attributes.contains_key("__hash__") {
+            attributes.insert("__hash__".into(), Value::None);
         }
         let mut type_bases = Vec::new();
         for base in &bases {
@@ -2452,103 +2589,103 @@ impl Vm<'_> {
         Ok(None)
     }
 
-    /// The native method `name` of the builtin type `owner_type`, bound to `owner`, or `None`.
-    /// `__new__` stays unbound, and a class method binds to the type.
-    fn type_method(
+    /// Search each type's own namespace in MRO order. User namespaces remain on their heap
+    /// class objects, while builtin namespaces remain in the registry.
+    pub(super) fn type_lookup(
         &mut self,
-        owner: Value,
-        owner_type: TypeId,
+        type_id: TypeId,
+        name: &str,
+    ) -> Result<Option<(TypeId, Value)>, String> {
+        let mro_len = self.state.types.get(type_id)?.mro.len();
+        for index in 0..=mro_len {
+            let ancestor = if index == 0 {
+                type_id
+            } else {
+                self.state.types.get(type_id)?.mro[index - 1]
+            };
+            self.charge_cpu(1)?;
+            if let Some(value) = self.type_namespace_attribute(ancestor, name)? {
+                return Ok(Some((ancestor, value)));
+            }
+        }
+        Ok(None)
+    }
+
+    fn type_namespace_attribute(
+        &self,
+        type_id: TypeId,
         name: &str,
     ) -> Result<Option<Value>, String> {
-        match self
+        let ty = self.state.types.get(type_id)?;
+        match self.state.types.value(type_id)?.object_id() {
+            Some(id) => match self.state.heap.get(id)? {
+                Object::Class { attributes, .. } => Ok(attributes.get(name).copied()),
+                _ => Ok(ty.attributes.get(name).copied()),
+            },
+            None => Ok(ty.attributes.get(name).copied()),
+        }
+    }
+
+    /// Bind a descriptor found by `type_lookup` to an instance or leave it unbound for class
+    /// access. Native descriptors have no heap class object, so they are handled here.
+    fn bind_type_attribute(
+        &mut self,
+        descriptor: Value,
+        receiver: Option<Value>,
+        accessed_type: TypeId,
+        defining_type: TypeId,
+    ) -> Result<Option<Value>, String> {
+        match descriptor.native_value() {
+            Some(NativeValue::NativeGetter(getter)) => {
+                return match receiver {
+                    Some(receiver) => self.call_native_getter(getter, receiver),
+                    None => Ok(Some(descriptor)),
+                };
+            }
+            Some(NativeValue::NativeClassMethod(method)) => {
+                let class = self.state.types.value(accessed_type)?;
+                return self.bind_native_class_method(class, method).map(Some);
+            }
+            Some(NativeValue::NativeMethod(method)) if method.name == "__new__" => {
+                return Ok(Some(descriptor));
+            }
+            Some(NativeValue::NativeMethod(_)) => {
+                return match receiver {
+                    Some(receiver) => self
+                        .allocate_object(Object::DescriptorBoundMethod {
+                            receiver,
+                            descriptor,
+                            owner: None,
+                        })
+                        .map(Some),
+                    None => Ok(Some(descriptor)),
+                };
+            }
+            Some(NativeValue::SlotWrapper { .. }) => {
+                return match receiver {
+                    Some(receiver) => self
+                        .allocate_object(Object::DescriptorBoundMethod {
+                            receiver,
+                            descriptor,
+                            owner: None,
+                        })
+                        .map(Some),
+                    None => Ok(Some(descriptor)),
+                };
+            }
+            _ => {}
+        }
+        let Some(defining_class) = self.state.types.value(defining_type)?.object_id() else {
+            return Ok(Some(descriptor));
+        };
+        let accessed_class = self
             .state
             .types
-            .attribute(owner_type, name)?
-            .and_then(|value| value.native_value())
-        {
-            Some(NativeValue::NativeMethod(method)) if method.name == "__new__" => {
-                Ok(Some(Value::Native(NativeValue::NativeMethod(method))))
-            }
-            Some(NativeValue::NativeMethod(method)) => self
-                .allocate_object(Object::DescriptorBoundMethod {
-                    receiver: owner,
-                    descriptor: Value::Native(NativeValue::NativeMethod(method)),
-                    owner: None,
-                })
-                .map(Some),
-            Some(NativeValue::NativeClassMethod(method)) => {
-                let class = self.state.types.value(owner_type)?;
-                self.bind_native_class_method(class, method).map(Some)
-            }
-            _ => Ok(None),
-        }
-    }
-
-    /// Look up `name` among the native attributes of a user class's builtin ancestors, such as
-    /// `int.bit_length` for `class Flag(int)` or `object.__init__` for any class.
-    ///
-    /// The MRO stored on a class lists only user-defined ancestors, so this runs after it finds
-    /// nothing and continues through the builtin types that end the class's full MRO. User types
-    /// register no attributes in the type registry, so only builtin ancestors can match.
-    /// `receiver` is the instance for instance lookup and `None` for lookup through the class,
-    /// which returns unbound methods and getters as the builtin type itself does.
-    fn builtin_base_attribute(
-        &mut self,
-        class: ObjectId,
-        receiver: Option<Value>,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
-        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
-            return Err("instance has an invalid class".into());
-        };
-        let mut found = None;
-        for ancestor in self.state.types.get(*instance_type)?.mro.clone() {
-            self.charge_cpu(1)?;
-            found = self.state.types.attribute(ancestor, name)?;
-            if found.is_some() {
-                break;
-            }
-        }
-        let Some(value) = found else {
-            return Ok(None);
-        };
-        match (value.native_value(), receiver) {
-            // `__new__` is a static method: it stays unbound and takes the class explicitly.
-            (Some(NativeValue::NativeMethod(method)), _) if method.name == "__new__" => {
-                Ok(Some(value))
-            }
-            (Some(NativeValue::NativeClassMethod(method)), _) => self
-                .bind_native_class_method(Value::Object(class), method)
-                .map(Some),
-            (Some(NativeValue::NativeMethod(_)), Some(receiver)) => self
-                .allocate_object(Object::DescriptorBoundMethod {
-                    receiver,
-                    descriptor: value,
-                    owner: None,
-                })
-                .map(Some),
-            (Some(NativeValue::NativeGetter(getter)), Some(receiver)) => {
-                self.call_native_getter(getter, receiver)
-            }
-            _ => Ok(Some(value)),
-        }
-    }
-
-    /// Call the class's `__getattr__` for an attribute that ordinary lookup did not find, as
-    /// Python does. An `AttributeError` it raises propagates with its own message; `getattr` with
-    /// a default and `hasattr` treat it as a missing attribute.
-    fn call_getattr_hook(
-        &mut self,
-        owner: Value,
-        class: ObjectId,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
-        let Some((defining_class, hook)) = self.class_attribute_entry(class, "__getattr__")? else {
-            return Ok(None);
-        };
-        let hook = self.bind_descriptor(hook, Some(owner), class, defining_class)?;
-        let name = self.allocate_string(name.to_string())?;
-        self.invoke_value(hook, vec![name]).map(Some)
+            .value(accessed_type)?
+            .object_id()
+            .ok_or("user descriptor has no class receiver")?;
+        self.bind_descriptor(descriptor, receiver, accessed_class, defining_class)
+            .map(Some)
     }
 
     fn call_native_getter(
@@ -2558,17 +2695,14 @@ impl Vm<'_> {
     ) -> Result<Option<Value>, String> {
         match (getter.get)(self, receiver) {
             Ok(value) => Ok(Some(value)),
-            // As in CPython, a getter's AttributeError means the attribute is absent for this
-            // receiver, which `getattr` defaults and `hasattr` observe.
-            Err(PyError {
-                kind: PyErrorKind::Exception("AttributeError"),
-                ..
-            }) => Ok(None),
             Err(error) => Err(self.record_native_error(error)),
         }
     }
 
     fn is_data_descriptor(&mut self, value: &Value) -> Result<bool, String> {
+        if matches!(value.native_value(), Some(NativeValue::NativeGetter(_))) {
+            return Ok(true);
+        }
         let Some(id) = value.object_id() else {
             return Ok(false);
         };
@@ -2611,7 +2745,7 @@ impl Vm<'_> {
         }
         if matches!(
             descriptor.native_value(),
-            Some(NativeValue::NativeMethod(_))
+            Some(NativeValue::NativeMethod(_) | NativeValue::SlotWrapper { .. })
         ) {
             return match receiver {
                 Some(receiver) => self.allocate_object(Object::DescriptorBoundMethod {
@@ -2757,16 +2891,68 @@ impl Vm<'_> {
         let Some(id) = receiver.object_id() else {
             return Ok(None);
         };
-        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
-            return Ok(None);
+        let class = match self.state.heap.get(id)? {
+            Object::Instance { class, .. } => *class,
+            Object::Class { metaclass, .. } => match metaclass.object_id() {
+                Some(class) => class,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
         };
-        let class = *class;
         let (defining_class, _) = self
             .class_attribute_entry(class, method_name)?
             .ok_or("cached type slot has no descriptor")?;
         let callable =
             self.bind_descriptor(slot_descriptor, Some(*receiver), class, defining_class)?;
         self.invoke_value(callable, arguments).map(Some)
+    }
+
+    /// Execute the defining type's native slot for an explicit dunder call. The receiver check
+    /// and local-slot lookup keep `int.__add__(x, y)` independent of overrides on `type(x)`.
+    pub(super) fn call_slot_wrapper(
+        &mut self,
+        owner: TypeId,
+        slot: Slot,
+        receiver: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
+        let (_, name, arity) = super::super::object_model::SLOT_DEFS[slot as usize];
+        if !keyword_arguments.is_empty() || arguments.len() != usize::from(arity) {
+            return Err(
+                self.raise_exception("TypeError", format!("{name}() received invalid arguments"))
+            );
+        }
+        let receiver_type = self.type_id(&receiver)?;
+        if !self.state.types.is_subclass(receiver_type, owner)? {
+            let owner_name = self.state.types.get(owner)?.name.clone();
+            return Err(self.raise_exception(
+                "TypeError",
+                format!("descriptor {name} requires a '{owner_name}' object"),
+            ));
+        }
+        let implementation = self
+            .state
+            .types
+            .local_slot(owner, slot)?
+            .ok_or("slot wrapper has no local implementation")?;
+        let receiver = self.builtin_view(receiver)?;
+        let result = match implementation {
+            SlotValue::NativeUnary(call) => call(self, receiver),
+            SlotValue::NativeBinary(call) => {
+                let argument = self.builtin_view(arguments[0])?;
+                call(self, receiver, argument)
+            }
+            SlotValue::NativeTernary(call) => {
+                let first = self.builtin_view(arguments[0])?;
+                let second = self.builtin_view(arguments[1])?;
+                call(self, receiver, first, second)
+            }
+            SlotValue::Descriptor(_) => return Err("slot wrapper is not native".into()),
+        };
+        result
+            .map(|result| result.unwrap_or(Value::Native(NativeValue::NotImplemented)))
+            .map_err(|error| self.record_native_error(error))
     }
 
     /// Invoke a binary-operator or rich-comparison slot. A method that returns `NotImplemented`
@@ -3099,14 +3285,7 @@ impl Vm<'_> {
         start_class: super::super::heap::ObjectId,
         receiver: &Value,
         name: &str,
-    ) -> Result<
-        (
-            super::super::heap::ObjectId,
-            Value,
-            super::super::heap::ObjectId,
-        ),
-        String,
-    > {
+    ) -> Result<(TypeId, Value, TypeId), String> {
         let accessed_class = if let Some(id) = receiver.object_id() {
             match self.state.heap.get(id)? {
                 Object::Instance { class, .. } => *class,
@@ -3116,36 +3295,27 @@ impl Vm<'_> {
         } else {
             return Err("super() receiver is not an instance or class".into());
         };
-        let Object::Class { mro, .. } = self.state.heap.get(accessed_class)? else {
-            return Err("super() receiver has an invalid class".into());
+        let accessed_type = self
+            .class_type_id(&Value::Object(accessed_class))?
+            .ok_or("super() receiver has an invalid class")?;
+        let start_type = self
+            .class_type_id(&Value::Object(start_class))?
+            .ok_or("super() start has an invalid class")?;
+        let mro = &self.state.types.get(accessed_type)?.mro;
+        let start = if accessed_type == start_type {
+            0
+        } else {
+            mro.iter()
+                .position(|class| *class == start_type)
+                .map(|position| position + 1)
+                .ok_or("super(type, obj): obj is not an instance or subtype of type")?
         };
-        let mut classes = Vec::with_capacity(mro.len().saturating_add(1));
-        classes.push(accessed_class);
-        classes.extend(mro.iter().copied());
-        let start = classes
-            .iter()
-            .position(|class| *class == start_class)
-            .ok_or("super(type, obj): obj is not an instance or subtype of type")?;
-        for class in classes.into_iter().skip(start.saturating_add(1)) {
+        let mro_len = mro.len();
+        for index in start..mro_len {
+            let ancestor = self.state.types.get(accessed_type)?.mro[index];
             self.charge_cpu(1)?;
-            let Object::Class { attributes, .. } = self.state.heap.get(class)? else {
-                return Err("super MRO contains a non-class object".into());
-            };
-            if let Some(value) = attributes.get(name) {
-                return Ok((class, *value, accessed_class));
-            }
-        }
-        // Past the last user class, the MRO continues through builtin ancestors such as `type`,
-        // `BaseException` and `object`, whose methods live in the type registry. User types
-        // register no attributes there, so only builtin ancestors can match.
-        let Object::Class { instance_type, .. } = self.state.heap.get(accessed_class)? else {
-            return Err("super() receiver has an invalid class".into());
-        };
-        let ancestors = self.state.types.get(*instance_type)?.mro.clone();
-        for ancestor in ancestors {
-            self.charge_cpu(1)?;
-            if let Some(descriptor) = self.state.types.attribute(ancestor, name)? {
-                return Ok((start_class, descriptor, accessed_class));
+            if let Some(descriptor) = self.type_namespace_attribute(ancestor, name)? {
+                return Ok((ancestor, descriptor, accessed_type));
             }
         }
         Err(format!("super object has no attribute {name:?}"))
@@ -3654,7 +3824,8 @@ impl Vm<'_> {
                 | NativeValue::ExceptionType(_) => BuiltinType::Type.id(),
                 NativeValue::Function(_)
                 | NativeValue::NativeFunction(_)
-                | NativeValue::NativeMethod(_) => BuiltinType::Function.id(),
+                | NativeValue::NativeMethod(_)
+                | NativeValue::SlotWrapper { .. } => BuiltinType::Function.id(),
                 NativeValue::Module(_) => BuiltinType::Module.id(),
                 NativeValue::Stream(_) => BuiltinType::Stream.id(),
                 NativeValue::Environment => BuiltinType::Environment.id(),

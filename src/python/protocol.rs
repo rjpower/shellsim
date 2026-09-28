@@ -111,13 +111,7 @@ fn normalize_index(length: usize, index: i64) -> Option<usize> {
 }
 
 pub fn bytes_value(heap: &Heap, value: &Value) -> Result<Option<Vec<u8>>, String> {
-    let Some(id) = value.object_id() else {
-        return Ok(None);
-    };
-    Ok(match heap.get(id)? {
-        Object::Bytes(value) | Object::ByteArray(value) => Some(value.clone()),
-        _ => None,
-    })
+    Ok(bytes_ref(heap, value)?.map(<[u8]>::to_vec))
 }
 
 /// Borrow the contents of a `bytes` or `bytearray` without copying them.
@@ -127,6 +121,10 @@ pub fn bytes_ref<'heap>(heap: &'heap Heap, value: &Value) -> Result<Option<&'hea
     };
     Ok(match heap.get(id)? {
         Object::Bytes(value) | Object::ByteArray(value) => Some(value),
+        Object::Instance {
+            payload: InstancePayload::Builtin(value),
+            ..
+        } => return bytes_ref(heap, value),
         _ => None,
     })
 }

@@ -661,6 +661,8 @@ pub(super) trait PyRuntime {
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
+    /// The physical builtin length, without invoking a user-defined `__len__` slot.
+    fn physical_length(&self, value: PyValue) -> PyResult<Option<usize>>;
     /// Render through the same bounded formatting protocol used by f-strings.
     fn format_value(
         &mut self,
@@ -672,6 +674,8 @@ pub(super) trait PyRuntime {
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
+    /// Invoke the default object lookup directly, without `__getattr__` fallback.
+    fn get_attribute_default(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
     /// Assign an attribute through the runtime's descriptor protocol, as `setattr` does.
     fn set_attribute(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
     /// Assign an attribute without consulting a class's `__setattr__`, as `object.__setattr__`

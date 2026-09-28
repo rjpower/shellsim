@@ -19,6 +19,7 @@ const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const FRACTIONS: &[u8] = include_bytes!("test_fractions.py");
 const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
+const TYPE_PROTOCOL: &[u8] = include_bytes!("test_type_protocol.py");
 const OPERATOR: &[u8] = include_bytes!("test_operator.py");
 const WARNINGS: &[u8] = include_bytes!("test_warnings.py");
 const COUNT_10_MILLION: &[u8] = include_bytes!("performance/test_count_10_million.py");
@@ -112,6 +113,11 @@ fn fractions() {
 #[test]
 fn object_model() {
     assert_source_suite("test_object_model.py", OBJECT_MODEL);
+}
+
+#[test]
+fn type_protocol() {
+    assert_source_suite("test_type_protocol.py", TYPE_PROTOCOL);
 }
 
 #[test]

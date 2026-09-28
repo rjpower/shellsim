@@ -449,6 +449,14 @@ impl Vm<'_> {
                     .map(|(name, value)| (name.clone(), *value))
                     .collect()
             }
+            ProxyTarget::RegisteredType(type_id) => self
+                .state
+                .types
+                .get(type_id)?
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
             ProxyTarget::NativeModule(module) => {
                 let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
                 for function in module.functions {

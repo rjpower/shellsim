@@ -65,6 +65,11 @@ pub(super) enum NativeValue {
     /// Native method that attribute lookup binds to the type, as CPython binds a classmethod,
     /// whether it is reached through the type or through an instance.
     NativeClassMethod(&'static super::native::MethodDef),
+    /// A callable view of a native slot owned by one type, independent of subclass overrides.
+    SlotWrapper {
+        owner: TypeId,
+        slot: Slot,
+    },
     /// Read-only data descriptor stored in a native type's attribute table.
     NativeGetter(&'static super::native::GetterDef),
     ValueKind(&'static super::native::ValueKindDef),
@@ -101,6 +106,7 @@ impl NativeValue {
     const ELLIPSIS: u8 = 13;
     const NOT_IMPLEMENTED: u8 = 14;
     const NATIVE_CLASS_METHOD: u8 = 15;
+    const SLOT_WRAPPER: u8 = 16;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -118,6 +124,10 @@ impl NativeValue {
             Self::NativeClassMethod(value) => (
                 value as *const super::native::MethodDef as usize as u64,
                 Self::NATIVE_CLASS_METHOD,
+            ),
+            Self::SlotWrapper { owner, slot } => (
+                (u64::from(owner.raw()) << 8) | slot as u64,
+                Self::SLOT_WRAPPER,
             ),
             Self::NativeGetter(value) => (
                 value as *const super::native::GetterDef as usize as u64,
@@ -171,6 +181,10 @@ impl NativeValue {
                     &*(payload as usize as *const super::native::MethodDef)
                 })
             }
+            Self::SLOT_WRAPPER => Self::SlotWrapper {
+                owner: TypeId::from_raw((payload >> 8) as u32),
+                slot: Slot::from_index(payload as u8),
+            },
             Self::NATIVE_GETTER => {
                 // SAFETY: `encode` stores a non-null pointer to a static `GetterDef`.
                 Self::NativeGetter(unsafe {
@@ -244,6 +258,15 @@ impl NativeValue {
                     "<method '{}' of '{}' objects>",
                     method.name, method.type_name
                 )
+            }
+            Self::SlotWrapper { owner, slot } => {
+                let name = super::object_model::SLOT_DEFS[slot as usize].1;
+                match BuiltinType::ALL.get(owner.raw() as usize) {
+                    Some(builtin) => {
+                        format!("<slot wrapper '{name}' of '{}' objects>", builtin.name())
+                    }
+                    None => format!("<slot wrapper '{name}'>"),
+                }
             }
             _ => "<native object>".into(),
         }

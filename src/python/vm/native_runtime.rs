@@ -621,6 +621,10 @@ impl PyRuntime for Vm<'_> {
         self.repr_value(value).map_err(PyError::runtime_error)
     }
 
+    fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
+        Vm::physical_length(self, value).map_err(PyError::runtime_error)
+    }
+
     fn format_value(
         &mut self,
         value: &Value,
@@ -661,6 +665,12 @@ impl PyRuntime for Vm<'_> {
                     PyError::runtime_error(message)
                 }
             })
+    }
+
+    fn get_attribute_default(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
+        let symbol = self.state.heap.symbol_id(name);
+        self.lookup_attribute_default(value, symbol, name)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn set_attribute(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {

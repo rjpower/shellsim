@@ -11,6 +11,27 @@ use super::{
 use num_traits::{One, Signed, Zero};
 
 impl Vm<'_> {
+    /// Length of a builtin representation without consulting Python slots. Native length slots
+    /// and the `len()` fallback share this path so their metering and results cannot diverge.
+    pub(super) fn physical_length(&self, value: Value) -> Result<Option<usize>, String> {
+        let subject = self.builtin_view(value)?;
+        if let Some(length) = protocol::string_length(&self.state.heap, &subject)? {
+            return Ok(Some(length));
+        }
+        let Some(id) = subject.object_id() else {
+            return Ok(None);
+        };
+        Ok(match self.state.heap.get(id)? {
+            Object::List(values)
+            | Object::Tuple(values)
+            | Object::Set(values)
+            | Object::FrozenSet(values) => Some(values.len()),
+            Object::Range { start, stop, step } => Some(range_length(*start, *stop, *step)?),
+            Object::Dict(entries) | Object::DefaultDict { entries, .. } => Some(entries.len()),
+            _ => None,
+        })
+    }
+
     /// The builtin `abs(value)`, through the `__abs__` slot.
     pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
         if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
@@ -294,6 +315,11 @@ impl Vm<'_> {
                             self.method_frames.pop();
                         }
                         result
+                    } else if let Some(NativeValue::SlotWrapper { owner, slot }) =
+                        descriptor.native_value()
+                    {
+                        self.call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
+                            .map(CallResult::Value)
                     } else if let Some(NativeValue::NativeMethod(method)) =
                         descriptor.native_value()
                     {
@@ -644,6 +670,15 @@ impl Vm<'_> {
                     args: arguments,
                 },
             )?));
+        }
+        if let Some(NativeValue::SlotWrapper { owner, slot }) = function.native_value() {
+            if arguments.is_empty() {
+                return Err(self.raise_exception("TypeError", "slot wrapper requires a receiver"));
+            }
+            let receiver = arguments.remove(0);
+            return self
+                .call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
+                .map(CallResult::Value);
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
             if arguments.is_empty() {
@@ -1021,70 +1056,16 @@ impl Vm<'_> {
                     }
                     return Ok(CallResult::Value(Value::Int(length)));
                 }
-                let subject = self.builtin_view(arguments[0])?;
-                let length =
-                    if let Some(length) = protocol::string_length(&self.state.heap, &subject)? {
-                        Some(length)
-                    } else if let Some(id) = subject.object_id() {
-                        match self.state.heap.get(id)? {
-                            Object::Bare => None,
-                            Object::List(values)
-                            | Object::Tuple(values)
-                            | Object::Set(values)
-                            | Object::FrozenSet(values) => Some(values.len()),
-                            Object::Range { start, stop, step } => {
-                                Some(range_length(*start, *stop, *step)?)
-                            }
-                            Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                                Some(entries.len())
-                            }
-                            Object::BigInt(_)
-                            | Object::Complex { .. }
-                            | Object::String(_)
-                            | Object::Bytes(_)
-                            | Object::ByteArray(_)
-                            | Object::Slice { .. }
-                            | Object::Exception { .. }
-                            | Object::Function { .. }
-                            | Object::Class { .. }
-                            | Object::Instance { .. }
-                            | Object::DescriptorBoundMethod { .. }
-                            | Object::Iterator { .. }
-                            | Object::SequenceIterator { .. }
-                            | Object::RangeIterator { .. }
-                            | Object::CountIterator { .. }
-                            | Object::StreamIterator { .. }
-                            | Object::CallableIterator { .. }
-                            | Object::Generator { .. }
-                            | Object::Module { .. }
-                            | Object::ArrayStorage(_)
-                            | Object::Array { .. }
-                            | Object::WideValue { .. }
-                            | Object::Regex { .. }
-                            | Object::Match { .. }
-                            | Object::ArgumentParser { .. }
-                            | Object::Namespace { .. }
-                            | Object::EnumMember { .. }
-                            | Object::RaisesContext { .. }
-                            | Object::Property { .. }
-                            | Object::StaticMethod { .. }
-                            | Object::ClassMethod { .. }
-                            | Object::Super { .. }
-                            | Object::NamespaceDict(_)
-                            | Object::DictView { .. }
-                            | Object::MappingProxy(_) => None,
-                        }
-                    } else {
-                        None
-                    };
-                let Some(length) = length else {
+                let Some(length) = self.physical_length(arguments[0])? else {
                     let message = format!(
                         "object of type '{}' has no len()",
                         self.type_name_of(&arguments[0])?
                     );
                     return Err(self.raise_exception("TypeError", message));
                 };
-                Ok(CallResult::Value(Value::Int(length as i64)))
+                let length = i64::try_from(length)
+                    .map_err(|_| self.raise_exception("OverflowError", "length is too large"))?;
+                Ok(CallResult::Value(Value::Int(length)))
             }
             Builtin::Sorted => {
                 expect_arity(&arguments, 1, 1)?;

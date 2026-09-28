@@ -176,43 +176,50 @@ impl Vm<'_> {
             self.stack.push(Value::Bool(result));
             return Ok(());
         }
-        let mut slot_result = match operator {
-            ComparisonOperator::Equal => {
-                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?
-            }
+        let comparison_slots = match operator {
+            ComparisonOperator::Equal => Some(((Slot::Equal, "__eq__"), (Slot::Equal, "__eq__"))),
             ComparisonOperator::NotEqual => {
-                self.invoke_operator_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
+                Some(((Slot::NotEqual, "__ne__"), (Slot::NotEqual, "__ne__")))
             }
             ComparisonOperator::Less => {
-                self.invoke_operator_slot(&left, Slot::LessThan, "__lt__", vec![right])?
+                Some(((Slot::LessThan, "__lt__"), (Slot::GreaterThan, "__gt__")))
             }
             ComparisonOperator::LessEqual => {
-                self.invoke_operator_slot(&left, Slot::LessEqual, "__le__", vec![right])?
+                Some(((Slot::LessEqual, "__le__"), (Slot::GreaterEqual, "__ge__")))
             }
             ComparisonOperator::Greater => {
-                self.invoke_operator_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
+                Some(((Slot::GreaterThan, "__gt__"), (Slot::LessThan, "__lt__")))
             }
             ComparisonOperator::GreaterEqual => {
-                self.invoke_operator_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
+                Some(((Slot::GreaterEqual, "__ge__"), (Slot::LessEqual, "__le__")))
             }
-            ComparisonOperator::In | ComparisonOperator::NotIn => {
-                self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?
-            }
-            ComparisonOperator::Is | ComparisonOperator::IsNot => None,
+            _ => None,
         };
-        if slot_result.is_none() {
-            let reflected = match operator {
-                ComparisonOperator::Equal => Some((Slot::Equal, "__eq__")),
-                ComparisonOperator::NotEqual => Some((Slot::NotEqual, "__ne__")),
-                ComparisonOperator::Less => Some((Slot::GreaterThan, "__gt__")),
-                ComparisonOperator::LessEqual => Some((Slot::GreaterEqual, "__ge__")),
-                ComparisonOperator::Greater => Some((Slot::LessThan, "__lt__")),
-                ComparisonOperator::GreaterEqual => Some((Slot::LessEqual, "__le__")),
-                _ => None,
-            };
-            if let Some((slot, name)) = reflected {
-                slot_result = self.invoke_operator_slot(&right, slot, name, vec![left])?;
+        let mut slot_result = None;
+        if let Some(((left_slot, left_name), (right_slot, right_name))) = comparison_slots {
+            let left_type = self.type_id(&left)?;
+            let right_type = self.type_id(&right)?;
+            let right_first = right_type != left_type
+                && self.state.types.is_subclass(right_type, left_type)?
+                && self
+                    .state
+                    .types
+                    .local_slot(right_type, right_slot)?
+                    .is_some();
+            if right_first {
+                slot_result =
+                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
             }
+            if slot_result.is_none() {
+                slot_result =
+                    self.invoke_operator_slot(&left, left_slot, left_name, vec![right])?;
+            }
+            if slot_result.is_none() && !right_first {
+                slot_result =
+                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
+            }
+        } else if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) {
+            slot_result = self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?;
         }
         if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
             let mut equality =
@@ -531,7 +538,7 @@ impl Vm<'_> {
             }
         }
         let type_id = self.type_id(&left)?;
-        if self.state.types.attribute(type_id, name)?.is_none() {
+        if self.type_lookup(type_id, name)?.is_none() {
             return Ok(None);
         }
         let Some(method) = self.resolve_attribute(left, name)? else {

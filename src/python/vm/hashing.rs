@@ -31,15 +31,18 @@ impl Vm<'_> {
             return Ok(hash::NONE);
         }
         // Instances of `int` subclasses have a numeric view but may define their own `__hash__`.
-        if !self.is_user_instance(value)? {
+        let user_instance = self.is_user_instance(value)?;
+        if !user_instance {
             if let Some(number) = number::view(&self.state.heap, value) {
                 return Ok(number_hash(number));
             }
         }
-        if let Some(text) = super::super::string::string_ref(&self.state.heap, value)? {
-            let text = text.as_str().to_owned();
-            self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
-            return Ok(hash::string(&text));
+        if !user_instance {
+            if let Some(text) = super::super::string::string_ref(&self.state.heap, value)? {
+                let text = text.as_str().to_owned();
+                self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+                return Ok(hash::string(&text));
+            }
         }
         match value.tag() {
             ValueTag::Native => return Ok(hash::identity(value.payload ^ u64::from(value.aux[0]))),

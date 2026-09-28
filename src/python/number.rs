@@ -115,7 +115,7 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
 
 /// Numeric-tower attributes shared by one builtin real number type.
 ///
-/// `int` and `bool` also expose the `numbers.Rational` accessors. Results follow CPython:
+/// `bool` inherits the integer namespace through its MRO. Results follow CPython:
 /// `True.real` is the integer `1`, `(3).imag` is `0`, and `(1.5).imag` is `0.0`.
 macro_rules! real_number_type {
     ($name:literal, rational) => {
@@ -201,7 +201,6 @@ macro_rules! real_number_type {
     };
 }
 
-pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
 
 /// `int.__new__(cls, value=0)`, installed on `int` alone since `bool` cannot be subclassed.
@@ -222,11 +221,6 @@ fn int_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> Py
 /// `int.from_bytes`, which receives the class so that `bool.from_bytes` returns a `bool`.
 pub(super) static INT_CLASS_METHODS: &[MethodDef] = &[MethodDef {
     type_name: "int",
-    name: "from_bytes",
-    call: int_from_bytes,
-}];
-pub(super) static BOOL_CLASS_METHODS: &[MethodDef] = &[MethodDef {
-    type_name: "bool",
     name: "from_bytes",
     call: int_from_bytes,
 }];

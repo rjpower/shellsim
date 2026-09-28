@@ -141,6 +141,8 @@ pub enum DictViewKind {
 pub enum ProxyTarget {
     /// A class's own attributes, for `cls.__dict__` and `vars(cls)`.
     Class(ObjectId),
+    /// A builtin or native value-kind type's fixed registry namespace.
+    RegisteredType(super::object_model::TypeId),
     /// A native module's functions and values, which cannot be rebound.
     NativeModule(&'static super::native::ModuleDef),
 }
@@ -1619,7 +1621,7 @@ fn trace_object(
         Object::NamespaceDict(NamespaceTarget::Instance(instance)) => object_work.push(*instance),
         Object::DictView { mapping, .. } => object_work.push(*mapping),
         Object::MappingProxy(ProxyTarget::Class(class)) => object_work.push(*class),
-        Object::MappingProxy(ProxyTarget::NativeModule(_)) => {}
+        Object::MappingProxy(ProxyTarget::NativeModule(_) | ProxyTarget::RegisteredType(_)) => {}
         Object::Array { storage, base, .. } => {
             object_work.push(*storage);
             object_work.extend(*base);

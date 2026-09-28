@@ -202,7 +202,6 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "__setitem__", dict_setitem),
         method("dict", "__delitem__", dict_delitem),
         method("dict", "__contains__", dict_contains),
-        method("dict", "__len__", dict_len),
         method("dict", "__iter__", dict_iter),
         method("dict", "__repr__", dict_repr),
         method("dict", "get", dict_get),
@@ -281,6 +280,7 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
         method("object", "__new__", object_new),
         method("object", "__init__", object_init),
         method("object", "__hash__", object_hash),
+        method("object", "__getattribute__", object_getattribute),
         method("object", "__eq__", object_eq),
         method("object", "__ne__", object_ne),
         method("object", "__setattr__", object_setattr),
@@ -2887,15 +2887,6 @@ fn dict_contains(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     ))
 }
 
-fn dict_len(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("dict.__len__", 0, 0)?;
-    args.reject_keywords("dict.__len__")?;
-    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
-    let length =
-        i64::try_from(entries.len()).map_err(|_| PyError::overflow_error("dict is too large"))?;
-    Ok(Value::Int(length))
-}
-
 fn dict_iter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.__iter__", 0, 0)?;
     args.reject_keywords("dict.__iter__")?;
@@ -3055,8 +3046,29 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     runtime.dict_copy(dict)
 }
 
-/// `view[key]` for a namespace view, which the VM's builtin subscript does not cover. The view's
-/// other dict behavior comes from `dict`'s own methods, through the runtime's dict accessors.
+/// The lazy iterator of a builtin sequence. The VM handles list, tuple and range before its
+/// generic iterator fallback, so this slot never materializes the sequence or re-enters itself.
+pub(crate) fn slot_sequence_iter(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let iterator = runtime.iterator(receiver)?;
+    Ok(Some(Value::Object(iterator.object_id())))
+}
+
+/// A builtin type's physical length, shared with `len()` after user-slot dispatch.
+pub(crate) fn slot_builtin_length(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(length) = runtime.physical_length(receiver)? else {
+        return Ok(None);
+    };
+    let length =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("length is too large"))?;
+    Ok(Some(Value::Int(length)))
+}
+
 pub(crate) fn slot_namespace_dict_get_item(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -3919,6 +3931,20 @@ fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         None => immediate_identity(&receiver),
     };
     Ok(Value::Int(super::super::hash::identity(identity)))
+}
+
+/// Call the default descriptor algorithm without the outer `__getattr__` fallback.
+fn object_getattribute(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__getattribute__", 1, 1)?;
+    args.reject_keywords("object.__getattribute__")?;
+    let name = runtime
+        .string_value(&args.positional()[0])?
+        .ok_or_else(|| PyError::type_error("attribute name must be a string"))?;
+    runtime
+        .get_attribute_default(receiver, &name)?
+        .ok_or_else(|| {
+            PyError::exception("AttributeError", format!("attribute {name:?} not found"))
+        })
 }
 
 /// `object.__delattr__(name)`: the default deletion, which a class's own `__delattr__` calls.
