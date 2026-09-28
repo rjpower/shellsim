@@ -748,6 +748,8 @@ pub(super) trait PyRuntime {
     fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
+    /// Invoke a class through the default `type.__call__` path, bypassing a metaclass override.
+    fn call_type_default(&mut self, class: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
     /// Whether `value` is an iterator: a builtin iterator or generator, or an object whose class
     /// defines `__next__`.

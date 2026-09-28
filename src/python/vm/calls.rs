@@ -376,282 +376,8 @@ impl Vm<'_> {
                     )?;
                     self.invoke_call(callable, arguments, keyword_arguments)
                 }
-                Object::Class {
-                    name,
-                    metaclass,
-                    layout,
-                    exception_base,
-                    is_dataclass,
-                    dataclass_fields,
-                    enum_members,
-                    ..
-                } => {
-                    if let Some(metaclass_id) = metaclass.object_id() {
-                        if let Some((owner, descriptor)) =
-                            self.class_attribute_entry(metaclass_id, "__call__")?
-                        {
-                            let callable = self.bind_descriptor(
-                                descriptor,
-                                Some(Value::Object(id)),
-                                metaclass_id,
-                                owner,
-                            )?;
-                            return self.invoke_call(callable, arguments, keyword_arguments);
-                        }
-                    }
-                    if !enum_members.is_empty() {
-                        if !keyword_arguments.is_empty() || arguments.len() != 1 {
-                            return Err(format!("{name}() expects one value"));
-                        }
-                        for member in enum_members {
-                            let Object::EnumMember { value, .. } = self
-                                .state
-                                .heap
-                                .get(member.object_id().ok_or("invalid enum member")?)?
-                            else {
-                                return Err("invalid enum member".into());
-                            };
-                            let value = *value;
-                            if self.values_equal(&value, &arguments[0])? {
-                                return Ok(CallResult::Value(member));
-                            }
-                        }
-                        return Err(format!("value is not a valid {name}"));
-                    }
-                    if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
-                        if let Some((owner, constructor)) =
-                            self.class_attribute_entry(id, "__new__")?
-                        {
-                            return self.construct_with_new(
-                                id,
-                                owner,
-                                constructor,
-                                arguments,
-                                keyword_arguments,
-                            );
-                        }
-                    }
-                    let payload = match layout {
-                        ClassLayout::Object => InstancePayload::Object,
-                        // Mutable builtin `__new__` creates empty storage. An override can then
-                        // populate it, usually through the base `__init__`.
-                        ClassLayout::Builtin(
-                            builtin @ (BuiltinType::List
-                            | BuiltinType::Set
-                            | BuiltinType::Dict
-                            | BuiltinType::ByteArray),
-                        ) if self.class_attribute(id, "__init__")?.is_some() => {
-                            InstancePayload::Builtin(self.builtin_value(
-                                builtin,
-                                Vec::new(),
-                                Vec::new(),
-                            )?)
-                        }
-                        ClassLayout::Builtin(builtin) => {
-                            InstancePayload::Builtin(self.builtin_value(
-                                builtin,
-                                arguments.clone(),
-                                keyword_arguments.clone(),
-                            )?)
-                        }
-                        ClassLayout::Type => {
-                            let created = if let Some((owner, constructor)) =
-                                self.class_attribute_entry(id, "__new__")?
-                            {
-                                let constructor = self.bind_descriptor(
-                                    constructor,
-                                    Some(Value::Object(id)),
-                                    id,
-                                    owner,
-                                )?;
-                                match self.invoke_call(
-                                    constructor,
-                                    arguments.clone(),
-                                    keyword_arguments.clone(),
-                                )? {
-                                    CallResult::Value(value) => value,
-                                    CallResult::Exit(status) => {
-                                        return Ok(CallResult::Exit(status))
-                                    }
-                                    CallResult::EnteredFrame => {
-                                        unreachable!("invoke_call is immediate")
-                                    }
-                                    CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                        unreachable!("immediate call cannot suspend")
-                                    }
-                                }
-                            } else {
-                                if !keyword_arguments.is_empty() || arguments.len() != 3 {
-                                    return Err(
-                                        "type construction expects name, bases, and namespace"
-                                            .into(),
-                                    );
-                                }
-                                let name = protocol::string_value(&self.state.heap, &arguments[0])?
-                                    .ok_or("type name must be a string")?;
-                                self.new_type(Value::Object(id), name, arguments[1], arguments[2])
-                                    .map_err(|error| error.to_string())?
-                            };
-                            if created.object_id().is_some_and(|created_id| {
-                                matches!(self.state.heap.get(created_id), Ok(Object::Class { .. }))
-                            }) {
-                                if let Some((owner, initializer)) =
-                                    self.class_attribute_entry(id, "__init__")?
-                                {
-                                    let initializer = self.bind_descriptor(
-                                        initializer,
-                                        Some(created),
-                                        id,
-                                        owner,
-                                    )?;
-                                    let result = match self.invoke_call(
-                                        initializer,
-                                        arguments,
-                                        keyword_arguments,
-                                    )? {
-                                        CallResult::Value(value) => value,
-                                        CallResult::Exit(status) => {
-                                            return Ok(CallResult::Exit(status))
-                                        }
-                                        CallResult::EnteredFrame => {
-                                            unreachable!("invoke_call is immediate")
-                                        }
-                                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                            unreachable!("immediate call cannot suspend")
-                                        }
-                                    };
-                                    if !result.is_none() {
-                                        return Err(
-                                            "metaclass __init__() should return None".into()
-                                        );
-                                    }
-                                }
-                            }
-                            return Ok(CallResult::Value(created));
-                        }
-                    };
-                    let instance = self.allocate_object(Object::Instance {
-                        class: id,
-                        payload,
-                        attributes: InstanceAttributes::default(),
-                    })?;
-                    if exception_base.is_some() {
-                        let exception_args =
-                            self.allocate_object(Object::Tuple(arguments.clone()))?;
-                        self.state.heap.insert_attribute(
-                            instance.object_id().expect("instances are heap objects"),
-                            "args".into(),
-                            exception_args,
-                            &mut self.interp.resources,
-                        )?;
-                    }
-                    if is_dataclass {
-                        let mut values = Vec::new();
-                        for (index, (field, default)) in dataclass_fields.iter().enumerate() {
-                            if index < arguments.len()
-                                && keyword_arguments.iter().any(|(name, _)| name == field)
-                            {
-                                return Err(format!(
-                                    "{name}() got multiple values for argument {field:?}"
-                                ));
-                            }
-                            let value = keyword_arguments
-                                .iter()
-                                .find(|(name, _)| name == field)
-                                .map(|(_, value)| *value)
-                                .or_else(|| arguments.get(index).cloned())
-                                .or(*default)
-                                .ok_or_else(|| {
-                                    format!("{name}() missing required argument: {field:?}")
-                                })?;
-                            if keyword_arguments
-                                .iter()
-                                .filter(|(name, _)| name == field)
-                                .count()
-                                > 1
-                            {
-                                return Err(format!(
-                                    "{name}() got multiple values for argument {field:?}"
-                                ));
-                            }
-                            values.push((field.clone(), value));
-                        }
-                        if arguments.len() > dataclass_fields.len() {
-                            return Err(format!(
-                                "{name}() takes {} positional arguments but {} were given",
-                                dataclass_fields.len(),
-                                arguments.len()
-                            ));
-                        }
-                        for (field, _) in &keyword_arguments {
-                            if !dataclass_fields.iter().any(|(name, _)| name == field) {
-                                return Err(format!(
-                                    "{name}() got an unexpected keyword argument {field:?}"
-                                ));
-                            }
-                        }
-                        self.state.heap.extend_attributes(
-                            instance.object_id().expect("instances are heap objects"),
-                            values,
-                            &mut self.interp.resources,
-                        )?;
-                    } else if let Some(initializer) = self.class_attribute(id, "__init__")? {
-                        let Some(function) = initializer.object_id() else {
-                            return Err(format!("{name}.__init__ is not callable"));
-                        };
-                        let Object::Function {
-                            name: function_name,
-                            code,
-                            closure,
-                            defaults,
-                            defining_class,
-                            ..
-                        } = self.state.heap.get(function)?.clone()
-                        else {
-                            return Err(format!("{name}.__init__ is not a function"));
-                        };
-                        arguments.insert(0, instance);
-                        // Zero-argument `super()` in the initializer reads this frame.
-                        if let Some(owner) = defining_class {
-                            self.method_frames.push((owner, instance));
-                        }
-                        let result = self.call_python_function(
-                            &function_name,
-                            &code,
-                            closure,
-                            &defaults,
-                            FunctionInvocation {
-                                arguments,
-                                keyword_arguments,
-                                mode: CallMode::Immediate,
-                                pop_method_frame: false,
-                            },
-                        );
-                        if defining_class.is_some() {
-                            self.method_frames.pop();
-                        }
-                        match result? {
-                            CallResult::Value(value) if value.is_none() => {}
-                            CallResult::Value(_) => {
-                                return Err("__init__() should return None".into())
-                            }
-                            CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                            CallResult::EnteredFrame => {
-                                unreachable!("immediate initializer entered a frame")
-                            }
-                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                unreachable!("immediate initializer cannot suspend")
-                            }
-                        }
-                    } else if exception_base.is_some() && !keyword_arguments.is_empty() {
-                        return Err(format!("{name}() does not accept keyword arguments"));
-                    } else if layout == ClassLayout::Object
-                        && exception_base.is_none()
-                        && (!arguments.is_empty() || !keyword_arguments.is_empty())
-                    {
-                        return Err(format!("{name}() takes no arguments"));
-                    }
-                    Ok(CallResult::Value(instance))
+                Object::Class { .. } => {
+                    self.call_user_class(id, arguments, keyword_arguments, true)
                 }
                 _ => Err(self.raise_object_type_error(&function, "is not callable")),
             };
@@ -1492,6 +1218,291 @@ impl Vm<'_> {
                 Ok(CallResult::Value(namespace))
             }
         }
+    }
+
+    /// Explicit `type.__call__` skips the metaclass override while retaining ordinary class
+    /// construction and the native type constructors.
+    pub(super) fn call_type_default(
+        &mut self,
+        class: Value,
+        args: CallArgs,
+    ) -> Result<CallResult, String> {
+        let (arguments, keyword_arguments) = args.into_parts();
+        if let Some(id) = class.object_id() {
+            if matches!(self.state.heap.get(id)?, Object::Class { .. }) {
+                return self.call_user_class(id, arguments, keyword_arguments, false);
+            }
+        }
+        if matches!(
+            class.native_value(),
+            Some(
+                NativeValue::BuiltinType(_)
+                    | NativeValue::ValueKind(_)
+                    | NativeValue::ExceptionType(_)
+            )
+        ) {
+            return self.invoke_call(class, arguments, keyword_arguments);
+        }
+        Err(self.raise_exception("TypeError", "type.__call__ requires a class"))
+    }
+
+    /// Apply the default class constructor after any metaclass `__call__` override has had
+    /// its turn. Direct `type.__call__` enters here with metaclass dispatch disabled.
+    fn call_user_class(
+        &mut self,
+        id: super::super::heap::ObjectId,
+        mut arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+        dispatch_metaclass: bool,
+    ) -> Result<CallResult, String> {
+        let Object::Class {
+            name,
+            metaclass,
+            layout,
+            exception_base,
+            is_dataclass,
+            dataclass_fields,
+            enum_members,
+            ..
+        } = self.state.heap.get(id)?.clone()
+        else {
+            return Err("type.__call__ requires a class".into());
+        };
+        if dispatch_metaclass {
+            if let Some(metaclass_id) = metaclass.object_id() {
+                if let Some((owner, descriptor)) =
+                    self.class_attribute_entry(metaclass_id, "__call__")?
+                {
+                    let callable = self.bind_descriptor(
+                        descriptor,
+                        Some(Value::Object(id)),
+                        metaclass_id,
+                        owner,
+                    )?;
+                    return self.invoke_call(callable, arguments, keyword_arguments);
+                }
+            }
+        }
+        if !enum_members.is_empty() {
+            if !keyword_arguments.is_empty() || arguments.len() != 1 {
+                return Err(format!("{name}() expects one value"));
+            }
+            for member in enum_members {
+                let Object::EnumMember { value, .. } = self
+                    .state
+                    .heap
+                    .get(member.object_id().ok_or("invalid enum member")?)?
+                else {
+                    return Err("invalid enum member".into());
+                };
+                let value = *value;
+                if self.values_equal(&value, &arguments[0])? {
+                    return Ok(CallResult::Value(member));
+                }
+            }
+            return Err(format!("value is not a valid {name}"));
+        }
+        if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
+            if let Some((owner, constructor)) = self.class_attribute_entry(id, "__new__")? {
+                return self.construct_with_new(
+                    id,
+                    owner,
+                    constructor,
+                    arguments,
+                    keyword_arguments,
+                );
+            }
+        }
+        let payload = match layout {
+            ClassLayout::Object => InstancePayload::Object,
+            // Mutable builtin `__new__` creates empty storage. An override can then
+            // populate it, usually through the base `__init__`.
+            ClassLayout::Builtin(
+                builtin @ (BuiltinType::List
+                | BuiltinType::Set
+                | BuiltinType::Dict
+                | BuiltinType::ByteArray),
+            ) if self.class_attribute(id, "__init__")?.is_some() => {
+                InstancePayload::Builtin(self.builtin_value(builtin, Vec::new(), Vec::new())?)
+            }
+            ClassLayout::Builtin(builtin) => InstancePayload::Builtin(self.builtin_value(
+                builtin,
+                arguments.clone(),
+                keyword_arguments.clone(),
+            )?),
+            ClassLayout::Type => {
+                let created = if let Some((owner, constructor)) =
+                    self.class_attribute_entry(id, "__new__")?
+                {
+                    let constructor =
+                        self.bind_descriptor(constructor, Some(Value::Object(id)), id, owner)?;
+                    match self.invoke_call(
+                        constructor,
+                        arguments.clone(),
+                        keyword_arguments.clone(),
+                    )? {
+                        CallResult::Value(value) => value,
+                        CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                        CallResult::EnteredFrame => {
+                            unreachable!("invoke_call is immediate")
+                        }
+                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                            unreachable!("immediate call cannot suspend")
+                        }
+                    }
+                } else {
+                    if !keyword_arguments.is_empty() || arguments.len() != 3 {
+                        return Err("type construction expects name, bases, and namespace".into());
+                    }
+                    let name = protocol::string_value(&self.state.heap, &arguments[0])?
+                        .ok_or("type name must be a string")?;
+                    self.new_type(Value::Object(id), name, arguments[1], arguments[2])
+                        .map_err(|error| error.to_string())?
+                };
+                if created.object_id().is_some_and(|created_id| {
+                    matches!(self.state.heap.get(created_id), Ok(Object::Class { .. }))
+                }) {
+                    if let Some((owner, initializer)) =
+                        self.class_attribute_entry(id, "__init__")?
+                    {
+                        let initializer =
+                            self.bind_descriptor(initializer, Some(created), id, owner)?;
+                        let result =
+                            match self.invoke_call(initializer, arguments, keyword_arguments)? {
+                                CallResult::Value(value) => value,
+                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                                CallResult::EnteredFrame => {
+                                    unreachable!("invoke_call is immediate")
+                                }
+                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                                    unreachable!("immediate call cannot suspend")
+                                }
+                            };
+                        if !result.is_none() {
+                            return Err("metaclass __init__() should return None".into());
+                        }
+                    }
+                }
+                return Ok(CallResult::Value(created));
+            }
+        };
+        let instance = self.allocate_object(Object::Instance {
+            class: id,
+            payload,
+            attributes: InstanceAttributes::default(),
+        })?;
+        if exception_base.is_some() {
+            let exception_args = self.allocate_object(Object::Tuple(arguments.clone()))?;
+            self.state.heap.insert_attribute(
+                instance.object_id().expect("instances are heap objects"),
+                "args".into(),
+                exception_args,
+                &mut self.interp.resources,
+            )?;
+        }
+        if is_dataclass {
+            let mut values = Vec::new();
+            for (index, (field, default)) in dataclass_fields.iter().enumerate() {
+                if index < arguments.len()
+                    && keyword_arguments.iter().any(|(name, _)| name == field)
+                {
+                    return Err(format!(
+                        "{name}() got multiple values for argument {field:?}"
+                    ));
+                }
+                let value = keyword_arguments
+                    .iter()
+                    .find(|(name, _)| name == field)
+                    .map(|(_, value)| *value)
+                    .or_else(|| arguments.get(index).cloned())
+                    .or(*default)
+                    .ok_or_else(|| format!("{name}() missing required argument: {field:?}"))?;
+                if keyword_arguments
+                    .iter()
+                    .filter(|(name, _)| name == field)
+                    .count()
+                    > 1
+                {
+                    return Err(format!(
+                        "{name}() got multiple values for argument {field:?}"
+                    ));
+                }
+                values.push((field.clone(), value));
+            }
+            if arguments.len() > dataclass_fields.len() {
+                return Err(format!(
+                    "{name}() takes {} positional arguments but {} were given",
+                    dataclass_fields.len(),
+                    arguments.len()
+                ));
+            }
+            for (field, _) in &keyword_arguments {
+                if !dataclass_fields.iter().any(|(name, _)| name == field) {
+                    return Err(format!(
+                        "{name}() got an unexpected keyword argument {field:?}"
+                    ));
+                }
+            }
+            self.state.heap.extend_attributes(
+                instance.object_id().expect("instances are heap objects"),
+                values,
+                &mut self.interp.resources,
+            )?;
+        } else if let Some(initializer) = self.class_attribute(id, "__init__")? {
+            let Some(function) = initializer.object_id() else {
+                return Err(format!("{name}.__init__ is not callable"));
+            };
+            let Object::Function {
+                name: function_name,
+                code,
+                closure,
+                defaults,
+                defining_class,
+                ..
+            } = self.state.heap.get(function)?.clone()
+            else {
+                return Err(format!("{name}.__init__ is not a function"));
+            };
+            arguments.insert(0, instance);
+            // Zero-argument `super()` in the initializer reads this frame.
+            if let Some(owner) = defining_class {
+                self.method_frames.push((owner, instance));
+            }
+            let result = self.call_python_function(
+                &function_name,
+                &code,
+                closure,
+                &defaults,
+                FunctionInvocation {
+                    arguments,
+                    keyword_arguments,
+                    mode: CallMode::Immediate,
+                    pop_method_frame: false,
+                },
+            );
+            if defining_class.is_some() {
+                self.method_frames.pop();
+            }
+            match result? {
+                CallResult::Value(value) if value.is_none() => {}
+                CallResult::Value(_) => return Err("__init__() should return None".into()),
+                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
+                CallResult::EnteredFrame => {
+                    unreachable!("immediate initializer entered a frame")
+                }
+                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                    unreachable!("immediate initializer cannot suspend")
+                }
+            }
+        } else if exception_base.is_some() && !keyword_arguments.is_empty() {
+            return Err(format!("{name}() does not accept keyword arguments"));
+        } else if layout == ClassLayout::Object
+            && exception_base.is_none()
+            && (!arguments.is_empty() || !keyword_arguments.is_empty())
+        {
+            return Err(format!("{name}() takes no arguments"));
+        }
+        Ok(CallResult::Value(instance))
     }
 
     fn call_python_function(

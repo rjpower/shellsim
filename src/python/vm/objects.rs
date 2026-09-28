@@ -3419,21 +3419,30 @@ impl Vm<'_> {
         receiver: &Value,
         name: &str,
     ) -> Result<(TypeId, Value, TypeId), String> {
-        let accessed_class = if let Some(id) = receiver.object_id() {
-            match self.state.heap.get(id)? {
-                Object::Instance { class, .. } => *class,
-                Object::Class { .. } => id,
-                _ => return Err("super() receiver is not an instance or class".into()),
-            }
-        } else {
-            return Err("super() receiver is not an instance or class".into());
-        };
-        let accessed_type = self
-            .class_type_id(&Value::Object(accessed_class))?
-            .ok_or("super() receiver has an invalid class")?;
         let start_type = self
             .class_type_id(&Value::Object(start_class))?
             .ok_or("super() start has an invalid class")?;
+        let Some(receiver_id) = receiver.object_id() else {
+            return Err("super() receiver is not an instance or class".into());
+        };
+        let accessed_type = match self.state.heap.get(receiver_id)? {
+            Object::Instance { class, .. } => self
+                .class_type_id(&Value::Object(*class))?
+                .ok_or("super() receiver has an invalid class")?,
+            Object::Class { .. } => {
+                let class_type = self
+                    .class_type_id(receiver)?
+                    .ok_or("super() receiver has an invalid class")?;
+                if self.state.types.is_subclass(class_type, start_type)? {
+                    class_type
+                } else {
+                    // A method on a metaclass receives a class object. Its `super()` walks
+                    // that object's metaclass MRO rather than the class's own MRO.
+                    self.type_id(receiver)?
+                }
+            }
+            _ => return Err("super() receiver is not an instance or class".into()),
+        };
         let mro = &self.state.types.get(accessed_type)?.mro;
         let start = if accessed_type == start_type {
             0

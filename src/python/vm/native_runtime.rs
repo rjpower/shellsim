@@ -1469,6 +1469,18 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::resource_error)
     }
 
+    fn call_type_default(&mut self, class: Value, args: CallArgs) -> PyResult<Value> {
+        match Vm::call_type_default(self, class, args)
+            .map_err(|message| self.raised_or_runtime_error(message))?
+        {
+            CallResult::Value(value) => Ok(value),
+            CallResult::Exit(status) => Err(PyError::exit(status)),
+            CallResult::EnteredFrame | CallResult::Blocked(..) | CallResult::Retry(..) => {
+                Err(PyError::runtime_error("default type call did not finish"))
+            }
+        }
+    }
+
     fn call_value(&mut self, callable: Value, args: CallArgs) -> PyResult<Value> {
         let (positional, keywords) = args.into_parts();
         let argument_count = positional.len();

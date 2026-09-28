@@ -173,6 +173,40 @@ def test_set_name_runs_before_cooperative_init_subclass():
     assert events == [("name", "Child", "field"), ("parent", "Child")]
 
 
+def test_type_call_runs_new_then_init_and_allows_metaclass_super():
+    events = []
+
+    class Meta(type):
+        def __call__(cls, value):
+            events.append("meta")
+            return super().__call__(value)
+
+    class Item(metaclass=Meta):
+        def __new__(cls, value):
+            events.append("new")
+            return super().__new__(cls)
+
+        def __init__(self, value):
+            events.append("init")
+            self.value = value
+
+    assert Item(3).value == 3
+    assert events == ["meta", "new", "init"]
+    events.clear()
+    assert type.__call__(Item, 4).value == 4
+    assert events == ["new", "init"]
+    assert type.__call__(list, [1, 2]) == [1, 2]
+
+    class ReturnOther:
+        def __new__(cls):
+            return "other"
+
+        def __init__(self):
+            raise AssertionError("__init__ ran after __new__ returned another type")
+
+    assert type.__call__(ReturnOther) == "other"
+
+
 def test_comparison_tries_subclass_reflection_first():
     class Left:
         def __lt__(self, other):

@@ -354,6 +354,7 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
     methods: &[
         method("type", "__new__", type_new),
+        method("type", "__call__", type_call),
         method("type", "mro", type_mro),
     ],
     getters: &[],
@@ -4171,6 +4172,10 @@ fn exception_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     let items = runtime.new_tuple(args.positional().to_vec())?;
     runtime.set_attribute(receiver, "args", items)?;
     Ok(Value::None)
+}
+
+fn type_call(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    runtime.call_type_default(receiver, args)
 }
 
 fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
