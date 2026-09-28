@@ -110,46 +110,6 @@ def _std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False):
     return result
 
 
-def _round(a, decimals=0, out=None):
-    """``rint(a * 10**decimals) / 10**decimals``, computed at `a`'s own dtype and precision."""
-    a = np.asanyarray(a)
-    dtype = a.dtype
-    if dtype == np.bool_:
-        result = a.copy()
-    elif np.issubdtype(dtype, np.integer):
-        if decimals >= 0:
-            result = a.copy()
-        else:
-            factor = 10.0 ** (-decimals)
-            result = (np.rint(a.astype(np.float64) / factor) * factor).astype(dtype)
-    else:
-        factor = dtype.type(10.0) ** decimals
-        result = np.rint(a * factor) / factor
-    if a.ndim == 0 and out is None:
-        result = result[()]
-    if out is not None:
-        out[...] = result
-        return out
-    return result
-
-
-def _clip(a, min=None, max=None, out=None, **kwargs):
-    a = np.asanyarray(a)
-    result = a
-    if min is not None:
-        result = np.maximum(result, min)
-    if max is not None:
-        result = np.minimum(result, max)
-    if result is a:
-        result = a.copy()
-    if a.ndim == 0 and out is None:
-        result = result[()]
-    if out is not None:
-        out[...] = result
-        return out
-    return result
-
-
 # -- public statistics: mean/var/std, order statistics, moments ------------------------------
 
 mean = _mean
