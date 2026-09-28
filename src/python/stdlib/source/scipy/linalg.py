@@ -450,29 +450,19 @@ def qr(a, overwrite_a=False, lwork=None, mode="full", pivoting=False, check_fini
     """The QR factorization of a matrix, or a stack of them.
 
     `mode` is one of `"full"`/`"qr"` (the default: `q` is square, `r` is the full `rows x cols`
-    shape), `"economic"` (`q` is `rows x k`, `r` is `k x cols`, `k = min(rows, cols)`), `"r"`
-    (the full `rows x cols` `r` alone, as a one-element tuple -- unlike `"economic"`, matching
-    SciPy's own asymmetry between the two), or `"raw"` (LAPACK's packed reflectors and their
-    scale factors, `(h, tau)`, alongside the *reduced* `k x cols` `r`). Column pivoting
-    (`pivoting=True`) is not supported.
+    shape), `"economic"` (`q` is `rows x k`, `r` is `k x cols`, `k = min(rows, cols)`), or `"r"`
+    (the full `rows x cols` `r` alone, as a one-element tuple). `mode="raw"` and column pivoting
+    are not supported.
     """
-    if mode not in ("full", "qr", "economic", "r", "raw"):
-        raise ValueError("Mode argument should be one of ['full', 'qr', 'r', 'raw', 'economic']")
-    if pivoting:
-        raise NotImplementedError("scipy.linalg.qr(pivoting=True) is not supported by shellsim's SciPy")
+    if mode == "raw" or pivoting:
+        raise NotImplementedError("qr supports modes 'full', 'economic' and 'r' without pivoting")
+    if mode not in ("full", "qr", "economic", "r"):
+        raise ValueError("mode must be 'full', 'economic' or 'r'")
     a = np.asarray(a)
     if check_finite:
         _check_finite(a)
     dtype = _resolve_precision("qr", a)
     a = a.astype(dtype)
-    if mode == "raw":
-        # `_numpy_linalg`'s own "raw" mode follows NumPy's `linalg.qr(mode="raw")` convention,
-        # whose `h` is the *transpose* of LAPACK's (and hence SciPy's own) `geqrf` output shape;
-        # swap it back so `h.shape == a.shape`, matching SciPy. Its paired `r` is the reduced
-        # `k x cols` triangle, unlike plain `mode="r"`'s full `rows x cols` one.
-        h, tau = _numpy_linalg.qr(a, "raw")
-        (r,) = _numpy_linalg.qr(a, "r")
-        return (np.swapaxes(h, -1, -2), tau), r
     if mode == "r":
         _, r = _numpy_linalg.qr(a, "complete")
         return (r,)
@@ -599,9 +589,8 @@ def eigvalsh(a, b=None, lower=True, overwrite_a=False, overwrite_b=False, turbo=
 
 def svd(a, full_matrices=True, compute_uv=True, overwrite_a=False, check_finite=True,
         lapack_driver="gesdd"):
-    """The singular value decomposition of a matrix, or a stack of them."""
-    if lapack_driver not in ("gesdd", "gesvd"):
-        raise ValueError(f'lapack_driver must be "gesdd" or "gesvd", not "{lapack_driver}"')
+    """The singular value decomposition of a matrix, or a stack of them. `lapack_driver` is
+    accepted and ignored: both drivers compute the same decomposition."""
     a = np.asarray(a)
     if check_finite:
         _check_finite(a)
@@ -626,13 +615,9 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
 
     Returns `(x, residues, rank, singular_values)`. `residues` is the sum of squared residuals
     (per right-hand-side column, if `b` is 2-D) when `a` has more rows than columns and full
-    column rank; a NaN scalar when `a` has fewer rows than columns (an underdetermined system, as
-    SciPy reports it); otherwise a shape-`(0,)` array. `singular_values` is `None` for the
-    `"gelsy"` driver, which does not compute them (SciPy's does not either).
+    column rank, NaN when it has more rows but lower rank, and otherwise a shape-`(0,)` array.
+    `lapack_driver` is accepted and ignored.
     """
-    driver = lapack_driver or lstsq.default_lapack_driver
-    if driver not in ("gelsd", "gelsy", "gelss"):
-        raise ValueError(f'LAPACK driver "{driver}" is not found')
     a = np.asarray(a)
     b = np.asarray(b)
     if a.shape[0] != b.shape[0]:
@@ -657,14 +642,7 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
     s_inv = np.where(large, 1.0 / safe, 0.0)
     utb = np.swapaxes(u, -1, -2) @ b2
     x = np.swapaxes(vt, -1, -2) @ (s_inv[:, None] * utb)
-    singular_values = None if driver == "gelsy" else s
-    # LAPACK's `gelsy` never reports residuals; `gelsd`/`gelss` report the sum of squared
-    # residuals, reduced fully for a 1-D `b`, only for a full-column-rank overdetermined system
-    # (`m > n and rank == n`); an overdetermined but rank-deficient system reports NaN, and an
-    # underdetermined or square one reports an empty array, as SciPy's own does.
-    if driver == "gelsy":
-        residues = np.empty(0, dtype=dtype)
-    elif m > n and rank == n:
+    if m > n and rank == n:
         sq = np.sum((b2 - a @ x) ** 2, axis=0)
         residues = sq[0] if is_1d else sq
     elif m > n:
@@ -673,10 +651,7 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
         residues = np.empty(0, dtype=dtype)
     if is_1d:
         x = x[:, 0]
-    return x, residues, rank, singular_values
-
-
-lstsq.default_lapack_driver = "gelsd"
+    return x, residues, rank, s
 
 
 def pinv(a, atol=None, rtol=None, return_rank=False, check_finite=True):

@@ -178,9 +178,6 @@ def test_qr_modes():
     close(q2.T @ q2, np.eye(2))
     assert [x.shape for x in sl.qr(R)] == [(3, 3), (3, 2)]
     assert [x.shape for x in sl.qr(R, mode="economic")] == [(3, 2), (2, 2)]
-    (h, tau), r3 = sl.qr(G, mode="raw")
-    assert h.shape == G.shape
-    close(r3, r[:3])
 
 
 def test_eig_and_eigvals_satisfy_the_eigenvector_equation():
@@ -223,12 +220,9 @@ def test_svd_and_svdvals():
     assert [x.shape for x in sl.svd(R, full_matrices=False)] == [(3, 2), (2,), (2, 2)]
     assert [x.shape for x in sl.svd(R)] == [(3, 3), (2,), (2, 2)]
     close(sl.svd(R, compute_uv=False), [9.525518091565107, 0.5143005806586443])
-    with pytest.raises(ValueError):
-        sl.svd(G, lapack_driver="bogus")
 
 
 def test_least_squares_and_pseudo_inverses():
-    assert sl.lstsq.default_lapack_driver == "gelsd"
     x, residues, rank, singular = sl.lstsq(np.array([[1.0, 1.0], [1.0, 2.0], [1.0, 3.0]]), np.array([1.0, 2.0, 2.0]))
     close(x, [0.6666666666666663, 0.5000000000000002])
     assert residues.shape == ()
@@ -242,13 +236,8 @@ def test_least_squares_and_pseudo_inverses():
     x, residues, rank, _ = sl.lstsq(R, target)
     assert residues.shape == (2,) and rank == 2
     close(residues, np.sum((R @ x - target) ** 2, axis=0))
-    x, residues, rank, singular = sl.lstsq(R, b, lapack_driver="gelsy")
-    close(R @ x, b, atol=1e-7)
-    assert residues.shape == (0,) and rank == 2 and singular is None
     with pytest.raises(ValueError):
         sl.lstsq(np.ones((3, 2)), np.ones(2))
-    with pytest.raises(ValueError):
-        sl.lstsq(np.ones((3, 2)), np.ones(3), lapack_driver="bogus")
     close(
         sl.pinv(R),
         [[-1.3333333333333337, -0.33333333333333287, 0.6666666666666665], [1.0833333333333335, 0.3333333333333329, -0.4166666666666665]],
@@ -328,10 +317,8 @@ INVALID_INPUT = {
     "eigh_subset": (lambda: sl.eigh(np.eye(3), subset_by_index=[2, 5]), ValueError),
     "eig_nonsquare": (lambda: sl.eig(np.ones((2, 3))), ValueError),
     "lstsq_shapes": (lambda: sl.lstsq(np.ones((3, 2)), np.ones(2)), ValueError),
-    "lstsq_driver": (lambda: sl.lstsq(np.ones((3, 2)), np.ones(3), lapack_driver="bogus"), ValueError),
     "expm_nonsquare": (lambda: sl.expm(np.ones((2, 3))), sl.LinAlgError),
     "qr_mode": (lambda: sl.qr(G, mode="bogus"), ValueError),
-    "svd_driver": (lambda: sl.svd(G, lapack_driver="bogus"), ValueError),
 }
 
 

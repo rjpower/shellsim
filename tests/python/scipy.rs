@@ -78,7 +78,7 @@ fn unsupported_scipy_features_fail_explicitly() {
         ("from scipy.linalg import blas", "ImportError"),
         (
             "import scipy.linalg as sl\nsl.qr(np.eye(3), pivoting=True)",
-            "scipy.linalg.qr(pivoting=True) is not supported by shellsim's SciPy",
+            "NotImplementedError",
         ),
         (
             "import scipy.linalg as sl\nsl.eig(np.eye(3), b=np.eye(3))",
