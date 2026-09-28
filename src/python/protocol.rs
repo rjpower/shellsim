@@ -155,11 +155,6 @@ pub fn exception_args(heap: &Heap, value: &Value) -> Result<Option<(String, Vec<
 /// `args`: empty without arguments, the `str()` of a single argument, whose `repr()` a
 /// `KeyError` shows because the argument is a key, and otherwise the `repr()` of the tuple.
 fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, String> {
-    if super::exception_types::exception_is_subclass(kind, "AxisError") {
-        if let Some(message) = axis_error_message(heap, args)? {
-            return Ok(message);
-        }
-    }
     match args {
         [] => Ok(String::new()),
         [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
@@ -174,28 +169,6 @@ fn exception_message(heap: &Heap, kind: &str, args: &[Value]) -> Result<String, 
             Ok(format!("({})", values.join(", ")))
         }
     }
-}
-
-/// NumPy's `AxisError(axis, ndim, msg_prefix=None)` message. Other argument lists, such as a
-/// single message, print as they do for any exception.
-fn axis_error_message(heap: &Heap, args: &[Value]) -> Result<Option<String>, String> {
-    let (axis, ndim, prefix) = match args {
-        [axis, ndim] => (axis, ndim, None),
-        [axis, ndim, prefix] => (axis, ndim, Some(prefix).filter(|prefix| !prefix.is_none())),
-        _ => return Ok(None),
-    };
-    if ndim.is_none() {
-        return Ok(None);
-    }
-    let message = format!(
-        "axis {} is out of bounds for array of dimension {}",
-        display(heap, axis)?,
-        display(heap, ndim)?
-    );
-    Ok(Some(match prefix {
-        Some(prefix) => format!("{}: {message}", display(heap, prefix)?),
-        None => message,
-    }))
 }
 
 /// The builtin value behind an instance of a subclass of a builtin type such as `int` or

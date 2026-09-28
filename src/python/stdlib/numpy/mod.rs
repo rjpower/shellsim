@@ -226,8 +226,6 @@ macro_rules! exception_types {
 exception_types! {
     axis_error => "AxisError";
     linalg_error => "LinAlgError";
-    ufunc_type_error => "UFuncTypeError";
-    dtype_promotion_error => "DTypePromotionError";
     complex_warning => "ComplexWarning";
 }
 
@@ -342,8 +340,6 @@ static VALUES: &[ValueDef] = module_values!(
         bool_scalar("False_", false),
         factory("_AxisError", axis_error),
         factory("_LinAlgError", linalg_error),
-        factory("_UFuncTypeError", ufunc_type_error),
-        factory("_DTypePromotionError", dtype_promotion_error),
         factory("_ComplexWarning", complex_warning),
     ],
     [

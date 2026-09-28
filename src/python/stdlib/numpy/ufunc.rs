@@ -202,8 +202,7 @@ pub(in crate::python) enum ObjectLoop {
     Square,
     /// `1 / x` (`Py_reciprocal`).
     Reciprocal,
-    /// The first operand if it compares `>=` to the second, else the second
-    /// (`npy_ObjectMax`).
+    /// The first operand if it compares `>=` to the second, else the second.
     Max,
     /// The first operand if it compares `<=` to the second, else the second.
     Min,
@@ -215,7 +214,7 @@ pub(in crate::python) enum ObjectLoop {
     Not,
     /// `-1`, `1` or `0` by comparison with `0`.
     Sign,
-    /// A `math` module function, as `npy_ObjectFloor` calls `math.floor`.
+    /// A `math` module function, such as `math.floor` for `floor`'s object loop.
     Math(&'static str),
     /// `x.name()` or `x.name(y)`, for the ufunc's `name`.
     Method,
@@ -1060,41 +1059,19 @@ pub(in crate::python) fn common_dtype(operands: &[Operand]) -> PyResult<DType> {
     dtype::result_type(&strong, &weak)
 }
 
-/// A missing-loop error with NumPy's text.
+/// A `TypeError` for a ufunc with no registered loop accepting `inputs`.
 fn no_loop(name: &str, inputs: &[DType]) -> PyError {
     let types = inputs
         .iter()
-        .map(|dtype| format!("dtype('{}')", dtype.display()))
+        .map(|dtype| dtype.repr())
         .collect::<Vec<_>>()
         .join(", ");
-    let rendered = if inputs.len() == 1 {
-        format!("<class 'numpy.dtypes.{}DType'>", class_name(inputs[0]))
-    } else {
-        format!("({types})")
-    };
-    PyError::exception(
-        "UFuncTypeError",
-        format!(
-        "ufunc '{name}' did not contain a loop with signature matching types {rendered} -> None"
-    ),
-    )
+    PyError::type_error(format!("ufunc '{name}' not supported for dtypes ({types})"))
 }
 
-fn class_name(dtype: DType) -> String {
-    match dtype.kind() {
-        Kind::Bool => "Bool".to_string(),
-        Kind::Str => "Str".to_string(),
-        Kind::Object => "Object".to_string(),
-        kind => {
-            let name = kind.name();
-            format!("{}{}", name[..1].to_uppercase(), &name[1..])
-        }
-    }
-}
-
-/// NumPy's error for a ufunc that mixes `str` with numbers, which share no loop. Comparisons
-/// name the operands' DType classes, since their promoter fails before a loop is chosen;
-/// arithmetic names concrete dtypes; and `multiply` by an integer points to `numpy.strings`.
+/// A ufunc that mixes `str` with numbers shares no loop for either type. `multiply` by an
+/// integer gets a more specific message pointing at `numpy.strings`, since that combination has
+/// its own dedicated replacement; every other mix falls through to [`no_loop`].
 fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
     let kind = |operand: &Operand| operand.dtype().map(DType::kind);
     let strings = operands
@@ -1124,32 +1101,6 @@ fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
              numpy.strings.multiply to multiply strings without specifying 'out'.",
         ));
     }
-    if matches!(ufunc.family, Family::Compare(_)) {
-        let classes = operands
-            .iter()
-            .map(|operand| {
-                let class = match operand {
-                    Operand::Array(array) => format!("{}DType", class_name(array.dtype)),
-                    Operand::Weak { weak, .. } => match weak {
-                        Weak::Bool => "BoolDType",
-                        Weak::Int => "_PyLongDType",
-                        Weak::Float => "_PyFloatDType",
-                        Weak::Complex => "_PyComplexDType",
-                    }
-                    .to_string(),
-                };
-                format!("<class 'numpy.dtypes.{class}'>")
-            })
-            .collect::<Vec<_>>();
-        return Some(PyError::exception(
-            "UFuncTypeError",
-            format!(
-                "ufunc '{}' did not contain a loop with signature matching types ({}) -> None",
-                ufunc.name,
-                classes.join(", ")
-            ),
-        ));
-    }
     let dtypes = operands
         .iter()
         .map(|operand| match operand {
@@ -1160,13 +1111,11 @@ fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
     Some(no_loop(ufunc.name, &dtypes))
 }
 
-/// NumPy's type-resolver error when no loop accepts the inputs. It is a plain `TypeError`,
-/// unlike the `UFuncTypeError` subclasses that casting and loop lookup raise.
+/// A `TypeError` for a ufunc whose resolver categorically rejects the input dtype (for example
+/// a complex operand to a real-only function), as opposed to [`no_loop`]'s dtype-combination
+/// mismatch.
 fn not_supported(name: &str) -> PyError {
-    PyError::type_error(format!(
-        "ufunc '{name}' not supported for the input types, and the inputs could not be safely \
-         coerced to any supported types according to the casting rule ''safe''"
-    ))
+    PyError::type_error(format!("ufunc '{name}' not supported for the input types"))
 }
 
 /// Loop and output dtypes chosen for one call.
@@ -1417,16 +1366,13 @@ pub(in crate::python) fn evaluate(
     if options.dtype.is_some() {
         for (position, dtype) in input_dtypes.iter().enumerate() {
             if !dtype::can_cast(*dtype, resolved.input, casting) {
-                return Err(PyError::exception(
-                    "UFuncTypeError",
-                    format!(
+                return Err(PyError::type_error(format!(
                     "Cannot cast ufunc '{}' input {position} from {} to {} with casting rule '{}'",
                     ufunc.name,
                     dtype.repr(),
                     resolved.input.repr(),
                     casting.name()
-                ),
-                ));
+                )));
             }
         }
     }
@@ -1561,16 +1507,13 @@ fn check_output_cast(
     if dtype::can_cast(output, out.dtype, casting) {
         return Ok(());
     }
-    Err(PyError::exception(
-        "UFuncTypeError",
-        format!(
-            "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
-            ufunc.name,
-            output.repr(),
-            out.dtype.repr(),
-            casting.name()
-        ),
-    ))
+    Err(PyError::type_error(format!(
+        "Cannot cast ufunc '{}' output from {} to {} with casting rule '{}'",
+        ufunc.name,
+        output.repr(),
+        out.dtype.repr(),
+        casting.name()
+    )))
 }
 
 /// `np.divmod(x1, x2)`: `(floor_divide(x1, x2), remainder(x1, x2))` from one pass of NumPy's
@@ -2738,8 +2681,8 @@ pub(in crate::python) fn slot_not_equal(
 }
 
 /// `==` and `!=` on arrays. When the operands share no comparison loop, such as a string array
-/// and a number, NumPy's `array_richcompare` answers "unequal" everywhere instead of raising;
-/// operands that do not broadcast still raise.
+/// and a number, shellsim answers "unequal" everywhere instead of raising; operands that do not
+/// broadcast still raise.
 fn equality(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
@@ -2754,10 +2697,10 @@ fn equality(
         Ok(value) => return Ok(Some(value)),
         Err(error) => error,
     };
-    if !matches!(
-        error.kind,
-        PyErrorKind::Exception("UFuncTypeError" | "DTypePromotionError")
-    ) {
+    // `left` and `right` are already prepared operands (arrays or weak scalars) applied with
+    // fixed, dtype-less options, so the only `TypeError` this call can raise is a missing
+    // comparison loop or dtype-promotion failure, never an unrelated one.
+    if error.kind != PyErrorKind::Type {
         return Err(error);
     }
     let (left, right) = (

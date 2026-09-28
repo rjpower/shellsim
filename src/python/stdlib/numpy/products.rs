@@ -693,31 +693,24 @@ fn matmul_values(
         }
     }
     let common = product_dtype(a.dtype, b.dtype, || {
-        PyError::exception(
-            "UFuncTypeError",
-            format!(
-                "ufunc 'matmul' did not contain a loop with signature matching types ({}, {}) \
-                 -> None",
-                a.dtype.repr(),
-                b.dtype.repr()
-            ),
-        )
+        PyError::type_error(format!(
+            "matmul not supported for dtypes ({}, {})",
+            a.dtype.repr(),
+            b.dtype.repr()
+        ))
     })?;
     let dtype = match requested {
         None => common,
         Some((dtype, casting)) => {
             for (position, operand) in [&a, &b].into_iter().enumerate() {
                 if !dtype::can_cast(operand.dtype, dtype, casting) {
-                    return Err(PyError::exception(
-                        "UFuncTypeError",
-                        format!(
-                            "Cannot cast ufunc 'matmul' input {position} from {} to {} with \
-                             casting rule '{}'",
-                            operand.dtype.repr(),
-                            dtype.repr(),
-                            casting.name()
-                        ),
-                    ));
+                    return Err(PyError::type_error(format!(
+                        "Cannot cast ufunc 'matmul' input {position} from {} to {} with \
+                         casting rule '{}'",
+                        operand.dtype.repr(),
+                        dtype.repr(),
+                        casting.name()
+                    )));
                 }
             }
             dtype
@@ -789,15 +782,12 @@ fn matmul_values(
         )));
     }
     if !dtype::can_cast(result.dtype, out.dtype, casting) {
-        return Err(PyError::exception(
-            "UFuncTypeError",
-            format!(
-                "Cannot cast ufunc 'matmul' output from {} to {} with casting rule '{}'",
-                result.dtype.repr(),
-                out.dtype.repr(),
-                casting.name()
-            ),
-        ));
+        return Err(PyError::type_error(format!(
+            "Cannot cast ufunc 'matmul' output from {} to {} with casting rule '{}'",
+            result.dtype.repr(),
+            out.dtype.repr(),
+            casting.name()
+        )));
     }
     array::assign(runtime, &out, &result)?;
     Ok(out.value())

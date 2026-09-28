@@ -32,9 +32,7 @@ from _numpy import (
     _AxisError,
     _c_contiguous,
     _ComplexWarning,
-    _DTypePromotionError,
     _LinAlgError,
-    _UFuncTypeError,
     _writeable,
 )
 from _numpy_io import *

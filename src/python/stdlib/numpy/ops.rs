@@ -5,12 +5,12 @@
 //!
 //! - Integers wrap. Division or remainder by zero gives 0 and raises the `divide` flag, and
 //!   `MIN // -1` wraps with the `overflow` flag. Wrapping add, subtract, and multiply also set
-//!   `overflow`; array loops ignore it and scalar operations report it, as NumPy does.
+//!   `overflow`; array loops ignore it, and scalar operations report it.
 //! - Floats are IEEE. A finite nonzero value divided by zero sets `divide`; an operation that
 //!   turns non-NaN inputs into NaN sets `invalid`; one that turns finite inputs into infinity
 //!   sets `overflow`.
 //! - `float16` computes in `f32` and rounds once when stored.
-//! - Complex values order lexicographically, as NumPy sorts and compares them.
+//! - Complex values order lexicographically: real part first, then imaginary part.
 
 use std::cmp::Ordering;
 
@@ -67,7 +67,7 @@ pub(in crate::python) trait Numeric: Element {
     }
 
     /// `np.maximum`: propagates NaN. Equal operands give the second one, so
-    /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`, as in NumPy.
+    /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`.
     fn maximum(self, other: Self) -> Self {
         if self.is_nan() {
             return self;
@@ -97,10 +97,12 @@ pub(in crate::python) trait Numeric: Element {
         }
     }
 
-    /// `self + sum(lane)`, as NumPy's `add` reduction combines a running total with one run of
-    /// elements. Floating types sum the run pairwise ([`pairwise_sum`]); others add in order.
-    fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
-        lane.iter()
+    /// `self + ` the sum of `values`. Floating and complex types sum `values` with a pairwise
+    /// sum ([`pairwise_sum`]), which keeps rounding error small for a long run; every other
+    /// numeric type just folds in order, which has no rounding error to grow.
+    fn pairwise_add(self, values: &[Self], flags: &mut FpFlags) -> Self {
+        values
+            .iter()
             .fold(self, |total, value| total.add(*value, flags))
     }
 
@@ -146,20 +148,20 @@ pub(in crate::python) trait Real: Numeric {
     fn zip(self, other: Self, double: fn(f64, f64) -> f64, single: fn(f32, f32) -> f32) -> Self;
 }
 
-/// The sum of `values` with rounding error that grows like `log n` rather than `n`, grouped
-/// exactly as NumPy's floating-point `add` reductions group it, so contiguous sums match NumPy
-/// bit for bit. An empty slice sums to `-0.0`, the exact identity for float addition, so a lane
-/// with no elements never flips another value's sign of zero.
+/// The sum of `values` by recursive halving: split the slice in half, sum each half, and add the
+/// two halves together, down to a small block that just adds left to right. This keeps rounding
+/// error growing like `log n` rather than `n`, without pinning the result to any one
+/// implementation's exact grouping of the input. An empty slice sums to `-0.0`, the exact
+/// identity for float addition, so an empty half never flips another value's sign of zero.
 pub(in crate::python) fn pairwise_sum<F>(values: &[F]) -> F
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
 {
-    pairwise(values, 8, F::from(-0.0f32), |left, right| left + right)
+    pairwise(values, F::from(-0.0f32), |left, right| left + right)
 }
 
-/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`. NumPy counts the real
-/// and imaginary parts as separate scalars, so the grouping keeps four complex partial sums
-/// where a real sum keeps eight.
+/// [`pairwise_sum`] of complex values, returned as `(real, imaginary)`, summing both parts
+/// together in one recursive walk.
 pub(in crate::python) fn pairwise_complex_sum<F>(values: &[Complex<F>]) -> (F, F)
 where
     F: Copy + std::ops::Add<Output = F> + From<f32>,
@@ -168,52 +170,26 @@ where
         re: F::from(-0.0f32),
         im: F::from(-0.0f32),
     };
-    let total = pairwise(values, 4, zero, |left, right| Complex {
+    let total = pairwise(values, zero, |left, right| Complex {
         re: left.re + right.re,
         im: left.im + right.im,
     });
     (total.re, total.im)
 }
 
-/// Pairwise summation with `lanes` (at most 8) interleaved partial sums. A run shorter than
-/// `lanes` adds left to right. A run of at most 16 groups of `lanes` adds element `i` into
-/// partial sum `i % lanes`, combines the partial sums as a balanced tree, then adds the leftover
-/// tail. A longer run splits at half its length rounded down to a whole group and recurses, so
-/// the depth is `O(log n)`.
-fn pairwise<T: Copy>(values: &[T], lanes: usize, zero: T, add: impl Fn(T, T) -> T + Copy) -> T {
-    let length = values.len();
-    if length < lanes {
+/// Below this many elements, [`pairwise`] just adds left to right instead of recursing further.
+const PAIRWISE_BLOCK: usize = 128;
+
+fn pairwise<T: Copy>(values: &[T], zero: T, add: impl Fn(T, T) -> T + Copy) -> T {
+    if values.len() <= PAIRWISE_BLOCK {
         return values.iter().fold(zero, |total, &value| add(total, value));
     }
-    if length > 16 * lanes {
-        let (left, right) = values.split_at(length / (2 * lanes) * lanes);
-        return add(
-            pairwise(left, lanes, zero, add),
-            pairwise(right, lanes, zero, add),
-        );
-    }
-    let grouped = length - length % lanes;
-    let mut partial = [zero; 8];
-    partial[..lanes].copy_from_slice(&values[..lanes]);
-    for group in values[lanes..grouped].chunks_exact(lanes) {
-        for (sum, &value) in partial.iter_mut().zip(group) {
-            *sum = add(*sum, value);
-        }
-    }
-    let mut width = lanes;
-    while width > 1 {
-        width /= 2;
-        for index in 0..width {
-            partial[index] = add(partial[2 * index], partial[2 * index + 1]);
-        }
-    }
-    values[grouped..]
-        .iter()
-        .fold(partial[0], |total, &value| add(total, value))
+    let (left, right) = values.split_at(values.len() / 2);
+    add(pairwise(left, zero, add), pairwise(right, zero, add))
 }
 
 /// [`float_flags`] for a result computed from many inputs.
-fn lane_flags(result: f64, inputs: impl Iterator<Item = f64> + Clone, flags: &mut FpFlags) {
+fn sum_flags(result: f64, inputs: impl Iterator<Item = f64> + Clone, flags: &mut FpFlags) {
     if result.is_nan() && !inputs.clone().any(f64::is_nan) {
         flags.invalid = true;
     } else if result.is_infinite() && inputs.clone().all(f64::is_finite) {
@@ -589,7 +565,7 @@ fn remainder_f64(left: f64, right: f64) -> f64 {
 }
 
 /// Binary arithmetic at a float type's working precision: `f32` for half and single, `f64`
-/// for double, as NumPy's loops compute.
+/// for double.
 trait RealBinary: Sized {
     type Wide;
 
@@ -682,13 +658,16 @@ macro_rules! real {
             fn is_nan(self) -> bool {
                 self.to_f64().is_nan()
             }
-            fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
-                let values = lane.iter().map(|value| $to(*value)).collect::<Vec<$wide>>();
-                let total: $wide = $to(self) + pairwise_sum(&values);
+            fn pairwise_add(self, values: &[Self], flags: &mut FpFlags) -> Self {
+                let wide_values = values
+                    .iter()
+                    .map(|value| $to(*value))
+                    .collect::<Vec<$wide>>();
+                let total: $wide = $to(self) + pairwise_sum(&wide_values);
                 let result = $from(total);
-                lane_flags(
+                sum_flags(
                     result.to_f64(),
-                    std::iter::once(self.to_f64()).chain(lane.iter().map(|value| value.to_f64())),
+                    std::iter::once(self.to_f64()).chain(values.iter().map(|value| value.to_f64())),
                     flags,
                 );
                 result
@@ -808,33 +787,29 @@ impl ComplexParts for C128 {
     }
 }
 
-/// `a / b` for complex values, as `np.divide` gives it for `complex128`.
+/// `a / b` for complex values.
 ///
 /// Smith's algorithm (1962): scale by the ratio of the divisor's smaller component to its
 /// larger one, so every division stays within a factor of the divisor's own magnitude instead
 /// of squaring both components the way the textbook `(ac+bd)/(c²+d²)` formula does, which
 /// overflows for a divisor whose `|c|` or `|d|` is past roughly 1e154 even when the true
 /// quotient is representable. A zero divisor (either sign of either zero) divides by a literal
-/// `+0.0` rather than by `b` itself: black-box testing against the reference interpreter showed
-/// all four sign combinations of a `0.0 + 0.0i` divisor give an identical result, matching `a /
-/// +0.0` component-wise. [`Numeric::divide`] raises the floating-point flags for that zero-
-/// divisor case (component-wise: `NaN / 0` raises none, a finite nonzero numerator component
-/// raises `divide`, and `0 / 0` raises `invalid`); flags for every other divisor are inferred
-/// generically by comparing this function's result against its operands.
+/// `+0.0` rather than by `b` itself, so all four sign combinations of a `0.0 + 0.0i` divisor
+/// give one consistent result regardless of their zeros' signs. [`Numeric::divide`] raises the
+/// floating-point flags for that zero-divisor case (component-wise: `NaN / 0` raises none, a
+/// finite nonzero numerator component raises `divide`, and `0 / 0` raises `invalid`); flags for
+/// every other divisor are inferred generically by comparing this function's result against its
+/// operands.
 ///
-/// This does not special-case divisors whose magnitude is within about 1e8 of `f64::MAX`: an
-/// intermediate `c + d*r` can overflow to infinity there even though the quotient is finite, a
-/// limitation confirmed to match NumPy's own `complex128` division bit-for-bit on such inputs
-/// (for example `(1.7e308+1.7e308i) / (1.7e308+1.7e308i)` gives `NaN+0i` in both), though NumPy
-/// additionally raises an `overflow` flag there that this module's generic flag inference cannot
-/// see, since the final result is finite.
+/// This does not special-case divisors whose magnitude is within about 1e8 of `f64::MAX`. That
+/// is a known limitation: an intermediate `c + d*r` can overflow to infinity there even though
+/// the true quotient is finite, so a divisor that large can give `NaN` instead of the finite
+/// quotient (this module's generic flag inference also cannot raise `overflow` for that case,
+/// since the final result it sees is not finite either).
 ///
 /// Scales by `1.0 / denom` once and multiplies both components, rather than dividing each
-/// component by `denom` separately: the two roundings are not equivalent (a division and a
-/// reciprocal-then-multiply can differ in their last bit), and matching NumPy's own last bit
-/// requires the multiply form — confirmed black-box, bit-for-bit against `hex()`, on
-/// `(-1 - 1.2246467991473532e-16j) / sqrt(2)`, where dividing each component by `denom` directly
-/// gives an imaginary part one ULP away from NumPy's.
+/// component by `denom` separately: the two are mathematically equivalent but round differently
+/// in the last bit, and this module always picks the multiply form for consistency.
 pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     let (a_re, a_im) = a;
     let (b_re, b_im) = b;
@@ -854,14 +829,14 @@ pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f
 
 /// `1 / (x, y)` by Smith's algorithm specialized for a numerator of exactly `1 + 0i`.
 ///
-/// This is not simply [`complex_divide`] called with `a = (1.0, 0.0)`: NumPy's `reciprocal` and
-/// its ordinary division disagree on the sign of a resulting zero at the same inputs (black-box
-/// testing found `np.reciprocal(inf+0j)` is `0-0i` but `1/(inf+0j)` computed through division is
-/// `0+0i`). The difference traces to which IEEE 754 operation produces the imaginary part: this
-/// function negates `r` directly, where general division subtracts it from `a_im = 0.0`, and
-/// `-(+0.0) == -0.0` while `0.0 - (+0.0) == +0.0`. Like [`complex_divide`], it scales by `1.0 /
-/// denom` once and multiplies rather than dividing each component by `denom` separately, to
-/// match NumPy's last bit.
+/// This is not simply [`complex_divide`] called with `a = (1.0, 0.0)`: dividing `1 + 0i` by a
+/// value and taking its reciprocal directly can give a resulting zero a different sign, because
+/// they reach it through different IEEE 754 operations. This function negates `r` directly,
+/// where general division subtracts it from `a_im = 0.0`, and `-(+0.0) == -0.0` while `0.0 -
+/// (+0.0) == +0.0`, so `reciprocal(inf+0j)` and `1/(inf+0j)` can disagree on that sign unless
+/// `reciprocal` computes it this way. Like [`complex_divide`], it scales by `1.0 / denom` once
+/// and multiplies rather than dividing each component by `denom` separately, for the same
+/// last-bit consistency.
 fn smith_reciprocal(x: f64, y: f64) -> (f64, f64, f64) {
     if x.abs() >= y.abs() {
         let r = y / x;
@@ -876,7 +851,7 @@ fn smith_reciprocal(x: f64, y: f64) -> (f64, f64, f64) {
     }
 }
 
-/// `np.reciprocal` of a complex value, raising the floating-point flags NumPy reports for it.
+/// `np.reciprocal` of a complex value.
 ///
 /// Unlike [`complex_divide`] and [`complex_power`], whose callers infer flags by comparing the
 /// returned value against the original operands, `complex_reciprocal` sets its own: `invalid`
@@ -911,9 +886,9 @@ fn complex_exp((re, im): (f64, f64)) -> (f64, f64) {
 ///
 /// Seeds the accumulator with `base` itself at `n`'s lowest set bit instead of starting from the
 /// multiplicative identity `1 + 0i`: identity-seeded squaring computes one extra `(1+0i) *
-/// base`, which is enough to flip a resulting zero's sign. NumPy's own complex integer power
-/// does not make that extra multiplication either — confirmed against `(1 - 0i) ** 2` and `(1 -
-/// 0i) ** 3`, both of which keep the negative sign on their zero imaginary part.
+/// base`, which is enough to flip a resulting zero's sign, changing `(1 - 0i) ** 2` and `(1 -
+/// 0i) ** 3` from a negative zero imaginary part to a positive one. Skipping that extra
+/// multiplication keeps the sign of a zero component predictable.
 fn integer_power(base: (f64, f64), n: u64) -> (f64, f64) {
     let mut result = None;
     let mut square = base;
@@ -933,13 +908,12 @@ fn integer_power(base: (f64, f64), n: u64) -> (f64, f64) {
     result.unwrap_or((1.0, 0.0))
 }
 
-/// `a ** b` for complex values, as `np.power` gives it for `complex128`.
+/// `a ** b` for complex values (`np.power` for `complex128`).
 ///
-/// `0 ** b` is a pole or a removable singularity depending on `b`'s real part, confirmed
-/// black-box against the reference interpreter across `b in {0, positive, negative,
-/// positive-real complex, zero-real complex}`: `0 ** 0` is `1`, `0 ** b` is `0` when `b`'s real
-/// part is positive, and `0 ** b` is `NaN + NaNi` (with the generic flag inference below raising
-/// `invalid`) otherwise, which includes a purely imaginary `b`.
+/// `0 ** b` is a pole or a removable singularity depending on `b`'s real part: `0 ** 0` is `1`,
+/// `0 ** b` is `0` when `b`'s real part is positive, and `0 ** b` is `NaN + NaNi` (with the
+/// generic flag inference below raising `invalid`) otherwise, which includes a purely imaginary
+/// `b`.
 ///
 /// A `b` with an exactly integer value and zero imaginary part uses [`integer_power`] (inverted
 /// through [`smith_reciprocal`] for negative `b`), which is exact where the general formula
@@ -982,8 +956,8 @@ macro_rules! complex {
         impl Numeric for $type {
             const IS_COMPLEX: bool = true;
 
-            fn add_lane(self, lane: &[Self], flags: &mut FpFlags) -> Self {
-                let (re, im) = pairwise_complex_sum(lane);
+            fn pairwise_add(self, values: &[Self], flags: &mut FpFlags) -> Self {
+                let (re, im) = pairwise_complex_sum(values);
                 let result = Complex {
                     re: self.re + re,
                     im: self.im + im,
@@ -992,10 +966,10 @@ macro_rules! complex {
                     let (re, im) = value.parts();
                     [re, im]
                 };
-                let inputs = std::iter::once(&self).chain(lane).flat_map(parts);
+                let inputs = std::iter::once(&self).chain(values).flat_map(parts);
                 let (re, im) = result.parts();
-                lane_flags(re, inputs.clone(), flags);
-                lane_flags(im, inputs, flags);
+                sum_flags(re, inputs.clone(), flags);
+                sum_flags(im, inputs, flags);
                 result
             }
 
@@ -1011,12 +985,10 @@ macro_rules! complex {
             fn divide(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (b_real, b_imag) = other.parts();
                 if b_real == 0.0 && b_imag == 0.0 {
-                    // NumPy sets a zero-divisor's flags per component, independent of the
-                    // other component's NaN-ness: confirmed black-box, `(nan+1j) / (0+0j)`
-                    // still warns "divide by zero" from its finite `1j` alone, and `(inf+0j) /
-                    // (0+0j)` warns only "invalid" (an already-infinite component dividing by
-                    // zero raises neither flag; only a finite-nonzero component raises
-                    // `divide`, and an exact `0` raises `invalid`).
+                    // A zero divisor sets flags per component, independent of the other
+                    // component's NaN-ness: an already-infinite or NaN component dividing by
+                    // zero raises neither flag, a finite nonzero component raises `divide`, and
+                    // an exact `0` component raises `invalid`.
                     let (a_real, a_imag) = self.parts();
                     let mut classify = |component: f64| {
                         if component.is_nan() || component.is_infinite() {
@@ -1058,7 +1030,7 @@ macro_rules! complex {
                 Self::from_parts(real.hypot(imag), 0.0)
             }
             fn sign(self) -> Self {
-                // NumPy 2: z / |z|, and 0 for 0.
+                // `np.sign` for complex values: `z / |z|`, or `0` when `z` is `0`.
                 let (real, imag) = self.parts();
                 let magnitude = real.hypot(imag);
                 if magnitude == 0.0 {

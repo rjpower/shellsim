@@ -14,10 +14,9 @@
 //! casts the result to `float32` only when every real operand was `float32`, rounding once. This
 //! is simpler than running parallel single- and double-precision kernels and, because it uses
 //! more precision than the target rather than less, cannot make results less accurate; see
-//! `docs/numpy.md` for the resulting (deliberate) difference from NumPy's own single-precision
-//! LAPACK calls. `float16` is rejected with NumPy's own message, and complex *input* is rejected
-//! as an explicit unsupported feature, both as real NumPy's `numpy.linalg` module does or as
-//! `docs/numpy.md` documents; `eig`'s own *output* is complex, same as real NumPy's.
+//! `docs/numpy.md` for the resulting (deliberate) difference from real NumPy's single-precision
+//! LAPACK calls. `float16` and complex *input* are both rejected as unsupported (see
+//! `docs/numpy.md`); `eig`'s *output* is still complex, matching `numpy.linalg.eig`.
 
 pub(in crate::python) mod dense;
 
