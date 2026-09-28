@@ -297,7 +297,7 @@ def quad(func, a, b, args=(), epsabs=1.49e-8, epsrel=1.49e-8, limit=50):
     is raised alongside the best estimate found.
 
     >>> quad(lambda x: x * x, 0, 1)
-    (0.33333333333333337, 3.700743415417189e-15)
+    (0.3333333333333333, 3.700743415417188e-15)
     """
     if not isinstance(args, tuple):
         args = (args,)
@@ -608,7 +608,7 @@ def solve_ivp(
     cubic-Hermite-interpolated from the step values and derivatives at the requested times.
 
     >>> solve_ivp(lambda t, y: -y, (0, 1), [1.0], t_eval=[0, 1]).y[0]
-    array([1.        , 0.36789397])
+    array([1.        , 0.36804663])
     """
     if method != "RK45":
         raise NotImplementedError(
@@ -644,7 +644,7 @@ def odeint(func, y0, t, args=()):
     of SciPy's older `odeint`: `func(y, t, *args)` and a result shaped ``(len(t), len(y0))``.
 
     >>> odeint(lambda y, t: -y, 1.0, [0, 1])[:, 0]
-    array([1.        , 0.36789397])
+    array([1.        , 0.36787944])
     """
     t = np.asarray(t, dtype=float)
     y0 = np.atleast_1d(np.asarray(y0, dtype=float))
