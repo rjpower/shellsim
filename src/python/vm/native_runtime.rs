@@ -426,6 +426,23 @@ impl PyRuntime for Vm<'_> {
         Vm::charge_cpu(self, units).map_err(PyError::resource_error)
     }
 
+    fn class_of(&self, value: &Value) -> PyResult<Value> {
+        self.type_of(value).map_err(PyError::runtime_error)
+    }
+
+    fn dictionary_of(&mut self, value: Value) -> PyResult<Option<Value>> {
+        Vm::dictionary_of(self, value).map_err(PyError::resource_error)
+    }
+
+    fn type_metadata(
+        &mut self,
+        value: Value,
+        field: super::super::native::TypeMetadata,
+    ) -> PyResult<Option<Value>> {
+        Vm::type_metadata(self, value, field)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn kind(&self, value: &Value) -> PyResult<PyKind> {
         if value.inline_string_len().is_some() {
             return Ok(PyKind::String);

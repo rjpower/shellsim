@@ -348,11 +348,7 @@ impl Vm<'_> {
         symbol: Option<SymbolId>,
         name: &str,
     ) -> Result<Option<Value>, String> {
-        let found = self.lookup_attribute(owner, symbol, name)?;
-        if found.is_none() && name == "__class__" {
-            return self.type_of(&owner).map(Some);
-        }
-        Ok(found)
+        self.lookup_attribute(owner, symbol, name)
     }
 
     fn call_type_getattr_hook(
@@ -377,11 +373,21 @@ impl Vm<'_> {
         symbol: Option<SymbolId>,
         name: &str,
     ) -> Result<Option<Value>, String> {
-        if let Some(NativeValue::Module(module)) = owner.native_value() {
-            if name == "__dict__" {
-                let proxy = Object::MappingProxy(ProxyTarget::NativeModule(module));
-                return self.allocate_object(proxy).map(Some);
+        // A metatype data descriptor wins over a class's own MRO, for native and user classes.
+        if self.class_type_id(&owner)?.is_some() {
+            let metatype = self.type_id(&owner)?;
+            if let Some((defining_type, descriptor)) = self.type_lookup(metatype, name)? {
+                if self.is_data_descriptor(&descriptor)? {
+                    return self.bind_type_attribute(
+                        descriptor,
+                        Some(owner),
+                        metatype,
+                        defining_type,
+                    );
+                }
             }
+        }
+        if let Some(NativeValue::Module(module)) = owner.native_value() {
             if let Some(function) = module.function(name) {
                 return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
             }
@@ -462,10 +468,6 @@ impl Vm<'_> {
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::Module { scope, .. } => {
-                    if name == "__dict__" {
-                        let namespace = Object::NamespaceDict(NamespaceTarget::Scope(scope));
-                        return self.allocate_object(namespace).map(Some);
-                    }
                     if let Some(value) = self.state.heap.scope_get(scope, name).copied() {
                         return Ok(Some(value));
                     }
@@ -495,35 +497,11 @@ impl Vm<'_> {
                         return self.module_name_of(closure);
                     }
                 }
-                Object::Class {
-                    name: class_name, ..
-                } => {
+                Object::Class { .. } => {
                     let class_type = self
                         .class_type_id(&owner)?
                         .ok_or("class has no registered type")?;
                     let metaclass_entry = self.type_lookup(owner_type, name)?;
-                    if let Some((defining_type, descriptor)) = metaclass_entry {
-                        if self.is_data_descriptor(&descriptor)? {
-                            return self.bind_type_attribute(
-                                descriptor,
-                                Some(owner),
-                                owner_type,
-                                defining_type,
-                            );
-                        }
-                    }
-                    if name == "__name__" {
-                        return Ok(Some(self.allocate_string(class_name)?));
-                    }
-                    // `type.__dict__` is a data descriptor, so it wins over the class's own
-                    // attributes. The proxy is read-only; `setattr(cls, ...)` still works.
-                    if name == "__dict__" {
-                        let proxy = Object::MappingProxy(ProxyTarget::Class(id));
-                        return self.allocate_object(proxy).map(Some);
-                    }
-                    if let Some(value) = self.class_metadata(id, name)? {
-                        return Ok(Some(value));
-                    }
                     if let Some((defining_type, descriptor)) = self.type_lookup(class_type, name)? {
                         return self.bind_type_attribute(
                             descriptor,
@@ -561,12 +539,6 @@ impl Vm<'_> {
                     };
                 }
                 Object::Instance { class, .. } => {
-                    // `object.__dict__` is a data descriptor on every class, so it wins over
-                    // anything stored on the instance.
-                    if name == "__dict__" {
-                        let namespace = Object::NamespaceDict(NamespaceTarget::Instance(id));
-                        return self.allocate_object(namespace).map(Some);
-                    }
                     let class_type = self
                         .class_type_id(&Value::Object(class))?
                         .ok_or("instance has no registered class")?;
@@ -656,19 +628,6 @@ impl Vm<'_> {
         let native_name =
             match owner.native_value() {
                 Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
-                // Builtin types and native value kinds record their qualified names, as `repr` shows
-                // them; `__name__` is the last component.
-                Some(NativeValue::BuiltinType(builtin)) if name == "__name__" => {
-                    builtin.name().rsplit('.').next()
-                }
-                Some(NativeValue::ValueKind(kind)) if name == "__name__" => {
-                    kind.name.rsplit('.').next()
-                }
-                Some(NativeValue::ExceptionType(ExceptionType(exception_name)))
-                    if name == "__name__" =>
-                {
-                    Some(exception_name)
-                }
                 Some(NativeValue::Function(builtin)) if name == "__name__" => Some(builtin.name()),
                 Some(NativeValue::NativeFunction(function)) if name == "__name__" => {
                     Some(function.name)
@@ -683,6 +642,83 @@ impl Vm<'_> {
             .map(|name| self.allocate_string(name))
             .transpose()?;
         Ok(value)
+    }
+
+    /// Materialize the live namespace selected by a `__dict__` data descriptor.
+    pub(super) fn dictionary_of(&mut self, owner: Value) -> Result<Option<Value>, String> {
+        let namespace = match owner.native_value() {
+            Some(NativeValue::Module(module)) => {
+                Some(Object::MappingProxy(ProxyTarget::NativeModule(module)))
+            }
+            Some(NativeValue::BuiltinType(builtin)) => Some(Object::MappingProxy(
+                ProxyTarget::RegisteredType(builtin.id()),
+            )),
+            Some(NativeValue::ValueKind(kind)) => {
+                let type_id = self
+                    .state
+                    .types
+                    .value_kind_type_id(kind)
+                    .ok_or("value kind is not registered")?;
+                Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
+            }
+            Some(NativeValue::ExceptionType(_)) => Some(Object::MappingProxy(
+                ProxyTarget::RegisteredType(BuiltinType::Exception.id()),
+            )),
+            _ => match owner.object_id() {
+                Some(id) => match self.state.heap.get(id)? {
+                    Object::Class { .. } => Some(Object::MappingProxy(ProxyTarget::Class(id))),
+                    Object::Instance { .. } => {
+                        Some(Object::NamespaceDict(NamespaceTarget::Instance(id)))
+                    }
+                    Object::Module { scope, .. } => {
+                        Some(Object::NamespaceDict(NamespaceTarget::Scope(*scope)))
+                    }
+                    _ => None,
+                },
+                None => None,
+            },
+        };
+        namespace
+            .map(|namespace| self.allocate_object(namespace))
+            .transpose()
+    }
+
+    /// Return class metadata through `type`'s data descriptors. User classes keep their own
+    /// namespace and MRO; native classes read the same fields from the type registry.
+    pub(super) fn type_metadata(
+        &mut self,
+        owner: Value,
+        field: super::super::native::TypeMetadata,
+    ) -> Result<Option<Value>, String> {
+        use super::super::native::TypeMetadata;
+        if let Some(id) = owner.object_id() {
+            if let Object::Class {
+                name, attributes, ..
+            } = self.state.heap.get(id)?
+            {
+                return match field {
+                    TypeMetadata::Name => self.allocate_string(name.clone()).map(Some),
+                    TypeMetadata::Module => Ok(attributes.get("__module__").copied()),
+                    TypeMetadata::Bases => self.class_metadata(id, "__bases__"),
+                    TypeMetadata::Mro => self.class_metadata(id, "__mro__"),
+                };
+            }
+        }
+        match field {
+            TypeMetadata::Name => {
+                let name = match owner.native_value() {
+                    Some(NativeValue::BuiltinType(builtin)) => builtin.name(),
+                    Some(NativeValue::ValueKind(kind)) => kind.name,
+                    Some(NativeValue::ExceptionType(ExceptionType(name))) => name,
+                    _ => return Ok(None),
+                };
+                self.allocate_string(name.rsplit('.').next().unwrap_or(name).to_string())
+                    .map(Some)
+            }
+            TypeMetadata::Module => self.native_type_metadata(owner, "__module__"),
+            TypeMetadata::Bases => self.native_type_metadata(owner, "__bases__"),
+            TypeMetadata::Mro => self.native_type_metadata(owner, "__mro__"),
+        }
     }
 
     /// Assign `owner.name = value`. A class that defines `__setattr__` receives the assignment;
@@ -1040,7 +1076,7 @@ impl Vm<'_> {
         name: &str,
         value: Option<Value>,
     ) -> Result<(), String> {
-        if matches!(name, "__name__" | "__bases__" | "__mro__") {
+        if matches!(name, "__dict__" | "__name__" | "__bases__" | "__mro__") {
             return Err(format!(
                 "assigning or deleting a class's {name} is not supported"
             ));
@@ -2275,20 +2311,6 @@ impl Vm<'_> {
                 }
             }
             "__mro__" => self.class_mro(class)?,
-            "mro" => {
-                let descriptor = self
-                    .state
-                    .types
-                    .attribute(BuiltinType::Type.id(), "mro")?
-                    .ok_or("type.mro is not installed")?;
-                return self
-                    .allocate_object(Object::DescriptorBoundMethod {
-                        receiver: Value::Object(class),
-                        descriptor,
-                        owner: None,
-                    })
-                    .map(Some);
-            }
             _ => return Ok(None),
         };
         self.allocate_object(Object::Tuple(items)).map(Some)
@@ -2378,20 +2400,6 @@ impl Vm<'_> {
             NativeValue::BuiltinType(_) | NativeValue::ValueKind(_) | NativeValue::ExceptionType(_)
         );
         match name {
-            "__dict__" if is_type => {
-                let type_id = match native {
-                    NativeValue::BuiltinType(builtin) => builtin.id(),
-                    NativeValue::ValueKind(kind) => self
-                        .state
-                        .types
-                        .value_kind_type_id(kind)
-                        .ok_or("value kind is not registered")?,
-                    NativeValue::ExceptionType(_) => BuiltinType::Exception.id(),
-                    _ => unreachable!("checked by is_type"),
-                };
-                self.allocate_object(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
-                    .map(Some)
-            }
             "__module__" => {
                 let module = match native {
                     NativeValue::BuiltinType(builtin) => qualified_module(builtin.name()),
@@ -2483,6 +2491,16 @@ impl Vm<'_> {
             dataclass_fields,
             enum_members,
         } = definition;
+        // A heap class introduces the instance-dictionary descriptor when no heap ancestor
+        // already supplies it. Metaclasses inherit type's own descriptor instead.
+        if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains_key("__dict__") {
+            attributes.insert(
+                "__dict__".into(),
+                Value::Native(NativeValue::NativeGetter(
+                    &super::super::stdlib::core::INSTANCE_DICT_GETTER,
+                )),
+            );
+        }
         // As in CPython, a class records the defining module's `__name__` unless its namespace
         // already sets `__module__`.
         if !attributes.contains_key("__module__") {
@@ -3957,6 +3975,7 @@ impl Vm<'_> {
         Ok(match value.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
+            Some(NativeValue::ExceptionType(_)) => Some(BuiltinType::Exception.id()),
             _ if value.object_id().is_some() => {
                 match self.state.heap.get(value.object_id().unwrap())? {
                     Object::Class { instance_type, .. } => Some(*instance_type),

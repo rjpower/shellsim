@@ -14,7 +14,7 @@ use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
     PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult,
-    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast, TypeMetadata,
 };
 use super::super::number::{index_argument, PyNumber};
 use super::super::object_model::BuiltinType;
@@ -292,7 +292,62 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
         method("object", "__setattr__", object_setattr),
         method("object", "__delattr__", object_delattr),
     ],
-    getters: &[],
+    getters: &[GetterDef {
+        owner: "object",
+        name: "__class__",
+        get: object_class,
+    }],
+};
+
+fn object_class(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime.class_of(&receiver)
+}
+
+/// The read side of the class, module and heap-instance `__dict__` descriptors.
+fn object_dict(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .dictionary_of(receiver)?
+        .ok_or_else(|| PyError::exception("AttributeError", "this object has no __dict__"))
+}
+
+fn type_name(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Name)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __name__"))
+}
+
+fn type_module(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Module)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __module__"))
+}
+
+fn type_bases(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Bases)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __bases__"))
+}
+
+fn type_mro_getter(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Mro)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __mro__"))
+}
+
+pub(crate) static INSTANCE_DICT_GETTER: GetterDef = GetterDef {
+    owner: "object",
+    name: "__dict__",
+    get: object_dict,
+};
+
+pub(crate) static MODULE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "module",
+    methods: &[],
+    getters: &[GetterDef {
+        owner: "module",
+        name: "__dict__",
+        get: object_dict,
+    }],
 };
 
 pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
@@ -357,7 +412,33 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
         method("type", "__call__", type_call),
         method("type", "mro", type_mro),
     ],
-    getters: &[],
+    getters: &[
+        GetterDef {
+            owner: "type",
+            name: "__dict__",
+            get: object_dict,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__name__",
+            get: type_name,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__module__",
+            get: type_module,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__bases__",
+            get: type_bases,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__mro__",
+            get: type_mro_getter,
+        },
+    ],
 };
 
 pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {

@@ -406,6 +406,58 @@ def test_getattribute_override_and_direct_default_lookup():
         raise AssertionError("direct default lookup called __getattr__")
 
 
+def test_class_attribute_uses_inherited_object_descriptor():
+    class Owner:
+        pass
+
+    owner = Owner()
+    assert object.__getattribute__(owner, "__class__") is Owner
+    assert Owner.__class__ is type
+    assert list.__class__ is type
+    assert (1).__class__ is int
+    assert "__class__" in object.__dict__
+
+
+def test_dictionary_descriptors_follow_type_and_instance_mros():
+    class Parent:
+        pass
+
+    class Child(Parent):
+        pass
+
+    class Items(list):
+        pass
+
+    assert "__dict__" not in object.__dict__
+    assert "__dict__" in type.__dict__
+    assert "__dict__" in Parent.__dict__
+    assert "__dict__" not in Child.__dict__
+    assert "__dict__" in Items.__dict__
+    assert not hasattr([], "__dict__")
+    parent = Parent()
+    parent.value = 3
+    assert object.__getattribute__(parent, "__dict__") == {"value": 3}
+    assert Child().__dict__ == {}
+
+
+def test_type_metadata_descriptors_precede_class_namespace():
+    class Parent:
+        pass
+
+    class Child(Parent):
+        __name__ = "shadow"
+        __bases__ = "shadow"
+        __mro__ = "shadow"
+        __module__ = "custom"
+
+    assert Child.__name__ == "Child"
+    assert Child.__dict__["__name__"] == "shadow"
+    assert Child.__bases__ == (Parent,)
+    assert Child.__mro__ == (Child, Parent, object)
+    assert Child.__module__ == "custom"
+    assert Child.mro() == [Child, Parent, object]
+
+
 def test_metaclass_data_descriptor_precedes_class_namespace():
     class Meta(type):
         @property

@@ -734,6 +734,10 @@ impl Default for TypeRegistry {
             &super::stdlib::core::TYPE_TYPE,
         );
         install_native_attributes(
+            &mut types[BuiltinType::Module as usize],
+            &super::stdlib::core::MODULE_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Exception as usize],
             &super::stdlib::core::EXCEPTION_TYPE,
         );

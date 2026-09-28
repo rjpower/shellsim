@@ -617,11 +617,25 @@ pub(super) struct PyFileMetadata {
     pub size: usize,
 }
 
+/// Read-only metadata supplied by the `type` data descriptors.
+#[derive(Clone, Copy)]
+pub(super) enum TypeMetadata {
+    Name,
+    Module,
+    Bases,
+    Mro,
+}
+
 /// Runtime value protocols and explicitly modeled services available to native modules.
 pub(super) trait PyRuntime {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()>;
     fn charge_cpu(&mut self, units: u64) -> PyResult<()>;
     fn kind(&self, value: &PyValue) -> PyResult<PyKind>;
+    /// The Python class of a value, including a user class's metaclass.
+    fn class_of(&self, value: &PyValue) -> PyResult<PyValue>;
+    /// A class, module or instance's live Python namespace, when it has one.
+    fn dictionary_of(&mut self, value: PyValue) -> PyResult<Option<PyValue>>;
+    fn type_metadata(&mut self, value: PyValue, field: TypeMetadata) -> PyResult<Option<PyValue>>;
     fn native_kind(&self, value: &PyValue) -> PyResult<Option<PyNativeKind>>;
     fn identity(&self, value: &PyValue) -> Option<PyIdentity>;
     fn int_value(&self, value: &PyValue) -> Option<i64>;
