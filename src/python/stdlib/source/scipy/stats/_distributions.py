@@ -552,8 +552,10 @@ class _DiscreteDistribution:
     def rvs(self, *args, size=None, random_state=None, **kwds):
         shapes, loc = self._bind(args, kwds)
         rng = _check_random_state(random_state)
-        raw = self._rvs(rng, size, *shapes)
-        return np.asarray(raw) + loc
+        draws = np.asarray(self._rvs(rng, size, *shapes))
+        # Counts stay integers, as users expect, unless a fractional `loc` shifts them.
+        shifted = draws + int(loc) if loc == int(loc) else draws + loc
+        return _scalarize(shifted)
 
 
 class _FrozenDiscrete:

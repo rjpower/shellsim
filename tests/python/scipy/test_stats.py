@@ -173,6 +173,7 @@ def test_rvs_shape_dtype_and_reproducibility():
 
     k = stats.binom.rvs(10, 0.3, size=5, random_state=1)
     assert k.shape == (5,)
+    assert k.dtype.kind == "i"
     assert np.array_equal(k, stats.binom.rvs(10, 0.3, size=5, random_state=1))
     assert np.all((k >= 0) & (k <= 10))
 

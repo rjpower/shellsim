@@ -452,7 +452,9 @@ def test_logsumexp():
 def test_comb():
     # The non-exact path goes through gammaln, so it is only accurate to a tolerance, not bit
     # for bit -- unlike `exact=True`, which uses Python integer arithmetic.
-    close(special.comb(5, 2), 10.0)
+    # Small counts are exact, as people comparing with `==` expect.
+    assert special.comb(5, 2) == 10.0
+    assert special.comb(30, 15) == 155117520.0
     assert type(special.comb(5, 2)) is np.float64
     result = special.comb(5, 2, exact=True)
     assert result == 10 and type(result) is int

@@ -174,6 +174,21 @@ def _is_pole(x):
     return (x <= 0.0) & (x == np.floor(x))
 
 
+def _binom_counting(n, k):
+    """`C(n, k)` for integral `0 <= k <= n` by the running product `r = r * (n - k + i) / i`.
+
+    Each step's `r` is itself a binomial coefficient, so the product stays an exact integer while
+    it fits a float64 mantissa, and `comb(5, 2)` is exactly `10.0`. Past `k = 1030` every result
+    has overflowed to `inf`, which bounds the loop.
+    """
+    k = np.minimum(k, n - k)
+    result = np.ones(np.shape(k))
+    steps = min(int(np.max(k)), 1030) if np.size(k) else 0
+    for i in range(1, steps + 1):
+        result = np.where(k >= i, result * (n - k + i) / i, result)
+    return result
+
+
 def binom(n, k):
     """The generalized binomial coefficient `C(n, k) = Gamma(n + 1) / (Gamma(k + 1)
     Gamma(n - k + 1))`, defined for any real `n` and `k` (not just non-negative integers)."""
@@ -186,6 +201,11 @@ def binom(n, k):
         sign = np.sign(gamma(p)) * np.sign(gamma(q1)) * np.sign(gamma(q2))  # noqa: F821
         result = np.where(q_pole, np.where(p_pole, np.nan, 0.0), magnitude * sign)
         result = np.where(p_pole & ~q_pole, np.inf * sign, result)
+        counting = (
+            np.isfinite(n) & (n == np.floor(n)) & (k == np.floor(k)) & (k >= 0.0) & (k <= n)
+        )
+        exact = _binom_counting(np.where(counting, n, 0.0), np.where(counting, k, 0.0))
+        result = np.where(counting, exact, result)
     return _out(np.where(k == 0.0, 1.0, result))
 
 
@@ -254,13 +274,6 @@ def _exact_map(arr, fn):
     return _to_int_array([fn(int(value)) for value in arr.ravel()], arr.shape)
 
 
-def _float_map(arr, fn):
-    if arr.ndim == 0:
-        return np.float64(fn(float(arr)))
-    values = [fn(float(value)) for value in arr.ravel()]
-    return np.array(values, dtype=np.float64).reshape(arr.shape)
-
-
 def factorial(n, exact=False, extend="zero"):
     """`n!`, continued to `factorial(x) = Gamma(x + 1)` for non-integer `x` (`extend='complex'`)
     or to `0` for negative `x` (`extend='zero'`, the default)."""
@@ -276,8 +289,10 @@ def factorial(n, exact=False, extend="zero"):
         # shellsim's own "complex input ... is not supported" error, rather than `np.asarray`
         # rejecting it first with a generic `TypeError`.
         return gamma(np.asarray(n) + 1.0)  # noqa: F821
-    arr = np.asarray(n)
-    return _float_map(arr, lambda x: 0.0 if x < 0.0 else gamma(x + 1.0))  # noqa: F821
+    arr = np.asarray(n, dtype=np.float64)
+    with np.errstate(invalid="ignore"):
+        result = np.where(arr < 0.0, 0.0, gamma(np.maximum(arr, 0.0) + 1.0))  # noqa: F821
+    return _out(np.where(np.isnan(arr), np.nan, result))
 
 
 def logsumexp(a, axis=None, b=None, keepdims=False, return_sign=False):
