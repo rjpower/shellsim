@@ -12,8 +12,7 @@
 //! Insurance: Mathematics and Economics 12(1)): transformed rejection from a fitted logistic-like
 //! shape, with a squeeze and an exact log-probability test using [`log_gamma`] as the fallback.
 //!
-//! Both BTPE and PTRS reproduce their papers' algorithms exactly; shellsim's random streams do
-//! not need to reproduce NumPy's own (see `random.py`'s module docstring).
+//! Both BTPE and PTRS follow their papers' algorithms.
 
 use super::bitgen::Pcg64;
 

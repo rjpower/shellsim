@@ -7,18 +7,17 @@
 //! Poisson; `random::sequence` holds shuffling and sampling without replacement.
 //!
 //! The frozen `numpy/random.py` owns the object model (`PCG64`, `Generator`, `RandomState`, the
-//! legacy module-level functions) and NumPy's own argument handling (defaults, broadcasting
+//! legacy module-level functions) and argument handling (defaults, broadcasting
 //! parameter arrays to the output shape, `dtype=`/`size=` parsing, error messages). This module
 //! is deliberately "dumb": every function here takes a bit generator's raw state as a plain
 //! Python value, an already-shaped and already-broadcast `float64`/`int64` parameter array where
 //! a distribution needs one, and returns `(result, new_state)`. Pushing shape resolution to
-//! Python lets it reuse NumPy's own broadcasting (`np.broadcast_to`) instead of a second
+//! Python lets it reuse `np.broadcast_to` instead of a second
 //! implementation here.
 //!
-//! Shellsim's random streams do not aim to reproduce NumPy's own bit for bit; the project's
-//! owner has decided that determinism, reproducibility, and correct statistics are enough (see
-//! `numpy/random.py`'s module docstring). That is what lets every distribution here use one
-//! simple, documented algorithm instead of NumPy's dtype- and generator-specific variants.
+//! Streams are deterministic and statistically sound but are not NumPy's streams (see
+//! `numpy/random.py`'s module docstring), so every distribution uses one simple, documented
+//! algorithm.
 //!
 //! Every function reserves the output's memory and charges CPU proportional to its size, in that
 //! order, before the draw loop runs — reserving first so a too-large `size=` fails at the memory

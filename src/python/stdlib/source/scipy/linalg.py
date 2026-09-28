@@ -86,33 +86,19 @@ _POSITIVE_STRUCTURES = ("pos",)
 
 
 def _resolve_precision(function, *arrays):
-    """The shared working dtype for `arrays`: `float32` stays `float32`; everything else
-    (including `float16` and `bool`, with SciPy's own one-time `DeprecationWarning`) promotes to
-    `float64`. Complex input is outside this module's scope (see the module docstring).
+    """The shared working dtype for `arrays`: `float32` when every input is at most single
+    precision (`float16` promotes to `float32`), otherwise `float64`. Complex input is outside
+    this module's scope (see the module docstring).
     """
-    warn_dtype = None
-    all_single = True
+    single = (np.dtype(np.float16), np.dtype(np.float32))
     for a in arrays:
         if a.dtype.kind == "c":
             raise NotImplementedError(
                 f"complex input to scipy.linalg.{function} is not supported by shellsim's SciPy"
             )
-        if a.dtype in (np.dtype(np.float16), np.dtype(np.bool_)):
-            if warn_dtype is None:
-                warn_dtype = a.dtype
-        elif a.dtype != np.dtype(np.float32):
-            all_single = False
-    if warn_dtype is not None:
-        warnings.warn(
-            f"Calling linalg.{function} with arguments of dtype={warn_dtype} "
-            f"(a.dtype.char = '{warn_dtype.char}') is deprecated in SciPy 1.18.0 and will be "
-            "removed in SciPy 1.20.0. Please cast array inputs to one of np.float{32,64} or "
-            "np.complex{64,128} manually.",
-            DeprecationWarning,
-            stacklevel=3,
-        )
+    if all(a.dtype in single for a in arrays):
         return np.dtype(np.float32)
-    return np.dtype(np.float32) if all_single else np.dtype(np.float64)
+    return np.dtype(np.float64)
 
 
 def _check_square(a, name):

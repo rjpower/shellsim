@@ -4,14 +4,11 @@
 //! State is a 128-bit linear congruential generator advanced by PCG's published 128-bit
 //! multiplier and a fixed odd 128-bit increment. Each step's output folds the 128 bits of state
 //! to a 64-bit word by XORing its halves and rotating by the state's own top bits ("XSL RR", the
-//! same output function NumPy's own default `PCG64` uses).
+//! standard PCG64 output function).
 //!
-//! This does not aim to reproduce NumPy's own PCG64 stream byte for byte: the project's owner
-//! has decided shellsim's random streams only need to be deterministic, reproducible, and
-//! statistically sound, not bit-compatible with NumPy's (see `numpy/random.py`'s module
-//! docstring for the policy this implements). Seeding therefore uses splitmix64 (Vigna's simple,
-//! well-distributed mixing step) to expand an arbitrary seed into the 256 bits PCG's own
-//! `pcg_setseq_128_srandom_r` needs, rather than NumPy's more elaborate `SeedSequence`.
+//! Seeding uses splitmix64 (Vigna's simple, well-distributed mixing step) to expand an arbitrary
+//! seed into the 256 bits of state and increment. Streams are therefore reproducible within
+//! shellsim but differ from NumPy's.
 
 /// PCG's published 128-bit LCG multiplier (`PCG_DEFAULT_MULTIPLIER_128`).
 const MULTIPLIER: u128 = 0x2360_ed05_1fc6_5da4_4385_df64_9fcc_f645;

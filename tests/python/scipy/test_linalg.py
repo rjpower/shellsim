@@ -66,11 +66,11 @@ def test_solve_promotes_and_preserves_dtype():
     single = sl.solve(G.astype(np.float32), b.astype(np.float32))
     assert single.dtype == np.float32
     close(single, [-0.3333333, 0.6666667, 0.0], rtol=1e-6, atol=1e-6)
-    result, caught = recorded(
+    # SciPy also warns that float16 input is deprecated; shellsim just promotes it.
+    result, _ = recorded(
         sl.solve, np.array([[2.0, 1.0], [1.0, 3.0]], dtype=np.float16), np.array([1.0, 2.0], dtype=np.float16)
     )
     assert result.dtype == np.float32
-    assert caught == [DeprecationWarning]
 
 
 def test_solve_triangular_and_banded():
