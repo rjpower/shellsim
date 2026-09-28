@@ -223,9 +223,7 @@ class rv_generic:
         order0, shapes, loc, scale = self._value_binder(self, order, *args, **kwds)
         n = order0
         if not float(n).is_integer() or not (1 <= n <= 4):
-            # Higher or fractional order moments need numerical integration, which shellsim's
-            # SciPy does not provide; SciPy itself would reach for `scipy.integrate` here too.
-            import scipy.integrate  # noqa: F401
+            raise NotImplementedError(f"moments of order {n} are not supported by shellsim's SciPy")
         n = int(n)
         mean0, var0, skew0, kurt0 = (np.asarray(v, dtype=float) for v in self._stats(*shapes))
         central = [np.ones_like(mean0), np.zeros_like(mean0), var0, skew0 * var0**1.5, (kurt0 + 3.0) * var0**2]

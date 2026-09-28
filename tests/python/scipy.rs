@@ -41,14 +41,14 @@ fn unsupported_scipy_features_fail_explicitly() {
             "import scipy.sparse",
             "NotImplementedError: scipy.sparse is not supported by shellsim's SciPy",
         ),
-        // Generic fitting and moments need scipy.optimize and scipy.integrate.
+        // Generic fitting needs scipy.optimize; moments above order 4 need integration.
         (
             "from scipy import stats\nstats.t.fit([1.0, 2.0])",
             "NotImplementedError: scipy.optimize is not supported by shellsim's SciPy",
         ),
         (
             "from scipy import stats\nstats.t.moment(5, 7)",
-            "NotImplementedError: scipy.integrate is not supported by shellsim's SciPy",
+            "moments of order 5 are not supported by shellsim's SciPy",
         ),
         (
             "from scipy import stats\nstats.rv_discrete(values=([1, 2], [0.5, 0.5]))",

@@ -16,6 +16,7 @@ pub(super) fn is_package(name: &str) -> bool {
             | "numpy.lib"
             | "scipy"
             | "scipy._lib"
+            | "scipy.integrate"
             | "scipy.interpolate"
             | "scipy.linalg"
             | "scipy.spatial"
@@ -79,6 +80,11 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         "scipy" => Some(include_str!("source/scipy/__init__.py")),
         "scipy._lib" => Some(include_str!("source/scipy/_lib/__init__.py")),
         "scipy._lib._util" => Some(include_str!("source/scipy/_lib/_util.py")),
+        "scipy.integrate" => Some(include_str!("source/scipy/integrate/__init__.py")),
+        "scipy.integrate._quadpack" => Some(include_str!("source/scipy/integrate/_quadpack.py")),
+        "scipy.integrate._quadrature" => {
+            Some(include_str!("source/scipy/integrate/_quadrature.py"))
+        }
         "scipy.linalg" => Some(include_str!("source/scipy/linalg/__init__.py")),
         "scipy.linalg.blas" => Some(include_str!("source/scipy/linalg/blas.py")),
         "scipy.linalg.lapack" => Some(include_str!("source/scipy/linalg/lapack.py")),
@@ -98,7 +104,6 @@ pub(super) fn module_source(name: &str) -> Option<&'static str> {
         | "scipy.differentiate"
         | "scipy.fft"
         | "scipy.fftpack"
-        | "scipy.integrate"
         | "scipy.io"
         | "scipy.ndimage"
         | "scipy.odr"
