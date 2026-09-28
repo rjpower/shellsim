@@ -34,7 +34,7 @@ impl Vm<'_> {
         let user_instance = self.is_user_instance(value)?;
         if !user_instance {
             if let Some(number) = number::view(&self.state.heap, value) {
-                return Ok(number_hash(number));
+                return Ok(number::number_hash(number));
             }
         }
         if !user_instance {
@@ -196,17 +196,6 @@ impl Vm<'_> {
             Err(error) => return error,
         };
         self.raise_exception("TypeError", message)
-    }
-}
-
-/// The numeric hash shared by every number type, so equal numbers hash alike.
-fn number_hash(number: NumberRef<'_>) -> i64 {
-    match number {
-        NumberRef::Int(value) => hash::integer(value),
-        NumberRef::UInt(value) => hash::big_integer(&value.into()),
-        NumberRef::BigInt(value) => hash::big_integer(value),
-        NumberRef::Float(value) => hash::float(value),
-        NumberRef::Complex(real, imag) => hash::complex(real, imag),
     }
 }
 

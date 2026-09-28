@@ -545,6 +545,32 @@ def test_builtin_repr_descriptors_share_nested_cycle_rendering():
     assert None.__repr__() == repr(None)
 
 
+def test_numeric_and_string_equality_slots_decline_other_types():
+    assert (1).__eq__(1.0) is NotImplemented
+    assert (1.0).__eq__(1) is True
+    assert (1).__ne__(2) is True
+    assert (1).__eq__("1") is NotImplemented
+    assert int.__eq__(1, 2) is False
+    assert (1).__hash__() == hash(1)
+    assert (2.5).__hash__() == hash(2.5)
+    assert (1 + 2j).__eq__(1 + 2j) is True
+    assert (1 + 2j).__hash__() == hash(1 + 2j)
+    assert None.__bool__() is False
+    assert None.__hash__() == hash(None)
+    assert (0).__bool__() is False
+    assert bool.__bool__(True) is True
+    assert (2.5).__bool__() is True
+    assert (0j).__bool__() is False
+    assert "a".__eq__("a") is True
+    assert "a".__eq__(1) is NotImplemented
+    assert "a".__ne__("b") is True
+    assert "a".__lt__("b") is True
+    assert "a".__le__("a") is True
+    assert "b".__gt__("a") is True
+    assert "b".__ge__("b") is True
+    assert "a".__lt__(1) is NotImplemented
+
+
 def test_metaclass_data_descriptor_precedes_class_namespace():
     class Meta(type):
         @property

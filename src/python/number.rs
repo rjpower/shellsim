@@ -7,6 +7,7 @@ use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
+use super::hash;
 use super::heap::{Heap, InstancePayload, Object};
 use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
@@ -58,6 +59,69 @@ pub(super) fn numbers_equal(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
         }
         (left, right) => left.to_bigint() == right.to_bigint(),
     }
+}
+
+pub(super) fn slot_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(numeric_slot_equality(runtime, left, right).map(PyValue::Bool))
+}
+
+pub(super) fn slot_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(numeric_slot_equality(runtime, left, right).map(|equal| PyValue::Bool(!equal)))
+}
+
+fn numeric_slot_equality(runtime: &dyn PyRuntime, left: PyValue, right: PyValue) -> Option<bool> {
+    let (Some(left), Some(right)) = (runtime.number(&left), runtime.number(&right)) else {
+        return None;
+    };
+    let accepts_right = match left {
+        NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_) => matches!(
+            right,
+            NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_)
+        ),
+        NumberRef::Float(_) => !matches!(right, NumberRef::Complex(..)),
+        NumberRef::Complex(..) => true,
+    };
+    accepts_right.then(|| numbers_equal(left, right))
+}
+
+/// Share the hash algorithm used by `hash(value)` and numeric `__hash__` wrappers.
+pub(super) fn number_hash(number: NumberRef<'_>) -> i64 {
+    match number {
+        NumberRef::Int(value) => hash::integer(value),
+        NumberRef::UInt(value) => hash::big_integer(&value.into()),
+        NumberRef::BigInt(value) => hash::big_integer(value),
+        NumberRef::Float(value) => hash::float(value),
+        NumberRef::Complex(real, imag) => hash::complex(real, imag),
+    }
+}
+
+pub(super) fn slot_hash(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let Some(number) = runtime.number(&value) else {
+        return Ok(None);
+    };
+    Ok(Some(PyValue::Int(number_hash(number))))
+}
+
+pub(super) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let Some(number) = runtime.number(&value) else {
+        return Ok(None);
+    };
+    let truth = match number {
+        NumberRef::Int(value) => value != 0,
+        NumberRef::BigInt(value) => !value.is_zero(),
+        NumberRef::UInt(value) => value != 0,
+        NumberRef::Float(value) => value != 0.0,
+        NumberRef::Complex(real, imaginary) => real != 0.0 || imaginary != 0.0,
+    };
+    Ok(Some(PyValue::Bool(truth)))
 }
 
 /// The kind and number of a registered value with a numeric view, such as a NumPy scalar.

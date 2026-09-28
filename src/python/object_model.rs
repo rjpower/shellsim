@@ -1396,6 +1396,9 @@ fn install_number_attributes(types: &mut [PyType]) {
 fn install_builtin_slots(types: &mut [PyType]) {
     let intrinsic = SlotValue::NativeBinary;
     let unary = SlotValue::NativeUnary;
+    types[BuiltinType::None as usize].slots.bool_ =
+        Some(unary(super::stdlib::core::slot_none_bool));
+    types[BuiltinType::None as usize].slots.hash = Some(unary(super::stdlib::core::slot_none_hash));
     for builtin in [
         BuiltinType::None,
         BuiltinType::Ellipsis,
@@ -1485,8 +1488,18 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_bitwise_xor = Some(intrinsic(super::number::slot_bitwise_xor));
         slots.bitwise_or = Some(intrinsic(super::number::slot_bitwise_or));
         slots.reflected_bitwise_or = Some(intrinsic(super::number::slot_bitwise_or));
+        slots.equal = Some(intrinsic(super::number::slot_equal));
+        slots.not_equal = Some(intrinsic(super::number::slot_not_equal));
+        slots.hash = Some(unary(super::number::slot_hash));
+        slots.bool_ = Some(unary(super::number::slot_bool));
     }
     let slots = &mut types[BuiltinType::String as usize].slots;
+    slots.equal = Some(intrinsic(super::stdlib::core::slot_string_equal));
+    slots.not_equal = Some(intrinsic(super::stdlib::core::slot_string_not_equal));
+    slots.less_than = Some(intrinsic(super::stdlib::core::slot_string_less));
+    slots.less_equal = Some(intrinsic(super::stdlib::core::slot_string_less_equal));
+    slots.greater_than = Some(intrinsic(super::stdlib::core::slot_string_greater));
+    slots.greater_equal = Some(intrinsic(super::stdlib::core::slot_string_greater_equal));
     slots.hash = Some(unary(super::stdlib::core::slot_string_hash));
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
@@ -1716,6 +1729,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     }
 
     let slots = &mut types[BuiltinType::Complex as usize].slots;
+    slots.equal = Some(intrinsic(super::number::slot_equal));
+    slots.not_equal = Some(intrinsic(super::number::slot_not_equal));
+    slots.hash = Some(unary(super::number::slot_hash));
+    slots.bool_ = Some(unary(super::number::slot_bool));
     slots.positive = Some(unary(super::complex::slot_positive));
     slots.negative = Some(unary(super::complex::slot_negative));
     slots.absolute = Some(unary(super::complex::slot_absolute));

@@ -4337,6 +4337,89 @@ pub(crate) fn slot_string_hash(
     Ok(Some(Value::Int(super::super::hash::string(&text))))
 }
 
+pub(crate) fn slot_none_bool(
+    _runtime: &mut dyn PyRuntime,
+    _value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(false)))
+}
+
+pub(crate) fn slot_none_hash(
+    _runtime: &mut dyn PyRuntime,
+    _value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Int(super::super::hash::NONE)))
+}
+
+pub(crate) fn slot_string_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(left == right)))
+}
+
+pub(crate) fn slot_string_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(left != right)))
+}
+
+fn slot_string_order(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    accepted: &[Ordering],
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(accepted.contains(&left.cmp(&right)))))
+}
+
+pub(crate) fn slot_string_less(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Less])
+}
+
+pub(crate) fn slot_string_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Less, Ordering::Equal])
+}
+
+pub(crate) fn slot_string_greater(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Greater])
+}
+
+pub(crate) fn slot_string_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Greater, Ordering::Equal])
+}
+
 pub(crate) fn slot_bytes_hash(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
