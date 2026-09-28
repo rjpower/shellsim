@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::heap::ObjectId;
+use super::super::heap::{NamespaceTarget, ObjectId};
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
@@ -362,6 +362,10 @@ impl Vm<'_> {
         if let Some(id) = owner.object_id() {
             match self.state.heap.get(id)?.clone() {
                 Object::Module { scope, .. } => {
+                    if name == "__dict__" {
+                        let namespace = Object::NamespaceDict(NamespaceTarget::Scope(scope));
+                        return self.allocate_object(namespace).map(Some);
+                    }
                     if let Some(value) = self.state.heap.scope_get(scope, name).copied() {
                         return Ok(Some(value));
                     }
@@ -431,6 +435,12 @@ impl Vm<'_> {
                     return Ok(Some(value));
                 }
                 Object::Instance { class, .. } => {
+                    // `object.__dict__` is a data descriptor on every class, so it wins over
+                    // anything stored on the instance.
+                    if name == "__dict__" {
+                        let namespace = Object::NamespaceDict(NamespaceTarget::Instance(id));
+                        return self.allocate_object(namespace).map(Some);
+                    }
                     let class_entry = self.class_attribute_entry(class, name)?;
                     if let Some((defining_class, descriptor)) = class_entry {
                         if self.is_data_descriptor(&descriptor)? {
@@ -623,6 +633,9 @@ impl Vm<'_> {
             }
             return Err(self.reject_builtin_attribute_store(owner, name));
         };
+        if name == "__dict__" {
+            return self.replace_instance_attributes(id, value);
+        }
         if let Some((_, descriptor)) = self.class_attribute_entry(class, name)? {
             if let Some(descriptor_id) = descriptor.object_id() {
                 match self.state.heap.get(descriptor_id)?.clone() {
@@ -667,6 +680,53 @@ impl Vm<'_> {
             value,
             &mut self.interp.resources,
         )?;
+        Ok(())
+    }
+
+    /// `obj.__dict__ = mapping`: replace every attribute of instance `id` with `mapping`'s
+    /// entries. The entries are copied, so later changes to `mapping` do not reach the instance;
+    /// CPython instead makes the instance adopt the dict itself.
+    fn replace_instance_attributes(&mut self, id: ObjectId, mapping: Value) -> Result<(), String> {
+        let source = mapping
+            .object_id()
+            .map(|source| self.state.heap.get(source))
+            .transpose()?;
+        let entries = match source {
+            Some(Object::Dict(entries) | Object::DefaultDict { entries, .. }) => {
+                let entries = entries.to_vec();
+                let mut named = Vec::with_capacity(entries.len());
+                for (key, value) in entries {
+                    let Some(name) = protocol::string_value(&self.state.heap, &key)? else {
+                        let message = format!(
+                            "namespace keys must be str, not {}",
+                            self.type_name_of(&key)?
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    };
+                    named.push((name, value));
+                }
+                named
+            }
+            Some(Object::NamespaceDict(target)) => {
+                let target = *target;
+                self.namespace_entries(target)?
+            }
+            _ => {
+                let message = format!(
+                    "__dict__ must be set to a dictionary, not a '{}'",
+                    self.type_name_of(&mapping)?
+                );
+                return Err(self.raise_exception("TypeError", message));
+            }
+        };
+        let current = self.state.heap.instance_attribute_names(id)?;
+        self.charge_cpu(u64::try_from(current.len() + entries.len()).unwrap_or(u64::MAX))?;
+        for name in current {
+            self.namespace_delete(NamespaceTarget::Instance(id), &name)?;
+        }
+        for (name, value) in entries {
+            self.namespace_store(NamespaceTarget::Instance(id), name, value)?;
+        }
         Ok(())
     }
 
@@ -1068,7 +1128,7 @@ impl Vm<'_> {
                 | Object::Namespace { .. }
                 | Object::EnumMember { .. }
                 | Object::RaisesContext { .. }
-                | Object::Globals(_) => BuiltinSubscript::Unsupported,
+                | Object::NamespaceDict(_) => BuiltinSubscript::Unsupported,
                 Object::Property { .. }
                 | Object::StaticMethod { .. }
                 | Object::ClassMethod { .. }
@@ -2742,8 +2802,8 @@ impl Vm<'_> {
                 .ok_or_else(|| "__repr__ should return str".into());
         }
         if let Some(id) = value.object_id() {
-            if let Object::Globals(target) = *self.state.heap.get(id)? {
-                return self.repr_globals(id, target, active);
+            if let Object::NamespaceDict(target) = *self.state.heap.get(id)? {
+                return self.repr_namespace_dict(id, target, active);
             }
         }
         let Some((id, container)) = self.container_items(value)? else {
@@ -2779,19 +2839,19 @@ impl Vm<'_> {
         Ok(rendered)
     }
 
-    /// `repr(globals())`: rendered like a dict literal, sharing `active` with `repr_nested` so a
-    /// namespace that holds its own `globals()` handle (`g = globals(); g["g"] = g`) prints
-    /// `{...}` for the cycle instead of recursing without limit.
-    fn repr_globals(
+    /// `repr` of a namespace view: rendered like a dict literal, sharing `active` with
+    /// `repr_nested` so a namespace that holds its own view (`g = globals()` at module level)
+    /// prints `{...}` for the cycle instead of recursing without limit.
+    fn repr_namespace_dict(
         &mut self,
         id: ObjectId,
-        target: super::super::heap::GlobalsTarget,
+        target: NamespaceTarget,
         active: &mut BTreeSet<ObjectId>,
     ) -> Result<String, String> {
         if !active.insert(id) {
             return Ok("{...}".into());
         }
-        let entries = self.globals_snapshot(target)?;
+        let entries = self.namespace_entries(target)?;
         self.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
         let mut parts = Vec::with_capacity(entries.len());
         for (name, value) in entries {
@@ -3442,7 +3502,7 @@ impl Vm<'_> {
             | BuiltinType::Native
             | BuiltinType::Stream
             | BuiltinType::Environment
-            | BuiltinType::Globals
+            | BuiltinType::NamespaceDict
             | BuiltinType::ArgumentParser
             | BuiltinType::RaisesContext
             | BuiltinType::Property

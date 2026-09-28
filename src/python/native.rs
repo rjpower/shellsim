@@ -293,8 +293,8 @@ pub(super) enum PyNativeKind {
     RaisesContext,
     Property,
     Array,
-    /// `globals()`'s live namespace view.
-    Globals,
+    /// The live namespace view behind `globals()`, `vars()` and `obj.__dict__`.
+    NamespaceDict,
 }
 
 /// Module-owned element type of an array, opaque to the runtime except for its storage needs.
@@ -716,12 +716,25 @@ pub(super) trait PyRuntime {
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     /// A shallow copy of `dict` of the same kind: a `defaultdict` copy keeps its factory.
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
-    /// Every `(name, value)` binding a `globals()` view currently holds, sorted by name for a
-    /// deterministic order. Names are freshly allocated strings.
-    fn globals_items(&mut self, globals: PyGlobals) -> PyResult<Vec<(PyValue, PyValue)>>;
-    fn globals_get(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<PyValue>>;
-    fn globals_insert(&mut self, globals: PyGlobals, name: String, value: PyValue) -> PyResult<()>;
-    fn globals_remove(&mut self, globals: PyGlobals, name: &str) -> PyResult<Option<PyValue>>;
+    /// Every `(name, value)` binding a namespace view currently holds, in a deterministic order
+    /// (see `Vm::namespace_entries`). Names are freshly allocated strings.
+    fn namespace_items(&mut self, namespace: PyNamespaceDict) -> PyResult<Vec<(PyValue, PyValue)>>;
+    fn namespace_get(
+        &mut self,
+        namespace: PyNamespaceDict,
+        name: &str,
+    ) -> PyResult<Option<PyValue>>;
+    fn namespace_insert(
+        &mut self,
+        namespace: PyNamespaceDict,
+        name: String,
+        value: PyValue,
+    ) -> PyResult<()>;
+    fn namespace_remove(
+        &mut self,
+        namespace: PyNamespaceDict,
+        name: &str,
+    ) -> PyResult<Option<PyValue>>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
@@ -1377,25 +1390,25 @@ impl PyDict {
     }
 }
 
-/// Checked handle to a `globals()` namespace view.
+/// Checked handle to a live namespace view: `globals()`, `vars()` or `obj.__dict__`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PyGlobals(ObjectId);
+pub(super) struct PyNamespaceDict(ObjectId);
 
-impl PyGlobals {
+impl PyNamespaceDict {
     pub(super) fn object_id(self) -> ObjectId {
         self.0
     }
 }
 
-impl FromPyValue for PyGlobals {
+impl FromPyValue for PyNamespaceDict {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
         let Some(id) = value.object_id() else {
-            return Err(PyError::type_error("expected a globals() mapping"));
+            return Err(PyError::type_error("expected a namespace view"));
         };
-        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::Globals) {
+        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::NamespaceDict) {
             Ok(Self(id))
         } else {
-            Err(PyError::type_error("expected a globals() mapping"))
+            Err(PyError::type_error("expected a namespace view"))
         }
     }
 }

@@ -1070,7 +1070,7 @@ impl Vm<'_> {
                             | Object::StaticMethod { .. }
                             | Object::ClassMethod { .. }
                             | Object::Super { .. }
-                            | Object::Globals(_) => None,
+                            | Object::NamespaceDict(_) => None,
                         }
                     } else {
                         None
@@ -1480,7 +1480,26 @@ impl Vm<'_> {
                 expect_arity(&arguments, 0, 0)?;
                 let target = self.current_globals_target()?;
                 Ok(CallResult::Value(
-                    self.allocate_object(Object::Globals(target))?,
+                    self.allocate_object(Object::NamespaceDict(target))?,
+                ))
+            }
+            Builtin::Locals => {
+                expect_arity(&arguments, 0, 0)?;
+                Ok(CallResult::Value(self.current_locals()?))
+            }
+            Builtin::Vars => {
+                expect_arity(&arguments, 0, 1)?;
+                let Some(owner) = arguments.first() else {
+                    return Ok(CallResult::Value(self.current_locals()?));
+                };
+                let Some(target) = self.attribute_namespace(owner)? else {
+                    return Err(self.raise_exception(
+                        "TypeError",
+                        "vars() argument must have __dict__ attribute",
+                    ));
+                };
+                Ok(CallResult::Value(
+                    self.allocate_object(Object::NamespaceDict(target))?,
                 ))
             }
         }

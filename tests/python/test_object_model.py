@@ -794,3 +794,81 @@ def test_functions_hold_their_own_attributes():
     square = lambda value: value * value  # noqa: E731
     square.label = "square"
     assert (square.label, square(3)) == ("square", 9)
+
+
+def test_instance_dict_reads_and_writes_the_same_attributes_as_the_object():
+    class Point:
+        def __init__(self, x, y):
+            self.x = x
+            self.y = y
+
+    point = Point(1, 2)
+    assert point.__dict__ == {"x": 1, "y": 2}
+    assert vars(point) == point.__dict__
+    assert sorted(point.__dict__.items()) == [("x", 1), ("y", 2)]
+    assert (len(point.__dict__), "x" in point.__dict__, "z" in point.__dict__) == (2, True, False)
+
+    point.__dict__["z"] = 3
+    assert point.z == 3
+    point.z = 4
+    assert point.__dict__["z"] == 4
+    del point.__dict__["z"]
+    assert not hasattr(point, "z")
+    assert point.__dict__.pop("y") == 2 and not hasattr(point, "y")
+    assert point.__dict__.setdefault("w", 5) == 5 and point.w == 5
+    assert not vars(Point.__new__(Point))
+
+
+def test_instance_dict_update_sets_attributes():
+    class Options:
+        def __init__(self, **settings):
+            self.__dict__.update(settings)
+
+    options = Options(verbose=True, depth=2)
+    assert (options.verbose, options.depth) == (True, 2)
+    assert list(vars(options)) == ["verbose", "depth"]
+
+
+def test_assigning_instance_dict_replaces_attributes():
+    class State:
+        pass
+
+    state = State()
+    state.stale = 1
+    state.__dict__ = {"fresh": 2}
+    assert vars(state) == {"fresh": 2} and not hasattr(state, "stale")
+    copy = State()
+    copy.__dict__ = state.__dict__
+    assert copy.fresh == 2
+    try:
+        state.__dict__ = 3
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("__dict__ accepted a non-mapping")
+
+
+def test_instance_dict_writes_bypass_setattr():
+    class Frozen:
+        def __setattr__(self, name, value):
+            raise AttributeError(name)
+
+    frozen = Frozen()
+    frozen.__dict__["value"] = 1
+    assert frozen.value == 1
+
+
+def test_vars_requires_an_object_with_a_dict():
+    for value in (object(), 1, "text"):
+        try:
+            vars(value)
+        except TypeError:
+            pass
+        else:
+            raise AssertionError(f"vars() accepted {value!r}")
+    try:
+        _ = object().__dict__
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("object() reported having a __dict__")

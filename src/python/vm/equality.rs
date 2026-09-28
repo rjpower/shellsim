@@ -30,7 +30,7 @@ enum ContainerPair {
 enum EqualityKind {
     /// Equality is structural and cannot run user code.
     Plain,
-    /// A builtin list, tuple, dict or set, compared element by element.
+    /// A builtin list, tuple, dict or set, or a namespace view, compared element by element.
     Container,
     /// A user class instance, which may define `__eq__`, or a value whose native type has an
     /// equality slot.
@@ -78,6 +78,16 @@ impl Vm<'_> {
         let (Some(left_id), Some(right_id)) = (left.object_id(), right.object_id()) else {
             return protocol::equals(&self.state.heap, left, right);
         };
+        // A namespace view compares as the dict of its current bindings, so
+        // `globals() == globals()` and `vars(a) == {"x": 1}` hold as they do in CPython.
+        if let Object::NamespaceDict(target) = *self.state.heap.get(left_id)? {
+            let left = self.namespace_snapshot_dict(target)?;
+            return self.builtin_equality_at(&left, right, depth);
+        }
+        if let Object::NamespaceDict(target) = *self.state.heap.get(right_id)? {
+            let right = self.namespace_snapshot_dict(target)?;
+            return self.builtin_equality_at(left, &right, depth);
+        }
         let pair = match (
             self.state.heap.get(left_id)?,
             self.state.heap.get(right_id)?,
@@ -116,7 +126,8 @@ impl Vm<'_> {
                 | Object::Dict(_)
                 | Object::DefaultDict { .. }
                 | Object::Set(_)
-                | Object::FrozenSet(_) => return Ok(EqualityKind::Container),
+                | Object::FrozenSet(_)
+                | Object::NamespaceDict(_) => return Ok(EqualityKind::Container),
                 _ => {}
             }
         }

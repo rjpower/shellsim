@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
-use super::heap::{GlobalsTarget, Heap, InstancePayload, Object, ObjectId};
+use super::heap::{Heap, InstancePayload, NamespaceTarget, Object, ObjectId};
 pub use super::string::{string_ref, string_value};
 use super::Value;
 
@@ -281,7 +281,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::CallableIterator { .. } => "<callable_iterator ...>",
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
-                Object::Globals(_) => "<globals ...>",
+                Object::NamespaceDict(_) => "{...}",
                 Object::ArrayStorage(_) => "<array storage ...>",
                 Object::WideValue { .. } => "<value ...>",
                 Object::Array { .. } => "array(...)",
@@ -388,7 +388,7 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::CallableIterator { .. } => "<callable_iterator>".into(),
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
-            Object::Globals(GlobalsTarget::Scope(scope)) => {
+            Object::NamespaceDict(NamespaceTarget::Scope(scope)) => {
                 let mut entries = heap.scope_values(*scope)?.into_iter().collect::<Vec<_>>();
                 entries.sort_by(|(left, _), (right, _)| left.cmp(right));
                 let mut rendered = Vec::with_capacity(entries.len());
@@ -401,11 +401,28 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 }
                 format!("{{{}}}", rendered.join(", "))
             }
+            Object::NamespaceDict(NamespaceTarget::Instance(instance)) => {
+                let mut rendered = Vec::new();
+                for name in heap.instance_attribute_names(*instance)? {
+                    let value = heap
+                        .symbol_id(&name)
+                        .map(|symbol| heap.attribute_by_symbol(*instance, symbol))
+                        .transpose()?
+                        .flatten()
+                        .ok_or("instance attribute vanished while rendering")?;
+                    rendered.push(format!(
+                        "{}: {}",
+                        quote_string(&name),
+                        render(heap, value, active)?
+                    ));
+                }
+                format!("{{{}}}", rendered.join(", "))
+            }
             // The REPL/script table isn't reachable from a bare `&Heap`. `Vm::repr_nested`
-            // (via `repr_globals`) covers every ordinary `repr()`, `str()`, or `print()` call, so
-            // this generic fallback is only reached by the interactive REPL auto-printing a bare
-            // expression, which already skips a user `__repr__` for every other type too.
-            Object::Globals(GlobalsTarget::Repl) => "<globals>".to_string(),
+            // (via `repr_namespace_dict`) covers every ordinary `repr()`, `str()`, or `print()`
+            // call, so this generic fallback is only reached by the interactive REPL auto-printing
+            // a bare expression, which already skips a user `__repr__` for every other type too.
+            Object::NamespaceDict(NamespaceTarget::Repl) => "<globals>".to_string(),
             Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
@@ -521,7 +538,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::Match { .. }
         | Object::ArgumentParser { .. }
         | Object::Namespace { .. }
-        | Object::Globals(_) => true,
+        | Object::NamespaceDict(_) => true,
         Object::EnumMember { .. } => true,
         Object::RaisesContext { .. } => true,
         Object::Property { .. }
@@ -993,7 +1010,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Match { .. }
             | Object::ArgumentParser { .. }
             | Object::Namespace { .. }
-            | Object::Globals(_) => Err("object is not a container".into()),
+            | Object::NamespaceDict(_) => Err("object is not a container".into()),
             Object::EnumMember { .. } => Err("object is not a container".into()),
             Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }

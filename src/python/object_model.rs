@@ -56,8 +56,9 @@ pub(super) enum BuiltinType {
     Match,
     Stream,
     Environment,
-    /// `globals()`'s live namespace view. See `heap::Object::Globals`.
-    Globals,
+    /// The live namespace view behind `globals()`, `vars()` and `obj.__dict__`. See
+    /// `heap::Object::NamespaceDict`.
+    NamespaceDict,
     ArgumentParser,
     RaisesContext,
     Property,
@@ -95,7 +96,7 @@ impl BuiltinType {
         Self::Match,
         Self::Stream,
         Self::Environment,
-        Self::Globals,
+        Self::NamespaceDict,
         Self::ArgumentParser,
         Self::RaisesContext,
         Self::Property,
@@ -137,7 +138,7 @@ impl BuiltinType {
             Self::Match => "re.Match",
             Self::Stream => "shellsim.stream",
             Self::Environment => "shellsim.environment",
-            Self::Globals => "shellsim.globals",
+            Self::NamespaceDict => "shellsim.namespace_dict",
             Self::ArgumentParser => "argparse.ArgumentParser",
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
@@ -704,8 +705,8 @@ impl Default for TypeRegistry {
             &super::stdlib::os::ENVIRONMENT_TYPE,
         );
         install_native_attributes(
-            &mut types[BuiltinType::Globals as usize],
-            &super::stdlib::core::GLOBALS_TYPE,
+            &mut types[BuiltinType::NamespaceDict as usize],
+            &super::stdlib::core::NAMESPACE_DICT_TYPE,
         );
         install_native_attributes(
             &mut types[BuiltinType::ArgumentParser as usize],
@@ -1200,19 +1201,21 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_union));
     slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_reflected_union));
 
-    let slots = &mut types[BuiltinType::Globals as usize].slots;
-    slots.get_item = Some(intrinsic(super::stdlib::core::slot_globals_get_item));
+    let slots = &mut types[BuiltinType::NamespaceDict as usize].slots;
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_namespace_dict_get_item));
     slots.set_item = Some(SlotValue::NativeTernary(
-        super::stdlib::core::slot_globals_set_item,
+        super::stdlib::core::slot_namespace_dict_set_item,
     ));
-    slots.delete_item = Some(intrinsic(super::stdlib::core::slot_globals_delete_item));
-    slots.length = Some(unary(super::stdlib::core::slot_globals_length));
-    slots.contains = Some(intrinsic(super::stdlib::core::slot_globals_contains));
-    slots.iter = Some(unary(super::stdlib::core::slot_globals_iter));
-    // No `slots.repr`: `Vm::repr_nested` renders `Object::Globals` directly (see its match arm),
-    // sharing the same cycle-tracking set as `dict`, `list` and `set`. A slot implemented through
-    // the erased `PyRuntime::repr` would start a fresh cycle-tracking set per nested call and
-    // recurse forever on `g = globals(); g["g"] = g`.
+    slots.delete_item = Some(intrinsic(
+        super::stdlib::core::slot_namespace_dict_delete_item,
+    ));
+    slots.length = Some(unary(super::stdlib::core::slot_namespace_dict_length));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_namespace_dict_contains));
+    slots.iter = Some(unary(super::stdlib::core::slot_namespace_dict_iter));
+    // No `slots.repr`: `Vm::repr_nested` renders `Object::NamespaceDict` directly, sharing the
+    // same cycle-tracking set as `dict`, `list` and `set`. A slot implemented through the erased
+    // `PyRuntime::repr` would start a fresh cycle-tracking set per nested call and recurse
+    // forever on `g = globals()`.
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));

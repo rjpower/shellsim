@@ -1519,3 +1519,51 @@ def test_sorted_over_globals_and_type_name_are_sensible():
     snapshot = view.copy()
     assert isinstance(snapshot, dict)
     assert snapshot["_globals_test_marker"] == "module-level"
+
+
+def test_globals_treats_non_string_keys_as_absent():
+    view = globals()
+    assert 1 not in view
+    assert view.get(1, "fallback") == "fallback"
+    try:
+        view[1]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("a non-string key was found in globals()")
+
+
+def test_globals_compare_as_the_dict_of_their_bindings():
+    assert globals() == globals()
+    assert globals() == globals().copy()
+    assert globals() != {}
+
+
+def test_repr_of_globals_holding_its_own_view_terminates():
+    view = globals()
+    view["_globals_self_view"] = view
+    try:
+        assert "'_globals_self_view': {...}" in repr(view)
+    finally:
+        del view["_globals_self_view"]
+
+
+def _globals_seen_from_a_nested_function():
+    def inner():
+        return "inner" in globals(), "_globals_seen_from_a_nested_function" in globals()
+
+    return inner()
+
+
+def test_globals_in_a_nested_function_is_the_defining_modules_namespace():
+    assert _globals_seen_from_a_nested_function() == (False, True)
+
+
+def test_locals_inside_a_function_is_a_detached_snapshot():
+    def scope(argument):
+        value = 1
+        snapshot = locals()
+        snapshot["value"] = 2
+        return value, sorted(snapshot), vars() == locals()
+
+    assert scope("a") == (1, ["argument", "value"], True)

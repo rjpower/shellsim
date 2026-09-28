@@ -74,7 +74,8 @@ impl Vm<'_> {
             | Object::Dict(_)
             | Object::DefaultDict { .. }
             | Object::Set(_)
-            | Object::ByteArray(_) => return Err(self.unhashable(value)),
+            | Object::ByteArray(_)
+            | Object::NamespaceDict(_) => return Err(self.unhashable(value)),
             Object::Instance { class, .. } => {
                 let class = *class;
                 return self.instance_hash(value, class);

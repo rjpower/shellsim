@@ -417,10 +417,10 @@ print(cos(0), floor(2.5))
 }
 
 /// `globals()` inside an imported module is backed by that module's own lexical scope (see
-/// `heap::GlobalsTarget::Scope`), distinct from the flat table backing the top-level script's own
-/// `globals()` (`GlobalsTarget::Repl`). `tests/python/test_language.py` runs entirely inside one
-/// `-c` script, so it never exercises the scope-backed path; a real `import` is needed to reach
-/// it.
+/// `heap::NamespaceTarget::Scope`), distinct from the flat table backing the top-level script's
+/// own `globals()` (`NamespaceTarget::Repl`). `module.__dict__`, `vars(module)` and module-level
+/// `locals()` view the same scope. `tests/python/test_language.py` runs entirely inside one `-c`
+/// script, so it never exercises the scope-backed path; a real `import` is needed to reach it.
 #[test]
 fn globals_of_an_imported_module_is_the_modules_own_live_scope() {
     let mut environment = Environment::new();
@@ -433,7 +433,9 @@ fn globals_of_an_imported_module_is_the_modules_own_live_scope() {
                   globals()[\"count\"] = globals()[\"count\"] + 1\n    \
                   return globals()[\"count\"]\n\n\
               class Marker:\n    \
-                  same_module = \"count\" in globals()\n"
+                  same_module = \"count\" in globals()\n\n\
+              locals()[\"from_locals\"] = \"module\"\n\
+              seen_from_locals = from_locals\n"
                 .to_vec(),
             0o644,
         )
@@ -444,9 +446,35 @@ print(counter.bump())
 print(counter.count)
 print(counter.Marker.same_module)
 print("count" in globals(), "counter" in globals())
+print(counter.seen_from_locals, counter.__dict__["count"], vars(counter) == counter.__dict__)
+counter.__dict__["extra"] = 5
+print(counter.extra, "bump" in vars(counter))
 "#;
     assert_eq!(
         super::support::run_python_text_in(&mut environment, source),
-        (0, "1\n2\n2\nTrue\nFalse True\n".into(), String::new())
+        (
+            0,
+            "1\n2\n2\nTrue\nFalse True\nmodule 2 True\n5 True\n".into(),
+            String::new()
+        )
+    );
+}
+
+/// Namespaces live on name-keyed storage, so binding a key that is not a string raises
+/// `TypeError` where CPython's dict-backed namespaces would accept it.
+#[test]
+fn namespace_views_reject_non_string_keys_on_write() {
+    let source = r#"class Box:
+    pass
+
+for view in (globals(), vars(Box())):
+    try:
+        view[1] = "one"
+    except TypeError:
+        print("TypeError")
+"#;
+    assert_eq!(
+        super::support::run_python_text(source),
+        (0, "TypeError\nTypeError\n".into(), String::new())
     );
 }

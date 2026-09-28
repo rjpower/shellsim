@@ -20,15 +20,15 @@ use super::cpython_names;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    ClassLayout, GlobalsTarget, InstanceAttributeSlot, InstanceAttributes, InstancePayload, Object,
-    ObjectId, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, NamespaceTarget,
+    Object, ObjectId, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
     PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
-    PyErrorKind, PyFilesystem, PyGlobals, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
-    PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle,
+    PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
+    PyMatch, PyMatchData, PyModule, PyNamespaceDict, PyNativeKind, PyOperator, PyProcessHandle,
     PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty,
     PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec,
     PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
@@ -325,6 +325,8 @@ pub(super) enum Builtin {
     SetAttribute,
     DeleteAttribute,
     Globals,
+    Locals,
+    Vars,
 }
 
 /// The builtin functions the VM implements itself, by Python name. `exit` and `quit` share one.
@@ -368,6 +370,8 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
     ("setattr", Builtin::SetAttribute),
     ("delattr", Builtin::DeleteAttribute),
     ("globals", Builtin::Globals),
+    ("locals", Builtin::Locals),
+    ("vars", Builtin::Vars),
 ];
 
 impl Builtin {
