@@ -302,7 +302,7 @@ def quad(func, a, b, args=(), epsabs=1.49e-8, epsrel=1.49e-8, limit=50):
     if not isinstance(args, tuple):
         args = (args,)
     if not callable(func):
-        raise ValueError("invalid callable given")
+        raise ValueError("func must be callable")
     if limit < 1:
         raise ValueError("`limit` must be at least 1")
     flip = b < a
@@ -371,7 +371,7 @@ def _spacing(y, x, axis):
         shape[axis] = -1
         return np.diff(x).reshape(shape)
     if x.ndim != y.ndim:
-        raise ValueError("If given, shape of x must be 1-D or the same as y.")
+        raise ValueError("x must be 1-D or have the shape of y")
     return np.diff(x, axis=axis)
 
 
@@ -386,20 +386,20 @@ def cumulative_trapezoid(y, x=None, dx=1.0, axis=-1, initial=None):
     """
     y = np.asarray(y)
     if y.shape[axis] == 0:
-        raise ValueError("At least one point is required along `axis`.")
+        raise ValueError("y needs at least one point along axis")
     if x is None:
         d = dx
     else:
         d = _spacing(y, x, axis)
         if d.shape[axis] != y.shape[axis] - 1:
-            raise ValueError("If given, length of x along axis must be the same as y.")
+            raise ValueError("x and y must have the same length along axis")
     upper = y[_along(y.ndim, axis, slice(1, None))]
     lower = y[_along(y.ndim, axis, slice(None, -1))]
     result = np.cumsum(d * (upper + lower) / 2.0, axis=axis)
     if initial is None:
         return result
     if initial != 0:
-        raise ValueError("`initial` must be `None` or `0`.")
+        raise ValueError("initial must be None or 0")
     shape = list(result.shape)
     shape[axis] = 1
     return np.concatenate([np.zeros(shape, dtype=result.dtype), result], axis=axis)
@@ -455,9 +455,9 @@ def simpson(y, x=None, *, dx=1.0, axis=-1):
     if x is not None:
         x = np.asarray(x)
         if x.ndim not in (1, y.ndim):
-            raise ValueError("If given, shape of x must be 1-D or the same as y.")
+            raise ValueError("x must be 1-D or have the shape of y")
         if x.shape[axis if x.ndim > 1 else 0] != n:
-            raise ValueError("If given, length of x along axis must be the same as y.")
+            raise ValueError("x and y must have the same length along axis")
     if n == 0:
         raise IndexError("cannot integrate an empty axis")
     if n < 3:
