@@ -50,18 +50,10 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("reshape", module_reshape),
     function("ravel", module_ravel),
     function("transpose", module_transpose),
-    function("swapaxes", module_swapaxes),
-    function("moveaxis", module_moveaxis),
-    function("squeeze", module_squeeze),
-    function("expand_dims", module_expand_dims),
     function("concatenate", join::module_concatenate),
     function("broadcast_to", broadcast::module_broadcast_to),
-    function("broadcast_arrays", broadcast::module_broadcast_arrays),
-    function("broadcast_shapes", broadcast::module_broadcast_shapes),
     function("repeat", repeat::module_repeat),
-    function("flip", module_flip),
     function("diagonal", diagonal::module_diagonal),
-    function("trace", diagonal::module_trace),
     function("_normalize_axis_index", module_normalize_axis_index),
 ];
 
@@ -76,7 +68,9 @@ const fn method(
     }
 }
 
-/// Methods this area installs on `numpy.ndarray`.
+/// Methods this area installs on `numpy.ndarray`. `squeeze`, `swapaxes` and `trace` are frozen
+/// Python in `numpy._shapes`, reached through [`super::reduce::python_method`] the same way
+/// `mean`/`var`/`std` reach `numpy._stats`.
 pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     name: "numpy.ndarray",
     methods: &[
@@ -88,11 +82,23 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
         method("squeeze", method_squeeze),
         method("repeat", repeat::method_repeat),
         method("diagonal", diagonal::method_diagonal),
-        method("trace", diagonal::method_trace),
+        method("trace", method_trace),
         method("resize", method_resize),
     ],
     getters: &[],
 };
+
+fn method_squeeze(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    super::reduce::python_method(runtime, "numpy._shapes", "squeeze", receiver, args)
+}
+
+fn method_swapaxes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    super::reduce::python_method(runtime, "numpy._shapes", "swapaxes", receiver, args)
+}
+
+fn method_trace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    super::reduce::python_method(runtime, "numpy._shapes", "trace", receiver, args)
+}
 
 /// Normalize `axis` against rank `ndim`, raising NumPy's `AxisError`. `prefix` names the
 /// argument in the message, as in `axis1: axis 3 is out of bounds for array of dimension 2`.
@@ -172,32 +178,6 @@ fn int_list(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Vec<i64>> 
             .collect(),
         None => Ok(vec![args::index_int(runtime, value)?]),
     }
-}
-
-/// NumPy's `normalize_axis_tuple`: an int or a sequence of ints, each normalized. Duplicates
-/// raise unless `allow_duplicate`.
-fn normalize_axis_tuple(
-    runtime: &mut dyn PyRuntime,
-    value: &PyValue,
-    ndim: usize,
-    argname: Option<&str>,
-    allow_duplicate: bool,
-) -> PyResult<Vec<usize>> {
-    let axes = int_list(runtime, value)?
-        .into_iter()
-        .map(|axis| axis_index(axis, ndim, argname))
-        .collect::<PyResult<Vec<_>>>()?;
-    if !allow_duplicate {
-        let mut sorted = axes.clone();
-        sorted.sort_unstable();
-        if sorted.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(PyError::value_error(match argname {
-                Some(name) => format!("repeated axis in `{name}` argument"),
-                None => "repeated axis".to_string(),
-            }));
-        }
-    }
-    Ok(axes)
 }
 
 /// `_normalize_axis_index(axis, ndim, msg_prefix=None)`, for the frozen Python composites.
@@ -578,210 +558,6 @@ fn module_transpose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         None => None,
     };
     Ok(transpose(runtime, &array, axes)?.value())
-}
-
-/// A view with `axis1` and `axis2` exchanged.
-fn swapaxes(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    axis1: &PyValue,
-    axis2: &PyValue,
-) -> PyResult {
-    let ndim = array.ndim();
-    let first = args::index_int(runtime, axis1)?;
-    let second = args::index_int(runtime, axis2)?;
-    let first = axis_index(first, ndim, Some("axis1"))?;
-    let second = axis_index(second, ndim, Some("axis2"))?;
-    let mut order = (0..ndim).collect::<Vec<_>>();
-    order.swap(first, second);
-    Ok(permute(runtime, array, &order)?.value())
-}
-
-fn method_swapaxes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    if !args.keywords().is_empty() {
-        return Err(PyError::type_error(
-            "ndarray.swapaxes() takes no keyword arguments",
-        ));
-    }
-    args.expect_positional("swapaxes", 2, 2)?;
-    let array = Array::from_value(runtime, receiver)?;
-    swapaxes(
-        runtime,
-        &array,
-        &args.positional()[0],
-        &args.positional()[1],
-    )
-}
-
-fn module_swapaxes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("swapaxes", &["a", "axis1", "axis2"], 3);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    swapaxes(
-        runtime,
-        &array,
-        &bound.required("axis1"),
-        &bound.required("axis2"),
-    )
-}
-
-/// `np.moveaxis(a, source, destination)`: a view with the `source` axes moved to
-/// `destination` and the other axes kept in order.
-fn module_moveaxis(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("moveaxis", &["a", "source", "destination"], 3);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let ndim = array.ndim();
-    let source = normalize_axis_tuple(
-        runtime,
-        &bound.required("source"),
-        ndim,
-        Some("source"),
-        false,
-    )?;
-    let destination = normalize_axis_tuple(
-        runtime,
-        &bound.required("destination"),
-        ndim,
-        Some("destination"),
-        false,
-    )?;
-    if source.len() != destination.len() {
-        return Err(PyError::value_error(
-            "`source` and `destination` arguments must have the same number of elements",
-        ));
-    }
-    let mut order = (0..ndim)
-        .filter(|axis| !source.contains(axis))
-        .collect::<Vec<_>>();
-    let mut moves = destination.into_iter().zip(source).collect::<Vec<_>>();
-    moves.sort_unstable();
-    for (destination, source) in moves {
-        order.insert(destination, source);
-    }
-    Ok(permute(runtime, &array, &order)?.value())
-}
-
-/// A view without the length-one axes selected by `axis` (all of them when `None`).
-fn squeeze(runtime: &mut dyn PyRuntime, array: &Array, axis: Option<PyValue>) -> PyResult<Array> {
-    let ndim = array.ndim();
-    let selected = match axis.filter(|axis| !axis.is_none()) {
-        None => (0..ndim)
-            .filter(|axis| array.shape()[*axis] == 1)
-            .collect::<Vec<_>>(),
-        // NumPy accepts axis 0 (or -1) on 0-d arrays as a no-op.
-        Some(axis) if ndim == 0 && runtime.kind(&axis)? != PyKind::Tuple => {
-            let value = args::index_int(runtime, &axis)?;
-            if value != 0 && value != -1 {
-                array::normalize_axis(value, ndim)?;
-            }
-            Vec::new()
-        }
-        Some(axis) => match args::axes(runtime, Some(axis), ndim)? {
-            args::Axes::All => Vec::new(),
-            args::Axes::Some(axes) => {
-                if axes.iter().any(|axis| array.shape()[*axis] != 1) {
-                    return Err(PyError::value_error(
-                        "cannot select an axis to squeeze out which has size not equal to one",
-                    ));
-                }
-                axes
-            }
-        },
-    };
-    let kept = (0..ndim)
-        .filter(|axis| !selected.contains(axis))
-        .collect::<Vec<_>>();
-    permute(runtime, array, &kept)
-}
-
-fn method_squeeze(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("squeeze", &["axis"], 0);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    Ok(squeeze(runtime, &array, bound.get("axis"))?.value())
-}
-
-fn module_squeeze(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("squeeze", &["a", "axis"], 1);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    Ok(squeeze(runtime, &array, bound.get("axis"))?.value())
-}
-
-/// A view of `array` with length-one axes inserted at the (output) positions `axes`.
-pub(in crate::python) fn insert_axes(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    axes: &[usize],
-) -> PyResult<Array> {
-    let rank = array.ndim() + axes.len();
-    let mut shape = Vec::with_capacity(rank);
-    let mut strides = Vec::with_capacity(rank);
-    let mut source = 0;
-    for axis in 0..rank {
-        if axes.contains(&axis) {
-            shape.push(1);
-            strides.push(0);
-        } else {
-            shape.push(array.shape()[source]);
-            strides.push(array.strides()[source]);
-            source += 1;
-        }
-    }
-    array::new_view(
-        runtime,
-        array,
-        array.dtype,
-        shape,
-        strides,
-        array.view.offset,
-    )
-}
-
-/// `np.expand_dims(a, axis)`: a view with new length-one axes at the positions `axis` names in
-/// the result.
-fn module_expand_dims(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("expand_dims", &["a", "axis"], 2);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let axis = bound.required("axis");
-    let count = sequence_items(runtime, &axis)?.map_or(1, |items| items.len());
-    let rank = array.ndim() + count;
-    let axes = normalize_axis_tuple(runtime, &axis, rank, None, false)?;
-    Ok(insert_axes(runtime, &array, &axes)?.value())
-}
-
-/// `np.flip(m, axis=None)`: a view with the chosen axes reversed through negative strides.
-fn module_flip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("flip", &["m", "axis"], 1);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("m"))?;
-    let ndim = array.ndim();
-    let axes = match bound.value("axis") {
-        // `m[()]` on a 0-d array: NumPy returns the element.
-        None if ndim == 0 => return convert::element_to_scalar(runtime, &array, array.view.offset),
-        None => (0..ndim).collect(),
-        Some(axis) => normalize_axis_tuple(runtime, &axis, ndim, None, false)?,
-    };
-    let mut strides = array.strides().to_vec();
-    let mut offset = array.view.offset as isize;
-    for axis in axes {
-        let length = array.shape()[axis];
-        if length > 0 {
-            offset += (length as isize - 1) * strides[axis];
-        }
-        strides[axis] = -strides[axis];
-    }
-    let view = array::new_view(
-        runtime,
-        &array,
-        array.dtype,
-        array.shape().to_vec(),
-        strides,
-        offset as usize,
-    )?;
-    Ok(view.value())
 }
 
 /// `a.resize(new_shape)` changes an array's storage in place, which shellsim's array model
