@@ -4,11 +4,14 @@ This package star-imports the native modules (arrays, dtypes, ufuncs, and the ar
 areas: reductions, shape operations, sorting, products, math kernels, and raw-buffer I/O) and
 layers the parts NumPy itself writes in Python on top, grouped by topic rather than by NumPy's
 own private file names: ``_creation`` (index tuples, grids, and the small array constructors
-built from them), ``_shapes`` (stacking, splitting, tiling, ``kron``/``block``, ``pad``),
-``_math`` (closeness, differencing, interpolation, polynomial fitting, ``vectorize``), ``_sets``
-(``unique`` and the set operations built on it), ``_stats`` (``mean``/``var``/``std``, order
-statistics, histograms, the ``nan*`` reductions), and ``_errors`` (``errstate``/``seterr``,
-``finfo``/``iinfo``). ``_io`` holds the ``.npy``/``.npz`` format and the text readers/writers;
+built from them), ``_shapes`` (stacking, splitting, tiling, ``kron``/``block``, ``pad``, and the
+axis-manipulation views ``squeeze``/``expand_dims``/``moveaxis``/``swapaxes``/``flip``/``trace``),
+``_math`` (closeness, differencing, interpolation, polynomial fitting, ``vectorize``),
+``_products`` (``vdot``/``inner``/``outer``/``tensordot``/``einsum``, built on ``dot``/
+``matmul``), ``_sets`` (``unique`` and the set operations built on it), ``_stats`` (``mean``/
+``var``/``std``, order statistics, histograms, the ``nan*`` reductions), and ``_errors``
+(``errstate``/``seterr``, ``finfo``/``iinfo``). ``_io`` holds the ``.npy``/``.npz`` format and
+the text readers/writers;
 only its public names (``save``, ``load``, ``savetxt``, ...) are re-exported, not the module
 itself. ``_printing`` and ``linalg`` (owned by other areas of this port) import eagerly, at the
 end, once every name they need (from the native modules and the areas above) is already bound
@@ -46,6 +49,7 @@ from _numpy_sort import *
 from numpy._creation import *
 from numpy._errors import *
 from numpy._math import *
+from numpy._products import *
 from numpy._sets import *
 from numpy._shapes import *
 from numpy._stats import *

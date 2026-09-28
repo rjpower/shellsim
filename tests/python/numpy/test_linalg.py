@@ -417,3 +417,75 @@ def test_vecdot_sums_over_an_axis_and_conjugates_the_first_operand():
 def test_vecdot_rejects_mismatched_core_dimensions():
     with pytest.raises(ValueError):
         np.vecdot(np.ones((2, 3)), np.ones(3), axis=0)
+
+
+def test_einsum_matmul_matches_dot_and_matmul():
+    a = np.arange(6).reshape(2, 3)
+    b = np.arange(12).reshape(3, 4)
+    assert_allclose(np.einsum("ij,jk->ik", a, b), np.dot(a, b))
+    assert np.einsum("ij,jk->ik", a, b).dtype == np.dot(a, b).dtype
+    batch_a = np.arange(24).reshape(2, 3, 4)
+    batch_b = np.arange(24).reshape(2, 4, 3)
+    assert_allclose(np.einsum("bij,bjk->bik", batch_a, batch_b), batch_a @ batch_b)
+
+
+def test_einsum_trace_and_diagonal_match_the_named_functions():
+    m = np.arange(9).reshape(3, 3)
+    assert np.einsum("ii", m) == np.trace(m)
+    assert_array_equal(np.einsum("ii->i", m), np.diagonal(m))
+
+
+def test_einsum_outer_product_matches_outer():
+    a = np.array([1, 2, 3])
+    b = np.array([4, 5])
+    assert_array_equal(np.einsum("i,j->ij", a, b), np.outer(a, b))
+
+
+def test_einsum_transpose_reorders_axes_without_a_copyable_operation():
+    a = np.arange(6).reshape(2, 3)
+    assert_array_equal(np.einsum("ij->ji", a), a.T)
+
+
+def test_einsum_implicit_mode_sums_unlisted_repeated_indices():
+    a = np.arange(6).reshape(2, 3)
+    b = np.arange(12).reshape(3, 4)
+    # No '->': every index appearing exactly once survives, sorted; 'j' is contracted away.
+    assert_array_equal(np.einsum("ij,jk", a, b), np.dot(a, b))
+    assert_array_equal(np.einsum("ii", np.arange(9).reshape(3, 3)), np.trace(np.arange(9).reshape(3, 3)))
+
+
+def test_einsum_three_operands_contract_left_to_right():
+    a = np.arange(6).reshape(2, 3)
+    b = np.arange(12).reshape(3, 4)
+    c = np.arange(8).reshape(4, 2)
+    assert_allclose(np.einsum("ij,jk,ki->", a, b, c), np.trace(a @ b @ c))
+
+
+def test_einsum_integer_operands_keep_integer_dtype():
+    a = np.arange(6).reshape(2, 3)
+    b = np.arange(12).reshape(3, 4)
+    result = np.einsum("ij,jk->ik", a, b)
+    assert result.dtype == np.int64
+    assert_array_equal(result, a @ b)
+
+
+def test_einsum_optimize_flag_is_accepted_and_ignored():
+    a = np.arange(6).reshape(2, 3)
+    b = np.arange(12).reshape(3, 4)
+    assert_array_equal(np.einsum("ij,jk->ik", a, b, optimize=True), a @ b)
+    assert_array_equal(np.einsum("ij,jk->ik", a, b, optimize="optimal"), a @ b)
+
+
+def test_einsum_rejects_repeated_output_indices():
+    with pytest.raises(ValueError):
+        np.einsum("ii->ii", np.eye(3))
+
+
+def test_einsum_rejects_mismatched_operand_shapes():
+    with pytest.raises(ValueError):
+        np.einsum("ij,jk->ik", np.zeros((2, 3)), np.zeros((5, 4)))
+
+
+def test_einsum_rejects_wrong_operand_count_for_the_subscripts():
+    with pytest.raises(ValueError):
+        np.einsum("ij,jk->ik", np.zeros((2, 3)))

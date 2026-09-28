@@ -61,6 +61,7 @@ pub(super) fn module_source(name: &str) -> Option<FrozenModule> {
         "numpy._io" => frozen!("numpy/_io.py"),
         "numpy._math" => frozen!("numpy/_math.py"),
         "numpy._printing" => frozen!("numpy/_printing.py"),
+        "numpy._products" => frozen!("numpy/_products.py"),
         "numpy._sets" => frozen!("numpy/_sets.py"),
         "numpy._shapes" => frozen!("numpy/_shapes.py"),
         "numpy._stats" => frozen!("numpy/_stats.py"),
