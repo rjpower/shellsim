@@ -470,7 +470,7 @@ fn wider(left: DType, right: DType) -> DType {
 }
 
 /// `np.promote_types` for two strong dtypes. Strings promote only with strings; mixing a string
-/// with a number raises NumPy's `DTypePromotionError`-style `TypeError`.
+/// with a number has no common dtype and raises `TypeError`.
 pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<DType> {
     use Category::*;
     let (left, right) = (left.native(), right.native());
@@ -483,14 +483,10 @@ pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<DType> {
         (_, Object) => DType::OBJECT,
         (Str, Str) => DType::str(a.chars().max(b.chars()))?,
         (_, Str) => {
-            return Err(PyError::exception(
-                "DTypePromotionError",
-                format!(
-                    "The DType <class 'numpy.dtypes.{}DType'> could not be promoted by <class \
-                     'numpy.dtypes.StrDType'>.",
-                    dtype_class_name(a)
-                ),
-            ))
+            return Err(PyError::type_error(format!(
+                "{} cannot be promoted with a string dtype",
+                a.repr()
+            )))
         }
         (Bool, _) => b,
         (Unsigned, Unsigned) | (Signed, Signed) | (Float, Float) | (Complex, Complex) => {
@@ -513,18 +509,6 @@ pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<DType> {
         (Float, Complex) => wider(a.complex_for(), b),
         _ => unreachable!("categories are ordered before matching"),
     })
-}
-
-fn dtype_class_name(dtype: DType) -> String {
-    match dtype.kind {
-        Kind::Bool => "Bool".to_string(),
-        kind => {
-            let name = kind.name();
-            let mut class = name[..1].to_uppercase();
-            class.push_str(&name[1..]);
-            class
-        }
-    }
 }
 
 /// Category of a weak Python scalar operand.

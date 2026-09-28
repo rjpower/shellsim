@@ -122,8 +122,6 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     // the one NumPy's own documentation leads with.
     native("AxisError", "ValueError", "numpy.exceptions"),
     native("LinAlgError", "ValueError", "numpy.linalg"),
-    native("UFuncTypeError", "TypeError", "numpy._core._exceptions"),
-    native("DTypePromotionError", "TypeError", "numpy.exceptions"),
     native("ComplexWarning", "RuntimeWarning", "numpy.exceptions"),
 ];
 

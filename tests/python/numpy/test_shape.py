@@ -143,12 +143,19 @@ def test_moveaxis_moves_single_and_multiple_axes():
         np.moveaxis(a, 3, 0)
 
 
-def test_axis_error_formats_its_axis_and_dimension():
-    error = np.exceptions.AxisError(2, 1)
-    prefixed = np.exceptions.AxisError(-3, 2, "destination")
-    assert str(prefixed) == "destination: axis -3 is out of bounds for array of dimension 2"
+def test_axis_error_is_a_value_error():
+    # `AxisError` is a plain exception constructor here: shellsim's own axis-checking code
+    # builds the "axis N is out of bounds..." message itself before raising, so a direct
+    # `AxisError(axis, ndim)` call just stores its arguments like any other exception.
+    assert isinstance(np.exceptions.AxisError(2, 1), ValueError)
     assert str(np.exceptions.AxisError("custom")) == "custom"
-    assert isinstance(error, ValueError)
+
+
+def test_moveaxis_reports_the_out_of_bounds_axis():
+    a = np.arange(24).reshape(2, 3, 4)
+    with pytest.raises(np.exceptions.AxisError) as excinfo:
+        np.moveaxis(a, 3, 0)
+    assert str(excinfo.value) == "source: axis 3 is out of bounds for array of dimension 3"
 
 
 def test_squeeze_removes_all_length_one_axes():
