@@ -109,6 +109,20 @@ impl ObjectId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeId(usize);
 
+/// Where a `globals()` view's bindings actually live.
+///
+/// An imported module's top-level code runs with its own lexical [`Scope`] (`uses_repl_globals`
+/// false), so `globals()` there is a live view of that scope. The entry-point script or an
+/// interactive REPL line runs with no scope of its own; its names, and those of any function or
+/// class body defined at that top level, live in the flat REPL/script table instead (see
+/// `ReplState::globals` and `Vm::scope_uses_repl_globals`). Keeping both cases in one type lets a
+/// single `globals()` implementation cover them without changing how either namespace is stored.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GlobalsTarget {
+    Scope(ScopeId),
+    Repl,
+}
+
 #[derive(Clone, Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -245,6 +259,10 @@ pub enum Object {
         name: String,
         scope: ScopeId,
     },
+    /// `globals()`: a live view over the namespace of the module whose code is running, backed by
+    /// [`GlobalsTarget`]. Reads, writes and deletes through it act on the same storage a bare name
+    /// lookup would.
+    Globals(GlobalsTarget),
     /// Flat element storage shared by one or more array views: packed bytes, or traced Python
     /// references for object arrays.
     ArrayStorage(PyArrayBuffer),
@@ -1230,6 +1248,7 @@ impl Heap {
             | Object::StreamIterator { .. } => BuiltinType::Iterator.id(),
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
+            Object::Globals(_) => BuiltinType::Globals.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
@@ -1551,6 +1570,10 @@ fn trace_object(
             trace_value(*return_value, object_work);
         }
         Object::Module { scope, .. } => scope_work.push(*scope),
+        Object::Globals(GlobalsTarget::Scope(scope)) => scope_work.push(*scope),
+        // The REPL/script global table is already a GC root at every collection (see
+        // `Vm::collect_heap`), so this handle owns nothing further to trace.
+        Object::Globals(GlobalsTarget::Repl) => {}
         Object::Array { storage, base, .. } => {
             object_work.push(*storage);
             object_work.extend(*base);
@@ -1710,6 +1733,9 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(stack.len()))
             .ok_or("modeled object size overflow")?,
         Object::Module { name, .. } => name.len(),
+        // The namespace it views is charged where that namespace actually lives (the scope or
+        // the REPL/script global table), so the view itself is a fixed, minimal handle.
+        Object::Globals(_) => 1,
         Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
         Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
         Object::Array { view, .. } => view

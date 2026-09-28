@@ -56,6 +56,8 @@ pub(super) enum BuiltinType {
     Match,
     Stream,
     Environment,
+    /// `globals()`'s live namespace view. See `heap::Object::Globals`.
+    Globals,
     ArgumentParser,
     RaisesContext,
     Property,
@@ -65,7 +67,7 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 33] = [
+    pub(super) const ALL: [Self; 34] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -93,6 +95,7 @@ impl BuiltinType {
         Self::Match,
         Self::Stream,
         Self::Environment,
+        Self::Globals,
         Self::ArgumentParser,
         Self::RaisesContext,
         Self::Property,
@@ -134,6 +137,7 @@ impl BuiltinType {
             Self::Match => "re.Match",
             Self::Stream => "shellsim.stream",
             Self::Environment => "shellsim.environment",
+            Self::Globals => "shellsim.globals",
             Self::ArgumentParser => "argparse.ArgumentParser",
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
@@ -700,6 +704,10 @@ impl Default for TypeRegistry {
             &super::stdlib::os::ENVIRONMENT_TYPE,
         );
         install_native_attributes(
+            &mut types[BuiltinType::Globals as usize],
+            &super::stdlib::core::GLOBALS_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::ArgumentParser as usize],
             &super::stdlib::argparse::ARGUMENT_PARSER_TYPE,
         );
@@ -1191,6 +1199,20 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
     slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_union));
     slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_reflected_union));
+
+    let slots = &mut types[BuiltinType::Globals as usize].slots;
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_globals_get_item));
+    slots.set_item = Some(SlotValue::NativeTernary(
+        super::stdlib::core::slot_globals_set_item,
+    ));
+    slots.delete_item = Some(intrinsic(super::stdlib::core::slot_globals_delete_item));
+    slots.length = Some(unary(super::stdlib::core::slot_globals_length));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_globals_contains));
+    slots.iter = Some(unary(super::stdlib::core::slot_globals_iter));
+    // No `slots.repr`: `Vm::repr_nested` renders `Object::Globals` directly (see its match arm),
+    // sharing the same cycle-tracking set as `dict`, `list` and `set`. A slot implemented through
+    // the erased `PyRuntime::repr` would start a fresh cycle-tracking set per nested call and
+    // recurse forever on `g = globals(); g["g"] = g`.
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));

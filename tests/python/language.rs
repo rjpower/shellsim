@@ -415,3 +415,38 @@ print(cos(0), floor(2.5))
         )
     );
 }
+
+/// `globals()` inside an imported module is backed by that module's own lexical scope (see
+/// `heap::GlobalsTarget::Scope`), distinct from the flat table backing the top-level script's own
+/// `globals()` (`GlobalsTarget::Repl`). `tests/python/test_language.py` runs entirely inside one
+/// `-c` script, so it never exercises the scope-backed path; a real `import` is needed to reach
+/// it.
+#[test]
+fn globals_of_an_imported_module_is_the_modules_own_live_scope() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .put_file(
+            "/counter.py",
+            b"count = 0\n\n\
+              def bump():\n    \
+                  globals()[\"count\"] = globals()[\"count\"] + 1\n    \
+                  return globals()[\"count\"]\n\n\
+              class Marker:\n    \
+                  same_module = \"count\" in globals()\n"
+                .to_vec(),
+            0o644,
+        )
+        .unwrap();
+    let source = r#"import counter
+print(counter.bump())
+print(counter.bump())
+print(counter.count)
+print(counter.Marker.same_module)
+print("count" in globals(), "counter" in globals())
+"#;
+    assert_eq!(
+        super::support::run_python_text_in(&mut environment, source),
+        (0, "1\n2\n2\nTrue\nFalse True\n".into(), String::new())
+    );
+}

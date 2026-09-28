@@ -412,6 +412,23 @@ impl GlobalBindings {
         self.values.iter().flatten().copied()
     }
 
+    /// Every populated `(name, value)` binding, resolved through the heap's symbol table, for
+    /// `globals()` on the entry-point script or REPL. Slot order here just follows `SymbolId`
+    /// allocation order, not Python's per-dict insertion order; callers that need a stable order
+    /// sort the result themselves.
+    fn entries(&self, heap: &heap::Heap) -> Vec<(String, Value)> {
+        self.values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let value = (*value)?;
+                let symbol = heap::SymbolId::from_index(index)?;
+                let name = heap.symbol_name(symbol)?.to_string();
+                Some((name, value))
+            })
+            .collect()
+    }
+
     fn take_modeled_bytes(&mut self) -> u64 {
         std::mem::take(&mut self.modeled_bytes)
     }
