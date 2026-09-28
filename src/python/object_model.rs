@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 
-use super::native::{BinarySlotFn, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn};
+use super::native::{
+    BinarySlotFn, MethodDef, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn,
+};
 use super::Value;
 
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
@@ -237,6 +239,7 @@ pub struct TypeSlots {
 #[derive(Clone, Debug)]
 pub enum SlotValue {
     Descriptor(Value),
+    NativeMethod(&'static MethodDef),
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
@@ -835,6 +838,9 @@ impl Default for TypeRegistry {
         // `dict`'s own methods serve it unchanged.
         types[BuiltinType::NamespaceDict as usize].attributes =
             types[BuiltinType::Dict as usize].attributes.clone();
+        for ty in &mut types {
+            install_native_method_slots(ty);
+        }
         install_builtin_slots(&mut types);
         for ty in &mut types {
             ty.local_slots = ty.slots.clone();
@@ -1238,6 +1244,34 @@ fn insert_native_attributes(
     }
 }
 
+/// Native methods with protocol names participate in the same slot resolution as user methods.
+/// Specialized builtin slots installed later replace these when a direct implementation exists.
+fn install_native_method_slots(ty: &mut PyType) {
+    for (slot, name, _) in SLOT_DEFS {
+        if !matches!(
+            slot,
+            Slot::Call
+                | Slot::New
+                | Slot::Init
+                | Slot::InitSubclass
+                | Slot::ClassGetItem
+                | Slot::Format
+        ) {
+            continue;
+        }
+        if let Some(method) = ty
+            .attributes
+            .get(name)
+            .and_then(|value| match value.native_value() {
+                Some(super::vm::NativeValue::NativeMethod(method)) => Some(method),
+                _ => None,
+            })
+        {
+            ty.slots.set(slot, SlotValue::NativeMethod(method));
+        }
+    }
+}
+
 /// Install methods such as `dict.fromkeys` that receive the type rather than an instance.
 fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::native::MethodDef]) {
     debug_assert!(methods.iter().all(|method| method.type_name == ty.name));
@@ -1344,6 +1378,9 @@ fn install_builtin_slots(types: &mut [PyType]) {
     }
     let slots = &mut types[BuiltinType::String as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.add = Some(intrinsic(super::stdlib::core::slot_string_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_string_multiply));
@@ -1351,6 +1388,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Bytes as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_bytes_length));
+    slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_bytes_get_item));
     slots.add = Some(intrinsic(super::stdlib::core::slot_bytes_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_bytes_multiply));
@@ -1358,6 +1397,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::ByteArray as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_bytearray_length));
+    slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_bytearray_get_item));
     slots.add = Some(intrinsic(super::stdlib::core::slot_bytearray_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_bytearray_multiply));
@@ -1369,6 +1410,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::List as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.set(
         Slot::Reversed,
@@ -1384,6 +1427,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Dict as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.set(
         Slot::Reversed,
         unary(super::stdlib::core::slot_dict_reversed),
@@ -1446,6 +1491,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));
     slots.bitwise_and = Some(intrinsic(super::stdlib::core::slot_set_intersection));
     slots.reflected_bitwise_and = Some(intrinsic(super::stdlib::core::slot_set_intersection));
@@ -1466,6 +1513,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
+    slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.set(
         Slot::Reversed,
@@ -1479,6 +1528,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
         Some(unary(super::stdlib::core::slot_sequence_iter));
     types[BuiltinType::Range as usize].slots.length =
         Some(unary(super::stdlib::core::slot_builtin_length));
+    types[BuiltinType::Range as usize].slots.get_item =
+        Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
+    types[BuiltinType::Range as usize].slots.contains =
+        Some(intrinsic(super::stdlib::core::slot_builtin_contains));
     types[BuiltinType::Range as usize].slots.set(
         Slot::Reversed,
         unary(super::stdlib::core::slot_sequence_reversed),

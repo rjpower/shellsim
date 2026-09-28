@@ -5,10 +5,10 @@ use std::collections::BTreeSet;
 use super::super::heap::{DictViewKind, NamespaceTarget, ObjectId, ProxyTarget};
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
-    BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
-    CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, InstancePayload,
-    LoadAttributeCache, NameId, NativeValue, Object, Ordering, PyError, PyRuntime, SlicePlan, Slot,
-    SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition, ClassField,
+    ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap,
+    InstancePayload, LoadAttributeCache, NameId, NativeValue, Object, Ordering, PyError, PyRuntime,
+    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Items of a builtin container whose `repr` the VM renders item by item.
@@ -1185,6 +1185,16 @@ impl Vm<'_> {
                 return self.invoke_value(method, vec![index]);
             }
         }
+        self.subscript_builtin(owner, index)
+    }
+
+    /// Index a builtin payload directly. A native `__getitem__` slot calls this after type-slot
+    /// dispatch, so the implementation cannot redispatch into its own wrapper.
+    pub(super) fn subscript_builtin(
+        &mut self,
+        owner: Value,
+        index: Value,
+    ) -> Result<Value, String> {
         let subject = owner;
         let owner = self.builtin_view(owner)?;
         // A slice is an ordinary key to a mapping; only sequences slice with it.
@@ -2699,7 +2709,7 @@ impl Vm<'_> {
 
     /// Bind a descriptor found by `type_lookup` to an instance or leave it unbound for class
     /// access. Native descriptors have no heap class object, so they are handled here.
-    fn bind_type_attribute(
+    pub(super) fn bind_type_attribute(
         &mut self,
         descriptor: Value,
         receiver: Option<Value>,
@@ -2928,6 +2938,12 @@ impl Vm<'_> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
+            SlotValue::NativeMethod(method) => {
+                let receiver = self.builtin_view(*receiver)?;
+                return (method.call)(self, receiver, CallArgs::new(arguments, Vec::new()))
+                    .map(Some)
+                    .map_err(|error| self.record_native_error(error));
+            }
             SlotValue::NativeBinary(call) => {
                 let [argument] = arguments.as_slice() else {
                     return Err(
@@ -2989,7 +3005,8 @@ impl Vm<'_> {
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<Value, String> {
         let (_, name, arity) = super::super::object_model::SLOT_DEFS[slot as usize];
-        if !keyword_arguments.is_empty() || arguments.len() != usize::from(arity) {
+        if arity != 255 && (!keyword_arguments.is_empty() || arguments.len() != usize::from(arity))
+        {
             return Err(
                 self.raise_exception("TypeError", format!("{name}() received invalid arguments"))
             );
@@ -3014,6 +3031,10 @@ impl Vm<'_> {
             .ok_or("slot wrapper has no local implementation")?;
         let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
+            SlotValue::NativeMethod(method) => {
+                return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
+                    .map_err(|error| self.record_native_error(error));
+            }
             SlotValue::NativeUnary(call) => call(self, receiver),
             SlotValue::NativeBinary(call) => {
                 let argument = self.builtin_view(arguments[0])?;
@@ -3932,7 +3953,7 @@ impl Vm<'_> {
         Ok(CallResult::Value(value))
     }
 
-    fn class_type_id(&self, value: &Value) -> Result<Option<TypeId>, String> {
+    pub(super) fn class_type_id(&self, value: &Value) -> Result<Option<TypeId>, String> {
         Ok(match value.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),

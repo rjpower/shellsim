@@ -1303,9 +1303,17 @@ impl Vm<'_> {
             return Err(format!("value is not a valid {name}"));
         }
         if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
-            if let Some((owner, constructor)) = self.class_attribute_entry(id, "__new__")? {
+            let class_type = self
+                .class_type_id(&Value::Object(id))?
+                .ok_or("class has no registered type")?;
+            let use_type_constructor = layout == ClassLayout::Object;
+            if use_type_constructor || self.class_attribute_entry(id, "__new__")?.is_some() {
+                let (owner, constructor) = self
+                    .type_lookup(class_type, "__new__")?
+                    .ok_or("class constructor has no descriptor")?;
                 return self.construct_with_new(
                     id,
+                    class_type,
                     owner,
                     constructor,
                     arguments,
@@ -1761,13 +1769,16 @@ impl Vm<'_> {
     fn construct_with_new(
         &mut self,
         class: super::super::heap::ObjectId,
-        owner: super::super::heap::ObjectId,
+        class_type: super::super::object_model::TypeId,
+        owner: super::super::object_model::TypeId,
         constructor: Value,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
     ) -> Result<CallResult, String> {
         // `__new__` is a static method that receives the class explicitly.
-        let constructor = self.bind_descriptor(constructor, None, class, owner)?;
+        let constructor = self
+            .bind_type_attribute(constructor, None, class_type, owner)?
+            .ok_or("__new__ descriptor has no value")?;
         let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
         new_arguments.push(Value::Object(class));
         new_arguments.extend(arguments.iter().copied());
@@ -1783,10 +1794,32 @@ impl Vm<'_> {
         if !self.is_instance(&created, &Value::Object(class))? {
             return Ok(CallResult::Value(created));
         }
-        let Some((owner, initializer)) = self.class_attribute_entry(class, "__init__")? else {
+        let layout = match self.state.heap.get(class)? {
+            Object::Class { layout, .. } => *layout,
+            _ => return Err("type.__call__ requires a class".into()),
+        };
+        let initializer = if layout == ClassLayout::Object {
+            let initializer = self.type_lookup(class_type, "__init__")?;
+            // CPython accepts constructor arguments when a class replaces `__new__` but keeps
+            // `object.__init__`; that base initializer has no state to populate.
+            initializer.filter(|(defining_type, _)| {
+                *defining_type != BuiltinType::Object.id() || owner == BuiltinType::Object.id()
+            })
+        } else {
+            self.class_attribute_entry(class, "__init__")?
+                .map(|(owner, value)| {
+                    self.class_type_id(&Value::Object(owner))
+                        .and_then(|owner| owner.ok_or("initializer class has no type".into()))
+                        .map(|owner| (owner, value))
+                })
+                .transpose()?
+        };
+        let Some((owner, initializer)) = initializer else {
             return Ok(CallResult::Value(created));
         };
-        let initializer = self.bind_descriptor(initializer, Some(created), class, owner)?;
+        let initializer = self
+            .bind_type_attribute(initializer, Some(created), class_type, owner)?
+            .ok_or("__init__ descriptor has no value")?;
         match self.invoke_call(initializer, arguments, keyword_arguments)? {
             CallResult::Value(value) if value.is_none() => Ok(CallResult::Value(created)),
             CallResult::Value(value) => {

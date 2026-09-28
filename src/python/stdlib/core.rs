@@ -3082,8 +3082,8 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     runtime.dict_copy(dict)
 }
 
-/// The lazy iterator of a builtin sequence. The VM handles list, tuple and range before its
-/// generic iterator fallback, so this slot never materializes the sequence or re-enters itself.
+/// A builtin iterator. The VM handles supported physical payloads before consulting their
+/// `__iter__` slots, so this call cannot redispatch into itself.
 pub(crate) fn slot_sequence_iter(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -3103,6 +3103,25 @@ pub(crate) fn slot_builtin_length(
     let length =
         i64::try_from(length).map_err(|_| PyError::overflow_error("length is too large"))?;
     Ok(Some(Value::Int(length)))
+}
+
+/// `__getitem__` for builtin sequences whose indexing is implemented by the VM's physical
+/// payload reader. The reader also handles slices and their resource charges.
+pub(crate) fn slot_builtin_get_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    runtime.builtin_get_item(receiver, index).map(Some)
+}
+
+/// Membership for builtin payloads, preserving the VM's bounded search and element equality.
+pub(crate) fn slot_builtin_contains(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    item: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(runtime.builtin_contains(receiver, item)?)))
 }
 
 /// The base implementation accepts only an empty format specifier and uses the type's string

@@ -1187,6 +1187,16 @@ impl PyRuntime for Vm<'_> {
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
+    fn builtin_get_item(&mut self, container: Value, key: Value) -> PyResult<Value> {
+        self.subscript_builtin(container, key)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn builtin_contains(&mut self, container: Value, item: Value) -> PyResult<bool> {
+        self.contains_value(&container, &item)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn mapping_items(&mut self, value: Value) -> PyResult<Option<Vec<(Value, Value)>>> {
         Vm::mapping_items(self, value).map_err(|message| self.raised_or_runtime_error(message))
     }

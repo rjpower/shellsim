@@ -32,6 +32,19 @@ def test_builtin_sequence_iterators_are_exposed_as_descriptors():
     assert list([1, 2].__iter__()) == [1, 2]
     assert list(tuple.__iter__((3, 4))) == [3, 4]
     assert list(range(3).__iter__()) == [0, 1, 2]
+    assert list(str.__iter__("éa")) == ["é", "a"]
+    assert list(bytes.__iter__(b"ab")) == [97, 98]
+    assert list(bytearray.__iter__(bytearray(b"ab"))) == [97, 98]
+    assert sorted(set.__iter__({2, 1})) == [1, 2]
+    assert sorted(frozenset.__iter__(frozenset({2, 1}))) == [1, 2]
+    assert list(dict.__iter__({"a": 1, "b": 2})) == ["a", "b"]
+
+    class Custom(str):
+        def __iter__(self):
+            return iter(["custom"])
+
+    assert list(Custom("original")) == ["custom"]
+    assert list(str.__iter__(Custom("original"))) == list("original")
 
 
 def test_native_length_slots_are_directly_callable():
@@ -41,6 +54,42 @@ def test_native_length_slots_are_directly_callable():
     assert range(4).__len__() == 4
     assert {1, 2}.__len__() == 2
     assert dict.__len__({"x": 1}) == 1
+
+
+def test_builtin_sequence_getitem_slots_keep_defining_implementation():
+    assert list.__getitem__([4, 5], -1) == 5
+    assert tuple.__getitem__((4, 5), 0) == 4
+    assert str.__getitem__("café", 3) == "é"
+    assert range.__getitem__(range(3), 1) == 1
+    assert list.__getitem__([1, 2, 3], slice(1, None)) == [2, 3]
+
+    class Doubled(tuple):
+        def __getitem__(self, index):
+            return 2 * super().__getitem__(index)
+
+    values = Doubled((3, 4))
+    assert values[1] == 8
+    assert tuple.__getitem__(values, 1) == 4
+
+
+def test_builtin_membership_slots_are_visible_and_keep_base_behavior():
+    assert list.__contains__([1, 2], 2)
+    assert tuple.__contains__((1, 2), 3) is False
+    assert str.__contains__("café", "fé")
+    assert bytes.__contains__(b"abc", 98)
+    assert bytearray.__contains__(bytearray(b"abc"), 98)
+    assert dict.__contains__({"a": 1}, "a")
+    assert set.__contains__({1, 2}, 2)
+    assert frozenset.__contains__(frozenset({1, 2}), 2)
+    assert range.__contains__(range(4), 3)
+
+    class Selective(list):
+        def __contains__(self, item):
+            return False
+
+    value = Selective([1])
+    assert 1 not in value
+    assert list.__contains__(value, 1)
 
 
 def test_format_uses_type_slot_and_exposes_builtin_descriptor():
@@ -205,6 +254,30 @@ def test_type_call_runs_new_then_init_and_allows_metaclass_super():
             raise AssertionError("__init__ ran after __new__ returned another type")
 
     assert type.__call__(ReturnOther) == "other"
+
+
+def test_default_constructor_uses_inherited_new_and_init():
+    class Parent:
+        def __init__(self, value):
+            self.value = value
+
+    class Child(Parent):
+        pass
+
+    assert Child(7).value == 7
+    assert type.__call__(Child, 8).value == 8
+    assert object.__new__(Child).__class__ is Child
+
+    class Empty:
+        pass
+
+    assert type(Empty()) is Empty
+    try:
+        Empty(1)
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("object constructor accepted an unused argument")
 
 
 def test_comparison_tries_subclass_reflection_first():

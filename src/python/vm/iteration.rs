@@ -148,6 +148,9 @@ impl Vm<'_> {
                 _ => {}
             }
         }
+        if let Some(iterator) = self.snapshot_builtin_iterator(iterable)? {
+            return Ok(iterator);
+        }
         if let Some(iterator) = self.class_iterator(&iterable)? {
             return Ok(iterator);
         }
@@ -163,6 +166,50 @@ impl Vm<'_> {
             &mut self.interp.resources,
         )?;
         Ok(iterator)
+    }
+
+    /// Builtin strings, byte strings and hash containers keep their existing snapshot iteration
+    /// behavior, but enter it before their new `__iter__` slots to avoid redispatching into the
+    /// native wrapper. Copying one element at a time charges its retained size before the next.
+    fn snapshot_builtin_iterator(&mut self, iterable: Value) -> Result<Option<Value>, String> {
+        if iterable
+            .object_id()
+            .is_some_and(|id| matches!(self.state.heap.get(id), Ok(Object::Instance { .. })))
+        {
+            return Ok(None);
+        }
+        let mut values = Vec::new();
+        if let Some(text) = protocol::string_value(&self.state.heap, &iterable)? {
+            for character in text.chars() {
+                let character = self.allocate_string(character.to_string())?;
+                self.push_materialized(&mut values, character)?;
+            }
+        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, &iterable)? {
+            for byte in bytes {
+                self.push_materialized(&mut values, Value::Int(i64::from(byte)))?;
+            }
+        } else if let Some(id) = iterable.object_id() {
+            let length = match self.state.heap.get(id)? {
+                Object::Set(items) | Object::FrozenSet(items) => items.len(),
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries.len(),
+                _ => return Ok(None),
+            };
+            for index in 0..length {
+                let item = match self.state.heap.get(id)? {
+                    Object::Set(items) | Object::FrozenSet(items) => items[index],
+                    Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries[index].0,
+                    _ => return Err("builtin iterator source changed object kind".into()),
+                };
+                self.push_materialized(&mut values, item)?;
+            }
+        } else {
+            return Ok(None);
+        }
+        self.allocate_object(Object::Iterator {
+            values,
+            position: 0,
+        })
+        .map(Some)
     }
 
     /// Whether `value` is an iterator: one of the runtime's lazy iterator objects, or an object

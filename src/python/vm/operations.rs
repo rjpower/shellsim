@@ -277,7 +277,11 @@ impl Vm<'_> {
     /// Answer `needle in container` once `__contains__` has declined. Builtin containers answer
     /// directly; any other iterable is searched item by item, stopping at the first match, as
     /// CPython does.
-    fn contains_value(&mut self, container: &Value, needle: &Value) -> Result<bool, String> {
+    pub(super) fn contains_value(
+        &mut self,
+        container: &Value,
+        needle: &Value,
+    ) -> Result<bool, String> {
         if protocol::string_ref(&self.state.heap, container)?.is_some() {
             if protocol::string_ref(&self.state.heap, needle)?.is_none() {
                 let message = format!(

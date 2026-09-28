@@ -730,6 +730,10 @@ pub(super) trait PyRuntime {
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
     /// `container[key]`, running the container's `__getitem__` or builtin subscript.
     fn get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// Index a builtin payload without reentering its `__getitem__` slot.
+    fn builtin_get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// Membership in a builtin payload without reentering its `__contains__` slot.
+    fn builtin_contains(&mut self, container: PyValue, item: PyValue) -> PyResult<bool>;
     /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no
     /// `keys` method. Mappings other than dicts are read through `keys()` and `__getitem__`, as
     /// `dict(m)` and `f(**m)` read them in CPython.
