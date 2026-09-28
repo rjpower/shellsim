@@ -8,15 +8,17 @@
 //! Like the NumPy core, this module reaches no host capability, and every kernel charges CPU
 //! through the ufunc loop that runs it.
 
-mod linalg;
 pub(in crate::python) mod special;
 
 use super::super::native::ModuleDef;
 
 /// The native module `name`, for names starting with `_scipy`.
+///
+/// `scipy.linalg` has no native module of its own: it is built entirely in Python over
+/// `_numpy_linalg`'s primitives (see `source/scipy/linalg.py`), so there is nothing to register
+/// here for it.
 pub(in crate::python) fn native_module(name: &str) -> Option<&'static ModuleDef> {
     Some(match name {
-        "_scipy_linalg" => &linalg::MODULE,
         "_scipy_special" => &special::MODULE,
         _ => return None,
     })

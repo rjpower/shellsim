@@ -125,8 +125,6 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     native("UFuncTypeError", "TypeError", "numpy._core._exceptions"),
     native("DTypePromotionError", "TypeError", "numpy.exceptions"),
     native("ComplexWarning", "RuntimeWarning", "numpy.exceptions"),
-    // The argument-check error of SciPy's f2py LAPACK wrappers, `scipy.linalg._flapack.error`.
-    native("error", "Exception", "_flapack"),
 ];
 
 /// Look up a modeled exception class by name.

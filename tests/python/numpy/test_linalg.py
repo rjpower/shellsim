@@ -323,6 +323,53 @@ def test_eigh_diagonal_matrix_sorts_eigenvalues():
     assert_allclose(np.abs(v), [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], atol=1e-12)
 
 
+def sorted_eigenvalues(w):
+    # Eigenvalue order is not part of the contract, so comparisons sort by (real, imag) first.
+    order = np.lexsort((w.imag, w.real))
+    return w[order]
+
+
+def test_eig_general_matrix_satisfies_eigenvector_equation():
+    # Eigenvectors are only defined up to sign/phase, so this checks the defining relation
+    # A @ v == w * v column-by-column rather than comparing v to a fixed reference.
+    a = general_matrix()
+    w, v = np.linalg.eig(a)
+    assert w.dtype == np.complex128
+    assert v.dtype == np.complex128
+    assert_allclose(a @ v, v * w, atol=1e-10)
+    assert_allclose(sorted_eigenvalues(w), sorted_eigenvalues(np.linalg.eigvals(a)), atol=1e-10)
+    assert_allclose(np.sum(w).real, np.trace(a), atol=1e-10)
+    assert_allclose(np.prod(w).real, np.linalg.det(a), atol=1e-10)
+
+
+def test_eig_rotation_matrix_has_complex_conjugate_pair():
+    a = np.array([[0.0, -1.0], [1.0, 0.0]])
+    w, v = np.linalg.eig(a)
+    assert_allclose(sorted_eigenvalues(w), sorted_eigenvalues(np.array([1j, -1j])), atol=1e-12)
+    assert_allclose(a @ v, v * w, atol=1e-12)
+
+
+def test_eig_defective_matrix_repeats_eigenvalue():
+    # A single non-trivial Jordan block: eigenvalue 2 with algebraic multiplicity 2 but only one
+    # independent eigenvector, so only the eigenvector equation is checked, not orthogonality.
+    a = np.array([[2.0, 1.0], [0.0, 2.0]])
+    w, v = np.linalg.eig(a)
+    assert_allclose(sorted_eigenvalues(w), [2.0, 2.0], atol=1e-8)
+    for k in range(2):
+        assert_allclose(a @ v[:, k], w[k] * v[:, k], atol=1e-8)
+
+
+def test_eig_non_square_raises_linalg_error():
+    with pytest.raises(np.linalg.LinAlgError):
+        np.linalg.eig(np.ones((2, 3)))
+
+
+def test_eigvals_matches_eig_without_vectors():
+    a = spd_matrix()
+    w, _ = np.linalg.eig(a)
+    assert_allclose(sorted_eigenvalues(w), sorted_eigenvalues(np.linalg.eigvals(a)), atol=1e-10)
+
+
 def test_svd_reconstructs_with_descending_singular_values():
     a = np.array([[3.0, 2.0, 2.0], [2.0, 3.0, -2.0]])
     u, s, vt = np.linalg.svd(a)

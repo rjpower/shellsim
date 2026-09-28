@@ -1,12 +1,14 @@
 """shellsim's ``numpy.linalg``.
 
-Eight functions (:func:`inv`, :func:`solve`, :func:`det`, :func:`slogdet`, :func:`cholesky`,
-:func:`qr`, :func:`eigh`, :func:`svd`) are thin wrappers around the native dense-matrix kernels
-in ``_numpy_linalg``, which batch over stacked leading dimensions and charge CPU for their cubic
-(or, for the Jacobi-based :func:`eigh` and :func:`svd`, per-sweep) work before running it. The
-remaining functions here (:func:`eigvalsh`, :func:`svdvals`, :func:`matrix_power`,
+Ten functions (:func:`inv`, :func:`solve`, :func:`det`, :func:`slogdet`, :func:`cholesky`,
+:func:`qr`, :func:`eigh`, :func:`eig`, :func:`svd`, plus :func:`eigvals` sharing `eig`'s native
+call) are thin wrappers around the native dense-matrix kernels in ``_numpy_linalg``, which batch
+over stacked leading dimensions and charge CPU for their cubic (or, for the Jacobi-based
+:func:`eigh`/:func:`svd` and the QR-iteration-based :func:`eig`, per-sweep) work before running
+it. The remaining functions here (:func:`eigvalsh`, :func:`svdvals`, :func:`matrix_power`,
 :func:`matrix_rank`, :func:`pinv`, :func:`lstsq`, :func:`norm`) are plain Python built from those
-eight and from ordinary NumPy array operations.
+and from ordinary NumPy array operations. ``_numpy_linalg`` also exposes `lu` and
+`solve_triangular`, used only by `scipy.linalg`, not part of this module's own public surface.
 
 See ``docs/numpy.md`` for the algorithm behind each native primitive, its accuracy, and its
 (documented, deliberate) differences from real NumPy's LAPACK-backed implementation.
@@ -16,6 +18,7 @@ import numpy as np
 from _numpy import _LinAlgError as LinAlgError
 from _numpy_linalg import cholesky as _cholesky
 from _numpy_linalg import det as _det
+from _numpy_linalg import eig as _eig
 from _numpy_linalg import eigh as _eigh
 from _numpy_linalg import inv as _inv
 from _numpy_linalg import qr as _qr
@@ -33,6 +36,8 @@ __all__ = [
     "qr",
     "eigh",
     "eigvalsh",
+    "eig",
+    "eigvals",
     "svd",
     "svdvals",
     "matrix_power",
@@ -92,6 +97,31 @@ def eigh(a, UPLO="L"):
 def eigvalsh(a, UPLO="L"):
     """Eigenvalues (ascending) of a Hermitian matrix, without eigenvectors."""
     w, _ = _eigh(a, UPLO, False)
+    return w
+
+
+def eig(a):
+    """Eigenvalues and right eigenvectors of a general square matrix, or a stack of them.
+
+    Returns ``(w, v)``: `w` holds the eigenvalues (not necessarily ordered, and not necessarily
+    real even when `a` is real: a real matrix's complex eigenvalues occur in conjugate pairs),
+    and column ``v[:, i]`` is the eigenvector for ``w[i]``, normalized to unit length. `w` and `v`
+    are always complex, matching real NumPy's own `eig` (whose docs describe casting an
+    all-real result down to a real dtype, but whose current implementation, like this one, does
+    not). Eigenvector signs (more generally, for a complex eigenvector, its phase) are normalized
+    so each column's largest-magnitude entry is a positive real number; real NumPy's come from
+    LAPACK and are not otherwise comparable.
+
+    Raises :class:`LinAlgError` if the underlying QR iteration fails to converge, or if `a` is
+    not square.
+    """
+    return _eig(a, True)
+
+
+def eigvals(a):
+    """Eigenvalues of a general square matrix, or a stack of them, without eigenvectors. See
+    :func:`eig`."""
+    w, _ = _eig(a, False)
     return w
 
 
