@@ -89,7 +89,7 @@ pub(super) fn module_source(name: &str) -> Option<FrozenModule> {
         "scipy.linalg" => frozen!("scipy/linalg/__init__.py"),
         "scipy.linalg.blas" => frozen!("scipy/linalg/blas.py"),
         "scipy.linalg.lapack" => frozen!("scipy/linalg/lapack.py"),
-        "scipy.interpolate" => frozen!("scipy/interpolate/__init__.py"),
+        "scipy.interpolate" => frozen!("scipy/interpolate.py"),
         "scipy.spatial" => frozen!("scipy/spatial/__init__.py"),
         "scipy.spatial.distance" => frozen!("scipy/spatial/distance.py"),
         "scipy.special" => frozen!("scipy/special/__init__.py"),

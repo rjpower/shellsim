@@ -1,9 +1,11 @@
 # Portable SciPy semantics. Expectations checked against SciPy 1.18.1 and NumPy 2.5.3 on
 # CPython 3.14.4.
-# Scope: scipy.interpolate's one-dimensional interpolators: interp1d, PPoly, CubicHermiteSpline,
-# CubicSpline and PCHIP. interp1d's linear and step kinds are compared exactly; spline
-# constructions solve banded systems whose last bits may differ between implementations, so
-# they are compared with a tight tolerance.
+# Scope: scipy.interpolate's one-dimensional interpolators: interp1d (kinds up to cubic), PPoly,
+# CubicHermiteSpline, CubicSpline and PCHIP. interp1d's linear and step kinds are compared
+# exactly; spline constructions solve banded systems whose last bits may differ between
+# implementations, so they are compared with a tight tolerance. shellsim-only restrictions, such
+# as rejecting interp1d's fill_value=(below, above) pairs and spline orders above cubic, live in
+# tests/python/scipy.rs since real SciPy accepts both.
 
 import numpy as np
 import pytest
@@ -79,9 +81,9 @@ def test_interp1d_step_kinds(kind, expected):
              0.7150711111111117, 3.3693200000000023, 4.0],
         ),
         (
-            4,
-            [1.0, 1.8526953333333331, 3.1246744791666656, 2.9706640624999987, 2.0,
-             0.7514586666666674, 3.3445520000000024, 4.0],
+            3,
+            [1.0, 1.9012566666666666, 3.1013454861111103, 2.935390625, 2.0,
+             0.7150711111111117, 3.3693200000000023, 4.0],
         ),
     ],
 )
@@ -105,12 +107,12 @@ def test_interp1d_out_of_range_points():
     filled = interpolate.interp1d(X, Y, bounds_error=False)
     assert np.isnan(filled.fill_value) and filled.fill_value.shape == ()
     assert_array_equal(filled([-1.0, 2.5, 6.0]), [np.nan, 2.0, np.nan])
-    pair = interpolate.interp1d(X, Y, bounds_error=False, fill_value=(-5, 7))
-    assert pair.fill_value == (-5, 7)
-    assert pair([-1.0, 6.0]).tolist() == [-5.0, 7.0]
-    # A fill value pair alone does not turn off the bounds check.
+    scalar_fill = interpolate.interp1d(X, Y, bounds_error=False, fill_value=-5.0)
+    assert scalar_fill.fill_value == -5.0
+    assert scalar_fill([-1.0, 6.0]).tolist() == [-5.0, -5.0]
+    # A fill value alone does not turn off the bounds check.
     with pytest.raises(ValueError):
-        interpolate.interp1d(X, Y, fill_value=(-5, 7))(6.0)
+        interpolate.interp1d(X, Y, fill_value=-5.0)(6.0)
     with pytest.raises(ValueError):
         interpolate.interp1d(X, Y, bounds_error=True, fill_value="extrapolate")
 
@@ -126,13 +128,13 @@ def test_interp1d_extrapolates_step_kinds_one_sided():
           [-4.303888888888886, 14.946111111111113])
 
 
-def test_interp1d_fill_values_broadcast_over_columns():
+def test_interp1d_fill_value_broadcasts_over_columns():
     columns = np.array([[1.0, 2.0], [3.0, 4.0]])
-    f = interpolate.interp1d([0.0, 1.0], columns, axis=0, bounds_error=False, fill_value=([1.0, 2.0], 7))
-    assert f([-1.0, 0.5, 2.0]).tolist() == [[1.0, 2.0], [2.0, 3.0], [7.0, 7.0]]
+    f = interpolate.interp1d([0.0, 1.0], columns, axis=0, bounds_error=False, fill_value=[5.0, 7.0])
+    assert f([-1.0, 0.5, 2.0]).tolist() == [[5.0, 7.0], [2.0, 3.0], [5.0, 7.0]]
     with pytest.raises(ValueError):
         interpolate.interp1d([0.0, 1.0], columns, axis=0, bounds_error=False,
-                             fill_value=([1.0, 2.0, 3.0], 7))
+                             fill_value=[1.0, 2.0, 3.0])
     with pytest.raises(ValueError):
         interpolate.interp1d([0.0, 1.0], [1.0, 2.0], bounds_error=False, fill_value=[1.0, 2.0])
 
@@ -188,8 +190,6 @@ def test_interp1d_rejects_invalid_arguments():
         interpolate.interp1d([0.0], [1.0], kind="slinear")
     with pytest.raises(ValueError):
         interpolate.interp1d([0.0, 1.0, 2.0], [0.0, 1.0, 3.0], kind="cubic")
-    with pytest.raises(ValueError):
-        interpolate.interp1d([0.0, 1.0, 2.0], [0.0, 1.0, 3.0], kind=5)
     # One sample is enough for the kinds that only look up neighbors.
     assert interpolate.interp1d([1.0], [2.0])(1.0) == 2.0
     assert interpolate.interp1d([1.0], [2.0], kind="nearest")(1.0) == 2.0

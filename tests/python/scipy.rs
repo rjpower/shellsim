@@ -89,14 +89,41 @@ fn unsupported_scipy_features_fail_explicitly() {
             "from scipy.spatial import distance\ndistance.dice",
             "AttributeError",
         ),
-        ("from scipy.interpolate import BSpline", "ImportError"),
         (
-            "from scipy.interpolate import CubicSpline\nCubicSpline([0, 1, 2], [1, -1, 1]).roots()",
-            "NotImplementedError: PPoly.roots is not supported by shellsim's SciPy",
+            "from scipy.spatial import distance\ndistance.is_valid_dm",
+            "AttributeError",
+        ),
+        (
+            "import scipy.spatial\nscipy.spatial.minkowski_distance",
+            "AttributeError",
+        ),
+        (
+            // Real SciPy accepts this shorthand alias for "euclidean"; shellsim's subset
+            // keeps only the plain metric names.
+            "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'euclid')",
+            "ValueError",
         ),
         (
             "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'yule')",
             "ValueError",
+        ),
+        ("from scipy.interpolate import BSpline", "ImportError"),
+        (
+            "from scipy.interpolate import CubicSpline\nCubicSpline([0, 1, 2], [1, -1, 1]).roots()",
+            "AttributeError",
+        ),
+        (
+            // Real SciPy supports arbitrary spline orders in interp1d; shellsim's subset caps
+            // at cubic.
+            "from scipy.interpolate import interp1d\ninterp1d([0.0, 1.0, 2.0], [0.0, 1.0, 2.0], kind=4)",
+            "NotImplementedError",
+        ),
+        (
+            // Real SciPy treats a 2-tuple fill_value as separate (below, above) values;
+            // shellsim's subset only accepts a single value used on both sides.
+            "from scipy.interpolate import interp1d\n\
+             interp1d([0.0, 1.0], [0.0, 1.0], bounds_error=False, fill_value=(-5, 7))",
+            "NotImplementedError",
         ),
     ] {
         let (status, stderr) = run(Limits::default().cpu, source);
