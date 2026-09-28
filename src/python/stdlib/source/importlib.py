@@ -1,6 +1,27 @@
-"""Small VFS-only importlib.util surface."""
+"""Small VFS-only importlib surface: ``import_module`` and part of ``importlib.util``."""
 
-from _importlib import exec_module as _exec_module, new_module as _new_module
+from _importlib import exec_module as _exec_module
+from _importlib import import_module as _import_module
+from _importlib import new_module as _new_module
+
+
+def import_module(name, package=None):
+    """Import the module ``name`` and return it; a leading dot makes ``name`` relative to ``package``.
+
+    >>> import_module("json").__name__
+    'json'
+    """
+    if not name.startswith("."):
+        return _import_module(name)
+    if not package:
+        raise TypeError(f"the 'package' argument is required to import {name!r}")
+    level = len(name) - len(name.lstrip("."))
+    parts = package.split(".")
+    if level > len(parts):
+        raise ImportError("attempted relative import beyond top-level package")
+    base = ".".join(parts[: len(parts) - level + 1])
+    rest = name[level:]
+    return _import_module(f"{base}.{rest}" if rest else base)
 
 
 class SourceFileLoader:

@@ -1,7 +1,7 @@
 """shellsim's ``scipy.spatial``: the ``distance`` module and the deprecated Minkowski helpers.
 
 Spatial data structures and computational geometry (``KDTree``, ``ConvexHull``, ``Delaunay``,
-``Voronoi``, ...) are not modeled and raise ``NotImplementedError`` when accessed.
+``Voronoi``, ...) are not provided.
 """
 
 import warnings
@@ -11,34 +11,6 @@ import numpy as np
 from scipy.spatial import distance
 
 __all__ = ["distance", "distance_matrix", "minkowski_distance", "minkowski_distance_p"]
-
-_UNSUPPORTED = {
-    "ConvexHull",
-    "Delaunay",
-    "HalfspaceIntersection",
-    "KDTree",
-    "QhullError",
-    "Rectangle",
-    "SphericalVoronoi",
-    "Voronoi",
-    "cKDTree",
-    "ckdtree",
-    "convex_hull_plot_2d",
-    "delaunay_plot_2d",
-    "geometric_slerp",
-    "kdtree",
-    "procrustes",
-    "qhull",
-    "transform",
-    "tsearch",
-    "voronoi_plot_2d",
-}
-
-
-def __getattr__(name):
-    if name in _UNSUPPORTED:
-        raise NotImplementedError(f"scipy.spatial.{name} is not supported by shellsim's SciPy")
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _deprecated(name, replacement):

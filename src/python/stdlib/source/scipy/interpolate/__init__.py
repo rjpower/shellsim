@@ -10,7 +10,7 @@ so building a spline costs time linear in the number of points.
 Results agree with SciPy to rounding. ``interp1d``'s linear kind reproduces SciPy bit for bit;
 the spline constructions solve the same systems but may round differently in the last bits.
 B-spline objects, multivariate and scattered-data interpolation, smoothing splines and the
-FITPACK wrappers are not modeled and raise ``NotImplementedError`` when accessed.
+FITPACK wrappers are not provided.
 """
 
 import math
@@ -29,67 +29,6 @@ __all__ = [
     "pchip",
     "pchip_interpolate",
 ]
-
-_UNSUPPORTED = {
-    "AAA",
-    "Akima1DInterpolator",
-    "BPoly",
-    "BSpline",
-    "BarycentricInterpolator",
-    "BivariateSpline",
-    "CloughTocher2DInterpolator",
-    "FloaterHormannInterpolator",
-    "InterpolatedUnivariateSpline",
-    "KroghInterpolator",
-    "LSQBivariateSpline",
-    "LSQSphereBivariateSpline",
-    "LSQUnivariateSpline",
-    "LinearNDInterpolator",
-    "NdBSpline",
-    "NdPPoly",
-    "NearestNDInterpolator",
-    "RBFInterpolator",
-    "Rbf",
-    "RectBivariateSpline",
-    "RectSphereBivariateSpline",
-    "RegularGridInterpolator",
-    "SmoothBivariateSpline",
-    "SmoothSphereBivariateSpline",
-    "UnivariateSpline",
-    "approximate_taylor_polynomial",
-    "barycentric_interpolate",
-    "bisplev",
-    "bisplrep",
-    "generate_knots",
-    "griddata",
-    "insert",
-    "interp2d",
-    "interpn",
-    "krogh_interpolate",
-    "lagrange",
-    "make_interp_spline",
-    "make_lsq_spline",
-    "make_smoothing_spline",
-    "make_splprep",
-    "make_splrep",
-    "pade",
-    "spalde",
-    "splantider",
-    "splder",
-    "splev",
-    "splint",
-    "splprep",
-    "splrep",
-    "sproot",
-}
-
-
-def __getattr__(name):
-    if name in _UNSUPPORTED:
-        raise NotImplementedError(
-            f"scipy.interpolate.{name} is not supported by shellsim's SciPy"
-        )
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _unsupported_method(name):

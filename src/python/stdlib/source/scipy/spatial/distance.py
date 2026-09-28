@@ -8,7 +8,7 @@ input. ``cdist`` applies it to ``XA[:, None]`` against ``XB[None, :]`` and ``pdi
 compiled loops are. A callable metric is called once per pair instead.
 
 The boolean dissimilarities other than ``hamming`` and ``jaccard`` (``dice``, ``yule``, ...)
-and ``directed_hausdorff`` are not modeled and raise ``NotImplementedError``.
+and ``directed_hausdorff`` are not provided.
 """
 
 import math
@@ -40,21 +40,6 @@ __all__ = [
     "squareform",
     "hamming",
 ]
-
-_UNSUPPORTED = {
-    "dice",
-    "directed_hausdorff",
-    "rogerstanimoto",
-    "russellrao",
-    "sokalsneath",
-    "yule",
-}
-
-
-def __getattr__(name):
-    if name in _UNSUPPORTED:
-        raise NotImplementedError(f"scipy.spatial.distance.{name} is not supported by shellsim's SciPy")
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _as_float(u):
@@ -323,23 +308,11 @@ _ALIASES = {
     alias: name for name, (_, aliases) in _METRICS.items() for alias in (name, *aliases)
 }
 
-_UNSUPPORTED_METRICS = {
-    "dice",
-    "kulczynski1",
-    "rogerstanimoto",
-    "russellrao",
-    "sokalmichener",
-    "sokalsneath",
-    "yule",
-}
-
 
 def _metric_name(metric):
     name = metric.lower()
     if name.startswith("test_"):
         name = name[len("test_") :]
-    if name in _UNSUPPORTED_METRICS:
-        raise NotImplementedError(f"the {name!r} distance metric is not supported by shellsim's SciPy")
     if name not in _ALIASES:
         raise ValueError(f"Unknown Distance Metric: {metric}")
     return _ALIASES[name]

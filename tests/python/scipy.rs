@@ -37,14 +37,11 @@ fn unsupported_scipy_features_fail_explicitly() {
             "special.factorial(1 + 1j, extend='complex')",
             "complex input to scipy.special.gamma is not supported by shellsim's SciPy",
         ),
-        (
-            "import scipy.sparse",
-            "NotImplementedError: scipy.sparse is not supported by shellsim's SciPy",
-        ),
+        ("import scipy.sparse", "ModuleNotFoundError"),
         // Generic fitting needs scipy.optimize; moments above order 4 need integration.
         (
             "from scipy import stats\nstats.t.fit([1.0, 2.0])",
-            "NotImplementedError: scipy.optimize is not supported by shellsim's SciPy",
+            "ModuleNotFoundError",
         ),
         (
             "from scipy import stats\nstats.t.moment(5, 7)",
@@ -54,10 +51,7 @@ fn unsupported_scipy_features_fail_explicitly() {
             "from scipy import stats\nstats.rv_discrete(values=([1, 2], [0.5, 0.5]))",
             "rv_discrete(values=...) is not supported by shellsim's SciPy",
         ),
-        (
-            "from scipy import stats\nstats.gamma",
-            "NotImplementedError: scipy.stats.gamma is not supported by shellsim's SciPy",
-        ),
+        ("from scipy import stats\nstats.gamma", "AttributeError"),
         (
             "from scipy import stats\nstats.describe([1, np.nan], nan_policy='omit')",
             "describe(..., nan_policy='omit') with NaN input is not supported by shellsim's SciPy",
@@ -67,12 +61,8 @@ fn unsupported_scipy_features_fail_explicitly() {
             "chi2_contingency(..., method=...) is not supported by shellsim's SciPy",
         ),
         (
-            "import scipy.linalg as sl\nsl.eig(np.eye(2))",
-            "NotImplementedError: scipy.linalg.eig is not supported by shellsim's SciPy",
-        ),
-        (
             "import scipy.linalg as sl\nsl.solveh_banded",
-            "NotImplementedError: scipy.linalg.solveh_banded is not supported by shellsim's SciPy",
+            "AttributeError",
         ),
         (
             "import scipy.linalg as sl\nsl.solve(np.eye(2) + 1j, np.ones(2))",
@@ -94,25 +84,19 @@ fn unsupported_scipy_features_fail_explicitly() {
             "from scipy.linalg import blas\nblas.ddot",
             "NotImplementedError: BLAS routine ddot is not supported by shellsim's SciPy",
         ),
-        (
-            "from scipy.spatial import KDTree",
-            "NotImplementedError: scipy.spatial.KDTree is not supported by shellsim's SciPy",
-        ),
+        ("from scipy.spatial import KDTree", "ImportError"),
         (
             "from scipy.spatial import distance\ndistance.dice",
-            "NotImplementedError: scipy.spatial.distance.dice is not supported by shellsim's SciPy",
+            "AttributeError",
         ),
-        (
-            "from scipy.interpolate import BSpline",
-            "NotImplementedError: scipy.interpolate.BSpline is not supported by shellsim's SciPy",
-        ),
+        ("from scipy.interpolate import BSpline", "ImportError"),
         (
             "from scipy.interpolate import CubicSpline\nCubicSpline([0, 1, 2], [1, -1, 1]).roots()",
             "NotImplementedError: PPoly.roots is not supported by shellsim's SciPy",
         ),
         (
             "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'yule')",
-            "NotImplementedError: the 'yule' distance metric is not supported by shellsim's SciPy",
+            "ValueError",
         ),
     ] {
         let (status, stderr) = run(Limits::default().cpu, source);

@@ -1,40 +1,17 @@
-"""shellsim's ``scipy``.
+"""shellsim's ``scipy``: a small subset of SciPy on top of shellsim's NumPy.
 
-Real SciPy loads each subpackage lazily on first attribute access instead of importing all of
-them up front. shellsim reproduces that with a module ``__getattr__`` (PEP 562): touching
-``scipy.stats`` imports the ``scipy.stats`` submodule the first time and caches it as a module
-attribute afterwards, exactly as ``import scipy.stats`` would. Only ``special``, ``stats``,
-``linalg``, ``spatial`` and ``interpolate`` do anything; the rest resolve to
-``scipy._unsupported``, whose import always raises ``NotImplementedError``.
+Subpackages load on first attribute access through a module ``__getattr__`` (PEP 562), so
+``import scipy`` stays cheap and ``scipy.stats`` works without importing it first. Importing a
+submodule binds it on this package, so the hook runs once per subpackage. Subpackages shellsim
+does not provide are missing modules: importing one raises ``ModuleNotFoundError``.
 """
 
 import importlib
 
-__all__ = [
-    "cluster",
-    "constants",
-    "datasets",
-    "differentiate",
-    "fft",
-    "fftpack",
-    "integrate",
-    "interpolate",
-    "io",
-    "linalg",
-    "ndimage",
-    "odr",
-    "optimize",
-    "signal",
-    "sparse",
-    "spatial",
-    "special",
-    "stats",
-]
+__all__ = ["integrate", "interpolate", "linalg", "spatial", "special", "stats"]
 
 
 def __getattr__(name):
     if name not in __all__:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = importlib.import_module(f"scipy.{name}")
-    globals()[name] = module
-    return module
+        raise AttributeError(f"module 'scipy' has no attribute {name!r}")
+    return importlib.import_module(f"scipy.{name}")

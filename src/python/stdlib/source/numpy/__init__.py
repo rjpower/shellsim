@@ -8,8 +8,8 @@ printing digits) and layers the parts NumPy itself writes in Python on top: erro
 statistics, ``nan*`` reductions, histograms, and ``vectorize``. ``_arrayprint``, ``strings`` and
 ``linalg`` (owned by other areas of this port) import eagerly, at the end, once every name they
 need (from the native modules and the areas above) is already bound here. ``numpy.fft``,
-``numpy.random``, ``numpy.testing``, ``numpy.lib``, and the file I/O functions (``save``,
-``load``, ...) load on first access through ``__getattr__``, as NumPy does.
+``numpy.random``, ``numpy.testing`` and ``numpy.lib`` load on first access through
+``__getattr__``.
 
 ``ndarray.flags``, ``generic.flags`` and ``ndarray.flat`` are native getters that call back into
 this module by name (``numpy._flagsobj``, ``numpy._scalar_flags``, ``numpy.flatiter``), so those
@@ -20,6 +20,8 @@ three classes live here rather than in a submodule.
 #: module's globals to NumPy's scalar type (as real NumPy itself does with ``np.bool``). Every
 #: later use of ``bool(...)`` in this file goes through this alias instead.
 _python_bool = bool
+
+from importlib import import_module as _import_module
 
 from _numpy import *
 from _numpy import (
@@ -293,19 +295,12 @@ class flatiter:
 
 
 _LAZY_SUBMODULES = ("fft", "random", "testing", "lib")
-_LAZY_IO_FUNCTIONS = ("save", "load", "savez", "savez_compressed", "savetxt", "loadtxt", "genfromtxt")
 
 
 def __getattr__(name):
-    # shellsim's interpreter has no `globals()` builtin, so this cannot cache the resolved
-    # value back into the module's own namespace the way CPython's lazy-import recipes do.
-    # `__import__` on an already-imported module is cheap (it returns the cached module
-    # object rather than re-running it), so re-resolving on every access is still fine.
+    # Importing a submodule binds it on this package, so this runs once per submodule.
     if name in _LAZY_SUBMODULES:
-        return __import__(f"numpy.{name}", fromlist=[name])
-    if name in _LAZY_IO_FUNCTIONS:
-        npyio = __import__("numpy.lib.npyio", fromlist=["npyio"])
-        return getattr(npyio, name)
+        return _import_module(f"numpy.{name}")
     raise AttributeError(f"module 'numpy' has no attribute {name!r}")
 
 
@@ -315,3 +310,4 @@ from numpy._arrayprint import *
 
 import numpy.strings as strings
 import numpy.linalg as linalg
+from numpy.lib.npyio import genfromtxt, load, loadtxt, save, savetxt, savez, savez_compressed

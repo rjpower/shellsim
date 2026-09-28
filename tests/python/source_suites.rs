@@ -13,6 +13,7 @@ const BUILTINS: &[u8] = include_bytes!("test_builtins.py");
 const COLLECTIONS: &[u8] = include_bytes!("test_collections.py");
 const ASYNCIO: &[u8] = include_bytes!("test_asyncio.py");
 const CONTEXTLIB: &[u8] = include_bytes!("test_contextlib.py");
+const IMPORTLIB: &[u8] = include_bytes!("test_importlib.py");
 const INSPECT: &[u8] = include_bytes!("test_inspect.py");
 const LANGUAGE: &[u8] = include_bytes!("test_language.py");
 const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
@@ -81,6 +82,11 @@ fn collections() {
 #[test]
 fn contextlib() {
     assert_source_suite("test_contextlib.py", CONTEXTLIB);
+}
+
+#[test]
+fn importlib() {
+    assert_source_suite("test_importlib.py", IMPORTLIB);
 }
 
 #[test]

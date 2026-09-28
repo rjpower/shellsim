@@ -56,15 +56,11 @@ pub(super) fn value_kind(index: u8) -> Option<&'static ValueKindDef> {
         .copied()
 }
 
-/// Resolve a capability-free stdlib module implemented in ordinary Python source.
-pub(super) fn frozen_module(name: &str) -> Option<&'static str> {
-    frozen::module_source(name)
-}
+pub(super) use frozen::FrozenModule;
 
-/// True when `name` is a frozen package rather than a plain module (see
-/// [`frozen::is_package`]).
-pub(super) fn frozen_module_is_package(name: &str) -> bool {
-    frozen::is_package(name)
+/// Resolve a capability-free stdlib module implemented in ordinary Python source.
+pub(super) fn frozen_module(name: &str) -> Option<FrozenModule> {
+    frozen::module_source(name)
 }
 
 /// Resolve a builtin implemented by a frozen module without preloading that module into the VFS.

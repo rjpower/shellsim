@@ -749,7 +749,6 @@ def lstsq(a, b, cond=None, overwrite_a=False, overwrite_b=False, check_finite=Tr
     return x, residues, rank, singular_values
 
 
-
 lstsq.default_lapack_driver = "gelsd"
 
 def pinv(a, atol=None, rtol=None, return_rank=False, check_finite=True):
@@ -1165,18 +1164,3 @@ def dft(n, scale=None):
 # -------------------------------------------------------------------------------------------
 # Unsupported frontier
 # -------------------------------------------------------------------------------------------
-
-_UNSUPPORTED_NAMES = {
-    "eig", "eigvals", "eig_banded", "eigvals_banded", "eigh_tridiagonal",
-    "eigvalsh_tridiagonal", "schur", "rsf2csf", "hessenberg", "cdf2rdf", "logm", "sqrtm",
-    "funm", "expm_frechet", "expm_cond", "matrix_balance", "solveh_banded", "solve_lyapunov",
-    "solve_sylvester", "solve_continuous_are", "solve_discrete_are",
-    "solve_continuous_lyapunov", "solve_discrete_lyapunov", "cossin", "qz", "ordqz",
-    "cholesky_banded", "cho_solve_banded", "matmul_toeplitz",
-}
-
-
-def __getattr__(name):
-    if name in _UNSUPPORTED_NAMES:
-        raise NotImplementedError(f"scipy.linalg.{name} is not supported by shellsim's SciPy")
-    raise AttributeError(f"module 'scipy.linalg' has no attribute '{name}'")

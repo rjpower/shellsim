@@ -420,8 +420,9 @@ impl Vm<'_> {
             return self.finish_import(&name, module, bind_root);
         }
 
-        let source = if let Some(source) = super::super::stdlib::frozen_module(&name) {
-            Some((format!("<frozen {name}>"), source.to_string()))
+        let frozen = super::super::stdlib::frozen_module(&name);
+        let source = if let Some(frozen) = frozen {
+            Some((format!("<frozen {name}>"), frozen.source.to_string()))
         } else {
             let roots = self.import_roots()?;
             self.interp
@@ -466,10 +467,9 @@ impl Vm<'_> {
             )
         })?;
         let code = super::super::compiler::compile(program);
-        // A frozen module's path is a synthetic `<frozen name>` marker, not a real file path, so
-        // package-ness for it comes from the frozen registry instead of a `/__init__.py` suffix.
-        let is_package =
-            path.ends_with("/__init__.py") || super::super::stdlib::frozen_module_is_package(&name);
+        // A frozen module's path is a synthetic `<frozen name>` marker, so its package-ness comes
+        // from the bundled file name instead.
+        let is_package = path.ends_with("/__init__.py") || frozen.is_some_and(|f| f.is_package());
         let package_name = if is_package {
             name.clone()
         } else {
