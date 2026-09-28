@@ -23,7 +23,6 @@ mod dtype;
 mod dtype_object;
 mod element;
 mod errstate;
-mod fft;
 mod float_digits;
 mod format;
 mod index;
@@ -105,7 +104,6 @@ pub(in crate::python) fn native_module(name: &str) -> Option<&'static ModuleDef>
         "_numpy_sort" => &sort::MODULE,
         "_numpy_products" => &products::MODULE,
         "_numpy_linalg" => &linalg::MODULE,
-        "_numpy_fft" => &fft::MODULE,
         "_numpy_random" => &random::MODULE,
         "_numpy_io" => &io::MODULE,
         "_numpy_math" => &math::MODULE,
