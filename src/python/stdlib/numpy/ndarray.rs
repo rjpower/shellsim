@@ -808,18 +808,28 @@ inplace_methods! {
     method_irshift => "right_shift";
 }
 
+/// `repr(array)` or `str(array)` through `numpy._printing.<function>`, which holds the layout
+/// rules (bracket nesting, column alignment, summarization, `dtype=`/`shape=` suffixes).
+fn array_text(runtime: &mut dyn PyRuntime, array: PyValue, function: &str) -> PyResult<PyValue> {
+    let module = runtime.import_module("numpy._printing")?;
+    let implementation = runtime
+        .get_attribute(module, function)?
+        .ok_or_else(|| PyError::runtime_error(format!("numpy._printing.{function} is missing")))?;
+    runtime.call_value(implementation, CallArgs::new(vec![array], Vec::new()))
+}
+
 pub(in crate::python) fn slot_repr(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    super::printing::array_text(runtime, value, "_array_repr_implementation").map(Some)
+    array_text(runtime, value, "_array_repr_implementation").map(Some)
 }
 
 pub(in crate::python) fn slot_str(
     runtime: &mut dyn PyRuntime,
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    super::printing::array_text(runtime, value, "_array_str_implementation").map(Some)
+    array_text(runtime, value, "_array_str_implementation").map(Some)
 }
 
 pub(in crate::python) fn slot_bool(

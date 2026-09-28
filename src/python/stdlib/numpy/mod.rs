@@ -24,7 +24,6 @@ mod dtype_object;
 mod element;
 mod errstate;
 mod fft;
-mod float_digits;
 mod format;
 mod index;
 mod io;
@@ -33,7 +32,6 @@ pub(in crate::python) mod linalg;
 mod math;
 mod ndarray;
 mod ops;
-mod printing;
 mod products;
 mod random;
 mod reduce;
@@ -110,7 +108,6 @@ pub(in crate::python) fn native_module(name: &str) -> Option<&'static ModuleDef>
         "_numpy_io" => &io::MODULE,
         "_numpy_math" => &math::MODULE,
         "_numpy_strings" => &strings::MODULE,
-        "_numpy_print" => &printing::MODULE,
         _ => return None,
     })
 }

@@ -1,23 +1,27 @@
-"""NumPy-compatible text for scalars and arrays: print options, ``format_float_*``, and the
+"""NumPy-compatible text for arrays: print options, ``format_float_*``, and the
 ``array2string``/``array_repr``/``array_str`` family that ``ndarray.__repr__``/``__str__`` call.
 
-Digit generation for a single float goes through the native ``_numpy_print`` module,
-imported below as ``format_positional``/``format_scientific``. This module supplies everything
-around that: argument validation for ``format_float_positional``/``format_float_scientific``, the
-global print-options state, and the array layout algorithm (per-element formatting, column
-alignment, line wrapping, summarization, and the ``dtype=``/``shape=`` suffixes ``repr`` adds).
+Every digit shellsim prints comes from CPython's own float text: `str(x)` already gives the
+shortest decimal that round-trips back to `x` at `x`'s own precision (a NumPy scalar's `str`
+honors its dtype, so a `float32` element's shortest digits differ from a `float64` holding the
+same value), and `format(x, ".Nf"/".Ne")` gives `x` correctly rounded to `N` digits. This module
+never generates digits itself: it decomposes `str(x)`'s text into a leading sign, significant
+digits and a decimal exponent (`_decompose`), then reuses that decomposition or asks `format` for
+a fresh rounding, and otherwise only does string bookkeeping (trimming, padding, line wrapping).
 
 Array layout works in two passes per axis of formattable (bool/int/float/complex) elements: a
-discovery pass formats every element that will actually be shown (see ``_visible``) without
+discovery pass formats every element that will actually be shown (see `_visible`) without
 padding, to learn column widths and, for floats, whether the whole array should switch to
 scientific notation; a second pass reformats each element with the resolved padding so a column
 lines up. String and object elements are not column-aligned, matching NumPy.
+
+Dropped relative to NumPy: the ``formatter`` dict, ``legacy`` modes, and the ``nanstr``/``infstr``
+overrides (`nan`/`inf` are always fixed strings). ``format_float_positional``/``_scientific``
+keep only ``precision``, ``unique``, ``trim``, ``pad_left`` and ``pad_right``.
 """
 
 import contextlib
 import math
-
-from _numpy_print import format_positional, format_scientific
 
 _DEFAULTS = {
     "precision": 8,
@@ -25,12 +29,8 @@ _DEFAULTS = {
     "edgeitems": 3,
     "linewidth": 75,
     "suppress": False,
-    "nanstr": "nan",
-    "infstr": "inf",
     "sign": "-",
-    "formatter": None,
     "floatmode": "maxprec",
-    "legacy": False,
 }
 
 _options = dict(_DEFAULTS)
@@ -49,18 +49,12 @@ def set_printoptions(
     edgeitems=None,
     linewidth=None,
     suppress=None,
-    nanstr=None,
-    infstr=None,
-    formatter=None,
     sign=None,
     floatmode=None,
-    *,
-    legacy=None,
 ):
     """Update the global print options used by array `repr`/`str` and `array2string`.
 
-    Every option is sticky (an omitted argument keeps its previous value) except `formatter`,
-    which NumPy always replaces outright, so a call that omits it clears any custom formatter.
+    Every option is sticky: an omitted argument keeps its previous value.
     """
     if precision is not None:
         _options["precision"] = precision
@@ -72,17 +66,10 @@ def set_printoptions(
         _options["linewidth"] = linewidth
     if suppress is not None:
         _options["suppress"] = bool(suppress)
-    if nanstr is not None:
-        _options["nanstr"] = nanstr
-    if infstr is not None:
-        _options["infstr"] = infstr
     if sign is not None:
         _options["sign"] = sign
     if floatmode is not None:
         _options["floatmode"] = floatmode
-    if legacy is not None:
-        _options["legacy"] = legacy
-    _options["formatter"] = formatter
 
 
 @contextlib.contextmanager
@@ -99,35 +86,166 @@ def printoptions(*args, **kwargs):
 
 
 # ---------------------------------------------------------------------------------------------
-# format_float_positional / format_float_scientific
+# Float digit decomposition and rendering
 #
-# These validate arguments the way NumPy's Python wrappers do (a negative value supplied
-# explicitly is an error, not "unset") and then call the native formatter, which uses -1 to
-# mean "unset". The checks and their order and messages match NumPy 2.5.3 (observed, since the
-# reference implementation is off limits here).
+# `_decompose` reads `str(value)`'s shortest round-trip text (CPython's own dtoa, dtype-aware
+# for a NumPy scalar) into a sign, digits and decimal exponent. Every other function here either
+# reassembles those digits with different padding, or asks `format(value, spec)` for a freshly
+# and correctly rounded string when the caller wants fewer digits than the natural count.
 # ---------------------------------------------------------------------------------------------
 
 
-def _unset(value):
-    return -1 if value is None else value
+def _decompose(value):
+    """`(negative, digits, exponent)` from `str(value)`'s shortest round-trip text: `value ==
+    (-1 if negative else 1) * 0.<digits> * 10**(exponent + 1)`, `digits` with no trailing zeros.
+    `value` must be finite. Zero returns `digits="0"`, `exponent=0`.
+    """
+    text = str(value)
+    negative = text.startswith("-")
+    if negative:
+        text = text[1:]
+    if value == 0:
+        return negative, "0", 0
+    mantissa, _, exp_text = text.partition("e")
+    exponent = int(exp_text) if exp_text else None
+    integer, _, fraction = mantissa.partition(".")
+    if exponent is not None:
+        return negative, (integer + fraction).rstrip("0") or "0", exponent
+    if integer != "0":
+        return negative, (integer + fraction).rstrip("0") or "0", len(integer) - 1
+    stripped = fraction.lstrip("0")
+    return negative, stripped.rstrip("0") or "0", -(len(fraction) - len(stripped)) - 1
 
 
-def format_float_positional(
-    x,
-    precision=None,
-    unique=True,
-    fractional=True,
-    trim="k",
-    sign=False,
-    pad_left=None,
-    pad_right=None,
-    min_digits=None,
-):
-    """Format a real scalar as decimal text in positional (non-exponential) notation.
+def _split_positional(digits, exponent):
+    """`digits`/`exponent` (see `_decompose`) as an unpadded `(integer, fraction)` pair: `"123"`
+    with `exponent=4` (i.e. `1.23e4`) is `("123", "00")`.
+    """
+    if exponent >= 0:
+        point = exponent + 1
+        if len(digits) >= point:
+            return digits[:point], digits[point:]
+        return digits + "0" * (point - len(digits)), ""
+    return "0", "0" * (-exponent - 1) + digits
 
-    See `format_float_scientific` for the shared options. `fractional` selects what `precision`
-    and `min_digits` count: digits after the decimal point (including leading zeros) when
-    `True`, or total significant digits when `False`.
+
+def _positional_digits(value, digits, exponent, precision, min_digits, unique):
+    """`(integer, fraction)` text (no sign) for `value` in positional notation. `unique=True`
+    reuses `digits`/`exponent`'s shortest text, capped at `precision` fractional digits and/or
+    extended to `min_digits` with zeros; `unique=False` always asks `format` for exactly
+    `precision` fractional digits, correctly rounded.
+    """
+    if not unique:
+        integer, _, fraction = format(value, f".{precision}f").lstrip("-").partition(".")
+        return integer, fraction
+    natural = max(len(digits) - exponent - 1, 0)
+    target = natural if precision is None else min(natural, precision)
+    if min_digits is not None:
+        target = max(target, min_digits)
+    if target < natural:
+        integer, _, fraction = format(value, f".{target}f").lstrip("-").partition(".")
+        return integer, fraction
+    integer, fraction = _split_positional(digits, exponent)
+    return integer, fraction.ljust(target, "0")
+
+
+def _scientific_digits(value, digits, exponent, precision, min_digits, unique):
+    """`(integer, fraction, exponent)` text (no sign) for `value` in scientific notation; see
+    `_positional_digits`. `precision`/`min_digits` count digits after the leading digit.
+    """
+    if not unique:
+        mantissa, exp_text = format(value, f".{precision}e").lstrip("-").split("e")
+        integer, _, fraction = mantissa.partition(".")
+        return integer, fraction, int(exp_text)
+    natural = len(digits) - 1
+    target = natural if precision is None else min(natural, precision)
+    if min_digits is not None:
+        target = max(target, min_digits)
+    if target < natural:
+        mantissa, exp_text = format(value, f".{target}e").lstrip("-").split("e")
+        integer, _, fraction = mantissa.partition(".")
+        return integer, fraction, int(exp_text)
+    return digits[:1], digits[1:].ljust(target, "0"), exponent
+
+
+def _trim_fraction(fraction, mode):
+    """Trailing-zero cleanup of a fraction digit string. `None` means the point itself should be
+    dropped (`mode="-"` with nothing left after trimming)."""
+    if mode == "k":
+        return fraction
+    trimmed = fraction.rstrip("0")
+    if mode == ".":
+        return trimmed
+    if mode == "0":
+        return trimmed or "0"
+    if mode == "-":
+        return trimmed or None
+    raise ValueError("trim must be 'k', '.', '0' or '-'")
+
+
+def _assemble(negative, show_plus, integer, fraction, pad_left, pad_right):
+    """Sign, integer part and left padding, then a decimal point/fraction and right padding.
+    `fraction=None` means the point is omitted; that column still counts toward `pad_right`, as
+    whitespace.
+    """
+    sign = "-" if negative else ("+" if show_plus else "")
+    left = sign + integer
+    left_width = max(pad_left if pad_left is not None else 0, len(left))
+    content = "" if fraction is None else "." + fraction
+    right_width = max((pad_right + 1) if pad_right is not None else 0, len(content))
+    return left.rjust(left_width) + content.ljust(right_width)
+
+
+def _exp_suffix(exponent):
+    return f"e{'-' if exponent < 0 else '+'}{abs(exponent):02d}"
+
+
+def _special_text(value, sign):
+    """Display text for a non-finite value, or `None` for a finite one. `sign` is a print-option
+    sign mode (`'-'`/`'+'`/`' '`); NaN never carries a sign."""
+    if math.isnan(value):
+        return "nan"
+    if math.isinf(value):
+        if value < 0:
+            return "-inf"
+        return {"+": "+inf", " ": " inf"}.get(sign, "inf")
+    return None
+
+
+def _format_positional(value, precision=None, unique=True, sign="-", trim="k", pad_left=None,
+                        pad_right=None, min_digits=None):
+    special = _special_text(value, sign)
+    if special is not None:
+        return special
+    negative, digits, exponent = _decompose(value)
+    integer, fraction = _positional_digits(value, digits, exponent, precision, min_digits, unique)
+    fraction = _trim_fraction(fraction, trim)
+    return _assemble(negative, sign == "+", integer, fraction, pad_left, pad_right)
+
+
+def _format_scientific(value, precision=None, unique=True, sign="-", trim="k", pad_left=None,
+                        min_digits=None):
+    special = _special_text(value, sign)
+    if special is not None:
+        return special
+    negative, digits, exponent = _decompose(value)
+    integer, fraction, exponent = _scientific_digits(
+        value, digits, exponent, precision, min_digits, unique
+    )
+    fraction = _trim_fraction(fraction, trim)
+    mantissa = _assemble(negative, sign == "+", integer, fraction, pad_left, None)
+    return mantissa + _exp_suffix(exponent)
+
+
+def format_float_positional(x, precision=None, unique=True, trim="k", pad_left=None, pad_right=None):
+    """Decimal text for the real scalar `x`, in positional (non-exponential) notation.
+
+    ``unique=True`` (the default) gives the shortest digits that round-trip back to `x`, capped
+    at `precision` digits after the point when given; ``unique=False`` always gives exactly
+    `precision` digits, correctly rounded. `trim` controls trailing-zero cleanup: ``'k'`` keeps
+    them, ``'.'`` drops them but keeps the point, ``'0'`` drops them but leaves one digit, ``'-'``
+    drops the point too if nothing is left after it. `pad_left`/`pad_right` widen the integer and
+    fraction parts with spaces, for column alignment.
     """
     if precision is not None and precision < 0:
         raise ValueError("precision must be >= 0")
@@ -135,64 +253,26 @@ def format_float_positional(
         raise ValueError("pad_left must be >= 0")
     if pad_right is not None and pad_right < 0:
         raise ValueError("pad_right must be >= 0")
-    if min_digits is not None and min_digits < 0:
-        raise ValueError("min_digits must be >= 0")
-    if precision and min_digits is not None and min_digits > precision:
-        raise ValueError("min_digits must be less than or equal to precision")
-    if not fractional and precision == 0:
-        raise ValueError("precision must be greater than 0 if fractional=False")
-    return format_positional(
-        x,
-        precision=_unset(precision),
-        unique=unique,
-        fractional=fractional,
-        sign=sign,
-        trim=trim,
-        pad_left=_unset(pad_left),
-        pad_right=_unset(pad_right),
-        min_digits=_unset(min_digits),
+    if not unique and precision is None:
+        raise TypeError("precision is required when unique=False")
+    return _format_positional(
+        x, precision=precision, unique=unique, trim=trim, pad_left=pad_left, pad_right=pad_right
     )
 
 
-def format_float_scientific(
-    x,
-    precision=None,
-    unique=True,
-    trim="k",
-    sign=False,
-    pad_left=None,
-    exp_digits=None,
-    min_digits=None,
-):
-    """Format a real scalar as decimal text in scientific notation, e.g. ``1.5e+00``.
+def format_float_scientific(x, precision=None, unique=True, trim="k", pad_left=None):
+    """Decimal text for the real scalar `x`, in scientific notation (e.g. ``1.5e+00``).
 
-    `precision`/`min_digits` count digits after the leading (always single) mantissa digit.
-    `unique=True` (the default) finds the shortest digits that round-trip, optionally capped by
-    `precision` and/or extended by `min_digits`; `unique=False` always uses exactly `precision`
-    digits, correctly rounded. `trim` controls trailing-zero cleanup: ``'k'`` keeps them, ``'.'``
-    drops them but keeps the point, ``'0'`` drops them but leaves one digit, ``'-'`` drops the
-    point too if nothing is left after it.
+    See `format_float_positional` for `precision`/`unique`/`trim`; `precision` here counts digits
+    after the single leading mantissa digit.
     """
     if precision is not None and precision < 0:
         raise ValueError("precision must be >= 0")
     if pad_left is not None and pad_left < 0:
         raise ValueError("pad_left must be >= 0")
-    if exp_digits is not None and exp_digits < 0:
-        raise ValueError("exp_digits must be >= 0")
-    if min_digits is not None and min_digits < 0:
-        raise ValueError("min_digits must be >= 0")
-    if precision and min_digits is not None and min_digits > precision:
-        raise ValueError("min_digits must be less than or equal to precision")
-    return format_scientific(
-        x,
-        precision=_unset(precision),
-        unique=unique,
-        sign=sign,
-        trim=trim,
-        pad_left=_unset(pad_left),
-        exp_digits=_unset(exp_digits),
-        min_digits=_unset(min_digits),
-    )
+    if not unique and precision is None:
+        raise TypeError("precision is required when unique=False")
+    return _format_scientific(x, precision=precision, unique=unique, trim=trim, pad_left=pad_left)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -200,18 +280,8 @@ def format_float_scientific(
 # ---------------------------------------------------------------------------------------------
 
 
-def _resolve(
-    precision=None,
-    threshold=None,
-    edgeitems=None,
-    linewidth=None,
-    suppress=None,
-    sign=None,
-    formatter=None,
-    floatmode=None,
-    nanstr=None,
-    infstr=None,
-):
+def _resolve(precision=None, threshold=None, edgeitems=None, linewidth=None, suppress=None,
+             sign=None, floatmode=None):
     resolved = dict(_options)
     if precision is not None:
         resolved["precision"] = precision
@@ -225,14 +295,8 @@ def _resolve(
         resolved["suppress"] = suppress
     if sign is not None:
         resolved["sign"] = sign
-    if formatter is not None:
-        resolved["formatter"] = formatter
     if floatmode is not None:
         resolved["floatmode"] = floatmode
-    if nanstr is not None:
-        resolved["nanstr"] = nanstr
-    if infstr is not None:
-        resolved["infstr"] = infstr
     return resolved
 
 
@@ -252,12 +316,12 @@ def _visible(a, edgeitems, summarize):
     """The elements that will actually be printed, in order, skipping elided runs.
 
     Indexes `a` directly rather than going through `.tolist()`/`.item()`: a bool/int/float/
-    complex element indexed this way stays a NumPy scalar, which is what lets
-    `format_float_positional`/`_scientific` (via `_float_column`) find the *value's own* shortest
-    round-trip digits (e.g. 7 for this particular float32) instead of `float64`'s (`.item()`
-    always unboxes to a plain, double-precision-for-floats Python value). String and object
-    elements unbox to a plain value directly on indexing, with no further array API to recurse
-    through, so they are read at the last axis without indexing one level deeper.
+    complex element indexed this way stays a NumPy scalar, which is what lets `_decompose` (via
+    `str`) find the *value's own* shortest round-trip digits (e.g. 7 for this particular float32)
+    instead of `float64`'s (`.item()` always unboxes to a plain, double-precision-for-floats
+    Python value). String and object elements unbox to a plain value directly on indexing, with
+    no further array API to recurse through, so they are read at the last axis without indexing
+    one level deeper.
     """
     if a.ndim == 0:
         return [a[()]]
@@ -292,7 +356,8 @@ def _bool_formatter(values, _options, ndim=1):
 
 
 def _sign_prefix(text, sign_mode):
-    """`text` from a `sign=False` native call; add NumPy's `+`/` ` sign for a non-negative value."""
+    """`text` from an unsigned integer render; add NumPy's `+`/` ` sign for a non-negative
+    value."""
     if text.startswith("-") or sign_mode == "-":
         return text
     if sign_mode == "+":
@@ -315,7 +380,7 @@ def _int_formatter(values, options):
 
 
 def _float_digit_plan(floatmode, precision):
-    """`(precision, unique, force_equal_digits)` for `format_float_positional`/`_scientific`."""
+    """`(precision, unique, force_equal_digits)` for the float digit engine."""
     if floatmode == "fixed":
         return (8 if precision is None else precision), False, False
     if floatmode == "unique":
@@ -339,15 +404,6 @@ def _float_exponential(values, suppress):
     return smallest < 1.0e-4 or largest / smallest > 1000.0
 
 
-def _special_text(value, sign_mode, nanstr, infstr):
-    """Display text for a non-finite value, or `None` for a finite one."""
-    if math.isnan(value):
-        return nanstr
-    if math.isinf(value):
-        return ("-" if value < 0 else _sign_prefix("", sign_mode)) + infstr
-    return None
-
-
 def _float_column(values, options, pad_fraction=True):
     """A formatter for one float column (plain, or one part of a complex column).
 
@@ -358,21 +414,17 @@ def _float_column(values, options, pad_fraction=True):
     precision, unique, force_equal = _float_digit_plan(options["floatmode"], options["precision"])
     exponential = _float_exponential(values, options["suppress"])
     sign_mode = options["sign"]
-    nanstr, infstr = options["nanstr"], options["infstr"]
 
     finite = [v for v in values if math.isfinite(v)]
-    neg_width = pos_width = frac_width = exp_width = 0
+    neg_width = pos_width = frac_width = 0
     naturals = []
     for value in finite:
-        if exponential:
-            text = format_float_scientific(value, precision=precision, unique=unique, sign=False, trim=".")
-            mantissa, _, exponent = text.partition("e")
-            exp_width = max(exp_width, len(exponent) - 1)
-        else:
-            mantissa = format_float_positional(
-                value, precision=precision, unique=unique, sign=False, fractional=True, trim="."
-            )
-        left, _, right = mantissa.partition(".")
+        text = (
+            _format_scientific(value, precision=precision, unique=unique, trim=".")
+            if exponential
+            else _format_positional(value, precision=precision, unique=unique, trim=".")
+        )
+        left, _, right = text.partition("e")[0].partition(".")
         frac_width = max(frac_width, len(right))
         naturals.append(len(right))
         if left.startswith("-"):
@@ -394,35 +446,30 @@ def _float_column(values, options, pad_fraction=True):
 
     reserve = sign_mode in ("+", " ")
     int_width = max(neg_width, pos_width + 1) if reserve else max(neg_width, pos_width, 1)
-    show_plus = sign_mode == "+"
     natural_total = int_width + 1 + (frac_width if pad_fraction else 0)
-    special_texts = [
-        text for value in values if (text := _special_text(value, sign_mode, nanstr, infstr))
-    ]
+    special_texts = [text for value in values if (text := _special_text(value, sign_mode))]
     overall = max([natural_total] + [len(text) for text in special_texts])
 
     def fmt(value):
-        special = _special_text(value, sign_mode, nanstr, infstr)
+        special = _special_text(value, sign_mode)
         if special is not None:
             return special.rjust(overall)
         if exponential:
-            text = format_float_scientific(
+            text = _format_scientific(
                 value,
                 precision=precision,
                 unique=unique,
-                sign=show_plus,
+                sign=sign_mode,
                 trim=trim_mode,
                 pad_left=int_width,
-                exp_digits=exp_width,
                 min_digits=min_digits,
             )
         else:
-            text = format_float_positional(
+            text = _format_positional(
                 value,
                 precision=precision,
                 unique=unique,
-                sign=show_plus,
-                fractional=True,
+                sign=sign_mode,
                 trim=trim_mode,
                 pad_left=int_width,
                 pad_right=frac_width if pad_fraction else None,
@@ -464,16 +511,6 @@ def _object_formatter(_values, _options):
     return repr
 
 
-_FORMATTER_KEYS = {
-    "b": (["bool"], "_bool"),
-    "u": (["int", "int_kind"], "_int"),
-    "i": (["int", "int_kind"], "_int"),
-    "f": (["float", "float_kind"], "_float"),
-    "c": (["complexfloat", "complex_kind"], "_complex"),
-    "U": (["numpystr", "str_kind"], "_str"),
-    "O": (["object"], "_object"),
-}
-
 _BUILDERS = {
     "b": _bool_formatter,
     "u": _int_formatter,
@@ -484,34 +521,12 @@ _BUILDERS = {
     "O": _object_formatter,
 }
 
-_PADDED_KINDS = ("b", "u", "i", "f", "c")
-
-
-def _custom_formatter(formatter_dict, kind):
-    if not formatter_dict:
-        return None
-    keys, _ = _FORMATTER_KEYS[kind]
-    for key in (*keys, "all"):
-        if key in formatter_dict:
-            return formatter_dict[key]
-    return None
-
 
 def _make_formatter(a, values, options):
     kind = a.dtype.kind
-    custom = _custom_formatter(options["formatter"], kind)
-    if custom is None:
-        if kind == "b":
-            return _bool_formatter(values, options, a.ndim)
-        return _BUILDERS[kind](values, options)
-    if kind not in _PADDED_KINDS:
-        return custom
-    width = max((len(custom(value)) for value in values), default=0)
-
-    def fmt(value):
-        return custom(value).rjust(width)
-
-    return fmt
+    if kind == "b":
+        return _bool_formatter(values, options, a.ndim)
+    return _BUILDERS[kind](values, options)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -577,18 +592,13 @@ def array2string(
     suppress_small=None,
     separator=" ",
     prefix="",
-    style=None,
-    formatter=None,
     threshold=None,
     edgeitems=None,
     sign=None,
     floatmode=None,
-    suffix="",
-    legacy=None,
 ):
     """Text for `a`'s data (no ``array(...)`` wrapper, `dtype=` or `shape=` suffix); see
     `array_repr`/`array_str` for those."""
-    del style, suffix, legacy
     options = _resolve(
         precision=precision,
         threshold=threshold,
@@ -596,7 +606,6 @@ def array2string(
         linewidth=max_line_width,
         suppress=suppress_small,
         sign=sign,
-        formatter=formatter,
         floatmode=floatmode,
     )
     if a.size == 0:
