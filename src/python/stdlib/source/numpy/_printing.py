@@ -416,7 +416,7 @@ def _float_column(values, options, pad_fraction=True):
     sign_mode = options["sign"]
 
     finite = [v for v in values if math.isfinite(v)]
-    neg_width = pos_width = frac_width = 0
+    neg_width = pos_width = frac_width = exp_width = 0
     naturals = []
     for value in finite:
         text = (
@@ -424,7 +424,9 @@ def _float_column(values, options, pad_fraction=True):
             if exponential
             else _format_positional(value, precision=precision, unique=unique, trim=".")
         )
-        left, _, right = text.partition("e")[0].partition(".")
+        mantissa, _, exponent = text.partition("e")
+        exp_width = max(exp_width, len(exponent))
+        left, _, right = mantissa.partition(".")
         frac_width = max(frac_width, len(right))
         naturals.append(len(right))
         if left.startswith("-"):
@@ -446,7 +448,8 @@ def _float_column(values, options, pad_fraction=True):
 
     reserve = sign_mode in ("+", " ")
     int_width = max(neg_width, pos_width + 1) if reserve else max(neg_width, pos_width, 1)
-    natural_total = int_width + 1 + (frac_width if pad_fraction else 0)
+    exp_suffix_width = 1 + exp_width if exponential else 0
+    natural_total = int_width + 1 + (frac_width if pad_fraction else 0) + exp_suffix_width
     special_texts = [text for value in values if (text := _special_text(value, sign_mode))]
     overall = max([natural_total] + [len(text) for text in special_texts])
 
@@ -534,7 +537,7 @@ def _make_formatter(a, values, options):
 # ---------------------------------------------------------------------------------------------
 
 
-def _wrap_row(words, separator, indent, linewidth):
+def _wrap_row(words, separator, indent, linewidth, reserve=0):
     """`"[" + words joined and wrapped at `linewidth` + "]"`, continuation lines at `indent`.
 
     A separator like ``", "`` splits across a wrap: its non-space part (the comma) stays at the
@@ -544,6 +547,11 @@ def _wrap_row(words, separator, indent, linewidth):
     `array_repr`) prepends a prefix such as ``"array("`` to line one itself, outside this
     function, so the length tracked here starts at `indent` rather than at the literal length of
     `line`, which never contains that prefix text.
+
+    `reserve` holds room for the closing brackets a wrapped row can't see coming: NumPy budgets
+    every row as if it were the array's very last, so a line wraps `reserve` characters early
+    even when this particular row isn't followed by all of them. Observed to equal the whole
+    array's `ndim` (one `]` per nesting level, matching one `[` already spent on `indent`).
     """
     if not words:
         return "[]"
@@ -554,7 +562,7 @@ def _wrap_row(words, separator, indent, linewidth):
     lines = []
     for word in words[1:]:
         piece = separator + word
-        if length + len(piece) >= linewidth:
+        if length + len(piece) + reserve >= linewidth:
             lines.append(line + marker)
             line = pad + word
             length = indent + len(word)
@@ -565,22 +573,26 @@ def _wrap_row(words, separator, indent, linewidth):
     return "\n".join(lines)
 
 
-def _render(a, edgeitems, summarize, formatter, separator, indent, linewidth):
+def _render(a, edgeitems, summarize, formatter, separator, indent, linewidth, root_ndim):
     """Renders `a`; see `_visible` for why this indexes the array rather than using
-    `.tolist()`."""
+    `.tolist()`. `root_ndim` is the *outermost* array's `ndim`, constant across the recursion
+    (see `_wrap_row`'s `reserve`); it is unrelated to `a.ndim`, which shrinks as this descends.
+    """
     if a.ndim == 0:
         return formatter(a[()])
     plan = _index_plan(a.shape[0], edgeitems, summarize)
     if a.ndim == 1:
         words = ["..." if i is _ELLIPSIS else formatter(a[i]) for i in plan]
-        return _wrap_row(words, separator, indent + 1, linewidth)
+        return _wrap_row(words, separator, indent + 1, linewidth, root_ndim)
     blocks = [
         "..."
         if i is _ELLIPSIS
-        else _render(a[i], edgeitems, summarize, formatter, separator, indent + 1, linewidth)
+        else _render(a[i], edgeitems, summarize, formatter, separator, indent + 1, linewidth, root_ndim)
         for i in plan
     ]
-    blank = "\n\n" if a.ndim - 1 >= 2 else "\n"
+    # One blank line per dimension beyond the row axis: a 3-D array separates its 2-D blocks by
+    # one blank line, a 4-D array separates its 3-D blocks by two, and so on.
+    blank = "\n" * (a.ndim - 1)
     joiner = separator.rstrip(" ") + blank + " " * (indent + 1)
     return "[" + joiner.join(blocks) + "]"
 
@@ -614,7 +626,7 @@ def array2string(
     values = _visible(a, options["edgeitems"], summarize)
     formatter_fn = _make_formatter(a, values, options)
     return _render(a, options["edgeitems"], summarize, formatter_fn, separator, len(prefix),
-                    options["linewidth"])
+                    options["linewidth"], a.ndim)
 
 
 _DEFAULT_DTYPE_NAMES = ("bool", "int64", "float64", "complex128")
@@ -650,7 +662,7 @@ def array_repr(arr, max_line_width=None, precision=None, suppress_small=None):
         values = _visible(arr, options["edgeitems"], summarize)
         formatter_fn = _make_formatter(arr, values, options)
         body = _render(arr, options["edgeitems"], summarize, formatter_fn, ", ", len(prefix),
-                        options["linewidth"])
+                        options["linewidth"], arr.ndim)
     extras = []
     if (arr.size == 0 and arr.ndim != 1) or summarize:
         extras.append(f"shape={arr.shape}")
@@ -681,7 +693,7 @@ def array_str(a, max_line_width=None, precision=None, suppress_small=None):
     values = _visible(a, options["edgeitems"], summarize)
     formatter_fn = _make_formatter(a, values, options)
     return _render(a, options["edgeitems"], summarize, formatter_fn, " ", 0,
-                    options["linewidth"])
+                    options["linewidth"], a.ndim)
 
 
 def _array_repr_implementation(arr):
