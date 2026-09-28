@@ -12,10 +12,10 @@
 //! Insurance: Mathematics and Economics 12(1)): transformed rejection from a fitted logistic-like
 //! shape, with a squeeze and an exact log-probability test using [`log_gamma`] as the fallback.
 //!
-//! **Accuracy**: both BTPE and PTRS reproduce their papers' algorithms; see `docs/numpy.md` for
-//! whether the large-parameter branches match NumPy 2.5.3's exact stream.
+//! Both BTPE and PTRS reproduce their papers' algorithms exactly; shellsim's random streams do
+//! not need to reproduce NumPy's own (see `random.py`'s module docstring).
 
-use super::bitgen::BitGen;
+use super::bitgen::Pcg64;
 
 /// `ln(Gamma(x))` by the Stirling series, shifted up to `x >= 8` first via the recurrence
 /// `Gamma(x) = Gamma(x+1)/x` so the asymptotic series converges to full `f64` precision.
@@ -40,7 +40,7 @@ fn log_factorial(k: i64) -> f64 {
 
 /// Binomial inversion (Kachitvichyanukul & Schmeiser's BINV): walk the cumulative mass function
 /// from `x = 0`, matching a single uniform draw against the running probability.
-fn binomial_inversion(bitgen: &mut BitGen, n: i64, p: f64) -> i64 {
+fn binomial_inversion(bitgen: &mut Pcg64, n: i64, p: f64) -> i64 {
     let q = 1.0 - p;
     let s = p / q;
     let a = (n as f64 + 1.0) * s;
@@ -62,7 +62,7 @@ fn binomial_inversion(bitgen: &mut BitGen, n: i64, p: f64) -> i64 {
 
 /// Kachitvichyanukul & Schmeiser's BTPE, for `n * min(p, 1-p) > 30`.
 #[allow(clippy::many_single_char_names)]
-fn binomial_btpe(bitgen: &mut BitGen, n: i64, p: f64) -> i64 {
+fn binomial_btpe(bitgen: &mut Pcg64, n: i64, p: f64) -> i64 {
     let r = p.min(1.0 - p);
     let q = 1.0 - r;
     let flipped = p > 0.5;
@@ -173,22 +173,14 @@ fn binomial_btpe(bitgen: &mut BitGen, n: i64, p: f64) -> i64 {
     }
 }
 
-/// `binomial(n, p)`: `n` trials, each independently `True` with probability `p`.
-///
-/// `legacy` selects `RandomState`'s behavior at the degenerate `n == 0` or `p` in `{0, 1}`
-/// edges: legacy still runs the general algorithm (which happens to draw exactly one uniform
-/// and immediately accept, since the degenerate cumulative mass function is `1` everywhere),
-/// while `Generator` short-circuits without drawing anything. Both are NumPy's actual observed
-/// behavior, not a free choice: a `Generator` draw before and after a degenerate `binomial` call
-/// reads the same bit-generator words either way, but `RandomState`'s does not.
-pub(in crate::python) fn binomial(bitgen: &mut BitGen, n: i64, p: f64, legacy: bool) -> i64 {
-    if !legacy {
-        if n == 0 || p == 0.0 {
-            return 0;
-        }
-        if p == 1.0 {
-            return n;
-        }
+/// `binomial(n, p)`: `n` trials, each independently `True` with probability `p`. The degenerate
+/// edges (`n == 0` or `p` in `{0, 1}`) short-circuit without drawing anything.
+pub(in crate::python) fn binomial(bitgen: &mut Pcg64, n: i64, p: f64) -> i64 {
+    if n == 0 || p == 0.0 {
+        return 0;
+    }
+    if p == 1.0 {
+        return n;
     }
     let mean_side = n as f64 * p.min(1.0 - p);
     if mean_side <= 30.0 {
@@ -203,7 +195,7 @@ pub(in crate::python) fn binomial(bitgen: &mut BitGen, n: i64, p: f64, legacy: b
 }
 
 /// Knuth's multiplication method, for `lambda < 10`.
-fn poisson_mult(bitgen: &mut BitGen, lam: f64) -> i64 {
+fn poisson_mult(bitgen: &mut Pcg64, lam: f64) -> i64 {
     let enlam = (-lam).exp();
     let mut x = 0i64;
     let mut prod = 1.0;
@@ -217,7 +209,7 @@ fn poisson_mult(bitgen: &mut BitGen, lam: f64) -> i64 {
 }
 
 /// Hörmann's PTRS, for `lambda >= 10`.
-fn poisson_ptrs(bitgen: &mut BitGen, lam: f64) -> i64 {
+fn poisson_ptrs(bitgen: &mut Pcg64, lam: f64) -> i64 {
     let b = 0.931 + 2.53 * lam.sqrt();
     let a = -0.059 + 0.02483 * b;
     let inv_alpha = 1.1239 + 1.1328 / (b - 3.4);
@@ -242,7 +234,7 @@ fn poisson_ptrs(bitgen: &mut BitGen, lam: f64) -> i64 {
 }
 
 /// `poisson(lam)`.
-pub(in crate::python) fn poisson(bitgen: &mut BitGen, lam: f64) -> i64 {
+pub(in crate::python) fn poisson(bitgen: &mut Pcg64, lam: f64) -> i64 {
     if lam < 10.0 {
         poisson_mult(bitgen, lam)
     } else {
