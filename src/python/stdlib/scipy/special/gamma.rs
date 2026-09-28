@@ -1,5 +1,7 @@
-//! The gamma family: `gamma`, `rgamma`, `gammaln`, `loggamma`, `psi`/`digamma`, `beta`,
-//! `betaln`, `poch` and `binom`.
+//! The gamma family: `gamma`, `gammaln`, `loggamma`, `psi`/`digamma`, plus the private `binom`
+//! helper [`ibeta`] uses for its exact-integer fast path. `scipy.special`'s public `beta`,
+//! `betaln`, `binom` and `comb` are compositions over `gamma`/`gammaln` written in frozen Python
+//! (`source/scipy/special.py`), not native kernels.
 //!
 //! Every function reduces to one core, [`lanczos_lgamma`], the Lanczos approximation of
 //! `ln Gamma(x)` for `x >= 0.5` (g = 7, n = 9; coefficients from C. Lanczos, "A Precision
@@ -11,9 +13,10 @@
 //! argument up with `psi(x+1) = psi(x) + 1/x` until it is large, then apply the Bernoulli-number
 //! asymptotic expansion), reflected the same way for `x < 0.5`.
 //!
-//! `beta`, `poch` and `binom` are all ratios of gammas, computed in the log domain and then
-//! exponentiated so that large arguments (`binom(50, 25)`, `beta(1e5, 3)`) do not overflow an
-//! intermediate `Gamma` value that the final ratio would bring back into range.
+//! `binom` is a ratio of gammas, computed in the log domain and then exponentiated so that large
+//! arguments (`binom(50, 25)`) do not overflow an intermediate `Gamma` value that the final ratio
+//! would bring back into range; a small positive integer `k` instead takes the exact
+//! falling-factorial product, which [`ibeta`]'s exactness fast path relies on.
 
 use std::f64::consts::PI;
 
@@ -110,14 +113,6 @@ pub(in crate::python) fn gamma(x: f64) -> f64 {
     magnitude.copysign(sin)
 }
 
-/// `1 / Gamma(x)`, which is entire (finite everywhere, zero at the poles of `Gamma`).
-pub(in crate::python) fn rgamma(x: f64) -> f64 {
-    if is_nonpositive_integer(x) {
-        return 0.0;
-    }
-    1.0 / gamma(x)
-}
-
 /// `ln |Gamma(x)|`, SciPy's `gammaln`. Poles (including `x == 0`) give `+inf`.
 pub(in crate::python) fn gammaln(x: f64) -> f64 {
     lgamma_abs(x)
@@ -180,48 +175,6 @@ pub(in crate::python) fn digamma(x: f64) -> f64 {
     digamma_asymptotic(shifted) - correction
 }
 
-/// `B(a, b) = Gamma(a) Gamma(b) / Gamma(a + b)`, computed in the log domain so large arguments
-/// (where the individual gammas would overflow but the ratio is representable) still work.
-pub(in crate::python) fn beta(a: f64, b: f64) -> f64 {
-    gamma_ratio(a, b, a + b)
-}
-
-/// `ln |B(a, b)|`.
-pub(in crate::python) fn betaln(a: f64, b: f64) -> f64 {
-    lgamma_abs(a) + lgamma_abs(b) - lgamma_abs(a + b)
-}
-
-/// `Gamma(p) Gamma(q) / Gamma(r)`, the shared shape of `beta`, `poch` and `binom`. Any pole in
-/// the numerator wins over a pole in the denominator (the ratio is infinite); a pole in the
-/// denominator alone makes the ratio zero; poles in both make it indeterminate (`NaN`).
-fn gamma_ratio(p: f64, q: f64, r: f64) -> f64 {
-    let p_pole = is_nonpositive_integer(p);
-    let q_pole = is_nonpositive_integer(q);
-    let r_pole = is_nonpositive_integer(r);
-    if (p_pole || q_pole) && r_pole {
-        return f64::NAN;
-    }
-    if p_pole || q_pole {
-        return f64::INFINITY * gamma_sign(p) * gamma_sign(q);
-    }
-    if r_pole {
-        return 0.0;
-    }
-    // When every `Gamma` value involved is safely within range (so none of them overflows or
-    // underflows to `0`), a direct ratio is more accurate than the general log-domain path below
-    // -- exact, even, for the common case of small integer arguments (`poch`, `binom` on modest
-    // inputs), where `exp(lgamma_abs(p) + ... )` accumulates enough rounding to land a couple of
-    // ULPs off an exact integer ratio.
-    if p.abs() <= 171.0 && q.abs() <= 171.0 && r.abs() <= 171.0 {
-        let denominator = gamma(r);
-        if denominator != 0.0 {
-            return gamma(p) * gamma(q) / denominator;
-        }
-    }
-    let magnitude = (lgamma_abs(p) + lgamma_abs(q) - lgamma_abs(r)).exp();
-    magnitude * gamma_sign(p) * gamma_sign(q) * gamma_sign(r)
-}
-
 /// `+1` or `-1`, matching the sign convention `gamma` uses (the sign of `sin(pi x)` for
 /// `x < 0.5`, and always positive for `x >= 0.5`). Callers only reach this away from poles.
 fn gamma_sign(x: f64) -> f64 {
@@ -230,15 +183,6 @@ fn gamma_sign(x: f64) -> f64 {
     } else {
         (PI * x).sin().signum()
     }
-}
-
-/// `(x)_m = Gamma(x + m) / Gamma(x)`, the Pochhammer (rising factorial) symbol. `m == 0` is
-/// always `1`, even where `x` is itself a pole (the empty product convention).
-pub(in crate::python) fn poch(x: f64, m: f64) -> f64 {
-    if m == 0.0 {
-        return 1.0;
-    }
-    gamma_ratio(x + m, 1.0, x)
 }
 
 /// `C(n, k)` for a non-negative integer `k` and any `n` with `Gamma(n + 1)` finite, as the
@@ -260,7 +204,9 @@ fn binom_falling_factorial(n: f64, k: f64) -> f64 {
 }
 
 /// The generalized binomial coefficient `C(n, k) = Gamma(n + 1) / (Gamma(k + 1) Gamma(n - k +
-/// 1))`, defined for any real `n` and `k` (not just non-negative integers).
+/// 1))`, defined for any real `n` and `k` (not just non-negative integers). Private: only
+/// [`super::ibeta`]'s exact-integer fast path calls this now; `scipy.special`'s public `binom`
+/// and `comb` are Python compositions over `gamma`/`gammaln` (see `source/scipy/special.py`).
 pub(in crate::python) fn binom(n: f64, k: f64) -> f64 {
     if k == 0.0 {
         return 1.0;

@@ -1,4 +1,4 @@
-"""Summary statistics: ``describe``, moments, ranking and Shannon/relative entropy.
+"""Summary statistics: ``describe``, moments and ranking.
 
 Each function is a plain wrapper around a "core" computation on a single 1-D slice; ``_reduce``
 applies that core along an ``axis`` and implements ``nan_policy`` (``'propagate'`` just runs the
@@ -15,8 +15,6 @@ from collections import namedtuple
 
 import numpy as np
 
-from scipy import special
-
 __all__ = [
     "describe",
     "moment",
@@ -28,7 +26,6 @@ __all__ = [
     "zmap",
     "trim_mean",
     "rankdata",
-    "entropy",
     "SmallSampleWarning",
     "ConstantInputWarning",
     "DegenerateDataWarning",
@@ -363,21 +360,3 @@ def mode(a, axis=0, nan_policy="propagate", keepdims=False):
         mode_vals = np.expand_dims(mode_vals, axis)
         counts = np.expand_dims(counts, axis)
     return ModeResult(_scalarize(mode_vals), _scalarize(counts))
-
-
-def entropy(pk, qk=None, base=None, axis=0, nan_policy="propagate"):
-    if base is not None and base <= 0:
-        raise ValueError("`base` must be a positive number or `None`.")
-    pk = np.asarray(pk, dtype=float)
-    pk = pk / np.sum(pk, axis=axis, keepdims=True)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        if qk is None:
-            terms = special.entr(pk)
-        else:
-            qk = np.asarray(qk, dtype=float)
-            qk = qk / np.sum(qk, axis=axis, keepdims=True)
-            terms = special.rel_entr(pk, qk)
-    result = np.sum(terms, axis=axis)
-    if base is not None:
-        result = result / math.log(base)
-    return _scalarize(result)

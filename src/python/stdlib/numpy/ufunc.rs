@@ -28,8 +28,7 @@ use super::super::super::native::{
 use super::super::super::number::NumberRef;
 use super::super::super::Value;
 use super::super::scipy::special::{
-    evaluate as evaluate_special, Function as SpecialFunction, Loops as SpecialLoops,
-    ELEMENT_COST as SPECIAL_ELEMENT_COST,
+    evaluate as evaluate_special, Function as SpecialFunction, ELEMENT_COST as SPECIAL_ELEMENT_COST,
 };
 use super::array::{
     broadcast_shapes, broadcast_strides, element_count, reserve_elements, Array, Offsets,
@@ -599,12 +598,9 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
     special(SpecialFunction::Erfinv),
     special(SpecialFunction::Erfcinv),
     special(SpecialFunction::Gamma),
-    special(SpecialFunction::Rgamma),
     special(SpecialFunction::Gammaln),
     special(SpecialFunction::Loggamma),
     special(SpecialFunction::Psi),
-    special(SpecialFunction::Beta),
-    special(SpecialFunction::Betaln),
     special(SpecialFunction::Betainc),
     special(SpecialFunction::Betaincc),
     special(SpecialFunction::Betaincinv),
@@ -615,39 +611,6 @@ pub(in crate::python) const UFUNCS: &[UfuncDef] = &[
     special(SpecialFunction::Ndtr),
     special(SpecialFunction::LogNdtr),
     special(SpecialFunction::Ndtri),
-    special(SpecialFunction::Expit),
-    special(SpecialFunction::Logit),
-    special(SpecialFunction::LogExpit),
-    special(SpecialFunction::Xlogy),
-    special(SpecialFunction::Xlog1py),
-    special(SpecialFunction::Entr),
-    special(SpecialFunction::RelEntr),
-    special(SpecialFunction::KlDiv),
-    special(SpecialFunction::Binom),
-    special(SpecialFunction::Poch),
-    special(SpecialFunction::Stdtr),
-    special(SpecialFunction::Stdtrit),
-    special(SpecialFunction::Chdtr),
-    special(SpecialFunction::Chdtrc),
-    special(SpecialFunction::Chdtri),
-    special(SpecialFunction::Fdtr),
-    special(SpecialFunction::Fdtrc),
-    special(SpecialFunction::Fdtri),
-    special(SpecialFunction::Pdtr),
-    special(SpecialFunction::Pdtrc),
-    special(SpecialFunction::Pdtrik),
-    special(SpecialFunction::Bdtr),
-    special(SpecialFunction::Bdtrc),
-    special(SpecialFunction::BinomPmf),
-    special(SpecialFunction::BinomCdf),
-    special(SpecialFunction::BinomSf),
-    special(SpecialFunction::BinomPpf),
-    special(SpecialFunction::BinomIsf),
-    special(SpecialFunction::Boxcox),
-    special(SpecialFunction::InvBoxcox),
-    special(SpecialFunction::Expm1),
-    special(SpecialFunction::Log1p),
-    special(SpecialFunction::RiemannZeta),
     special(SpecialFunction::Zeta),
 ];
 
@@ -1342,7 +1305,7 @@ fn resolve_special(
     requested: Option<DType>,
 ) -> PyResult<DType> {
     let name = function.name();
-    let complex = matches!(function.loops(), SpecialLoops::Real { complex: true });
+    let complex = function.supports_complex();
     let complex_error = || {
         PyError::unsupported(format!(
             "complex input to scipy.special.{name} is not supported by shellsim's SciPy"
@@ -1362,12 +1325,7 @@ fn resolve_special(
         Category::Complex if complex => return Err(complex_error()),
         Category::Complex | Category::Str | Category::Object => return Err(not_supported(name)),
     }
-    let single = match function.loops() {
-        SpecialLoops::DoubleFirst => common == DType::FLOAT32,
-        SpecialLoops::Real { .. } | SpecialLoops::Binomial => {
-            dtype::can_cast(common, DType::FLOAT32, Casting::Safe)
-        }
-    };
+    let single = dtype::can_cast(common, DType::FLOAT32, Casting::Safe);
     Ok(if single {
         DType::FLOAT32
     } else {
@@ -1492,15 +1450,6 @@ pub(in crate::python) fn evaluate(
         Some(out) => out.shape().to_vec(),
         None => shape,
     };
-    if let Family::Special(function) = ufunc.family {
-        if function.loops() == SpecialLoops::Binomial
-            && element_count(&shape)? > 0
-            && (resolved.input == DType::FLOAT32 || !integer_operand(&operands[1]))
-        {
-            // SciPy warns once per element; one warning per call is what default filters show.
-            super::errstate::call_warning(runtime, "scipy.special", "_warn_non_integer_n")?;
-        }
-    }
     if let (
         Family::Arith {
             op: ArithOp::Power, ..
@@ -1577,15 +1526,6 @@ fn constant_operand(operand: &Operand, count: usize) -> bool {
     match operand {
         Operand::Array(array) => array.size() == 1 && (array.ndim() == 0 || count > 1),
         Operand::Weak { .. } => true,
-    }
-}
-
-/// Whether an operand selects an integer loop argument: an integer or boolean array that casts
-/// safely to `int64`, or a Python `int` or `bool`.
-fn integer_operand(operand: &Operand) -> bool {
-    match operand {
-        Operand::Array(array) => dtype::can_cast(array.dtype, DType::INT64, Casting::Safe),
-        Operand::Weak { weak, .. } => matches!(weak, Weak::Int | Weak::Bool),
     }
 }
 

@@ -30,22 +30,26 @@ fn unsupported_scipy_features_fail_explicitly() {
             "complex input to scipy.special.erf is not supported by shellsim's SciPy",
         ),
         (
-            "special.xlogy.reduce(np.array([1.0, 2.0]))",
-            "reduce and accumulate of scipy.special.xlogy are not supported by shellsim's SciPy",
+            "special.gammainc.reduce(np.array([1.0, 2.0]))",
+            "reduce and accumulate of scipy.special.gammainc are not supported by shellsim's SciPy",
         ),
         (
             "special.factorial(1 + 1j, extend='complex')",
             "complex input to scipy.special.gamma is not supported by shellsim's SciPy",
         ),
         ("import scipy.sparse", "ModuleNotFoundError"),
-        // Moments above order 4 need integration this module does not wire up.
+        // Distributions are plain classes with only the kept methods.
         (
-            "from scipy import stats\nstats.t.moment(5, 7)",
-            "moments of order 5 are not supported by shellsim's SciPy",
+            "from scipy import stats\nstats.t.fit([1.0, 2.0])",
+            "AttributeError",
         ),
         (
-            "from scipy import stats\nstats.rv_discrete(values=([1, 2], [0.5, 0.5]))",
-            "rv_discrete(values=...) is not supported by shellsim's SciPy",
+            "from scipy import stats\nstats.t.moment(5, 7)",
+            "AttributeError",
+        ),
+        (
+            "from scipy import stats\nstats.rv_discrete",
+            "AttributeError",
         ),
         ("from scipy import stats\nstats.gamma", "AttributeError"),
         (
