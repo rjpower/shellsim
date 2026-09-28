@@ -38,11 +38,7 @@ fn unsupported_scipy_features_fail_explicitly() {
             "complex input to scipy.special.gamma is not supported by shellsim's SciPy",
         ),
         ("import scipy.sparse", "ModuleNotFoundError"),
-        // Generic fitting needs scipy.optimize; moments above order 4 need integration.
-        (
-            "from scipy import stats\nstats.t.fit([1.0, 2.0])",
-            "ModuleNotFoundError",
-        ),
+        // Moments above order 4 need integration this module does not wire up.
         (
             "from scipy import stats\nstats.t.moment(5, 7)",
             "moments of order 5 are not supported by shellsim's SciPy",
@@ -97,6 +93,39 @@ fn unsupported_scipy_features_fail_explicitly() {
         (
             "from scipy.spatial import distance\ndistance.pdist([[1.0], [2.0]], 'yule')",
             "ValueError",
+        ),
+        ("import scipy.integrate as si\nsi.nquad", "AttributeError"),
+        (
+            "import scipy.integrate as si\nsi.quad(lambda x: x, 0, 1, weight='cos', wvar=1.0)",
+            "TypeError",
+        ),
+        (
+            "import scipy.integrate as si\n\
+             si.solve_ivp(lambda t, y: -y, (0, 1), [1.0], method='RK23')",
+            "NotImplementedError: solve_ivp(method='RK23') is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import optimize as so\n\
+             so.minimize(lambda x: x[0] ** 2, [0.0], method='Powell')",
+            "NotImplementedError: minimize(method='Powell') is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import optimize as so\n\
+             so.minimize(lambda x: x[0] ** 2, [0.0], bounds=[(0, 1)])",
+            "NotImplementedError: minimize(bounds=...) is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import optimize as so\n\
+             so.curve_fit(lambda x, a: a * x, [1.0, 2.0], [1.0, 2.0], bounds=(0.0, 1.0))",
+            "NotImplementedError: curve_fit(bounds=...) is not supported by shellsim's SciPy",
+        ),
+        (
+            "from scipy import optimize as so\nso.least_squares",
+            "AttributeError",
+        ),
+        (
+            "from scipy import optimize as so\nso.fsolve",
+            "AttributeError",
         ),
     ] {
         let (status, stderr) = run(Limits::default().cpu, source);
