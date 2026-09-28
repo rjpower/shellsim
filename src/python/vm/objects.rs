@@ -50,10 +50,14 @@ pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
     matches!(
         builtin,
         BuiltinType::Int
+            | BuiltinType::List
             | BuiltinType::Tuple
             | BuiltinType::Dict
+            | BuiltinType::Set
+            | BuiltinType::FrozenSet
             | BuiltinType::String
             | BuiltinType::Bytes
+            | BuiltinType::ByteArray
             | BuiltinType::Float
             | BuiltinType::Complex
     )
@@ -387,9 +391,23 @@ impl Vm<'_> {
             }
         }
         if let Some(NativeValue::BuiltinType(builtin)) = owner.native_value() {
-            if let Some((_, value)) = self.type_lookup(builtin.id(), name)? {
+            if let Some((defining_type, value)) = self.type_lookup(builtin.id(), name)? {
                 if let Some(NativeValue::NativeClassMethod(method)) = value.native_value() {
                     return self.bind_native_class_method(owner, method).map(Some);
+                }
+                if matches!(
+                    value.native_value(),
+                    Some(NativeValue::SlotWrapper {
+                        slot: Slot::ClassGetItem,
+                        ..
+                    })
+                ) {
+                    return self.bind_type_attribute(
+                        value,
+                        Some(owner),
+                        builtin.id(),
+                        defining_type,
+                    );
                 }
                 return Ok(Some(value));
             }
@@ -534,6 +552,13 @@ impl Vm<'_> {
                         _ => return Ok(None),
                     };
                     return Ok(Some(value));
+                }
+                Object::GenericAlias { origin, arguments } => {
+                    return match name {
+                        "__origin__" => Ok(Some(origin)),
+                        "__args__" => self.allocate_object(Object::Tuple(arguments)).map(Some),
+                        _ => Ok(None),
+                    };
                 }
                 Object::Instance { class, .. } => {
                     // `object.__dict__` is a data descriptor on every class, so it wins over
@@ -844,28 +869,23 @@ impl Vm<'_> {
         Ok(())
     }
 
-    /// Delete `owner.name`. A class that defines `__delattr__` receives the deletion;
-    /// otherwise [`Vm::delete_attribute_default`] performs it.
+    /// Delete `owner.name` through its type slot, then use the default descriptor algorithm if
+    /// the type supplies no deletion override.
     pub(super) fn delete_attribute_by_symbol(
         &mut self,
         owner: Value,
         symbol: SymbolId,
         name: &str,
     ) -> Result<(), String> {
-        if let Some(Object::Instance { class, .. }) = owner
-            .object_id()
-            .map(|id| self.state.heap.get(id))
-            .transpose()?
+        if self
+            .state
+            .types
+            .slot(self.type_id(&owner)?, Slot::DeleteAttribute)?
+            .is_some()
         {
-            let class = *class;
-            if let Some((defining_class, hook)) =
-                self.class_attribute_entry(class, "__delattr__")?
-            {
-                let hook = self.bind_descriptor(hook, Some(owner), class, defining_class)?;
-                let name = self.allocate_string(name.to_string())?;
-                self.invoke_value(hook, vec![name])?;
-                return Ok(());
-            }
+            let name = self.allocate_string(name.to_string())?;
+            self.invoke_slot(&owner, Slot::DeleteAttribute, "__delattr__", vec![name])?;
+            return Ok(());
         }
         self.delete_attribute_default(owner, symbol, name)
     }
@@ -1123,10 +1143,47 @@ impl Vm<'_> {
         Ok(())
     }
 
+    /// Build an alias after the class-subscription slot has selected a builtin container.
+    pub(super) fn new_generic_alias(
+        &mut self,
+        origin: Value,
+        item: Value,
+    ) -> Result<Value, String> {
+        let count = match item
+            .object_id()
+            .map(|id| self.state.heap.get(id))
+            .transpose()?
+        {
+            Some(Object::Tuple(arguments)) => arguments.len(),
+            _ => 1,
+        };
+        self.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
+        self.reserve_result(count.saturating_mul(std::mem::size_of::<Value>()))?;
+        let arguments = match item
+            .object_id()
+            .map(|id| self.state.heap.get(id))
+            .transpose()?
+        {
+            Some(Object::Tuple(arguments)) => arguments.clone(),
+            _ => vec![item],
+        };
+        self.allocate_object(Object::GenericAlias { origin, arguments })
+    }
+
     /// `owner[index]`: the owner's `__getitem__` or its builtin subscript.
     pub(super) fn subscript_value(&mut self, owner: Value, index: Value) -> Result<Value, String> {
         if let Some(value) = self.invoke_slot(&owner, Slot::GetItem, "__getitem__", vec![index])? {
             return Ok(value);
+        }
+        if let Some(class_type) = self.class_type_id(&owner)? {
+            if let Some((defining_type, descriptor)) =
+                self.type_lookup(class_type, "__class_getitem__")?
+            {
+                let method = self
+                    .bind_type_attribute(descriptor, Some(owner), class_type, defining_type)?
+                    .ok_or("__class_getitem__ descriptor has no value")?;
+                return self.invoke_value(method, vec![index]);
+            }
         }
         let subject = owner;
         let owner = self.builtin_view(owner)?;
@@ -1246,6 +1303,7 @@ impl Vm<'_> {
                 | Object::DescriptorBoundMethod { .. }
                 | Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::StreamIterator { .. }
@@ -1264,6 +1322,7 @@ impl Vm<'_> {
                 | Object::NamespaceDict(_)
                 | Object::DictView { .. }
                 | Object::MappingProxy(_) => BuiltinSubscript::Unsupported,
+                Object::GenericAlias { .. } => BuiltinSubscript::Unsupported,
                 Object::Property { .. }
                 | Object::StaticMethod { .. }
                 | Object::ClassMethod { .. }
@@ -1821,7 +1880,8 @@ impl Vm<'_> {
                         }
                     }
                 })
-                .collect::<Result<Vec<_>, _>>()?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|message| self.raise_exception("TypeError", message))?
         };
         // Direct builtin bases such as `tuple` and those inherited through user classes must agree
         // on one instance layout, as in CPython.
@@ -2093,13 +2153,24 @@ impl Vm<'_> {
         if !matches!(self.state.heap.get(class_id)?, Object::Class { .. }) {
             return Err("metaclass __new__() must return a class in this slice".into());
         }
-        if let Some(base) = user_bases.first().copied() {
-            if let Some((owner, initializer)) =
-                self.class_attribute_entry(base, "__init_subclass__")?
-            {
-                let initializer =
-                    self.bind_descriptor(initializer, Some(Value::Object(class_id)), base, owner)?;
-                self.invoke_value(initializer, Vec::new())?;
+        if let Some(base) = bases.first() {
+            if let Some(base_type) = self.class_type_id(base)? {
+                if let Some((defining_type, initializer)) =
+                    self.type_lookup(base_type, "__init_subclass__")?
+                {
+                    let child_type = self
+                        .class_type_id(&Value::Object(class_id))?
+                        .ok_or("class has no registered type")?;
+                    let initializer = self
+                        .bind_type_attribute(
+                            initializer,
+                            Some(Value::Object(class_id)),
+                            child_type,
+                            defining_type,
+                        )?
+                        .ok_or("__init_subclass__ descriptor has no value")?;
+                    self.invoke_value(initializer, Vec::new())?;
+                }
             }
         }
         if let Some(metaclass_id) = metaclass.object_id() {
@@ -2923,7 +2994,12 @@ impl Vm<'_> {
                 self.raise_exception("TypeError", format!("{name}() received invalid arguments"))
             );
         }
-        let receiver_type = self.type_id(&receiver)?;
+        let receiver_type = if slot == Slot::ClassGetItem {
+            self.class_type_id(&receiver)?
+                .ok_or("class subscription receiver has no registered type")?
+        } else {
+            self.type_id(&receiver)?
+        };
         if !self.state.types.is_subclass(receiver_type, owner)? {
             let owner_name = self.state.types.get(owner)?.name.clone();
             return Err(self.raise_exception(
@@ -3781,7 +3857,8 @@ impl Vm<'_> {
             | BuiltinType::Property
             | BuiltinType::Regex
             | BuiltinType::Match
-            | BuiltinType::Array => {
+            | BuiltinType::Array
+            | BuiltinType::GenericAlias => {
                 return Err(format!("cannot create '{}' instances", builtin_type.name()));
             }
             BuiltinType::Complex => unreachable!("complex construction returned above"),

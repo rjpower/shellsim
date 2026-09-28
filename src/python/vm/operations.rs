@@ -508,43 +508,25 @@ impl Vm<'_> {
         left: Value,
         right: Value,
     ) -> Result<Option<Value>, String> {
-        let name = match operator {
-            BinaryOperator::Add => "__iadd__",
-            BinaryOperator::Subtract => "__isub__",
-            BinaryOperator::Multiply => "__imul__",
-            BinaryOperator::MatrixMultiply => "__imatmul__",
-            BinaryOperator::Power => "__ipow__",
-            BinaryOperator::Divide => "__itruediv__",
-            BinaryOperator::FloorDivide => "__ifloordiv__",
-            BinaryOperator::Remainder => "__imod__",
-            BinaryOperator::LeftShift => "__ilshift__",
-            BinaryOperator::RightShift => "__irshift__",
-            BinaryOperator::BitwiseAnd => "__iand__",
-            BinaryOperator::BitwiseXor => "__ixor__",
-            BinaryOperator::BitwiseOr => "__ior__",
+        let slot = match operator {
+            BinaryOperator::Add => Slot::InplaceAdd,
+            BinaryOperator::Subtract => Slot::InplaceSubtract,
+            BinaryOperator::Multiply => Slot::InplaceMultiply,
+            BinaryOperator::MatrixMultiply => Slot::InplaceMatrixMultiply,
+            BinaryOperator::Power => Slot::InplacePower,
+            BinaryOperator::Divide => Slot::InplaceDivide,
+            BinaryOperator::FloorDivide => Slot::InplaceFloorDivide,
+            BinaryOperator::Remainder => Slot::InplaceRemainder,
+            BinaryOperator::LeftShift => Slot::InplaceLeftShift,
+            BinaryOperator::RightShift => Slot::InplaceRightShift,
+            BinaryOperator::BitwiseAnd => Slot::InplaceBitwiseAnd,
+            BinaryOperator::BitwiseXor => Slot::InplaceBitwiseXor,
+            BinaryOperator::BitwiseOr => Slot::InplaceBitwiseOr,
         };
-        if let Some(id) = left.object_id() {
-            if let Object::Instance { class, .. } = self.state.heap.get(id)? {
-                let class = *class;
-                let Some((defining_class, descriptor)) = self.class_attribute_entry(class, name)?
-                else {
-                    return Ok(None);
-                };
-                let method = self.bind_descriptor(descriptor, Some(left), class, defining_class)?;
-                let result = self.invoke_value(method, vec![right])?;
-                return Ok(
-                    (result.native_value() != Some(NativeValue::NotImplemented)).then_some(result)
-                );
-            }
-        }
-        let type_id = self.type_id(&left)?;
-        if self.type_lookup(type_id, name)?.is_none() {
-            return Ok(None);
-        }
-        let Some(method) = self.resolve_attribute(left, name)? else {
-            return Ok(None);
-        };
-        self.invoke_value(method, vec![right]).map(Some)
+        let (_, name, _) = super::super::object_model::SLOT_DEFS[slot as usize];
+        Ok(self
+            .invoke_slot(&left, slot, name, vec![right])?
+            .filter(|result| result.native_value() != Some(NativeValue::NotImplemented)))
     }
 
     #[cold]
@@ -816,35 +798,39 @@ impl Vm<'_> {
         value: &Value,
         format_spec: &str,
     ) -> Result<String, String> {
-        if let Some(id) = value.object_id() {
-            if matches!(self.state.heap.get(id)?, Object::Instance { .. }) {
-                if let Some(method) = self.special_method(value, "__format__")? {
-                    let spec = self.allocate_string(format_spec.to_string())?;
-                    let result = self.invoke_value(method, vec![spec])?;
-                    return protocol::string_value(&self.state.heap, &result)?.ok_or_else(|| {
-                        self.raise_exception("TypeError", "__format__ must return a str")
-                    });
-                }
-            }
+        let spec = self.allocate_string(format_spec.to_string())?;
+        if let Some(result) = self.invoke_slot(value, Slot::Format, "__format__", vec![spec])? {
+            return protocol::string_value(&self.state.heap, &result)?
+                .ok_or_else(|| self.raise_exception("TypeError", "__format__ must return a str"));
         }
-        if let Some((_, number)) = super::number::registered_number(&self.state.heap, value) {
-            let number = match number {
-                KindNumber::Bool(value) => Value::Bool(value),
-                KindNumber::Int(value) => Value::Int(value),
-                KindNumber::UInt(value) => {
-                    self.allocate_object(Object::BigInt(BigInt::from(value)))?
-                }
-                KindNumber::Float(value) => Value::Float(value),
-                KindNumber::Complex(real, imag) => {
-                    self.allocate_object(Object::Complex { real, imag })?
-                }
-            };
-            return self.format_object(&number, format_spec);
+        if let Some(rendered) = self.format_registered_number(value, format_spec)? {
+            return Ok(rendered);
         }
         if format_spec.is_empty() {
             return self.display_value(value);
         }
         self.format_unconverted_value(value, format_spec)
+    }
+
+    /// Registered scalar formats use their Python numeric value, including when the spec is empty.
+    pub(super) fn format_registered_number(
+        &mut self,
+        value: &Value,
+        format_spec: &str,
+    ) -> Result<Option<String>, String> {
+        let Some((_, number)) = super::number::registered_number(&self.state.heap, value) else {
+            return Ok(None);
+        };
+        let number = match number {
+            KindNumber::Bool(value) => Value::Bool(value),
+            KindNumber::Int(value) => Value::Int(value),
+            KindNumber::UInt(value) => self.allocate_object(Object::BigInt(BigInt::from(value)))?,
+            KindNumber::Float(value) => Value::Float(value),
+            KindNumber::Complex(real, imag) => {
+                self.allocate_object(Object::Complex { real, imag })?
+            }
+        };
+        self.format_object(&number, format_spec).map(Some)
     }
 
     /// Reserve the largest width or precision before formatting can allocate padding.
@@ -870,7 +856,11 @@ impl Vm<'_> {
     /// `format(value, text)` for a builtin value with a non-empty specification: ints, bools
     /// and floats through the numeric mini-language, strings through the string one, and
     /// anything else with the `TypeError` of `object.__format__`.
-    fn format_unconverted_value(&mut self, value: &Value, text: &str) -> Result<String, String> {
+    pub(super) fn format_unconverted_value(
+        &mut self,
+        value: &Value,
+        text: &str,
+    ) -> Result<String, String> {
         let result = match super::number::view(&self.state.heap, value) {
             Some(number::NumberRef::Complex(real, imag)) => format_complex(real, imag, text),
             Some(number::NumberRef::Float(float)) => {

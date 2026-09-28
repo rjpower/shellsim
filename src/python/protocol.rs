@@ -13,6 +13,22 @@ use super::heap::{Heap, InstancePayload, NamespaceTarget, Object, ObjectId};
 pub use super::string::{string_ref, string_value};
 use super::Value;
 
+fn alias_item_repr(
+    heap: &Heap,
+    value: &Value,
+    active: &mut BTreeSet<ObjectId>,
+) -> Result<String, String> {
+    if let Some(super::vm::NativeValue::BuiltinType(builtin)) = value.native_value() {
+        return Ok(builtin.name().into());
+    }
+    if let Some(id) = value.object_id() {
+        if let Object::Class { name, .. } = heap.get(id)? {
+            return Ok(name.clone());
+        }
+    }
+    render(heap, value, active)
+}
+
 pub fn display(heap: &Heap, value: &Value) -> Result<String, String> {
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
@@ -272,8 +288,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Class { .. } => "<class ...>",
                 Object::Instance { .. } => "<instance ...>",
                 Object::DescriptorBoundMethod { .. } => "<bound method ...>",
+                Object::GenericAlias { .. } => "<generic alias ...>",
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. } => "<iterator ...>",
                 Object::CountIterator { .. } | Object::StreamIterator { .. } => "<iterator ...>",
                 Object::CallableIterator { .. } => "<callable_iterator ...>",
@@ -381,8 +399,17 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 },
             },
             Object::DescriptorBoundMethod { .. } => "<bound method>".into(),
+            Object::GenericAlias { origin, arguments } => {
+                let origin = alias_item_repr(heap, origin, active)?;
+                let arguments = arguments
+                    .iter()
+                    .map(|argument| alias_item_repr(heap, argument, active))
+                    .collect::<Result<Vec<_>, _>>()?;
+                format!("{origin}[{}]", arguments.join(", "))
+            }
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. } => "<iterator>".into(),
             Object::CountIterator { .. } | Object::StreamIterator { .. } => "<iterator>".into(),
             Object::CallableIterator { .. } => "<callable_iterator>".into(),
@@ -529,6 +556,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::DescriptorBoundMethod { .. }
         | Object::Iterator { .. }
         | Object::SequenceIterator { .. }
+        | Object::ReverseIterator { .. }
         | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
         | Object::StreamIterator { .. }
@@ -545,6 +573,7 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::NamespaceDict(_)
         | Object::DictView { .. }
         | Object::MappingProxy(_) => true,
+        Object::GenericAlias { .. } => true,
         Object::EnumMember { .. } => true,
         Object::RaisesContext { .. } => true,
         Object::Property { .. }
@@ -594,6 +623,19 @@ fn equals_inner(
                 (Object::List(left), Object::List(right))
                 | (Object::Tuple(left), Object::Tuple(right)) => {
                     sequence_equal(heap, left, right, active)?
+                }
+                (
+                    Object::GenericAlias {
+                        origin: left_origin,
+                        arguments: left_args,
+                    },
+                    Object::GenericAlias {
+                        origin: right_origin,
+                        arguments: right_args,
+                    },
+                ) => {
+                    identical(left_origin, right_origin)
+                        && sequence_equal(heap, left_args, right_args, active)?
                 }
                 (
                     Object::Slice {
@@ -1003,6 +1045,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::StreamIterator { .. }
@@ -1019,6 +1062,7 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::NamespaceDict(_)
             | Object::DictView { .. }
             | Object::MappingProxy(_) => Err("object is not a container".into()),
+            Object::GenericAlias { .. } => Err("object is not a container".into()),
             Object::EnumMember { .. } => Err("object is not a container".into()),
             Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }

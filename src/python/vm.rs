@@ -1156,6 +1156,7 @@ impl<'a> Vm<'a> {
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. } => {
                     while let Some(value) = self.next_stored_iterator(id)? {
                         self.push_materialized(&mut result, value)?;

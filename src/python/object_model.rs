@@ -9,10 +9,6 @@ use std::collections::HashMap;
 use super::native::{BinarySlotFn, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn};
 use super::Value;
 
-// Builtins and native value kinds are immutable process metadata. A fixed charge keeps their
-// accounting out of the VM hot path; user-defined types are charged when registered below.
-const BUILTIN_TYPE_MEMORY_BYTES: u64 = 16 * 1024;
-
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TypeId(u32);
@@ -78,10 +74,11 @@ pub(super) enum BuiltinType {
     Array,
     Complex,
     Slice,
+    GenericAlias,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 38] = [
+    pub(super) const ALL: [Self; 39] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -120,6 +117,7 @@ impl BuiltinType {
         Self::Array,
         Self::Complex,
         Self::Slice,
+        Self::GenericAlias,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -166,6 +164,7 @@ impl BuiltinType {
             Self::Array => "numpy.ndarray",
             Self::Complex => "complex",
             Self::Slice => "slice",
+            Self::GenericAlias => "GenericAlias",
         }
     }
 }
@@ -231,6 +230,7 @@ pub struct TypeSlots {
     pub greater_equal: Option<SlotValue>,
     pub contains: Option<SlotValue>,
     pub delete_item: Option<SlotValue>,
+    extra: [Option<SlotValue>; 18],
 }
 
 /// A cached Python descriptor or a native implementation attached directly to a builtin type.
@@ -300,10 +300,28 @@ pub enum Slot {
     GreaterEqual,
     Contains,
     DeleteItem,
+    Format,
+    Reversed,
+    DeleteAttribute,
+    ClassGetItem,
+    InitSubclass,
+    InplaceAdd,
+    InplaceSubtract,
+    InplaceMultiply,
+    InplaceMatrixMultiply,
+    InplacePower,
+    InplaceDivide,
+    InplaceFloorDivide,
+    InplaceRemainder,
+    InplaceLeftShift,
+    InplaceRightShift,
+    InplaceBitwiseAnd,
+    InplaceBitwiseXor,
+    InplaceBitwiseOr,
 }
 
 impl Slot {
-    pub(super) const ALL: [Self; 54] = [
+    pub(super) const ALL: [Self; 72] = [
         Self::Call,
         Self::New,
         Self::Init,
@@ -358,6 +376,24 @@ impl Slot {
         Self::GreaterEqual,
         Self::Contains,
         Self::DeleteItem,
+        Self::Format,
+        Self::Reversed,
+        Self::DeleteAttribute,
+        Self::ClassGetItem,
+        Self::InitSubclass,
+        Self::InplaceAdd,
+        Self::InplaceSubtract,
+        Self::InplaceMultiply,
+        Self::InplaceMatrixMultiply,
+        Self::InplacePower,
+        Self::InplaceDivide,
+        Self::InplaceFloorDivide,
+        Self::InplaceRemainder,
+        Self::InplaceLeftShift,
+        Self::InplaceRightShift,
+        Self::InplaceBitwiseAnd,
+        Self::InplaceBitwiseXor,
+        Self::InplaceBitwiseOr,
     ];
 
     pub(super) fn from_index(index: u8) -> Self {
@@ -369,7 +405,7 @@ impl Slot {
 
 /// Python names and call shapes for implicitly dispatched slots. Native wrappers are created
 /// from this table only when the defining type supplies the corresponding local slot.
-pub(super) const SLOT_DEFS: [(Slot, &str, u8); 54] = [
+pub(super) const SLOT_DEFS: [(Slot, &str, u8); 72] = [
     (Slot::Call, "__call__", 255),
     (Slot::New, "__new__", 255),
     (Slot::Init, "__init__", 255),
@@ -424,6 +460,24 @@ pub(super) const SLOT_DEFS: [(Slot, &str, u8); 54] = [
     (Slot::GreaterEqual, "__ge__", 1),
     (Slot::Contains, "__contains__", 1),
     (Slot::DeleteItem, "__delitem__", 1),
+    (Slot::Format, "__format__", 1),
+    (Slot::Reversed, "__reversed__", 0),
+    (Slot::DeleteAttribute, "__delattr__", 1),
+    (Slot::ClassGetItem, "__class_getitem__", 1),
+    (Slot::InitSubclass, "__init_subclass__", 255),
+    (Slot::InplaceAdd, "__iadd__", 1),
+    (Slot::InplaceSubtract, "__isub__", 1),
+    (Slot::InplaceMultiply, "__imul__", 1),
+    (Slot::InplaceMatrixMultiply, "__imatmul__", 1),
+    (Slot::InplacePower, "__ipow__", 1),
+    (Slot::InplaceDivide, "__itruediv__", 1),
+    (Slot::InplaceFloorDivide, "__ifloordiv__", 1),
+    (Slot::InplaceRemainder, "__imod__", 1),
+    (Slot::InplaceLeftShift, "__ilshift__", 1),
+    (Slot::InplaceRightShift, "__irshift__", 1),
+    (Slot::InplaceBitwiseAnd, "__iand__", 1),
+    (Slot::InplaceBitwiseXor, "__ixor__", 1),
+    (Slot::InplaceBitwiseOr, "__ior__", 1),
 ];
 
 impl TypeSlots {
@@ -497,6 +551,7 @@ impl TypeSlots {
         .into_iter()
         .filter(|slot| slot.is_some())
         .count()
+            + self.extra.iter().filter(|slot| slot.is_some()).count()
     }
 
     pub fn get(&self, slot: Slot) -> Option<&SlotValue> {
@@ -555,6 +610,7 @@ impl TypeSlots {
             Slot::GreaterEqual => self.greater_equal.as_ref(),
             Slot::Contains => self.contains.as_ref(),
             Slot::DeleteItem => self.delete_item.as_ref(),
+            _ => self.extra[slot as usize - 54].as_ref(),
         }
     }
 
@@ -614,6 +670,7 @@ impl TypeSlots {
             Slot::GreaterEqual => &mut self.greater_equal,
             Slot::Contains => &mut self.contains,
             Slot::DeleteItem => &mut self.delete_item,
+            _ => &mut self.extra[slot as usize - 54],
         } = Some(value);
     }
 }
@@ -800,11 +857,16 @@ impl Default for TypeRegistry {
             );
         }
         types[BuiltinType::Bool as usize].local_slots = bool_local;
+        resolve_builtin_slots(&mut types);
         install_slot_wrappers(&mut types);
+        let builtin_bytes = types
+            .iter()
+            .map(modeled_type_bytes)
+            .fold(0u64, u64::saturating_add);
         let mut registry = Self {
             types,
             value_kinds: Vec::new(),
-            modeled_bytes: BUILTIN_TYPE_MEMORY_BYTES,
+            modeled_bytes: builtin_bytes,
         };
         for kind in super::stdlib::value_kinds() {
             registry.register_value_kind(kind);
@@ -993,7 +1055,11 @@ impl TypeRegistry {
             .collect::<Vec<_>>();
         sequences.push(bases.clone());
         let mro = c3_merge(sequences).expect("value kind bases have a consistent MRO");
-        let local_slots = value_kind_slots(kind.slots);
+        let mut local_slots = value_kind_slots(kind.slots);
+        local_slots.set(
+            Slot::Format,
+            SlotValue::NativeBinary(super::stdlib::core::slot_builtin_format),
+        );
         let mut slots = local_slots.clone();
         for slot in Slot::ALL {
             if slots.get(slot).is_none() {
@@ -1016,6 +1082,7 @@ impl TypeRegistry {
         };
         insert_native_attributes(&mut ty, kind.methods, kind.getters);
         install_slot_wrappers_for_type(&mut ty, type_id);
+        self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
         self.types.push(ty);
         self.value_kinds.push(kind);
         debug_assert_eq!(self.value_kind_type_id(kind), Some(type_id));
@@ -1214,6 +1281,34 @@ fn install_number_attributes(types: &mut [PyType]) {
 fn install_builtin_slots(types: &mut [PyType]) {
     let intrinsic = SlotValue::NativeBinary;
     let unary = SlotValue::NativeUnary;
+    for builtin in [
+        BuiltinType::List,
+        BuiltinType::Tuple,
+        BuiltinType::Dict,
+        BuiltinType::Set,
+        BuiltinType::FrozenSet,
+        BuiltinType::Type,
+    ] {
+        types[builtin as usize].slots.set(
+            Slot::ClassGetItem,
+            intrinsic(super::stdlib::core::slot_generic_alias),
+        );
+    }
+    types[BuiltinType::Object as usize].slots.set(
+        Slot::Format,
+        intrinsic(super::stdlib::core::slot_object_format),
+    );
+    for builtin in [
+        BuiltinType::Int,
+        BuiltinType::Float,
+        BuiltinType::Complex,
+        BuiltinType::String,
+    ] {
+        types[builtin as usize].slots.set(
+            Slot::Format,
+            intrinsic(super::stdlib::core::slot_builtin_format),
+        );
+    }
     for builtin in [BuiltinType::Bool, BuiltinType::Int, BuiltinType::Float] {
         let slots = &mut types[builtin as usize].slots;
         slots.positive = Some(unary(super::number::slot_positive));
@@ -1275,6 +1370,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     let slots = &mut types[BuiltinType::List as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.set(
+        Slot::Reversed,
+        unary(super::stdlib::core::slot_sequence_reversed),
+    );
     slots.add = Some(intrinsic(super::stdlib::core::slot_list_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_list_multiply));
@@ -1285,6 +1384,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
 
     let slots = &mut types[BuiltinType::Dict as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
+    slots.set(
+        Slot::Reversed,
+        unary(super::stdlib::core::slot_dict_reversed),
+    );
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_dict_delete_item));
     slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_union));
     slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_reflected_union));
@@ -1315,6 +1418,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
         let slots = &mut types[view as usize].slots;
         slots.length = Some(unary(views::slot_view_length));
         slots.iter = Some(unary(views::slot_view_iter));
+        slots.set(Slot::Reversed, unary(views::slot_view_reversed));
         slots.contains = Some(intrinsic(views::slot_view_contains));
         if view == BuiltinType::DictValues {
             continue;
@@ -1363,6 +1467,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
+    slots.set(
+        Slot::Reversed,
+        unary(super::stdlib::core::slot_sequence_reversed),
+    );
     slots.add = Some(intrinsic(super::stdlib::core::slot_tuple_add));
     slots.multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
     slots.reflected_multiply = Some(intrinsic(super::stdlib::core::slot_tuple_multiply));
@@ -1371,6 +1479,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
         Some(unary(super::stdlib::core::slot_sequence_iter));
     types[BuiltinType::Range as usize].slots.length =
         Some(unary(super::stdlib::core::slot_builtin_length));
+    types[BuiltinType::Range as usize].slots.set(
+        Slot::Reversed,
+        unary(super::stdlib::core::slot_sequence_reversed),
+    );
 
     let slots = &mut types[BuiltinType::Array as usize].slots;
     {
@@ -1420,6 +1532,22 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.less_equal = Some(intrinsic(np::slot_less_equal));
         slots.greater_than = Some(intrinsic(np::slot_greater_than));
         slots.greater_equal = Some(intrinsic(np::slot_greater_equal));
+        for (slot, call) in [
+            (Slot::InplaceAdd, np::slot_iadd as BinarySlotFn),
+            (Slot::InplaceSubtract, np::slot_isub),
+            (Slot::InplaceMultiply, np::slot_imul),
+            (Slot::InplacePower, np::slot_ipow),
+            (Slot::InplaceDivide, np::slot_itruediv),
+            (Slot::InplaceFloorDivide, np::slot_ifloordiv),
+            (Slot::InplaceRemainder, np::slot_imod),
+            (Slot::InplaceLeftShift, np::slot_ilshift),
+            (Slot::InplaceRightShift, np::slot_irshift),
+            (Slot::InplaceBitwiseAnd, np::slot_iand),
+            (Slot::InplaceBitwiseXor, np::slot_ixor),
+            (Slot::InplaceBitwiseOr, np::slot_ior),
+        ] {
+            slots.set(slot, intrinsic(call));
+        }
     }
 
     let slots = &mut types[BuiltinType::Complex as usize].slots;
@@ -1447,6 +1575,25 @@ fn install_builtin_slots(types: &mut [PyType]) {
     stream.next = Some(unary(super::stdlib::sys::slot_next));
 
     types[BuiltinType::NotImplemented as usize].slots.bool_ = Some(unary(not_implemented_bool));
+}
+
+/// Fill resolved builtin slots from the first defining ancestor. Local slots were captured
+/// before this pass so inherited native wrappers appear only in their defining namespace.
+fn resolve_builtin_slots(types: &mut [PyType]) {
+    for index in 0..types.len() {
+        let mro = types[index].mro.clone();
+        for slot in Slot::ALL {
+            if types[index].slots.get(slot).is_some() {
+                continue;
+            }
+            if let Some(value) = mro
+                .iter()
+                .find_map(|ancestor| types[ancestor.0 as usize].local_slots.get(slot).cloned())
+            {
+                types[index].slots.set(slot, value);
+            }
+        }
+    }
 }
 
 fn install_slot_wrappers(types: &mut [PyType]) {
@@ -1510,9 +1657,21 @@ mod tests {
     }
 
     #[test]
-    fn modeled_memory_uses_a_fixed_builtin_charge_and_tracks_registered_types() {
+    fn modeled_memory_counts_builtin_and_registered_types() {
         let mut registry = TypeRegistry::default();
-        assert_eq!(registry.modeled_bytes(), BUILTIN_TYPE_MEMORY_BYTES);
+        let builtin_bytes = registry
+            .types
+            .iter()
+            .take(BuiltinType::ALL.len())
+            .map(modeled_type_bytes)
+            .fold(0u64, u64::saturating_add);
+        let value_kind_bytes = registry
+            .types
+            .iter()
+            .skip(BuiltinType::ALL.len())
+            .map(modeled_type_bytes)
+            .fold(0u64, u64::saturating_add);
+        assert_eq!(registry.modeled_bytes(), builtin_bytes + value_kind_bytes);
 
         let before = registry.modeled_bytes();
         let id = registry

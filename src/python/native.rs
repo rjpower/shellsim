@@ -670,6 +670,14 @@ pub(super) trait PyRuntime {
         conversion: Option<char>,
         specification: &str,
     ) -> PyResult<String>;
+    /// Format a builtin payload directly, without calling its `__format__` slot again.
+    fn builtin_format(&mut self, value: &PyValue, specification: &str) -> PyResult<String>;
+    /// Dispatch `reversed` through the type slot, then through the sequence protocol.
+    fn reverse_value(&mut self, value: PyValue) -> PyResult<PyValue>;
+    /// Reverse a builtin sequence directly for its native `__reversed__` slot.
+    fn reverse_builtin_sequence(&mut self, value: PyValue) -> PyResult<PyValue>;
+    /// Create a metered generic alias for a builtin container's class subscription.
+    fn new_generic_alias(&mut self, origin: PyValue, item: PyValue) -> PyResult<PyValue>;
     fn equals(&mut self, left: &PyValue, right: &PyValue) -> PyResult<bool>;
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
@@ -1013,10 +1021,11 @@ pub(super) struct PyByteArray(ObjectId);
 
 impl FromPyValue for PyByteArray {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             return Err(PyError::type_error("expected a bytearray"));
         };
-        if runtime.kind(&value)? == PyKind::ByteArray {
+        if runtime.kind(&payload)? == PyKind::ByteArray {
             Ok(Self(id))
         } else {
             Err(PyError::type_error("expected a bytearray"))
@@ -1213,11 +1222,12 @@ pub(super) struct PyList(ObjectId);
 
 impl FromPyValue for PyList {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected list, got {actual}")));
         };
-        if runtime.kind(&Value::Object(id))? == PyKind::List {
+        if runtime.kind(&payload)? == PyKind::List {
             Ok(Self(id))
         } else {
             let actual = runtime.type_name(&Value::Object(id))?;
@@ -1390,10 +1400,11 @@ pub(super) struct PySet(ObjectId);
 
 impl FromPyValue for PySet {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             return Err(PyError::type_error("expected set"));
         };
-        if runtime.kind(&Value::Object(id))? == PyKind::Set {
+        if runtime.kind(&payload)? == PyKind::Set {
             Ok(Self(id))
         } else {
             Err(PyError::type_error("expected set"))

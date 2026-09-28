@@ -70,18 +70,13 @@ fn int_subclasses_preserve_identity_and_use_numeric_protocols() {
 }
 
 #[test]
-fn subclassing_unmodeled_builtin_layouts_fails_loudly() {
-    // Only int and tuple instances carry a builtin payload. Other builtin bases must not fall
-    // back to a plain object layout that silently lacks list or dict behavior.
+fn subclassing_non_subclassable_builtins_raises_type_error() {
     let (status, stdout, stderr) = run_python_text(
-        "try:\n    class Items(list):\n        pass\nexcept TypeError:\n    print('caught')",
+        "try:\n    class Items(range):\n        pass\nexcept TypeError:\n    print('caught')",
     );
-    assert_eq!(status, 2);
-    assert!(stdout.is_empty());
-    assert!(
-        stderr.contains("subclassing the builtin type 'list' is not supported"),
-        "{stderr}"
-    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, "caught\n");
+    assert!(stderr.is_empty());
 }
 
 #[test]

@@ -42,8 +42,10 @@ mod ufunc;
 mod underflow;
 
 pub(in crate::python) use ndarray::{
-    slot_bool, slot_get_item, slot_iter, slot_length, slot_matrix_multiply,
-    slot_reflected_matrix_multiply, slot_repr, slot_set_item, slot_str,
+    slot_bool, slot_get_item, slot_iadd, slot_iand, slot_ifloordiv, slot_ilshift, slot_imod,
+    slot_imul, slot_ior, slot_ipow, slot_irshift, slot_isub, slot_iter, slot_itruediv, slot_ixor,
+    slot_length, slot_matrix_multiply, slot_reflected_matrix_multiply, slot_repr, slot_set_item,
+    slot_str,
 };
 pub(in crate::python) use ufunc::{
     slot_absolute, slot_add, slot_bitwise_and, slot_bitwise_or, slot_bitwise_xor, slot_divide,

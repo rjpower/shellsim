@@ -459,8 +459,10 @@ impl PyRuntime for Vm<'_> {
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
                 Object::Class { .. } => PyKind::Class,
                 Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
+                Object::GenericAlias { .. } => PyKind::Native,
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::StreamIterator { .. }
@@ -639,6 +641,35 @@ impl PyRuntime for Vm<'_> {
                     PyError::unsupported(message)
                 }
             })
+    }
+
+    fn builtin_format(&mut self, value: &Value, specification: &str) -> PyResult<String> {
+        if let Some(rendered) = self
+            .format_registered_number(value, specification)
+            .map_err(|message| self.raised_or_runtime_error(message))?
+        {
+            return Ok(rendered);
+        }
+        let result = if specification.is_empty() {
+            self.display_value(value)
+        } else {
+            self.format_unconverted_value(value, specification)
+        };
+        result.map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn reverse_value(&mut self, value: Value) -> PyResult<Value> {
+        Vm::reverse_value(self, value).map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn reverse_builtin_sequence(&mut self, value: Value) -> PyResult<Value> {
+        Vm::reverse_builtin_sequence(self, value)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn new_generic_alias(&mut self, origin: Value, item: Value) -> PyResult<Value> {
+        Vm::new_generic_alias(self, origin, item)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
@@ -1559,6 +1590,7 @@ impl PyRuntime for Vm<'_> {
                 Ok(value)
             }
             Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::StreamIterator { .. } => self
                 .next_stored_iterator(id)

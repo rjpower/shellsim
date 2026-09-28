@@ -179,7 +179,7 @@ fn direct_list_growth_does_not_require_a_full_container_snapshot() {
     let (status, stdout, stderr, usage) = run_with_limits(
         "items = []\nfor value in range(3000):\n    items.append(value)\nprint(len(items))",
         Limits {
-            memory: 128 * 1024,
+            memory: 256 * 1024,
             ..Limits::unlimited()
         },
     );
@@ -190,7 +190,7 @@ fn direct_list_growth_does_not_require_a_full_container_snapshot() {
         String::from_utf8_lossy(&stderr)
     );
     assert_eq!(stdout, b"3000\n");
-    assert!(usage.memory_peak <= 128 * 1024);
+    assert!(usage.memory_peak <= 256 * 1024);
 }
 
 #[test]

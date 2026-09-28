@@ -64,6 +64,12 @@ impl Vm<'_> {
                 return Ok(hash::bytes(&bytes));
             }
             Object::Tuple(items) => (items.clone(), hash::tuple),
+            Object::GenericAlias { origin, arguments } => {
+                let mut items = Vec::with_capacity(arguments.len().saturating_add(1));
+                items.push(*origin);
+                items.extend(arguments.iter().copied());
+                (items, hash::tuple)
+            }
             Object::FrozenSet(items) => (items.clone(), hash::frozenset),
             Object::Range { start, stop, step } => {
                 let (start, stop, step) = (*start, *stop, *step);

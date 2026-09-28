@@ -25,7 +25,7 @@ def test_native_slot_wrappers_bind_and_keep_defining_implementation():
     except TypeError:
         pass
     else:
-        assert False, "slot wrapper accepted an unrelated receiver"
+        raise AssertionError("slot wrapper accepted an unrelated receiver")
 
 
 def test_builtin_sequence_iterators_are_exposed_as_descriptors():
@@ -43,6 +43,113 @@ def test_native_length_slots_are_directly_callable():
     assert dict.__len__({"x": 1}) == 1
 
 
+def test_format_uses_type_slot_and_exposes_builtin_descriptor():
+    assert format(True) == "True"
+    assert format(True, "d") == "1"
+    assert format(3.5, ".2f") == "3.50"
+    assert (3.5).__format__(".2f") == "3.50"
+    assert str.__format__("hi", ">4") == "  hi"
+
+    class Named:
+        def __format__(self, spec):
+            return "named:" + spec
+
+    assert format(Named(), "x") == "named:x"
+
+    class Plain:
+        pass
+
+    assert format(Plain()).startswith("<")
+    try:
+        format(Plain(), "x")
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("object.__format__ accepted a non-empty spec")
+
+
+def test_reversed_uses_slot_then_indexed_sequence():
+    assert list(reversed([1, 2, 3])) == [3, 2, 1]
+    assert list(list.__reversed__([1, 2])) == [2, 1]
+    assert list(reversed("abc")) == ["c", "b", "a"]
+    large = reversed(range(1_000_000_000))
+    assert next(large) == 999_999_999
+    assert next(large) == 999_999_998
+
+    class Reversed:
+        def __reversed__(self):
+            return iter([7, 8])
+
+    assert list(reversed(Reversed())) == [7, 8]
+
+    class Sequence:
+        def __len__(self):
+            return 3
+
+        def __getitem__(self, index):
+            return index * 2
+
+    assert list(reversed(Sequence())) == [4, 2, 0]
+
+    try:
+        reversed(iter([1, 2]))
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("reversed() accepted a bare iterator")
+
+
+def test_class_subscription_and_builtin_generic_aliases():
+    alias = list[int]
+    assert alias.__origin__ is list
+    assert alias.__args__ == (int,)
+    assert repr(alias) == "list[int]"
+    assert alias([1, 2]) == [1, 2]
+    assert alias == list[int]
+    assert hash(alias) == hash(list[int])
+    assert dict[str, int].__args__ == (str, int)
+
+    class Generic:
+        def __class_getitem__(cls, item):
+            return cls, item
+
+    assert Generic[int] == (Generic, int)
+
+    class Meta(type):
+        def __getitem__(cls, item):
+            return "metaclass"
+
+    class Chosen(metaclass=Meta):
+        def __class_getitem__(cls, item):
+            return "class"
+
+    assert Chosen[int] == "metaclass"
+
+    class Numbers(list):
+        pass
+
+    assert Numbers[int].__origin__ is Numbers
+    assert list.__class_getitem__(int) == list[int]
+
+
+def test_set_name_runs_before_cooperative_init_subclass():
+    events = []
+
+    class Descriptor:
+        def __set_name__(self, owner, name):
+            events.append(("name", owner.__name__, name))
+
+    class Parent:
+        def __init_subclass__(cls):
+            events.append(("parent", cls.__name__))
+            super().__init_subclass__()
+
+    class Child(Parent):
+        field = Descriptor()
+
+    assert events == [("name", "Child", "field"), ("parent", "Child")]
+
+
 def test_comparison_tries_subclass_reflection_first():
     class Left:
         def __lt__(self, other):
@@ -53,6 +160,46 @@ def test_comparison_tries_subclass_reflection_first():
             return "right"
 
     assert (Left() < Right()) == "right"
+
+
+def test_inplace_slot_precedes_binary_and_can_decline():
+    class Inplace:
+        def __iadd__(self, other):
+            return "in-place"
+
+        def __add__(self, other):
+            return "binary"
+
+    value = Inplace()
+    value += 1
+    assert value == "in-place"
+
+    class Declining:
+        def __iadd__(self, other):
+            return NotImplemented
+
+        def __add__(self, other):
+            return "binary fallback"
+
+    value = Declining()
+    value += 1
+    assert value == "binary fallback"
+
+
+def test_delete_attribute_uses_type_slot():
+    class Owner:
+        def __init__(self):
+            self.value = 3
+            self.deleted = []
+
+        def __delattr__(self, name):
+            self.deleted.append(name)
+            object.__delattr__(self, name)
+
+    owner = Owner()
+    del owner.value
+    assert owner.deleted == ["value"]
+    assert not hasattr(owner, "value")
 
 
 def test_hash_rule_is_visible_in_class_namespace():
@@ -66,7 +213,7 @@ def test_hash_rule_is_visible_in_class_namespace():
     except TypeError:
         pass
     else:
-        assert False, "class defining equality kept an inherited hash"
+        raise AssertionError("class defining equality kept an inherited hash")
 
 
 def test_class_and_descriptor_mutation_after_cached_reads():
@@ -126,7 +273,7 @@ def test_getattribute_override_and_direct_default_lookup():
     except AttributeError:
         pass
     else:
-        assert False, "direct default lookup called __getattr__"
+        raise AssertionError("direct default lookup called __getattr__")
 
 
 def test_metaclass_data_descriptor_precedes_class_namespace():
@@ -182,7 +329,7 @@ def test_inherited_native_getter_rejects_assignment():
     except AttributeError:
         pass
     else:
-        assert False, "inherited native getter accepted assignment"
+        raise AssertionError("inherited native getter accepted assignment")
     assert value.real == 5
 
 
@@ -236,11 +383,71 @@ def test_bytes_subclass_keeps_bytes_payload():
     assert hash(value) == hash(b"ab")
 
 
+def test_mutable_builtin_subclasses_keep_live_payloads():
+    class Stack(list):
+        def push(self, value):
+            super().append(value)
+
+    stack = Stack([1])
+    stack.push(2)
+    assert stack == [1, 2]
+    assert len(stack) == 2
+    assert type(stack + [3]) is list
+
+    class Labels(set):
+        pass
+
+    labels = Labels(["a"])
+    labels.add("b")
+    assert labels == {"a", "b"}
+    assert type(labels | {"c"}) is set
+
+    class Buffer(bytearray):
+        pass
+
+    buffer = Buffer(b"a")
+    buffer.append(98)
+    assert buffer == bytearray(b"ab")
+    assert type(buffer + b"c") is bytearray
+
+
+def test_mutable_builtin_new_starts_empty_before_user_init():
+    class Stack(list):
+        def __init__(self, values):
+            assert self == []
+            super().__init__(values)
+
+    class Labels(set):
+        def __init__(self, values):
+            assert self == set()
+            super().__init__(values)
+
+    class Buffer(bytearray):
+        def __init__(self, values):
+            assert self == bytearray()
+            super().__init__(values)
+
+    assert Stack([1, 2]) == [1, 2]
+    assert Labels([1, 2]) == {1, 2}
+    assert Buffer(b"ab") == bytearray(b"ab")
+
+
+def test_frozenset_subclass_uses_builtin_payload():
+    class Keys(frozenset):
+        pass
+
+    keys = Keys([1, 2])
+    assert len(keys) == 2
+    assert 1 in keys
+    assert type(keys | {3}) is frozenset
+
+
 def test_incompatible_builtin_payloads_raise_type_error():
     try:
+
         class Mixed(str, bytes):
             pass
     except TypeError:
         pass
     else:
-        assert False, "incompatible builtin layouts were accepted"
+        raise AssertionError("incompatible builtin layouts were accepted")

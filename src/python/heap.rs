@@ -230,6 +230,11 @@ pub enum Object {
         descriptor: Value,
         owner: Option<ObjectId>,
     },
+    /// A parameterized builtin class such as `list[int]`.
+    GenericAlias {
+        origin: Value,
+        arguments: Vec<Value>,
+    },
     Iterator {
         values: Vec<Value>,
         position: usize,
@@ -239,6 +244,11 @@ pub enum Object {
     SequenceIterator {
         owner: ObjectId,
         position: usize,
+    },
+    /// Reverse traversal indexes the source on demand, preserving bounded iterator storage.
+    ReverseIterator {
+        owner: Value,
+        next: usize,
     },
     RangeIterator {
         current: i64,
@@ -1280,6 +1290,7 @@ impl Heap {
             },
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::CallableIterator { .. }
@@ -1293,6 +1304,7 @@ impl Heap {
                 DictViewKind::Items => BuiltinType::DictItems.id(),
             },
             Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
+            Object::GenericAlias { .. } => BuiltinType::GenericAlias.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
@@ -1591,10 +1603,15 @@ fn trace_object(
             trace_values([*receiver, *descriptor], object_work);
             object_work.extend(*owner);
         }
+        Object::GenericAlias { origin, arguments } => {
+            trace_value(*origin, object_work);
+            trace_values(arguments.iter().copied(), object_work);
+        }
         Object::Iterator { values: items, .. } => {
             trace_values(items.iter().copied(), object_work);
         }
         Object::SequenceIterator { owner, .. } => object_work.push(*owner),
+        Object::ReverseIterator { owner, .. } => trace_value(*owner, object_work),
         Object::CallableIterator {
             callable, sentinel, ..
         } => {
@@ -1760,8 +1777,10 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(1)
             .ok_or("modeled object size overflow")?,
         Object::DescriptorBoundMethod { .. } => 3,
+        Object::GenericAlias { arguments, .. } => arguments.len().saturating_add(1),
         Object::Iterator { values, .. } => values.len(),
         Object::SequenceIterator { .. } => 2,
+        Object::ReverseIterator { .. } => 2,
         Object::RangeIterator { .. } => 4,
         Object::CountIterator { .. } => 2,
         Object::CallableIterator { .. } => 3,

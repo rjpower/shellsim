@@ -779,7 +779,7 @@ fn method_put(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallAr
 }
 
 macro_rules! inplace_methods {
-    ($($method:ident => $ufunc:literal;)*) => {
+    ($($method:ident, $slot:ident => $ufunc:literal;)*) => {
         $(
             fn $method(
                 runtime: &mut dyn PyRuntime,
@@ -789,23 +789,31 @@ macro_rules! inplace_methods {
                 args.expect_positional(stringify!($method), 1, 1)?;
                 ufunc::inplace(runtime, $ufunc, receiver_value, args.positional()[0])
             }
+
+            pub(in crate::python) fn $slot(
+                runtime: &mut dyn PyRuntime,
+                receiver_value: PyValue,
+                other: PyValue,
+            ) -> PyResult<Option<PyValue>> {
+                ufunc::inplace(runtime, $ufunc, receiver_value, other).map(Some)
+            }
         )*
     };
 }
 
 inplace_methods! {
-    method_iadd => "add";
-    method_isub => "subtract";
-    method_imul => "multiply";
-    method_itruediv => "divide";
-    method_ifloordiv => "floor_divide";
-    method_imod => "remainder";
-    method_ipow => "power";
-    method_iand => "bitwise_and";
-    method_ior => "bitwise_or";
-    method_ixor => "bitwise_xor";
-    method_ilshift => "left_shift";
-    method_irshift => "right_shift";
+    method_iadd, slot_iadd => "add";
+    method_isub, slot_isub => "subtract";
+    method_imul, slot_imul => "multiply";
+    method_itruediv, slot_itruediv => "divide";
+    method_ifloordiv, slot_ifloordiv => "floor_divide";
+    method_imod, slot_imod => "remainder";
+    method_ipow, slot_ipow => "power";
+    method_iand, slot_iand => "bitwise_and";
+    method_ior, slot_ior => "bitwise_or";
+    method_ixor, slot_ixor => "bitwise_xor";
+    method_ilshift, slot_ilshift => "left_shift";
+    method_irshift, slot_irshift => "right_shift";
 }
 
 /// `repr(array)` or `str(array)` through `numpy._printing.<function>`, which holds the layout

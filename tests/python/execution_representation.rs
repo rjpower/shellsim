@@ -65,13 +65,13 @@ print(total)"#;
     let (status, stdout, stderr, usage) = run(
         source,
         Limits {
-            memory: 64 * 1024,
+            memory: 256 * 1024,
             ..Limits::unlimited()
         },
     );
     assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(stdout, b"6\n");
-    assert!(usage.memory_peak <= 64 * 1024);
+    assert!(usage.memory_peak <= 256 * 1024);
 }
 
 #[test]

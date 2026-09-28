@@ -357,6 +357,9 @@ impl Vm<'_> {
                         Err("bound descriptor is not callable".into())
                     }
                 }
+                Object::GenericAlias { origin, .. } => {
+                    self.invoke_call(origin, arguments, keyword_arguments)
+                }
                 Object::Instance { class, .. } => {
                     let type_id = self.state.heap.type_id(id)?;
                     if self.state.types.slot(type_id, Slot::Call)?.is_none() {
@@ -430,13 +433,16 @@ impl Vm<'_> {
                     }
                     let payload = match layout {
                         ClassLayout::Object => InstancePayload::Object,
-                        // A dict subclass with its own `__init__` starts empty and fills itself
-                        // through `super().__init__`, since `dict.__new__` ignores arguments.
-                        ClassLayout::Builtin(BuiltinType::Dict)
-                            if self.class_attribute(id, "__init__")?.is_some() =>
-                        {
+                        // Mutable builtin `__new__` creates empty storage. An override can then
+                        // populate it, usually through the base `__init__`.
+                        ClassLayout::Builtin(
+                            builtin @ (BuiltinType::List
+                            | BuiltinType::Set
+                            | BuiltinType::Dict
+                            | BuiltinType::ByteArray),
+                        ) if self.class_attribute(id, "__init__")?.is_some() => {
                             InstancePayload::Builtin(self.builtin_value(
-                                BuiltinType::Dict,
+                                builtin,
                                 Vec::new(),
                                 Vec::new(),
                             )?)
@@ -1990,6 +1996,7 @@ impl Vm<'_> {
             Object::Generator { .. } => self.resume_generator(id)?,
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::StreamIterator { .. } => self.next_stored_iterator(id)?,
             _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
