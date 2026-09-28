@@ -103,7 +103,7 @@ fn check_dtype(array: &Array, function: &str) -> PyResult<Precision> {
         ));
     }
     if array.dtype.category() == Category::Complex {
-        return Err(PyError::unsupported(format!(
+        return Err(PyError::not_implemented_error(format!(
             "complex input to numpy.linalg.{function} is not supported by shellsim's NumPy"
         )));
     }

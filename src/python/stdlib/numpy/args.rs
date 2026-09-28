@@ -292,7 +292,7 @@ pub(in crate::python) fn dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> P
         // subarray dtype.
         PyKind::List | PyKind::Dict | PyKind::Tuple => {
             let repr = runtime.repr(&value)?;
-            return Err(PyError::unsupported(format!(
+            return Err(PyError::not_implemented_error(format!(
                 "NumPy dtype {repr} is not supported"
             )));
         }

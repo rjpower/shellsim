@@ -648,7 +648,7 @@ fn module_matmul(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let bound = SIGNATURE.bind(&args)?;
     for name in ["axes", "axis", "signature"] {
         if bound.value(name).is_some() {
-            return Err(PyError::unsupported(format!(
+            return Err(PyError::not_implemented_error(format!(
                 "matmul() with {name}= is not supported"
             )));
         }

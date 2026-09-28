@@ -458,7 +458,7 @@ pub(in crate::python) fn numbers_array(
         return array::new_array(runtime, buffer, dtype, shape);
     }
     if !dtype.is_numeric() {
-        return Err(PyError::unsupported(format!(
+        return Err(PyError::not_implemented_error(format!(
             "{} arrays cannot be built from numbers here",
             dtype.name()
         )));
@@ -540,7 +540,7 @@ pub(in crate::python) fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -
         .value("axis")
         .is_some_and(|axis| axis != Value::Int(0))
     {
-        return Err(PyError::unsupported(
+        return Err(PyError::not_implemented_error(
             "linspace() with axis= is not supported",
         ));
     }
@@ -556,7 +556,7 @@ pub(in crate::python) fn linspace(runtime: &mut dyn PyRuntime, args: CallArgs) -
         // Complex bounds interpolate each part separately, as NumPy's complex arithmetic does.
         let dtype = dtype.unwrap_or(DType::COMPLEX128);
         if dtype.category() != dtype::Category::Complex {
-            return Err(PyError::unsupported(
+            return Err(PyError::not_implemented_error(
                 "linspace() with complex bounds and a real dtype is not supported",
             ));
         }
@@ -655,7 +655,7 @@ pub(in crate::python) fn geomspace(runtime: &mut dyn PyRuntime, args: CallArgs) 
         ));
     }
     if (start < 0.0) != (stop < 0.0) {
-        return Err(PyError::unsupported(
+        return Err(PyError::not_implemented_error(
             "geomspace() between bounds of different signs is not supported",
         ));
     }
@@ -804,7 +804,7 @@ pub(in crate::python) fn meshgrid(runtime: &mut dyn PyRuntime, args: CallArgs) -
             "copy" => copy = runtime.truth(value)?,
             "sparse" if !runtime.truth(value)? => {}
             "sparse" => {
-                return Err(PyError::unsupported(
+                return Err(PyError::not_implemented_error(
                     "meshgrid() with sparse=True is not supported",
                 ))
             }

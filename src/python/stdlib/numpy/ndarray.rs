@@ -216,7 +216,7 @@ fn get_imag(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
         return Ok(view.value());
     }
     if array.dtype.kind() == Kind::Object {
-        return Err(PyError::unsupported(
+        return Err(PyError::not_implemented_error(
             "ndarray.imag of object arrays is not supported",
         ));
     }
@@ -542,7 +542,7 @@ fn method_view(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
             ));
         }
         if dtype.itemsize() != array.itemsize() {
-            return Err(PyError::unsupported(
+            return Err(PyError::not_implemented_error(
                 "ndarray.view with a dtype of a different item size is not supported",
             ));
         }
@@ -553,7 +553,7 @@ fn method_view(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
             dtype.category() == Category::Complex || array.dtype.category() == Category::Complex;
         let big_endian = !dtype.is_native() || !array.dtype.is_native();
         if big_endian && (dtype.is_native() != array.dtype.is_native() || complex) {
-            return Err(PyError::unsupported(
+            return Err(PyError::not_implemented_error(
                 "ndarray.view between byte orders is not supported",
             ));
         }

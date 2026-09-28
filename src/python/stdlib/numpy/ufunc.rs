@@ -1256,7 +1256,7 @@ fn resolve_special(
     let name = function.name();
     let complex = function.supports_complex();
     let complex_error = || {
-        PyError::unsupported(format!(
+        PyError::not_implemented_error(format!(
             "complex input to scipy.special.{name} is not supported by shellsim's SciPy"
         ))
     };

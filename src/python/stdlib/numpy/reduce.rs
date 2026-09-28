@@ -334,13 +334,13 @@ fn classify(ufunc: &UfuncDef) -> PyResult<ReduceOp> {
 }
 
 fn unsupported_reduce(name: &str) -> PyError {
-    PyError::unsupported(format!(
+    PyError::not_implemented_error(format!(
         "reduce/accumulate for ufunc '{name}' is not supported by shellsim's NumPy"
     ))
 }
 
 fn unsupported_scipy_reduce(name: &str) -> PyError {
-    PyError::unsupported(format!(
+    PyError::not_implemented_error(format!(
         "reduce and accumulate of scipy.special.{name} are not supported by shellsim's SciPy"
     ))
 }
@@ -506,7 +506,7 @@ fn resolve_dtype(
     );
     match dtype.kind() {
         Kind::Object if numeric_object_ok => Ok(dtype),
-        Kind::Object | Kind::Str => Err(PyError::unsupported(format!(
+        Kind::Object | Kind::Str => Err(PyError::not_implemented_error(format!(
             "{} reduction of '{}' arrays is not supported by shellsim's NumPy",
             ufunc.name,
             dtype.kind().name()
@@ -1461,7 +1461,7 @@ fn arg_extreme(
     runtime.charge_cpu(array.size() as u64 + 1)?;
     let bytes = match array.dtype.kind() {
         Kind::Object | Kind::Str => {
-            return Err(PyError::unsupported(format!(
+            return Err(PyError::not_implemented_error(format!(
                 "{name} of '{}' arrays is not supported by shellsim's NumPy",
                 array.dtype.kind().name()
             )))

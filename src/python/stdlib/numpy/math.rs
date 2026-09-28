@@ -477,7 +477,7 @@ fn round_array(runtime: &mut dyn PyRuntime, array: &Array, decimals: i64) -> PyR
     let mut buffer = array::buffer_with_capacity(array.dtype, count);
     runtime.read_arrays(&[array.handle], &mut |arrays| {
         let PyArrayData::Bytes(bytes) = arrays[0].data else {
-            return Err(PyError::unsupported(
+            return Err(PyError::not_implemented_error(
                 "round on object arrays is not supported",
             ));
         };

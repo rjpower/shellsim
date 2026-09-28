@@ -356,7 +356,7 @@ impl DType {
         if let Some(body) = text.strip_prefix('>').filter(|body| !body.is_empty()) {
             let dtype = Self::parse(body)?;
             if dtype.kind == Kind::Str {
-                return Err(PyError::unsupported(format!(
+                return Err(PyError::not_implemented_error(format!(
                     "big-endian dtype '{text}' is not supported"
                 )));
             }
@@ -398,7 +398,7 @@ impl DType {
             "g" | "G" | "f16" | "c32" | "longdouble" | "clongdouble" | "S" | "a" | "V"
             | "bytes" | "bytes_" | "void" | "M" | "m" | "M8" | "m8" | "datetime64"
             | "timedelta64" => {
-                return Err(PyError::unsupported(format!(
+                return Err(PyError::not_implemented_error(format!(
                     "NumPy dtype '{text}' is not supported"
                 )))
             }
@@ -411,7 +411,7 @@ impl DType {
                 || body.starts_with("datetime64[")
                 || body.starts_with("timedelta64[") =>
             {
-                return Err(PyError::unsupported(format!(
+                return Err(PyError::not_implemented_error(format!(
                     "NumPy dtype '{text}' is not supported"
                 )))
             }
@@ -715,7 +715,7 @@ mod tests {
         );
         assert_eq!(
             DType::parse("M8[ns]").unwrap_err().kind,
-            super::super::super::super::native::PyErrorKind::Unsupported
+            super::super::super::super::native::PyErrorKind::Exception("NotImplementedError")
         );
     }
 

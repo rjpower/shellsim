@@ -233,6 +233,12 @@ impl PyError {
         Self::new(PyErrorKind::Unsupported, message)
     }
 
+    /// A catchable `NotImplementedError` for a library feature outside shellsim's subset, such
+    /// as an unsupported dtype or option in NumPy or SciPy.
+    pub fn not_implemented_error(message: impl Into<String>) -> Self {
+        Self::new(PyErrorKind::Exception("NotImplementedError"), message)
+    }
+
     pub fn exception(kind: &'static str, message: impl Into<String>) -> Self {
         Self::new(PyErrorKind::Exception(kind), message)
     }

@@ -76,7 +76,7 @@ fn method_tobytes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     let array = Array::from_value(runtime, receiver)?;
     if array.dtype.kind() == Kind::Object {
         // NumPy returns the elements' addresses, which mean nothing outside the process.
-        return Err(PyError::unsupported(
+        return Err(PyError::not_implemented_error(
             "ndarray.tobytes of an object array is not supported",
         ));
     }
@@ -104,7 +104,7 @@ fn method_byteswap(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
     let array = Array::from_value(runtime, receiver)?;
     let inplace = args::flag(runtime, bound.value("inplace"), false)?;
     if array.dtype.kind() == Kind::Str {
-        return Err(PyError::unsupported(
+        return Err(PyError::not_implemented_error(
             "ndarray.byteswap of a str array is not supported",
         ));
     }

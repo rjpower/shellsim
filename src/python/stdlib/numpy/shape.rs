@@ -787,7 +787,7 @@ fn module_flip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 /// `a.resize(new_shape)` changes an array's storage in place, which shellsim's array model
 /// does not allow; `np.resize` returns a new array instead.
 fn method_resize(_runtime: &mut dyn PyRuntime, _receiver: PyValue, _args: CallArgs) -> PyResult {
-    Err(PyError::unsupported(
+    Err(PyError::not_implemented_error(
         "ndarray.resize is not supported: arrays cannot change size in place; use np.resize",
     ))
 }
