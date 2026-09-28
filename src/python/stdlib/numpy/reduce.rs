@@ -8,21 +8,18 @@
 //!
 //! Every reduction splits an array's axes into the ones kept in the output and the ones being
 //! combined, and reads the whole array once through [`layout::reading_order`] with the kept
-//! axes outermost and the reduced axes innermost. That lays out, for every output cell, a
-//! contiguous run of its inputs. The reduced axes within a run follow the array's memory order,
-//! the order NumPy's iterator visits them in (see [`AxisSplit::in_memory_order`]). Each run is
-//! then combined with [`reduce_numeric`], [`reduce_integer`], [`reduce_bool`], or
-//! [`reduce_object`], the same building block generic `ufunc.reduce` uses for every dtype.
+//! axes outermost and the reduced axes innermost, in each axis's own logical order regardless of
+//! strides. That lays out, for every output cell, a contiguous run of its inputs in logical
+//! order. Each run is then combined with [`reduce_numeric`], [`reduce_integer`], [`reduce_bool`],
+//! or [`reduce_object`], the same building block generic `ufunc.reduce` uses for every dtype.
 //!
 //! # Floating-point accuracy
 //!
-//! Floating-point and complex `add` reductions split each run into the lanes NumPy's iterator
-//! would hand its inner loop, sum every lane with [`ops::pairwise_sum`], and add the lane sums
-//! in order. Contiguous and strided arrays therefore match NumPy bit for bit, whether the
-//! reduced axis is the fastest-varying one (each row sums pairwise) or not (each column gains
-//! one element at a time). A reduction that casts its input, such as `sum(dtype=np.float64)`
-//! of `float32` data, does not model the 8192-element blocks NumPy casts through and may differ
-//! in the last bits. Every other reduction combines its run sequentially in the order read.
+//! Floating-point and complex `add` reductions combine each run with a plain pairwise sum
+//! ([`ops::pairwise_sum`]): recursive halving down to a small block, which keeps rounding error
+//! growing like `log n` rather than `n`. The result does not depend on the array's strides, only
+//! on the logical order of the values being summed. Every other reduction combines its run
+//! sequentially in the order read, since only `add` is associative enough to reorder safely.
 //!
 //! # Supported ufunc families
 //!
@@ -518,69 +515,16 @@ fn resolve_dtype(
     }
 }
 
-/// Elements NumPy's iterator copies at a time when a reduction's input needs buffering.
-const BUFFER_ELEMENTS: usize = 8192;
-
-/// An array's axes split into the ones a reduction keeps and the ones it combines.
+/// An array's axes split into the ones a reduction keeps and the ones it combines, both in
+/// logical (ascending) axis order.
 struct AxisSplit {
     kept_axes: Vec<usize>,
     reduce_axes: Vec<usize>,
     kept_shape: Vec<usize>,
     reduce_shape: Vec<usize>,
-    /// How many consecutive elements of one output cell's run a floating-point `add` sums
-    /// pairwise before adding them to the cell's total; see [`AxisSplit::in_memory_order`].
-    inner_run: usize,
 }
 
 impl AxisSplit {
-    /// The split for a reduction that visits `array` in memory order, as NumPy's iterator does.
-    /// The reduced axes are read from the largest stride to the smallest, so each output cell
-    /// sees its elements in the order NumPy adds them. The order also fixes how NumPy groups a
-    /// floating-point sum. When the fastest-varying axis is kept, every cell gains one element
-    /// at a time. Otherwise the iterator hands its inner loop a run over the fastest reduced
-    /// axes: the whole run when those axes form one contiguous block, and otherwise as many
-    /// whole contiguous rows as fit in its 8192-element buffer.
-    fn in_memory_order(array: &Array, axes: &Axes) -> Self {
-        let (shape, strides) = (array.shape(), array.strides());
-        let order = layout::iteration_axes(&[strides.to_vec()], shape);
-        let mut split = Self::new(shape, axes);
-        split.reduce_axes = order
-            .iter()
-            .copied()
-            .filter(|axis| split.reduce_axes.contains(axis))
-            .collect();
-        split.reduce_shape = split.reduce_axes.iter().map(|&axis| shape[axis]).collect();
-        let mut fastest = order.iter().rev().copied().filter(|&axis| shape[axis] > 1);
-        let Some(innermost) = fastest.next() else {
-            return split;
-        };
-        if !axes.contains(innermost) {
-            return split;
-        }
-        let (mut run, mut row, mut inner, mut contiguous) =
-            (shape[innermost], shape[innermost], innermost, true);
-        for axis in fastest.take_while(|&axis| axes.contains(axis)) {
-            let adjacent = isize::try_from(shape[inner])
-                .ok()
-                .and_then(|length| strides[inner].checked_mul(length));
-            if contiguous && adjacent == Some(strides[axis]) {
-                row *= shape[axis];
-                inner = axis;
-            } else {
-                contiguous = false;
-            }
-            run *= shape[axis];
-        }
-        split.inner_run = if contiguous {
-            run
-        } else {
-            run.min((BUFFER_ELEMENTS / row).max(1) * row)
-        };
-        split
-    }
-
-    /// The split with both kept and reduced axes in logical order, for callers that report
-    /// positions within a cell's run, such as `argmax`.
     fn new(shape: &[usize], axes: &Axes) -> Self {
         let ndim = shape.len();
         let kept_axes = (0..ndim)
@@ -596,7 +540,6 @@ impl AxisSplit {
             reduce_axes,
             kept_shape,
             reduce_shape,
-            inner_run: 1,
         }
     }
 
@@ -751,7 +694,7 @@ fn check_power_exponent<T: Numeric>(op: NumericOp, value: T) -> PyResult<()> {
 }
 
 /// Combine every output cell's run of `T` (see [`AxisSplit`]) with `op`. `Add` sums pairwise
-/// through [`ops::Numeric::add_lane`]; every other operator folds sequentially in the order
+/// through [`ops::Numeric::pairwise_add`]; every other operator folds sequentially in the order
 /// read. An operator without an identity (everything but `Add`/`Multiply`) needs `initial` or a
 /// non-empty run.
 fn reduce_numeric<T: Numeric + Element>(
@@ -772,10 +715,7 @@ fn reduce_numeric<T: Numeric + Element>(
     for bucket in 0..kept_count {
         let run = window(values, mask, bucket, reduce_count, &mut storage);
         let result = if op == NumericOp::Add {
-            run.chunks(split.inner_run.max(1))
-                .fold(seed.unwrap_or_else(T::zero), |total, lane| {
-                    total.add_lane(lane, &mut flags)
-                })
+            seed.unwrap_or_else(T::zero).pairwise_add(run, &mut flags)
         } else {
             match seed {
                 Some(seed) => run.iter().try_fold(seed, |acc, &value| {
@@ -1030,8 +970,7 @@ pub(in crate::python) fn reduce_call(
 ) -> PyResult<PyValue> {
     let op = classify(ufunc)?;
     let dtype = resolve_dtype(ufunc, op, array.dtype, dtype)?;
-    // The input's own strides decide the order, as they do before NumPy casts it.
-    let split = AxisSplit::in_memory_order(&array, &axes);
+    let split = AxisSplit::new(array.shape(), &axes);
     let array = if array.dtype == dtype {
         array
     } else {

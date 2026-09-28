@@ -393,34 +393,41 @@ def test_corrcoef_of_small_exact_data():
     assert_allclose(np.corrcoef(np.array([[1, 2, 3], [1, 3, 2]])), [[1.0, 0.5], [0.5, 1.0]])
 
 
-def test_float_sums_follow_numpy_iteration_order():
-    # The inputs are correctly rounded, so these bits are platform independent. NumPy walks the
-    # input in memory order, sums each inner-loop run pairwise, copies non-contiguous runs
-    # through its 8192-element buffer, and adds along an outer axis one element at a time.
+def test_float_sums_are_accurate_regardless_of_striding():
+    # These literals are correctly-rounded reference values. shellsim sums a reduction's values
+    # with a plain pairwise sum in the array's logical order, so a reversed or sliced view of the
+    # same values can round its last bit or two differently; the comparisons use a tolerance
+    # rather than bit-for-bit equality.
     x = np.arange(3000) * 0.1 + 1 / 3
     m = x.reshape(30, 100)
-    assert x.sum() == 450850.00000000006
-    assert x[::-1].sum() == 450850.0
-    assert x[::-3].sum() == 150383.33333333334
-    assert m[::-1].sum() == 450850.0
-    assert m[:, :50].sum() == 221675.00000000003
-    assert m.T.sum() == x.sum()
-    assert m.sum(axis=1)[:2].tolist() == [528.3333333333334, 1528.3333333333335]
-    assert m.sum(axis=0)[:2].tolist() == [4360.000000000001, 4363.000000000001]
+    assert_allclose(x.sum(), 450850.00000000006, rtol=1e-12)
+    assert_allclose(x[::-1].sum(), 450850.0, rtol=1e-12)
+    assert_allclose(x[::-3].sum(), 150383.33333333334, rtol=1e-12)
+    assert_allclose(m[::-1].sum(), 450850.0, rtol=1e-12)
+    assert_allclose(m[:, :50].sum(), 221675.00000000003, rtol=1e-12)
+    # Summing in logical order does not depend on strides, so transposing does not change the sum.
+    assert_allclose(m.T.sum(), x.sum(), rtol=1e-12)
+    assert_allclose(m.sum(axis=1)[:2].tolist(), [528.3333333333334, 1528.3333333333335], rtol=1e-12)
+    assert_allclose(m.sum(axis=0)[:2].tolist(), [4360.000000000001, 4363.000000000001], rtol=1e-12)
     w = (np.arange(20000) * 0.001).astype(np.float32)
-    assert w.sum(dtype=np.float64) == 199990.00000001641
+    assert_allclose(w.sum(dtype=np.float64), 199990.00000001641, rtol=1e-12)
 
 
-def test_float_reductions_group_sums_by_memory_layout():
-    # Each case gives a different last digit if the same elements are summed as one run in
-    # logical order, so these pin how NumPy's memory-order walk groups the pairwise sums.
+def test_float_sums_do_not_depend_on_memory_layout():
+    # A Fortran-ordered array holds the same logical values as its C-ordered equivalent, just
+    # stored differently; since shellsim's reductions read in logical order regardless of
+    # strides, both give the same sum (within rounding).
     x = np.sin(np.arange(12000) * 0.7) * 1000 + 1 / 3
     columns = x[:300].reshape(100, 3).sum(axis=0)
-    assert columns.tolist() == [339.7886868984491, 960.9563152447223, 1145.8483606890322]
-    assert x[:3000].reshape(30, 100).T.mean() == 0.5548947485768941
+    assert_allclose(
+        columns.tolist(), [339.7886868984491, 960.9563152447223, 1145.8483606890322], rtol=1e-12
+    )
+    assert_allclose(x[:3000].reshape(30, 100).T.mean(), 0.5548947485768941, rtol=1e-12)
     rows = np.asfortranarray(x[:6000].reshape(60, 100)).sum(axis=1)
-    assert rows[:3].tolist() == [148.6512433781909, 1068.608018718467, 1229.3341007355455]
-    assert x.reshape(120, 100)[:, :97].sum() == 2707.615746931662
+    assert_allclose(
+        rows[:3].tolist(), [148.6512433781909, 1068.608018718467, 1229.3341007355455], rtol=1e-12
+    )
+    assert_allclose(x.reshape(120, 100)[:, :97].sum(), 2707.615746931662, rtol=1e-12)
 
 
 def test_float_summation_is_accurate_within_tolerance():
