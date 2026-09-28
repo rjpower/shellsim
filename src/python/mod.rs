@@ -1643,7 +1643,7 @@ mod tests {
 
     #[test]
     fn unsupported_python_fails_loudly() {
-        let (status, _, err) = run("print(eval('1'))");
+        let (status, _, err) = run("breakpoint()");
         assert_eq!(status, 2);
         assert!(err.contains("unsupported"));
     }

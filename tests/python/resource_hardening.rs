@@ -514,8 +514,10 @@ fn numpy_fft_charges_transform_work_before_running() {
         "{}",
         String::from_utf8_lossy(&stderr)
     );
-    // 64 transforms of 4096 points cost 64 * 24 * 4096 units in pocketfft's model, which the
-    // call charges before transforming anything.
+    // `numpy.fft` is frozen Python built from ordinary vectorized NumPy calls (moveaxis, take,
+    // reshape, exp, ...), each already metered per element by the native ufunc/array machinery
+    // they go through; a 64x4096 batch's log2(4096) = 12 butterfly stages charge for tens of
+    // millions of complex-array elements well before the transform finishes.
     let (status, stdout, stderr, usage) = run_with_limits(
         "import numpy as np\na = np.zeros((64, 4096))\nprint('built')\nnp.fft.fft(a)",
         limits,

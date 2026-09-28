@@ -1,16 +1,16 @@
 """shellsim's ``scipy.interpolate``: one-dimensional interpolation.
 
-Implemented: ``interp1d`` (every kind, including spline orders above 3), the piecewise
-polynomial ``PPoly``, and the cubic families built on it: ``CubicHermiteSpline``,
-``CubicSpline`` (not-a-knot, natural, clamped, periodic and explicit derivative end
-conditions) and ``PchipInterpolator``/``pchip_interpolate``. Everything is composed from NumPy
-array operations; the only linear solves are banded ones through ``scipy.linalg.solve_banded``,
-so building a spline costs time linear in the number of points.
+Implemented: ``interp1d`` (kinds up to cubic), the piecewise polynomial ``PPoly``, and the
+cubic families built on it: ``CubicHermiteSpline``, ``CubicSpline`` (not-a-knot, natural,
+clamped, periodic and explicit derivative end conditions) and
+``PchipInterpolator``/``pchip``/``pchip_interpolate``. Everything is composed from NumPy array
+operations; the only linear solves are banded ones through ``scipy.linalg.solve_banded``, so
+building a spline costs time linear in the number of points.
 
-Results agree with SciPy to rounding. ``interp1d``'s linear kind reproduces SciPy bit for bit;
-the spline constructions solve the same systems but may round differently in the last bits.
-B-spline objects, multivariate and scattered-data interpolation, smoothing splines and the
-FITPACK wrappers are not provided.
+Results agree with SciPy within a small tolerance; they are not bit-for-bit identical, since the
+banded solves and running sums can round differently in the last bits. B-spline objects above
+cubic order, multivariate and scattered-data interpolation, smoothing splines and the FITPACK
+wrappers are not provided.
 """
 
 import math
@@ -29,10 +29,6 @@ __all__ = [
     "pchip",
     "pchip_interpolate",
 ]
-
-
-def _unsupported_method(name):
-    raise NotImplementedError(f"{name} is not supported by shellsim's SciPy")
 
 
 def _float_or_complex(a):
@@ -195,23 +191,6 @@ class PPoly:
         else:
             total = _integral(pieces, self.x, a, b)
         return np.asarray(sign * total)
-
-    def roots(self, discontinuity=True, extrapolate=None):
-        _unsupported_method("PPoly.roots")
-
-    def solve(self, y=0.0, discontinuity=True, extrapolate=None):
-        _unsupported_method("PPoly.solve")
-
-    def extend(self, c, x):
-        _unsupported_method("PPoly.extend")
-
-    @classmethod
-    def from_spline(cls, tck, extrapolate=None):
-        _unsupported_method("PPoly.from_spline")
-
-    @classmethod
-    def from_bernstein_basis(cls, bp, extrapolate=None):
-        _unsupported_method("PPoly.from_bernstein_basis")
 
 
 def _extrapolate_mode(extrapolate):
@@ -617,14 +596,14 @@ class interp1d:
     """Interpolation of a 1-D function sampled at `x`, along `axis` of `y`.
 
     `kind` is ``"linear"``, ``"nearest"`` (ties go down), ``"nearest-up"`` (ties go up),
-    ``"previous"``, ``"next"``, or a spline order given by name (``"zero"``, ``"slinear"``,
-    ``"quadratic"``, ``"cubic"``) or as an integer. Spline kinds interpolate with a B-spline
-    of that degree whose knots are the interior data points (odd degrees) or their midpoints
-    (even degrees), so ``"cubic"`` is the not-a-knot cubic spline.
+    ``"previous"``, ``"next"``, or a spline order up to cubic given by name (``"zero"``,
+    ``"slinear"``, ``"quadratic"``, ``"cubic"``) or as an integer from 0 to 3. Spline kinds
+    interpolate with a B-spline of that degree whose knots are the interior data points (odd
+    degrees) or their midpoints (even degrees), so ``"cubic"`` is the not-a-knot cubic spline.
 
     Points outside ``[x[0], x[-1]]`` raise ``ValueError`` when `bounds_error` is true (the
-    default unless ``fill_value="extrapolate"``). Otherwise they take `fill_value`: one
-    array broadcast to the value shape, a ``(below, above)`` pair, or ``"extrapolate"`` to
+    default unless ``fill_value="extrapolate"``). Otherwise they take `fill_value`: a scalar
+    or array broadcast to the value shape and used on both sides, or ``"extrapolate"`` to
     extend the end pieces.
     """
 
@@ -661,26 +640,20 @@ class interp1d:
             self.bounds_error = False
             self.fill_value = fill_value
             return
+        if isinstance(fill_value, tuple):
+            raise NotImplementedError(
+                "fill_value=(below, above) is not supported by shellsim's SciPy; pass one "
+                "value used on both sides, or 'extrapolate'."
+            )
         self.bounds_error = True if bounds_error is None else bounds_error
         target = self._values.shape[1:] or (1,)
-        if isinstance(fill_value, tuple) and len(fill_value) == 2:
-            below, above = np.asarray(fill_value[0]), np.asarray(fill_value[1])
-            for name, fill in (("below", below), ("above", above)):
-                if not _broadcastable(fill.shape, target):
-                    raise ValueError(
-                        f"fill_value ({name}) argument must be able to broadcast up to shape "
-                        f"{target} but had shape {fill.shape}"
-                    )
-            self.fill_value = fill_value
-        else:
-            below = above = np.asarray(fill_value)
-            if not _broadcastable(below.shape, target):
-                raise ValueError(
-                    f"fill_value argument must be able to broadcast up to shape {target} but "
-                    f"had shape {below.shape}"
-                )
-            self.fill_value = below
-        self._fill_below, self._fill_above = below, above
+        fill = np.asarray(fill_value)
+        if not _broadcastable(fill.shape, target):
+            raise ValueError(
+                f"fill_value argument must be able to broadcast up to shape {target} but had "
+                f"shape {fill.shape}"
+            )
+        self.fill_value = fill
 
     def _prepare_spline(self):
         order = self._order
@@ -717,8 +690,7 @@ class interp1d:
                     f"A value ({points[np.argmax(above)]}) in x_new is above the "
                     f"interpolation range's maximum value ({self.x[-1]})."
                 )
-            values[below] = self._fill_below
-            values[above] = self._fill_above
+            values[below | above] = self.fill_value
         values = values.reshape(x.shape + self._values.shape[1:])
         return _place_points(values, x.ndim, self.axis)
 
@@ -757,6 +729,11 @@ def _spline_order(kind):
     order = operator.index(kind)
     if order < 0:
         raise ValueError("Expect non-negative k.")
+    if order > 3:
+        raise NotImplementedError(
+            f"spline order {order} is unsupported: shellsim's SciPy supports interp1d kinds up "
+            "to cubic (order 3)."
+        )
     return order
 
 

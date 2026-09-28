@@ -1,9 +1,10 @@
 # Portable SciPy semantics. Expectations checked against SciPy 1.18.1 and NumPy 2.5.3 on
 # CPython 3.14.4.
-# Scope: scipy.spatial.distance vector metrics, cdist, pdist and the condensed-matrix helpers.
-# cdist and pdist sum left to right as SciPy's compiled loops do, so the sums below agree bit
-# for bit; cosine, correlation, seuclidean and mahalanobis can differ from SciPy's compiled
-# loops in the last bit and are compared with a tolerance.
+# Scope: scipy.spatial.distance vector metrics, cdist, pdist and squareform. cdist and pdist sum
+# left to right as SciPy's compiled loops do, so the sums below agree bit for bit; cosine,
+# correlation, seuclidean and mahalanobis can differ from SciPy's compiled loops in the last bit
+# and are compared with a tolerance. shellsim-only restrictions, such as rejecting metric
+# aliases, live in tests/python/scipy.rs since real SciPy accepts them.
 
 import warnings
 
@@ -11,8 +12,6 @@ import numpy as np
 import pytest
 from numpy.testing import assert_allclose, assert_array_equal
 from scipy.spatial import distance
-
-import scipy.spatial
 
 U = [1.0, 2.0, 5.0]
 V = [4.0, 0.0, -1.0]
@@ -145,10 +144,8 @@ def test_pairwise_distances_agree_with_the_vector_functions():
 def test_metric_names_callables_and_out():
     X = np.array([[0.0, 0.0], [3.0, 4.0], [1.0, 1.0]])
     Y = np.array([[1.0, 0.0], [0.0, 2.0]])
-    for alias in ["euclid", "EU", "e", "test_euclidean"]:
-        assert_array_equal(distance.cdist(X, Y, alias), distance.cdist(X, Y))
-    assert_array_equal(distance.cdist(X, Y, "co"), distance.cdist(X, Y, "correlation"))
-    assert_array_equal(distance.pdist(X, "matching"), distance.pdist(X, "hamming"))
+    # Metric names are case-insensitive, but shorthand aliases are not accepted.
+    assert_array_equal(distance.cdist(X, Y, "EUCLIDEAN"), distance.cdist(X, Y, "euclidean"))
     assert_array_equal(
         distance.cdist(X, Y, lambda a, b: a.sum() - b.sum()), [[-1.0, -2.0], [6.0, 5.0], [1.0, 0.0]]
     )
@@ -217,34 +214,6 @@ def test_squareform_converts_between_condensed_and_square_forms():
 def test_squareform_errors(argument, kwargs):
     with pytest.raises(ValueError):
         distance.squareform(argument, **kwargs)
-
-
-def test_validity_checks_and_observation_counts():
-    asymmetric = np.array([[0, 1], [2, 0]])
-    assert distance.is_valid_dm(np.zeros((2, 2))) and not distance.is_valid_dm(asymmetric)
-    with pytest.raises(ValueError):
-        distance.is_valid_dm(np.array([[0, 1], [1.5, 0]]), tol=0.1, throw=True)
-    with pytest.raises(ValueError):
-        distance.is_valid_dm(np.array([[1, 1], [1, 0]]), tol=0.1, throw=True)
-    with pytest.warns(UserWarning):
-        assert not distance.is_valid_dm(asymmetric, warning=True)
-    assert distance.is_valid_y(np.zeros(3)) and not distance.is_valid_y(np.zeros(2))
-    with pytest.raises(ValueError):
-        distance.is_valid_y(np.zeros((2, 2)), throw=True)
-    assert (distance.num_obs_y([1, 2, 3]), distance.num_obs_y([1]), distance.num_obs_dm(np.zeros((3, 3)))) == (3, 2, 3)
-    with pytest.raises(ValueError):
-        distance.num_obs_y([])
-
-
-def test_deprecated_minkowski_helpers():
-    X = np.array([[0.0, 0.0], [3.0, 4.0]])
-    Y = np.array([[1.0, 0.0], [0.0, 2.0]])
-    with pytest.warns(DeprecationWarning):
-        assert_array_equal(scipy.spatial.distance_matrix(X, Y, p=1), [[1.0, 2.0], [6.0, 5.0]])
-    with pytest.warns(DeprecationWarning):
-        assert_allclose(scipy.spatial.minkowski_distance(X, Y, p=3), [1.0, 35.0 ** (1 / 3)], rtol=1e-15)
-    with pytest.warns(DeprecationWarning):
-        assert_array_equal(scipy.spatial.minkowski_distance_p(X, Y, p=3), [1.0, 35.0])
 
 
 # The first four entries of cdist(XA, XB) and pdist(XA), measured with SciPy 1.18.1.
