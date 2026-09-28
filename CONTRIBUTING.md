@@ -104,11 +104,13 @@ Use the following testing layers for new behavior:
    explicitly in `tests/python/source_suites.rs` so shellsim always runs it and CPython 3.14 checks
    it when available.
 5. Put large differential and reduced real-task inputs under `tests/python/corpus/`.
-6. Put portable NumPy semantics in a per-area `tests/python/numpy/test_*.py` pytest suite and
-   register it in `tests/python/scientific_suites.rs`. Each expectation must hold under the
-   releases pinned in `tests/python/scientific-requirements.txt`; `infra/scientific-reference.py`
-   builds that environment, runs the suites, and prints the `SHELLSIM_SCIENTIFIC_PYTHON` export
-   that makes `cargo test` repeat the check.
+6. Put portable NumPy and SciPy semantics in a per-area `tests/python/numpy/test_*.py` or
+   `tests/python/scipy/test_*.py` pytest suite and register it in
+   `tests/python/scientific_suites.rs`. Each expectation must hold under the releases pinned in
+   `tests/python/scientific-requirements.txt`: compare computed values with a tolerance, and check
+   exception and warning types rather than message text. `infra/scientific-reference.py` builds
+   that environment, runs the suites, and prints the `SHELLSIM_SCIENTIFIC_PYTHON` export that
+   makes `cargo test` repeat the check.
 7. Test malformed input, limits, and unsupported behavior as well as the success path. Compare
    compatibility surfaces with CPython or coreutils where practical.
 
