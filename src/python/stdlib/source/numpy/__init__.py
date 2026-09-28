@@ -2,13 +2,17 @@
 
 This package star-imports the native modules (arrays, dtypes, ufuncs, and the array-shaped
 areas: reductions, shape operations, sorting, products, math kernels, and raw-buffer I/O) and
-layers the parts NumPy itself writes in Python on top: error/warning types, ``errstate``,
-``finfo``/``iinfo``, index-construction helpers, shape composites (``stack``, ``split``,
-``kron``, ``block``, ...), set operations, padding, general numeric helpers, statistics, ``nan*``
-reductions, histograms, and ``vectorize``. ``_printing``, ``strings`` and ``linalg`` (owned by
-other areas of this port) import eagerly, at the end, once every name they need (from the native
-modules and the areas above) is already bound here. ``numpy.fft``,
-``numpy.random``, ``numpy.testing`` and ``numpy.lib`` load on first access through
+layers the parts NumPy itself writes in Python on top, grouped by topic rather than by NumPy's
+own private file names: ``_creation`` (index tuples, grids, and the small array constructors
+built from them), ``_shapes`` (stacking, splitting, tiling, ``kron``/``block``, ``pad``),
+``_math`` (closeness, differencing, interpolation, polynomial fitting, ``vectorize``), ``_sets``
+(``unique`` and the set operations built on it), ``_stats`` (``mean``/``var``/``std``, order
+statistics, histograms, the ``nan*`` reductions), and ``_errors`` (``errstate``/``seterr``,
+``finfo``/``iinfo``). ``_io`` holds the ``.npy``/``.npz`` format and the text readers/writers;
+only its public names (``save``, ``load``, ``savetxt``, ...) are re-exported, not the module
+itself. ``_printing`` and ``linalg`` (owned by other areas of this port) import eagerly, at the
+end, once every name they need (from the native modules and the areas above) is already bound
+here. ``numpy.fft``, ``numpy.random`` and ``numpy.testing`` load on first access through
 ``__getattr__``.
 
 ``ndarray.flags``, ``generic.flags`` and ``ndarray.flat`` are native getters that call back into
@@ -41,18 +45,12 @@ from _numpy_shape import *
 from _numpy_shape import _normalize_axis_index
 from _numpy_sort import *
 
-from numpy._arraypad import *
-from numpy._arraysetops import *
-from numpy._errstate import *
-from numpy._function_base import *
-from numpy._getlimits import *
-from numpy._histograms import *
-from numpy._index_tricks import *
-from numpy._nanfunctions import *
-from numpy._numeric import *
-from numpy._shape_base import *
-from numpy._statistics import *
-from numpy._vectorize import *
+from numpy._creation import *
+from numpy._errors import *
+from numpy._math import *
+from numpy._sets import *
+from numpy._shapes import *
+from numpy._stats import *
 from numpy.exceptions import *
 
 __version__ = "2.5.3"
@@ -294,7 +292,7 @@ class flatiter:
             self._array[unravel_index(position, shape)] = one_value
 
 
-_LAZY_SUBMODULES = ("fft", "random", "testing", "lib")
+_LAZY_SUBMODULES = ("fft", "random", "testing")
 
 
 def __getattr__(name):
@@ -308,6 +306,5 @@ def __getattr__(name):
 # level or on every call, which needs every name above already bound here.
 from numpy._printing import *
 
-import numpy.strings as strings
 import numpy.linalg as linalg
-from numpy.lib.npyio import genfromtxt, load, loadtxt, save, savetxt, savez, savez_compressed
+from numpy._io import genfromtxt, load, loadtxt, save, savetxt, savez, savez_compressed

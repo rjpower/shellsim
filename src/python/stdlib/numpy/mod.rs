@@ -38,7 +38,6 @@ mod scalar;
 mod select;
 mod shape;
 mod sort;
-mod strings;
 mod ufunc;
 mod underflow;
 
@@ -98,7 +97,6 @@ pub(in crate::python) fn native_module(name: &str) -> Option<&'static ModuleDef>
         "_numpy_random" => &random::MODULE,
         "_numpy_io" => &io::MODULE,
         "_numpy_math" => &math::MODULE,
-        "_numpy_strings" => &strings::MODULE,
         _ => return None,
     })
 }

@@ -1,5 +1,9 @@
 """`numpy.testing`: array-aware assertion helpers with NumPy's comparison rules and messages.
 
+Trimmed to the assertions shellsim programs actually rely on: `assert_allclose`,
+`assert_array_equal`, `assert_array_almost_equal`, `assert_almost_equal`, `assert_equal`,
+`assert_array_less`, `assert_raises`, and `assert_warns`.
+
 Failure messages follow NumPy's `build_err_msg` layout (a header line, an optional inline or
 multi-line `err_msg`, then ` ACTUAL: ...` / ` DESIRED: ...` lines) since the portable suite
 checks this text exactly. `assert_equal` recurses through lists, tuples, and dicts, prepending
@@ -57,11 +61,6 @@ def _scalars_equal(actual, desired):
     if isinstance(actual, (float, np.floating)) or isinstance(desired, (float, np.floating)):
         return _float_equal(float(actual), float(desired))
     return actual == desired
-
-
-def assert_(condition, msg=""):
-    if not condition:
-        raise AssertionError(msg)
 
 
 def assert_equal(actual, desired, err_msg="", verbose=True):

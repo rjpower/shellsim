@@ -578,70 +578,8 @@ except ValueError as error:
     );
 }
 
-/// Object arrays load through a restricted unpickler. A pickle that names any global other
-/// than NumPy's reconstructors and a few builtins fails before anything is imported or called.
-#[test]
-fn npy_object_pickles_resolve_only_numpy_globals() {
-    let source = r#"import io
-import numpy as np
-from numpy.lib import format
-
-def load(payload):
-    buffer = io.BytesIO()
-    format.write_array_header_1_0(buffer, {"descr": "|O", "fortran_order": False, "shape": (1,)})
-    buffer.write(payload)
-    buffer.seek(0)
-    try:
-        np.load(buffer, allow_pickle=True)
-    except Exception as error:
-        print(type(error).__name__, error)
-
-load(b"\x80\x04cos\nsystem\n\x8c\x07echo hi\x85R.")
-load(b"\x80\x04\x8c\x08builtins\x8c\x04eval\x93\x8c\x011\x85R.")
-load(b"\x80\x04cnumpy\nndarray\n)R.")
-load(b"\x80\x04]\x94(K\x01")
-buffer = io.BytesIO()
-np.save(buffer, np.array([1, "a"], dtype=object))
-buffer.seek(0)
-try:
-    np.load(buffer)
-except ValueError as error:
-    print(error)
-"#;
-    let (status, stdout, stderr) = run(source);
-    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
-    assert_eq!(
-        String::from_utf8_lossy(&stdout),
-        concat!(
-            "UnpicklingError global 'os.system' is forbidden\n",
-            "UnpicklingError global 'builtins.eval' is forbidden\n",
-            "UnpicklingError only NumPy array and scalar reconstructors may be called\n",
-            "UnpicklingError pickle data was truncated\n",
-            "Object arrays cannot be loaded when allow_pickle=False\n",
-        )
-    );
-}
-
-/// shellsim memoizes equal strings by value because short strings have no identity. CPython
-/// memoizes by identity, so NumPy writes each computed duplicate again; both files load to
-/// equal arrays.
-#[test]
-fn npy_object_pickles_write_equal_strings_once() {
-    let source = r#"import io
-import numpy as np
-values = np.empty(3, dtype=object)
-values[:] = [str(10), str(10), "10"]
-buffer = io.BytesIO()
-np.save(buffer, values)
-print(buffer.getvalue().count(b"\x8c\x0210"))
-buffer.seek(0)
-print(np.load(buffer, allow_pickle=True).tolist())
-"#;
-    let (status, stdout, stderr) = run(source);
-    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
-    assert_eq!(String::from_utf8_lossy(&stdout), "1\n['10', '10', '10']\n");
-}
-
+/// shellsim has no pickler, so `dtype=object` arrays cannot round-trip through `.npy`/`.npz` at
+/// all: both `np.save` and `np.load` reject that dtype outright, regardless of `allow_pickle`.
 #[test]
 fn numpy_file_io_frontier_fails_explicitly() {
     for (source, expected) in [
@@ -670,15 +608,30 @@ fn numpy_file_io_frontier_fails_explicitly() {
             "memory-mapped arrays are not supported by shellsim's NumPy",
         ),
         (
-            "from numpy.lib import format\nb = io.BytesIO()\nformat.write_array_header_1_0(b, {'descr': [('a', '<i4')], 'fortran_order': False, 'shape': (1,)})\nb.write(bytes(4)); b.seek(0); np.load(b)",
+            "from numpy._io import write_array_header_1_0\nb = io.BytesIO()\nwrite_array_header_1_0(b, {'descr': [('a', '<i4')], 'fortran_order': False, 'shape': (1,)})\nb.write(bytes(4)); b.seek(0); np.load(b)",
             "structured dtypes are not supported by shellsim's NumPy",
         ),
         (
-            "class Point: pass\na = np.empty(1, dtype=object); a[0] = Point(); np.save(io.BytesIO(), a)",
-            "np.save cannot pickle 'Point' array elements in shellsim",
+            "np.save(io.BytesIO(), np.empty(1, dtype=object))",
+            "dtype=object arrays cannot be saved by shellsim's NumPy",
+        ),
+        (
+            "np.save(io.BytesIO(), np.empty(1, dtype=object), allow_pickle=False)",
+            "dtype=object arrays cannot be saved by shellsim's NumPy",
         ),
     ] {
         assert_fails_with(&format!("import io\nimport numpy as np\n{source}"), expected);
+    }
+}
+
+/// `numpy.lib` and `numpy.strings` mirror no shellsim area: they are simply missing modules.
+#[test]
+fn removed_numpy_submodules_are_missing() {
+    for source in ["import numpy.lib", "import numpy.strings"] {
+        assert_fails_with(
+            &format!("import numpy as np\n{source}"),
+            "ModuleNotFoundError",
+        );
     }
 }
 
