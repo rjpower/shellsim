@@ -1,158 +1,135 @@
-"""The ``rv_continuous``/``rv_discrete`` distribution framework and its built-in distributions.
+"""Plain distribution classes for shellsim's ``scipy.stats``: six continuous distributions
+(``norm``, ``t``, ``chi2``, ``f``, ``uniform``, ``expon``) and two discrete ones (``binom``,
+``poisson``).
 
-A distribution class defines its shape in "standard form" (``loc=0``, ``scale=1`` for continuous
-distributions; ``loc=0`` for discrete ones) through a handful of private hooks: ``_pdf``/``_pmf``,
-``_cdf``, ``_ppf``, ``_stats`` (raw mean/variance/skewness/excess kurtosis), ``_entropy`` and
-``_rvs``. The base classes turn those into the public API (``pdf``, ``cdf``, ``sf``, ``ppf``,
-``isf``, their logarithms, ``stats``, ``moment``, ``entropy``, ``interval``, ``support``, ``rvs``,
-frozen distributions) and apply ``loc``/``scale``. A hook a subclass does not define falls back to
-a generic implementation derived from whichever of ``_pdf``/``_cdf``/``_ppf`` *is* defined
-(numerical differentiation, integration or bisection), mirroring SciPy's own fallbacks but with a
-single simple implementation of each instead of SciPy's layered dispatch.
+Unlike SciPy's ``rv_continuous``/``rv_discrete``, there is no public subclassing framework, no
+``inspect.signature`` shape discovery, and no ``exec``-generated argument binders: each
+distribution is a small class with named ``_pdf``/``_cdf``/``_ppf`` (or ``_pmf``) hooks taking
+its shape parameters as plain positional arguments, and a shared base class applies ``loc``
+(and, for continuous distributions, ``scale``). A wrong number of shape arguments fails through
+Python's own call mechanism (calling ``self._pdf(x, *shapes)`` with the wrong ``len(shapes)``)
+with an ordinary ``TypeError``, rather than a hand-reproduced SciPy error message.
 
-A subclass's shape parameters are read from the declared parameters of its ``_pdf``/``_pmf``
-and ``_cdf`` methods with ``inspect.signature``, as in SciPy. The public methods themselves are generated once per instance with ``exec`` so
-that shellsim's own CPython-compatible argument binding produces SciPy's argument-count and
-keyword-argument error messages, instead of this module reproducing that text by hand.
+Every hook is closed-form, built from ``scipy.special``'s incomplete gamma/beta ufuncs (which
+already broadcast like ufuncs), so there is no elementwise Python loop for the continuous side.
+The two discrete quantile functions (``binom``/``poisson`` ``ppf``/``isf``) need an integer
+search; ``_integer_search`` below runs that search vectorized, over the whole array at once with
+a bounded number of iterations, rather than looping in Python over array elements.
 """
-
-import inspect
-import math
 
 import numpy as np
 
 from scipy import special
-from scipy.special._ufuncs import _binom_cdf, _binom_isf, _binom_pmf, _binom_ppf
-from scipy._lib._util import check_random_state
 
-__all__ = [
-    "rv_continuous",
-    "rv_discrete",
-    "norm",
-    "t",
-    "chi2",
-    "f",
-    "uniform",
-    "expon",
-    "binom",
-    "poisson",
-]
+__all__ = ["norm", "t", "chi2", "f", "uniform", "expon", "binom", "poisson"]
 
 
-def _shape_tuple_literal(names):
-    if not names:
-        return "()"
-    if len(names) == 1:
-        return f"({names[0]},)"
-    return "(" + ", ".join(names) + ")"
+def _check_random_state(seed):
+    """Turn `seed` into a `numpy.random.Generator` for `rvs`, via `default_rng` (`None`, an
+    `int`, or an existing `Generator`). Kept local (rather than imported from
+    `scipy._lib._util`) since this module no longer depends on `scipy._lib`, and deliberately
+    does not touch the legacy `RandomState`/`mtrand` API."""
+    return np.random.default_rng(seed)
 
 
-def _make_binder(shape_names, leading, trailing=(), scale=True):
-    """Build a real function with the given parameter list via ``exec``.
-
-    ``leading`` are required positional names before the shape parameters (the domain variable
-    for ``pdf``/``cdf``/... , or the moment order for ``moment``); ``trailing`` are
-    ``(name, default)`` pairs for keyword-only parameters after ``loc``/``scale`` (``stats``'
-    ``moments=``). When ``scale`` is false (discrete distributions), the generated function still
-    returns a `scale` slot so callers can share code with the continuous case, but it is always
-    the literal ``1`` rather than a real parameter.
-    """
-    params = ["self", *leading, *shape_names, "loc=0"]
-    if scale:
-        params.append("scale=1")
-    if trailing:
-        params.append("*")
-        params.extend(f"{name}={default!r}" for name, default in trailing)
-    ret = [*leading, _shape_tuple_literal(shape_names), "loc", "scale" if scale else "1"]
-    ret.extend(name for name, _ in trailing)
-    source = f"def _bind({', '.join(params)}):\n    return ({', '.join(ret)})\n"
-    exec(source)
-    return _bind
+def _scalarize(value):
+    value = np.asarray(value)
+    return value[()] if value.ndim == 0 else value
 
 
-def _comb(n, k):
-    """Small integer binomial coefficient, used to expand raw moments; avoids depending on
-    whether shellsim's ``math`` module has ``math.comb``."""
-    result = 1
-    for i in range(k):
-        result = result * (n - i) // (i + 1)
-    return result
+# ------------------------------------------------------------------------------------------------
+# Student's t, chi-square and F cdf/ppf: shared with scipy.stats._tests, which needs the same
+# tail probabilities for its t-tests and chi-square tests.
+# ------------------------------------------------------------------------------------------------
 
 
-class rv_generic:
-    """Shared machinery for ``rv_continuous`` and ``rv_discrete``.
+def _t_cdf(t, df):
+    """Student's t CDF via `x = df / (df + t^2)` and the incomplete beta function
+    (Abramowitz & Stegun 26.7.1)."""
+    t = np.asarray(t, dtype=np.float64)
+    df = np.asarray(df, dtype=np.float64)
+    x = df / (df + t * t)
+    half = special.betainc(df / 2.0, 0.5, x)
+    return np.where(t >= 0.0, 1.0 - 0.5 * half, 0.5 * half)
 
-    Subclasses set ``_shape_methods`` (the private method names shape inference reads) and
-    ``_has_scale``, and implement ``_generic_method`` to return their own base class's version of
-    a hook (so shape inference can tell an override from the generic fallback), so the same code
-    here can serve both.
-    """
 
-    _has_scale = True
-    _shape_methods = ()
+def _t_ppf(p, df):
+    """Solve `_t_cdf(t, df) = p` for `t`."""
+    p = np.asarray(p, dtype=np.float64)
+    df = np.asarray(df, dtype=np.float64)
+    target = np.where(p < 0.5, 2.0 * p, 2.0 * (1.0 - p))
+    x = special.betaincinv(df / 2.0, 0.5, target)
+    magnitude = np.sqrt(df * (1.0 - x) / x)
+    return np.where(p < 0.5, -magnitude, magnitude)
 
-    def _generic_method(self, name):
-        raise NotImplementedError
 
-    def __init__(self, a=None, b=None, name=None, shapes=None, badvalue=np.nan):
-        self.a = (-np.inf if self._has_scale else 0.0) if a is None else a
-        self.b = np.inf if b is None else b
+def _chi2_cdf(x, df):
+    return special.gammainc(df / 2.0, x / 2.0)
+
+
+def _chi2_ppf(q, df):
+    return 2.0 * special.gammainccinv(df / 2.0, 1.0 - q)
+
+
+def _f_cdf(x, dfn, dfd):
+    z = dfn * x / (dfn * x + dfd)
+    return special.betainc(dfn / 2.0, dfd / 2.0, z)
+
+
+def _f_ppf(q, dfn, dfd):
+    z = special.betaincinv(dfn / 2.0, dfd / 2.0, q)
+    return dfd * z / (dfn * (1.0 - z))
+
+
+# ------------------------------------------------------------------------------------------------
+# Continuous distributions
+# ------------------------------------------------------------------------------------------------
+
+
+class _ContinuousDistribution:
+    """Shared plumbing for the six continuous distributions: applies `loc`/`scale` to a
+    subclass's standard-form `_pdf`/`_cdf`/`_ppf`/`_mean`/`_var`/`_rvs` hooks."""
+
+    def __init__(self, name, numargs=0, a=-np.inf, b=np.inf):
         self.name = name
-        self.badvalue = badvalue
-        self.shapes, shape_names = self._infer_shapes(shapes)
-        self.numargs = len(shape_names)
-        self._shape_names = shape_names
-        self._value_binder = _make_binder(shape_names, ["v"], scale=self._has_scale)
-        self._shape_binder = _make_binder(shape_names, [], scale=self._has_scale)
-        self._stats_binder = _make_binder(
-            shape_names, [], trailing=[("moments", "mv")], scale=self._has_scale
-        )
-
-    def _infer_shapes(self, explicit_shapes):
-        if explicit_shapes is not None:
-            text = explicit_shapes.strip()
-            names = [part.strip() for part in text.split(",")] if text else []
-            return (text if names else None), names
-
-        candidates = []
-        cls = type(self)
-        for method_name in self._shape_methods:
-            if getattr(cls, method_name, None) is self._generic_method(method_name):
-                continue
-            params = list(inspect.signature(getattr(self, method_name)).parameters.values())
-            if not params:
-                continue
-            names = []
-            for param in params[1:]:
-                if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-                    raise TypeError("*args are not allowed w/out explicit shapes")
-                if param.default is not inspect.Parameter.empty:
-                    raise TypeError(f"defaults are not allowed for shapes: {param.name}=...")
-                names.append(param.name)
-            candidates.append(names)
-
-        nonempty = [names for names in candidates if names]
-        if not nonempty:
-            return None, []
-        first = nonempty[0]
-        for other in nonempty[1:]:
-            if other != first:
-                raise TypeError("Shape arguments are inconsistent.")
-        return ", ".join(first), first
+        self.numargs = numargs
+        self.a = a
+        self.b = b
 
     def __call__(self, *args, **kwds):
-        return _FrozenDist(self, args, kwds)
+        return _FrozenContinuous(self, args, kwds)
 
     def __repr__(self):
-        return f"<scipy.stats._distributions.{type(self).__name__} object at {id(self):#x}>"
+        return f"<scipy.stats._distributions.{type(self).__name__} object>"
 
-    # -- Shared numeric helpers ------------------------------------------------------------
-    def _out(self, result):
-        result = np.asarray(result)
-        return result[()] if result.ndim == 0 else result
+    def _bind(self, args, kwds):
+        """Split `(shape args..., [loc[, scale]])` from `args`/`kwds`, the way SciPy's own
+        `dist.pdf(x, *shapeargs, loc=0, scale=1)` calling convention allows `loc`/`scale`
+        positionally or by keyword, but not both."""
+        n = self.numargs
+        if len(args) < n:
+            raise TypeError(f"{self.name}() missing required shape parameter(s)")
+        shapes, rest = args[:n], args[n:]
+        if len(rest) > 2:
+            raise TypeError(f"{self.name}() takes at most {n + 2} positional arguments")
+        if len(rest) >= 1:
+            if "loc" in kwds:
+                raise TypeError(f"{self.name}() got multiple values for argument 'loc'")
+            loc = rest[0]
+        else:
+            loc = kwds.pop("loc", 0.0)
+        if len(rest) >= 2:
+            if "scale" in kwds:
+                raise TypeError(f"{self.name}() got multiple values for argument 'scale'")
+            scale = rest[1]
+        else:
+            scale = kwds.pop("scale", 1.0)
+        if kwds:
+            raise TypeError(f"{self.name}() got an unexpected keyword argument {next(iter(kwds))!r}")
+        return shapes, float(loc), float(scale)
 
     def _argcheck(self, *shapes):
-        ok = True
+        ok = np.array(True)
         for shape in shapes:
             ok = ok & (np.asarray(shape, dtype=float) > 0)
         return ok
@@ -160,211 +137,35 @@ class rv_generic:
     def _valid(self, shapes, scale):
         valid = np.asarray(scale, dtype=float) > 0
         if shapes:
-            valid = valid & np.asarray(self._argcheck(*shapes))
+            valid = valid & self._argcheck(*shapes)
         return valid
 
-    def _get_support(self, *shapes):
-        return self.a, self.b
-
-    # -- Methods shared between continuous and discrete distributions ----------------------
-    def stats(self, *args, **kwds):
-        shapes, loc, scale, moments = self._stats_binder(self, *args, **kwds)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        valid = self._valid(shapes, scale)
-        mean0, var0, skew0, kurt0 = (np.asarray(v, dtype=float) for v in self._stats(*shapes))
-        results = []
-        for letter in "mvsk":
-            if letter not in moments:
-                continue
-            if letter == "m":
-                value = loc + scale * mean0
-            elif letter == "v":
-                value = scale**2 * var0
-            elif letter == "s":
-                value = skew0
-            else:
-                value = kurt0
-            results.append(self._out(np.where(valid, value, self.badvalue)))
-        return tuple(results)
-
-    def mean(self, *args, **kwds):
-        return self.stats(*args, **kwds, moments="m")[0]
-
-    def var(self, *args, **kwds):
-        return self.stats(*args, **kwds, moments="v")[0]
-
-    def std(self, *args, **kwds):
-        return np.sqrt(self.stats(*args, **kwds, moments="v")[0])
-
-    def median(self, *args, **kwds):
-        return self.ppf(0.5, *args, **kwds)
-
-    def support(self, *args, **kwds):
-        shapes, loc, scale = self._shape_binder(self, *args, **kwds)
-        a, b = self._get_support(*shapes)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        return self._out(loc + scale * a), self._out(loc + scale * b)
-
-    def interval(self, confidence, *args, **kwds):
-        alpha = (1.0 - np.asarray(confidence, dtype=float)) / 2.0
-        return self.ppf(alpha, *args, **kwds), self.ppf(1.0 - alpha, *args, **kwds)
-
-    def entropy(self, *args, **kwds):
-        shapes, loc, scale = self._shape_binder(self, *args, **kwds)
-        scale = np.asarray(scale, dtype=float)
-        valid = self._valid(shapes, scale)
-        with np.errstate(divide="ignore"):
-            h = np.asarray(self._entropy(*shapes), dtype=float) + np.log(np.abs(scale))
-        return self._out(np.where(valid, h, self.badvalue))
-
-    def moment(self, order, *args, **kwds):
-        order0, shapes, loc, scale = self._value_binder(self, order, *args, **kwds)
-        n = order0
-        if not float(n).is_integer() or not (1 <= n <= 4):
-            raise NotImplementedError(f"moments of order {n} are not supported by shellsim's SciPy")
-        n = int(n)
-        mean0, var0, skew0, kurt0 = (np.asarray(v, dtype=float) for v in self._stats(*shapes))
-        central = [np.ones_like(mean0), np.zeros_like(mean0), var0, skew0 * var0**1.5, (kurt0 + 3.0) * var0**2]
-        raw = [np.ones_like(mean0), mean0]
-        raw.append(central[2] + mean0**2)
-        raw.append(central[3] + 3 * mean0 * central[2] + mean0**3)
-        raw.append(central[4] + 4 * mean0 * central[3] + 6 * mean0**2 * central[2] + mean0**4)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        total = sum(_comb(n, k) * loc ** (n - k) * scale**k * raw[k] for k in range(n + 1))
-        valid = self._valid(shapes, scale)
-        return self._out(np.where(valid, total, self.badvalue))
-
-
-class _FrozenDist:
-    """A distribution with its shape/``loc``/``scale`` arguments fixed, as ``dist(...)`` returns.
-
-    Every call forwards to the underlying distribution with the frozen positional arguments
-    appended after whatever the caller passes (the value for ``pdf``/``cdf``/..., or nothing for
-    ``mean``/``std``/...) and the frozen keywords merged under the caller's. shellsim's object
-    model does not call ``__getattr__`` for missing instance attributes, so each forwarding
-    method is built as a real instance attribute up front instead of looked up lazily.
-    """
-
-    _METHODS = (
-        "pdf", "logpdf", "cdf", "logcdf", "sf", "logsf", "ppf", "isf",
-        "pmf", "logpmf",
-        "stats", "entropy", "mean", "var", "std", "median", "support", "interval", "moment",
-        "rvs", "nnlf", "fit", "expect",
-    )
-
-    def __init__(self, dist, args, kwds):
-        self._dist = dist
-        self._args = args
-        self._kwds = kwds
-        for name in self._METHODS:
-            method = getattr(dist, name, None)
-            if method is not None:
-                setattr(self, name, self._forward(method))
-
-    def _forward(self, method):
-        def call(*args, **kwds):
-            merged = dict(self._kwds)
-            merged.update(kwds)
-            return method(*args, *self._args, **merged)
-
-        return call
-
-
-# ----------------------------------------------------------------------------------------------
-# Continuous distributions
-# ----------------------------------------------------------------------------------------------
-
-
-class rv_continuous(rv_generic):
-    """Base class for continuous probability distributions.
-
-    Subclasses normally override ``_pdf`` and/or ``_cdf`` (and ``_ppf``, ``_stats``, ``_entropy``
-    and ``_rvs`` for exactness and performance); this class derives whichever of them is missing
-    from the ones that are present.
-    """
-
-    _has_scale = True
-    _shape_methods = ("_pdf", "_cdf")
-
-    def _generic_method(self, name):
-        return getattr(rv_continuous, name)
-
-    # -- Generic fallbacks, used when a subclass does not override the hook ----------------
-    def _pdf(self, x, *shapes):
-        dx = 1e-5
-        return (self._cdf(x + dx, *shapes) - self._cdf(x - dx, *shapes)) / (2.0 * dx)
-
-    def _cdf(self, x, *shapes):
-        def pdf_at(t):
-            return float(self._pdf(np.asarray(t), *shapes))
-
-        a = self.a if np.isfinite(self.a) else -50.0
-        results = [_simpson(pdf_at, a, float(xi)) for xi in np.atleast_1d(x)]
-        result = np.array(results).reshape(np.shape(x))
-        return result[()] if result.ndim == 0 else result
-
-    def _ppf(self, q, *shapes):
-        def cdf_at(t):
-            return float(self._cdf(np.asarray(t), *shapes))
-
-        results = [_bisect_ppf(cdf_at, float(qi), self.a, self.b) for qi in np.atleast_1d(q)]
-        result = np.array(results).reshape(np.shape(q))
-        return result[()] if result.ndim == 0 else result
-
-    def _stats(self, *shapes):
-        return np.nan, np.nan, np.nan, np.nan
-
-    def _entropy(self, *shapes):
-        def integrand(t):
-            p = float(self._pdf(np.asarray(t), *shapes))
-            return -p * math.log(p) if p > 0 else 0.0
-
-        a = self.a if np.isfinite(self.a) else -50.0
-        b = self.b if np.isfinite(self.b) else 50.0
-        return _simpson(integrand, a, b)
-
-    def _rvs(self, rng, size, *shapes):
-        u = rng.random_sample(size=size)
-        return self._ppf(np.asarray(u, dtype=float), *shapes)
-
-    # -- Public API --------------------------------------------------------------------------
     def pdf(self, x, *args, **kwds):
-        x0, shapes, loc, scale = self._value_binder(self, x, *args, **kwds)
-        x0 = np.asarray(x0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        safe_scale = np.where(scale > 0, scale, 1.0)
-        xs = (x0 - loc) / safe_scale
-        a, b = self._get_support(*shapes)
+        shapes, loc, scale = self._bind(args, kwds)
+        x = np.asarray(x, dtype=float)
+        safe_scale = scale if scale > 0 else 1.0
+        xs = (x - loc) / safe_scale
         valid = self._valid(shapes, scale)
         with np.errstate(all="ignore"):
-            inside = (xs >= a) & (xs <= b)
+            inside = (xs >= self.a) & (xs <= self.b)
             density = np.where(inside, self._pdf(xs, *shapes) / safe_scale, 0.0)
-            result = np.where(valid, density, self.badvalue)
-        return self._out(result)
+            result = np.where(valid, density, np.nan)
+        return _scalarize(result)
 
     def logpdf(self, x, *args, **kwds):
         with np.errstate(divide="ignore"):
             return np.log(self.pdf(x, *args, **kwds))
 
     def cdf(self, x, *args, **kwds):
-        x0, shapes, loc, scale = self._value_binder(self, x, *args, **kwds)
-        x0 = np.asarray(x0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        safe_scale = np.where(scale > 0, scale, 1.0)
-        xs = (x0 - loc) / safe_scale
-        a, b = self._get_support(*shapes)
+        shapes, loc, scale = self._bind(args, kwds)
+        x = np.asarray(x, dtype=float)
+        safe_scale = scale if scale > 0 else 1.0
+        xs = (x - loc) / safe_scale
         valid = self._valid(shapes, scale)
         with np.errstate(all="ignore"):
-            below = xs < a
-            above = xs > b
-            result = np.where(above, 1.0, np.where(below, 0.0, self._cdf(xs, *shapes)))
-            result = np.where(valid, result, self.badvalue)
-        return self._out(result)
+            result = np.where(xs > self.b, 1.0, np.where(xs < self.a, 0.0, self._cdf(xs, *shapes)))
+            result = np.where(valid, result, np.nan)
+        return _scalarize(result)
 
     def logcdf(self, x, *args, **kwds):
         with np.errstate(divide="ignore"):
@@ -378,88 +179,75 @@ class rv_continuous(rv_generic):
             return np.log(self.sf(x, *args, **kwds))
 
     def ppf(self, q, *args, **kwds):
-        q0, shapes, loc, scale = self._value_binder(self, q, *args, **kwds)
-        q0 = np.asarray(q0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        scale = np.asarray(scale, dtype=float)
-        a, b = self._get_support(*shapes)
-        valid = self._valid(shapes, scale) & (q0 >= 0.0) & (q0 <= 1.0)
+        shapes, loc, scale = self._bind(args, kwds)
+        q = np.asarray(q, dtype=float)
+        valid = self._valid(shapes, scale) & (q >= 0.0) & (q <= 1.0)
         with np.errstate(all="ignore"):
-            clipped = np.clip(q0, 0.0, 1.0)
-            core = np.where(q0 <= 0.0, a, np.where(q0 >= 1.0, b, self._ppf(clipped, *shapes)))
-            result = np.where(valid, loc + scale * core, self.badvalue)
-        return self._out(result)
+            clipped = np.clip(q, 0.0, 1.0)
+            core = np.where(q <= 0.0, self.a, np.where(q >= 1.0, self.b, self._ppf(clipped, *shapes)))
+            result = np.where(valid, loc + scale * core, np.nan)
+        return _scalarize(result)
 
     def isf(self, q, *args, **kwds):
         return self.ppf(1.0 - np.asarray(q, dtype=float), *args, **kwds)
 
+    def mean(self, *args, **kwds):
+        shapes, loc, scale = self._bind(args, kwds)
+        valid = self._valid(shapes, scale)
+        value = loc + scale * np.asarray(self._mean(*shapes), dtype=float)
+        return _scalarize(np.where(valid, value, np.nan))
+
+    def var(self, *args, **kwds):
+        shapes, loc, scale = self._bind(args, kwds)
+        valid = self._valid(shapes, scale)
+        value = scale**2 * np.asarray(self._var(*shapes), dtype=float)
+        return _scalarize(np.where(valid, value, np.nan))
+
+    def std(self, *args, **kwds):
+        return _scalarize(np.sqrt(np.asarray(self.var(*args, **kwds), dtype=float)))
+
+    def median(self, *args, **kwds):
+        return self.ppf(0.5, *args, **kwds)
+
+    def interval(self, confidence, *args, **kwds):
+        alpha = (1.0 - np.asarray(confidence, dtype=float)) / 2.0
+        return self.ppf(alpha, *args, **kwds), self.ppf(1.0 - alpha, *args, **kwds)
+
     def rvs(self, *args, size=None, random_state=None, **kwds):
-        loc = kwds.pop("loc", 0)
-        scale = kwds.pop("scale", 1)
-        if kwds or len(args) != self.numargs:
-            raise TypeError(f"{self.name}.rvs() got an unexpected argument")
-        rng = check_random_state(random_state)
-        raw = self._rvs(rng, size, *args)
+        shapes, loc, scale = self._bind(args, kwds)
+        rng = _check_random_state(random_state)
+        raw = self._rvs(rng, size, *shapes)
         return loc + scale * np.asarray(raw)
 
-    def nnlf(self, theta, x):
-        theta = tuple(theta)
-        shapes, loc, scale = theta[:-2], theta[-2], theta[-1]
-        if scale <= 0:
-            return np.inf
-        x = np.asarray(x, dtype=float)
-        xs = (x - loc) / scale
-        a, b = self._get_support(*shapes)
-        if np.any((xs < a) | (xs > b)):
-            return np.inf
-        with np.errstate(all="ignore"):
-            logpdf = np.log(self._pdf(xs, *shapes)) - math.log(scale)
-        return -np.sum(logpdf)
 
-    def fit(self, data, *args, **kwds):
-        # Generic fitting maximizes the likelihood numerically; only the closed-form overrides
-        # below (norm, uniform, expon) avoid needing `scipy.optimize`.
-        import scipy.optimize  # noqa: F401
+class _FrozenContinuous:
+    """A continuous distribution with its shape/`loc`/`scale` arguments fixed, as `dist(...)`
+    returns."""
 
-    def expect(self, func=None, args=(), loc=0, scale=1, lb=None, ub=None, conditional=False, **kwds):
-        # SciPy computes this by numerical integration; shellsim does not provide scipy.integrate.
-        import scipy.integrate  # noqa: F401
+    _METHODS = (
+        "pdf", "logpdf", "cdf", "logcdf", "sf", "logsf", "ppf", "isf",
+        "mean", "var", "std", "median", "interval", "rvs",
+    )
 
+    def __init__(self, dist, args, kwds):
+        self._dist = dist
+        self._args = args
+        self._kwds = kwds
+        for name in self._METHODS:
+            setattr(self, name, self._forward(getattr(dist, name)))
 
-def _simpson(func, lo, hi, n=200):
-    """A fixed-resolution composite Simpson's rule, the generic fallback's numerical integrator.
+    def _forward(self, method):
+        def call(*args, **kwds):
+            merged = dict(self._kwds)
+            merged.update(kwds)
+            return method(*args, *self._args, **merged)
 
-    Used only when a distribution does not override ``_cdf``/``_entropy``; every built-in
-    distribution below has a closed form, so this never runs during the portable test suite.
-    """
-    if hi <= lo:
-        return 0.0
-    xs = np.linspace(lo, hi, 2 * n + 1)
-    ys = np.array([func(x) for x in xs])
-    h = (hi - lo) / (2 * n)
-    return h / 3.0 * (ys[0] + ys[-1] + 4.0 * np.sum(ys[1:-1:2]) + 2.0 * np.sum(ys[2:-2:2]))
+        return call
 
 
-def _bisect_ppf(cdf_at, q, a, b):
-    """Bisect for the generic ``_ppf`` fallback, expanding an infinite bound until it brackets."""
-    lo = a if np.isfinite(a) else -1.0
-    hi = b if np.isfinite(b) else 1.0
-    while not np.isfinite(a) and cdf_at(lo) > q:
-        lo *= 2.0
-    while not np.isfinite(b) and cdf_at(hi) < q:
-        hi *= 2.0
-    for _ in range(60):
-        mid = (lo + hi) / 2.0
-        if cdf_at(mid) < q:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
-
-
-class _norm_gen(rv_continuous):
+class _Norm(_ContinuousDistribution):
     def _pdf(self, x):
-        return np.exp(-0.5 * x * x) / math.sqrt(2.0 * math.pi)
+        return np.exp(-0.5 * x * x) / np.sqrt(2.0 * np.pi)
 
     def _cdf(self, x):
         return special.ndtr(x)
@@ -467,76 +255,66 @@ class _norm_gen(rv_continuous):
     def _ppf(self, q):
         return special.ndtri(q)
 
-    def _stats(self):
-        return 0.0, 1.0, 0.0, 0.0
+    def _mean(self):
+        return 0.0
 
-    def _entropy(self):
-        return 0.5 * math.log(2.0 * math.pi * math.e)
+    def _var(self):
+        return 1.0
 
     def _rvs(self, rng, size):
         return rng.standard_normal(size=size)
 
 
-class _t_gen(rv_continuous):
+class _T(_ContinuousDistribution):
     def _pdf(self, x, df):
         return np.exp(
             -0.5 * (df + 1.0) * np.log1p(x * x / df) - 0.5 * np.log(df) - special.betaln(0.5, 0.5 * df)
         )
 
     def _cdf(self, x, df):
-        return special.stdtr(df, x)
+        return _t_cdf(x, df)
 
     def _ppf(self, q, df):
-        return special.stdtrit(df, q)
+        return _t_ppf(q, df)
 
-    def _stats(self, df):
-        mean = np.where(df > 1, 0.0, np.nan)
-        var = np.where(df > 2, df / (df - 2.0), np.where(df > 1, np.inf, np.nan))
-        skew = np.where(df > 3, 0.0, np.nan)
-        kurt = np.where(df > 4, 6.0 / (df - 4.0), np.where(df > 2, np.inf, np.nan))
-        return mean, var, skew, kurt
+    def _mean(self, df):
+        return np.where(df > 1, 0.0, np.nan)
 
-    def _entropy(self, df):
-        half = 0.5 * df
-        return (
-            (df + 1.0) / 2.0 * (special.psi((df + 1.0) / 2.0) - special.psi(half))
-            + 0.5 * math.log(df)
-            + special.betaln(half, 0.5)
-        )
+    def _var(self, df):
+        return np.where(df > 2, df / (df - 2.0), np.where(df > 1, np.inf, np.nan))
 
     def _rvs(self, rng, size, df):
         return rng.standard_t(df, size=size)
 
 
-class _chi2_gen(rv_continuous):
+class _Chi2(_ContinuousDistribution):
     def _pdf(self, x, df):
         with np.errstate(divide="ignore", invalid="ignore"):
-            logpdf = (0.5 * df - 1.0) * np.log(x) - 0.5 * x - 0.5 * df * math.log(2.0) - special.gammaln(0.5 * df)
+            logpdf = (0.5 * df - 1.0) * np.log(x) - 0.5 * x - 0.5 * df * np.log(2.0) - special.gammaln(0.5 * df)
         return np.exp(logpdf)
 
     def _cdf(self, x, df):
-        return special.chdtr(df, x)
+        return _chi2_cdf(x, df)
 
     def _ppf(self, q, df):
-        return special.chdtri(df, 1.0 - q)
+        return _chi2_ppf(q, df)
 
-    def _stats(self, df):
-        return df, 2.0 * df, np.sqrt(8.0 / df), 12.0 / df
+    def _mean(self, df):
+        return df
 
-    def _entropy(self, df):
-        half = 0.5 * df
-        return half + math.log(2.0) + special.gammaln(half) + (1.0 - half) * special.psi(half)
+    def _var(self, df):
+        return 2.0 * df
 
     def _rvs(self, rng, size, df):
         return rng.chisquare(df, size=size)
 
 
-class _f_gen(rv_continuous):
+class _F(_ContinuousDistribution):
     def _pdf(self, x, dfn, dfd):
         with np.errstate(divide="ignore", invalid="ignore"):
             logpdf = (
-                0.5 * dfn * math.log(dfn)
-                + 0.5 * dfd * math.log(dfd)
+                0.5 * dfn * np.log(dfn)
+                + 0.5 * dfd * np.log(dfd)
                 + (0.5 * dfn - 1.0) * np.log(x)
                 - 0.5 * (dfn + dfd) * np.log(dfd + dfn * x)
                 - special.betaln(0.5 * dfn, 0.5 * dfd)
@@ -544,47 +322,26 @@ class _f_gen(rv_continuous):
         return np.exp(logpdf)
 
     def _cdf(self, x, dfn, dfd):
-        return special.fdtr(dfn, dfd, x)
+        return _f_cdf(x, dfn, dfd)
 
     def _ppf(self, q, dfn, dfd):
-        # Unlike `chdtri`, `fdtri` inverts `fdtr` (the lower CDF) directly, not `fdtrc`.
-        return special.fdtri(dfn, dfd, q)
+        return _f_ppf(q, dfn, dfd)
 
-    def _stats(self, dfn, dfd):
-        mean = np.where(dfd > 2, dfd / (dfd - 2.0), np.nan)
-        var = np.where(
+    def _mean(self, dfn, dfd):
+        return np.where(dfd > 2, dfd / (dfd - 2.0), np.nan)
+
+    def _var(self, dfn, dfd):
+        return np.where(
             dfd > 4,
             2.0 * dfd**2 * (dfn + dfd - 2.0) / (dfn * (dfd - 2.0) ** 2 * (dfd - 4.0)),
             np.nan,
-        )
-        skew = np.where(
-            dfd > 6,
-            (2.0 * dfn + dfd - 2.0) * np.sqrt(8.0 * (dfd - 4.0)) / ((dfd - 6.0) * np.sqrt(dfn * (dfn + dfd - 2.0))),
-            np.nan,
-        )
-        kurt = np.where(
-            dfd > 8,
-            12.0
-            * (dfn * (5.0 * dfd - 22.0) * (dfn + dfd - 2.0) + (dfd - 4.0) * (dfd - 2.0) ** 2)
-            / (dfn * (dfd - 6.0) * (dfd - 8.0) * (dfn + dfd - 2.0)),
-            np.nan,
-        )
-        return mean, var, skew, kurt
-
-    def _entropy(self, dfn, dfd):
-        return (
-            math.log(dfd / dfn)
-            + special.betaln(0.5 * dfn, 0.5 * dfd)
-            + (1.0 - 0.5 * dfn) * special.psi(0.5 * dfn)
-            - (1.0 + 0.5 * dfd) * special.psi(0.5 * dfd)
-            + 0.5 * (dfn + dfd) * special.psi(0.5 * (dfn + dfd))
         )
 
     def _rvs(self, rng, size, dfn, dfd):
         return rng.f(dfn, dfd, size=size)
 
 
-class _uniform_gen(rv_continuous):
+class _Uniform(_ContinuousDistribution):
     def _pdf(self, x):
         return np.ones_like(x)
 
@@ -594,23 +351,17 @@ class _uniform_gen(rv_continuous):
     def _ppf(self, q):
         return q
 
-    def _stats(self):
-        return 0.5, 1.0 / 12.0, 0.0, -1.2
+    def _mean(self):
+        return 0.5
 
-    def _entropy(self):
-        return 0.0
+    def _var(self):
+        return 1.0 / 12.0
 
     def _rvs(self, rng, size):
-        return rng.random_sample(size=size)
-
-    def fit(self, data, *, floc=None, fscale=None):
-        data = np.asarray(data, dtype=float)
-        loc = float(np.min(data)) if floc is None else float(floc)
-        scale = (float(np.max(data)) - loc) if fscale is None else float(fscale)
-        return loc, scale
+        return rng.random(size=size)
 
 
-class _expon_gen(rv_continuous):
+class _Expon(_ContinuousDistribution):
     def _pdf(self, x):
         return np.exp(-x)
 
@@ -620,158 +371,136 @@ class _expon_gen(rv_continuous):
     def _ppf(self, q):
         return -np.log1p(-q)
 
-    def _stats(self):
-        return 1.0, 1.0, 2.0, 6.0
+    def _mean(self):
+        return 1.0
 
-    def _entropy(self):
+    def _var(self):
         return 1.0
 
     def _rvs(self, rng, size):
         return rng.standard_exponential(size=size)
 
-    def fit(self, data, *, floc=None, fscale=None):
-        data = np.asarray(data, dtype=float)
-        loc = float(np.min(data)) if floc is None else float(floc)
-        scale = (float(np.mean(data)) - loc) if fscale is None else float(fscale)
-        return loc, scale
+
+norm = _Norm("norm")
+t = _T("t", numargs=1)
+chi2 = _Chi2("chi2", numargs=1, a=0.0)
+f = _F("f", numargs=2, a=0.0)
+uniform = _Uniform("uniform", a=0.0, b=1.0)
+expon = _Expon("expon", a=0.0)
 
 
-class _norm_gen_fit(_norm_gen):
-    def fit(self, data, *, floc=None, fscale=None):
-        data = np.asarray(data, dtype=float)
-        loc = float(np.mean(data)) if floc is None else float(floc)
-        if fscale is None:
-            scale = float(np.sqrt(np.mean((data - loc) ** 2)))
-        else:
-            scale = float(fscale)
-        return loc, scale
-
-
-
-norm = _norm_gen_fit(name="norm")
-t = _t_gen(name="t")
-chi2 = _chi2_gen(a=0.0, name="chi2")
-f = _f_gen(a=0.0, name="f")
-uniform = _uniform_gen(a=0.0, b=1.0, name="uniform")
-expon = _expon_gen(a=0.0, name="expon")
-
-
-# ----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 # Discrete distributions
-# ----------------------------------------------------------------------------------------------
+# ------------------------------------------------------------------------------------------------
 
 
-class rv_discrete(rv_generic):
-    """Base class for discrete probability distributions (``loc`` only, no ``scale``)."""
+def _integer_search(cdf, q, lo, hi):
+    """Smallest integer `k` in `[lo, hi]` with `cdf(k) >= q`, by bisection. `cdf` is
+    non-decreasing in `k` (a discrete CDF), so ordinary bisection applies; this runs it vectorized
+    over the whole array at once (a bounded number of iterations, each a single call to `cdf`
+    over every element), rather than searching one array element at a time in a Python loop.
+    """
+    lo, hi, q = np.broadcast_arrays(np.asarray(lo, dtype=np.float64), np.asarray(hi, dtype=np.float64), q)
+    lo = lo.copy()
+    hi = hi.copy()
+    # A generous fixed iteration count keeps this simple; the CPU budget is not a design
+    # constraint, and 64 doublings of the bisection interval is far more than any of `hi`'s
+    # practical magnitudes need.
+    for _ in range(64):
+        active = lo < hi
+        if not np.any(active):
+            break
+        mid = np.floor((lo + hi) / 2.0)
+        below = active & (cdf(mid) < q)
+        hi = np.where(active & ~below, mid, hi)
+        lo = np.where(below, mid + 1.0, lo)
+    return lo
 
-    _has_scale = False
-    _shape_methods = ("_pmf", "_cdf")
 
-    def _generic_method(self, name):
-        return getattr(rv_discrete, name)
+def _poisson_upper_bound(mu, q):
+    """A `k` with `poisson(mu).cdf(k) >= q`, generous enough to bracket `_integer_search`: a
+    normal-approximation guess, doubled (vectorized, over the whole array) until it holds."""
+    mu = np.asarray(mu, dtype=np.float64)
+    q = np.asarray(q, dtype=np.float64)
+    hi = np.maximum(np.ceil(mu + 10.0 * np.sqrt(mu + 1.0) + 10.0), 1.0)
+    for _ in range(64):
+        insufficient = special.gammaincc(hi + 1.0, mu) < q
+        if not np.any(insufficient):
+            break
+        hi = np.where(insufficient, hi * 2.0, hi)
+    return hi
 
-    def __init__(self, a=0, b=np.inf, name=None, shapes=None, badvalue=np.nan, values=None):
-        if values is not None:
-            raise NotImplementedError("rv_discrete(values=...) is not supported by shellsim's SciPy")
-        super().__init__(a=a, b=b, name=name, shapes=shapes, badvalue=badvalue)
 
-    def _pmf(self, k, *shapes):
-        return self._cdf(k, *shapes) - self._cdf(k - 1.0, *shapes)
+class _DiscreteDistribution:
+    """Shared plumbing for the two discrete distributions (`loc` only, no `scale`)."""
 
-    def _cdf(self, k, *shapes):
-        a, _ = self._get_support(*shapes)
-        low = int(a) if np.isfinite(a) else 0
+    def __init__(self, name, numargs, a=0.0, b=np.inf):
+        self.name = name
+        self.numargs = numargs
+        self._a = a
+        self._b = b
 
-        def at(ki):
-            ki = int(ki)
-            return float(sum(float(self._pmf(np.asarray(float(j)), *shapes)) for j in range(low, ki + 1)))
+    def __call__(self, *args, **kwds):
+        return _FrozenDiscrete(self, args, kwds)
 
-        results = [at(ki) for ki in np.atleast_1d(k)]
-        result = np.array(results).reshape(np.shape(k))
-        return result[()] if result.ndim == 0 else result
+    def __repr__(self):
+        return f"<scipy.stats._distributions.{type(self).__name__} object>"
 
-    def _ppf(self, q, *shapes):
-        a, b = self._get_support(*shapes)
+    def _get_support(self, *shapes):
+        return self._a, self._b
 
-        def search(qi):
-            lo = int(a) if np.isfinite(a) else 0
-            k = lo
-            step = 1
-            while float(self._cdf(np.asarray(float(k)), *shapes)) < qi:
-                k += step
-                step *= 2
-                if np.isfinite(b) and k >= b:
-                    return float(b)
-            hi = k
-            lo2 = max(lo, k - step)
-            while lo2 < hi:
-                mid = (lo2 + hi) // 2
-                if float(self._cdf(np.asarray(float(mid)), *shapes)) >= qi:
-                    hi = mid
-                else:
-                    lo2 = mid + 1
-            return float(lo2)
+    def _bind(self, args, kwds):
+        n = self.numargs
+        if len(args) < n:
+            raise TypeError(f"{self.name}() missing required shape parameter(s)")
+        shapes, rest = args[:n], args[n:]
+        if len(rest) > 1:
+            raise TypeError(f"{self.name}() takes at most {n + 1} positional arguments")
+        if rest:
+            if "loc" in kwds:
+                raise TypeError(f"{self.name}() got multiple values for argument 'loc'")
+            loc = rest[0]
+        else:
+            loc = kwds.pop("loc", 0.0)
+        if kwds:
+            raise TypeError(f"{self.name}() got an unexpected keyword argument {next(iter(kwds))!r}")
+        return shapes, float(loc)
 
-        results = [search(float(qi)) for qi in np.atleast_1d(q)]
-        result = np.array(results).reshape(np.shape(q))
-        return result[()] if result.ndim == 0 else result
+    def _argcheck(self, *shapes):
+        ok = np.array(True)
+        for shape in shapes:
+            ok = ok & (np.asarray(shape, dtype=float) > 0)
+        return ok
 
-    def _stats(self, *shapes):
-        return np.nan, np.nan, np.nan, np.nan
-
-    def _entropy(self, *shapes):
-        a, b = self._get_support(*shapes)
-        low = int(a) if np.isfinite(a) else 0
-        high = int(b) if np.isfinite(b) else low + 100000
-        total = 0.0
-        zero_run = 0
-        k = low
-        while k <= high:
-            p = float(self._pmf(np.asarray(float(k)), *shapes))
-            if p > 0.0:
-                total -= p * math.log(p)
-                zero_run = 0
-            else:
-                zero_run += 1
-                if zero_run > 10 and k > low:
-                    break
-            k += 1
-        return total
-
-    def _rvs(self, rng, size, *shapes):
-        u = rng.random_sample(size=size)
-        return self._ppf(np.asarray(u, dtype=float), *shapes)
+    def _valid(self, shapes):
+        return self._argcheck(*shapes) if shapes else np.array(True)
 
     def pmf(self, k, *args, **kwds):
-        k0, shapes, loc, _scale = self._value_binder(self, k, *args, **kwds)
-        k0 = np.asarray(k0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        ks = np.floor(k0 - loc)
+        shapes, loc = self._bind(args, kwds)
         a, b = self._get_support(*shapes)
-        valid = self._valid(shapes, np.array(1.0))
+        k = np.asarray(k, dtype=float)
+        ks = k - loc
+        valid = self._valid(shapes)
         with np.errstate(all="ignore"):
-            inside = (ks >= a) & (ks <= b) & (k0 - loc == ks)
+            inside = (ks >= a) & (ks <= b) & (ks == np.floor(ks))
             result = np.where(inside, self._pmf(ks, *shapes), 0.0)
-            result = np.where(valid, result, self.badvalue)
-        return self._out(result)
+            result = np.where(valid, result, np.nan)
+        return _scalarize(result)
 
     def logpmf(self, k, *args, **kwds):
         with np.errstate(divide="ignore"):
             return np.log(self.pmf(k, *args, **kwds))
 
     def cdf(self, k, *args, **kwds):
-        k0, shapes, loc, _scale = self._value_binder(self, k, *args, **kwds)
-        k0 = np.asarray(k0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        ks = np.floor(k0 - loc)
+        shapes, loc = self._bind(args, kwds)
         a, b = self._get_support(*shapes)
-        valid = self._valid(shapes, np.array(1.0))
+        k = np.asarray(k, dtype=float)
+        ks = np.floor(k - loc)
+        valid = self._valid(shapes)
         with np.errstate(all="ignore"):
-            below = ks < a
-            above = ks > b
-            result = np.where(above, 1.0, np.where(below, 0.0, self._cdf(ks, *shapes)))
-            result = np.where(valid, result, self.badvalue)
-        return self._out(result)
+            result = np.where(ks > b, 1.0, np.where(ks < a, 0.0, self._cdf(ks, *shapes)))
+            result = np.where(valid, result, np.nan)
+        return _scalarize(result)
 
     def logcdf(self, k, *args, **kwds):
         with np.errstate(divide="ignore"):
@@ -785,105 +514,98 @@ class rv_discrete(rv_generic):
             return np.log(self.sf(k, *args, **kwds))
 
     def ppf(self, q, *args, **kwds):
-        q0, shapes, loc, _scale = self._value_binder(self, q, *args, **kwds)
-        q0 = np.asarray(q0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
+        shapes, loc = self._bind(args, kwds)
         a, b = self._get_support(*shapes)
-        valid = self._valid(shapes, np.array(1.0)) & (q0 >= 0.0) & (q0 <= 1.0)
+        q = np.asarray(q, dtype=float)
+        valid = self._valid(shapes) & (q >= 0.0) & (q <= 1.0)
         with np.errstate(all="ignore"):
-            clipped = np.clip(q0, 0.0, 1.0)
-            core = np.where(q0 <= 0.0, a, np.where(q0 >= 1.0, b, self._ppf(clipped, *shapes)))
-            result = np.where(valid, loc + core, self.badvalue)
-        return self._out(result)
+            clipped = np.clip(q, 0.0, 1.0)
+            core = np.where(q <= 0.0, a, np.where(q >= 1.0, b, self._ppf(clipped, *shapes)))
+            result = np.where(valid, loc + core, np.nan)
+        return _scalarize(result)
 
     def isf(self, q, *args, **kwds):
         return self.ppf(1.0 - np.asarray(q, dtype=float), *args, **kwds)
 
+    def mean(self, *args, **kwds):
+        shapes, loc = self._bind(args, kwds)
+        valid = self._valid(shapes)
+        value = loc + np.asarray(self._mean(*shapes), dtype=float)
+        return _scalarize(np.where(valid, value, np.nan))
+
+    def var(self, *args, **kwds):
+        shapes, loc = self._bind(args, kwds)
+        valid = self._valid(shapes)
+        value = np.asarray(self._var(*shapes), dtype=float)
+        return _scalarize(np.where(valid, value, np.nan))
+
+    def std(self, *args, **kwds):
+        return _scalarize(np.sqrt(np.asarray(self.var(*args, **kwds), dtype=float)))
+
+    def median(self, *args, **kwds):
+        return self.ppf(0.5, *args, **kwds)
+
+    def interval(self, confidence, *args, **kwds):
+        alpha = (1.0 - np.asarray(confidence, dtype=float)) / 2.0
+        return self.ppf(alpha, *args, **kwds), self.ppf(1.0 - alpha, *args, **kwds)
+
     def rvs(self, *args, size=None, random_state=None, **kwds):
-        loc = kwds.pop("loc", 0)
-        if kwds or len(args) != self.numargs:
-            raise TypeError(f"{self.name}.rvs() got an unexpected argument")
-        rng = check_random_state(random_state)
-        raw = self._rvs(rng, size, *args)
+        shapes, loc = self._bind(args, kwds)
+        rng = _check_random_state(random_state)
+        raw = self._rvs(rng, size, *shapes)
         return np.asarray(raw) + loc
 
-    def expect(
-        self,
-        func=None,
-        args=(),
-        loc=0,
-        lb=None,
-        ub=None,
-        conditional=False,
-        maxcount=1000,
-        tolerance=1e-10,
-        chunksize=32,
-    ):
-        if func is None:
-            func = lambda k: k  # noqa: E731
-        shapes = tuple(args)
-        a, b = self._get_support(*shapes)
-        low = a if lb is None else max(lb, a)
-        high = b if ub is None else min(ub, b)
-        low = int(math.ceil(low))
-        total = 0.0
-        k = low
-        count = 0
-        zero_run = 0
-        while k <= high and count < maxcount:
-            p = float(self.pmf(k, *shapes, loc=loc))
-            if p > 0.0:
-                total += func(k) * p
-                zero_run = 0
-            else:
-                zero_run += 1
-                if zero_run > 10 and k > low:
-                    break
-            k += 1
-            count += 1
-        return total
+
+class _FrozenDiscrete:
+    """A discrete distribution with its shape/`loc` arguments fixed, as `dist(...)` returns."""
+
+    _METHODS = (
+        "pmf", "logpmf", "cdf", "logcdf", "sf", "logsf", "ppf", "isf",
+        "mean", "var", "std", "median", "interval", "rvs",
+    )
+
+    def __init__(self, dist, args, kwds):
+        self._dist = dist
+        self._args = args
+        self._kwds = kwds
+        for name in self._METHODS:
+            setattr(self, name, self._forward(getattr(dist, name)))
+
+    def _forward(self, method):
+        def call(*args, **kwds):
+            merged = dict(self._kwds)
+            merged.update(kwds)
+            return method(*args, *self._args, **merged)
+
+        return call
 
 
-class _binom_gen(rv_discrete):
-    def _argcheck(self, n, p):
-        n_arr = np.asarray(n, dtype=float)
-        p_arr = np.asarray(p, dtype=float)
-        return (n_arr >= 0) & (n_arr == np.floor(n_arr)) & (p_arr >= 0) & (p_arr <= 1)
-
+class _Binom(_DiscreteDistribution):
     def _get_support(self, n, p):
-        return 0, n
+        return 0.0, n
 
     def _pmf(self, k, n, p):
-        return _binom_pmf(k, n, p)
+        with np.errstate(divide="ignore"):
+            log_coeff = special.gammaln(n + 1.0) - special.gammaln(k + 1.0) - special.gammaln(n - k + 1.0)
+            return np.exp(log_coeff + special.xlogy(k, p) + special.xlogy(n - k, 1.0 - p))
 
     def _cdf(self, k, n, p):
-        return _binom_cdf(k, n, p)
+        return np.where(k >= n, 1.0, special.betaincc(k + 1.0, n - k, p))
 
     def _ppf(self, q, n, p):
-        return _binom_ppf(q, n, p)
+        return _integer_search(lambda k: self._cdf(k, n, p), q, 0.0, n)
 
-    def _stats(self, n, p):
-        mean = n * p
-        var = n * p * (1.0 - p)
-        skew = (1.0 - 2.0 * p) / np.sqrt(var)
-        kurt = (1.0 - 6.0 * p * (1.0 - p)) / var
-        return mean, var, skew, kurt
+    def _mean(self, n, p):
+        return n * p
+
+    def _var(self, n, p):
+        return n * p * (1.0 - p)
 
     def _rvs(self, rng, size, n, p):
         return rng.binomial(n, p, size=size)
 
-    def isf(self, q, *args, **kwds):
-        # `_binom_isf` is exact (ported from Boost); avoid the generic `ppf(1 - q)` round trip.
-        q0, shapes, loc, _scale = self._value_binder(self, q, *args, **kwds)
-        q0 = np.asarray(q0, dtype=float)
-        loc = np.asarray(loc, dtype=float)
-        valid = self._valid(shapes, np.array(1.0)) & (q0 >= 0.0) & (q0 <= 1.0)
-        with np.errstate(all="ignore"):
-            result = np.where(valid, loc + _binom_isf(np.clip(q0, 0.0, 1.0), *shapes), self.badvalue)
-        return self._out(result)
 
-
-class _poisson_gen(rv_discrete):
+class _Poisson(_DiscreteDistribution):
     def _pmf(self, k, mu):
         with np.errstate(divide="ignore"):
             return np.exp(special.xlogy(k, mu) - mu - special.gammaln(k + 1.0))
@@ -891,12 +613,19 @@ class _poisson_gen(rv_discrete):
     def _cdf(self, k, mu):
         return special.gammaincc(np.floor(k) + 1.0, mu)
 
-    def _stats(self, mu):
-        return mu, mu, 1.0 / np.sqrt(mu), 1.0 / mu
+    def _ppf(self, q, mu):
+        hi = _poisson_upper_bound(mu, q)
+        return _integer_search(lambda k: self._cdf(k, mu), q, 0.0, hi)
+
+    def _mean(self, mu):
+        return mu
+
+    def _var(self, mu):
+        return mu
 
     def _rvs(self, rng, size, mu):
         return rng.poisson(mu, size=size)
 
 
-binom = _binom_gen(name="binom")
-poisson = _poisson_gen(name="poisson")
+binom = _Binom("binom", numargs=2)
+poisson = _Poisson("poisson", numargs=1)

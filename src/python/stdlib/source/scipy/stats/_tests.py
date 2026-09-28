@@ -1,10 +1,10 @@
 """Correlation coefficients and hypothesis tests: ``pearsonr``, ``spearmanr``, ``linregress``,
-the Student's t-tests and the chi-square/power-divergence family.
+the Student's t-tests, ``chisquare`` and ``chi2_contingency``.
 
 Every p-value here reduces to the Student's t or chi-squared distribution function, computed
-through :mod:`scipy.special` (``stdtr``/``stdtrit`` and ``chdtrc``) exactly as the corresponding
-``scipy.stats`` distributions do, so results agree with SciPy through the same floating-point
-path documented in docs/scipy.md.
+through the same ``scipy.special`` incomplete gamma/beta ufuncs ``scipy.stats``'s own
+distributions use (``scipy.stats._distributions._t_cdf`` and ``special.gammaincc``), so results
+agree with SciPy through the same floating-point path documented in docs/scipy.md.
 """
 
 import math
@@ -14,12 +14,8 @@ from collections import namedtuple
 import numpy as np
 
 from scipy import special
-from scipy.stats._stats import (
-    ConstantInputWarning,
-    _rankdata_1d,
-    _scalarize,
-    _tuple_bunch,
-)
+from scipy.stats._describe import ConstantInputWarning, _rankdata_1d, _scalarize, _tuple_bunch
+from scipy.stats._distributions import _t_cdf
 
 __all__ = [
     "pearsonr",
@@ -27,91 +23,24 @@ __all__ = [
     "linregress",
     "ttest_1samp",
     "ttest_ind",
-    "ttest_ind_from_stats",
     "ttest_rel",
     "chisquare",
-    "power_divergence",
+    "chi2_contingency",
 ]
 
 
 SignificanceResult = namedtuple("SignificanceResult", ["statistic", "pvalue"])
-Power_divergenceResult = namedtuple("Power_divergenceResult", ["statistic", "pvalue"])
-Ttest_indResult = namedtuple("Ttest_indResult", ["statistic", "pvalue"])
+Chi2ContingencyResult = namedtuple("Chi2ContingencyResult", ["statistic", "pvalue", "dof", "expected_freq"])
 LinregressResult = _tuple_bunch(
     "LinregressResult",
     ["slope", "intercept", "rvalue", "pvalue", "stderr"],
     ["intercept_stderr"],
 )
+TtestResult = _tuple_bunch("TtestResult", ["statistic", "pvalue"], ["df"])
 
 
-ConfidenceInterval = namedtuple("ConfidenceInterval", ["low", "high"])
-
-
-def _pearson_confidence_interval(self, confidence_level=0.95, method=None):
-    r = np.asarray(self.statistic, dtype=float)
-    se = 1.0 / math.sqrt(self._n - 3)
-    with np.errstate(invalid="ignore", divide="ignore"):
-        z = np.arctanh(r)
-    if self._alternative == "two-sided":
-        crit = special.ndtri(0.5 + confidence_level / 2.0)
-        lo, hi = z - crit * se, z + crit * se
-    elif self._alternative == "less":
-        crit = special.ndtri(confidence_level)
-        lo, hi = -np.inf, z + crit * se
-    else:
-        crit = special.ndtri(confidence_level)
-        lo, hi = z - crit * se, np.inf
-    # tanh saturates to +/-1 at infinite bounds, so a one-sided interval needs no special case.
-    return ConfidenceInterval(_scalarize(np.tanh(lo)), _scalarize(np.tanh(hi)))
-
-
-PearsonRResult = _tuple_bunch(
-    "PearsonRResult",
-    ["statistic", "pvalue"],
-    methods={
-        "correlation": property(lambda self: self.statistic),
-        "confidence_interval": _pearson_confidence_interval,
-    },
-)
-
-
-def _pearson_result(statistic, pvalue, n, alternative):
-    result = PearsonRResult(statistic, pvalue)
-    result._n = n
-    result._alternative = alternative
-    return result
-
-
-def _ttest_confidence_interval(self, confidence_level=0.95):
-    df = np.asarray(self.df, dtype=float)
-    se = np.asarray(self._se, dtype=float)
-    center = np.asarray(self._center, dtype=float)
-    if self._alternative == "two-sided":
-        crit = special.stdtrit(df, 0.5 + confidence_level / 2.0)
-        lo, hi = center - crit * se, center + crit * se
-    elif self._alternative == "less":
-        crit = special.stdtrit(df, confidence_level)
-        lo, hi = np.full(center.shape, -np.inf) if center.ndim else -np.inf, center + crit * se
-    else:
-        crit = special.stdtrit(df, confidence_level)
-        lo, hi = center - crit * se, np.full(center.shape, np.inf) if center.ndim else np.inf
-    return ConfidenceInterval(_scalarize(np.asarray(lo)), _scalarize(np.asarray(hi)))
-
-
-TtestResult = _tuple_bunch(
-    "TtestResult",
-    ["statistic", "pvalue"],
-    ["df"],
-    methods={"confidence_interval": _ttest_confidence_interval},
-)
-
-
-def _ttest_result(statistic, pvalue, df, *, center, standard_error, alternative):
-    result = TtestResult(statistic, pvalue, df=df)
-    result._center = center
-    result._se = standard_error
-    result._alternative = alternative
-    return result
+def _ttest_result(statistic, pvalue, df):
+    return TtestResult(statistic, pvalue, df=df)
 
 
 def _broadcast_df(df, like):
@@ -122,11 +51,11 @@ def _t_pvalue(t, df, alternative):
     t = np.asarray(t, dtype=float)
     with np.errstate(invalid="ignore", divide="ignore"):
         if alternative == "two-sided":
-            return 2.0 * special.stdtr(df, -np.abs(t))
+            return 2.0 * _t_cdf(-np.abs(t), df)
         if alternative == "less":
-            return special.stdtr(df, t)
+            return _t_cdf(t, df)
         if alternative == "greater":
-            return special.stdtr(df, -t)
+            return _t_cdf(-t, df)
     raise ValueError("alternative must be 'less', 'greater' or 'two-sided'")
 
 
@@ -167,10 +96,10 @@ def pearsonr(x, y, *, alternative="two-sided", axis=0):
     r, p, constant = _pearson_core(x, y, axis, alternative)
     if np.any(constant):
         _warn_constant()
-    return _pearson_result(_scalarize(r), _scalarize(p), x.shape[axis], alternative)
+    return SignificanceResult(_scalarize(r), _scalarize(p))
 
 
-def spearmanr(a, b=None, axis=0, nan_policy="propagate", alternative="two-sided"):
+def spearmanr(a, b=None, axis=0, alternative="two-sided"):
     a = np.asarray(a, dtype=float)
 
     def ranked(arr, axis):
@@ -222,7 +151,7 @@ def linregress(x, y=None, alternative="two-sided"):
     return LinregressResult(slope, intercept, r, pvalue, stderr, intercept_stderr=intercept_stderr)
 
 
-def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sided"):
+def ttest_1samp(a, popmean, axis=0, alternative="two-sided"):
     a = np.asarray(a, dtype=float)
     popmean = np.asarray(popmean, dtype=float)
     n = a.shape[axis]
@@ -232,13 +161,10 @@ def ttest_1samp(a, popmean, axis=0, nan_policy="propagate", alternative="two-sid
         t = (mean - popmean) / se
     df = n - 1
     p = _t_pvalue(t, df, alternative)
-    return _ttest_result(
-        _scalarize(t), _scalarize(p), _broadcast_df(df, t),
-        center=_scalarize(mean), standard_error=_scalarize(se), alternative=alternative,
-    )
+    return _ttest_result(_scalarize(t), _scalarize(p), _broadcast_df(df, t))
 
 
-def ttest_rel(a, b, axis=0, nan_policy="propagate", alternative="two-sided"):
+def ttest_rel(a, b, axis=0, alternative="two-sided"):
     d = np.asarray(a, dtype=float) - np.asarray(b, dtype=float)
     n = d.shape[axis]
     mean = np.mean(d, axis=axis)
@@ -247,10 +173,7 @@ def ttest_rel(a, b, axis=0, nan_policy="propagate", alternative="two-sided"):
         t = mean / se
     df = n - 1
     p = _t_pvalue(t, df, alternative)
-    return _ttest_result(
-        _scalarize(t), _scalarize(p), _broadcast_df(df, t),
-        center=_scalarize(mean), standard_error=_scalarize(se), alternative=alternative,
-    )
+    return _ttest_result(_scalarize(t), _scalarize(p), _broadcast_df(df, t))
 
 
 def _winsorized_stats(x, axis, trim):
@@ -271,7 +194,7 @@ def _winsorized_stats(x, axis, trim):
     return trimmed_mean, d, h
 
 
-def ttest_ind(a, b, axis=0, equal_var=True, nan_policy="propagate", alternative="two-sided", trim=0):
+def ttest_ind(a, b, axis=0, equal_var=True, alternative="two-sided", trim=0):
     a = np.asarray(a, dtype=float)
     b = np.asarray(b, dtype=float)
     if trim > 0:
@@ -299,46 +222,13 @@ def ttest_ind(a, b, axis=0, equal_var=True, nan_policy="propagate", alternative=
     with np.errstate(invalid="ignore", divide="ignore"):
         t = diff / se
     p = _t_pvalue(t, df, alternative)
-    return _ttest_result(
-        _scalarize(t), _scalarize(p), _broadcast_df(df, t),
-        center=_scalarize(diff), standard_error=_scalarize(se), alternative=alternative,
-    )
+    return _ttest_result(_scalarize(t), _scalarize(p), _broadcast_df(df, t))
 
 
-def ttest_ind_from_stats(mean1, std1, nobs1, mean2, std2, nobs2, equal_var=True, alternative="two-sided"):
-    v1, v2 = std1**2, std2**2
-    if equal_var:
-        df = nobs1 + nobs2 - 2
-        pooled = ((nobs1 - 1) * v1 + (nobs2 - 1) * v2) / df
-        se = math.sqrt(pooled * (1.0 / nobs1 + 1.0 / nobs2))
-    else:
-        se2 = v1 / nobs1 + v2 / nobs2
-        se = math.sqrt(se2)
-        df = se2**2 / ((v1 / nobs1) ** 2 / (nobs1 - 1) + (v2 / nobs2) ** 2 / (nobs2 - 1))
-    diff = mean1 - mean2
-    t = diff / se
-    p = float(_t_pvalue(t, df, alternative))
-    return Ttest_indResult(t, p)
-
-
-_LAMBDA_NAMES = {
-    "pearson": 1.0,
-    "log-likelihood": 0.0,
-    "freeman-tukey": -0.5,
-    "mod-log-likelihood": -1.0,
-    "neyman": -2.0,
-    "cressie-read": 2.0 / 3.0,
-}
-
-
-def power_divergence(f_obs, f_exp=None, ddof=0, axis=0, lambda_=None):
+def chisquare(f_obs, f_exp=None, ddof=0, axis=0):
+    """Pearson's chi-square goodness-of-fit test: `sum((observed - expected)^2 / expected)`
+    against the chi-square distribution with `n - 1 - ddof` degrees of freedom."""
     f_obs = np.asarray(f_obs, dtype=float)
-    if lambda_ is None:
-        lambda_ = 1.0
-    elif isinstance(lambda_, str):
-        if lambda_ not in _LAMBDA_NAMES:
-            raise ValueError(f"invalid string for lambda_: {lambda_!r}")
-        lambda_ = _LAMBDA_NAMES[lambda_]
     n = f_obs.shape[axis]
     if f_exp is None:
         f_exp = np.broadcast_to(np.mean(f_obs, axis=axis, keepdims=True), f_obs.shape)
@@ -349,20 +239,41 @@ def power_divergence(f_obs, f_exp=None, ddof=0, axis=0, lambda_=None):
                 "For each axis slice, the sum of the observed frequencies must agree with the "
                 "sum of the expected frequencies to a relative tolerance of 1e-8."
             )
-    with np.errstate(invalid="ignore", divide="ignore"):
-        if lambda_ == 0.0:
-            terms = np.where(f_obs == 0, 0.0, f_obs * np.log(f_obs / f_exp))
-            stat = 2.0 * np.sum(terms, axis=axis)
-        elif lambda_ == -1.0:
-            terms = np.where(f_exp == 0, 0.0, f_exp * np.log(f_exp / f_obs))
-            stat = 2.0 * np.sum(terms, axis=axis)
-        else:
-            terms = f_obs * ((f_obs / f_exp) ** lambda_ - 1.0)
-            stat = 2.0 / (lambda_ * (lambda_ + 1.0)) * np.sum(terms, axis=axis)
+    stat = np.sum((f_obs - f_exp) ** 2 / f_exp, axis=axis)
     df = n - 1 - ddof
-    p = special.chdtrc(df, stat)
-    return Power_divergenceResult(_scalarize(stat), _scalarize(p))
+    p = special.gammaincc(df / 2.0, stat / 2.0)
+    return SignificanceResult(_scalarize(stat), _scalarize(p))
 
 
-def chisquare(f_obs, f_exp=None, ddof=0, axis=0):
-    return power_divergence(f_obs, f_exp, ddof=ddof, axis=axis, lambda_="pearson")
+def _expected_freq(observed):
+    """The independence-model expected counts: the outer product of `observed`'s margins."""
+    observed = np.asarray(observed, dtype=float)
+    total = observed.sum()
+    if total == 0:
+        return np.zeros_like(observed)
+    expected = np.ones_like(observed)
+    for axis in range(observed.ndim):
+        margin = np.sum(observed, axis=tuple(i for i in range(observed.ndim) if i != axis), keepdims=True)
+        expected = expected * margin
+    return expected / total ** (observed.ndim - 1)
+
+
+def chi2_contingency(observed, correction=True, lambda_=None, method=None):
+    """Pearson's chi-square test of independence, with Yates' continuity correction for a 2x2
+    table by default."""
+    if method is not None:
+        raise NotImplementedError("chi2_contingency(..., method=...) is not supported by shellsim's SciPy")
+    observed = np.asarray(observed, dtype=float)
+    expected = _expected_freq(observed)
+    if np.any(expected == 0):
+        index = tuple(int(i) for i in np.argwhere(expected == 0)[0])
+        raise ValueError(f"The internally computed table of expected frequencies has a zero element at {index}.")
+    dof = expected.size - sum(expected.shape) + expected.ndim - 1
+    if dof == 0:
+        return Chi2ContingencyResult(0.0, 1.0, 0, expected)
+    diff = observed - expected
+    if dof == 1 and correction:
+        diff = np.sign(diff) * np.clip(np.abs(diff) - 0.5, 0.0, None)
+    statistic = float(np.sum(diff**2 / expected))
+    pvalue = float(special.gammaincc(dof / 2.0, statistic / 2.0))
+    return Chi2ContingencyResult(statistic, pvalue, dof, expected)
