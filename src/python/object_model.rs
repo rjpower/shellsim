@@ -696,6 +696,7 @@ pub struct PyType {
 pub struct TypeRegistry {
     types: Vec<PyType>,
     value_kinds: Vec<&'static super::native::ValueKindDef>,
+    exception_types: HashMap<&'static str, TypeId>,
     modeled_bytes: u64,
 }
 
@@ -876,16 +877,59 @@ impl Default for TypeRegistry {
         let mut registry = Self {
             types,
             value_kinds: Vec::new(),
+            exception_types: HashMap::new(),
             modeled_bytes: builtin_bytes,
         };
         for kind in super::stdlib::value_kinds() {
             registry.register_value_kind(kind);
         }
+        registry.register_exception_types();
         registry
     }
 }
 
 impl TypeRegistry {
+    /// Builtin exception classes keep their public values while sharing the registry's C3 MRO.
+    /// Registering them after value kinds preserves the compact registered-value indices.
+    fn register_exception_types(&mut self) {
+        use super::vm::{ExceptionType, NativeValue};
+
+        let base = BuiltinType::Exception.id();
+        self.types[base.raw() as usize].value = Some(Value::Native(NativeValue::ExceptionType(
+            ExceptionType("BaseException"),
+        )));
+        self.exception_types.insert("BaseException", base);
+        for definition in super::exception_types::EXCEPTION_TYPES.iter().skip(1) {
+            let parent = definition.parent.expect("non-root exception has a parent");
+            let parent = self.exception_types[parent];
+            let mut bases = vec![parent];
+            if let Some(secondary) = definition.secondary_parent {
+                bases.push(self.exception_types[secondary]);
+            }
+            let mro = self
+                .linearize_bases(&bases)
+                .expect("exception MRO is valid");
+            let value = Value::Native(NativeValue::ExceptionType(ExceptionType(definition.name)));
+            let ty = PyType {
+                name: definition.name.into(),
+                bases,
+                mro: mro.clone(),
+                attributes: HashMap::new(),
+                local_slots: TypeSlots::default(),
+                slots: self.inherit_slots(TypeSlots::default(), &mro),
+                value: Some(value),
+            };
+            let id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
+            self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
+            self.types.push(ty);
+            self.exception_types.insert(definition.name, id);
+        }
+    }
+
+    pub(super) fn exception_type_id(&self, name: &str) -> Option<TypeId> {
+        self.exception_types.get(name).copied()
+    }
+
     /// Conservative modeled size of registry metadata retained between executions.
     pub fn modeled_bytes(&self) -> u64 {
         self.modeled_bytes
@@ -1018,6 +1062,27 @@ impl TypeRegistry {
         Ok(class == base || self.get(class)?.mro.contains(&base))
     }
 
+    /// Linearize every registered base, builtin or heap-owned, with the same C3 rule used to
+    /// register native value kinds. The result excludes the class being created.
+    pub(super) fn linearize_bases(&self, bases: &[TypeId]) -> Result<Vec<TypeId>, String> {
+        for (index, base) in bases.iter().enumerate() {
+            if bases[..index].contains(base) {
+                return Err("duplicate base class".into());
+            }
+        }
+        let mut sequences = Vec::with_capacity(bases.len().saturating_add(1));
+        for base in bases {
+            let ty = self.get(*base)?;
+            let mut sequence = Vec::with_capacity(ty.mro.len().saturating_add(1));
+            sequence.push(*base);
+            sequence.extend(&ty.mro);
+            sequences.push(sequence);
+        }
+        sequences.push(bases.to_vec());
+        c3_merge(sequences)
+            .ok_or_else(|| "cannot create a consistent method resolution order".into())
+    }
+
     pub fn slot(&self, type_id: TypeId, slot: Slot) -> Result<Option<SlotValue>, String> {
         Ok(self.get(type_id)?.slots.get(slot).cloned())
     }
@@ -1028,10 +1093,6 @@ impl TypeRegistry {
         slot: Slot,
     ) -> Result<Option<SlotValue>, String> {
         Ok(self.get(type_id)?.local_slots.get(slot).cloned())
-    }
-
-    pub fn attribute(&self, type_id: TypeId, name: &str) -> Result<Option<Value>, String> {
-        Ok(self.get(type_id)?.attributes.get(name).cloned())
     }
 
     /// Register a module-owned value kind after its bases, linearizing them with C3 as a class
@@ -1714,6 +1775,39 @@ mod tests {
     }
 
     #[test]
+    fn registered_bases_use_c3_order_and_reject_conflicts() {
+        let registry = TypeRegistry::default();
+        assert_eq!(
+            registry
+                .linearize_bases(&[BuiltinType::Bool.id(), BuiltinType::Int.id()])
+                .unwrap(),
+            vec![
+                BuiltinType::Bool.id(),
+                BuiltinType::Int.id(),
+                BuiltinType::Object.id()
+            ]
+        );
+        assert!(registry
+            .linearize_bases(&[BuiltinType::Int.id(), BuiltinType::Bool.id()])
+            .is_err());
+        assert!(registry
+            .linearize_bases(&[BuiltinType::Int.id(), BuiltinType::Int.id()])
+            .is_err());
+    }
+
+    #[test]
+    fn exception_types_have_distinct_registry_ids_and_multiple_ancestors() {
+        let registry = TypeRegistry::default();
+        let axis = registry.exception_type_id("AxisError").unwrap();
+        let value = registry.exception_type_id("ValueError").unwrap();
+        let index = registry.exception_type_id("IndexError").unwrap();
+        assert_ne!(value, index);
+        assert!(registry.is_subclass(axis, value).unwrap());
+        assert!(registry.is_subclass(axis, index).unwrap());
+        assert_eq!(registry.get(axis).unwrap().bases, vec![value, index]);
+    }
+
+    #[test]
     fn modeled_memory_counts_builtin_and_registered_types() {
         let mut registry = TypeRegistry::default();
         let builtin_bytes = registry
@@ -1740,7 +1834,7 @@ mod tests {
             )
             .unwrap();
         let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
-        assert_eq!(registry.attribute(id, "value").unwrap(), None);
+        assert_eq!(registry.get(id).unwrap().attributes.get("value"), None);
         assert_eq!(
             registry.modeled_bytes(),
             before.saturating_add(registered_bytes)

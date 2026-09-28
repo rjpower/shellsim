@@ -4,11 +4,11 @@ use std::collections::BTreeSet;
 
 use super::super::heap::{DictViewKind, NamespaceTarget, ObjectId, ProxyTarget};
 use super::{
-    exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
-    BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition, ClassField,
-    ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap,
-    InstancePayload, LoadAttributeCache, NameId, NativeValue, Object, Ordering, PyError, PyRuntime,
-    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
+    CallArgs, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
+    ComparisonOperator, ExceptionType, Execution, HashMap, InstancePayload, LoadAttributeCache,
+    NameId, NativeValue, Object, Ordering, PyError, PyRuntime, SlicePlan, Slot, SlotValue,
+    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Items of a builtin container whose `repr` the VM renders item by item.
@@ -418,12 +418,14 @@ impl Vm<'_> {
                 return Ok(Some(value));
             }
         }
-        if let Some(NativeValue::ExceptionType(_)) = owner.native_value() {
-            // Every builtin exception class shares the `BaseException` methods, then `object`'s.
-            for ancestor in [BuiltinType::Exception.id(), BuiltinType::Object.id()] {
-                if let Some(value) = self.state.types.attribute(ancestor, name)? {
-                    return Ok(Some(value));
-                }
+        if let Some(NativeValue::ExceptionType(ExceptionType(kind))) = owner.native_value() {
+            let type_id = self
+                .state
+                .types
+                .exception_type_id(kind)
+                .ok_or("exception type is not registered")?;
+            if let Some((_, value)) = self.type_lookup(type_id, name)? {
+                return Ok(Some(value));
             }
         }
         if let Some(NativeValue::ValueKind(kind)) = owner.native_value() {
@@ -661,9 +663,14 @@ impl Vm<'_> {
                     .ok_or("value kind is not registered")?;
                 Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
             }
-            Some(NativeValue::ExceptionType(_)) => Some(Object::MappingProxy(
-                ProxyTarget::RegisteredType(BuiltinType::Exception.id()),
-            )),
+            Some(NativeValue::ExceptionType(ExceptionType(name))) => {
+                let type_id = self
+                    .state
+                    .types
+                    .exception_type_id(name)
+                    .ok_or("exception type is not registered")?;
+                Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
+            }
             _ => match owner.object_id() {
                 Some(id) => match self.state.heap.get(id)? {
                     Object::Class { .. } => Some(Object::MappingProxy(ProxyTarget::Class(id))),
@@ -1968,9 +1975,6 @@ impl Vm<'_> {
             .chain(inherited_exception_bases.iter())
             .copied()
             .next();
-        if direct_exception_bases.len() + inherited_exception_bases.len() > 1 {
-            return Err("multiple exception bases are unsupported".into());
-        }
         if exception_base.is_some()
             && (builtin_layout.is_some() || has_type_base || is_enum || is_unittest)
         {
@@ -2319,33 +2323,14 @@ impl Vm<'_> {
     /// A user class's method resolution order: the class and its C3-linearized user ancestors,
     /// then the native types their bases derive from, ending with `object`.
     fn class_mro(&self, class: ObjectId) -> Result<Vec<Value>, String> {
-        let Object::Class { mro, .. } = self.state.heap.get(class)? else {
+        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
             return Err("class metadata requested for a non-class".into());
         };
-        let classes = std::iter::once(class)
-            .chain(mro.iter().copied())
-            .collect::<Vec<_>>();
-        let mut order = classes
-            .iter()
-            .copied()
-            .map(Value::Object)
-            .collect::<Vec<_>>();
-        for ancestor in classes {
-            let Object::Class { bases, .. } = self.state.heap.get(ancestor)? else {
-                return Err("class MRO contains a non-class object".into());
-            };
-            for base in bases.iter().filter(|base| base.object_id().is_none()) {
-                for native in self.native_mro(*base)? {
-                    if !order.contains(&native) {
-                        order.push(native);
-                    }
-                }
-            }
-        }
-        let object = Value::Native(NativeValue::BuiltinType(BuiltinType::Object));
-        order.retain(|value| *value != object);
-        order.push(object);
-        Ok(order)
+        let ty = self.state.types.get(*instance_type)?;
+        std::iter::once(*instance_type)
+            .chain(ty.mro.iter().copied())
+            .map(|id| self.state.types.value(id))
+            .collect()
     }
 
     /// The MRO of a native type, starting with the type itself.
@@ -2354,17 +2339,7 @@ impl Vm<'_> {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
             Some(NativeValue::ExceptionType(ExceptionType(name))) => {
-                let mut order = Vec::new();
-                let mut current = Some(name);
-                while let Some(name) = current {
-                    order.push(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                        name,
-                    ))));
-                    current = super::super::exception_types::exception_type(name)
-                        .and_then(|definition| definition.parent);
-                }
-                order.push(Value::Native(NativeValue::BuiltinType(BuiltinType::Object)));
-                return Ok(order);
+                self.state.types.exception_type_id(name)
             }
             _ => None,
         };
@@ -2419,36 +2394,28 @@ impl Vm<'_> {
                 self.allocate_object(Object::Tuple(order)).map(Some)
             }
             "__bases__" if is_type => {
-                let bases = match native {
-                    NativeValue::ExceptionType(ExceptionType(name)) => {
-                        let parent = super::super::exception_types::exception_type(name)
-                            .and_then(|definition| definition.parent);
-                        vec![match parent {
-                            Some(parent) => {
-                                Value::Native(NativeValue::ExceptionType(ExceptionType(parent)))
-                            }
-                            None => Value::Native(NativeValue::BuiltinType(BuiltinType::Object)),
-                        }]
-                    }
-                    _ => {
-                        let type_id = match native {
-                            NativeValue::BuiltinType(builtin) => builtin.id(),
-                            NativeValue::ValueKind(kind) => self
-                                .state
-                                .types
-                                .value_kind_type_id(kind)
-                                .ok_or("value kind is not registered")?,
-                            _ => unreachable!("checked by is_type"),
-                        };
-                        self.state
-                            .types
-                            .get(type_id)?
-                            .bases
-                            .iter()
-                            .map(|base| self.state.types.value(*base))
-                            .collect::<Result<Vec<_>, _>>()?
-                    }
+                let type_id = match native {
+                    NativeValue::BuiltinType(builtin) => builtin.id(),
+                    NativeValue::ValueKind(kind) => self
+                        .state
+                        .types
+                        .value_kind_type_id(kind)
+                        .ok_or("value kind is not registered")?,
+                    NativeValue::ExceptionType(ExceptionType(name)) => self
+                        .state
+                        .types
+                        .exception_type_id(name)
+                        .ok_or("exception type is not registered")?,
+                    _ => unreachable!("checked by is_type"),
                 };
+                let bases = self
+                    .state
+                    .types
+                    .get(type_id)?
+                    .bases
+                    .iter()
+                    .map(|base| self.state.types.value(*base))
+                    .collect::<Result<Vec<_>, _>>()?;
                 self.allocate_object(Object::Tuple(bases)).map(Some)
             }
             _ => Ok(None),
@@ -2513,10 +2480,7 @@ impl Vm<'_> {
         }
         let mut type_bases = Vec::new();
         for base in &bases {
-            let base = match base.native_value() {
-                Some(NativeValue::ExceptionType(_)) => Some(BuiltinType::Exception.id()),
-                _ => self.class_type_id(base)?,
-            };
+            let base = self.class_type_id(base)?;
             if let Some(base) = base {
                 type_bases.push(base);
             }
@@ -2524,29 +2488,15 @@ impl Vm<'_> {
         if type_bases.is_empty() {
             type_bases.push(BuiltinType::Object.id());
         }
-        let mut type_mro = mro
-            .iter()
-            .map(|ancestor| match self.state.heap.get(*ancestor)? {
-                Object::Class { instance_type, .. } => Ok(*instance_type),
-                _ => Err("class MRO contains a non-class object".into()),
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        if exception_base.is_some() && !type_mro.contains(&BuiltinType::Exception.id()) {
-            type_mro.push(BuiltinType::Exception.id());
-        }
-        let builtin_ancestor = match layout {
-            ClassLayout::Object => None,
-            ClassLayout::Builtin(builtin) => Some(builtin.id()),
-            ClassLayout::Type => Some(BuiltinType::Type.id()),
-        };
-        if let Some(ancestor) = builtin_ancestor {
-            if !type_mro.contains(&ancestor) {
-                type_mro.push(ancestor);
-            }
-        }
-        if !type_mro.contains(&BuiltinType::Object.id()) {
-            type_mro.push(BuiltinType::Object.id());
-        }
+        let entries = type_bases.iter().try_fold(0usize, |total, base| {
+            total
+                .checked_add(self.state.types.get(*base)?.mro.len().saturating_add(1))
+                .ok_or_else(|| "class MRO is too large".to_string())
+        })?;
+        self.charge_cpu(
+            u64::try_from(entries.saturating_mul(type_bases.len())).unwrap_or(u64::MAX),
+        )?;
+        let type_mro = self.state.types.linearize_bases(&type_bases)?;
         self.class_type_id(&metaclass)?
             .ok_or("metaclass must be a type")?;
         let instance_type =
@@ -3975,7 +3925,9 @@ impl Vm<'_> {
         Ok(match value.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
-            Some(NativeValue::ExceptionType(_)) => Some(BuiltinType::Exception.id()),
+            Some(NativeValue::ExceptionType(ExceptionType(name))) => {
+                self.state.types.exception_type_id(name)
+            }
             _ if value.object_id().is_some() => {
                 match self.state.heap.get(value.object_id().unwrap())? {
                     Object::Class { instance_type, .. } => Some(*instance_type),
@@ -3990,6 +3942,11 @@ impl Vm<'_> {
     pub(super) fn type_id(&self, value: &Value) -> Result<TypeId, String> {
         if value.inline_string_len().is_some() {
             return Ok(BuiltinType::String.id());
+        }
+        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
+            if let Some(id) = self.state.types.exception_type_id(&kind) {
+                return Ok(id);
+            }
         }
         Ok(match value.tag() {
             ValueTag::None => BuiltinType::None.id(),
@@ -4040,30 +3997,10 @@ impl Vm<'_> {
     }
 
     pub(super) fn type_of(&self, value: &Value) -> Result<Value, String> {
-        // Builtin exception instances share one heap type; their class is the modeled
-        // exception type, so `type(error) is ValueError` and `type(error).__name__` work.
-        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
-            if let Some(definition) = exception_types::exception_type(&kind) {
-                return Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                    definition.name,
-                ))));
-            }
-        }
         self.state.types.value(self.type_id(value)?)
     }
 
     pub(super) fn is_instance(&mut self, value: &Value, class: &Value) -> Result<bool, String> {
-        if let Some(NativeValue::ExceptionType(ExceptionType(expected))) = class.native_value() {
-            let actual =
-                if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
-                    kind
-                } else if let Some(base) = self.user_exception_base(value)? {
-                    base.to_string()
-                } else {
-                    return Ok(false);
-                };
-            return Ok(exception_types::exception_is_subclass(&actual, expected));
-        }
         if let Some(class_id) = class.object_id() {
             if let Object::Tuple(classes) = self.state.heap.get(class_id)? {
                 let classes = classes.clone();
@@ -4094,22 +4031,6 @@ impl Vm<'_> {
                 }
                 return Ok(false);
             }
-        }
-        if let Some(NativeValue::ExceptionType(ExceptionType(base))) = base.native_value() {
-            if let Some(kind) = self.exception_class_base(class)? {
-                return Ok(exception_types::exception_is_subclass(kind, base));
-            }
-            self.class_type_id(class)?
-                .ok_or("issubclass() requires a class argument")?;
-            return Ok(false);
-        }
-        if let Some(NativeValue::ExceptionType(_)) = class.native_value() {
-            // A builtin exception class is never a subclass of a user class, and its only
-            // non-exception ancestor is `object`.
-            return Ok(matches!(
-                base.native_value(),
-                Some(NativeValue::BuiltinType(BuiltinType::Object))
-            ));
         }
         let class = self
             .class_type_id(class)?

@@ -458,6 +458,22 @@ def test_type_metadata_descriptors_precede_class_namespace():
     assert Child.mro() == [Child, Parent, object]
 
 
+def test_registered_mro_orders_user_and_builtin_bases_together():
+    class First:
+        def __len__(self):
+            return 7
+
+    class Second(list):
+        pass
+
+    class Combined(First, Second):
+        pass
+
+    value = Combined([1])
+    assert len(value) == 7
+    assert Combined.__mro__ == (Combined, First, Second, list, object)
+
+
 def test_metaclass_data_descriptor_precedes_class_namespace():
     class Meta(type):
         @property

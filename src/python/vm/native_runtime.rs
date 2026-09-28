@@ -1435,11 +1435,7 @@ impl PyRuntime for Vm<'_> {
                     layout = *base_layout;
                 }
                 if let Some(base_exception) = base_exception {
-                    if exception_base.replace(*base_exception).is_some() {
-                        return Err(PyError::type_error(
-                            "multiple exception bases are unsupported",
-                        ));
-                    }
+                    exception_base.get_or_insert(*base_exception);
                 }
                 user_bases.push(id);
             } else {
@@ -1457,9 +1453,9 @@ impl PyRuntime for Vm<'_> {
                         layout = ClassLayout::Type;
                     }
                     Some(NativeValue::ExceptionType(ExceptionType(name)))
-                        if layout == ClassLayout::Object && exception_base.is_none() =>
+                        if layout == ClassLayout::Object =>
                     {
-                        exception_base = Some(name);
+                        exception_base.get_or_insert(name);
                     }
                     _ => return Err(PyError::type_error("type.__new__() bases must be classes")),
                 }
