@@ -6,9 +6,9 @@ use super::super::heap::{DictViewKind, NamespaceTarget, ObjectId, ProxyTarget};
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
-    CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, LoadAttributeCache,
-    NameId, NativeValue, Object, Ordering, PyError, PyRuntime, SlicePlan, Slot, SlotValue,
-    SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution, HashMap, InstancePayload,
+    LoadAttributeCache, NameId, NativeValue, Object, Ordering, PyError, PyRuntime, SlicePlan, Slot,
+    SlotValue, SymbolId, TypeId, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Items of a builtin container whose `repr` the VM renders item by item.
@@ -3067,6 +3067,31 @@ impl Vm<'_> {
         self.repr_nested(value, &mut BTreeSet::new())
     }
 
+    /// Render the base object's identity without consulting the value's `__repr__` slot.
+    pub(super) fn default_object_repr(&self, value: &Value) -> Result<String, String> {
+        let mut name = self.type_name_of(value)?;
+        if let Some(id) = value.object_id() {
+            if let Object::Instance { class, .. } = self.state.heap.get(id)? {
+                if let Object::Class { attributes, .. } = self.state.heap.get(*class)? {
+                    if let Some(module) = attributes.get("__module__") {
+                        if let Some(module) = protocol::string_value(&self.state.heap, module)? {
+                            if module != "builtins" {
+                                name = format!("{module}.{name}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let address = value.object_id().map(protocol::address).unwrap_or_else(|| {
+            format!(
+                "0x{:x}",
+                super::super::stdlib::core::immediate_identity(value)
+            )
+        });
+        Ok(format!("<{name} object at {address}>"))
+    }
+
     /// `repr()` that renders container items through their own `__repr__` and protocol slots,
     /// as CPython does. `active` holds the containers being rendered, so a container that
     /// contains itself prints as `[...]`.
@@ -3081,6 +3106,20 @@ impl Vm<'_> {
         }
         if let Some(id) = value.object_id() {
             match *self.state.heap.get(id)? {
+                Object::Instance {
+                    class,
+                    payload: InstancePayload::Object,
+                    ..
+                } if matches!(
+                    self.state.heap.get(class),
+                    Ok(Object::Class {
+                        exception_base: None,
+                        ..
+                    })
+                ) =>
+                {
+                    return self.default_object_repr(value)
+                }
                 Object::NamespaceDict(target) => {
                     return self.repr_namespace_dict(id, target, active);
                 }
@@ -3257,11 +3296,29 @@ impl Vm<'_> {
             return protocol::string_value(&self.state.heap, &result)?
                 .ok_or_else(|| "__str__ should return str".into());
         }
+        let plain_instance = match value.object_id() {
+            Some(id) => match self.state.heap.get(id)? {
+                Object::Instance {
+                    class,
+                    payload: InstancePayload::Object,
+                    ..
+                } => matches!(
+                    self.state.heap.get(*class)?,
+                    Object::Class {
+                        exception_base: None,
+                        ..
+                    }
+                ),
+                _ => false,
+            },
+            None => false,
+        };
         if self
             .state
             .types
             .slot(self.type_id(value)?, Slot::Repr)?
             .is_some()
+            || plain_instance
             || self.container_items(value)?.is_some()
             || self.is_mapping_view(value)?
         {

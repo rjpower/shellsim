@@ -661,6 +661,8 @@ pub(super) trait PyRuntime {
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
+    /// The base object's identity representation, without dispatching to an override.
+    fn default_object_repr(&self, value: &PyValue) -> PyResult<String>;
     /// The physical builtin length, without invoking a user-defined `__len__` slot.
     fn physical_length(&self, value: PyValue) -> PyResult<Option<usize>>;
     /// Render through the same bounded formatting protocol used by f-strings.

@@ -68,6 +68,29 @@ def test_format_uses_type_slot_and_exposes_builtin_descriptor():
         raise AssertionError("object.__format__ accepted a non-empty spec")
 
 
+def test_object_repr_and_str_are_directly_callable():
+    class Custom:
+        def __repr__(self):
+            return "custom"
+
+    value = Custom()
+    assert "Custom object at 0x" in object.__repr__(value)
+    assert object.__str__(value) == "custom"
+
+    class Plain:
+        pass
+
+    plain = Plain()
+    assert str(plain) == repr(plain)
+    assert "Plain object at 0x" in str(plain)
+
+    class Fancy:
+        def __repr__(self):
+            return "fancy " + super().__repr__()
+
+    assert "Fancy object at 0x" in repr(Fancy())
+
+
 def test_reversed_uses_slot_then_indexed_sequence():
     assert list(reversed([1, 2, 3])) == [3, 2, 1]
     assert list(list.__reversed__([1, 2])) == [2, 1]

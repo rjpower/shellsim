@@ -623,6 +623,10 @@ impl PyRuntime for Vm<'_> {
         self.repr_value(value).map_err(PyError::runtime_error)
     }
 
+    fn default_object_repr(&self, value: &Value) -> PyResult<String> {
+        Vm::default_object_repr(self, value).map_err(PyError::runtime_error)
+    }
+
     fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
         Vm::physical_length(self, value).map_err(PyError::runtime_error)
     }

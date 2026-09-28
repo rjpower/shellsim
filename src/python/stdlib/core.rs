@@ -283,6 +283,8 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
         method("object", "__new__", object_new),
         method("object", "__init__", object_init),
         method("object", "__init_subclass__", object_init_subclass),
+        method("object", "__repr__", object_repr),
+        method("object", "__str__", object_str),
         method("object", "__hash__", object_hash),
         method("object", "__getattribute__", object_getattribute),
         method("object", "__eq__", object_eq),
@@ -3815,7 +3817,7 @@ fn builtin_id(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 /// The stand-in address of an immediate value, below the heap addresses. Equal immediates are
 /// the same object, so this is a deterministic hash of the value.
-fn immediate_identity(value: &PyValue) -> u64 {
+pub(crate) fn immediate_identity(value: &PyValue) -> u64 {
     use std::hash::{Hash, Hasher};
     const IMMEDIATE_BASE: u64 = 0x5000_0000_0000;
     let mut hasher = std::hash::DefaultHasher::new();
@@ -4030,6 +4032,21 @@ fn object_init_subclass(
     args.expect_positional("object.__init_subclass__", 0, 0)?;
     args.reject_keywords("object.__init_subclass__")?;
     Ok(Value::None)
+}
+
+/// The base representation uses identity even when a subclass overrides `__repr__`.
+fn object_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__repr__", 0, 0)?;
+    args.reject_keywords("object.__repr__")?;
+    let rendered = runtime.default_object_repr(&receiver)?;
+    runtime.new_string(rendered)
+}
+
+fn object_str(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__str__", 0, 0)?;
+    args.reject_keywords("object.__str__")?;
+    let rendered = runtime.repr(&receiver)?;
+    runtime.new_string(rendered)
 }
 
 /// `object.__hash__`: the identity hash an instance has unless its class overrides it, so a
