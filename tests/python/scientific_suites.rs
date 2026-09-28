@@ -130,5 +130,6 @@ suites!(scipy, "scipy", {
     linalg => "test_linalg.py";
     integrate => "test_integrate.py";
     interpolate => "test_interpolate.py";
+    optimize => "test_optimize.py";
     spatial => "test_spatial.py";
 });

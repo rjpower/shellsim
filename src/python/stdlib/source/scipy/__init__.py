@@ -8,7 +8,7 @@ does not provide are missing modules: importing one raises ``ModuleNotFoundError
 
 import importlib
 
-__all__ = ["integrate", "interpolate", "linalg", "spatial", "special", "stats"]
+__all__ = ["integrate", "interpolate", "linalg", "optimize", "spatial", "special", "stats"]
 
 
 def __getattr__(name):
