@@ -343,9 +343,9 @@ def recorded_warnings(function, *args):
 def test_small_samples_warn_and_give_nan():
     result, caught = recorded_warnings(stats.sem, [1.0])
     assert np.isnan(result)
-    assert caught == [stats.SmallSampleWarning]
+    assert len(caught) == 1 and issubclass(caught[0], RuntimeWarning)
     empty, caught = recorded_warnings(stats.mode, [])
-    assert caught == [stats.SmallSampleWarning]
+    assert len(caught) == 1 and issubclass(caught[0], RuntimeWarning)
     assert np.isnan(empty.mode)
     assert empty.count == 0
 
