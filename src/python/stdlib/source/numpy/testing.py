@@ -1,19 +1,25 @@
-"""`numpy.testing`: array-aware assertion helpers with NumPy's comparison rules and messages.
+"""`numpy.testing`: array-aware assertion helpers.
 
-Trimmed to the assertions shellsim programs actually rely on: `assert_allclose`,
-`assert_array_equal`, `assert_array_almost_equal`, `assert_almost_equal`, `assert_equal`,
-`assert_array_less`, `assert_raises`, and `assert_warns`.
-
-Failure messages follow NumPy's `build_err_msg` layout (a header line, an optional inline or
-multi-line `err_msg`, then ` ACTUAL: ...` / ` DESIRED: ...` lines) since the portable suite
-checks this text exactly. `assert_equal` recurses through lists, tuples, and dicts, prepending
-`item=<index>` or `key=<repr>` context to `err_msg` as it goes, so a mismatch deep inside a
-nested structure still reports the exact path to it, matching NumPy's own behavior.
+Provides `assert_allclose`, `assert_array_equal`, `assert_array_almost_equal`,
+`assert_almost_equal`, `assert_equal`, `assert_array_less`, `assert_raises` and `assert_warns`.
+A failure raises `AssertionError` with a header, the optional `err_msg`, and the actual and
+desired values; `assert_equal` names the index or key where nested containers differ.
 """
 
 import math
 
 import numpy as np
+
+__all__ = [
+    "assert_allclose",
+    "assert_almost_equal",
+    "assert_array_almost_equal",
+    "assert_array_equal",
+    "assert_array_less",
+    "assert_equal",
+    "assert_raises",
+    "assert_warns",
+]
 
 
 def _isnan(value):
