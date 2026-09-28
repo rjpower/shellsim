@@ -6,13 +6,14 @@ use super::{
     PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
     PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef, PyArrayView, PyByteArray, PyCallable,
     PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem, PyHttpClient,
-    PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule,
-    PyNamespaceDict, PyNativeKind, PyOperator, PyProcessRunner, PyProperty, PyRaisesContext,
-    PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
-    PyTypeObject, PyValueCast, RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm,
-    MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
+    PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet,
+    PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
+    RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
+use crate::python::heap::{DictViewKind, NamespaceTarget, ObjectId};
 use crate::python::native::PyParameter;
 
 /// Check that every element `view` addresses lies inside `buffer` and suits its element kind.
@@ -392,6 +393,30 @@ impl Vm<'_> {
     }
 }
 
+impl Vm<'_> {
+    /// The namespace a dict handle views, when it is a namespace view rather than a stored
+    /// dict.
+    fn namespace_view(&self, id: ObjectId) -> PyResult<Option<NamespaceTarget>> {
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::NamespaceDict(target) => Ok(Some(*target)),
+            _ => Ok(None),
+        }
+    }
+
+    /// The name to bind for a key stored in a namespace view. CPython's namespaces are dicts
+    /// and accept any hashable key; shellsim's live on name-keyed storage, so other keys are
+    /// rejected.
+    fn namespace_key(&self, key: &Value) -> PyResult<String> {
+        match self.string_value(key)? {
+            Some(name) => Ok(name),
+            None => Err(PyError::type_error(format!(
+                "namespace keys must be str, not {}",
+                self.type_name(key)?
+            ))),
+        }
+    }
+}
+
 impl PyRuntime for Vm<'_> {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()> {
         self.reserve_result(bytes).map_err(PyError::resource_error)
@@ -442,7 +467,8 @@ impl PyRuntime for Vm<'_> {
                 | Object::CallableIterator { .. } => PyKind::Iterator,
                 Object::Generator { .. } => PyKind::Generator,
                 Object::Module { .. } => PyKind::Module,
-                Object::NamespaceDict(_) => PyKind::Native,
+                Object::NamespaceDict(_) => PyKind::Dict,
+                Object::DictView { .. } | Object::MappingProxy(_) => PyKind::Native,
                 Object::Array { .. } => PyKind::Array,
                 Object::ArrayStorage(_) | Object::WideValue { .. } => PyKind::Native,
                 Object::Regex { .. }
@@ -492,7 +518,6 @@ impl PyRuntime for Vm<'_> {
                 Object::RaisesContext { .. } => Some(PyNativeKind::RaisesContext),
                 Object::Property { .. } => Some(PyNativeKind::Property),
                 Object::Array { .. } => Some(PyNativeKind::Array),
-                Object::NamespaceDict(_) => Some(PyNativeKind::NamespaceDict),
                 _ => None,
             },
         )
@@ -923,6 +948,11 @@ impl PyRuntime for Vm<'_> {
 
     fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(Value, Value)>> {
         let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            return self
+                .namespace_items(target)
+                .map_err(|message| self.raised_or_runtime_error(message));
+        }
         let length = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(items) | Object::DefaultDict { entries: items, .. } => items.len(),
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
@@ -939,6 +969,15 @@ impl PyRuntime for Vm<'_> {
 
     fn dict_get(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
         let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            // A namespace binds only names, so any other key is absent.
+            let Some(name) = self.string_value(key)? else {
+                return Ok(None);
+            };
+            return self
+                .namespace_lookup(target, &name)
+                .map_err(PyError::runtime_error);
+        }
         let Some(position) = self
             .find_mapping_entry(id, key)
             .map_err(PyError::runtime_error)?
@@ -955,6 +994,12 @@ impl PyRuntime for Vm<'_> {
 
     fn dict_insert(&mut self, dict: PyDict, key: Value, value: Value) -> PyResult<()> {
         let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            let name = self.namespace_key(&key)?;
+            return self
+                .namespace_store(target, name, value)
+                .map_err(PyError::resource_error);
+        }
         if let Some(position) = self
             .find_mapping_entry(id, &key)
             .map_err(PyError::runtime_error)?
@@ -990,6 +1035,16 @@ impl PyRuntime for Vm<'_> {
 
     fn dict_remove(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
         let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            let Some(name) = self.string_value(key)? else {
+                return Ok(None);
+            };
+            // Removing an attribute can convert a shaped instance to dictionary storage, which
+            // charges memory.
+            return self
+                .namespace_delete(target, &name)
+                .map_err(PyError::resource_error);
+        }
         let Some(position) = self
             .find_mapping_entry(id, key)
             .map_err(PyError::runtime_error)?
@@ -1016,6 +1071,36 @@ impl PyRuntime for Vm<'_> {
 
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(Value, Value)>) -> PyResult<()> {
         let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            let mut kept = Vec::with_capacity(items.len());
+            for (key, value) in items {
+                kept.push((self.namespace_key(&key)?, value));
+            }
+            let names = kept
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            let removed = self
+                .namespace_entries(target)
+                .map_err(PyError::runtime_error)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| !names.contains(name.as_str()))
+                .collect::<Vec<_>>();
+            PyRuntime::charge_cpu(
+                self,
+                u64::try_from(removed.len() + kept.len()).unwrap_or(u64::MAX),
+            )?;
+            for name in removed {
+                self.namespace_delete(target, &name)
+                    .map_err(PyError::resource_error)?;
+            }
+            for (name, value) in kept {
+                self.namespace_store(target, name, value)
+                    .map_err(PyError::resource_error)?;
+            }
+            return Ok(());
+        }
         let replacement = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(_) => Object::Dict(items.into()),
             Object::DefaultDict { factory, .. } => Object::DefaultDict {
@@ -1031,6 +1116,11 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<Value> {
+        if let Some(target) = self.namespace_view(dict.object_id())? {
+            return self
+                .namespace_snapshot_dict(target)
+                .map_err(PyError::resource_error);
+        }
         let copy = match self
             .state
             .heap
@@ -1047,56 +1137,31 @@ impl PyRuntime for Vm<'_> {
         Vm::allocate_object(self, copy).map_err(PyError::resource_error)
     }
 
-    fn namespace_items(&mut self, namespace: PyNamespaceDict) -> PyResult<Vec<(Value, Value)>> {
-        let target = self
-            .namespace_target(namespace.object_id())
-            .map_err(PyError::runtime_error)?;
-        let entries = self
-            .namespace_entries(target)
-            .map_err(PyError::runtime_error)?;
-        let mut items = Vec::with_capacity(entries.len());
-        for (name, value) in entries {
-            let key = self
-                .allocate_string(name)
-                .map_err(PyError::resource_error)?;
-            items.push((key, value));
+    fn get_item(&mut self, container: Value, key: Value) -> PyResult<Value> {
+        self.subscript_value(container, key)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn mapping_items(&mut self, value: Value) -> PyResult<Option<Vec<(Value, Value)>>> {
+        Vm::mapping_items(self, value).map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn new_dict_view(&mut self, kind: DictViewKind, mapping: Value) -> PyResult<Value> {
+        let mapping = mapping
+            .object_id()
+            .ok_or_else(|| PyError::runtime_error("a dict view needs a mapping object"))?;
+        self.allocate_object(Object::DictView { kind, mapping })
+            .map_err(PyError::resource_error)
+    }
+
+    fn dict_view(&self, value: &Value) -> PyResult<Option<(DictViewKind, Value)>> {
+        let Some(id) = value.object_id() else {
+            return Ok(None);
+        };
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::DictView { kind, mapping } => Ok(Some((*kind, Value::Object(*mapping)))),
+            _ => Ok(None),
         }
-        Ok(items)
-    }
-
-    fn namespace_get(&mut self, namespace: PyNamespaceDict, name: &str) -> PyResult<Option<Value>> {
-        let target = self
-            .namespace_target(namespace.object_id())
-            .map_err(PyError::runtime_error)?;
-        self.namespace_lookup(target, name)
-            .map_err(PyError::runtime_error)
-    }
-
-    fn namespace_insert(
-        &mut self,
-        namespace: PyNamespaceDict,
-        name: String,
-        value: Value,
-    ) -> PyResult<()> {
-        let target = self
-            .namespace_target(namespace.object_id())
-            .map_err(PyError::runtime_error)?;
-        self.namespace_store(target, name, value)
-            .map_err(PyError::resource_error)
-    }
-
-    fn namespace_remove(
-        &mut self,
-        namespace: PyNamespaceDict,
-        name: &str,
-    ) -> PyResult<Option<Value>> {
-        let target = self
-            .namespace_target(namespace.object_id())
-            .map_err(PyError::runtime_error)?;
-        // Removing an attribute can convert a shaped instance to dictionary storage, which
-        // charges memory.
-        self.namespace_delete(target, name)
-            .map_err(PyError::resource_error)
     }
 
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<Value>> {

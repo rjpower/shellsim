@@ -9,11 +9,12 @@ use std::cmp::Ordering;
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, Zero};
 
+use super::super::heap::DictViewKind;
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
-    PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyNamespaceDict, PyProperty,
-    PyResult, PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult,
+    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
 };
 use super::super::number::{index_argument, PyNumber};
 use super::super::object_model::BuiltinType;
@@ -70,6 +71,7 @@ pub(crate) static STRING_TYPE: NativeTypeDef = NativeTypeDef {
         method("str", "join", string_join),
         method("str", "replace", string_replace),
         method("str", "format", string_format),
+        method("str", "format_map", string_format_map),
         method("str", "ljust", string_ljust),
         method("str", "rjust", string_rjust),
         method("str", "center", string_center),
@@ -219,29 +221,6 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
 
 /// `dict` methods bound to the type, so `dict.fromkeys(...)` and `{}.fromkeys(...)` agree.
 pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys", dict_fromkeys)];
-
-/// Named methods of the live namespace view behind `globals()`, `vars()` and `obj.__dict__`.
-/// Subscript access, `del`, `len`, `in` and `iter` are builtin-slot behavior (see
-/// `object_model::install_builtin_slots`). `repr` is handled directly in `Vm::repr_nested`,
-/// alongside `dict`, `list` and `set`, so it shares their cycle tracking.
-pub(crate) static NAMESPACE_DICT_TYPE: NativeTypeDef = NativeTypeDef {
-    name: "shellsim.namespace_dict",
-    methods: &[
-        method("shellsim.namespace_dict", "get", namespace_dict_get),
-        method("shellsim.namespace_dict", "keys", namespace_dict_keys),
-        method("shellsim.namespace_dict", "values", namespace_dict_values),
-        method("shellsim.namespace_dict", "items", namespace_dict_items),
-        method(
-            "shellsim.namespace_dict",
-            "setdefault",
-            namespace_dict_setdefault,
-        ),
-        method("shellsim.namespace_dict", "update", namespace_dict_update),
-        method("shellsim.namespace_dict", "pop", namespace_dict_pop),
-        method("shellsim.namespace_dict", "copy", namespace_dict_copy),
-    ],
-    getters: &[],
-};
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
@@ -2216,12 +2195,13 @@ pub(crate) fn slot_string_remainder(
         }
         let value = if let Some(key) = mapping_key {
             used_mapping = true;
-            let mapping = right.cast::<PyDict>(runtime)?;
-            let key_value = runtime.new_string(key.clone())?;
-            match runtime.dict_get(mapping, &key_value)? {
-                Some(value) => value,
-                None => return Err(runtime.exception_with_args("KeyError", vec![key_value])),
+            // Any mapping works here, read through its `__getitem__`; a tuple or string is a
+            // sequence of arguments instead.
+            if matches!(runtime.kind(&right)?, PyKind::Tuple | PyKind::String) {
+                return Err(PyError::type_error("format requires a mapping"));
             }
+            let key = runtime.new_string(key.clone())?;
+            runtime.get_item(right, key)?
         } else {
             let value = arguments
                 .get(argument)
@@ -2415,6 +2395,42 @@ fn percent_character(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<S
 
 fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let OwnedPyString(template) = receiver.cast(runtime)?;
+    format_template(
+        runtime,
+        &template,
+        args.positional(),
+        NamedFields::Keywords(args.keywords()),
+    )
+}
+
+/// `str.format_map(mapping)`: `str.format` with named fields read from `mapping` through its
+/// `__getitem__`, so a dict subclass's `__missing__` can supply absent names.
+fn string_format_map(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("format_map", 1, 1)?;
+    args.reject_keywords("format_map")?;
+    let OwnedPyString(template) = receiver.cast(runtime)?;
+    format_template(
+        runtime,
+        &template,
+        &[],
+        NamedFields::Mapping(args.positional()[0]),
+    )
+}
+
+/// Where a named replacement field such as `{name}` finds its value.
+enum NamedFields<'a> {
+    /// `str.format`'s keyword arguments.
+    Keywords(&'a [(String, PyValue)]),
+    /// `str.format_map`'s mapping.
+    Mapping(PyValue),
+}
+
+fn format_template(
+    runtime: &mut dyn PyRuntime,
+    template: &str,
+    positional: &[PyValue],
+    named: NamedFields<'_>,
+) -> PyResult {
     let mut result = String::new();
     let mut characters = template.chars().peekable();
     let mut automatic = 0usize;
@@ -2450,8 +2466,7 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                         ));
                     }
                     used_automatic = true;
-                    let value = args
-                        .positional()
+                    let value = positional
                         .get(automatic)
                         .ok_or_else(|| PyError::value_error("replacement index out of range"))?;
                     automatic = automatic.saturating_add(1);
@@ -2463,16 +2478,23 @@ fn string_format(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
                         ));
                     }
                     used_manual_index = true;
-                    *args
-                        .positional()
+                    *positional
                         .get(index)
                         .ok_or_else(|| PyError::value_error("replacement index out of range"))?
                 } else {
-                    match args.keywords().iter().find(|(name, _)| name == field) {
-                        Some((_, value)) => *value,
-                        None => {
+                    match named {
+                        NamedFields::Keywords(keywords) => {
+                            match keywords.iter().find(|(name, _)| name == field) {
+                                Some((_, value)) => *value,
+                                None => {
+                                    let key = runtime.new_string(field.to_string())?;
+                                    return Err(runtime.exception_with_args("KeyError", vec![key]));
+                                }
+                            }
+                        }
+                        NamedFields::Mapping(mapping) => {
                             let key = runtime.new_string(field.to_string())?;
-                            return Err(runtime.exception_with_args("KeyError", vec![key]));
+                            runtime.get_item(mapping, key)?
                         }
                     }
                 };
@@ -2919,36 +2941,28 @@ fn dict_lookup(
 }
 
 fn dict_keys(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    dict_projection(runtime, receiver, args, 0)
+    dict_view(runtime, receiver, args, DictViewKind::Keys)
 }
 
 fn dict_values(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    dict_projection(runtime, receiver, args, 1)
+    dict_view(runtime, receiver, args, DictViewKind::Values)
 }
 
 fn dict_items(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    dict_projection(runtime, receiver, args, 2)
+    dict_view(runtime, receiver, args, DictViewKind::Items)
 }
 
-fn dict_projection(
+/// A live view of the dict's keys, values or items, which `mapping_views` implements.
+fn dict_view(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     args: CallArgs,
-    projection: u8,
+    kind: DictViewKind,
 ) -> PyResult {
     args.expect_positional("dict view", 0, 0)?;
     args.reject_keywords("dict view")?;
-    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
-    let mut values = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        runtime.charge_cpu(1)?;
-        values.push(match projection {
-            0 => key,
-            1 => value,
-            _ => runtime.new_tuple(vec![key, value])?,
-        });
-    }
-    runtime.new_list(values)
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.new_dict_view(kind, Value::Object(dict.object_id()))
 }
 
 fn dict_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -2956,8 +2970,8 @@ fn dict_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     let dict = receiver.cast::<PyDict>(runtime)?;
     let mut additions = Vec::new();
     if let Some(source) = args.positional().first() {
-        if runtime.kind(source)? == PyKind::Dict {
-            additions.extend(source.cast::<PyDict>(runtime)?.items(runtime)?);
+        if let Some(entries) = runtime.mapping_items(*source)? {
+            additions.extend(entries);
         } else {
             let iterator = runtime.iterator(*source)?;
             while let Some(item) = runtime.iterator_next(iterator)? {
@@ -3041,178 +3055,18 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     runtime.dict_copy(dict)
 }
 
-fn namespace_dict_get(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    namespace_dict_lookup(runtime, receiver, args, false)
-}
-
-fn namespace_dict_setdefault(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
-    namespace_dict_lookup(runtime, receiver, args, true)
-}
-
-/// A namespace binds only names, so a key that is not a `str` is simply absent, as a key of the
-/// wrong type is in an ordinary dict.
-fn namespace_key(runtime: &dyn PyRuntime, key: PyValue) -> PyResult<Option<String>> {
-    runtime.string_value(&key)
-}
-
-/// The name to bind for `namespace[key] = value`. CPython's namespaces are real dicts and accept
-/// any hashable key; shellsim's live on name-keyed storage, so other keys are rejected.
-fn namespace_store_key(runtime: &dyn PyRuntime, key: PyValue) -> PyResult<String> {
-    match namespace_key(runtime, key)? {
-        Some(name) => Ok(name),
-        None => Err(PyError::type_error(format!(
-            "namespace keys must be str, not {}",
-            runtime.type_name(&key)?
-        ))),
-    }
-}
-
-fn namespace_dict_lookup(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-    insert: bool,
-) -> PyResult {
-    let method = if insert { "setdefault" } else { "get" };
-    args.expect_positional(method, 1, 2)?;
-    args.reject_keywords(method)?;
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let key = args.positional()[0];
-    let default = args.positional().get(1).copied().unwrap_or(Value::None);
-    if !insert {
-        let Some(name) = namespace_key(runtime, key)? else {
-            return Ok(default);
-        };
-        return Ok(runtime.namespace_get(namespace, &name)?.unwrap_or(default));
-    }
-    let name = namespace_store_key(runtime, key)?;
-    if let Some(value) = runtime.namespace_get(namespace, &name)? {
-        return Ok(value);
-    }
-    runtime.namespace_insert(namespace, name, default)?;
-    Ok(default)
-}
-
-fn namespace_dict_keys(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    namespace_dict_projection(runtime, receiver, args, 0)
-}
-
-fn namespace_dict_values(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
-    namespace_dict_projection(runtime, receiver, args, 1)
-}
-
-fn namespace_dict_items(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
-    namespace_dict_projection(runtime, receiver, args, 2)
-}
-
-/// `keys()`, `values()` and `items()` return plain lists rather than live dict views. Programs
-/// iterate, sort or test membership on them; none of that needs a view that tracks later
-/// mutation.
-fn namespace_dict_projection(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-    projection: u8,
-) -> PyResult {
-    args.expect_positional("namespace view", 0, 0)?;
-    args.reject_keywords("namespace view")?;
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let entries = runtime.namespace_items(namespace)?;
-    let mut values = Vec::with_capacity(entries.len());
-    for (key, value) in entries {
-        runtime.charge_cpu(1)?;
-        values.push(match projection {
-            0 => key,
-            1 => value,
-            _ => runtime.new_tuple(vec![key, value])?,
-        });
-    }
-    runtime.new_list(values)
-}
-
-fn namespace_dict_update(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
-    args.expect_positional("update", 0, 1)?;
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let mut additions = Vec::new();
-    if let Some(source) = args.positional().first() {
-        if runtime.kind(source)? == PyKind::Dict {
-            additions.extend(source.cast::<PyDict>(runtime)?.items(runtime)?);
-        } else {
-            let iterator = runtime.iterator(*source)?;
-            while let Some(item) = runtime.iterator_next(iterator)? {
-                let pair = item.cast::<PySequence>(runtime)?.items(runtime)?;
-                if pair.len() != 2 {
-                    return Err(PyError::value_error(
-                        "dictionary update sequence element has length other than 2",
-                    ));
-                }
-                additions.push((pair[0], pair[1]));
-            }
-        }
-    }
-    for (name, value) in args.keywords() {
-        additions.push((runtime.new_string(name.clone())?, *value));
-    }
-    for (key, value) in additions {
-        let name = namespace_store_key(runtime, key)?;
-        runtime.namespace_insert(namespace, name, value)?;
-    }
-    Ok(Value::None)
-}
-
-fn namespace_dict_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("pop", 1, 2)?;
-    args.reject_keywords("pop")?;
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let key = args.positional()[0];
-    if let Some(name) = namespace_key(runtime, key)? {
-        if let Some(value) = runtime.namespace_remove(namespace, &name)? {
-            return Ok(value);
-        }
-    }
-    if let Some(default) = args.positional().get(1) {
-        return Ok(*default);
-    }
-    Err(runtime.exception_with_args("KeyError", vec![key]))
-}
-
-/// `copy()` returns a plain, detached `dict`, as CPython's `globals().copy()` does.
-fn namespace_dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("copy", 0, 0)?;
-    args.reject_keywords("copy")?;
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let entries = runtime.namespace_items(namespace)?;
-    runtime.new_dict(entries)
-}
-
+/// `view[key]` for a namespace view, which the VM's builtin subscript does not cover. The view's
+/// other dict behavior comes from `dict`'s own methods, through the runtime's dict accessors.
 pub(crate) fn slot_namespace_dict_get_item(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
     key: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    if let Some(name) = namespace_key(runtime, key)? {
-        if let Some(value) = runtime.namespace_get(namespace, &name)? {
-            return Ok(Some(value));
-        }
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    match runtime.dict_get(dict, &key)? {
+        Some(value) => Ok(Some(value)),
+        None => Err(runtime.exception_with_args("KeyError", vec![key])),
     }
-    Err(runtime.exception_with_args("KeyError", vec![key]))
 }
 
 pub(crate) fn slot_namespace_dict_set_item(
@@ -3221,34 +3075,18 @@ pub(crate) fn slot_namespace_dict_set_item(
     key: PyValue,
     value: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let name = namespace_store_key(runtime, key)?;
-    runtime.namespace_insert(namespace, name, value)?;
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    runtime.dict_insert(dict, key, value)?;
     Ok(Some(Value::None))
-}
-
-pub(crate) fn slot_namespace_dict_delete_item(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    key: PyValue,
-) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    if let Some(name) = namespace_key(runtime, key)? {
-        if runtime.namespace_remove(namespace, &name)?.is_some() {
-            return Ok(Some(Value::None));
-        }
-    }
-    Err(runtime.exception_with_args("KeyError", vec![key]))
 }
 
 pub(crate) fn slot_namespace_dict_length(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let length = runtime.namespace_items(namespace)?.len();
+    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
     let length =
-        i64::try_from(length).map_err(|_| PyError::overflow_error("namespace is too large"))?;
+        i64::try_from(entries.len()).map_err(|_| PyError::overflow_error("dict is too large"))?;
     Ok(Some(Value::Int(length)))
 }
 
@@ -3257,21 +3095,17 @@ pub(crate) fn slot_namespace_dict_contains(
     receiver: PyValue,
     key: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let found = match namespace_key(runtime, key)? {
-        Some(name) => runtime.namespace_get(namespace, &name)?.is_some(),
-        None => false,
-    };
-    Ok(Some(Value::Bool(found)))
+    let dict = receiver.cast::<PyDict>(runtime)?;
+    Ok(Some(Value::Bool(runtime.dict_get(dict, &key)?.is_some())))
 }
 
 pub(crate) fn slot_namespace_dict_iter(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let namespace = receiver.cast::<PyNamespaceDict>(runtime)?;
-    let keys = runtime
-        .namespace_items(namespace)?
+    let keys = receiver
+        .cast::<PyDict>(runtime)?
+        .items(runtime)?
         .into_iter()
         .map(|(key, _)| key)
         .collect();
@@ -3600,14 +3434,20 @@ fn set_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> P
     }
 }
 
+/// Whether `left`'s members are all in `right`, and whether `left` is smaller; `None` when
+/// `right` is not a set, so the comparison declines and a set-like right operand, such as a
+/// dict keys view, can answer through its reflected slot.
 fn set_is_subset(
     runtime: &mut dyn PyRuntime,
     left: PyValue,
     right: PyValue,
-) -> PyResult<(bool, bool)> {
+) -> PyResult<Option<(bool, bool)>> {
     let left = left.cast::<PySet>(runtime)?;
     let left = left.items(runtime)?;
-    let right = right.cast::<PySet>(runtime)?.items(runtime)?;
+    let Ok(right) = right.cast::<PySet>(runtime) else {
+        return Ok(None);
+    };
+    let right = right.items(runtime)?;
     let mut subset = true;
     for value in &left {
         let mut present = false;
@@ -3623,7 +3463,7 @@ fn set_is_subset(
             break;
         }
     }
-    Ok((subset, left.len() < right.len()))
+    Ok(Some((subset, left.len() < right.len())))
 }
 
 pub(crate) fn slot_set_less(
@@ -3631,8 +3471,8 @@ pub(crate) fn slot_set_less(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    let (subset, smaller) = set_is_subset(runtime, left, right)?;
-    Ok(Some(Value::Bool(subset && smaller)))
+    let relation = set_is_subset(runtime, left, right)?;
+    Ok(relation.map(|(subset, smaller)| Value::Bool(subset && smaller)))
 }
 
 pub(crate) fn slot_set_less_equal(
@@ -3640,7 +3480,8 @@ pub(crate) fn slot_set_less_equal(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
-    Ok(Some(Value::Bool(set_is_subset(runtime, left, right)?.0)))
+    let relation = set_is_subset(runtime, left, right)?;
+    Ok(relation.map(|(subset, _)| Value::Bool(subset)))
 }
 
 pub(crate) fn slot_set_greater(
@@ -3648,6 +3489,9 @@ pub(crate) fn slot_set_greater(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if right.cast::<PySet>(runtime).is_err() {
+        return Ok(None);
+    }
     slot_set_less(runtime, right, left)
 }
 
@@ -3656,6 +3500,9 @@ pub(crate) fn slot_set_greater_equal(
     left: PyValue,
     right: PyValue,
 ) -> PyResult<Option<PyValue>> {
+    if right.cast::<PySet>(runtime).is_err() {
+        return Ok(None);
+    }
     slot_set_less_equal(runtime, right, left)
 }
 

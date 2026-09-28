@@ -30,7 +30,8 @@ enum ContainerPair {
 enum EqualityKind {
     /// Equality is structural and cannot run user code.
     Plain,
-    /// A builtin list, tuple, dict or set, or a namespace view, compared element by element.
+    /// A builtin list, tuple, dict or set, a namespace view or a mapping proxy, compared
+    /// element by element.
     Container,
     /// A user class instance, which may define `__eq__`, or a value whose native type has an
     /// equality slot.
@@ -78,14 +79,13 @@ impl Vm<'_> {
         let (Some(left_id), Some(right_id)) = (left.object_id(), right.object_id()) else {
             return protocol::equals(&self.state.heap, left, right);
         };
-        // A namespace view compares as the dict of its current bindings, so
-        // `globals() == globals()` and `vars(a) == {"x": 1}` hold as they do in CPython.
-        if let Object::NamespaceDict(target) = *self.state.heap.get(left_id)? {
-            let left = self.namespace_snapshot_dict(target)?;
+        // A namespace view or mapping proxy compares as the dict of its current entries, so
+        // `globals() == globals()`, `vars(a) == {"x": 1}` and `A.__dict__ == A.__dict__` hold
+        // as they do in CPython.
+        if let Some(left) = self.mapping_snapshot(left_id)? {
             return self.builtin_equality_at(&left, right, depth);
         }
-        if let Object::NamespaceDict(target) = *self.state.heap.get(right_id)? {
-            let right = self.namespace_snapshot_dict(target)?;
+        if let Some(right) = self.mapping_snapshot(right_id)? {
             return self.builtin_equality_at(left, &right, depth);
         }
         let pair = match (
@@ -117,6 +117,17 @@ impl Vm<'_> {
         }
     }
 
+    /// A dict of the current entries when `id` is a namespace view or mapping proxy, whose
+    /// entries live outside the object.
+    fn mapping_snapshot(&mut self, id: ObjectId) -> Result<Option<Value>, String> {
+        let entries = match *self.state.heap.get(id)? {
+            Object::NamespaceDict(target) => self.namespace_items(target)?,
+            Object::MappingProxy(target) => self.proxy_items(target)?,
+            _ => return Ok(None),
+        };
+        self.allocate_object(Object::Dict(entries.into())).map(Some)
+    }
+
     fn equality_kind(&self, value: &Value) -> Result<EqualityKind, String> {
         if let Some(id) = value.object_id() {
             match self.state.heap.get(id)? {
@@ -127,7 +138,8 @@ impl Vm<'_> {
                 | Object::DefaultDict { .. }
                 | Object::Set(_)
                 | Object::FrozenSet(_)
-                | Object::NamespaceDict(_) => return Ok(EqualityKind::Container),
+                | Object::NamespaceDict(_)
+                | Object::MappingProxy(_) => return Ok(EqualityKind::Container),
                 _ => {}
             }
         }

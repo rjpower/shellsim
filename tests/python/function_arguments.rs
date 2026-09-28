@@ -64,17 +64,20 @@ fn keyword_variadics_and_mapping_expansion_share_the_call_binder() {
 }
 
 #[test]
-fn invalid_keyword_expansion_fails_loudly() {
+fn invalid_keyword_expansion_raises_type_error() {
     for (source, expected) in [
-        ("dict(**[])\n", "argument after ** must be a mapping"),
-        ("dict(**{1: 2})\n", "keywords must be strings"),
+        (
+            "dict(**[])\n",
+            "TypeError: argument after ** must be a mapping",
+        ),
+        ("dict(**{1: 2})\n", "TypeError: keywords must be strings"),
         (
             "def f(**kwargs): return kwargs\nf(value=1, **{'value': 2})\n",
             "multiple values for keyword argument",
         ),
     ] {
         let (status, stdout, stderr) = run_python(source);
-        assert_eq!(status, 2);
+        assert_eq!(status, 1);
         assert!(stdout.is_empty());
         assert!(
             String::from_utf8_lossy(&stderr).contains(expected),

@@ -695,7 +695,7 @@ impl Vm<'_> {
     fn dispatch_pop_expression(&mut self) -> Result<DispatchControl, String> {
         let value = self.pop()?;
         if self.mode.interactive && !matches!(value, Value::None) {
-            let rendered = protocol::repr(&self.state.heap, &value)?;
+            let rendered = self.repr_value(&value)?;
             self.out.extend_from_slice(rendered.as_bytes());
             self.out.push(b'\n');
         }

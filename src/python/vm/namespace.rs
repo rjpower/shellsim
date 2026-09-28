@@ -2,7 +2,7 @@
 
 use super::{
     cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
-    HashMap, NameId, NamespaceTarget, NativeValue, Object, ObjectId, PyModuleLoader, PyRuntime,
+    HashMap, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader, PyRuntime,
     RaisedException, ScopeId, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 
@@ -414,37 +414,61 @@ impl Vm<'_> {
         &mut self,
         target: NamespaceTarget,
     ) -> Result<Value, String> {
+        let items = self.namespace_items(target)?;
+        self.allocate_object(Object::Dict(items.into()))
+    }
+
+    /// `target`'s bindings as `(key, value)` pairs with freshly allocated string keys, in the
+    /// order [`Self::namespace_entries`] gives.
+    pub(super) fn namespace_items(
+        &mut self,
+        target: NamespaceTarget,
+    ) -> Result<Vec<(Value, Value)>, String> {
         let entries = self.namespace_entries(target)?;
-        let mut pairs = Vec::with_capacity(entries.len());
+        let mut items = Vec::with_capacity(entries.len());
         for (name, value) in entries {
-            pairs.push((self.allocate_string(name)?, value));
+            items.push((self.allocate_string(name)?, value));
         }
-        self.allocate_object(Object::Dict(pairs.into()))
+        Ok(items)
     }
 
-    /// The namespace `owner.__dict__` and `vars(owner)` view, or `None` when `owner` has none
-    /// that shellsim can expose live. Modules written in Python and class instances qualify;
-    /// classes, native modules and builtin values do not.
-    pub(super) fn attribute_namespace(
-        &self,
-        owner: &Value,
-    ) -> Result<Option<NamespaceTarget>, String> {
-        let Some(id) = owner.object_id() else {
-            return Ok(None);
+    /// The entries of a class's or native module's read-only `__dict__`, sorted by name, with
+    /// freshly allocated string keys. Class attributes live in a `HashMap` and native modules
+    /// declare functions apart from values, so neither keeps CPython's definition order.
+    pub(super) fn proxy_items(
+        &mut self,
+        target: ProxyTarget,
+    ) -> Result<Vec<(Value, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = match target {
+            ProxyTarget::Class(class) => {
+                let Object::Class { attributes, .. } = self.state.heap.get(class)? else {
+                    return Err("mappingproxy target is not a class".into());
+                };
+                attributes
+                    .iter()
+                    .map(|(name, value)| (name.clone(), *value))
+                    .collect()
+            }
+            ProxyTarget::NativeModule(module) => {
+                let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
+                for function in module.functions {
+                    let value = Value::Native(NativeValue::NativeFunction(function));
+                    entries.push((function.name.to_string(), value));
+                }
+                for definition in module.values {
+                    let value = definition.get(self).map_err(|error| error.to_string())?;
+                    entries.push((definition.name().to_string(), value));
+                }
+                entries
+            }
         };
-        Ok(match self.state.heap.get(id)? {
-            Object::Module { scope, .. } => Some(NamespaceTarget::Scope(*scope)),
-            Object::Instance { .. } => Some(NamespaceTarget::Instance(id)),
-            _ => None,
-        })
-    }
-
-    /// The target a live namespace view refers to.
-    pub(super) fn namespace_target(&self, id: ObjectId) -> Result<NamespaceTarget, String> {
-        match self.state.heap.get(id)? {
-            Object::NamespaceDict(target) => Ok(*target),
-            _ => Err("value is not a namespace view".into()),
+        self.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
+        entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let mut items = Vec::with_capacity(entries.len());
+        for (name, value) in entries {
+            items.push((self.allocate_string(name)?, value));
         }
+        Ok(items)
     }
 
     /// Every binding a namespace target currently holds, in a deterministic order.

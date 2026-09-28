@@ -566,6 +566,12 @@ fn python_repl_persists_and_returns_to_shell() {
     assert_eq!(String::from_utf8_lossy(&assigned), ">>> ");
     let (_, evaluated, _) = env.run_script_capture("x + 3");
     assert_eq!(String::from_utf8_lossy(&evaluated), "7\n>>> ");
+    // Echo uses the full repr protocol: a user `__repr__` and a dict view.
+    env.run_script_capture("class P:\n    def __repr__(self):\n        return 'P!'\n");
+    let (_, custom, _) = env.run_script_capture("P()");
+    assert_eq!(String::from_utf8_lossy(&custom), "P!\n>>> ");
+    let (_, view, _) = env.run_script_capture("{'a': 1}.keys()");
+    assert_eq!(String::from_utf8_lossy(&view), "dict_keys(['a'])\n>>> ");
 
     env.run_script_capture("exit()");
     assert!(!env.in_python_repl());

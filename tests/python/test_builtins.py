@@ -128,6 +128,76 @@ def test_dict_pop_raises_key_error_with_the_key():
     assert raised(lambda: {}.pop(3)) == (KeyError, "3")
 
 
+def test_dict_views_follow_the_dict():
+    value = {"a": 1, "b": 2}
+    keys, values, items = value.keys(), value.values(), value.items()
+    assert [type(view).__name__ for view in (keys, values, items)] == ["dict_keys", "dict_values", "dict_items"]
+    value["c"] = 3
+    del value["a"]
+    assert (len(keys), list(keys), list(values), list(items)) == (2, ["b", "c"], [2, 3], [("b", 2), ("c", 3)])
+    assert ("b" in keys, "a" in keys, 3 in values, 9 in values) == (True, False, True, False)
+    assert (("c", 3) in items, ("c", 4) in items, "c" in items) == (True, False, False)
+    assert list(reversed(keys)) == ["c", "b"]
+    assert (bool({}.keys()), bool(keys)) == (False, True)
+    assert (repr(items), str(keys)) == ("dict_items([('b', 2), ('c', 3)])", "dict_keys(['b', 'c'])")
+    nested = {}
+    nested["self"] = nested.values()
+    assert repr(nested) == "{'self': dict_values([...])}"
+    assert raised(lambda: keys[0]) == (TypeError, "'dict_keys' object is not subscriptable")
+    assert raised(lambda: hash(keys)) == (TypeError, "unhashable type: 'dict_keys'")
+
+
+def test_keys_and_items_views_are_set_like():
+    keys = {"a": 1, "b": 2}.keys()
+    assert keys == {"a", "b"} and {"a", "b"} == keys and keys != ["a", "b"]
+    assert keys == {"b": 0, "a": 0}.keys()
+    assert (keys & {"a", "z"}, {"a", "z"} & keys) == ({"a"}, {"a"})
+    assert (keys | ["z"], keys ^ {"a", "z"}, keys - {"a"}, ["a", "z"] - keys) == (
+        {"a", "b", "z"},
+        {"b", "z"},
+        {"b"},
+        {"z"},
+    )
+    assert (keys <= {"a", "b"}, keys < {"a", "b"}, {"a"} < keys, keys >= {"a"}) == (True, False, True, True)
+    assert (keys.isdisjoint(["x"]), keys.isdisjoint(["x", "a"])) == (True, False)
+    assert raised(lambda: keys | 1) == (TypeError, "'int' object is not iterable")
+    items = {"a": 1}.items()
+    assert items == {("a", 1)} and items & {("a", 1), ("b", 2)} == {("a", 1)}
+    values = {"a": 1}.values()
+    assert values == values and values != {"a": 1}.values()
+
+
+def test_objects_with_keys_and_getitem_are_mappings():
+    class Mapping:
+        def keys(self):
+            return ["x", "y"]
+
+        def __getitem__(self, key):
+            return key.upper()
+
+    def collect(**kwargs):
+        return kwargs
+
+    assert collect(**Mapping()) == {"x": "X", "y": "Y"}
+    assert {**Mapping(), "z": 1} == {"x": "X", "y": "Y", "z": 1}
+    updated = {}
+    updated.update(Mapping())
+    assert updated == {"x": "X", "y": "Y"}
+    assert "%(x)s-%(y)s" % Mapping() == "X-Y"
+    assert "{x}/{y}".format_map(Mapping()) == "X/Y"
+
+    class Defaults(dict):
+        def __missing__(self, key):
+            return f"<{key}>"
+
+    assert "{a} {b}".format_map(Defaults(a=1)) == "1 <b>"
+    assert raised(lambda: {**[1]}) == (TypeError, "'list' object is not a mapping")
+    assert raised(lambda: collect(**[1]))[0] is TypeError
+    assert raised(lambda: collect(**{1: 2})) == (TypeError, "keywords must be strings")
+    assert raised(lambda: collect(a=1, **{"a": 2}))[0] is TypeError
+    assert raised(lambda: "%(x)s" % ("a",)) == (TypeError, "format requires a mapping")  # noqa: F502 - exercise the error
+
+
 def test_set_pop_and_clear():
     values = {1, 2, 3}
     popped = values.pop()

@@ -59,6 +59,11 @@ pub(super) enum BuiltinType {
     /// The live namespace view behind `globals()`, `vars()` and `obj.__dict__`. See
     /// `heap::Object::NamespaceDict`.
     NamespaceDict,
+    DictKeys,
+    DictValues,
+    DictItems,
+    /// A read-only mapping: a class's `__dict__` or a native module's namespace.
+    MappingProxy,
     ArgumentParser,
     RaisesContext,
     Property,
@@ -68,7 +73,7 @@ pub(super) enum BuiltinType {
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 34] = [
+    pub(super) const ALL: [Self; 38] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -97,6 +102,10 @@ impl BuiltinType {
         Self::Stream,
         Self::Environment,
         Self::NamespaceDict,
+        Self::DictKeys,
+        Self::DictValues,
+        Self::DictItems,
+        Self::MappingProxy,
         Self::ArgumentParser,
         Self::RaisesContext,
         Self::Property,
@@ -139,6 +148,10 @@ impl BuiltinType {
             Self::Stream => "shellsim.stream",
             Self::Environment => "shellsim.environment",
             Self::NamespaceDict => "shellsim.namespace_dict",
+            Self::DictKeys => "dict_keys",
+            Self::DictValues => "dict_values",
+            Self::DictItems => "dict_items",
+            Self::MappingProxy => "mappingproxy",
             Self::ArgumentParser => "argparse.ArgumentParser",
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
@@ -673,6 +686,22 @@ impl Default for TypeRegistry {
             super::stdlib::core::DICT_CLASS_METHODS,
         );
         install_native_attributes(
+            &mut types[BuiltinType::DictKeys as usize],
+            &super::stdlib::mapping_views::DICT_KEYS_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::DictValues as usize],
+            &super::stdlib::mapping_views::DICT_VALUES_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::DictItems as usize],
+            &super::stdlib::mapping_views::DICT_ITEMS_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::MappingProxy as usize],
+            &super::stdlib::mapping_views::MAPPING_PROXY_TYPE,
+        );
+        install_native_attributes(
             &mut types[BuiltinType::Set as usize],
             &super::stdlib::core::SET_TYPE,
         );
@@ -705,10 +734,6 @@ impl Default for TypeRegistry {
             &super::stdlib::os::ENVIRONMENT_TYPE,
         );
         install_native_attributes(
-            &mut types[BuiltinType::NamespaceDict as usize],
-            &super::stdlib::core::NAMESPACE_DICT_TYPE,
-        );
-        install_native_attributes(
             &mut types[BuiltinType::ArgumentParser as usize],
             &super::stdlib::argparse::ARGUMENT_PARSER_TYPE,
         );
@@ -720,6 +745,11 @@ impl Default for TypeRegistry {
             install_native_attributes(&mut types[BuiltinType::Array as usize], definition);
         }
         install_number_attributes(&mut types);
+        // A namespace view is a `dict` whose storage is a module scope, the script table or an
+        // instance's attributes. The runtime's dict accessors read and write that storage, so
+        // `dict`'s own methods serve it unchanged.
+        types[BuiltinType::NamespaceDict as usize].attributes =
+            types[BuiltinType::Dict as usize].attributes.clone();
         install_builtin_slots(&mut types);
         let mut registry = Self {
             types,
@@ -1043,6 +1073,10 @@ fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>) {
             vec![BuiltinType::Int.id()],
             vec![BuiltinType::Int.id(), object],
         ),
+        BuiltinType::NamespaceDict => (
+            vec![BuiltinType::Dict.id()],
+            vec![BuiltinType::Dict.id(), object],
+        ),
         _ => (vec![object], vec![object]),
     }
 }
@@ -1201,13 +1235,14 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_union));
     slots.reflected_bitwise_or = Some(intrinsic(super::stdlib::core::slot_dict_reflected_union));
 
+    // The VM's builtin subscript, `len`, `in` and iteration read stored dicts directly, so a
+    // namespace view supplies those through slots and inherits the rest from `dict`.
+    types[BuiltinType::NamespaceDict as usize].slots =
+        types[BuiltinType::Dict as usize].slots.clone();
     let slots = &mut types[BuiltinType::NamespaceDict as usize].slots;
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_namespace_dict_get_item));
     slots.set_item = Some(SlotValue::NativeTernary(
         super::stdlib::core::slot_namespace_dict_set_item,
-    ));
-    slots.delete_item = Some(intrinsic(
-        super::stdlib::core::slot_namespace_dict_delete_item,
     ));
     slots.length = Some(unary(super::stdlib::core::slot_namespace_dict_length));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_namespace_dict_contains));
@@ -1216,6 +1251,40 @@ fn install_builtin_slots(types: &mut [PyType]) {
     // same cycle-tracking set as `dict`, `list` and `set`. A slot implemented through the erased
     // `PyRuntime::repr` would start a fresh cycle-tracking set per nested call and recurse
     // forever on `g = globals()`.
+
+    for view in [
+        BuiltinType::DictKeys,
+        BuiltinType::DictValues,
+        BuiltinType::DictItems,
+    ] {
+        use super::stdlib::mapping_views as views;
+        let slots = &mut types[view as usize].slots;
+        slots.length = Some(unary(views::slot_view_length));
+        slots.iter = Some(unary(views::slot_view_iter));
+        slots.contains = Some(intrinsic(views::slot_view_contains));
+        if view == BuiltinType::DictValues {
+            continue;
+        }
+        // Keys and items views are set-like; a values view compares by identity.
+        slots.equal = Some(intrinsic(views::slot_view_equal));
+        slots.less_than = Some(intrinsic(views::slot_view_less));
+        slots.less_equal = Some(intrinsic(views::slot_view_less_equal));
+        slots.greater_than = Some(intrinsic(views::slot_view_greater));
+        slots.greater_equal = Some(intrinsic(views::slot_view_greater_equal));
+        slots.bitwise_and = Some(intrinsic(views::slot_view_and));
+        slots.reflected_bitwise_and = Some(intrinsic(views::slot_view_reflected_and));
+        slots.bitwise_or = Some(intrinsic(views::slot_view_or));
+        slots.reflected_bitwise_or = Some(intrinsic(views::slot_view_reflected_or));
+        slots.bitwise_xor = Some(intrinsic(views::slot_view_xor));
+        slots.reflected_bitwise_xor = Some(intrinsic(views::slot_view_reflected_xor));
+        slots.subtract = Some(intrinsic(views::slot_view_subtract));
+        slots.reflected_subtract = Some(intrinsic(views::slot_view_reflected_subtract));
+    }
+    let slots = &mut types[BuiltinType::MappingProxy as usize].slots;
+    slots.get_item = Some(intrinsic(super::stdlib::mapping_views::slot_proxy_get_item));
+    slots.length = Some(unary(super::stdlib::mapping_views::slot_proxy_length));
+    slots.contains = Some(intrinsic(super::stdlib::mapping_views::slot_proxy_contains));
+    slots.iter = Some(unary(super::stdlib::mapping_views::slot_proxy_iter));
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
     slots.subtract = Some(intrinsic(super::stdlib::core::slot_set_subtract));

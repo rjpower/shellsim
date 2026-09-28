@@ -20,6 +20,7 @@ mod importlib;
 mod introspect;
 pub mod itertools;
 pub mod json;
+pub mod mapping_views;
 pub mod math;
 pub mod numpy;
 mod operator;

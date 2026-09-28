@@ -2,7 +2,7 @@
 
 use std::collections::BTreeSet;
 
-use super::super::heap::{NamespaceTarget, ObjectId};
+use super::super::heap::{DictViewKind, NamespaceTarget, ObjectId, ProxyTarget};
 use super::{
     exception_types, expect_arity, protocol, range_length, select_string_slice, Arc,
     BuiltinSubscript, BuiltinType, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout,
@@ -304,6 +304,10 @@ impl Vm<'_> {
         name: &str,
     ) -> Result<Option<Value>, String> {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
+            if name == "__dict__" {
+                let proxy = Object::MappingProxy(ProxyTarget::NativeModule(module));
+                return self.allocate_object(proxy).map(Some);
+            }
             if let Some(function) = module.function(name) {
                 return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
             }
@@ -400,6 +404,12 @@ impl Vm<'_> {
                 } => {
                     if name == "__name__" {
                         return Ok(Some(self.allocate_string(class_name)?));
+                    }
+                    // `type.__dict__` is a data descriptor, so it wins over the class's own
+                    // attributes. The proxy is read-only; `setattr(cls, ...)` still works.
+                    if name == "__dict__" {
+                        let proxy = Object::MappingProxy(ProxyTarget::Class(id));
+                        return self.allocate_object(proxy).map(Some);
                     }
                     if let Some(value) = self.class_metadata(id, name)? {
                         return Ok(Some(value));
@@ -990,9 +1000,15 @@ impl Vm<'_> {
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {
         let index = self.pop()?;
         let owner = self.pop()?;
+        let value = self.subscript_value(owner, index)?;
+        self.stack.push(value);
+        Ok(())
+    }
+
+    /// `owner[index]`: the owner's `__getitem__` or its builtin subscript.
+    pub(super) fn subscript_value(&mut self, owner: Value, index: Value) -> Result<Value, String> {
         if let Some(value) = self.invoke_slot(&owner, Slot::GetItem, "__getitem__", vec![index])? {
-            self.stack.push(value);
-            return Ok(());
+            return Ok(value);
         }
         let subject = owner;
         let owner = self.builtin_view(owner)?;
@@ -1007,8 +1023,7 @@ impl Vm<'_> {
         if !mapping {
             if let Some((start, stop, step)) = self.slice_bounds(&index)? {
                 let value = self.load_builtin_slice(owner, start, stop, step)?;
-                self.stack.push(value);
-                return Ok(());
+                return Ok(value);
             }
         }
         let index = self.sequence_index(&owner, index)?;
@@ -1128,7 +1143,9 @@ impl Vm<'_> {
                 | Object::Namespace { .. }
                 | Object::EnumMember { .. }
                 | Object::RaisesContext { .. }
-                | Object::NamespaceDict(_) => BuiltinSubscript::Unsupported,
+                | Object::NamespaceDict(_)
+                | Object::DictView { .. }
+                | Object::MappingProxy(_) => BuiltinSubscript::Unsupported,
                 Object::Property { .. }
                 | Object::StaticMethod { .. }
                 | Object::ClassMethod { .. }
@@ -1182,8 +1199,7 @@ impl Vm<'_> {
         } else {
             return Err(self.raise_object_type_error(&owner, "is not subscriptable"));
         };
-        self.stack.push(value);
-        Ok(())
+        Ok(value)
     }
 
     /// The value a dict subclass's `__missing__(key)` supplies for an absent key, or `None` when
@@ -2802,8 +2818,17 @@ impl Vm<'_> {
                 .ok_or_else(|| "__repr__ should return str".into());
         }
         if let Some(id) = value.object_id() {
-            if let Object::NamespaceDict(target) = *self.state.heap.get(id)? {
-                return self.repr_namespace_dict(id, target, active);
+            match *self.state.heap.get(id)? {
+                Object::NamespaceDict(target) => {
+                    return self.repr_namespace_dict(id, target, active);
+                }
+                Object::DictView { kind, mapping } => {
+                    return self.repr_dict_view(id, kind, mapping, active);
+                }
+                Object::MappingProxy(target) => {
+                    return self.repr_mapping_proxy(id, target, active);
+                }
+                _ => {}
             }
         }
         let Some((id, container)) = self.container_items(value)? else {
@@ -2825,18 +2850,79 @@ impl Vm<'_> {
             ContainerItems::FrozenSet(items) => {
                 format!("frozenset({{{}}})", self.repr_items(&items, active)?)
             }
-            ContainerItems::Dict(entries) => {
-                let mut parts = Vec::with_capacity(entries.len());
-                for (key, item) in &entries {
-                    let key = self.repr_nested(key, active)?;
-                    let item = self.repr_nested(item, active)?;
-                    parts.push(format!("{key}: {item}"));
-                }
-                format!("{{{}}}", parts.join(", "))
-            }
+            ContainerItems::Dict(entries) => self.repr_entries(&entries, active)?,
         };
         active.remove(&id);
         Ok(rendered)
+    }
+
+    /// Dict-literal text for `entries`: `{key: value, ...}`.
+    fn repr_entries(
+        &mut self,
+        entries: &[(Value, Value)],
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        let mut parts = Vec::with_capacity(entries.len());
+        for (key, item) in entries {
+            let key = self.repr_nested(key, active)?;
+            let item = self.repr_nested(item, active)?;
+            parts.push(format!("{key}: {item}"));
+        }
+        Ok(format!("{{{}}}", parts.join(", ")))
+    }
+
+    /// `dict_keys([...])`, `dict_values([...])` or `dict_items([...])` for a view of the
+    /// mapping's current entries. A view reached again while it renders prints `...`, as in
+    /// CPython.
+    fn repr_dict_view(
+        &mut self,
+        id: ObjectId,
+        kind: DictViewKind,
+        mapping: ObjectId,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        if !active.insert(id) {
+            return Ok("...".into());
+        }
+        let entries = self
+            .mapping_items(Value::Object(mapping))?
+            .ok_or("a dict view needs a mapping")?;
+        self.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
+        let mut parts = Vec::with_capacity(entries.len());
+        for (key, item) in &entries {
+            parts.push(match kind {
+                DictViewKind::Keys => self.repr_nested(key, active)?,
+                DictViewKind::Values => self.repr_nested(item, active)?,
+                DictViewKind::Items => format!(
+                    "({}, {})",
+                    self.repr_nested(key, active)?,
+                    self.repr_nested(item, active)?
+                ),
+            });
+        }
+        active.remove(&id);
+        let name = match kind {
+            DictViewKind::Keys => "dict_keys",
+            DictViewKind::Values => "dict_values",
+            DictViewKind::Items => "dict_items",
+        };
+        Ok(format!("{name}([{}])", parts.join(", ")))
+    }
+
+    /// `mappingproxy({...})` over a class's or native module's current attributes.
+    fn repr_mapping_proxy(
+        &mut self,
+        id: ObjectId,
+        target: ProxyTarget,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
+        if !active.insert(id) {
+            return Ok("...".into());
+        }
+        let entries = self.proxy_items(target)?;
+        let rendered = self.repr_entries(&entries, active)?;
+        active.remove(&id);
+        Ok(format!("mappingproxy({rendered})"))
     }
 
     /// `repr` of a namespace view: rendered like a dict literal, sharing `active` with
@@ -2892,6 +2978,18 @@ impl Vm<'_> {
         Ok(Some((id, items)))
     }
 
+    /// Whether `value` is a namespace view, dict view or mapping proxy, which `repr_nested`
+    /// renders through the VM because their entries live outside the object.
+    fn is_mapping_view(&self, value: &Value) -> Result<bool, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.state.heap.get(id)?,
+            Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_)
+        ))
+    }
+
     pub(super) fn display_value(&mut self, value: &Value) -> Result<String, String> {
         if let Some(result) = self.invoke_slot(value, Slot::String, "__str__", Vec::new())? {
             return protocol::string_value(&self.state.heap, &result)?
@@ -2903,6 +3001,7 @@ impl Vm<'_> {
             .slot(self.type_id(value)?, Slot::Repr)?
             .is_some()
             || self.container_items(value)?.is_some()
+            || self.is_mapping_view(value)?
         {
             return self.repr_value(value);
         }
@@ -3503,6 +3602,10 @@ impl Vm<'_> {
             | BuiltinType::Stream
             | BuiltinType::Environment
             | BuiltinType::NamespaceDict
+            | BuiltinType::DictKeys
+            | BuiltinType::DictValues
+            | BuiltinType::DictItems
+            | BuiltinType::MappingProxy
             | BuiltinType::ArgumentParser
             | BuiltinType::RaisesContext
             | BuiltinType::Property

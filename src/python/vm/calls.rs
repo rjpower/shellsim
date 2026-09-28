@@ -185,22 +185,21 @@ impl Vm<'_> {
             let additions = match (name, expanded) {
                 (Some(name), false) => vec![(name.clone(), value)],
                 (None, true) => {
-                    let entries = match self
-                        .builtin_view(value)?
-                        .object_id()
-                        .map(|id| self.state.heap.get(id).cloned())
-                        .transpose()?
-                    {
-                        Some(Object::Dict(entries)) | Some(Object::DefaultDict { entries, .. }) => {
-                            self.reserve_result(entries.len().saturating_mul(64))?;
-                            entries.to_vec()
-                        }
-                        _ => return Err("argument after ** must be a mapping".into()),
+                    let Some(entries) = self.mapping_items(value)? else {
+                        let message = format!(
+                            "argument after ** must be a mapping, not {}",
+                            self.type_name_of(&value)?
+                        );
+                        return Err(self.raise_exception("TypeError", message));
                     };
+                    self.reserve_result(entries.len().saturating_mul(64))?;
                     let mut additions = Vec::with_capacity(entries.len());
                     for (key, value) in entries {
-                        let name = protocol::string_value(&self.state.heap, &key)?
-                            .ok_or("keywords must be strings")?;
+                        let Some(name) = protocol::string_value(&self.state.heap, &key)? else {
+                            return Err(
+                                self.raise_exception("TypeError", "keywords must be strings")
+                            );
+                        };
                         self.reserve_result(64usize.saturating_add(name.len()))?;
                         self.charge_cpu(1)?;
                         additions.push((name, value));
@@ -214,7 +213,8 @@ impl Vm<'_> {
                     .iter()
                     .any(|(existing, _)| existing == &name)
                 {
-                    return Err(format!("got multiple values for keyword argument {name:?}"));
+                    let message = format!("got multiple values for keyword argument '{name}'");
+                    return Err(self.raise_exception("TypeError", message));
                 }
                 self.reserve_result(64usize.saturating_add(name.len()))?;
                 self.charge_cpu(1)?;
@@ -1070,7 +1070,9 @@ impl Vm<'_> {
                             | Object::StaticMethod { .. }
                             | Object::ClassMethod { .. }
                             | Object::Super { .. }
-                            | Object::NamespaceDict(_) => None,
+                            | Object::NamespaceDict(_)
+                            | Object::DictView { .. }
+                            | Object::MappingProxy(_) => None,
                         }
                     } else {
                         None
@@ -1492,15 +1494,15 @@ impl Vm<'_> {
                 let Some(owner) = arguments.first() else {
                     return Ok(CallResult::Value(self.current_locals()?));
                 };
-                let Some(target) = self.attribute_namespace(owner)? else {
+                // `vars(obj)` is `obj.__dict__`: a namespace view, or a class's or native
+                // module's read-only proxy.
+                let Some(namespace) = self.resolve_optional_attribute(*owner, "__dict__")? else {
                     return Err(self.raise_exception(
                         "TypeError",
                         "vars() argument must have __dict__ attribute",
                     ));
                 };
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::NamespaceDict(target))?,
-                ))
+                Ok(CallResult::Value(namespace))
             }
         }
     }

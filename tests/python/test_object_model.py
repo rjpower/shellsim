@@ -858,6 +858,73 @@ def test_instance_dict_writes_bypass_setattr():
     assert frozen.value == 1
 
 
+def test_instance_dict_is_a_dict():
+    class Record:
+        pass
+
+    record = Record()
+    record.x, record.y = 1, "two"
+    namespace = vars(record)
+    assert isinstance(namespace, dict)
+    assert json.dumps(namespace, sort_keys=True) == '{"x": 1, "y": "two"}'
+
+    def pair(x, y):
+        return x, y
+
+    assert pair(**namespace) == (1, "two")
+    assert namespace | {"z": 3} == {"x": 1, "y": "two", "z": 3}
+    namespace |= {"w": 4}
+    assert record.w == 4
+    assert namespace.popitem() == ("w", 4) and not hasattr(record, "w")
+    keys = namespace.keys()
+    record.v = 5
+    assert type(keys).__name__ == "dict_keys" and "v" in keys
+    namespace.clear()
+    assert vars(record) == {} and not hasattr(record, "x")
+
+
+def test_class_dict_is_a_read_only_mapping_proxy():
+    class Shape:
+        sides = 4
+
+        def area(self):
+            return 2
+
+    class Square(Shape):
+        pass
+
+    proxy = Shape.__dict__
+    assert type(proxy).__name__ == "mappingproxy" and type(vars(Shape)) is type(proxy)
+    assert not isinstance(proxy, dict)
+    assert proxy["sides"] == 4 and proxy["area"](Shape()) == 2
+    assert ("sides" in proxy, "missing" in proxy, proxy.get("missing", 0)) == (True, False, 0)
+    assert "sides" in proxy.keys() and ("sides", 4) in proxy.items() and 4 in proxy.values()
+    assert type(proxy.copy()) is dict and proxy.copy()["sides"] == 4
+    assert {**proxy}["sides"] == 4 and dict(proxy)["sides"] == 4
+    assert proxy == Shape.__dict__ and "sides" not in Square.__dict__
+    Shape.color = "red"
+    assert proxy["color"] == "red"
+    try:
+        _ = proxy["missing"]
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("mappingproxy found a missing key")
+    try:
+        proxy["sides"] = 5
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("mappingproxy accepted an assignment")
+
+
+def test_native_module_dict_reads_module_members():
+    import math
+
+    assert math.__dict__["sqrt"](4.0) == 2.0 and vars(math)["pi"] == math.pi
+    assert "floor" in math.__dict__ and "missing" not in vars(math)
+
+
 def test_vars_requires_an_object_with_a_dict():
     for value in (object(), 1, "text"):
         try:

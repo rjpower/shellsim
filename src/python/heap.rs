@@ -128,6 +128,23 @@ pub enum NamespaceTarget {
     Instance(ObjectId),
 }
 
+/// Which projection of a mapping a [`Object::DictView`] presents.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DictViewKind {
+    Keys,
+    Values,
+    Items,
+}
+
+/// What a [`Object::MappingProxy`] reads: a namespace that shellsim exposes read-only.
+#[derive(Clone, Copy, Debug)]
+pub enum ProxyTarget {
+    /// A class's own attributes, for `cls.__dict__` and `vars(cls)`.
+    Class(ObjectId),
+    /// A native module's functions and values, which cannot be rebound.
+    NativeModule(&'static super::native::ModuleDef),
+}
+
 #[derive(Clone, Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -268,6 +285,14 @@ pub enum Object {
     /// `obj.__dict__` return. Reads, writes and deletes through it act on the same storage that
     /// name and attribute lookups use.
     NamespaceDict(NamespaceTarget),
+    /// `dict.keys()`, `dict.values()` or `dict.items()`: a live view that reads `mapping`'s
+    /// current entries on every use. `mapping` is a dict, a namespace view or a mapping proxy.
+    DictView {
+        kind: DictViewKind,
+        mapping: ObjectId,
+    },
+    /// A read-only mapping over a [`ProxyTarget`], like CPython's `mappingproxy`.
+    MappingProxy(ProxyTarget),
     /// Flat element storage shared by one or more array views: packed bytes, or traced Python
     /// references for object arrays.
     ArrayStorage(PyArrayBuffer),
@@ -1260,6 +1285,12 @@ impl Heap {
             Object::Generator { .. } => BuiltinType::Generator.id(),
             Object::Module { .. } => BuiltinType::Module.id(),
             Object::NamespaceDict(_) => BuiltinType::NamespaceDict.id(),
+            Object::DictView { kind, .. } => match kind {
+                DictViewKind::Keys => BuiltinType::DictKeys.id(),
+                DictViewKind::Values => BuiltinType::DictValues.id(),
+                DictViewKind::Items => BuiltinType::DictItems.id(),
+            },
+            Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
@@ -1586,6 +1617,9 @@ fn trace_object(
         // `Vm::collect_heap`), so this handle owns nothing further to trace.
         Object::NamespaceDict(NamespaceTarget::Repl) => {}
         Object::NamespaceDict(NamespaceTarget::Instance(instance)) => object_work.push(*instance),
+        Object::DictView { mapping, .. } => object_work.push(*mapping),
+        Object::MappingProxy(ProxyTarget::Class(class)) => object_work.push(*class),
+        Object::MappingProxy(ProxyTarget::NativeModule(_)) => {}
         Object::Array { storage, base, .. } => {
             object_work.push(*storage);
             object_work.extend(*base);
@@ -1747,7 +1781,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Module { name, .. } => name.len(),
         // The namespace it views is charged where that namespace actually lives (the scope or
         // the REPL/script global table), so the view itself is a fixed, minimal handle.
-        Object::NamespaceDict(_) => 1,
+        Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
         Object::ArrayStorage(PyArrayBuffer::Bytes(bytes)) => return packed(bytes.len()),
         Object::ArrayStorage(PyArrayBuffer::Values(values)) => values.len(),
         Object::Array { view, .. } => view

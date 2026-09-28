@@ -114,7 +114,7 @@ print(values.keys())"#;
     assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(
         stdout,
-        b"4 float two three long\n[1, 3, 4, 'key-longer-than-inline-storage']\n"
+        b"4 float two three long\ndict_keys([1, 3, 4, 'key-longer-than-inline-storage'])\n"
     );
 }
 

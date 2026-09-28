@@ -496,7 +496,9 @@ print({**base, "b": 3, **{"c": 4}})
         run(source),
         (0, "{'a': 1, 'b': 3, 'c': 4}\n".into(), String::new())
     );
-    assert!(run("print({**[1, 2]})").2.contains("must be a mapping"));
+    assert!(run("print({**[1, 2]})")
+        .2
+        .contains("TypeError: 'list' object is not a mapping"));
 }
 
 #[test]

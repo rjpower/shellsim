@@ -63,16 +63,13 @@ impl Vm<'_> {
         for unpacked in unpacked {
             let additions = if *unpacked {
                 let mapping = values.next().expect("dictionary stack contract");
-                match self
-                    .builtin_view(mapping)?
-                    .object_id()
-                    .map(|id| self.state.heap.get(id))
-                    .transpose()?
-                {
-                    Some(Object::Dict(entries)) | Some(Object::DefaultDict { entries, .. }) => {
-                        entries.to_vec()
+                match self.mapping_items(mapping)? {
+                    Some(entries) => entries,
+                    None => {
+                        let message =
+                            format!("'{}' object is not a mapping", self.type_name_of(&mapping)?);
+                        return Err(self.raise_exception("TypeError", message));
                     }
-                    _ => return Err("'**' argument must be a mapping".into()),
                 }
             } else {
                 vec![(
@@ -479,11 +476,13 @@ impl Vm<'_> {
 
     /// Call the left operand's in-place method, looked up on its type as CPython does. A method
     /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
-    /// Whether `|=` on object `id` is `dict.update`: a dict, or a dict subclass instance whose
-    /// class does not define `__ior__`.
+    /// Whether `|=` on object `id` is `dict.update`: a dict or namespace view, or a dict
+    /// subclass instance whose class does not define `__ior__`.
     fn updates_dict_in_place(&mut self, id: super::super::heap::ObjectId) -> Result<bool, String> {
         let class = match self.state.heap.get(id)? {
-            Object::Dict(_) | Object::DefaultDict { .. } => return Ok(true),
+            Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_) => {
+                return Ok(true)
+            }
             Object::Instance { class, .. } => *class,
             _ => return Ok(false),
         };

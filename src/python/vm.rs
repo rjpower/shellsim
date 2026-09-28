@@ -21,17 +21,18 @@ use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, NamespaceTarget,
-    Object, ObjectId, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES, MODELED_VALUE_BYTES,
+    Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
     PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
     PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
-    PyMatch, PyMatchData, PyModule, PyNamespaceDict, PyNativeKind, PyOperator, PyProcessHandle,
-    PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty,
-    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec,
-    PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
+    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle, PyProcessOutput,
+    PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
+    PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
+    PyTypeObject, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
@@ -46,6 +47,7 @@ mod format;
 mod hashing;
 mod host;
 mod iteration;
+mod mappings;
 mod namespace;
 mod native_runtime;
 mod objects;

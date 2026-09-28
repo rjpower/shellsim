@@ -282,6 +282,8 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 Object::Generator { .. } => "<generator ...>",
                 Object::Module { .. } => "<module ...>",
                 Object::NamespaceDict(_) => "{...}",
+                Object::DictView { .. } => "<dict view ...>",
+                Object::MappingProxy(_) => "mappingproxy(...)",
                 Object::ArrayStorage(_) => "<array storage ...>",
                 Object::WideValue { .. } => "<value ...>",
                 Object::Array { .. } => "array(...)",
@@ -423,6 +425,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             // call, so this generic fallback is only reached by the interactive REPL auto-printing
             // a bare expression, which already skips a user `__repr__` for every other type too.
             Object::NamespaceDict(NamespaceTarget::Repl) => "<globals>".to_string(),
+            // `Vm::repr_nested` renders views and proxies from their mapping's entries; the
+            // heap alone cannot read every mapping they may view.
+            Object::DictView { .. } => "<dict view>".to_string(),
+            Object::MappingProxy(_) => "mappingproxy(...)".to_string(),
             Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
@@ -538,7 +544,9 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         | Object::Match { .. }
         | Object::ArgumentParser { .. }
         | Object::Namespace { .. }
-        | Object::NamespaceDict(_) => true,
+        | Object::NamespaceDict(_)
+        | Object::DictView { .. }
+        | Object::MappingProxy(_) => true,
         Object::EnumMember { .. } => true,
         Object::RaisesContext { .. } => true,
         Object::Property { .. }
@@ -1010,7 +1018,9 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
             | Object::Match { .. }
             | Object::ArgumentParser { .. }
             | Object::Namespace { .. }
-            | Object::NamespaceDict(_) => Err("object is not a container".into()),
+            | Object::NamespaceDict(_)
+            | Object::DictView { .. }
+            | Object::MappingProxy(_) => Err("object is not a container".into()),
             Object::EnumMember { .. } => Err("object is not a container".into()),
             Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }

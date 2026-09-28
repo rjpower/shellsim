@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
-use super::heap::ObjectId;
+use super::heap::{DictViewKind, ObjectId};
 use super::Value;
 
 /// The erased value exchanged by native modules and the VM.
@@ -293,8 +293,6 @@ pub(super) enum PyNativeKind {
     RaisesContext,
     Property,
     Array,
-    /// The live namespace view behind `globals()`, `vars()` and `obj.__dict__`.
-    NamespaceDict,
 }
 
 /// Module-owned element type of an array, opaque to the runtime except for its storage needs.
@@ -716,25 +714,17 @@ pub(super) trait PyRuntime {
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     /// A shallow copy of `dict` of the same kind: a `defaultdict` copy keeps its factory.
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
-    /// Every `(name, value)` binding a namespace view currently holds, in a deterministic order
-    /// (see `Vm::namespace_entries`). Names are freshly allocated strings.
-    fn namespace_items(&mut self, namespace: PyNamespaceDict) -> PyResult<Vec<(PyValue, PyValue)>>;
-    fn namespace_get(
-        &mut self,
-        namespace: PyNamespaceDict,
-        name: &str,
-    ) -> PyResult<Option<PyValue>>;
-    fn namespace_insert(
-        &mut self,
-        namespace: PyNamespaceDict,
-        name: String,
-        value: PyValue,
-    ) -> PyResult<()>;
-    fn namespace_remove(
-        &mut self,
-        namespace: PyNamespaceDict,
-        name: &str,
-    ) -> PyResult<Option<PyValue>>;
+    /// `container[key]`, running the container's `__getitem__` or builtin subscript.
+    fn get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no
+    /// `keys` method. Mappings other than dicts are read through `keys()` and `__getitem__`, as
+    /// `dict(m)` and `f(**m)` read them in CPython.
+    fn mapping_items(&mut self, value: PyValue) -> PyResult<Option<Vec<(PyValue, PyValue)>>>;
+    /// A live `keys()`, `values()` or `items()` view of `mapping`, which is a dict, a namespace
+    /// view or a mapping proxy.
+    fn new_dict_view(&mut self, kind: DictViewKind, mapping: PyValue) -> PyResult<PyValue>;
+    /// The projection and viewed mapping of a dict view, or `None` when `value` is not one.
+    fn dict_view(&self, value: &PyValue) -> PyResult<Option<(DictViewKind, PyValue)>>;
     fn set_items(&mut self, set: PySet) -> PyResult<Vec<PyValue>>;
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
@@ -1387,29 +1377,6 @@ impl PyDict {
     /// Snapshot entries so callers do not retain an arena borrow across Python work.
     pub fn items(self, runtime: &mut dyn PyRuntime) -> PyResult<Vec<(PyValue, PyValue)>> {
         runtime.dict_items(self)
-    }
-}
-
-/// Checked handle to a live namespace view: `globals()`, `vars()` or `obj.__dict__`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct PyNamespaceDict(ObjectId);
-
-impl PyNamespaceDict {
-    pub(super) fn object_id(self) -> ObjectId {
-        self.0
-    }
-}
-
-impl FromPyValue for PyNamespaceDict {
-    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
-            return Err(PyError::type_error("expected a namespace view"));
-        };
-        if runtime.native_kind(&Value::Object(id))? == Some(PyNativeKind::NamespaceDict) {
-            Ok(Self(id))
-        } else {
-            Err(PyError::type_error("expected a namespace view"))
-        }
     }
 }
 
