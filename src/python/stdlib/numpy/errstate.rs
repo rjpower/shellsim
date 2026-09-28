@@ -1,7 +1,7 @@
 //! Floating-point error reporting for ufunc loops.
 //!
 //! Loops record IEEE-style flags in [`FpFlags`] without calling back into Python. After a loop
-//! finishes, [`report`] hands raised flags to `numpy._errstate._report`, which applies the modes
+//! finishes, [`report`] hands raised flags to `numpy._errors._report`, which applies the modes
 //! set by `np.errstate`/`np.seterr`: ignore, warn with `RuntimeWarning`, or raise
 //! `FloatingPointError`. Keeping the state in Python means `errstate` nests and restores like
 //! any context manager, and native code pays nothing when no flag is raised.
@@ -20,10 +20,10 @@ pub(in crate::python) fn report(
     if !flags.any() {
         return Ok(());
     }
-    let module = runtime.import_module("numpy._errstate")?;
+    let module = runtime.import_module("numpy._errors")?;
     let report = runtime
         .get_attribute(module, "_report")?
-        .ok_or_else(|| PyError::runtime_error("numpy._errstate._report is missing"))?;
+        .ok_or_else(|| PyError::runtime_error("numpy._errors._report is missing"))?;
     let name = runtime.new_string(name.to_string())?;
     runtime.call_value(
         report,
@@ -54,7 +54,7 @@ pub(in crate::python) fn warn_where_without_out(runtime: &mut dyn PyRuntime) -> 
 }
 
 fn warn(runtime: &mut dyn PyRuntime, name: &str) -> PyResult<()> {
-    call_warning(runtime, "numpy._errstate", name)
+    call_warning(runtime, "numpy._errors", name)
 }
 
 /// Call the no-argument warning function `name` of the frozen module `module`, which issues

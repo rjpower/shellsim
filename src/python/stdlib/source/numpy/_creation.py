@@ -1,8 +1,10 @@
-"""Index-construction helpers: ``ix_``, ``ndindex``, ``mgrid``/``ogrid``, ``r_``/``c_``, and the
-diagonal- and triangle-index helpers built on ``ndarray.nonzero``.
+"""Index- and array-construction helpers: mesh/open grids (``mgrid``, ``ogrid``), index tuples
+(``ix_``, ``ndindex``, ``unravel_index``, ``ravel_multi_index``), diagonal- and triangle-index
+helpers built on ``ndarray.nonzero``, and the small array constructors built the same way
+(``tri``, ``tril``, ``triu``, ``indices``).
 
-These build plain index tuples and coordinate arrays; none of them touch storage directly, so
-they compose from ``arange``, ``reshape``, and the array constructors like any other array code.
+None of these touch storage directly; they compose from ``arange``, ``reshape``, and the array
+constructors like any other array code.
 """
 
 import numpy as np
@@ -13,6 +15,7 @@ __all__ = [
     "diag_indices_from",
     "fill_diagonal",
     "index_exp",
+    "indices",
     "ix_",
     "mgrid",
     "ndindex",
@@ -20,8 +23,11 @@ __all__ = [
     "r_",
     "ravel_multi_index",
     "s_",
+    "tri",
+    "tril",
     "tril_indices",
     "tril_indices_from",
+    "triu",
     "triu_indices",
     "triu_indices_from",
     "unravel_index",
@@ -265,3 +271,38 @@ def fill_diagonal(a, val, wrap=False):
         step = sum(n**k for k in range(a.ndim))
         end = n**a.ndim
     a.flat[0:end:step] = val
+
+
+def tri(N, M=None, k=0, dtype=np.float64):
+    """An N-by-M array that is 1 at and below diagonal `k`, 0 elsewhere."""
+    M = N if M is None else M
+    rows = np.arange(N).reshape(N, 1)
+    cols = np.arange(M).reshape(1, M)
+    return (cols <= rows + k).astype(dtype)
+
+
+def tril(m, k=0):
+    """`m` with the elements above diagonal `k` zeroed."""
+    m = np.asanyarray(m)
+    mask = tri(m.shape[-2], m.shape[-1], k=k, dtype=np.bool_)
+    return np.where(mask, m, 0)
+
+
+def triu(m, k=0):
+    """`m` with the elements below diagonal `k` zeroed."""
+    m = np.asanyarray(m)
+    mask = tri(m.shape[-2], m.shape[-1], k=k - 1, dtype=np.bool_)
+    return np.where(~mask, m, 0)
+
+
+def indices(dimensions, dtype=np.int64, sparse=False):
+    """The per-axis index arrays of an array with shape `dimensions`."""
+    dimensions = tuple(dimensions)
+    ndim = len(dimensions)
+    axes = [
+        np.arange(size, dtype=dtype).reshape([size if i == axis else 1 for i in range(ndim)])
+        for axis, size in enumerate(dimensions)
+    ]
+    if sparse:
+        return tuple(axes)
+    return np.stack([np.broadcast_to(a, dimensions) for a in axes], axis=0)

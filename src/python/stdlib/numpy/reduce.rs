@@ -1,7 +1,7 @@
 //! Reductions: `ufunc.reduce`/`ufunc.accumulate`, the `numpy` reduction functions built on them
 //! (`sum`, `prod`, `max`/`amax`, `min`/`amin`, `any`, `all`, `argmin`, `argmax`, `cumsum`,
 //! `cumprod`), their `ndarray` methods, and the `python_method` trampoline other areas use to
-//! reach Python-level helpers in `numpy._methods` (`round`, `clip`, and, through it, `mean`,
+//! reach Python-level helpers in `numpy._stats` (`round`, `clip`, and, through it, `mean`,
 //! `var`, `std`).
 //!
 //! # Walk order
@@ -124,9 +124,9 @@ const fn method(
     }
 }
 
-/// Call a method implemented in Python at `numpy._methods.<name>`, with `receiver` as the first
-/// positional argument ahead of `args`. `round` and `clip` reach `numpy._methods._round` and
-/// `_clip` this way; `numpy._methods` reaches `mean`/`var`/`std` the same way from Python, once
+/// Call a method implemented in Python at `numpy._stats.<name>`, with `receiver` as the first
+/// positional argument ahead of `args`. `round` and `clip` reach `numpy._stats._round` and
+/// `_clip` this way; `numpy._stats` reaches `mean`/`var`/`std` the same way from Python, once
 /// `sum` (below) is in place for them to build on.
 pub(in crate::python) fn python_method(
     runtime: &mut dyn PyRuntime,
@@ -134,10 +134,10 @@ pub(in crate::python) fn python_method(
     receiver: PyValue,
     args: CallArgs,
 ) -> PyResult {
-    let module = runtime.import_module("numpy._methods")?;
+    let module = runtime.import_module("numpy._stats")?;
     let implementation = runtime
         .get_attribute(module, name)?
-        .ok_or_else(|| PyError::runtime_error(format!("numpy._methods.{name} is missing")))?;
+        .ok_or_else(|| PyError::runtime_error(format!("numpy._stats.{name} is missing")))?;
     let (positional, keywords) = args.into_parts();
     let mut all_positional = Vec::with_capacity(positional.len() + 1);
     all_positional.push(receiver);
