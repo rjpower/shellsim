@@ -108,12 +108,10 @@ def test_quantile_matches_percentile_scale():
 
 
 def test_percentile_and_quantile_reject_out_of_range_q():
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         np.percentile([1, 2], 101)
-    assert str(info.value) == "Percentiles must be in the range [0, 100]"
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         np.quantile([1, 2], 1.5)
-    assert str(info.value) == "Quantiles must be in the range [0, 1]"
 
 
 def test_average_with_weights_and_returned_sum_of_weights():
@@ -130,9 +128,8 @@ def test_average_with_weights_and_returned_sum_of_weights():
 
 
 def test_average_rejects_weights_that_sum_to_zero():
-    with pytest.raises(ZeroDivisionError) as info:
+    with pytest.raises(ZeroDivisionError):
         np.average([1, 2], weights=[1, -1])
-    assert str(info.value) == "Weights sum to zero, can't be normalized"
 
 
 def test_argmin_and_argmax_flat_and_along_axes():
@@ -154,9 +151,8 @@ def test_argmin_and_argmax_return_first_of_ties_and_first_nan():
 
 
 def test_argmax_of_empty_array_raises():
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         np.argmax(np.array([]))
-    assert str(info.value) == "attempt to get argmax of an empty sequence"
 
 
 def test_any_and_all_on_ints_and_floats():
@@ -231,18 +227,15 @@ def test_nanstd_nanvar_nanmedian_skip_nan():
 
 
 def test_all_nan_slices_return_nan_and_warn():
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
+    with pytest.warns(RuntimeWarning):
         maximum = np.nanmax(np.array([np.nan, np.nan]))
+    with pytest.warns(RuntimeWarning):
         column_minimums = np.nanmin(np.array([[1.0, np.nan, 3.0], [np.nan, np.nan, 6.0]]), axis=0)
+    with pytest.warns(RuntimeWarning):
         mean = np.nanmean(np.array([np.nan]))
     assert np.isnan(maximum)
     assert_array_equal(column_minimums, [1.0, np.nan, 3.0])
     assert np.isnan(mean)
-    messages = [str(item.message) for item in caught]
-    assert all(issubclass(item.category, RuntimeWarning) for item in caught)
-    assert messages.count("All-NaN slice encountered") == 2
-    assert "Mean of empty slice" in messages
 
 
 def test_sum_and_prod_of_empty_arrays_are_identities():
@@ -257,12 +250,10 @@ def test_sum_and_prod_of_empty_arrays_are_identities():
 
 
 def test_max_and_min_of_empty_arrays_raise():
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         np.max(np.array([]))
-    assert str(info.value) == "zero-size array to reduction operation maximum which has no identity"
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         np.array([]).min()
-    assert str(info.value) == "zero-size array to reduction operation minimum which has no identity"
     with pytest.raises(ValueError):
         np.zeros((0, 3)).max(axis=0)
     assert np.zeros((0, 3)).max(axis=1).shape == (0,)
@@ -275,7 +266,6 @@ def test_mean_of_empty_array_is_nan_with_runtime_warning():
     assert np.isnan(result)
     assert caught
     assert all(issubclass(item.category, RuntimeWarning) for item in caught)
-    assert "Mean of empty slice" in [str(item.message) for item in caught]
 
 
 def test_mean_of_empty_array_is_nan_when_warnings_ignored():
@@ -372,9 +362,8 @@ def test_method_forms_match_function_forms():
 
 def test_axis_out_of_range_raises_value_error():
     a = np.array([[1, 2, 3], [4, 5, 6]])
-    with pytest.raises(ValueError) as info:
+    with pytest.raises(ValueError):
         a.sum(axis=2)
-    assert str(info.value) == "axis 2 is out of bounds for array of dimension 2"
     with pytest.raises(ValueError):
         np.mean(a, axis=-3)
 
@@ -451,7 +440,7 @@ def test_cumulative_sum_and_prod_can_include_the_identity():
 
 
 def test_cumulative_sum_requires_an_axis_for_multidimensional_input():
-    with pytest.raises(ValueError, match="``axis`` argument is required"):
+    with pytest.raises(ValueError):
         np.cumulative_sum(np.ones((2, 2)))
 
 
@@ -481,7 +470,7 @@ def test_trapezoid_keeps_float32_and_complex_results():
 
 
 def test_trapezoid_rejects_mismatched_samples():
-    with pytest.raises(ValueError, match="could not be broadcast"):
+    with pytest.raises(ValueError):
         np.trapezoid([1, 2, 3], x=[1, 2, 3, 4])
     with pytest.raises(IndexError):
         np.trapezoid(3)

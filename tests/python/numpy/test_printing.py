@@ -2,6 +2,7 @@
 # Scope: exact str/repr text for arrays and scalars, print options, and array2string.
 
 import numpy as np
+import pytest
 
 
 def test_int_array_one_dimensional():
@@ -463,19 +464,18 @@ def test_format_float_positional_and_scientific():
     assert np.format_float_scientific(5e-324) == "5.e-324"
 
 
-def test_format_float_argument_errors():
-    for call, kind, message in [
-        (lambda: np.format_float_positional(1.5, unique=False), TypeError, "in non-unique mode `precision` must be supplied"),
-        (lambda: np.format_float_positional(1.5, precision=-1), ValueError, "precision must be >= 0"),
-        (lambda: np.format_float_positional(1.5, precision=2, min_digits=3), ValueError, "min_digits must be less than or equal to precision"),
-        (lambda: np.format_float_positional(1.5, fractional=False, precision=0), ValueError, "precision must be greater than 0 if fractional=False"),
-    ]:
-        try:
-            call()
-        except kind as error:
-            assert str(error) == message
-        else:
-            raise AssertionError(message)
+@pytest.mark.parametrize(
+    ("call", "kind"),
+    [
+        (lambda: np.format_float_positional(1.5, unique=False), TypeError),
+        (lambda: np.format_float_positional(1.5, precision=-1), ValueError),
+        (lambda: np.format_float_positional(1.5, precision=2, min_digits=3), ValueError),
+        (lambda: np.format_float_positional(1.5, fractional=False, precision=0), ValueError),
+    ],
+)
+def test_format_float_argument_errors(call, kind):
+    with pytest.raises(kind):
+        call()
 
 
 def test_sign_and_floatmode_options():

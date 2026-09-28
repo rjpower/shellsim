@@ -19,7 +19,7 @@ _MAX_U64 = (1 << 64) - 1
 class Limits:
     """Cumulative resource limits for one simulated environment."""
 
-    cpu: int = 10_000_000
+    cpu: int = 100_000_000
     memory: int = 64 * 1024 * 1024
     disk: int = 64 * 1024 * 1024
     output: int = 4 * 1024 * 1024

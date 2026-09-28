@@ -33,7 +33,7 @@ impl Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            cpu: 10_000_000,
+            cpu: 100_000_000,
             memory: 64 * 1024 * 1024,
             disk: 64 * 1024 * 1024,
             output: 4 * 1024 * 1024,

@@ -193,7 +193,7 @@ printf '%s\n' \
 ## Resource model
 
 CPU is deterministic fuel, memory is modeled working set, disk is current virtual-filesystem
-usage, and output bounds materialized stdout and stderr. The defaults are 10,000,000 CPU units,
+usage, and output bounds materialized stdout and stderr. The defaults are 100,000,000 CPU units,
 64 MiB memory, 64 MiB disk, and 4 MiB output. Costs use simple, stable approximations intended to
 be correct within an order of magnitude. They bound runaway work and make runs comparable; they
 do not model allocator layouts or instruction timing exactly. Exhaustion is observable and never

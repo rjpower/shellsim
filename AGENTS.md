@@ -30,6 +30,11 @@ shellsim's Rust codebase. See `CONTRIBUTING.md` for the human-facing workflow.
   exact accounting. Resource limits are safety and scheduling controls, not a profiler.
 - Add a small unit test for tricky logic and an integration or differential test for observable
   compatibility behavior.
+- Treat CPython, NumPy, SciPy and other reference libraries as behavioral references, never as
+  code to port. Implement a small public subset in shellsim's own structure: one frozen module
+  per public module, over a private native module only for elementwise or inner-loop work. Match
+  what an ordinary program relies on (values within tolerance, shapes, dtypes, exception and
+  warning types), not internal layout, error text, rounding order or random streams.
 
 ## Validation workflow
 
@@ -60,6 +65,8 @@ the intended behavior.
   or unordered collection output.
 - Prefer semantic assertions over snapshots. Use checked output fixtures when exact compatibility
   is the contract and record their provenance.
+- Assert exception and warning types, not message text. Check exact text only when the text is
+  the contract, such as shellsim's own frontier messages or CPython's formatting behavior.
 - Differential tests may invoke a reference implementation only from the test harness. Product
   code must remain capability-free.
 - Cover success, invalid input, resource exhaustion, and the explicit unsupported frontier when

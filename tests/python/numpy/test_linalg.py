@@ -368,5 +368,5 @@ def test_vecdot_sums_over_an_axis_and_conjugates_the_first_operand():
 
 
 def test_vecdot_rejects_mismatched_core_dimensions():
-    with pytest.raises(ValueError, match=r"size 3 is different from 2"):
+    with pytest.raises(ValueError):
         np.vecdot(np.ones((2, 3)), np.ones(3), axis=0)

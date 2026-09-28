@@ -65,7 +65,7 @@ def test_weighted_metrics():
     assert distance.hamming([1, 0, 1], [1, 1, 0], w=[1, 2, 3]) == 0.8333333333333333
     assert distance.jaccard([1, 0, 1], [1, 1, 0], w=[1, 2, 3]) == 0.8333333333333334
     assert_allclose(distance.cosine(u, v, w=w), 0.0018850158136837214, rtol=1e-12)
-    with pytest.raises(ValueError, match="^Input weights should be all non-negative$"):
+    with pytest.raises(ValueError):
         distance.euclidean(u, v, w=[1.0, -1.0])
 
 
@@ -73,7 +73,7 @@ def test_metric_edge_cases():
     assert distance.minkowski([1, 2], [3, 5], np.inf) == 3.0
     assert distance.minkowski([1, 2], [3, 5], 1) == 5.0
     assert distance.minkowski([1, 2], [3, 5], 0.5) == 9.898979485566358
-    with pytest.raises(ValueError, match="^p must be greater than 0$"):
+    with pytest.raises(ValueError):
         distance.minkowski(U, V, 0)
     assert distance.cosine([1e-9, 3], [1e-9, 3]) == 0.0
     assert distance.correlation([1, 2, 3], [3, 2, 1]) == 2.0
@@ -82,7 +82,7 @@ def test_metric_edge_cases():
     assert distance.jaccard([True, False], [False, False]) == 1.0
     assert distance.seuclidean([1, 2], [3, 4], [1, 2]) == np.sqrt(6.0)
     assert distance.mahalanobis([1, 2], [3, 4], np.eye(2) * 2) == 4.0
-    with pytest.raises(TypeError, match="^V must be a 1-D array of the same dimension as u and v.$"):
+    with pytest.raises(TypeError):
         distance.seuclidean([1, 2], [3, 4], [1, 2, 3])
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -97,7 +97,7 @@ def test_jensenshannon():
     assert distance.jensenshannon([1, 0], [0, 1], base=2) == 1.0
     rows = distance.jensenshannon([[1, 0], [0.5, 0.5]], [[0, 1], [0.5, 0.5]], axis=1, keepdims=True)
     assert_allclose(rows, [[0.8325546111576977], [0.0]], rtol=1e-15)
-    with pytest.raises(np.exceptions.AxisError, match="^axis 1 is out of bounds for array of dimension 1$"):
+    with pytest.raises(np.exceptions.AxisError):
         distance.jensenshannon([1, 2], [3, 4], axis=1)
 
 
@@ -166,29 +166,28 @@ def test_seuclidean_and_mahalanobis_default_to_the_data_covariance():
     assert_allclose(distance.cdist(X, Y, "seuclidean")[0], [0.816496580927726, 1.1952286093343936], rtol=1e-14)
     assert_allclose(distance.pdist(X, "seuclidean", V=[1, 2]), [4.123105625617661, 1.224744871391589, 2.9154759474226504])
     assert_allclose(distance.pdist(X, "mahalanobis", VI=np.eye(2) * 4), [10.0, 2.8284271247461903, 7.211102550927978])
-    with pytest.raises(ValueError, match=r"^The number of observations \(2\) is too small; the covariance"):
+    with pytest.raises(ValueError):
         distance.pdist([[1.0, 2.0], [3.0, 4.0]], "mahalanobis")
-    with pytest.raises(ValueError, match="^Variance vector V must be of the same dimension"):
+    with pytest.raises(ValueError):
         distance.pdist(X, "seuclidean", V=[1, 2, 3])
 
 
 @pytest.mark.parametrize(
-    "call, error, message",
+    "call, error",
     [
-        (lambda: distance.cdist([[1.0]], [[1.0]], "nope"), ValueError, "Unknown Distance Metric: nope"),
-        (lambda: distance.cdist([[1.0]], [[1.0]], 1), TypeError, "2nd argument metric must be a string identifier or a function."),
-        (lambda: distance.pdist([1, 2, 3]), ValueError, "A 2-dimensional array must be passed. (Shape was (3,))."),
-        (lambda: distance.cdist([1, 2], [[1, 2]]), ValueError, "XA must be a 2-dimensional array."),
-        (lambda: distance.cdist([[1, 2]], [[1, 2, 3]]), ValueError, "XA and XB must have the same number of columns (i.e. feature dimension.)"),
-        (lambda: distance.pdist(np.array([[1j, 2]])), ValueError, "Unsupported dtype complex128"),
-        (lambda: distance.cdist([[1.0]], [[1.0]], out=np.zeros(2)), ValueError, "Output array has incorrect shape."),
-        (lambda: distance.pdist([[1.0], [2.0]], out=np.zeros(1, dtype=np.float32)), ValueError, "wrong out dtype, expected float64"),
+        (lambda: distance.cdist([[1.0]], [[1.0]], "nope"), ValueError),
+        (lambda: distance.cdist([[1.0]], [[1.0]], 1), TypeError),
+        (lambda: distance.pdist([1, 2, 3]), ValueError),
+        (lambda: distance.cdist([1, 2], [[1, 2]]), ValueError),
+        (lambda: distance.cdist([[1, 2]], [[1, 2, 3]]), ValueError),
+        (lambda: distance.pdist(np.array([[1j, 2]])), ValueError),
+        (lambda: distance.cdist([[1.0]], [[1.0]], out=np.zeros(2)), ValueError),
+        (lambda: distance.pdist([[1.0], [2.0]], out=np.zeros(1, dtype=np.float32)), ValueError),
     ],
 )
-def test_pairwise_distance_errors(call, error, message):
-    with pytest.raises(error) as raised:
+def test_pairwise_distance_errors(call, error):
+    with pytest.raises(error):
         call()
-    assert str(raised.value) == message
 
 
 def test_squareform_converts_between_condensed_and_square_forms():
@@ -204,48 +203,47 @@ def test_squareform_converts_between_condensed_and_square_forms():
 
 
 @pytest.mark.parametrize(
-    "argument, kwargs, message",
+    "argument, kwargs",
     [
-        ([1, 2], {}, "Incompatible vector size. It must be a binomial coefficient n choose 2 for some integer n >= 2."),
-        (np.ones((2, 2)), {}, "Distance matrix 'X' diagonal must be zero."),
-        (np.array([[0, 1], [2, 0]]), {}, "Distance matrix 'X' must be symmetric."),
-        (np.ones((2, 3)), {}, "The matrix argument must be square."),
-        (np.zeros((2, 2, 2)), {}, "The first argument must be one or two dimensional array. A 3-dimensional array is not permitted"),
-        ([1, 2, 3], {"force": "tovector"}, "Forcing 'tovector' but input X is not a distance matrix."),
-        (np.zeros((3, 3)), {"force": "tomatrix"}, "Forcing 'tomatrix' but input X is not a distance vector."),
+        ([1, 2], {}),
+        (np.ones((2, 2)), {}),
+        (np.array([[0, 1], [2, 0]]), {}),
+        (np.ones((2, 3)), {}),
+        (np.zeros((2, 2, 2)), {}),
+        ([1, 2, 3], {"force": "tovector"}),
+        (np.zeros((3, 3)), {"force": "tomatrix"}),
     ],
 )
-def test_squareform_errors(argument, kwargs, message):
-    with pytest.raises(ValueError) as raised:
+def test_squareform_errors(argument, kwargs):
+    with pytest.raises(ValueError):
         distance.squareform(argument, **kwargs)
-    assert str(raised.value) == message
 
 
 def test_validity_checks_and_observation_counts():
     asymmetric = np.array([[0, 1], [2, 0]])
     assert distance.is_valid_dm(np.zeros((2, 2))) and not distance.is_valid_dm(asymmetric)
-    with pytest.raises(ValueError, match="^Distance matrix 'D' must be symmetric within tolerance 0.10000.$"):
+    with pytest.raises(ValueError):
         distance.is_valid_dm(np.array([[0, 1], [1.5, 0]]), tol=0.1, throw=True)
-    with pytest.raises(ValueError, match="^Distance matrix 'D' diagonal must be close to zero within tolerance 0.10000.$"):
+    with pytest.raises(ValueError):
         distance.is_valid_dm(np.array([[1, 1], [1, 0]]), tol=0.1, throw=True)
-    with pytest.warns(UserWarning, match="^Distance matrix 'D' must be symmetric.$"):
+    with pytest.warns(UserWarning):
         assert not distance.is_valid_dm(asymmetric, warning=True)
     assert distance.is_valid_y(np.zeros(3)) and not distance.is_valid_y(np.zeros(2))
-    with pytest.raises(ValueError, match="^Condensed distance matrix must have shape=1"):
+    with pytest.raises(ValueError):
         distance.is_valid_y(np.zeros((2, 2)), throw=True)
     assert (distance.num_obs_y([1, 2, 3]), distance.num_obs_y([1]), distance.num_obs_dm(np.zeros((3, 3)))) == (3, 2, 3)
-    with pytest.raises(ValueError, match="^The number of observations cannot be determined on an empty distance matrix.$"):
+    with pytest.raises(ValueError):
         distance.num_obs_y([])
 
 
 def test_deprecated_minkowski_helpers():
     X = np.array([[0.0, 0.0], [3.0, 4.0]])
     Y = np.array([[1.0, 0.0], [0.0, 2.0]])
-    with pytest.warns(DeprecationWarning, match="`distance_matrix` is deprecated in favor of `scipy.spatial.distance.cdist`"):
+    with pytest.warns(DeprecationWarning):
         assert_array_equal(scipy.spatial.distance_matrix(X, Y, p=1), [[1.0, 2.0], [6.0, 5.0]])
-    with pytest.warns(DeprecationWarning, match="`minkowski_distance` is deprecated"):
+    with pytest.warns(DeprecationWarning):
         assert_allclose(scipy.spatial.minkowski_distance(X, Y, p=3), [1.0, 35.0 ** (1 / 3)], rtol=1e-15)
-    with pytest.warns(DeprecationWarning, match="`minkowski_distance_p` is deprecated"):
+    with pytest.warns(DeprecationWarning):
         assert_array_equal(scipy.spatial.minkowski_distance_p(X, Y, p=3), [1.0, 35.0])
 
 

@@ -49,9 +49,8 @@ def test_operator_index_on_integer_scalars():
 
 
 def test_float_scalar_is_not_an_index():
-    with pytest.raises(TypeError) as info:
+    with pytest.raises(TypeError):
         operator.index(np.float64(1.0))
-    assert str(info.value) == "'numpy.float64' object cannot be interpreted as an integer"
     with pytest.raises(TypeError):
         [1, 2][np.float64(0)]
 
@@ -210,9 +209,8 @@ def test_isinstance_with_numpy_abstract_types():
 def test_json_serializes_float64_but_not_int64():
     assert json.dumps(np.float64(1.5)) == "1.5"
     assert json.dumps([np.float64(0.25)]) == "[0.25]"
-    with pytest.raises(TypeError) as info:
+    with pytest.raises(TypeError):
         json.dumps(np.int64(1))
-    assert str(info.value) == "Object of type int64 is not JSON serializable"
 
 
 @pytest.mark.parametrize(
@@ -274,9 +272,8 @@ def test_integer_scalar_overflow_wraps():
 
 def test_integer_scalar_overflow_raises_under_errstate():
     with np.errstate(over="raise"):
-        with pytest.raises(FloatingPointError) as info:
+        with pytest.raises(FloatingPointError):
             np.int8(127) + np.int8(1)
-    assert str(info.value) == "overflow encountered in scalar add"
 
 
 def test_mixed_integer_scalars_promote():
