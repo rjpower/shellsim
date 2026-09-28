@@ -1,29 +1,16 @@
-"""numpy.random: pseudo-random number generation.
+"""numpy.random: seeded pseudo-random numbers.
 
-One bit generator, `PCG64` (O'Neill 2014, XSL-RR variant), backs every stream in this module.
-Shellsim's owner has decided that random streams do not need to reproduce NumPy's own bit for
-bit: only determinism, reproducibility within shellsim, and statistically correct distributions
-matter, plus the shapes, dtypes, and call signatures an ordinary program relies on. That frees
-this module from NumPy's `SeedSequence` entropy mixing, its second bit generator (`MT19937`),
-its per-dtype and per-generator sampling variants, and legacy `RandomState`'s own bit-for-bit
-stream and cached-Gaussian state.
+One bit generator, `PCG64` (a 128-bit LCG with XSL-RR output), backs every stream. A seed (an
+int, a sequence of ints, or `None` for a fixed default, since shellsim has no host entropy) is
+mixed into its state with splitmix64. Streams are deterministic and reproducible within
+shellsim but do not match NumPy's; distributions, shapes, dtypes and call signatures do.
 
-Seeding mixes an int, or a sequence of ints, into `PCG64`'s 256 bits of initial state with
-splitmix64 (a simple, well-distributed mixing function; see `_seed_words` and the native
-`_pcg_seed`). `None` seeds from a fixed default rather than host entropy, since shellsim has none
-to offer (the same rule the stdlib `random` module documents for itself) — so every run stays
-reproducible even without an explicit seed.
+`Generator` (from `default_rng`) is the main interface. `RandomState` and the module-level
+legacy functions (`seed`, `rand`, `randn`, ...) wrap a hidden `Generator`. `SeedSequence`,
+`MT19937` and bit-generator state access are not provided.
 
-`Generator` (returned by `default_rng`) is the modern interface. `RandomState` and the
-module-level legacy functions (`rand`, `randn`, `seed`, ...) are a thin compatibility layer over
-one hidden `Generator` each; they exist for older call patterns and for SciPy's
-`check_random_state`, not to reproduce NumPy's legacy generator's own stream.
-
-The per-element draw loops live in the native `_numpy_random` module, documented there
-(`src/python/stdlib/numpy/random.rs` and its submodules): PCG64 itself, bounded-integer rejection
-sampling, Marsaglia's polar method for normals, inversion for exponentials, Marsaglia and Tsang's
-method for gamma, and so on. This file owns object state, argument defaults, dtype/shape
-resolution, and parameter broadcasting (via `numpy.broadcast_to`).
+Per-draw sampling runs in the native `_numpy_random` module. This file resolves arguments,
+shapes and dtypes and broadcasts parameters.
 """
 
 import numpy as _np
@@ -166,44 +153,24 @@ def _choice_result(idx, values_source, size, shape):
 
 
 def _weighted_choice_with_replacement(raw_state, store_state, p_arr, n_samples):
-    cumulative = p_arr.astype(float).tolist()
-    running = 0.0
-    for i, weight in enumerate(cumulative):
-        running += weight
-        cumulative[i] = running
-    cumulative[-1] = 1.0
-    base, new_state = _nr._uniform01_fill(raw_state(), [n_samples], "float64")
+    cumulative = _np.cumsum(p_arr)
+    cumulative = cumulative / cumulative[-1]
+    u, new_state = _nr._uniform01_fill(raw_state(), [n_samples], "float64")
     store_state(new_state)
-    result = []
-    for value in base.tolist():
-        pick = len(cumulative) - 1
-        for i, threshold in enumerate(cumulative):
-            if value < threshold:
-                pick = i
-                break
-        result.append(pick)
-    return _np.array(result, dtype=_np.int64)
+    # u < 1 == cumulative[-1], and side="right" skips zero-weight entries.
+    return _np.searchsorted(cumulative, u, side="right").astype(_np.int64)
 
 
 def _weighted_choice_without_replacement(raw_state, store_state, p_arr, n_samples):
-    remaining_p = p_arr.astype(float).tolist()
-    remaining_idx = list(range(len(remaining_p)))
-    result = []
-    for _ in range(n_samples):
-        total = sum(remaining_p)
-        base, new_state = _nr._uniform01_fill(raw_state(), [1], "float64")
-        store_state(new_state)
-        target = float(base[0]) * total
-        cumulative = 0.0
-        pick = len(remaining_p) - 1
-        for i, weight in enumerate(remaining_p):
-            cumulative += weight
-            if target < cumulative:
-                pick = i
-                break
-        result.append(remaining_idx.pop(pick))
-        remaining_p.pop(pick)
-    return _np.array(result, dtype=_np.int64)
+    if _np.count_nonzero(p_arr) < n_samples:
+        raise ValueError("fewer non-zero probabilities than samples")
+    u, new_state = _nr._uniform01_fill(raw_state(), [p_arr.shape[0]], "float64")
+    store_state(new_state)
+    # Efraimidis-Spirakis: ordering entries by decreasing log(1 - u) / p draws them one by one
+    # with probability proportional to p among those not yet drawn.
+    with _np.errstate(divide="ignore", invalid="ignore"):
+        keys = _np.where(p_arr > 0, _np.log1p(-u) / p_arr, -_np.inf)
+    return _np.argsort(-keys, kind="stable")[:n_samples].astype(_np.int64)
 
 
 def _choice_indices(raw_state, store_state, pop_size, shape, replace, p, shuffle=True):
