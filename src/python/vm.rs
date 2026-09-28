@@ -78,10 +78,6 @@ pub(super) enum NativeValue {
     ExceptionType(ExceptionType),
     /// Runtime representation of ``typing.List`` used by the generic-alias probe.
     TypingList,
-    /// Marker used as the only supported base for the capability-free enum slice.
-    EnumBase,
-    /// Marker used as the only supported base for the capability-free unittest slice.
-    UnitTestBase,
     /// The `Ellipsis` singleton written as `...`. An immediate marker keeps identity, equality,
     /// and dictionary hashing canonical without allocating an arena object.
     Ellipsis,
@@ -99,14 +95,12 @@ impl NativeValue {
     const ENVIRONMENT: u8 = 6;
     const EXCEPTION_TYPE: u8 = 7;
     const TYPING_LIST: u8 = 8;
-    const ENUM_BASE: u8 = 9;
-    const UNITTEST_BASE: u8 = 10;
-    const VALUE_KIND: u8 = 11;
-    const NATIVE_GETTER: u8 = 12;
-    const ELLIPSIS: u8 = 13;
-    const NOT_IMPLEMENTED: u8 = 14;
-    const NATIVE_CLASS_METHOD: u8 = 15;
-    const SLOT_WRAPPER: u8 = 16;
+    const VALUE_KIND: u8 = 9;
+    const NATIVE_GETTER: u8 = 10;
+    const ELLIPSIS: u8 = 11;
+    const NOT_IMPLEMENTED: u8 = 12;
+    const NATIVE_CLASS_METHOD: u8 = 13;
+    const SLOT_WRAPPER: u8 = 14;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -141,8 +135,6 @@ impl NativeValue {
             Self::Environment => (0, Self::ENVIRONMENT),
             Self::ExceptionType(value) => (exception_type_code(value.0), Self::EXCEPTION_TYPE),
             Self::TypingList => (0, Self::TYPING_LIST),
-            Self::EnumBase => (0, Self::ENUM_BASE),
-            Self::UnitTestBase => (0, Self::UNITTEST_BASE),
             Self::Ellipsis => (0, Self::ELLIPSIS),
             Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
         }
@@ -202,8 +194,6 @@ impl NativeValue {
                 Self::ExceptionType(ExceptionType(exception_type_name(payload)))
             }
             Self::TYPING_LIST => Self::TypingList,
-            Self::ENUM_BASE => Self::EnumBase,
-            Self::UNITTEST_BASE => Self::UnitTestBase,
             Self::ELLIPSIS => Self::Ellipsis,
             Self::NOT_IMPLEMENTED => Self::NotImplemented,
             Self::VALUE_KIND => {
@@ -1114,6 +1104,9 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+        if self.is_unbounded_iterator(value)? {
+            return Err("cannot materialize infinite itertools.count without a bound".into());
+        }
         if let Some(iterator) = self.class_iterator(value)? {
             let mut result = Vec::new();
             while let Some(item) = self.next_until_stop(&iterator)? {
@@ -1218,6 +1211,16 @@ impl<'a> Vm<'a> {
             return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
+    }
+
+    fn is_unbounded_iterator(&self, value: &Value) -> Result<bool, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.state.heap.get(id)?,
+            Object::CountIterator { .. }
+        ))
     }
 
     /// Iterate an instance without `__iter__` through CPython's legacy sequence protocol:

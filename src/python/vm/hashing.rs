@@ -8,7 +8,7 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{protocol, Object, Slot, Value, ValueTag, Vm};
+use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, ValueTag, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -76,7 +76,21 @@ impl Vm<'_> {
                 return range_hash(start, stop, step);
             }
             Object::Slice { start, stop, step } => (vec![*start, *stop, *step], hash::slice),
-            Object::EnumMember { name, .. } => return Ok(hash::string(name)),
+            Object::EnumMember { class, name, value } => {
+                let (class, name, item) = (*class, name.clone(), *value);
+                if let Some(class) = class {
+                    if matches!(
+                        self.state.heap.get(class)?,
+                        Object::Class {
+                            layout: ClassLayout::Builtin(BuiltinType::String),
+                            ..
+                        }
+                    ) {
+                        return self.hash_nested(&item, depth + 1);
+                    }
+                }
+                return Ok(hash::string(&name));
+            }
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
             }

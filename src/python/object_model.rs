@@ -77,10 +77,12 @@ pub(super) enum BuiltinType {
     Complex,
     Slice,
     GenericAlias,
+    Enum,
+    TestCase,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 39] = [
+    pub(super) const ALL: [Self; 41] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -120,6 +122,8 @@ impl BuiltinType {
         Self::Complex,
         Self::Slice,
         Self::GenericAlias,
+        Self::Enum,
+        Self::TestCase,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -167,6 +171,8 @@ impl BuiltinType {
             Self::Complex => "complex",
             Self::Slice => "slice",
             Self::GenericAlias => "GenericAlias",
+            Self::Enum => "enum.Enum",
+            Self::TestCase => "unittest.TestCase",
         }
     }
 }
@@ -240,6 +246,10 @@ pub struct TypeSlots {
 pub enum SlotValue {
     Descriptor(Value),
     NativeMethod(&'static MethodDef),
+    /// The VM's representation renderer, which shares cycle tracking across nested values.
+    VmRepr,
+    /// Enum member text needs its defining class, which is stored in the VM's heap.
+    VmEnumString,
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
@@ -834,6 +844,10 @@ impl Default for TypeRegistry {
             &mut types[BuiltinType::RaisesContext as usize],
             &super::stdlib::unittest::RAISES_CONTEXT_TYPE,
         );
+        install_native_attributes(
+            &mut types[BuiltinType::TestCase as usize],
+            &super::stdlib::unittest::TEST_CASE_TYPE,
+        );
         for definition in super::stdlib::numpy::array_types() {
             install_native_attributes(&mut types[BuiltinType::Array as usize], definition);
         }
@@ -1321,6 +1335,8 @@ fn install_native_method_slots(ty: &mut PyType) {
                 | Slot::InitSubclass
                 | Slot::ClassGetItem
                 | Slot::Format
+                | Slot::Iter
+                | Slot::Next
         ) {
             continue;
         }
@@ -1380,6 +1396,35 @@ fn install_number_attributes(types: &mut [PyType]) {
 fn install_builtin_slots(types: &mut [PyType]) {
     let intrinsic = SlotValue::NativeBinary;
     let unary = SlotValue::NativeUnary;
+    for builtin in [
+        BuiltinType::None,
+        BuiltinType::Ellipsis,
+        BuiltinType::NotImplemented,
+        BuiltinType::Bool,
+        BuiltinType::Int,
+        BuiltinType::Float,
+        BuiltinType::String,
+        BuiltinType::Bytes,
+        BuiltinType::ByteArray,
+        BuiltinType::List,
+        BuiltinType::Tuple,
+        BuiltinType::Dict,
+        BuiltinType::Set,
+        BuiltinType::FrozenSet,
+        BuiltinType::Range,
+        BuiltinType::NamespaceDict,
+        BuiltinType::DictKeys,
+        BuiltinType::DictValues,
+        BuiltinType::DictItems,
+        BuiltinType::MappingProxy,
+        BuiltinType::Complex,
+        BuiltinType::Slice,
+        BuiltinType::Exception,
+        BuiltinType::Module,
+        BuiltinType::Function,
+    ] {
+        types[builtin as usize].slots.repr = Some(SlotValue::VmRepr);
+    }
     for builtin in [
         BuiltinType::List,
         BuiltinType::Tuple,
@@ -1442,6 +1487,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.reflected_bitwise_or = Some(intrinsic(super::number::slot_bitwise_or));
     }
     let slots = &mut types[BuiltinType::String as usize].slots;
+    slots.hash = Some(unary(super::stdlib::core::slot_string_hash));
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
@@ -1452,6 +1498,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.remainder = Some(intrinsic(super::stdlib::core::slot_string_remainder));
 
     let slots = &mut types[BuiltinType::Bytes as usize].slots;
+    slots.hash = Some(unary(super::stdlib::core::slot_bytes_hash));
     slots.length = Some(unary(super::stdlib::core::slot_bytes_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
@@ -1693,6 +1740,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
     stream.next = Some(unary(super::stdlib::sys::slot_next));
 
     types[BuiltinType::NotImplemented as usize].slots.bool_ = Some(unary(not_implemented_bool));
+    types[BuiltinType::Enum as usize].slots.repr = Some(SlotValue::VmRepr);
+    types[BuiltinType::Enum as usize].slots.str_ = Some(SlotValue::VmEnumString);
 }
 
 /// Fill resolved builtin slots from the first defining ancestor. Local slots were captured
@@ -1729,6 +1778,8 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                 SlotValue::NativeBinary(_)
                     | SlotValue::NativeTernary(_)
                     | SlotValue::NativeUnary(_)
+                    | SlotValue::VmRepr
+                    | SlotValue::VmEnumString
             )
         ) {
             ty.attributes.entry(name.into()).or_insert(Value::Native(

@@ -1440,7 +1440,9 @@ impl PyRuntime for Vm<'_> {
                 user_bases.push(id);
             } else {
                 match base.native_value() {
-                    Some(NativeValue::BuiltinType(BuiltinType::Object)) => {}
+                    Some(NativeValue::BuiltinType(
+                        BuiltinType::Object | BuiltinType::Enum | BuiltinType::TestCase,
+                    )) => {}
                     Some(NativeValue::BuiltinType(builtin))
                         if super::objects::is_subclassable_builtin(builtin)
                             && layout == ClassLayout::Object =>
@@ -1587,6 +1589,10 @@ impl PyRuntime for Vm<'_> {
 
     fn is_iterator(&self, value: &Value) -> PyResult<bool> {
         Vm::is_iterator(self, value).map_err(PyError::runtime_error)
+    }
+
+    fn is_unbounded_iterator(&self, value: &Value) -> PyResult<bool> {
+        Vm::is_unbounded_iterator(self, value).map_err(PyError::runtime_error)
     }
 
     fn iterator(&mut self, value: Value) -> PyResult<PyIterator> {
@@ -2244,8 +2250,8 @@ impl PyRuntime for Vm<'_> {
     fn marker(&self, marker: PyMarker) -> Value {
         Value::Native(match marker {
             PyMarker::TypingList => NativeValue::TypingList,
-            PyMarker::EnumBase => NativeValue::EnumBase,
-            PyMarker::UnitTestBase => NativeValue::UnitTestBase,
+            PyMarker::EnumType => NativeValue::BuiltinType(BuiltinType::Enum),
+            PyMarker::TestCaseType => NativeValue::BuiltinType(BuiltinType::TestCase),
             PyMarker::Environment => NativeValue::Environment,
             PyMarker::Stdin => NativeValue::Stream(Stream::Stdin),
             PyMarker::StdinBuffer => NativeValue::Stream(Stream::StdinBuffer),

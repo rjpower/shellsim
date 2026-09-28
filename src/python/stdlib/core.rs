@@ -444,6 +444,7 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {
     name: "generator",
     methods: &[
+        method("generator", "__iter__", iterator_iter),
         method("generator", "__next__", generator_next),
         method("generator", "send", generator_send),
         method("generator", "throw", generator_throw),
@@ -1400,6 +1401,11 @@ fn bytearray_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallA
 }
 
 fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+    if runtime.is_unbounded_iterator(&value)? {
+        return Err(PyError::resource_error(
+            "cannot materialize infinite itertools.count without a bound",
+        ));
+    }
     let iterator = runtime.iterator(value)?;
     let mut bytes = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
@@ -1412,6 +1418,11 @@ fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8
 }
 
 fn collect_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyValue>> {
+    if runtime.is_unbounded_iterator(&value)? {
+        return Err(PyError::resource_error(
+            "cannot materialize infinite itertools.count without a bound",
+        ));
+    }
     let iterator = runtime.iterator(value)?;
     let mut values = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
@@ -4313,6 +4324,28 @@ pub(crate) fn slot_string_add(
         .ok_or_else(|| PyError::resource_error("string result is too large"))?;
     runtime.reserve_memory(bytes)?;
     runtime.new_string(left + &right).map(Some)
+}
+
+pub(crate) fn slot_string_hash(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(text) = runtime.string_value(&value)? else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+    Ok(Some(Value::Int(super::super::hash::string(&text))))
+}
+
+pub(crate) fn slot_bytes_hash(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(bytes) = runtime.bytes_value(&value)? else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(u64::try_from(bytes.len() / 32).unwrap_or(u64::MAX))?;
+    Ok(Some(Value::Int(super::super::hash::bytes(&bytes))))
 }
 
 pub(crate) fn slot_string_multiply(

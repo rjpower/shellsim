@@ -473,6 +473,77 @@ def test_registered_mro_orders_user_and_builtin_bases_together():
     assert len(value) == 7
     assert Combined.__mro__ == (Combined, First, Second, list, object)
 
+    class Later:
+        def __init__(self, values):
+            raise AssertionError("a later MRO initializer ran")
+
+    class NativeFirst(list, Later):
+        pass
+
+    assert NativeFirst([1]) == [1]
+
+
+def test_enum_and_testcase_bases_are_classes_in_the_registered_mro():
+    import enum
+    import unittest
+
+    assert isinstance(enum.Enum, type)
+    assert enum.Enum.__mro__ == (enum.Enum, object)
+    assert isinstance(unittest.TestCase, type)
+    assert unittest.TestCase.__mro__ == (unittest.TestCase, object)
+
+    class Color(str, enum.Enum):
+        RED = "red"
+
+        def label(self):
+            return self.name + ":" + self.upper()
+
+    assert Color.__mro__ == (Color, str, enum.Enum, object)
+    assert isinstance(Color.RED, Color)
+    assert isinstance(Color.RED, str)
+    assert Color.RED.name == "RED"
+    assert Color.RED.value == "red"
+    assert type(Color.RED) is Color
+    assert Color.RED == "red"
+    assert hash(Color.RED) == hash("red")
+    assert Color.RED.__hash__() == "red".__hash__()
+    assert repr(Color.RED) == "<Color.RED: 'red'>"
+    assert str(Color.RED) == "Color.RED"
+    assert Color.RED.upper() == "RED"
+    assert Color.RED.label() == "RED:RED"
+
+    class Case(unittest.TestCase):
+        pass
+
+    assert Case.__mro__ == (Case, unittest.TestCase, object)
+    assert Case().assertTrue(True) is None
+
+
+def test_generator_iteration_methods_share_the_protocol_slots():
+    def values():
+        yield 3
+
+    generator = values()
+    assert generator.__iter__() is generator
+    assert iter(generator) is generator
+    assert generator.__next__() == 3
+    try:
+        next(generator)
+    except StopIteration:
+        pass
+    else:
+        raise AssertionError("exhausted generator advanced")
+
+
+def test_builtin_repr_descriptors_share_nested_cycle_rendering():
+    values = []
+    values.append(values)
+    assert values.__repr__() == repr(values) == "[[...]]"
+    assert list.__repr__(values) == repr(values)
+    assert "red".__repr__() == repr("red")
+    assert bytes.__repr__(b"red") == repr(b"red")
+    assert None.__repr__() == repr(None)
+
 
 def test_metaclass_data_descriptor_precedes_class_namespace():
     class Meta(type):

@@ -523,15 +523,31 @@ impl Vm<'_> {
                     return Ok(None);
                 }
                 Object::EnumMember {
+                    class,
                     name: member_name,
                     value,
                 } => {
-                    let value = match name {
-                        "name" => self.allocate_string(member_name)?,
-                        "value" => value,
-                        _ => return Ok(None),
-                    };
-                    return Ok(Some(value));
+                    match name {
+                        "name" => return self.allocate_string(member_name).map(Some),
+                        "value" => return Ok(Some(value)),
+                        _ => {}
+                    }
+                    if let Some(class) = class {
+                        let type_id = self
+                            .class_type_id(&Value::Object(class))?
+                            .ok_or("enum member has an invalid class")?;
+                        if let Some((defining_type, descriptor)) =
+                            self.type_lookup(type_id, name)?
+                        {
+                            return self.bind_type_attribute(
+                                descriptor,
+                                Some(owner),
+                                type_id,
+                                defining_type,
+                            );
+                        }
+                    }
+                    return Ok(None);
                 }
                 Object::GenericAlias { origin, arguments } => {
                     return match name {
@@ -629,7 +645,6 @@ impl Vm<'_> {
         }
         let native_name =
             match owner.native_value() {
-                Some(NativeValue::UnitTestBase) if name == "__name__" => Some("TestCase"),
                 Some(NativeValue::Function(builtin)) if name == "__name__" => Some(builtin.name()),
                 Some(NativeValue::NativeFunction(function)) if name == "__name__" => {
                     Some(function.name)
@@ -1175,6 +1190,11 @@ impl Vm<'_> {
     /// `value`, or the builtin value it holds when it is an instance of a builtin subclass such
     /// as a `tuple` subclass. Builtin operations that the class does not override act on it.
     pub(super) fn builtin_view(&self, value: Value) -> Result<Value, String> {
+        if let Some(id) = value.object_id() {
+            if let Object::EnumMember { value, .. } = self.state.heap.get(id)? {
+                return Ok(*value);
+            }
+        }
         Ok(protocol::builtin_payload(&self.state.heap, &value)?.unwrap_or(value))
     }
 
@@ -1862,10 +1882,18 @@ impl Vm<'_> {
         let explicit_metaclass = has_metaclass.then(|| self.stack.pop().expect("checked above"));
         let bases_start = self.stack.len() - base_count;
         let bases = self.stack.split_off(bases_start);
-        let is_enum =
-            bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::EnumBase));
-        let is_unittest =
-            bases.len() == 1 && matches!(bases[0].native_value(), Some(NativeValue::UnitTestBase));
+        let is_enum = bases.iter().any(|base| {
+            matches!(
+                base.native_value(),
+                Some(NativeValue::BuiltinType(BuiltinType::Enum))
+            )
+        });
+        let is_unittest = bases.iter().any(|base| {
+            matches!(
+                base.native_value(),
+                Some(NativeValue::BuiltinType(BuiltinType::TestCase))
+            )
+        });
         let named_tuple_bases = bases
             .iter()
             .filter(|base| {
@@ -1902,7 +1930,7 @@ impl Vm<'_> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        let user_bases = if is_enum || is_unittest || is_named_tuple {
+        let user_bases = if is_named_tuple {
             Vec::new()
         } else {
             bases
@@ -1917,7 +1945,10 @@ impl Vm<'_> {
                     } else {
                         match base.native_value() {
                             Some(NativeValue::BuiltinType(
-                                BuiltinType::Object | BuiltinType::Type,
+                                BuiltinType::Object
+                                | BuiltinType::Type
+                                | BuiltinType::Enum
+                                | BuiltinType::TestCase,
                             ))
                             | Some(NativeValue::ExceptionType(_)) => None,
                             Some(NativeValue::BuiltinType(builtin))
@@ -2118,15 +2149,6 @@ impl Vm<'_> {
             self.stack.push(class);
             return Ok(());
         }
-        if is_unittest {
-            attributes.insert("__shellsim_unittest__".into(), Value::Bool(true));
-            for method in super::super::stdlib::unittest::TEST_CASE_TYPE.methods {
-                attributes.insert(
-                    method.name.into(),
-                    Value::Native(NativeValue::NativeMethod(method)),
-                );
-            }
-        }
         let dataclass_fields = fields
             .iter()
             .map(|field| (field.name.clone(), attributes.get(&field.name).cloned()))
@@ -2146,6 +2168,7 @@ impl Vm<'_> {
                     continue;
                 }
                 let member = self.allocate_object(Object::EnumMember {
+                    class: None,
                     name: member_name.clone(),
                     value,
                 })?;
@@ -2458,6 +2481,10 @@ impl Vm<'_> {
             dataclass_fields,
             enum_members,
         } = definition;
+        let enum_member_ids = enum_members
+            .iter()
+            .filter_map(Value::object_id)
+            .collect::<Vec<_>>();
         // A heap class introduces the instance-dictionary descriptor when no heap ancestor
         // already supplies it. Metaclasses inherit type's own descriptor instead.
         if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains_key("__dict__") {
@@ -2522,6 +2549,12 @@ impl Vm<'_> {
         })?;
         self.state.types.finish(instance_type, class)?;
         let class_id = class.object_id().expect("allocated class has an object id");
+        for member in enum_member_ids {
+            let Object::EnumMember { class, .. } = self.state.heap.get_mut(member)? else {
+                return Err("invalid enum member".into());
+            };
+            *class = Some(class_id);
+        }
         for (_, descriptor) in &descriptors {
             let Some(function_id) = descriptor.object_id() else {
                 continue;
@@ -2616,24 +2649,26 @@ impl Vm<'_> {
         class: super::super::heap::ObjectId,
         name: &str,
     ) -> Result<Option<(super::super::heap::ObjectId, Value)>, String> {
-        let Object::Class {
-            attributes, mro, ..
-        } = self.state.heap.get(class)?
-        else {
+        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
             return Err("instance has an invalid class".into());
         };
-        if let Some(value) = attributes.get(name) {
-            return Ok(Some((class, *value)));
-        }
-        let ancestors = mro.clone();
+        let ancestors = std::iter::once(*instance_type)
+            .chain(self.state.types.get(*instance_type)?.mro.iter().copied())
+            .collect::<Vec<_>>();
         for ancestor in ancestors {
             self.charge_cpu(1)?;
-            let Object::Class { attributes, .. } = self.state.heap.get(ancestor)? else {
-                return Err("class MRO contains a non-class object".into());
+            let Some(value) = self.type_namespace_attribute(ancestor, name)? else {
+                continue;
             };
-            if let Some(value) = attributes.get(name) {
-                return Ok(Some((ancestor, *value)));
+            let owner = self.state.types.value(ancestor)?;
+            if let Some(id) = owner.object_id() {
+                if matches!(self.state.heap.get(id)?, Object::Class { .. }) {
+                    return Ok(Some((id, value)));
+                }
             }
+            // This helper returns heap-owned definitions only. A native definition before a
+            // later user class still wins and must be handled by the caller's native path.
+            return Ok(None);
         }
         Ok(None)
     }
@@ -2906,6 +2941,19 @@ impl Vm<'_> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
+            SlotValue::VmEnumString => {
+                if !arguments.is_empty() {
+                    return Err("enum string slot received arguments".into());
+                }
+                return self.enum_member_string(*receiver).map(Some);
+            }
+            SlotValue::VmRepr => {
+                if !arguments.is_empty() {
+                    return Err("representation slot received arguments".into());
+                }
+                let rendered = self.repr_nested(receiver, &mut BTreeSet::new())?;
+                return self.allocate_string(rendered).map(Some);
+            }
             SlotValue::NativeMethod(method) => {
                 let receiver = self.builtin_view(*receiver)?;
                 return (method.call)(self, receiver, CallArgs::new(arguments, Vec::new()))
@@ -2997,8 +3045,22 @@ impl Vm<'_> {
             .types
             .local_slot(owner, slot)?
             .ok_or("slot wrapper has no local implementation")?;
+        if matches!(implementation, SlotValue::VmRepr) {
+            let value = if owner == BuiltinType::Enum.id() {
+                receiver
+            } else {
+                self.builtin_view(receiver)?
+            };
+            let rendered = self.repr_nested(&value, &mut BTreeSet::new())?;
+            return self.allocate_string(rendered);
+        }
+        if matches!(implementation, SlotValue::VmEnumString) {
+            return self.enum_member_string(receiver);
+        }
         let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
+            SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
+            SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
             SlotValue::NativeMethod(method) => {
                 return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
                     .map_err(|error| self.record_native_error(error));
@@ -3089,9 +3151,14 @@ impl Vm<'_> {
         value: &Value,
         active: &mut BTreeSet<ObjectId>,
     ) -> Result<String, String> {
-        if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
-            return protocol::string_value(&self.state.heap, &result)?
-                .ok_or_else(|| "__repr__ should return str".into());
+        if !matches!(
+            self.state.types.slot(self.type_id(value)?, Slot::Repr)?,
+            Some(SlotValue::VmRepr)
+        ) {
+            if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
+                return protocol::string_value(&self.state.heap, &result)?
+                    .ok_or_else(|| "__repr__ should return str".into());
+            }
         }
         if let Some(id) = value.object_id() {
             match *self.state.heap.get(id)? {
@@ -3144,6 +3211,25 @@ impl Vm<'_> {
         };
         active.remove(&id);
         Ok(rendered)
+    }
+
+    fn enum_member_string(&mut self, member: Value) -> Result<Value, String> {
+        let Some(id) = member.object_id() else {
+            return Err("enum string slot requires a member".into());
+        };
+        let Object::EnumMember {
+            class: Some(class),
+            name,
+            ..
+        } = self.state.heap.get(id)?
+        else {
+            return Err("enum string slot requires a member".into());
+        };
+        let class_name = match self.state.heap.get(*class)? {
+            Object::Class { name, .. } => name.clone(),
+            _ => return Err("enum member has an invalid class".into()),
+        };
+        self.allocate_string(format!("{class_name}.{name}"))
     }
 
     /// Dict-literal text for `entries`: `{key: value, ...}`.
@@ -3284,6 +3370,16 @@ impl Vm<'_> {
         if let Some(result) = self.invoke_slot(value, Slot::String, "__str__", Vec::new())? {
             return protocol::string_value(&self.state.heap, &result)?
                 .ok_or_else(|| "__str__ should return str".into());
+        }
+        if let Some(text) = protocol::string_value(&self.state.heap, value)? {
+            return Ok(text);
+        }
+        if self
+            .state
+            .types
+            .is_subclass(self.type_id(value)?, BuiltinType::Exception.id())?
+        {
+            return protocol::display(&self.state.heap, value);
         }
         let plain_instance = match value.object_id() {
             Some(id) => match self.state.heap.get(id)? {
@@ -3913,7 +4009,9 @@ impl Vm<'_> {
             | BuiltinType::Regex
             | BuiltinType::Match
             | BuiltinType::Array
-            | BuiltinType::GenericAlias => {
+            | BuiltinType::GenericAlias
+            | BuiltinType::Enum
+            | BuiltinType::TestCase => {
                 return Err(format!("cannot create '{}' instances", builtin_type.name()));
             }
             BuiltinType::Complex => unreachable!("complex construction returned above"),
@@ -3946,6 +4044,16 @@ impl Vm<'_> {
         if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
             if let Some(id) = self.state.types.exception_type_id(&kind) {
                 return Ok(id);
+            }
+        }
+        if let Some(id) = value.object_id() {
+            if let Object::EnumMember {
+                class: Some(class), ..
+            } = self.state.heap.get(id)?
+            {
+                return self
+                    .class_type_id(&Value::Object(*class))?
+                    .ok_or_else(|| "invalid enum class".to_string());
             }
         }
         Ok(match value.tag() {

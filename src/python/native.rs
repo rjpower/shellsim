@@ -427,8 +427,8 @@ pub(super) enum PyOperator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyMarker {
     TypingList,
-    EnumBase,
-    UnitTestBase,
+    EnumType,
+    TestCaseType,
     Environment,
     Stdin,
     /// `sys.stdin.buffer`: the standard-input descriptor read as raw bytes.
@@ -772,6 +772,8 @@ pub(super) trait PyRuntime {
     /// Whether `value` is an iterator: a builtin iterator or generator, or an object whose class
     /// defines `__next__`.
     fn is_iterator(&self, value: &PyValue) -> PyResult<bool>;
+    /// Whether a native iterator is known to be unbounded and cannot be collected into memory.
+    fn is_unbounded_iterator(&self, value: &PyValue) -> PyResult<bool>;
     /// `iter(value)`: an iterator is returned as is; any other iterable produces one.
     fn iterator(&mut self, value: PyValue) -> PyResult<PyIterator>;
     /// The next item of `iterator`, or `None` once it is exhausted.

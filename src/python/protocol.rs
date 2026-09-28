@@ -474,9 +474,20 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                     .collect::<Result<Vec<_>, String>>()?;
                 format!("Namespace({})", rendered.join(", "))
             }
-            Object::EnumMember { name, .. } => {
-                format!("<enum member {name}>")
+            Object::EnumMember {
+                class: Some(class),
+                name,
+                value,
+            } => {
+                let Object::Class {
+                    name: class_name, ..
+                } = heap.get(*class)?
+                else {
+                    return Err("enum member has an invalid class".into());
+                };
+                format!("<{class_name}.{name}: {}>", render(heap, value, active)?)
             }
+            Object::EnumMember { name, .. } => format!("<enum member {name}>"),
             Object::RaisesContext { .. } => "<pytest.raises>".into(),
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),

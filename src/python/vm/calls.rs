@@ -335,7 +335,14 @@ impl Vm<'_> {
                         };
                         let previous_suspend = self.native_suspend_allowed;
                         self.native_suspend_allowed = self.may_suspend(mode);
-                        let result = (method.call)(self, receiver, call);
+                        let native_receiver = if receiver.object_id().is_some_and(|id| {
+                            matches!(self.state.heap.get(id), Ok(Object::EnumMember { .. }))
+                        }) {
+                            self.builtin_view(receiver)?
+                        } else {
+                            receiver
+                        };
+                        let result = (method.call)(self, native_receiver, call);
                         self.native_suspend_allowed = previous_suspend;
                         match result {
                             Ok(value) => Ok(CallResult::Value(value)),

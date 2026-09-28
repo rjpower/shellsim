@@ -222,6 +222,7 @@ pub enum Object {
         attributes: InstanceAttributes,
     },
     EnumMember {
+        class: Option<ObjectId>,
         name: String,
         value: Value,
     },
@@ -1594,7 +1595,10 @@ fn trace_object(
                 }
             }
         }
-        Object::EnumMember { value, .. } => trace_value(*value, object_work),
+        Object::EnumMember { class, value, .. } => {
+            object_work.extend(*class);
+            trace_value(*value, object_work);
+        }
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,

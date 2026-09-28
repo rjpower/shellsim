@@ -49,7 +49,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 };
 
 fn test_case(runtime: &mut dyn PyRuntime) -> PyResult {
-    Ok(runtime.marker(PyMarker::UnitTestBase))
+    Ok(runtime.marker(PyMarker::TestCaseType))
 }
 
 fn assert_equal(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
