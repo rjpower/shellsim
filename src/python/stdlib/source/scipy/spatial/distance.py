@@ -7,12 +7,14 @@ input. ``cdist`` applies it to ``XA[:, None]`` against ``XB[None, :]`` and ``pdi
 ``np.triu_indices`` selects, both in float64 with floating-point warnings silenced, as SciPy's
 compiled loops are. A callable metric is called once per pair instead.
 
-The boolean dissimilarities other than ``hamming`` and ``jaccard`` (``dice``, ``yule``, ...)
-and ``directed_hausdorff`` are not provided.
+The boolean dissimilarities other than ``hamming`` and ``jaccard`` (``dice``, ``yule``, ...) and
+``directed_hausdorff`` are not provided. ``cdist`` and ``pdist`` take a metric's plain name only
+(case-insensitively), not SciPy's shorthand aliases. ``is_valid_dm``, ``is_valid_y``,
+``num_obs_dm`` and ``num_obs_y`` are not provided; ``squareform`` still validates its square
+input directly.
 """
 
 import math
-import warnings
 
 import numpy as np
 from scipy.special import rel_entr
@@ -26,14 +28,10 @@ __all__ = [
     "correlation",
     "cosine",
     "euclidean",
-    "is_valid_dm",
-    "is_valid_y",
     "jaccard",
     "jensenshannon",
     "mahalanobis",
     "minkowski",
-    "num_obs_dm",
-    "num_obs_y",
     "pdist",
     "seuclidean",
     "sqeuclidean",
@@ -287,35 +285,31 @@ def _float64(u):
 
 # Pairwise distances.
 
+# Plain names only: SciPy's shorthand aliases (`"euclid"`, `"co"`, `"test_euclidean"`, ...)
+# are not supported.
 _METRICS = {
-    "braycurtis": (_braycurtis, ()),
-    "canberra": (_canberra, ()),
-    "chebyshev": (_chebyshev, ("chebychev", "cheby", "cheb", "ch")),
-    "cityblock": (_cityblock, ("cblock", "cb", "c")),
-    "correlation": (_correlation, ("co",)),
-    "cosine": (_cosine, ("cos",)),
-    "euclidean": (_euclidean, ("euclid", "eu", "e")),
-    "hamming": (_hamming, ("matching", "hamm", "ha", "h")),
-    "jaccard": (_jaccard, ("jacc", "ja", "j")),
-    "jensenshannon": (_jensenshannon, ("js",)),
-    "mahalanobis": (_mahalanobis, ("mahal", "mah")),
-    "minkowski": (_minkowski, ("mi", "m", "pnorm")),
-    "seuclidean": (_seuclidean, ("se", "s")),
-    "sqeuclidean": (_sqeuclidean, ("sqe", "sqeuclid")),
-}
-
-_ALIASES = {
-    alias: name for name, (_, aliases) in _METRICS.items() for alias in (name, *aliases)
+    "braycurtis": _braycurtis,
+    "canberra": _canberra,
+    "chebyshev": _chebyshev,
+    "cityblock": _cityblock,
+    "correlation": _correlation,
+    "cosine": _cosine,
+    "euclidean": _euclidean,
+    "hamming": _hamming,
+    "jaccard": _jaccard,
+    "jensenshannon": _jensenshannon,
+    "mahalanobis": _mahalanobis,
+    "minkowski": _minkowski,
+    "seuclidean": _seuclidean,
+    "sqeuclidean": _sqeuclidean,
 }
 
 
 def _metric_name(metric):
     name = metric.lower()
-    if name.startswith("test_"):
-        name = name[len("test_") :]
-    if name not in _ALIASES:
+    if name not in _METRICS:
         raise ValueError(f"Unknown Distance Metric: {metric}")
-    return _ALIASES[name]
+    return name
 
 
 def _matrix(X):
@@ -381,7 +375,7 @@ def cdist(XA, XB, metric="euclidean", *, out=None, **kwargs):
     XB = _matrix(XB)
     name = _metric_name(metric)
     kwargs = _defaults(name, np.vstack([XA, XB]), kwargs)
-    kernel = _METRICS[name][0]
+    kernel = _METRICS[name]
     with np.errstate(all="ignore"):
         result = kernel(_sequential_sum, XA[:, None, :], XB[None, :, :], **kwargs)
     return _output(np.asarray(result, dtype=np.float64).reshape(shape), out)
@@ -407,7 +401,7 @@ def pdist(X, metric="euclidean", *, out=None, **kwargs):
             f"{X.shape[1] + 1} observations are required."
         )
     kwargs = _defaults(name, X, kwargs)
-    kernel = _METRICS[name][0]
+    kernel = _METRICS[name]
     with np.errstate(all="ignore"):
         result = kernel(_sequential_sum, X[rows], X[columns], **kwargs)
     return _output(np.asarray(result, dtype=np.float64).reshape(len(rows)), out)
@@ -442,7 +436,7 @@ def squareform(X, force="no", checks=True):
         if shape[0] != shape[1]:
             raise ValueError("The matrix argument must be square.")
         if checks:
-            is_valid_dm(X, throw=True, name="X")
+            _check_square_distance_matrix(X)
         if shape[0] <= 1:
             return np.array([], dtype=X.dtype)
         return X[np.triu_indices(shape[0], 1)]
@@ -452,66 +446,10 @@ def squareform(X, force="no", checks=True):
     )
 
 
-def _invalid(message, throw, warning):
-    if throw:
-        raise ValueError(message)
-    if warning:
-        warnings.warn(message, stacklevel=3)
-    return False
-
-
-def is_valid_dm(D, tol=0.0, throw=False, name="D", warning=False):
-    """Whether ``D`` is a square, symmetric matrix with a zero diagonal, within ``tol``."""
-    D = np.asarray(D)
-    label = f"Distance matrix {name!r}" if name else "Distance matrix"
-    if D.ndim != 2:
-        return _invalid(f"{label} must have shape=2 (i.e. be two-dimensional).", throw, warning)
-    if D.shape[0] != D.shape[1]:
-        return _invalid(f"{label} must be square.", throw, warning)
-    if tol == 0.0:
-        if not np.array_equal(D, D.T):
-            return _invalid(f"{label} must be symmetric.", throw, warning)
-        if np.any(np.diagonal(D) != 0):
-            return _invalid(f"{label} diagonal must be zero.", throw, warning)
-        return True
-    if np.any(np.abs(D - D.T) > tol):
-        return _invalid(f"{label} must be symmetric within tolerance {tol:5.5f}.", throw, warning)
-    if np.any(np.abs(np.diagonal(D)) > tol):
-        message = f"{label} diagonal must be close to zero within tolerance {tol:5.5f}."
-        return _invalid(message, throw, warning)
-    return True
-
-
-def is_valid_y(y, warning=False, throw=False, name=None):
-    """Whether ``y`` is a condensed distance vector: 1-D with ``n * (n - 1) / 2`` entries."""
-    y = np.asarray(y)
-    label = f"condensed distance matrix {name!r}" if name else "condensed distance matrix"
-    if y.ndim != 1:
-        message = f"{label[0].upper()}{label[1:]} must have shape=1 (i.e. be one-dimensional)."
-        return _invalid(message, throw, warning)
-    n = int(math.ceil(math.sqrt(y.shape[0] * 2)))
-    if n * (n - 1) != y.shape[0] * 2:
-        message = (
-            f"Length n of {label} must be a binomial coefficient, i.e. there must be a k such "
-            "that (k \\choose 2)=n)!"
-        )
-        return _invalid(message, throw, warning)
-    return True
-
-
-def num_obs_dm(d):
-    """The number of observations a square distance matrix describes."""
-    d = np.asarray(d)
-    is_valid_dm(d, tol=np.inf, throw=True, name="d")
-    return d.shape[0]
-
-
-def num_obs_y(Y):
-    """The number of observations a condensed distance vector describes."""
-    Y = np.asarray(Y)
-    is_valid_y(Y, throw=True, name="Y")
-    if Y.shape[0] == 0:
-        raise ValueError(
-            "The number of observations cannot be determined on an empty distance matrix."
-        )
-    return int(math.ceil(math.sqrt(Y.shape[0] * 2)))
+def _check_square_distance_matrix(D):
+    """Raise ``ValueError`` unless the square `D` is symmetric with a zero diagonal, as a
+    condensed-to-square round trip and a genuine distance matrix both require."""
+    if not np.array_equal(D, D.T):
+        raise ValueError("Distance matrix 'X' must be symmetric.")
+    if np.any(np.diagonal(D) != 0):
+        raise ValueError("Distance matrix 'X' diagonal must be zero.")
