@@ -10,9 +10,6 @@ coefficients and hypothesis tests, including ``chi2_contingency``).
 from scipy.stats._describe import (
     ConstantInputWarning,
     DegenerateDataWarning,
-    DescribeResult,
-    ModeResult,
-    SmallSampleWarning,
     describe,
     kurtosis,
     mode,
@@ -63,9 +60,6 @@ __all__ = [
     "ttest_rel",
     "chisquare",
     "chi2_contingency",
-    "SmallSampleWarning",
     "ConstantInputWarning",
     "DegenerateDataWarning",
-    "DescribeResult",
-    "ModeResult",
 ]

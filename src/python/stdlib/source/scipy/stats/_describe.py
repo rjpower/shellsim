@@ -26,11 +26,8 @@ __all__ = [
     "zmap",
     "trim_mean",
     "rankdata",
-    "SmallSampleWarning",
     "ConstantInputWarning",
     "DegenerateDataWarning",
-    "DescribeResult",
-    "ModeResult",
 ]
 
 

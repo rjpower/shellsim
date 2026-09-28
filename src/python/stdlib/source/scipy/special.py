@@ -30,6 +30,47 @@ from _scipy_special import zeta as _zeta
 # special.digamma` holds.
 digamma = psi  # noqa: F821
 
+__all__ = [
+    "beta",
+    "betainc",
+    "betaincc",
+    "betaincinv",
+    "betaln",
+    "binom",
+    "boxcox",
+    "comb",
+    "digamma",
+    "entr",
+    "erf",
+    "erfc",
+    "erfcinv",
+    "erfinv",
+    "expit",
+    "expm1",
+    "factorial",
+    "gamma",
+    "gammainc",
+    "gammaincc",
+    "gammainccinv",
+    "gammaincinv",
+    "gammaln",
+    "inv_boxcox",
+    "kl_div",
+    "log1p",
+    "log_ndtr",
+    "loggamma",
+    "logit",
+    "logsumexp",
+    "ndtr",
+    "ndtri",
+    "psi",
+    "rel_entr",
+    "softmax",
+    "xlog1py",
+    "xlogy",
+    "zeta",
+]
+
 
 def _out(value):
     value = np.asarray(value)
