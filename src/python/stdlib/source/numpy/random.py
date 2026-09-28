@@ -508,10 +508,8 @@ def default_rng(seed=None):
 
 
 class RandomState:
-    """Legacy `numpy.random` interface (`rand`, `randn`, `randint`, ...), kept for older call
-    patterns and for SciPy's `check_random_state`. This is a thin wrapper around one `Generator`;
-    shellsim's `RandomState` does not reproduce NumPy's own legacy generator's stream (see this
-    module's docstring).
+    """Legacy `numpy.random` interface (`rand`, `randn`, `randint`, ...) as a thin wrapper
+    around one `Generator`. Its stream does not reproduce NumPy's legacy generator.
     """
 
     def __init__(self, seed=None):
@@ -668,14 +666,3 @@ def binomial(n, p, size=None):
 
 def poisson(lam=1.0, size=None):
     return _rand.poisson(lam, size)
-
-
-class _Mtrand:
-    """Minimal shim for `np.random.mtrand._rand`, which SciPy's `check_random_state` reads
-    directly for `random_state=None` (real NumPy's `numpy.random` package always has a `mtrand`
-    submodule); shellsim implements nothing else of it.
-    """
-
-
-mtrand = _Mtrand()
-mtrand._rand = _rand

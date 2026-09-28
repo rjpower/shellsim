@@ -24,14 +24,6 @@ from scipy import special
 __all__ = ["norm", "t", "chi2", "f", "uniform", "expon", "binom", "poisson"]
 
 
-def _check_random_state(seed):
-    """Turn `seed` into a `numpy.random.Generator` for `rvs`, via `default_rng` (`None`, an
-    `int`, or an existing `Generator`). Kept local (rather than imported from
-    `scipy._lib._util`) since this module no longer depends on `scipy._lib`, and deliberately
-    does not touch the legacy `RandomState`/`mtrand` API."""
-    return np.random.default_rng(seed)
-
-
 def _scalarize(value):
     value = np.asarray(value)
     return value[()] if value.ndim == 0 else value
@@ -215,7 +207,7 @@ class _ContinuousDistribution:
 
     def rvs(self, *args, size=None, random_state=None, **kwds):
         shapes, loc, scale = self._bind(args, kwds)
-        rng = _check_random_state(random_state)
+        rng = np.random.default_rng(random_state)
         raw = self._rvs(rng, size, *shapes)
         return loc + scale * np.asarray(raw)
 
@@ -551,7 +543,7 @@ class _DiscreteDistribution:
 
     def rvs(self, *args, size=None, random_state=None, **kwds):
         shapes, loc = self._bind(args, kwds)
-        rng = _check_random_state(random_state)
+        rng = np.random.default_rng(random_state)
         draws = np.asarray(self._rvs(rng, size, *shapes))
         # Counts stay integers, as users expect, unless a fractional `loc` shifts them.
         shifted = draws + int(loc) if loc == int(loc) else draws + loc

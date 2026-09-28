@@ -450,8 +450,7 @@ def test_random_state_methods_shapes_and_ranges():
     assert rs.normal(0, 1, 2).shape == (2,)
 
 
-def test_random_state_scipy_surface_shapes():
-    # SciPy's `check_random_state` calls these directly on a `RandomState`.
+def test_random_state_distribution_shapes():
     rs = np.random.RandomState(1)
     assert rs.standard_normal(3).shape == (3,)
     assert rs.standard_t(5.0, 3).shape == (3,)
@@ -529,14 +528,6 @@ def test_legacy_choice_without_replacement_is_unique():
     np.random.seed(3)
     values = np.random.choice(10, size=5, replace=False)
     assert len(set(values.tolist())) == 5
-
-
-def test_mtrand_shared_global_reflects_seed():
-    assert isinstance(np.random.mtrand._rand, np.random.RandomState)
-    np.random.seed(11)
-    expected = np.random.rand(3).tolist()
-    np.random.seed(11)
-    assert np.random.mtrand._rand.rand(3).tolist() == expected
 
 
 @pytest.mark.parametrize(

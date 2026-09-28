@@ -81,8 +81,6 @@ pub(super) fn module_source(name: &str) -> Option<FrozenModule> {
         "numpy.strings" => frozen!("numpy/strings.py"),
         "numpy.testing" => frozen!("numpy/testing.py"),
         "scipy" => frozen!("scipy/__init__.py"),
-        "scipy._lib" => frozen!("scipy/_lib/__init__.py"),
-        "scipy._lib._util" => frozen!("scipy/_lib/_util.py"),
         "scipy.integrate" => frozen!("scipy/integrate.py"),
         "scipy.interpolate" => frozen!("scipy/interpolate.py"),
         "scipy.linalg" => frozen!("scipy/linalg/__init__.py"),
