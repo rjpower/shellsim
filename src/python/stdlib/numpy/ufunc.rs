@@ -941,42 +941,6 @@ fn keyword_options(
     Ok((options, out))
 }
 
-/// `np.divmod(x1, x2[, out1, out2], /, *, out=(None, None), dtype=None, casting='same_kind')`.
-pub(in crate::python) fn call_divmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    let positional = args.positional();
-    if !(2..=4).contains(&positional.len()) {
-        return Err(PyError::type_error(format!(
-            "divmod() takes from 2 to 4 positional arguments but {} were given",
-            positional.len()
-        )));
-    }
-    let positional_outs = (positional.len() > 2).then(|| positional[2..].to_vec());
-    let (options, keyword_out) = keyword_options(runtime, "divmod", &args, None)?;
-    let outs = match (positional_outs, keyword_out) {
-        (Some(_), Some(_)) => {
-            return Err(PyError::type_error(
-                "cannot specify 'out' as both a positional and keyword argument",
-            ))
-        }
-        (Some(values), None) => values,
-        (None, Some(value)) if !value.is_none() => {
-            let tuple = value.cast(runtime)?;
-            runtime.tuple_items(tuple)?
-        }
-        (None, _) => Vec::new(),
-    };
-    if !outs.is_empty() && outs.len() != 2 {
-        return Err(PyError::value_error(
-            "The 'out' tuple must have exactly one entry per ufunc output",
-        ));
-    }
-    let mut arrays = [None, None];
-    for (slot, value) in arrays.iter_mut().zip(outs) {
-        *slot = out_array(runtime, Some(value))?;
-    }
-    divmod(runtime, &positional[..2], &options, arrays)
-}
-
 /// Accept `out=array`, `out=(array,)`, or `out=None`.
 fn out_array(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
@@ -1516,8 +1480,10 @@ fn check_output_cast(
     )))
 }
 
-/// `np.divmod(x1, x2)`: `(floor_divide(x1, x2), remainder(x1, x2))` from one pass of NumPy's
-/// divmod loop, so floating-point errors are reported once under the name `divmod`.
+/// The `__divmod__`/`__rdivmod__` operator protocol on ndarrays: `(floor_divide(x1, x2),
+/// remainder(x1, x2))` from one pass, so floating-point errors are reported once under the name
+/// `divmod`. `np.divmod` itself is frozen Python (`numpy._math.divmod`), two independent ufunc
+/// calls; this function exists only for `divmod(array, array)`, a different call path.
 pub(in crate::python) fn divmod(
     runtime: &mut dyn PyRuntime,
     inputs: &[PyValue],

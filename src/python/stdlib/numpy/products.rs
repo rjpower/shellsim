@@ -1,13 +1,14 @@
-//! Array products in the top-level namespace: `dot`, `vdot`, `inner`, `outer`, `matmul` (the
-//! `@` operator), `tensordot`, and `ndarray.dot`.
+//! Array products in the top-level namespace: `dot`, `matmul` (the `@` operator), and
+//! `ndarray.dot`. `vdot`, `inner`, `outer`, `tensordot`, and `einsum` are frozen Python in
+//! `numpy._products`, built on `dot`/`matmul` plus reshape and transpose.
 //!
-//! Every product except `outer` runs one kernel over a [`Plan`]: for each output position it
-//! sums the products of paired elements. The plan holds byte offsets relative to each operand's
-//! first element for the batch, free, and summed positions, so strided views and broadcast
-//! batch dimensions need no copies. The kernel computes in the result dtype, so integer
-//! products wrap at the dtype width as NumPy's do. `float16` accumulates in `float32` and rounds
-//! once, like NumPy's half-precision loops. Object arrays call the Python `*` and `+` operators
-//! element by element, starting from the first product.
+//! `dot` and `matmul` run one kernel over a [`Plan`]: for each output position it sums the
+//! products of paired elements. The plan holds byte offsets relative to each operand's first
+//! element for the batch, free, and summed positions, so strided views and broadcast batch
+//! dimensions need no copies. The kernel computes in the result dtype, so integer products wrap
+//! at the dtype width as NumPy's do. `float16` accumulates in `float32` and rounds once, like
+//! NumPy's half-precision loops. Object arrays call the Python `*` and `+` operators element by
+//! element, starting from the first product.
 //!
 //! Work is charged before it starts: one CPU unit per multiply-add, plus memory for the offset
 //! tables and the result. Floating-point flags raised by a product go to `numpy.errstate` under
@@ -16,7 +17,7 @@
 use super::super::super::ast::BinaryOperator;
 use super::super::super::native::{
     CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyArrayData,
-    PyArrayDtype, PyError, PyKind, PyOperator, PyResult, PyRuntime, PyValue, PyValueCast,
+    PyArrayDtype, PyError, PyOperator, PyResult, PyRuntime, PyValue,
 };
 use super::super::super::Value;
 use super::args::{self, Signature};
@@ -46,11 +47,7 @@ const fn function(
 
 static FUNCTIONS: &[FunctionDef] = &[
     function("dot", module_dot),
-    function("vdot", vdot),
-    function("inner", inner),
-    function("outer", outer),
     function("matmul", module_matmul),
-    function("tensordot", tensordot),
 ];
 
 /// Methods this area installs on `numpy.ndarray`.
@@ -128,19 +125,9 @@ fn product_dtype(a: DType, b: DType, no_loop: impl Fn() -> PyError) -> PyResult<
     dtype::promote(a, b)
 }
 
-/// What an object product with nothing to sum returns: `dot` and `matmul` give `0`, while
-/// `vdot` leaves NumPy's output slot empty, which reads back as `None`.
-#[derive(Clone, Copy)]
-enum EmptySum {
-    Zero,
-    None,
-}
-
 /// Evaluate `plan` over `a` and `b`, already prepared for `dtype`, into a new array of `shape`.
-///
-/// `conjugate_left` conjugates each element of `a` first, for `vdot` on object arrays; numeric
-/// callers conjugate complex operands before planning.
-#[allow(clippy::too_many_arguments)]
+/// An object product with nothing to sum (an empty contraction axis) gives `0`, as `dot` and
+/// `matmul` do.
 fn run_plan(
     runtime: &mut dyn PyRuntime,
     name: &str,
@@ -149,13 +136,11 @@ fn run_plan(
     dtype: DType,
     plan: &Plan,
     shape: Vec<usize>,
-    empty: EmptySum,
-    conjugate_left: bool,
 ) -> PyResult<Array> {
     let count = array::element_count(&shape)?;
     runtime.charge_cpu(plan.cost(count) + 1)?;
     if dtype.kind() == Kind::Object {
-        let values = object_products(runtime, a, b, plan, count, empty, conjugate_left)?;
+        let values = object_products(runtime, a, b, plan, count)?;
         return array::new_array(runtime, PyArrayBuffer::Values(values), DType::OBJECT, shape);
     }
     let work = a.dtype;
@@ -239,8 +224,6 @@ fn object_products(
     b: &Array,
     plan: &Plan,
     count: usize,
-    empty: EmptySum,
-    conjugate_left: bool,
 ) -> PyResult<Vec<PyValue>> {
     let left = array::read_objects(runtime, a)?;
     let right = array::read_objects(runtime, b)?;
@@ -254,35 +237,19 @@ fn object_products(
             for b_free in &plan.b_free {
                 let mut sum = None;
                 for (a_sum, b_sum) in plan.a_sum.iter().zip(&plan.b_sum) {
-                    let mut x = left[slot(a_batch + a_free + a_sum)];
+                    let x = left[slot(a_batch + a_free + a_sum)];
                     let y = right[slot(b_batch + b_free + b_sum)];
-                    if conjugate_left {
-                        x = call_method(runtime, x, "conjugate")?;
-                    }
                     let product = runtime.apply_operator(multiply, &[x, y])?;
                     sum = Some(match sum {
                         None => product,
                         Some(total) => runtime.apply_operator(add, &[total, product])?,
                     });
                 }
-                values.push(sum.unwrap_or(match empty {
-                    EmptySum::Zero => Value::Int(0),
-                    EmptySum::None => Value::None,
-                }));
+                values.push(sum.unwrap_or(Value::Int(0)));
             }
         }
     }
     Ok(values)
-}
-
-fn call_method(runtime: &mut dyn PyRuntime, value: PyValue, name: &str) -> PyResult {
-    let method = runtime.get_attribute(value, name)?.ok_or_else(|| {
-        PyError::exception(
-            "AttributeError",
-            format!("object has no attribute '{name}'"),
-        )
-    })?;
-    runtime.call_value(method, CallArgs::new(Vec::new(), Vec::new()))
 }
 
 /// Contract `a` and `b` over paired axes. The result's axes are `a`'s remaining axes followed
@@ -328,17 +295,7 @@ fn contract(
         a_sum: offset_table(runtime, &sum_shape, &a_sum_strides)?,
         b_sum: offset_table(runtime, &sum_shape, &b_sum_strides)?,
     };
-    run_plan(
-        runtime,
-        name,
-        &a,
-        &b,
-        dtype,
-        &plan,
-        shape,
-        EmptySum::Zero,
-        false,
-    )
+    run_plan(runtime, name, &a, &b, dtype, &plan, shape)
 }
 
 /// A 0-d result as the scalar NumPy returns; other arrays as themselves.
@@ -428,200 +385,6 @@ fn method_dot(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     static SIGNATURE: Signature = Signature::new("dot", &["b", "out"], 1);
     let bound = SIGNATURE.bind(&args)?;
     dot(runtime, receiver, bound.required("b"), bound.get("out"))
-}
-
-/// `np.vdot(a, b)`: the dot product of both operands flattened, conjugating `a`. The result is
-/// always a scalar.
-fn vdot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("vdot", &["a", "b"], 2);
-    let bound = SIGNATURE.bind(&args)?;
-    let a = convert::as_array(runtime, bound.required("a"))?;
-    let b = convert::as_array(runtime, bound.required("b"))?;
-    let dtype = product_dtype(a.dtype, b.dtype, || {
-        PyError::value_error("function not available for this data type")
-    })?;
-    let a = array::ravel(runtime, &a)?;
-    let b = array::ravel(runtime, &b)?;
-    if a.size() != b.size() {
-        return Err(PyError::value_error(format!(
-            "cannot reshape array of size {} into shape ({},)",
-            b.size(),
-            a.size()
-        )));
-    }
-    let mut a = prepare(runtime, &a, dtype)?;
-    let b = prepare(runtime, &b, dtype)?;
-    if a.dtype.category() == dtype::Category::Complex {
-        let conjugate = ufunc::find("conjugate").expect("conjugate is a ufunc");
-        let value = ufunc::apply(runtime, conjugate, &[a.value()], &ufunc::Options::default())?;
-        a = Array::from_value(runtime, value)?;
-    }
-    let length = a.size();
-    let plan = Plan {
-        batches: vec![(0, 0)],
-        a_free: vec![0],
-        b_free: vec![0],
-        a_sum: offset_table(runtime, &[length], a.strides())?,
-        b_sum: offset_table(runtime, &[length], b.strides())?,
-    };
-    let conjugate_objects = dtype.kind() == Kind::Object;
-    let result = run_plan(
-        runtime,
-        "vdot",
-        &a,
-        &b,
-        dtype,
-        &plan,
-        Vec::new(),
-        EmptySum::None,
-        conjugate_objects,
-    )?;
-    scalar_or_array(runtime, &result)
-}
-
-/// `np.inner(a, b)`: a sum product over the last axes of both operands. A 0-d operand
-/// multiplies elementwise.
-fn inner(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("inner", &["a", "b"], 2);
-    let bound = SIGNATURE.bind(&args)?;
-    let a = convert::as_array(runtime, bound.required("a"))?;
-    let b = convert::as_array(runtime, bound.required("b"))?;
-    if a.ndim() == 0 || b.ndim() == 0 {
-        return multiply(runtime, &a, &b, None);
-    }
-    let dtype = product_dtype(a.dtype, b.dtype, dot_unavailable)?;
-    let (a_axis, b_axis) = (a.ndim() - 1, b.ndim() - 1);
-    if a.shape()[a_axis] != b.shape()[b_axis] {
-        return Err(not_aligned(&a, &b, a_axis, b_axis));
-    }
-    let result = contract(runtime, "inner", &a, &b, dtype, &[a_axis], &[b_axis])?;
-    scalar_or_array(runtime, &result)
-}
-
-/// `np.outer(a, b, out=None)`: `multiply(a.ravel()[:, None], b.ravel()[None, :], out)`.
-fn outer(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("outer", &["a", "b", "out"], 2);
-    let bound = SIGNATURE.bind(&args)?;
-    let a = convert::as_array(runtime, bound.required("a"))?;
-    let b = convert::as_array(runtime, bound.required("b"))?;
-    let out = bound
-        .value("out")
-        .map(|value| Array::from_value(runtime, value))
-        .transpose()?;
-    let a = array::ravel(runtime, &a)?;
-    let b = array::ravel(runtime, &b)?;
-    let column = array::new_view(
-        runtime,
-        &a,
-        a.dtype,
-        vec![a.size(), 1],
-        vec![a.strides()[0], 0],
-        a.view.offset,
-    )?;
-    let row = array::new_view(
-        runtime,
-        &b,
-        b.dtype,
-        vec![1, b.size()],
-        vec![0, b.strides()[0]],
-        b.view.offset,
-    )?;
-    multiply(runtime, &column, &row, out)
-}
-
-/// `np.tensordot(a, b, axes=2)`: contract the last `axes` axes of `a` with the first `axes`
-/// axes of `b`, or explicit axis lists `(axes_a, axes_b)`. The result stays an array even when
-/// it is 0-d, as NumPy's does.
-fn tensordot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new("tensordot", &["a", "b", "axes"], 2);
-    let bound = SIGNATURE.bind(&args)?;
-    let a = convert::as_array(runtime, bound.required("a"))?;
-    let b = convert::as_array(runtime, bound.required("b"))?;
-    let (a_axes, b_axes) = match bound.get("axes") {
-        None => count_axes(2),
-        Some(value) => match runtime.kind(&value)? {
-            PyKind::Tuple | PyKind::List => {
-                let pair = sequence_items(runtime, value)?;
-                let [first, second] = pair.as_slice() else {
-                    return Err(PyError::value_error(format!(
-                        "too many values to unpack (expected 2, got {})",
-                        pair.len()
-                    )));
-                };
-                (axis_list(runtime, *first)?, axis_list(runtime, *second)?)
-            }
-            _ => count_axes(args::index_int(runtime, &value)?),
-        },
-    };
-    for axes in [&a_axes, &b_axes] {
-        let mut sorted = axes.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        if sorted.len() != axes.len() {
-            return Err(PyError::value_error(
-                "duplicate axes are not allowed in tensordot",
-            ));
-        }
-    }
-    if a_axes.len() != b_axes.len() {
-        return Err(PyError::value_error("shape-mismatch for sum"));
-    }
-    let out_of_range = || PyError::exception("IndexError", "tuple index out of range");
-    let mut a_normalized = Vec::with_capacity(a_axes.len());
-    let mut b_normalized = Vec::with_capacity(b_axes.len());
-    for (a_axis, b_axis) in a_axes.iter().zip(&b_axes) {
-        let a_axis = python_index(*a_axis, a.ndim()).ok_or_else(out_of_range)?;
-        let b_axis = python_index(*b_axis, b.ndim()).ok_or_else(out_of_range)?;
-        if a.shape()[a_axis] != b.shape()[b_axis] {
-            return Err(PyError::value_error("shape-mismatch for sum"));
-        }
-        a_normalized.push(a_axis);
-        b_normalized.push(b_axis);
-    }
-    let dtype = product_dtype(a.dtype, b.dtype, dot_unavailable)?;
-    let result = contract(runtime, "dot", &a, &b, dtype, &a_normalized, &b_normalized)?;
-    Ok(result.value())
-}
-
-/// `axes=n`: the last `n` axes of `a` against the first `n` of `b`. Negative counts select no
-/// axes, as `range(-n, 0)` does in NumPy's implementation.
-fn count_axes(count: i64) -> (Vec<i64>, Vec<i64>) {
-    let count = count.max(0);
-    ((-count..0).collect(), (0..count).collect())
-}
-
-/// Resolve a possibly negative index into a tuple of `length` items, as Python indexing does.
-fn python_index(index: i64, length: usize) -> Option<usize> {
-    let resolved = if index < 0 {
-        index.checked_add(length as i64)?
-    } else {
-        index
-    };
-    usize::try_from(resolved)
-        .ok()
-        .filter(|index| *index < length)
-}
-
-fn sequence_items(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyValue>> {
-    match runtime.kind(&value)? {
-        PyKind::Tuple => {
-            let tuple = value.cast(runtime)?;
-            runtime.tuple_items(tuple)
-        }
-        PyKind::List => {
-            let list = value.cast(runtime)?;
-            runtime.list_items(list)
-        }
-        _ => Ok(vec![value]),
-    }
-}
-
-/// One side of `axes=(axes_a, axes_b)`: an int or a sequence of ints.
-fn axis_list(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>> {
-    sequence_items(runtime, value)?
-        .iter()
-        .map(|item| args::index_int(runtime, item))
-        .collect()
 }
 
 /// `a @ b` and `np.matmul(a, b)`.
@@ -760,17 +523,7 @@ fn matmul_values(
         a_sum: offset_table(runtime, &[a_k], &[a.strides()[a.ndim() - 1]])?,
         b_sum: offset_table(runtime, &[a_k], &[b.strides()[b_k_axis]])?,
     };
-    let result = run_plan(
-        runtime,
-        "matmul",
-        &a,
-        &b,
-        dtype,
-        &plan,
-        shape,
-        EmptySum::Zero,
-        false,
-    )?;
+    let result = run_plan(runtime, "matmul", &a, &b, dtype, &plan, shape)?;
     let Some((out, casting)) = out else {
         return scalar_or_array(runtime, &result);
     };
@@ -841,16 +594,6 @@ fn remapped_broadcast_error(a: &Array, b: &Array) -> PyError {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn tensordot_axis_counts_follow_python_ranges() {
-        assert_eq!(count_axes(2), (vec![-2, -1], vec![0, 1]));
-        assert_eq!(count_axes(0), (vec![], vec![]));
-        assert_eq!(count_axes(-1), (vec![], vec![]));
-        assert_eq!(python_index(-1, 3), Some(2));
-        assert_eq!(python_index(-4, 3), None);
-        assert_eq!(python_index(3, 3), None);
-    }
 
     #[test]
     fn product_kernel_sums_strided_pairs_with_wrapping() {

@@ -1,17 +1,16 @@
-//! `np.diagonal` and `np.trace`: read-only diagonal views and their sum.
+//! `np.diagonal`: a read-only diagonal view.
 //!
 //! A diagonal is a view, never a copy: stepping `offset` elements into the plane of `axis1` and
 //! `axis2` and then walking both axes together (stride `strides[axis1] + strides[axis2]`) reads
 //! every diagonal element without moving any storage. NumPy makes the view read-only because a
 //! write through it would touch two logical axes from one store; this module marks it read-only
-//! for the same reason. `trace` reuses the view: it is exactly [`super::super::reduce::reduce`]
-//! ("add") of the diagonal's last axis, which is where the view puts it.
+//! for the same reason. `np.trace` is frozen Python in `numpy._shapes`, built on this diagonal
+//! plus `sum`.
 
 use super::super::super::super::native::{CallArgs, PyError, PyResult, PyRuntime, PyValue};
-use super::super::args::{self, Axes, Signature};
+use super::super::args::{self, Signature};
 use super::super::array::{self, Array};
 use super::super::convert;
-use super::super::reduce;
 
 /// A read-only view of the `axis1`/`axis2` diagonal of `array` at `offset`, with `axis1` and
 /// `axis2` removed and the diagonal appended as the last axis — NumPy's own placement,
@@ -89,77 +88,6 @@ pub(super) fn method_diagonal(
     let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
     let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
     Ok(diagonal_view(runtime, &array, offset, axis1, axis2)?.value())
-}
-
-/// `np.trace`: the sum of one diagonal. Since [`diagonal_view`] always appends the diagonal as
-/// the last axis, this is [`reduce::reduce_call`] of that one axis with the `add` ufunc, the
-/// same engine `np.sum` uses, so `dtype=`/`out=` and the empty-diagonal-sums-to-zero identity
-/// behave exactly as they do for `sum`.
-fn trace_array(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    offset: i64,
-    axis1: i64,
-    axis2: i64,
-    dtype: Option<super::super::dtype::DType>,
-    out: Option<Array>,
-) -> PyResult {
-    let diagonal = diagonal_view(runtime, array, offset, axis1, axis2)?;
-    let axis = diagonal.ndim() - 1;
-    reduce::reduce_call(
-        runtime,
-        reduce::ufunc_named("add"),
-        diagonal,
-        Axes::Some(vec![axis]),
-        dtype,
-        out,
-        false,
-        None,
-        None,
-    )
-}
-
-/// Accept `out=array` or an omitted/`None` `out=`.
-fn out_argument(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
-    value
-        .map(|value| {
-            Array::from_value(runtime, value)
-                .map_err(|_| PyError::type_error("output must be an array"))
-        })
-        .transpose()
-}
-
-pub(super) fn module_trace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    static SIGNATURE: Signature = Signature::new(
-        "trace",
-        &["a", "offset", "axis1", "axis2", "dtype", "out"],
-        1,
-    );
-    let bound = SIGNATURE.bind(&args)?;
-    let array = convert::as_array(runtime, bound.required("a"))?;
-    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
-    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
-    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
-    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
-    let out = out_argument(runtime, bound.value("out"))?;
-    trace_array(runtime, &array, offset, axis1, axis2, dtype, out)
-}
-
-pub(super) fn method_trace(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
-    static SIGNATURE: Signature =
-        Signature::new("trace", &["offset", "axis1", "axis2", "dtype", "out"], 0);
-    let bound = SIGNATURE.bind(&args)?;
-    let array = Array::from_value(runtime, receiver)?;
-    let offset = args::optional_int(runtime, bound.get("offset"))?.unwrap_or(0);
-    let axis1 = args::optional_int(runtime, bound.get("axis1"))?.unwrap_or(0);
-    let axis2 = args::optional_int(runtime, bound.get("axis2"))?.unwrap_or(1);
-    let dtype = args::optional_dtype(runtime, bound.value("dtype"))?;
-    let out = out_argument(runtime, bound.value("out"))?;
-    trace_array(runtime, &array, offset, axis1, axis2, dtype, out)
 }
 
 #[cfg(test)]

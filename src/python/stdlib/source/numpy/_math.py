@@ -1,15 +1,23 @@
 """Whole-array numeric helpers: closeness and equality (``isclose``/``allclose``,
 ``array_equal``), dtype classification, the small ``ndarray``-method wrappers (``round``/
-``clip``) exposed as top-level functions, difference and integration (``diff``, ``gradient``,
-``trapezoid``), interpolation and correlation (``interp``, ``convolve``/``correlate``),
-polynomial least-squares fitting (``polyfit``/``polyval``), the condition-driven selectors
-(``select``, ``extract``, ``place``, ``putmask``), and ``vectorize``.
+``clip``) exposed as top-level functions, ``divmod``, difference and integration (``diff``,
+``gradient``, ``trapezoid``), interpolation and correlation (``interp``, ``convolve``/
+``correlate``), polynomial least-squares fitting (``polyfit``/``polyval``), the condition-driven
+selectors (``select``, ``extract``, ``place``, ``putmask``), and ``vectorize``.
+
+``interp`` locates each query point among the sorted samples with ``searchsorted`` (one
+vectorized call, no Python loop over `x`) and then evaluates NumPy's own line formula with
+``where`` in place of a per-point branch. ``convolve``/``correlate`` loop over whichever operand
+is shorter, adding one shifted, scaled copy of the longer operand per iteration; this is the
+textbook shift-and-add convolution, vectorized over the longer operand so the Python loop only
+ever runs ``min(len(a), len(v))`` times. ``round``/``clip`` stay backed by native ``ndarray``
+methods; ``clip`` itself is ``minimum(maximum(a, min), max)`` through the ufuncs, which already
+implement broadcasting, promotion, and ``out=``.
 """
 
 import re
 
 import numpy as np
-from _numpy_math import _compiled_interp, _compiled_interp_complex, _correlate
 
 __all__ = [
     "allclose",
@@ -30,6 +38,7 @@ __all__ = [
     "cumulative_prod",
     "cumulative_sum",
     "diff",
+    "divmod",
     "extract",
     "flatnonzero",
     "gradient",
@@ -58,6 +67,14 @@ __all__ = [
     "vecdot",
     "vectorize",
 ]
+
+
+def divmod(x1, x2, out=None, **kwargs):
+    """``(floor_divide(x1, x2), remainder(x1, x2))``, as two independent ufunc calls."""
+    out1, out2 = out if isinstance(out, tuple) else (out, None)
+    quotient = np.floor_divide(x1, x2, out=out1, **kwargs)
+    remainder = np.remainder(x1, x2, out=out2, **kwargs)
+    return quotient, remainder
 
 concat = np.concatenate
 
@@ -98,11 +115,30 @@ def round(a, decimals=0, out=None):
 around = round
 
 
+def _clip(a, min=None, max=None, out=None, **kwargs):
+    """Core of ``np.clip``/``ndarray.clip``: ``minimum(maximum(a, min), max)``, skipping either
+    ufunc call when its bound is ``None``."""
+    if kwargs:
+        raise NotImplementedError(f"clip() with {sorted(kwargs)} is not supported")
+    if min is None and max is None:
+        result = np.array(a, copy=True)
+        if out is not None:
+            out[...] = result
+            return out
+        return result
+    if max is None:
+        return np.maximum(a, min, out=out)
+    if min is None:
+        return np.minimum(a, max, out=out)
+    lower = np.maximum(a, min)
+    return np.minimum(lower, max, out=out)
+
+
 def clip(a, a_min=None, a_max=None, out=None, *, min=None, max=None, **kwargs):
     """`a` with every value clamped to ``[lower, upper]``; either bound may be ``None``."""
     lower = min if min is not None else a_min
     upper = max if max is not None else a_max
-    return np.asanyarray(a).clip(min=lower, max=upper, out=out, **kwargs)
+    return _clip(a, lower, upper, out, **kwargs)
 
 
 def isclose(a, b, rtol=1e-05, atol=1e-08, equal_nan=False):
@@ -482,6 +518,90 @@ def gradient(f, *varargs, axis=None, edge_order=1):
     return results[0] if len(results) == 1 else results
 
 
+def _interp_masks(x, xp):
+    """Where each `x` falls among sorted `xp`, located with one ``searchsorted`` call: the
+    bracketing sample indices (clamped into range so they can always index `xp`/`fp`) and the
+    boolean masks `interp`'s formula branches on. On a tie the bracket is the *last* matching
+    sample, matching NumPy: ``side='right'`` puts the index just past every value ``<= x``."""
+    n = xp.size
+    idx = np.searchsorted(xp, x, side="right")
+    lo = np.clip(idx - 1, 0, n - 1)
+    hi = np.clip(idx, 0, n - 1)
+    x0, x1 = xp[lo], xp[hi]
+    nan_mask = np.isnan(x)
+    below_mask = x < xp[0]
+    above_mask = x > xp[-1]
+    exact_mask = (~nan_mask) & (~below_mask) & (~above_mask) & (x0 == x)
+    return x0, x1, lo, hi, nan_mask, below_mask, above_mask, exact_mask
+
+
+def _interp_channel(x, x0, x1, y0, y1, slope, masks, left_value, right_value):
+    """One real channel of NumPy's interpolation formula: the line through `(x0, y0)`/`(x1, y1)`
+    evaluated from the left end, then the right end if that is NaN (an infinite slope or sample),
+    and `y0` if both are NaN but the samples agree (such as two equal infinities)."""
+    nan_mask, below_mask, above_mask, exact_mask = masks
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        value1 = slope * (x - x0) + y0
+        value2 = slope * (x - x1) + y1
+    fallback = np.where(np.isnan(value2) & (y0 == y1), y0, value2)
+    interval_value = np.where(np.isnan(value1), fallback, value1)
+    return np.where(
+        nan_mask,
+        np.float64("nan"),
+        np.where(below_mask, left_value, np.where(above_mask, right_value, np.where(exact_mask, y0, interval_value))),
+    )
+
+
+def _interp_samples(xp, fp, dtype):
+    xp = np.asanyarray(xp)
+    fp = np.asanyarray(fp)
+    if xp.ndim != 1 or fp.ndim != 1:
+        raise ValueError("interp() requires 1-D sample arrays")
+    if xp.size == 0:
+        raise ValueError("array of sample points is empty")
+    if xp.size != fp.size:
+        raise ValueError("fp and xp are not of the same length.")
+    return xp.astype(np.float64), fp.astype(dtype)
+
+
+def _interp_real(x, xp, fp, left, right):
+    """``numpy.interp`` for real `fp`: always computes and returns `float64`, matching NumPy even
+    when `x`/`fp` are narrower."""
+    x = np.asanyarray(x, dtype=np.float64)
+    xp, fp = _interp_samples(xp, fp, np.float64)
+    x0, x1, lo, hi, *masks = _interp_masks(x, xp)
+    y0, y1 = fp[lo], fp[hi]
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        slope = (y1 - y0) / (x1 - x0)
+    left_value = fp[0] if left is None else float(left)
+    right_value = fp[-1] if right is None else float(right)
+    result = _interp_channel(x, x0, x1, y0, y1, slope, masks, left_value, right_value)
+    return result[()] if result.ndim == 0 else result
+
+
+def _interp_complex(x, xp, fp, left, right):
+    """``numpy.interp`` for complex `fp`: the real and imaginary parts interpolate independently
+    at the same `x` position, always producing `complex128`. NumPy divides by the interval width
+    for a real slope but multiplies by its reciprocal for each part of a complex one, so this
+    computes `inverse` once and reuses it for both parts."""
+    x = np.asanyarray(x, dtype=np.float64)
+    xp, fp = _interp_samples(xp, fp, np.complex128)
+    x0, x1, lo, hi, *masks = _interp_masks(x, xp)
+    y0, y1 = fp[lo], fp[hi]
+    left_c = fp[0] if left is None else complex(left)
+    right_c = fp[-1] if right is None else complex(right)
+    with np.errstate(invalid="ignore", divide="ignore", over="ignore"):
+        inverse = 1.0 / (x1 - x0)
+    real_part = _interp_channel(
+        x, x0, x1, y0.real, y1.real, (y1.real - y0.real) * inverse, masks, left_c.real, right_c.real
+    )
+    imag_part = _interp_channel(
+        x, x0, x1, y0.imag, y1.imag, (y1.imag - y0.imag) * inverse, masks, left_c.imag, right_c.imag
+    )
+    result = real_part + 1j * imag_part
+    return result[()] if result.ndim == 0 else result
+
+
 def interp(x, xp, fp, left=None, right=None, period=None):
     """Piecewise-linear interpolation of `x` against the samples (`xp`, `fp`).
 
@@ -503,19 +623,66 @@ def interp(x, xp, fp, left=None, right=None, period=None):
         left = None
         right = None
     if np.asanyarray(fp).dtype.kind == "c":
-        return _compiled_interp_complex(x, xp, fp, left, right)
-    return _compiled_interp(x, xp, fp, left, right)
+        return _interp_complex(x, xp, fp, left, right)
+    return _interp_real(x, xp, fp, left, right)
+
+
+def _shift_add_convolve(a, w, dtype):
+    """The convolution ``sum_j a[j] * shift(w, j)``, looping over whichever operand is shorter so
+    the Python loop runs at most ``min(a.size, w.size)`` times; each iteration adds one shifted,
+    scaled copy of the longer operand, a single vectorized multiply-add."""
+    m, n = a.size, w.size
+    full = np.zeros(m + n - 1, dtype=dtype)
+    if m <= n:
+        for j in range(m):
+            full[j : j + n] += a[j] * w
+    else:
+        for k in range(n):
+            full[k : k + m] += w[k] * a
+    return full
+
+
+def _correlate_core(a, v, mode, conjugate):
+    """``correlate``/``convolve``'s shared kernel: cross-correlation is convolution of `a` with
+    `v` reversed (and conjugated, for `correlate`), so this reverses `v` once and reuses the
+    convolution shift-and-add loop. Computes in `float64`/`complex128` regardless of the input
+    dtype, then casts back to the operands' promoted dtype, matching NumPy's own dtype-preserving
+    behavior (and, for large integers outside the 53-bit exactly-representable range, its
+    float64-accumulation rounding too)."""
+    a = np.asanyarray(a).reshape(-1)
+    v = np.asanyarray(v).reshape(-1)
+    m, n = a.size, v.size
+    if m == 0:
+        raise ValueError("first array argument cannot be empty")
+    if n == 0:
+        raise ValueError("second array argument cannot be empty")
+    if mode == "full":
+        start, length = 0, m + n - 1
+    elif mode == "same":
+        start, length = (n - 1) // 2, max(m, n)
+    elif mode == "valid":
+        start, length = min(m, n) - 1, max(m, n) - min(m, n) + 1
+    else:
+        raise ValueError(f"mode must be one of 'valid', 'same', or 'full' (got {mode!r})")
+
+    dtype = np.result_type(a.dtype, v.dtype)
+    work_dtype = np.complex128 if dtype.kind == "c" else np.float64
+    a_work = a.astype(work_dtype)
+    v_work = v.astype(work_dtype)
+    v_prime = np.conjugate(v_work) if conjugate else v_work
+    full = _shift_add_convolve(a_work, v_prime[::-1], work_dtype)
+    return full[start : start + length].astype(dtype)
 
 
 def correlate(a, v, mode="valid"):
     """The cross-correlation of `a` and `v`; complex `v` is conjugated."""
-    return _correlate(a, v, mode, True)
+    return _correlate_core(a, v, mode, True)
 
 
 def convolve(a, v, mode="full"):
     """The discrete convolution of `a` and `v`: correlation of `a` with `v` reversed."""
     v = np.asanyarray(v)
-    return _correlate(a, v[::-1], mode, False)
+    return _correlate_core(a, v[::-1], mode, False)
 
 
 def polyfit(x, y, deg):

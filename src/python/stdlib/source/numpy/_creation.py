@@ -1,25 +1,42 @@
 """Index- and array-construction helpers: mesh/open grids (``mgrid``, ``ogrid``), index tuples
 (``ix_``, ``ndindex``, ``unravel_index``, ``ravel_multi_index``), diagonal- and triangle-index
-helpers built on ``ndarray.nonzero``, and the small array constructors built the same way
-(``tri``, ``tril``, ``triu``, ``indices``).
+helpers built on ``ndarray.nonzero``, the small array constructors built the same way (``tri``,
+``tril``, ``triu``, ``indices``), and the range/diagonal/``*_like`` constructors moved here from
+native code (``linspace``, ``logspace``, ``geomspace``, ``eye``, ``identity``, ``diag``,
+``meshgrid``, ``zeros_like``, ``ones_like``, ``empty_like``, ``full_like``).
 
-None of these touch storage directly; they compose from ``arange``, ``reshape``, and the array
-constructors like any other array code.
+None of these touch storage directly; they compose from ``arange``, ``empty``/``zeros``/``full``,
+``reshape``, ``transpose``, and slicing or fancy indexing like any other array code. The
+``*_like`` constructors reproduce a prototype's ``order='K'`` memory layout by allocating a
+C-contiguous array with the axes permuted into memory order and transposing it back: a pure view
+operation, so it costs no more than the allocation itself.
 """
+
+import math
 
 import numpy as np
 
 __all__ = [
     "c_",
+    "diag",
     "diag_indices",
     "diag_indices_from",
+    "empty_like",
+    "eye",
     "fill_diagonal",
+    "full_like",
+    "geomspace",
+    "identity",
     "index_exp",
     "indices",
     "ix_",
+    "linspace",
+    "logspace",
+    "meshgrid",
     "mgrid",
     "ndindex",
     "ogrid",
+    "ones_like",
     "r_",
     "ravel_multi_index",
     "s_",
@@ -31,6 +48,7 @@ __all__ = [
     "triu_indices",
     "triu_indices_from",
     "unravel_index",
+    "zeros_like",
 ]
 
 
@@ -306,3 +324,229 @@ def indices(dimensions, dtype=np.int64, sparse=False):
     if sparse:
         return tuple(axes)
     return np.stack([np.broadcast_to(a, dimensions) for a in axes], axis=0)
+
+
+def _linspace_values(start, stop, num, endpoint):
+    """`(values, step)`: `num` samples at `start + i * step`, NumPy's own `linspace` formula,
+    with the last sample pinned to `stop` when `endpoint`. `start`/`stop` are plain floats, one
+    real or imaginary part at a time; :func:`linspace` combines two calls for complex bounds."""
+    divisions = max(num - 1, 0) if endpoint else num
+    delta = stop - start
+    if divisions > 0:
+        step = delta / divisions
+        if step == 0.0:
+            values = start + np.arange(num, dtype=np.float64) / divisions * delta
+        else:
+            values = start + np.arange(num, dtype=np.float64) * step
+    else:
+        step = float("nan")
+        values = np.full(num, start, dtype=np.float64)
+    if endpoint and num > 1:
+        values[-1] = stop
+    return values, step
+
+
+def _sample_count(num):
+    num = int(num)
+    if num < 0:
+        raise ValueError(f"Number of samples, {num}, must be non-negative.")
+    return num
+
+
+def _scalar_float(value):
+    return float(np.asanyarray(value).item())
+
+
+def _scalar_complex(value):
+    return complex(np.asanyarray(value).item())
+
+
+def linspace(start, stop, num=50, endpoint=True, retstep=False, dtype=None, axis=0, *, device=None):
+    """`num` samples evenly spaced from `start` to `stop` (inclusive unless `endpoint=False`)."""
+    if axis != 0:
+        raise NotImplementedError("linspace() with axis= is not supported")
+    num = _sample_count(num)
+    if np.iscomplexobj(start) or np.iscomplexobj(stop):
+        start_c, stop_c = _scalar_complex(start), _scalar_complex(stop)
+        values_re, step_re = _linspace_values(start_c.real, stop_c.real, num, endpoint)
+        values_im, step_im = _linspace_values(start_c.imag, stop_c.imag, num, endpoint)
+        result_dtype = np.dtype(np.complex128) if dtype is None else np.dtype(dtype)
+        if result_dtype.kind != "c":
+            raise NotImplementedError(
+                "linspace() with complex bounds and a real dtype is not supported"
+            )
+        result = (values_re + 1j * values_im).astype(result_dtype)
+        step = np.complex128(complex(step_re, step_im))
+    else:
+        values, step_value = _linspace_values(_scalar_float(start), _scalar_float(stop), num, endpoint)
+        result_dtype = np.dtype(np.float64) if dtype is None else np.dtype(dtype)
+        if result_dtype.kind in "iu":
+            values = np.floor(values)
+        result = values.astype(result_dtype)
+        step = np.float64(step_value)
+    return (result, step) if retstep else result
+
+
+def logspace(start, stop, num=50, endpoint=True, base=10.0, dtype=None, axis=0):
+    """`num` samples evenly spaced on a log scale: `base` raised to a :func:`linspace` exponent."""
+    if axis != 0:
+        raise NotImplementedError("logspace() with axis= is not supported")
+    num = _sample_count(num)
+    exponents, _ = _linspace_values(_scalar_float(start), _scalar_float(stop), num, endpoint)
+    values = np.power(float(base), exponents)
+    result_dtype = np.float64 if dtype is None else np.dtype(dtype)
+    return values.astype(result_dtype)
+
+
+def geomspace(start, stop, num=50, endpoint=True, dtype=None, axis=0):
+    """`num` samples in geometric progression from `start` to `stop`; both must be nonzero and
+    the same sign."""
+    if axis != 0:
+        raise NotImplementedError("geomspace() with axis= is not supported")
+    start_f, stop_f = _scalar_float(start), _scalar_float(stop)
+    if start_f == 0.0 or stop_f == 0.0:
+        raise ValueError("Geometric sequence cannot include zero")
+    if (start_f < 0.0) != (stop_f < 0.0):
+        raise NotImplementedError("geomspace() between bounds of different signs is not supported")
+    num = _sample_count(num)
+    sign = -1.0 if start_f < 0.0 else 1.0
+    exponents, _ = _linspace_values(math.log10(abs(start_f)), math.log10(abs(stop_f)), num, endpoint)
+    values = sign * np.power(10.0, exponents)
+    if values.size:
+        values[0] = start_f
+    if endpoint and num > 1:
+        values[-1] = stop_f
+    result_dtype = np.float64 if dtype is None else np.dtype(dtype)
+    return values.astype(result_dtype)
+
+
+def _dimension(value):
+    size = int(value)
+    if size < 0:
+        raise ValueError("negative dimensions are not allowed")
+    return size
+
+
+def eye(N, M=None, k=0, dtype=np.float64, order="C", *, device=None, like=None):
+    """An N-by-M matrix that is 1 on diagonal `k`, 0 elsewhere."""
+    rows = _dimension(N)
+    columns = rows if M is None else _dimension(M)
+    k = int(k)
+    order = "C" if order is None else order
+    rows_idx = np.arange(rows).reshape(rows, 1)
+    cols_idx = np.arange(columns).reshape(1, columns)
+    base = (cols_idx - rows_idx == k).astype(np.int64).astype(dtype)
+    if order in ("F", "f"):
+        return np.asfortranarray(base)
+    if order not in ("C", "c"):
+        raise ValueError(f"order must be one of 'C', 'F', 'A', or 'K' (got {order!r})")
+    return base
+
+
+def identity(n, dtype=np.float64, *, like=None):
+    """The `n`-by-`n` identity matrix."""
+    return eye(n, n, 0, dtype)
+
+
+def diag(v, k=0):
+    """A matrix with vector `v` on diagonal `k`, or the diagonal `k` of matrix `v`."""
+    v = np.asanyarray(v)
+    k = int(k)
+    if v.ndim == 1:
+        length = v.shape[0]
+        size = length + abs(k)
+        result = np.zeros((size, size), dtype=v.dtype)
+        step = size + 1
+        start = k if k >= 0 else -k * size
+        result.flat[start : start + length * step : step] = v
+        return result
+    if v.ndim == 2:
+        return np.diagonal(v, k)
+    raise ValueError("Input must be 1- or 2-d.")
+
+
+def meshgrid(*xi, indexing="xy", sparse=False, copy=True):
+    """Coordinate matrices (or, if `sparse`, open coordinate vectors) from 1-D arrays `xi`."""
+    if sparse:
+        raise NotImplementedError("meshgrid() with sparse=True is not supported")
+    if indexing not in ("xy", "ij"):
+        raise ValueError("Valid values for `indexing` are 'xy' and 'ij'.")
+    inputs = [np.asanyarray(x).reshape(-1) for x in xi]
+    swap = indexing == "xy" and len(inputs) >= 2
+    shape = [x.size for x in inputs]
+    if swap:
+        shape[0], shape[1] = shape[1], shape[0]
+    grids = []
+    for position, x in enumerate(inputs):
+        axis = {0: 1, 1: 0}.get(position, position) if swap else position
+        new_shape = [1] * len(inputs)
+        new_shape[axis] = x.size
+        view = np.broadcast_to(x.reshape(new_shape), shape)
+        grids.append(view.copy() if copy else view)
+    return tuple(grids)
+
+
+def _layout_axes(order, prototype, ndim):
+    """The axis order (outermost to innermost) NumPy's `*_like` constructors give a new array of
+    `ndim` dimensions modeled on `prototype`'s memory layout (`PyArray_NewLikeArrayWithShape`):
+    `K` keeps a C- or Fortran-contiguous prototype's order and otherwise sorts axes by decreasing
+    absolute stride; it falls back to `C` order when the ranks differ."""
+    order = "K" if order is None else order
+    if order == "A":
+        order = "F" if (prototype.flags.f_contiguous and not prototype.flags.c_contiguous) else "C"
+    elif order not in ("C", "F", "K"):
+        raise ValueError(f"order must be one of 'C', 'F', 'A', or 'K' (got {order!r})")
+    if order == "K":
+        if ndim != prototype.ndim or ndim <= 1 or prototype.flags.c_contiguous:
+            order = "C"
+        elif prototype.flags.f_contiguous:
+            order = "F"
+        else:
+            return tuple(sorted(range(ndim), key=lambda axis: -abs(prototype.strides[axis])))
+    if order == "F":
+        return tuple(range(ndim - 1, -1, -1))
+    return tuple(range(ndim))
+
+
+def _shape_tuple(value):
+    return (int(value),) if isinstance(value, (int, np.integer)) else tuple(int(d) for d in value)
+
+
+def _like(prototype, dtype, shape, order, build):
+    """`build(permuted_shape, dtype)`, C-contiguous, transposed back so its memory order matches
+    `prototype`'s under `order`. Allocating the permuted shape directly and transposing (a view)
+    costs no more than `build` itself already does."""
+    axes = _layout_axes(order, prototype, len(shape))
+    permuted = tuple(shape[axis] for axis in axes)
+    inverse = [0] * len(axes)
+    for position, axis in enumerate(axes):
+        inverse[axis] = position
+    return build(permuted, dtype).transpose(tuple(inverse))
+
+
+def zeros_like(a, dtype=None, order="K", subok=True, shape=None, *, device=None):
+    a = np.asanyarray(a)
+    dtype = a.dtype if dtype is None else np.dtype(dtype)
+    shape = a.shape if shape is None else _shape_tuple(shape)
+    return _like(a, dtype, shape, order, lambda s, d: np.zeros(s, dtype=d))
+
+
+def empty_like(prototype, dtype=None, order="K", subok=True, shape=None, *, device=None):
+    prototype = np.asanyarray(prototype)
+    dtype = prototype.dtype if dtype is None else np.dtype(dtype)
+    shape = prototype.shape if shape is None else _shape_tuple(shape)
+    return _like(prototype, dtype, shape, order, lambda s, d: np.empty(s, dtype=d))
+
+
+def ones_like(a, dtype=None, order="K", subok=True, shape=None, *, device=None):
+    a = np.asanyarray(a)
+    dtype = a.dtype if dtype is None else np.dtype(dtype)
+    shape = a.shape if shape is None else _shape_tuple(shape)
+    return _like(a, dtype, shape, order, lambda s, d: np.ones(s, dtype=d))
+
+
+def full_like(a, fill_value, dtype=None, order="K", subok=True, shape=None, *, device=None):
+    a = np.asanyarray(a)
+    dtype = a.dtype if dtype is None else np.dtype(dtype)
+    shape = a.shape if shape is None else _shape_tuple(shape)
+    return _like(a, dtype, shape, order, lambda s, d: np.full(s, fill_value, dtype=d))

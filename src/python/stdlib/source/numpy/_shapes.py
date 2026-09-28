@@ -1,14 +1,18 @@
-"""Shape-changing helpers built on the native ``reshape``, ``concatenate``, ``take`` and
-``expand_dims`` primitives: stacking, splitting, tiling, rolling, ``kron``/``block``, and
-``pad`` (extending an array's edges under a boundary mode).
+"""Shape-changing helpers built on the native ``reshape``, ``transpose``, ``concatenate``,
+``take``, ``diagonal`` and ``broadcast_to`` primitives: stacking, splitting, tiling, rolling,
+axis moves and removal, flipping, ``trace``, broadcasting shapes, ``kron``/``block``, and ``pad``
+(extending an array's edges under a boundary mode).
 
-``kron``, ``block`` and ``pad`` build their result through broadcasting, ``concatenate`` and
-``take`` rather than a Python loop over elements, so their cost is charged by the array
-primitives they call, and the result they allocate is reserved up front the same way any other
-array constructor's is. ``reflect``, ``symmetric`` and ``wrap`` padding compute the source index
-for every padded position with a triangle-wave (reflect/symmetric) or modulo (wrap) formula, so a
-single ``np.take`` builds an axis's whole padded run, however wide, without a Python loop over
-elements.
+``squeeze``, ``expand_dims`` and ``flip`` never move data: dropping or inserting length-one axes
+is always representable as a ``reshape`` view, and reversing an axis is ordinary negative-step
+slicing. ``moveaxis``/``swapaxes`` are ``transpose`` with a computed axis order. ``trace`` is
+``diagonal(...).sum(-1)``, reusing the read-only diagonal view and the ``add`` reduction. ``kron``,
+``block`` and ``pad`` build their result through broadcasting, ``concatenate`` and ``take`` rather
+than a Python loop over elements, so their cost is charged by the array primitives they call, and
+the result they allocate is reserved up front the same way any other array constructor's is.
+``reflect``, ``symmetric`` and ``wrap`` padding compute the source index for every padded position
+with a triangle-wave (reflect/symmetric) or modulo (wrap) formula, so a single ``np.take`` builds
+an axis's whole padded run, however wide, without a Python loop over elements.
 """
 
 import numpy as np
@@ -22,14 +26,19 @@ __all__ = [
     "atleast_2d",
     "atleast_3d",
     "block",
+    "broadcast_arrays",
+    "broadcast_shapes",
     "column_stack",
     "dsplit",
     "dstack",
+    "expand_dims",
+    "flip",
     "fliplr",
     "flipud",
     "hsplit",
     "hstack",
     "kron",
+    "moveaxis",
     "normalize_axis_index",
     "normalize_axis_tuple",
     "pad",
@@ -37,9 +46,12 @@ __all__ = [
     "roll",
     "row_stack",
     "split",
+    "squeeze",
     "stack",
+    "swapaxes",
     "take_along_axis",
     "tile",
+    "trace",
     "vsplit",
     "vstack",
 ]
@@ -51,14 +63,141 @@ def normalize_axis_index(axis, ndim, msg_prefix=None):
 
 
 def normalize_axis_tuple(axis, ndim, argname=None, allow_duplicate=False):
-    """`axis` as a tuple of normalized, non-negative axis indices."""
+    """`axis` as a tuple of normalized, non-negative axis indices; each out-of-range axis raises
+    `AxisError` naming `argname`, as NumPy's own `normalize_axis_tuple` does."""
     axes = (axis,) if isinstance(axis, (int, np.integer)) else tuple(axis)
-    normalized = tuple(normalize_axis_index(a, ndim) for a in axes)
+    normalized = tuple(normalize_axis_index(a, ndim, argname) for a in axes)
     if not allow_duplicate and len(set(normalized)) != len(normalized):
         if argname:
             raise ValueError(f"repeated axis in `{argname}` argument")
         raise ValueError("repeated axis")
     return normalized
+
+
+def squeeze(a, axis=None):
+    """`a` with the length-one axes named by `axis` removed (every length-one axis, if `None`).
+    Dropping axes without reordering the rest is always a valid `reshape`, so this never copies."""
+    a = np.asanyarray(a)
+    ndim = a.ndim
+    if axis is None:
+        selected = tuple(ax for ax in range(ndim) if a.shape[ax] == 1)
+    elif ndim == 0 and not isinstance(axis, tuple):
+        value = int(axis)
+        if value not in (0, -1):
+            normalize_axis_index(value, ndim)
+        selected = ()
+    else:
+        selected = normalize_axis_tuple(axis, ndim)
+        if any(a.shape[ax] != 1 for ax in selected):
+            raise ValueError("cannot select an axis to squeeze out which has size not equal to one")
+    shape = tuple(a.shape[ax] for ax in range(ndim) if ax not in selected)
+    return a.reshape(shape)
+
+
+def expand_dims(a, axis):
+    """`a` with new length-one axes inserted at the (output) positions `axis`."""
+    a = np.asanyarray(a)
+    count = 1 if isinstance(axis, (int, np.integer)) else len(tuple(axis))
+    rank = a.ndim + count
+    axes = normalize_axis_tuple(axis, rank)
+    source = iter(a.shape)
+    shape = tuple(1 if pos in axes else next(source) for pos in range(rank))
+    return a.reshape(shape)
+
+
+def moveaxis(a, source, destination):
+    """`a` with the `source` axes moved to `destination`, the rest kept in their relative order."""
+    a = np.asanyarray(a)
+    ndim = a.ndim
+    source = normalize_axis_tuple(source, ndim, "source")
+    destination = normalize_axis_tuple(destination, ndim, "destination")
+    if len(source) != len(destination):
+        raise ValueError("`source` and `destination` arguments must have the same number of elements")
+    order = [ax for ax in range(ndim) if ax not in source]
+    for dest, src in sorted(zip(destination, source)):
+        order.insert(dest, src)
+    return a.transpose(order)
+
+
+def swapaxes(a, axis1, axis2):
+    """`a` with `axis1` and `axis2` exchanged."""
+    a = np.asanyarray(a)
+    ndim = a.ndim
+    first = normalize_axis_index(axis1, ndim, "axis1")
+    second = normalize_axis_index(axis2, ndim, "axis2")
+    order = list(range(ndim))
+    order[first], order[second] = order[second], order[first]
+    return a.transpose(order)
+
+
+def flip(m, axis=None):
+    """`m` with the elements along `axis` (every axis, if `None`) reversed: a negative-step
+    slice, so the result is a view."""
+    m = np.asanyarray(m)
+    ndim = m.ndim
+    if axis is None:
+        if ndim == 0:
+            return m[()]
+        axes = range(ndim)
+    else:
+        axes = normalize_axis_tuple(axis, ndim)
+    index = [slice(None)] * ndim
+    for ax in axes:
+        index[ax] = slice(None, None, -1)
+    return m[tuple(index)]
+
+
+def trace(a, offset=0, axis1=0, axis2=1, dtype=None, out=None):
+    """The sum along diagonal `offset` of the `axis1`/`axis2` plane(s) of `a`."""
+    result = np.sum(np.diagonal(a, offset, axis1, axis2), axis=-1, dtype=dtype)
+    if out is not None:
+        out[...] = result
+        return out
+    return result
+
+
+def _common_shape(shapes):
+    """The NumPy broadcast shape of `shapes` (each a tuple of non-negative ints)."""
+    rank = max((len(shape) for shape in shapes), default=0)
+    result = [1] * rank
+    source = [0] * rank
+    for axis in range(rank):
+        for position, shape in enumerate(shapes):
+            index = axis + len(shape) - rank
+            if index < 0:
+                continue
+            dimension = shape[index]
+            if dimension == 1:
+                continue
+            if result[axis] == 1:
+                result[axis] = dimension
+                source[axis] = position
+            elif result[axis] != dimension:
+                raise ValueError(
+                    "shape mismatch: objects cannot be broadcast to a single shape.  Mismatch is "
+                    f"between arg {source[axis]} with shape {shapes[source[axis]]} and arg "
+                    f"{position} with shape {shape}."
+                )
+    return tuple(result)
+
+
+def broadcast_shapes(*args):
+    """The shape that broadcasting arrays of shapes `args` together would produce."""
+    shapes = []
+    for value in args:
+        shape = (int(value),) if isinstance(value, (int, np.integer)) else tuple(int(d) for d in value)
+        if any(d < 0 for d in shape):
+            raise ValueError("negative dimensions are not allowed")
+        shapes.append(shape)
+    return _common_shape(shapes)
+
+
+def broadcast_arrays(*args, subok=False):
+    """Each of `args` as an array of their common broadcast shape; arrays that already have it
+    are returned unchanged, the rest as read-only broadcast views."""
+    arrays = [np.asanyarray(a) for a in args]
+    shape = _common_shape([a.shape for a in arrays])
+    return tuple(a if a.shape == shape else np.broadcast_to(a, shape) for a in arrays)
 
 
 def _one_atleast(a, ndim, leading):
