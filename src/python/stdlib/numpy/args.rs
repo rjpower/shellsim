@@ -219,25 +219,6 @@ pub(in crate::python) fn optional_int(
         .transpose()
 }
 
-/// A float argument accepting any real Python or NumPy number.
-pub(in crate::python) fn float_arg(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<f64> {
-    use super::super::super::number::NumberRef;
-    if let Some((_, number)) = super::scalar::unbox_number(runtime, value) {
-        return Ok(number.as_f64());
-    }
-    match runtime.number(value) {
-        Some(NumberRef::Int(value)) => Ok(value as f64),
-        Some(NumberRef::BigInt(value)) => {
-            Ok(num_traits::ToPrimitive::to_f64(value).unwrap_or(f64::INFINITY))
-        }
-        Some(NumberRef::Float(value)) => Ok(value),
-        _ => Err(PyError::type_error(format!(
-            "must be real number, not {}",
-            runtime.type_name(value)?
-        ))),
-    }
-}
-
 /// Truth of a flag argument such as `keepdims`.
 pub(in crate::python) fn flag(
     runtime: &mut dyn PyRuntime,
