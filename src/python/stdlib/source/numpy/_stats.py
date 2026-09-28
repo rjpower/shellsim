@@ -38,8 +38,8 @@ __all__ = [
 ]
 
 
-# -- ndarray-method fallbacks (`a.mean()`, `.var()`, `.std()`, `.round()`, `.clip()` reach these
-# -- by name through `numpy._stats`; see `reduce.rs`'s `python_method`) -----------------------
+# -- ndarray-method fallbacks (`a.mean()`, `.var()` and `.std()` reach these by name through
+# -- `numpy._stats`; see `reduce.rs`'s `python_method`) ------------------------------------------
 
 
 def _count_reduce_items(a, axis):
@@ -62,15 +62,23 @@ def _result_dtype(a, dtype):
     return a.dtype if np.issubdtype(a.dtype, np.inexact) else np.dtype(np.float64)
 
 
-def _mean(a, axis=None, dtype=None, out=None, keepdims=False):
+def _count(a, axis, where, keepdims, dtype):
+    """The number of elements each output cell of a reduction over `axis` combines: a Python
+    int without a mask, or an array of per-cell counts in `dtype` under a `where=` mask."""
+    if where is True:
+        return _count_reduce_items(a, axis)
+    mask = np.broadcast_to(np.asarray(where, dtype=bool), a.shape)
+    return np.sum(mask, axis=axis, keepdims=keepdims).astype(dtype)
+
+
+def _mean(a, axis=None, dtype=None, out=None, keepdims=False, *, where=True):
     a = np.asanyarray(a)
     result_dtype = _result_dtype(a, dtype)
-    total = np.sum(a, axis=axis, dtype=result_dtype, keepdims=keepdims)
-    count = _count_reduce_items(a, axis)
-    if count == 0:
+    total = np.sum(a, axis=axis, dtype=result_dtype, keepdims=keepdims, where=where)
+    count = _count(a, axis, where, keepdims, np.asarray(total).dtype)
+    if np.any(np.asarray(count) == 0):
         warnings.warn("Mean of empty slice", RuntimeWarning, stacklevel=2)
-        result = total * float("nan")
-    else:
+    with np.errstate(invalid="ignore", divide="ignore"):
         result = total / count
     if out is not None:
         out[...] = result
@@ -78,31 +86,33 @@ def _mean(a, axis=None, dtype=None, out=None, keepdims=False):
     return result
 
 
-def _var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False):
+def _var(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=True):
     a = np.asanyarray(a)
     is_complex = np.issubdtype(a.dtype, np.complexfloating)
     result_dtype = _result_dtype(a, dtype)
-    mean_value = _mean(a, axis=axis, dtype=result_dtype, keepdims=True)
+    with np.errstate(invalid="ignore", divide="ignore"), warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        mean_value = _mean(a, axis=axis, dtype=result_dtype, keepdims=True, where=where)
     if is_complex:
         deviation = a - mean_value
         squared = (deviation * deviation.conjugate()).real
     else:
         deviation = a.astype(result_dtype) - mean_value
         squared = deviation * deviation
-    count = _count_reduce_items(a, axis)
-    divisor = count - ddof
-    if divisor <= 0:
+    total = np.sum(squared, axis=axis, dtype=squared.dtype, keepdims=keepdims, where=where)
+    divisor = _count(a, axis, where, keepdims, np.asarray(total).dtype) - ddof
+    if np.any(np.asarray(divisor) <= 0):
         warnings.warn("Degrees of freedom <= 0 for slice", RuntimeWarning, stacklevel=2)
-    total = np.sum(squared, axis=axis, dtype=squared.dtype, keepdims=keepdims)
-    result = total / divisor
+    with np.errstate(invalid="ignore", divide="ignore"):
+        result = total / divisor
     if out is not None:
         out[...] = result
         return out
     return result
 
 
-def _std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False):
-    variance = _var(a, axis=axis, dtype=dtype, ddof=ddof, keepdims=keepdims)
+def _std(a, axis=None, dtype=None, out=None, ddof=0, keepdims=False, *, where=True):
+    variance = _var(a, axis=axis, dtype=dtype, ddof=ddof, keepdims=keepdims, where=where)
     result = np.sqrt(variance)
     if out is not None:
         out[...] = result

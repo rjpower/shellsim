@@ -55,6 +55,19 @@ def test_mean_along_axes_returns_float64_for_ints():
     assert np.mean(a, axis=0).dtype == np.float64
 
 
+def test_mean_var_and_std_honor_where_masks():
+    a = np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]])
+    mask = np.array([[True, False, True], [False, True, True]])
+    assert_allclose(np.mean(a, where=mask), 3.75)
+    assert_allclose(np.mean(a, axis=1, where=mask), [2.0, 5.5])
+    assert_allclose(a.mean(axis=0, where=mask, keepdims=True), [[1.0, 5.0, 4.5]])
+    assert_allclose(np.var(a, axis=1, where=mask), [1.0, 0.25])
+    assert_allclose(a.std(axis=1, where=mask, ddof=1), [np.sqrt(2.0), np.sqrt(0.5)])
+    with pytest.warns(RuntimeWarning):
+        empty_column = np.mean(a, axis=0, where=np.array([False, True, True]))
+    assert np.isnan(empty_column[0])
+
+
 def test_ptp_is_max_minus_min():
     a = np.array([[1, 2, 3], [4, 5, 6]])
     assert np.ptp(a) == 5
