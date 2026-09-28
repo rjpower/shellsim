@@ -1,13 +1,13 @@
 """shellsim's NumPy work-alike, targeting NumPy 2.5.3's observable behavior (see ``docs/numpy.md``).
 
 This package star-imports the native modules (arrays, dtypes, ufuncs, and the array-shaped
-areas: reductions, shape operations, sorting, products, math kernels, raw-buffer I/O, and
-printing digits) and layers the parts NumPy itself writes in Python on top: error/warning types,
-``errstate``, ``finfo``/``iinfo``, index-construction helpers, shape composites (``stack``,
-``split``, ``kron``, ``block``, ...), set operations, padding, general numeric helpers,
-statistics, ``nan*`` reductions, histograms, and ``vectorize``. ``_arrayprint``, ``strings`` and
-``linalg`` (owned by other areas of this port) import eagerly, at the end, once every name they
-need (from the native modules and the areas above) is already bound here. ``numpy.fft``,
+areas: reductions, shape operations, sorting, products, math kernels, and raw-buffer I/O) and
+layers the parts NumPy itself writes in Python on top: error/warning types, ``errstate``,
+``finfo``/``iinfo``, index-construction helpers, shape composites (``stack``, ``split``,
+``kron``, ``block``, ...), set operations, padding, general numeric helpers, statistics, ``nan*``
+reductions, histograms, and ``vectorize``. ``_printing``, ``strings`` and ``linalg`` (owned by
+other areas of this port) import eagerly, at the end, once every name they need (from the native
+modules and the areas above) is already bound here. ``numpy.fft``,
 ``numpy.random``, ``numpy.testing`` and ``numpy.lib`` load on first access through
 ``__getattr__``.
 
@@ -306,7 +306,7 @@ def __getattr__(name):
 
 # Eager, and last: these modules do `from numpy import (...)` (or `np.X`) at their own top
 # level or on every call, which needs every name above already bound here.
-from numpy._arrayprint import *
+from numpy._printing import *
 
 import numpy.strings as strings
 import numpy.linalg as linalg

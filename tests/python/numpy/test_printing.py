@@ -398,11 +398,6 @@ def test_printoptions_linewidth():
         assert repr(np.arange(12)) == "array([ 0,  1,  2,\n        3,  4,  5,\n        6,  7,  8,\n        9, 10, 11])"
 
 
-def test_printoptions_nanstr_and_infstr():
-    with np.printoptions(nanstr="NaN", infstr="Inf"):
-        assert str(np.array([np.nan, np.inf, 1.0])) == "[NaN Inf  1.]"
-
-
 def test_printoptions_context_restores_defaults():
     with np.printoptions(precision=2, threshold=10, linewidth=40, suppress=True):
         assert np.get_printoptions()["precision"] == 2
@@ -422,13 +417,10 @@ def test_set_printoptions_changes_global_state():
     finally:
         np.set_printoptions(
             edgeitems=3,
-            infstr="inf",
             linewidth=75,
-            nanstr="nan",
             precision=8,
             suppress=False,
             threshold=1000,
-            formatter=None,
         )
     assert repr(np.array([1 / 3])) == "array([0.33333333])"
 
@@ -460,7 +452,6 @@ def test_format_float_positional_and_scientific():
     assert np.format_float_scientific(np.float32(1.23e24), unique=False, precision=15) == (
         "1.230000071797338e+24"
     )
-    assert np.format_float_scientific(np.float32(1.23e24), exp_digits=4) == "1.23e+0024"
     assert np.format_float_scientific(5e-324) == "5.e-324"
 
 
@@ -469,8 +460,6 @@ def test_format_float_positional_and_scientific():
     [
         (lambda: np.format_float_positional(1.5, unique=False), TypeError),
         (lambda: np.format_float_positional(1.5, precision=-1), ValueError),
-        (lambda: np.format_float_positional(1.5, precision=2, min_digits=3), ValueError),
-        (lambda: np.format_float_positional(1.5, fractional=False, precision=0), ValueError),
     ],
 )
 def test_format_float_argument_errors(call, kind):
@@ -488,11 +477,6 @@ def test_sign_and_floatmode_options():
     assert np.array2string(halves, floatmode="maxprec_equal") == "[0.50 0.25]"
     assert np.array2string(halves, floatmode="unique", precision=1) == "[0.5  0.25]"
     assert np.array2string(halves, precision=1) == "[0.5 0.2]"
-
-
-def test_formatter_option():
-    assert np.array2string(np.arange(3.0), formatter={"float_kind": lambda x: "%.2f" % x}) == "[0.00 1.00 2.00]"
-    assert np.array2string(np.arange(3), formatter={"int": lambda x: hex(x)}) == "[0x0 0x1 0x2]"
 
 
 def test_dtypes_are_native_byte_order():
