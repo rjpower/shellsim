@@ -72,18 +72,27 @@ fn unsupported_scipy_features_fail_explicitly() {
             "import scipy.linalg as sl\nsl.eigh(np.eye(2) * 1j)",
             "complex input to scipy.linalg.eigh is not supported by shellsim's SciPy",
         ),
+        // scipy.linalg.lapack and .blas (the f2py-style LAPACK/BLAS wrappers) do not exist:
+        // scipy.linalg is one frozen module built entirely over `_numpy_linalg`, not a package.
+        ("from scipy.linalg import lapack", "ImportError"),
+        ("from scipy.linalg import blas", "ImportError"),
         (
-            "from scipy.linalg import lapack\nlapack.zgetrf",
-            "NotImplementedError: LAPACK routine zgetrf is not supported by shellsim's SciPy",
+            "import scipy.linalg as sl\nsl.qr(np.eye(3), pivoting=True)",
+            "NotImplementedError",
         ),
         (
-            "from scipy.linalg import lapack\nlapack.dgeev",
-            "NotImplementedError: LAPACK routine dgeev is not supported by shellsim's SciPy",
+            "import scipy.linalg as sl\nsl.eig(np.eye(3), b=np.eye(3))",
+            "scipy.linalg.eig's generalized problem (b given) is not supported by shellsim's SciPy",
         ),
         (
-            "from scipy.linalg import blas\nblas.ddot",
-            "NotImplementedError: BLAS routine ddot is not supported by shellsim's SciPy",
+            "import scipy.linalg as sl\nsl.eig(np.eye(3), left=True)",
+            "scipy.linalg.eig(left=True) is not supported by shellsim's SciPy",
         ),
+        // Dropped SciPy 1.18 functionality: a narrowed, hand-picked subset (see
+        // `source/scipy/linalg.py`'s module docstring), not a missing feature to add.
+        ("import scipy.linalg as sl\nsl.pinvh", "AttributeError"),
+        ("import scipy.linalg as sl\nsl.hadamard", "AttributeError"),
+        ("import scipy.linalg as sl\nsl.polar", "AttributeError"),
         ("from scipy.spatial import KDTree", "ImportError"),
         (
             "from scipy.spatial import distance\ndistance.dice",

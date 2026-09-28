@@ -2,25 +2,26 @@
 //!
 //! This module is the thin runtime-facing layer over [`dense`], the shared kernel module: it
 //! reads operand arrays, batches over stacked leading dimensions, charges CPU for the cubic (or,
-//! for the Jacobi solvers, per-sweep) work before running it, calls into [`dense`], and writes
-//! results back into new arrays. `source/numpy/linalg.py` composes these primitives (plus
-//! ordinary NumPy array operations) into the full `numpy.linalg` surface: functions such as
-//! `matrix_power`, `matrix_rank`, `pinv`, `lstsq` and `norm` are plain Python built from `inv`,
-//! `solve`, `svd` and `eigh` here, so this module exposes only the eight primitives that need
-//! their own factorization: `inv`, `solve`, `det`, `slogdet`, `cholesky`, `qr`, `eigh`, `svd`.
+//! for the Jacobi and QR-iteration solvers, per-sweep) work before running it, calls into
+//! [`dense`], and writes results back into new arrays. `source/numpy/linalg.py` composes these
+//! primitives (plus ordinary NumPy array operations) into the full `numpy.linalg` surface:
+//! functions such as `matrix_power`, `matrix_rank`, `pinv`, `lstsq` and `norm` are plain Python
+//! built from `inv`, `solve`, `svd` and `eigh` here. `lu` and `solve_triangular` are exposed only
+//! for `scipy.linalg` to build its own `lu`/`lu_factor`/`solve_triangular`/`cho_solve` on top of,
+//! not part of `numpy.linalg`'s own public surface.
 //!
 //! Every primitive computes in `f64` regardless of the input's integer or floating dtype, and
 //! casts the result to `float32` only when every real operand was `float32`, rounding once. This
 //! is simpler than running parallel single- and double-precision kernels and, because it uses
 //! more precision than the target rather than less, cannot make results less accurate; see
 //! `docs/numpy.md` for the resulting (deliberate) difference from NumPy's own single-precision
-//! LAPACK calls. `float16` is rejected with NumPy's own message, and complex input is rejected
+//! LAPACK calls. `float16` is rejected with NumPy's own message, and complex *input* is rejected
 //! as an explicit unsupported feature, both as real NumPy's `numpy.linalg` module does or as
-//! `docs/numpy.md` documents.
+//! `docs/numpy.md` documents; `eig`'s own *output* is complex, same as real NumPy's.
 
 pub(in crate::python) mod dense;
 
-use dense::{Mat, Trans};
+use dense::{Cplx, Mat, Trans};
 
 use super::super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArrayBuffer, PyError, PyResult, PyRuntime,
@@ -30,6 +31,7 @@ use super::args::Signature;
 use super::array::{self, Array};
 use super::convert;
 use super::dtype::{Category, DType, Kind};
+use super::element::{C128, C64};
 
 pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     name: "_numpy_linalg",
@@ -56,7 +58,10 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("cholesky", cholesky),
     function("qr", qr),
     function("eigh", eigh),
+    function("eig", eig),
     function("svd", svd),
+    function("lu", lu),
+    function("solve_triangular", solve_triangular),
 ];
 
 /// Whether every real operand was `float32`, the one case where a result narrows from the
@@ -590,4 +595,253 @@ fn svd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     let u_array = array_from_batches(runtime, &batch_shape, rows, u_width, &us, precision)?;
     let vt_array = array_from_batches(runtime, &batch_shape, vt_height, cols, &vts, precision)?;
     runtime.new_tuple(vec![u_array.value(), s_array.value(), vt_array.value()])
+}
+
+// ---------------------------------------------------------------------------------------------
+// eig
+// ---------------------------------------------------------------------------------------------
+
+fn non_convergence_error() -> PyError {
+    PyError::exception("LinAlgError", "Eigenvalues did not converge")
+}
+
+fn eig(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("eig", &["a", "compute_vectors"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let compute_vectors = match bound.value("compute_vectors") {
+        Some(value) => runtime.truth(&value)?,
+        None => true,
+    };
+    let precision = check_dtype(&a, "eig")?;
+    let (batch_shape, n) = square_shape(&a)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, n, n);
+    let mut values = Vec::with_capacity(mats.len());
+    let mut vectors = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let Some(result) =
+            dense::eig_general(mat, compute_vectors, |cost| runtime.charge_cpu(cost))?
+        else {
+            return Err(non_convergence_error());
+        };
+        values.push(result.values);
+        if let Some(v) = result.vectors {
+            vectors.push(v);
+        }
+    }
+    let w_array = complex_array_from_vectors(runtime, &batch_shape, n, &values, precision)?;
+    if !compute_vectors {
+        return runtime.new_tuple(vec![w_array.value(), Value::None]);
+    }
+    let v_array = complex_array_from_columns(runtime, &batch_shape, n, &vectors, precision)?;
+    runtime.new_tuple(vec![w_array.value(), v_array.value()])
+}
+
+/// Build a new array from batched length-`n` complex vectors (eigenvalues), narrowing to
+/// `complex64` when `precision` is `Single`, matching how the real primitives narrow to
+/// `float32`.
+fn complex_array_from_vectors(
+    runtime: &mut dyn PyRuntime,
+    batch_shape: &[usize],
+    n: usize,
+    vectors: &[Vec<Cplx>],
+    precision: Precision,
+) -> PyResult<Array> {
+    let mut shape = batch_shape.to_vec();
+    shape.push(n);
+    let flat: Vec<C128> = vectors
+        .iter()
+        .flatten()
+        .map(|value| C128 {
+            re: value.re,
+            im: value.im,
+        })
+        .collect();
+    match precision {
+        Precision::Double => {
+            array::array_from_elements::<C128>(runtime, DType::COMPLEX128, shape, &flat)
+        }
+        Precision::Single => {
+            let narrowed: Vec<C64> = flat
+                .iter()
+                .map(|value| C64 {
+                    re: value.re as f32,
+                    im: value.im as f32,
+                })
+                .collect();
+            array::array_from_elements::<C64>(runtime, DType::COMPLEX64, shape, &narrowed)
+        }
+    }
+}
+
+/// Build a new array from batched `n x n` complex matrices, each given as `n` length-`n`
+/// eigenvector columns (`columns[k]` is column `k`, as [`dense::eig_general`] returns them),
+/// narrowing to `complex64` when `precision` is `Single`.
+fn complex_array_from_columns(
+    runtime: &mut dyn PyRuntime,
+    batch_shape: &[usize],
+    n: usize,
+    batches: &[Vec<Vec<Cplx>>],
+    precision: Precision,
+) -> PyResult<Array> {
+    let mut shape = batch_shape.to_vec();
+    shape.push(n);
+    shape.push(n);
+    let mut flat = Vec::with_capacity(batches.len() * n * n);
+    for columns in batches {
+        let mut mat = vec![C128 { re: 0.0, im: 0.0 }; n * n];
+        for (col_index, column) in columns.iter().enumerate() {
+            for (row_index, value) in column.iter().enumerate() {
+                mat[row_index * n + col_index] = C128 {
+                    re: value.re,
+                    im: value.im,
+                };
+            }
+        }
+        flat.extend(mat);
+    }
+    match precision {
+        Precision::Double => {
+            array::array_from_elements::<C128>(runtime, DType::COMPLEX128, shape, &flat)
+        }
+        Precision::Single => {
+            let narrowed: Vec<C64> = flat
+                .iter()
+                .map(|value| C64 {
+                    re: value.re as f32,
+                    im: value.im as f32,
+                })
+                .collect();
+            array::array_from_elements::<C64>(runtime, DType::COMPLEX64, shape, &narrowed)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// lu (exposed for scipy.linalg's `lu`/`lu_factor`/`lu_solve`, not part of numpy.linalg itself)
+// ---------------------------------------------------------------------------------------------
+
+/// `_numpy_linalg.lu(a)`: the packed `getrf`-style LU factorization [`dense::lu_factor`]
+/// computes (`lu`, and the 0-based `piv` such that step `k` swapped row `k` with row `piv[k]`),
+/// batched like this module's other primitives. `a` need not be square. `scipy.linalg.lu_factor`
+/// returns this pair directly; `scipy.linalg.lu` and `.lu_solve` build on it in Python.
+fn lu(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new("lu", &["a"], 1);
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let precision = check_dtype(&a, "lu")?;
+    let (batch_shape, rows, cols) = rect_shape(&a)?;
+    let k = rows.min(cols);
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(rows as u64, cols as u64) * count as u64)?;
+    let flat = as_f64(runtime, &a)?;
+    let mats = chunks(&flat, rows, cols);
+    let mut lus = Vec::with_capacity(mats.len());
+    let mut pivs = Vec::with_capacity(mats.len());
+    for mat in &mats {
+        let factorization = dense::lu_factor(mat);
+        lus.push(factorization.lu);
+        pivs.push(
+            factorization
+                .piv
+                .iter()
+                .map(|&value| value as i32)
+                .collect::<Vec<i32>>(),
+        );
+    }
+    let lu_array = array_from_batches(runtime, &batch_shape, rows, cols, &lus, precision)?;
+    let piv_array = array_from_int_vectors(runtime, &batch_shape, k, &pivs)?;
+    runtime.new_tuple(vec![lu_array.value(), piv_array.value()])
+}
+
+/// Build a new C-ordered `int32` array from batched length-`n` pivot vectors.
+fn array_from_int_vectors(
+    runtime: &mut dyn PyRuntime,
+    batch_shape: &[usize],
+    n: usize,
+    vectors: &[Vec<i32>],
+) -> PyResult<Array> {
+    let mut flat = Vec::with_capacity(vectors.len() * n);
+    for vector in vectors {
+        flat.extend_from_slice(vector);
+    }
+    let mut shape = batch_shape.to_vec();
+    shape.push(n);
+    array::array_from_elements::<i32>(runtime, DType::INT32, shape, &flat)
+}
+
+// ---------------------------------------------------------------------------------------------
+// solve_triangular (exposed for scipy.linalg's `solve_triangular` and `cho_solve`)
+// ---------------------------------------------------------------------------------------------
+
+/// `_numpy_linalg.solve_triangular(a, b, lower, transpose, unit_diagonal)`: the solution of the
+/// triangular system `a @ x == b` (or, if `transpose`, `a.T @ x == b`), batched like `solve`.
+/// Real NumPy has no public triangular solve; this exists for `scipy.linalg.solve_triangular`
+/// and, applied twice, `scipy.linalg.cho_solve`.
+fn solve_triangular(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+    static SIGNATURE: Signature = Signature::new(
+        "solve_triangular",
+        &["a", "b", "lower", "transpose", "unit_diagonal"],
+        2,
+    );
+    let bound = SIGNATURE.bind(&args)?;
+    let a = convert::as_array(runtime, bound.required("a"))?;
+    let b = convert::as_array(runtime, bound.required("b"))?;
+    let lower = match bound.value("lower") {
+        Some(value) => runtime.truth(&value)?,
+        None => false,
+    };
+    let transpose = match bound.value("transpose") {
+        Some(value) => runtime.truth(&value)?,
+        None => false,
+    };
+    let unit_diagonal = match bound.value("unit_diagonal") {
+        Some(value) => runtime.truth(&value)?,
+        None => false,
+    };
+    let trans = if transpose {
+        Trans::Transpose
+    } else {
+        Trans::No
+    };
+    let precision =
+        check_dtype(&a, "solve_triangular")?.combine(check_dtype(&b, "solve_triangular")?);
+    let (a_batch, n) = square_shape(&a)?;
+    if b.ndim() == 0 {
+        return Err(need_2d(0));
+    }
+    let vector_rhs = b.ndim() < a.ndim();
+    let (b_batch, k): (Vec<usize>, usize) = if vector_rhs {
+        (b.shape()[..b.ndim() - 1].to_vec(), 1)
+    } else {
+        (b.shape()[..b.ndim() - 2].to_vec(), b.shape()[b.ndim() - 1])
+    };
+    let batch_shape = array::broadcast_shapes(&[&a_batch, &b_batch])?;
+    let count = batch_count(&batch_shape);
+    runtime.charge_cpu(dense::factor_cost(n as u64, n as u64) * count as u64)?;
+    let a_flat = broadcast_f64(runtime, &a, &batch_shape, &[n, n])?;
+    let b_core: Vec<usize> = if vector_rhs { vec![n] } else { vec![n, k] };
+    let b_flat = broadcast_f64(runtime, &b, &batch_shape, &b_core)?;
+    let a_mats = chunks(&a_flat, n, n);
+    let b_mats = chunks(&b_flat, n, k);
+    let mut results = Vec::with_capacity(a_mats.len());
+    for (a_mat, b_mat) in a_mats.iter().zip(&b_mats) {
+        match dense::triangular_solve(a_mat, b_mat, lower, trans, unit_diagonal) {
+            Ok(x) => results.push(x),
+            Err(_) => return Err(singular_error()),
+        }
+    }
+    let result = if vector_rhs {
+        array_from_vectors(
+            runtime,
+            &batch_shape,
+            n,
+            &results.iter().map(|m| m.data.clone()).collect::<Vec<_>>(),
+            precision,
+        )?
+    } else {
+        array_from_batches(runtime, &batch_shape, n, k, &results, precision)?
+    };
+    scalar_or_array(runtime, &result)
 }

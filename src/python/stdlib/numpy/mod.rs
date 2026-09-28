@@ -42,13 +42,6 @@ mod strings;
 mod ufunc;
 mod underflow;
 
-// The array plumbing that SciPy's native kernels share with NumPy's.
-pub(in crate::python) use args::{flag, float_arg, index_int, Bound, Signature};
-pub(in crate::python) use array::{
-    array_from_elements, fortran_array_from_elements, read_elements, Array,
-};
-pub(in crate::python) use convert::{as_array, cast_array};
-pub(in crate::python) use dtype::{Category, DType};
 pub(in crate::python) use ndarray::{
     slot_bool, slot_get_item, slot_iter, slot_length, slot_matrix_multiply,
     slot_reflected_matrix_multiply, slot_repr, slot_set_item, slot_str,

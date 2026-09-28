@@ -20,16 +20,11 @@
 //! - The SVD uses one-sided Jacobi orthogonalization of the columns of `A` (Hestenes 1958, and
 //!   see Golub & Van Loan §8.6.3): repeatedly rotate pairs of columns to make them orthogonal.
 //!   Singular values are the resulting column norms and `U` their normalized columns.
-//! - The tridiagonal solver is Gaussian elimination with partial pivoting specialized to a
-//!   tridiagonal system (Golub & Van Loan §4.3.6), matching LAPACK's `gtsv`.
-//! - The banded solver is Gaussian elimination with partial pivoting specialized to a banded
-//!   system stored in LAPACK band form (Golub & Van Loan §4.3.1), matching LAPACK's `gbsv`.
-//! - The matrix exponential uses scaling and squaring with a Padé approximant, following Higham,
-//!   "The Scaling and Squaring Method for the Matrix Exponential Revisited" (SIAM J. Matrix Anal.
-//!   Appl., 2005). A fixed [13/13] Padé order is used at every scale rather than Higham's
-//!   adaptive order selection, which trades a little unneeded work for simplicity; accuracy is
-//!   unaffected because the scaling step already brings the matrix norm below the order-13
-//!   threshold.
+//! - The general (non-symmetric) eigenproblem reduces `A` to upper Hessenberg form (§7.4.2), then
+//!   deflates it to real Schur form with the explicit double-shift QR step of §7.5; eigenvectors
+//!   come from a few steps of shifted inverse iteration on `A` directly, in complex arithmetic.
+//!   See [`eig_general`]'s own doc for the full citation and the (deliberate) choice of the
+//!   explicit over the implicit ("bulge-chasing") form of the double shift.
 //!
 //! ## Accuracy and sign conventions
 //!
@@ -41,15 +36,19 @@
 //! Eigenvectors and singular vectors are free up to sign (and, for repeated singular values, up
 //! to rotation within the repeated subspace). Every eigenvector and singular vector this module
 //! returns is scaled so that its largest-magnitude entry is positive; ties keep the first such
-//! entry. `jacobi_eigh` and `jacobi_svd` apply this rule before returning.
+//! entry. `jacobi_eigh` and `jacobi_svd` apply this rule before returning; `eig_general`'s
+//! eigenvectors, which are generally complex even for a real matrix, generalize it to a phase
+//! convention (see [`eig_general`]'s doc).
 //!
 //! ## Resource accounting
 //!
 //! Deterministic factorizations (LU, Cholesky, QR, triangular solves) cost a fixed multiple of
 //! `n^3` (or `m*n^2` for rectangular input); callers charge that before calling in. The Jacobi
-//! solvers do not know their iteration count in advance, so `jacobi_eigh` and `jacobi_svd` accept
-//! a `charge_sweep` closure and call it with the cost of one sweep before running it, so a caller
-//! low on CPU budget is stopped before, not after, doing that sweep's work.
+//! solvers and the general eigenproblem's QR iteration do not know their iteration count in
+//! advance, so `jacobi_eigh`, `jacobi_svd`, and `eig_general` accept a `charge`/`charge_sweep`
+//! closure and call it with the cost of one sweep (or, for `eig_general`, one QR step or one
+//! eigenvector's inverse iteration) before running it, so a caller low on CPU budget is stopped
+//! before, not after, doing that work.
 
 use super::super::super::super::native::PyResult;
 
@@ -98,10 +97,6 @@ impl Mat {
         self.data[i * self.cols + j] += value;
     }
 
-    pub(in crate::python) fn row(&self, i: usize) -> &[f64] {
-        &self.data[i * self.cols..(i + 1) * self.cols]
-    }
-
     pub(in crate::python) fn transpose(&self) -> Mat {
         let mut result = Mat::zeros(self.cols, self.rows);
         for i in 0..self.rows {
@@ -121,15 +116,6 @@ impl Mat {
         }
     }
 
-    fn swap_columns(&mut self, a: usize, b: usize) {
-        if a == b {
-            return;
-        }
-        for i in 0..self.rows {
-            self.data.swap(i * self.cols + a, i * self.cols + b);
-        }
-    }
-
     pub(in crate::python) fn matmul(&self, other: &Mat) -> Mat {
         debug_assert_eq!(self.cols, other.rows);
         let mut result = Mat::zeros(self.rows, other.cols);
@@ -145,38 +131,6 @@ impl Mat {
             }
         }
         result
-    }
-
-    pub(in crate::python) fn scale(&self, factor: f64) -> Mat {
-        Mat::from_row_major(
-            self.rows,
-            self.cols,
-            self.data.iter().map(|value| value * factor).collect(),
-        )
-    }
-
-    fn add_mat(&self, other: &Mat) -> Mat {
-        Mat::from_row_major(
-            self.rows,
-            self.cols,
-            self.data
-                .iter()
-                .zip(&other.data)
-                .map(|(a, b)| a + b)
-                .collect(),
-        )
-    }
-
-    fn sub_mat(&self, other: &Mat) -> Mat {
-        Mat::from_row_major(
-            self.rows,
-            self.cols,
-            self.data
-                .iter()
-                .zip(&other.data)
-                .map(|(a, b)| a - b)
-                .collect(),
-        )
     }
 }
 
@@ -377,20 +331,6 @@ pub(in crate::python) fn lu_det(factorization: &LuFactorization) -> f64 {
     sign * log_det.exp()
 }
 
-/// The matrix 1-norm (maximum absolute column sum), used for condition-number estimates.
-pub(in crate::python) fn one_norm(a: &Mat) -> f64 {
-    (0..a.cols)
-        .map(|j| (0..a.rows).map(|i| a.get(i, j).abs()).sum::<f64>())
-        .fold(0.0, f64::max)
-}
-
-/// The matrix infinity-norm (maximum absolute row sum).
-pub(in crate::python) fn inf_norm(a: &Mat) -> f64 {
-    (0..a.rows)
-        .map(|i| a.row(i).iter().map(|value| value.abs()).sum::<f64>())
-        .fold(0.0, f64::max)
-}
-
 /// The Frobenius norm.
 pub(in crate::python) fn frobenius_norm(a: &Mat) -> f64 {
     a.data.iter().map(|value| value * value).sum::<f64>().sqrt()
@@ -426,45 +366,6 @@ pub(in crate::python) fn cholesky_lower(a: &Mat) -> Result<Mat, usize> {
         }
     }
     Ok(l)
-}
-
-/// Solve `A x = b` given the lower Cholesky factor of `A`.
-pub(in crate::python) fn cholesky_solve(l: &Mat, b: &Mat) -> Mat {
-    let mut x = b.clone();
-    forward_substitute_lower(l, &mut x, false);
-    forward_substitute_lower(l, &mut x, true);
-    x
-}
-
-/// The inverse of `A` given its lower Cholesky factor.
-pub(in crate::python) fn cholesky_invert(l: &Mat) -> Mat {
-    cholesky_solve(l, &Mat::identity(l.rows))
-}
-
-/// Forward (or, transposed, backward) substitution against a lower-triangular `l`, in place.
-fn forward_substitute_lower(l: &Mat, b: &mut Mat, transposed: bool) {
-    let n = l.rows;
-    if !transposed {
-        for i in 0..n {
-            for col in 0..b.cols {
-                let mut sum = b.get(i, col);
-                for k in 0..i {
-                    sum -= l.get(i, k) * b.get(k, col);
-                }
-                b.set(i, col, sum / l.get(i, i));
-            }
-        }
-    } else {
-        for i in (0..n).rev() {
-            for col in 0..b.cols {
-                let mut sum = b.get(i, col);
-                for k in (i + 1)..n {
-                    sum -= l.get(k, i) * b.get(k, col);
-                }
-                b.set(i, col, sum / l.get(i, i));
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -522,15 +423,6 @@ pub(in crate::python) fn triangular_solve(
         }
     }
     Ok(x)
-}
-
-/// The inverse of a triangular `a`.
-pub(in crate::python) fn triangular_invert(
-    a: &Mat,
-    lower: bool,
-    unit_diag: bool,
-) -> Result<Mat, usize> {
-    triangular_solve(a, &Mat::identity(a.rows), lower, Trans::No, unit_diag)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -607,96 +499,6 @@ pub(in crate::python) fn householder_qr(a: &Mat) -> QrFactorization {
         tau.push(current_tau * leading * leading);
     }
     QrFactorization { factored, tau }
-}
-
-/// Factor `a` with column pivoting: `A P = Q R`, `P` the permutation that reorders columns
-/// (Businger & Golub 1965; Golub & Van Loan §5.4.1). At each step, the remaining column (from
-/// `col` onward) of largest Euclidean norm is swapped into the pivot position before reflecting
-/// it, so `R`'s diagonal is non-increasing in magnitude; remaining columns' norms are then
-/// downdated in `O(1)` each from the just-computed row, rather than recomputed from scratch, as
-/// the original algorithm does (LAPACK's `geqp3` refines this with periodic recomputation for
-/// numerical stability in edge cases; that refinement is not implemented here). Returns the
-/// factorization, in the pivoted column order, and the 0-based permutation `jpvt` with
-/// `jpvt[i]` naming which column of `a` became column `i`, matching LAPACK's `geqp3` convention.
-pub(in crate::python) fn householder_qr_pivoted(a: &Mat) -> (QrFactorization, Vec<usize>) {
-    let mut factored = a.clone();
-    let k = a.rows.min(a.cols);
-    let mut tau = Vec::with_capacity(k);
-    let mut jpvt: Vec<usize> = (0..a.cols).collect();
-    let mut norms: Vec<f64> = (0..a.cols)
-        .map(|col| {
-            (0..a.rows)
-                .map(|row| factored.get(row, col).powi(2))
-                .sum::<f64>()
-                .sqrt()
-        })
-        .collect();
-    for col in 0..k {
-        let mut best = col;
-        for j in (col + 1)..a.cols {
-            if norms[j] > norms[best] {
-                best = j;
-            }
-        }
-        if best != col {
-            factored.swap_columns(col, best);
-            norms.swap(col, best);
-            jpvt.swap(col, best);
-        }
-        // See the matching comment in `householder_qr`: a length-1 trailing column has nothing
-        // to reflect, and LAPACK leaves it unnegated (`tau = 0`).
-        if a.rows - col <= 1 {
-            tau.push(0.0);
-            continue;
-        }
-        let mut norm = 0.0f64;
-        for row in col..a.rows {
-            norm = norm.hypot(factored.get(row, col));
-        }
-        if norm == 0.0 {
-            tau.push(0.0);
-            continue;
-        }
-        let pivot = factored.get(col, col);
-        let alpha = if pivot >= 0.0 { -norm } else { norm };
-        let mut v = vec![0.0; a.rows - col];
-        v[0] = pivot - alpha;
-        for row in (col + 1)..a.rows {
-            v[row - col] = factored.get(row, col);
-        }
-        let v_norm = v.iter().map(|value| value * value).sum::<f64>().sqrt();
-        if v_norm == 0.0 {
-            tau.push(0.0);
-            continue;
-        }
-        for value in &mut v {
-            *value /= v_norm;
-        }
-        let current_tau = 2.0;
-        for j in col..a.cols {
-            let mut dot = 0.0;
-            for (offset, entry) in v.iter().enumerate() {
-                dot += entry * factored.get(col + offset, j);
-            }
-            let scale = current_tau * dot;
-            for (offset, entry) in v.iter().enumerate() {
-                factored.add(col + offset, j, -scale * entry);
-            }
-        }
-        let leading = v[0];
-        if leading != 0.0 {
-            for (offset, entry) in v.iter().enumerate().skip(1) {
-                factored.set(col + offset, col, entry / leading);
-            }
-        }
-        tau.push(current_tau * leading * leading);
-        for (j, norm) in norms.iter_mut().enumerate().skip(col + 1) {
-            let entry = factored.get(col, j);
-            let updated = *norm * *norm - entry * entry;
-            *norm = if updated > 0.0 { updated.sqrt() } else { 0.0 };
-        }
-    }
-    (QrFactorization { factored, tau }, jpvt)
 }
 
 /// Apply `Q` (or, transposed, `Q^T`) from the left to `c` in place, reading reflectors from
@@ -1093,282 +895,498 @@ fn extend_orthonormal(basis: &Mat, width: usize) -> Mat {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Tridiagonal solve (LAPACK `gtsv`).
+// General (non-symmetric) eigenproblem: Hessenberg reduction, explicit double-shift QR, and
+// inverse iteration.
 // ---------------------------------------------------------------------------------------------
 
-/// Solve a tridiagonal system by Gaussian elimination with partial pivoting, overwriting `b`
-/// with the solution. `dl` and `du` have `n - 1` entries and `d` has `n` entries; all three are
-/// consumed (overwritten as scratch), as LAPACK's `gtsv` does. `Err(i)` reports the one-based
-/// step at which the matrix was found exactly singular.
-pub(in crate::python) fn tridiagonal_solve(
-    dl: &mut [f64],
-    d: &mut [f64],
-    du: &mut [f64],
-    b: &mut Mat,
-) -> Result<(), usize> {
-    let n = d.len();
-    if n == 0 {
-        return Ok(());
+/// A complex number, used only internally: a real matrix's eigenvalues and eigenvectors are
+/// generally complex, even though every arithmetic operation on the *input* stays real until the
+/// Schur form's diagonal blocks are read off (see [`eig_general`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(in crate::python) struct Cplx {
+    pub re: f64,
+    pub im: f64,
+}
+
+impl Cplx {
+    pub(in crate::python) fn new(re: f64, im: f64) -> Self {
+        Self { re, im }
     }
-    // `du2[i]` holds the fill-in entry at column i+2 of row i, which appears only after a
-    // pivot swap carries row i+1's superdiagonal entry into row i.
-    let mut du2 = vec![0.0; n.saturating_sub(2)];
-    for i in 0..n - 1 {
-        if d[i].abs() >= dl[i].abs() {
-            if d[i] == 0.0 {
-                return Err(i + 1);
-            }
-            let factor = dl[i] / d[i];
-            d[i + 1] -= factor * du[i];
-            for col in 0..b.cols {
-                let value = b.get(i + 1, col) - factor * b.get(i, col);
-                b.set(i + 1, col, value);
-            }
+
+    fn real(re: f64) -> Self {
+        Self::new(re, 0.0)
+    }
+
+    pub(in crate::python) fn abs(self) -> f64 {
+        self.re.hypot(self.im)
+    }
+
+    fn scale(self, factor: f64) -> Self {
+        Self::new(self.re * factor, self.im * factor)
+    }
+}
+
+impl std::ops::Add for Cplx {
+    type Output = Cplx;
+    fn add(self, other: Cplx) -> Cplx {
+        Cplx::new(self.re + other.re, self.im + other.im)
+    }
+}
+
+impl std::ops::Sub for Cplx {
+    type Output = Cplx;
+    fn sub(self, other: Cplx) -> Cplx {
+        Cplx::new(self.re - other.re, self.im - other.im)
+    }
+}
+
+impl std::ops::Mul for Cplx {
+    type Output = Cplx;
+    fn mul(self, other: Cplx) -> Cplx {
+        Cplx::new(
+            self.re * other.re - self.im * other.im,
+            self.re * other.im + self.im * other.re,
+        )
+    }
+}
+
+impl std::ops::Div for Cplx {
+    type Output = Cplx;
+    fn div(self, other: Cplx) -> Cplx {
+        // Scale both parts by the smaller of the divisor's magnitudes first (Smith's algorithm)
+        // to avoid overflow when `other` has a very large component; this module's matrices are
+        // small, but the shift used in inverse iteration can still be numerically large.
+        if other.re.abs() >= other.im.abs() {
+            let r = other.im / other.re;
+            let d = other.re + other.im * r;
+            Cplx::new((self.re + self.im * r) / d, (self.im - self.re * r) / d)
         } else {
-            // Pivot on the subdiagonal: rows i and i+1 swap (implicitly, via `factor`), then
-            // eliminate the new row i+1's entry in column i using the new row i.
-            //
-            // Before the swap, row i is [d[i], du[i], 0] and row i+1 is
-            // [dl[i], d[i+1], du[i+1]] (columns i, i+1, i+2). After swapping, row i (finalized
-            // here) is the old row i+1, and row i+1 becomes old row i minus `factor` times the
-            // new row i, where `factor = d[i] / dl[i]` zeros column i.
-            let factor = d[i] / dl[i];
-            let old_du_i = du[i];
-            let old_d_ip1 = d[i + 1];
-            let old_du_ip1 = if i < n - 2 { du[i + 1] } else { 0.0 };
-
-            d[i] = dl[i];
-            du[i] = old_d_ip1;
-            if i < n - 2 {
-                du2[i] = old_du_ip1;
-            }
-            d[i + 1] = old_du_i - factor * old_d_ip1;
-            if i < n - 2 {
-                du[i + 1] = -factor * old_du_ip1;
-            }
-            for col in 0..b.cols {
-                let bi = b.get(i, col);
-                let bip1 = b.get(i + 1, col);
-                b.set(i, col, bip1);
-                b.set(i + 1, col, bi - factor * bip1);
-            }
+            let r = other.re / other.im;
+            let d = other.re * r + other.im;
+            Cplx::new((self.re * r + self.im) / d, (self.im * r - self.re) / d)
         }
     }
-    if d[n - 1] == 0.0 {
-        return Err(n);
-    }
-    for col in 0..b.cols {
-        b.set(n - 1, col, b.get(n - 1, col) / d[n - 1]);
-        if n >= 2 {
-            let value = (b.get(n - 2, col) - du[n - 2] * b.get(n - 1, col)) / d[n - 2];
-            b.set(n - 2, col, value);
-        }
-        for i in (0..n.saturating_sub(2)).rev() {
-            let value =
-                (b.get(i, col) - du[i] * b.get(i + 1, col) - du2[i] * b.get(i + 2, col)) / d[i];
-            b.set(i, col, value);
-        }
-    }
-    Ok(())
 }
 
-// ---------------------------------------------------------------------------------------------
-// Banded solve (LAPACK `gbsv`).
-// ---------------------------------------------------------------------------------------------
-
-/// Solve a banded system given in LAPACK's expanded band-storage form: `ab` has
-/// `2*kl + ku + 1` rows and `n` columns, where row `kl + ku + i - j` (zero-based) of column `j`
-/// holds `A[i, j]` for `max(0, j - ku) <= i <= min(n - 1, j + kl)`, and the top `kl` rows are
-/// scratch for fill-in, as LAPACK's `gbsv` expects. Returns the factored `ab` (with `L`'s
-/// multipliers recorded in the scratch rows, as `gbsv` leaves them), the pivot vector, and the
-/// solution, or `Err(i)` at the first exactly-zero pivot.
-pub(in crate::python) fn banded_lu_solve(
-    kl: usize,
-    ku: usize,
-    ab: &Mat,
-    b: &Mat,
-) -> Result<(Mat, Vec<usize>, Mat), usize> {
-    let n = ab.cols;
-    let mut ab = ab.clone();
-    let mut x = b.clone();
-    let mut piv = Vec::with_capacity(n);
-    let band_rows = 2 * kl + ku + 1;
-    debug_assert_eq!(ab.rows, band_rows);
-    // Row index within `ab` of `A[i, j]`, in the working (post-fill-in) storage.
-    let row_of =
-        |i: isize, j: usize| -> usize { (kl as isize + ku as isize + i - j as isize) as usize };
-    for j in 0..n {
-        let last_row = (j + kl).min(n - 1);
-        let mut best_i = j;
-        let mut best_value = ab.get(row_of(j as isize, j), j).abs();
-        for i in (j + 1)..=last_row {
-            let value = ab.get(row_of(i as isize, j), j).abs();
-            if value > best_value {
-                best_value = value;
-                best_i = i;
-            }
-        }
-        piv.push(best_i);
-        if best_i != j {
-            let last_col = (j + kl + ku).min(n - 1);
-            for col in j..=last_col {
-                let a = row_of(j as isize, col);
-                let b_row = row_of(best_i as isize, col);
-                let tmp = ab.get(a, col);
-                ab.set(a, col, ab.get(b_row, col));
-                ab.set(b_row, col, tmp);
-            }
-            x.swap_rows(j, best_i);
-        }
-        let pivot = ab.get(row_of(j as isize, j), j);
-        if pivot == 0.0 {
-            return Err(j + 1);
-        }
-        let last_col = (j + kl + ku).min(n - 1);
-        for i in (j + 1)..=last_row {
-            let factor = ab.get(row_of(i as isize, j), j) / pivot;
-            ab.set(row_of(i as isize, j), j, factor);
-            if factor == 0.0 {
-                continue;
-            }
-            for col in (j + 1)..=last_col {
-                let updated = ab.get(row_of(i as isize, col), col)
-                    - factor * ab.get(row_of(j as isize, col), col);
-                ab.set(row_of(i as isize, col), col, updated);
-            }
-            for rhs in 0..x.cols {
-                let updated = x.get(i, rhs) - factor * x.get(j, rhs);
-                x.set(i, rhs, updated);
-            }
-        }
-    }
-    // Back substitution using the upper band (bandwidth kl + ku) left in `ab`.
-    for i in (0..n).rev() {
-        let last_col = (i + kl + ku).min(n - 1);
-        for rhs in 0..x.cols {
-            let mut sum = x.get(i, rhs);
-            for col in (i + 1)..=last_col {
-                sum -= ab.get(row_of(i as isize, col), col) * x.get(col, rhs);
-            }
-            x.set(i, rhs, sum / ab.get(row_of(i as isize, i), i));
-        }
-    }
-    Ok((ab, piv, x))
+/// Eigenvalues and, if requested, eigenvectors of a general square real matrix.
+pub(in crate::python) struct EigResult {
+    pub values: Vec<Cplx>,
+    /// `vectors[k]` is the (unit-norm) eigenvector for `values[k]`, stored as a length-`n` column.
+    pub vectors: Option<Vec<Vec<Cplx>>>,
 }
 
-// ---------------------------------------------------------------------------------------------
-// Matrix exponential: scaling and squaring with a [13/13] Padé approximant.
-// ---------------------------------------------------------------------------------------------
+/// The number of Francis-style QR sweeps allowed per remaining eigenvalue before giving up (and
+/// reporting non-convergence), a generous multiple of the O(n) sweeps typically needed.
+const SCHUR_MAX_SWEEPS_PER_VALUE: usize = 40;
 
-/// [13/13] Padé numerator coefficients for `e^A`, from Higham (2005), Table 2.3 / eq. (3.12).
-const PADE_13: [f64; 14] = [
-    64764752532480000.0,
-    32382376266240000.0,
-    7771770303897600.0,
-    1187353796428800.0,
-    129060195264000.0,
-    10559470521600.0,
-    670442572800.0,
-    33522128640.0,
-    1323241920.0,
-    40840800.0,
-    960960.0,
-    16380.0,
-    182.0,
-    1.0,
-];
-
-/// The scaling threshold for order-13 Padé, `theta_13` from Higham (2005), Table 2.3.
-const PADE_13_THETA: f64 = 5.371920351148152;
-
-/// `e^A` for square `a`, by scaling and squaring with a fixed [13/13] Padé approximant.
-pub(in crate::python) fn expm(a: &Mat) -> Mat {
+/// Eigenvalues and, if requested, eigenvectors of the general (non-symmetric) eigenproblem
+/// `A x = lambda x`, or `None` if the QR iteration fails to converge within its sweep budget
+/// (which the caller reports as `LinAlgError`, as NumPy's own non-convergence does).
+///
+/// Follows Golub & Van Loan (4th ed.) §7.4-7.5: reduce `a` to upper Hessenberg form by
+/// Householder similarity transforms (§7.4.2), then repeatedly deflate it with the explicit
+/// double-shift QR step of §7.5 (forming `M = H^2 - s*H + t*I` from the trailing active block's
+/// trace `s` and determinant `t`, factoring `M = QR`, and updating `H := Q^T H Q`) until every
+/// diagonal block is `1x1` (a real eigenvalue) or `2x2` (a complex-conjugate pair, read off by
+/// the quadratic formula). This module uses the explicit form rather than LAPACK's implicit
+/// bulge-chasing `dlahqr`: the two are mathematically equivalent, but the explicit form reuses
+/// this module's existing `householder_qr` and `matmul` instead of a dedicated bulge-chase, at
+/// the cost of doing asymptotically more arithmetic — an acceptable trade under this module's
+/// resource-accounting policy (CPU is charged for, not minimized).
+///
+/// Eigenvectors, when requested, come from shifted inverse iteration on `a` directly (a few
+/// steps of solving `(A - lambda*I) v_{k+1} = v_k` in complex arithmetic and renormalizing),
+/// rather than back-substitution on the Schur form: simpler to implement correctly, and just as
+/// accurate once `lambda` is known to near machine precision from the QR iteration. Every
+/// eigenvector is normalized to unit 2-norm and rotated so its largest-magnitude entry is a
+/// positive real number, generalizing this module's real sign convention to a phase convention.
+pub(in crate::python) fn eig_general(
+    a: &Mat,
+    compute_vectors: bool,
+    mut charge: impl FnMut(u64) -> PyResult<()>,
+) -> PyResult<Option<EigResult>> {
     debug_assert_eq!(a.rows, a.cols);
     let n = a.rows;
     if n == 0 {
-        return Mat::zeros(0, 0);
+        return Ok(Some(EigResult {
+            values: Vec::new(),
+            vectors: compute_vectors.then(Vec::new),
+        }));
     }
-    let norm = one_norm(a);
-    let scaling = if norm > PADE_13_THETA {
-        (norm / PADE_13_THETA).log2().ceil().max(0.0) as u32
-    } else {
-        0
+    let scale = frobenius_norm(a).max(1.0);
+    // Hessenberg reduction is a fixed multiple of QR's own O(n^3) cost; the two-sided update
+    // (applying each reflector from both sides) does roughly twice the work of one-sided QR.
+    charge(factor_cost(n as u64, n as u64) * 2)?;
+    let h = hessenberg(a);
+    let Some(values) = schur_eigenvalues(h, scale, &mut charge)? else {
+        return Ok(None);
     };
-    let scaled = a.scale(1.0 / 2f64.powi(scaling as i32));
-
-    let identity = Mat::identity(n);
-    let a2 = scaled.matmul(&scaled);
-    let a4 = a2.matmul(&a2);
-    let a6 = a4.matmul(&a2);
-
-    // Evaluate the [13/13] Padé numerator and denominator with Horner-style grouping in A^2,
-    // following Higham (2005) eq. (3.12)-(3.13).
-    let u_inner = a6
-        .scale(PADE_13[13])
-        .add_mat(&a4.scale(PADE_13[11]))
-        .add_mat(&a2.scale(PADE_13[9]));
-    let u_right = a6
-        .matmul(&u_inner)
-        .add_mat(&a6.scale(PADE_13[7]))
-        .add_mat(&a4.scale(PADE_13[5]))
-        .add_mat(&a2.scale(PADE_13[3]))
-        .add_mat(&identity.scale(PADE_13[1]));
-    let u = scaled.matmul(&u_right);
-
-    let v_inner = a6
-        .scale(PADE_13[12])
-        .add_mat(&a4.scale(PADE_13[10]))
-        .add_mat(&a2.scale(PADE_13[8]));
-    let v = a6
-        .matmul(&v_inner)
-        .add_mat(&a6.scale(PADE_13[6]))
-        .add_mat(&a4.scale(PADE_13[4]))
-        .add_mat(&a2.scale(PADE_13[2]))
-        .add_mat(&identity.scale(PADE_13[0]));
-
-    let numerator = v.add_mat(&u);
-    let denominator = v.sub_mat(&u);
-    let factorization = lu_factor(&denominator);
-    let mut result = lu_solve(&factorization.lu, &factorization.piv, &numerator, Trans::No);
-    for _ in 0..scaling {
-        result = result.matmul(&result);
+    if !compute_vectors {
+        return Ok(Some(EigResult {
+            values,
+            vectors: None,
+        }));
     }
-    result
+    let mut vectors = Vec::with_capacity(n);
+    for &lambda in &values {
+        // A complex LU factorization plus a handful of solves, each cubic; charge before each
+        // eigenvector's inverse iteration so a budget-limited caller stops between vectors.
+        charge(factor_cost(n as u64, n as u64) * 6)?;
+        vectors.push(inverse_iterate(a, lambda, scale));
+    }
+    Ok(Some(EigResult {
+        values,
+        vectors: Some(vectors),
+    }))
 }
 
-// ---------------------------------------------------------------------------------------------
-// Generalized symmetric eigenproblem (`A x = lambda B x`, `B` symmetric positive definite).
-// ---------------------------------------------------------------------------------------------
+/// Reduce `a` to upper Hessenberg form by Householder similarity transforms (Golub & Van Loan
+/// §7.4.2): for each column, a reflector zeroing the entries below the subdiagonal is applied
+/// from the left (to zero them) and from the right (to complete the similarity transform), so
+/// the result is similar to `a` (shares its eigenvalues) without needing to track the
+/// accumulated orthogonal transform itself (eigenvectors here come from inverse iteration on `a`
+/// directly, not from back-substitution on the Hessenberg or Schur form).
+fn hessenberg(a: &Mat) -> Mat {
+    let n = a.rows;
+    let mut h = a.clone();
+    for k in 0..n.saturating_sub(2) {
+        let mut norm = 0.0f64;
+        for i in (k + 1)..n {
+            norm = norm.hypot(h.get(i, k));
+        }
+        if norm == 0.0 {
+            continue;
+        }
+        let pivot = h.get(k + 1, k);
+        let alpha = if pivot >= 0.0 { -norm } else { norm };
+        let mut v = vec![0.0; n - k - 1];
+        v[0] = pivot - alpha;
+        for i in (k + 2)..n {
+            v[i - k - 1] = h.get(i, k);
+        }
+        let v_norm = v.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if v_norm == 0.0 {
+            continue;
+        }
+        for value in &mut v {
+            *value /= v_norm;
+        }
+        // Apply H = I - 2 v v^T from the left to rows k+1..n, all columns from k onward.
+        for j in k..n {
+            let mut dot = 0.0;
+            for (offset, entry) in v.iter().enumerate() {
+                dot += entry * h.get(k + 1 + offset, j);
+            }
+            let update = 2.0 * dot;
+            for (offset, entry) in v.iter().enumerate() {
+                h.add(k + 1 + offset, j, -update * entry);
+            }
+        }
+        // Apply H from the right to all rows, columns k+1..n, completing the similarity.
+        for i in 0..n {
+            let mut dot = 0.0;
+            for (offset, entry) in v.iter().enumerate() {
+                dot += entry * h.get(i, k + 1 + offset);
+            }
+            let update = 2.0 * dot;
+            for (offset, entry) in v.iter().enumerate() {
+                h.add(i, k + 1 + offset, -update * entry);
+            }
+        }
+    }
+    // Entries below the subdiagonal are zero in exact arithmetic; clear the rounding residue so
+    // the deflation checks below compare against exact zeros where the structure guarantees them.
+    for i in 2..n {
+        for j in 0..(i - 1) {
+            h.set(i, j, 0.0);
+        }
+    }
+    h
+}
 
-/// The generalized eigenproblem's eigenvalues and, if requested, eigenvectors; `Err` reports
-/// that `B` was not positive definite (Cholesky's `info`), matching [`cholesky_lower`]'s own
-/// error type.
-pub(in crate::python) type EighGeneralized = Result<(Vec<f64>, Option<Mat>), usize>;
+/// Whether the subdiagonal entry `h[i+1, i]` is negligible relative to its neighboring diagonal
+/// entries (or, if both are zero, relative to `scale`), the standard deflation criterion for the
+/// QR algorithm (Golub & Van Loan §7.5.4).
+fn negligible_subdiagonal(h: &Mat, i: usize, scale: f64) -> bool {
+    let local = h.get(i, i).abs() + h.get(i + 1, i + 1).abs();
+    let tolerance = f64::EPSILON * local.max(scale);
+    h.get(i + 1, i).abs() <= tolerance
+}
 
-/// Reduce `A x = lambda B x` to a standard symmetric eigenproblem via the Cholesky factor of
-/// `B` (Golub & Van Loan §8.7.2, "Problem 1"): with `B = L L^T`, solve the standard problem for
-/// `C = L^-1 A L^-T`, then map eigenvectors back with `v = L^-T y`. `Err` reports that `B` is
-/// not positive definite (Cholesky's `info`).
-pub(in crate::python) fn eigh_generalized(
-    a: &Mat,
-    b: &Mat,
-    compute_vectors: bool,
-    charge_sweep: impl FnMut(u64) -> PyResult<()>,
-) -> PyResult<EighGeneralized> {
-    let l = match cholesky_lower(b) {
-        Ok(l) => l,
-        Err(info) => return Ok(Err(info)),
-    };
-    // C = L^-1 A L^-T, computed as two triangular solves.
-    let step = triangular_solve(&l, a, true, Trans::No, false).expect("L has a nonzero diagonal");
-    let step_t = triangular_solve(&l, &step.transpose(), true, Trans::No, false)
-        .expect("L has a nonzero diagonal");
-    let c = step_t.transpose();
-    let (values, vectors) = jacobi_eigh(&c, compute_vectors, charge_sweep)?;
-    let vectors = vectors.map(|y| {
-        triangular_solve(&l, &y, true, Trans::Transpose, false).expect("L has a nonzero diagonal")
-    });
-    Ok(Ok((values, vectors)))
+/// The (possibly complex-conjugate) eigenvalues of the `2x2` block at `h[k..k+2, k..k+2]`, by
+/// the quadratic formula applied to its trace and determinant.
+fn eigenvalues_2x2(h: &Mat, k: usize) -> (Cplx, Cplx) {
+    let a = h.get(k, k);
+    let b = h.get(k, k + 1);
+    let c = h.get(k + 1, k);
+    let d = h.get(k + 1, k + 1);
+    let trace = a + d;
+    let det = a * d - b * c;
+    let discriminant = trace * trace - 4.0 * det;
+    if discriminant >= 0.0 {
+        let root = discriminant.sqrt();
+        (
+            Cplx::real((trace + root) / 2.0),
+            Cplx::real((trace - root) / 2.0),
+        )
+    } else {
+        let root = (-discriminant).sqrt() / 2.0;
+        let re = trace / 2.0;
+        (Cplx::new(re, root), Cplx::new(re, -root))
+    }
+}
+
+/// Deflate upper Hessenberg `h` down to its real Schur form by explicit double-shift QR steps
+/// (see [`eig_general`]'s doc), returning the eigenvalues read off the resulting `1x1`/`2x2`
+/// diagonal blocks, or `None` if a block fails to deflate within its sweep budget.
+fn schur_eigenvalues(
+    mut h: Mat,
+    scale: f64,
+    charge: &mut impl FnMut(u64) -> PyResult<()>,
+) -> PyResult<Option<Vec<Cplx>>> {
+    let n = h.rows;
+    let mut values = vec![Cplx::real(0.0); n];
+    let mut active_end = n;
+    let max_sweeps = SCHUR_MAX_SWEEPS_PER_VALUE.saturating_mul(n).max(100);
+    let mut sweeps = 0usize;
+    let mut sweeps_without_progress = 0usize;
+    while active_end > 2 {
+        if negligible_subdiagonal(&h, active_end - 2, scale) {
+            values[active_end - 1] = Cplx::real(h.get(active_end - 1, active_end - 1));
+            active_end -= 1;
+            sweeps_without_progress = 0;
+            continue;
+        }
+        if active_end >= 3 && negligible_subdiagonal(&h, active_end - 3, scale) {
+            let (first, second) = eigenvalues_2x2(&h, active_end - 2);
+            values[active_end - 2] = first;
+            values[active_end - 1] = second;
+            active_end -= 2;
+            sweeps_without_progress = 0;
+            continue;
+        }
+        sweeps += 1;
+        sweeps_without_progress += 1;
+        if sweeps > max_sweeps {
+            return Ok(None);
+        }
+        charge(factor_cost(active_end as u64, active_end as u64) * 8)?;
+        let (mut s, mut t) = shift_from_trailing_block(&h, active_end);
+        // An ad hoc "exceptional shift" (Golub & Van Loan §7.5.4, following Wilkinson): if many
+        // sweeps have passed without a deflation, the ordinary shift has stagnated (a known
+        // failure mode of the plain algorithm), so perturb it using the subdiagonal's own
+        // magnitude to break the cycle.
+        if sweeps_without_progress > 0 && sweeps_without_progress.is_multiple_of(11) {
+            let kick = h.get(active_end - 1, active_end - 2).abs()
+                + h.get(active_end - 2, active_end.saturating_sub(3)).abs();
+            let d = h.get(active_end - 1, active_end - 1);
+            s = 2.0 * d;
+            t = d * d + kick * kick;
+        }
+        double_shift_step(&mut h, active_end, s, t);
+    }
+    if active_end == 2 {
+        let (first, second) = eigenvalues_2x2(&h, 0);
+        values[0] = first;
+        values[1] = second;
+    } else if active_end == 1 {
+        values[0] = Cplx::real(h.get(0, 0));
+    }
+    Ok(Some(values))
+}
+
+/// The trace and determinant of the trailing `2x2` block of the active `m x m` submatrix,
+/// `(s, t)`, used to form the double-shift polynomial `M = H^2 - s*H + t*I`. Real even when the
+/// block's own eigenvalues are complex, which is exactly what lets the double-shift QR step stay
+/// in real arithmetic while still converging toward complex-conjugate pairs.
+fn shift_from_trailing_block(h: &Mat, m: usize) -> (f64, f64) {
+    let a = h.get(m - 2, m - 2);
+    let b = h.get(m - 2, m - 1);
+    let c = h.get(m - 1, m - 2);
+    let d = h.get(m - 1, m - 1);
+    (a + d, a * d - b * c)
+}
+
+/// One explicit double-shift QR step (Golub & Van Loan §7.5), applied to `h`'s leading `m x m`
+/// active block and propagated to the trailing columns `m..n` that carry the rest of the
+/// (partially deflated) Schur form: form `M = H_active^2 - s*H_active + t*I`, factor `M = QR`,
+/// and update `H_active := Q^T H_active Q` (a similarity transform, so eigenvalues are
+/// preserved) and the trailing block `H[0:m, m:n] := Q^T H[0:m, m:n]` (so later deflation steps
+/// still see a consistent, if not literally Hessenberg, matrix above the active block).
+fn double_shift_step(h: &mut Mat, m: usize, s: f64, t: f64) {
+    let n = h.rows;
+    let active = extract_block(h, 0, 0, m, m);
+    let squared = active.matmul(&active);
+    let mut shifted = Mat::zeros(m, m);
+    for i in 0..m {
+        for j in 0..m {
+            let mut value = squared.get(i, j) - s * active.get(i, j);
+            if i == j {
+                value += t;
+            }
+            shifted.set(i, j, value);
+        }
+    }
+    let qr = householder_qr(&shifted);
+    let q = qr_explicit_q(&qr, true);
+    let updated = q.transpose().matmul(&active).matmul(&q);
+    write_block(h, &updated, 0, 0);
+    if m < n {
+        let trailing = extract_block(h, 0, m, m, n - m);
+        let updated_trailing = q.transpose().matmul(&trailing);
+        write_block(h, &updated_trailing, 0, m);
+    }
+}
+
+/// The `rows x cols` block of `m` starting at `(row0, col0)`.
+fn extract_block(m: &Mat, row0: usize, col0: usize, rows: usize, cols: usize) -> Mat {
+    let mut block = Mat::zeros(rows, cols);
+    for i in 0..rows {
+        for j in 0..cols {
+            block.set(i, j, m.get(row0 + i, col0 + j));
+        }
+    }
+    block
+}
+
+/// Write `block` into `m` starting at `(row0, col0)`.
+fn write_block(m: &mut Mat, block: &Mat, row0: usize, col0: usize) {
+    for i in 0..block.rows {
+        for j in 0..block.cols {
+            m.set(row0 + i, col0 + j, block.get(i, j));
+        }
+    }
+}
+
+/// A small complex LU factorization with partial pivoting, used only by [`inverse_iterate`]:
+/// `a`'s rows are permuted (recorded in `piv`, applied eagerly rather than deferred) and reduced
+/// to upper-triangular `u` with unit-diagonal multipliers packed below it, exactly as
+/// [`lu_factor`] does for real matrices. A pivot that rounds to exactly zero (only possible here
+/// if the shift in [`inverse_iterate`] lands exactly on a repeated eigenvalue's already-reduced
+/// column) is nudged to a tiny nonzero value rather than dividing by zero, since the caller only
+/// wants *a* solution vector dominated by the eigenspace, not a certified factorization.
+struct ComplexLu {
+    lu: Vec<Vec<Cplx>>,
+    piv: Vec<usize>,
+}
+
+fn complex_lu_factor(mut a: Vec<Vec<Cplx>>) -> ComplexLu {
+    let n = a.len();
+    let mut piv = Vec::with_capacity(n);
+    for k in 0..n {
+        let mut best = k;
+        let mut best_value = a[k][k].abs();
+        for (i, row) in a.iter().enumerate().skip(k + 1) {
+            let value = row[k].abs();
+            if value > best_value {
+                best_value = value;
+                best = i;
+            }
+        }
+        piv.push(best);
+        a.swap(k, best);
+        if a[k][k].abs() < 1e-300 {
+            a[k][k] = Cplx::real(1e-300);
+        }
+        let pivot = a[k][k];
+        // Elimination reads row `k` while writing row `i`, two different rows of the same `Vec`,
+        // so this clones the (short) pivot row rather than fighting the borrow checker over it.
+        let pivot_row = a[k].clone();
+        for row in a.iter_mut().skip(k + 1) {
+            let factor = row[k] / pivot;
+            row[k] = factor;
+            for (j, value) in row.iter_mut().enumerate().skip(k + 1) {
+                *value = *value - factor * pivot_row[j];
+            }
+        }
+    }
+    ComplexLu { lu: a, piv }
+}
+
+fn complex_lu_solve(factorization: &ComplexLu, b: &[Cplx]) -> Vec<Cplx> {
+    let n = b.len();
+    let mut x = b.to_vec();
+    for (k, &p) in factorization.piv.iter().enumerate() {
+        x.swap(k, p);
+    }
+    for i in 0..n {
+        let mut sum = x[i];
+        for (k, &value) in x.iter().enumerate().take(i) {
+            sum = sum - factorization.lu[i][k] * value;
+        }
+        x[i] = sum;
+    }
+    for i in (0..n).rev() {
+        let mut sum = x[i];
+        for (k, &value) in x.iter().enumerate().skip(i + 1) {
+            sum = sum - factorization.lu[i][k] * value;
+        }
+        x[i] = sum / factorization.lu[i][i];
+    }
+    x
+}
+
+/// The unit-norm eigenvector of real `a` for the (possibly complex) eigenvalue `lambda`, by a
+/// few steps of shifted inverse iteration in complex arithmetic: starting from an arbitrary
+/// vector, repeatedly solve `(A - lambda'*I) v_{k+1} = v_k` and renormalize, where `lambda'` is
+/// `lambda` nudged by a scale-relative epsilon so the shifted system is never exactly singular
+/// (inverse iteration is famously insensitive to how accurately that system is solved, so this
+/// nudge costs essentially nothing; see Golub & Van Loan §7.6.1). The result is rotated so its
+/// largest-magnitude entry is a positive real number (this module's real sign convention,
+/// generalized to a phase for a genuinely complex eigenvector).
+fn inverse_iterate(a: &Mat, lambda: Cplx, scale: f64) -> Vec<Cplx> {
+    let n = a.rows;
+    let epsilon = 1e-10 * scale;
+    let shifted = Cplx::new(lambda.re + epsilon, lambda.im + 0.5 * epsilon);
+    let mut matrix = vec![vec![Cplx::real(0.0); n]; n];
+    for (i, row) in matrix.iter_mut().enumerate() {
+        for (j, entry) in row.iter_mut().enumerate() {
+            *entry = Cplx::real(a.get(i, j));
+        }
+        row[i] = row[i] - shifted;
+    }
+    let factorization = complex_lu_factor(matrix);
+    let mut v = vec![Cplx::real(1.0); n];
+    for _ in 0..4 {
+        v = complex_lu_solve(&factorization, &v);
+        normalize_complex_vector(&mut v);
+    }
+    fix_complex_phase(&mut v);
+    v
+}
+
+fn normalize_complex_vector(v: &mut [Cplx]) {
+    let norm = v
+        .iter()
+        .map(|value| value.abs() * value.abs())
+        .sum::<f64>()
+        .sqrt();
+    if norm > 0.0 {
+        for value in v.iter_mut() {
+            *value = value.scale(1.0 / norm);
+        }
+    }
+}
+
+/// Rotate `v` (in place) so its largest-magnitude entry becomes a positive real number, the
+/// phase convention documented at the top of [`inverse_iterate`].
+fn fix_complex_phase(v: &mut [Cplx]) {
+    let mut best = 0usize;
+    let mut best_magnitude = 0.0f64;
+    for (i, value) in v.iter().enumerate() {
+        let magnitude = value.abs();
+        if magnitude > best_magnitude {
+            best_magnitude = magnitude;
+            best = i;
+        }
+    }
+    if best_magnitude == 0.0 {
+        return;
+    }
+    let unit = v[best].scale(1.0 / best_magnitude);
+    for value in v.iter_mut() {
+        *value = *value / unit;
+    }
 }
 
 #[cfg(test)]
@@ -1481,118 +1499,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn tridiagonal_solve_matches_direct_solve() {
-        let mut dl = vec![1.0, 1.0, 1.0];
-        let mut d = vec![4.0, 4.0, 4.0, 4.0];
-        let mut du = vec![1.0, 1.0, 1.0];
-        let mut b = mat(4, 1, &[1.0, 2.0, 3.0, 4.0]);
-        tridiagonal_solve(&mut dl, &mut d, &mut du, &mut b).unwrap();
-        let a = mat(
-            4,
-            4,
-            &[
-                4.0, 1.0, 0.0, 0.0, 1.0, 4.0, 1.0, 0.0, 0.0, 1.0, 4.0, 1.0, 0.0, 0.0, 1.0, 4.0,
-            ],
-        );
-        let f = lu_factor(&a);
-        let rhs = mat(4, 1, &[1.0, 2.0, 3.0, 4.0]);
-        let expected = lu_solve(&f.lu, &f.piv, &rhs, Trans::No);
-        for row in 0..4 {
-            assert_close(b.get(row, 0), expected.get(row, 0), 1e-10);
-        }
+    fn assert_close_cplx(a: Cplx, b: Cplx, tol: f64) {
+        assert_close(a.re, b.re, tol);
+        assert_close(a.im, b.im, tol);
     }
 
-    #[test]
-    fn tridiagonal_solve_takes_the_pivoting_branch_when_the_subdiagonal_dominates() {
-        // Row 0's diagonal (1) is smaller in magnitude than the subdiagonal entry below it (3),
-        // so elimination at i=0 must take the "pivot on the subdiagonal" branch. Built as a
-        // dense matrix too, so the tridiagonal path can be checked against `lu_factor`/`lu_solve`
-        // directly instead of a hand-derived expectation.
-        let dense = mat(3, 3, &[1.0, 2.0, 0.0, 3.0, 5.0, 4.0, 0.0, 1.0, 6.0]);
-        let mut dl = vec![3.0, 1.0];
-        let mut d = vec![1.0, 5.0, 6.0];
-        let mut du = vec![2.0, 4.0];
-        let mut b = mat(3, 1, &[1.0, 2.0, 3.0]);
-        tridiagonal_solve(&mut dl, &mut d, &mut du, &mut b).unwrap();
-
-        let f = lu_factor(&dense);
-        assert!(f.singular_at.is_none());
-        let expected = lu_solve(&f.lu, &f.piv, &mat(3, 1, &[1.0, 2.0, 3.0]), Trans::No);
-        for row in 0..3 {
-            assert_close(b.get(row, 0), expected.get(row, 0), 1e-10);
-        }
-    }
-
-    #[test]
-    fn tridiagonal_solve_takes_the_pivoting_branch_with_multiple_right_hand_sides() {
-        // Same matrix as above but with n=4 (so the pivot branch's fill-in entry `du2[0]` is
-        // exercised) and two right-hand-side columns.
-        let dense = mat(
-            4,
-            4,
-            &[
-                1.0, 2.0, 0.0, 0.0, 3.0, 5.0, 4.0, 0.0, 0.0, 1.0, 6.0, 1.0, 0.0, 0.0, 1.0, 3.0,
-            ],
-        );
-        let mut dl = vec![3.0, 1.0, 1.0];
-        let mut d = vec![1.0, 5.0, 6.0, 3.0];
-        let mut du = vec![2.0, 4.0, 1.0];
-        let mut b = mat(4, 2, &[1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]);
-        tridiagonal_solve(&mut dl, &mut d, &mut du, &mut b).unwrap();
-
-        let f = lu_factor(&dense);
-        assert!(f.singular_at.is_none());
-        let expected = lu_solve(
-            &f.lu,
-            &f.piv,
-            &mat(4, 2, &[1.0, 5.0, 2.0, 6.0, 3.0, 7.0, 4.0, 8.0]),
-            Trans::No,
-        );
-        for row in 0..4 {
-            for col in 0..2 {
-                assert_close(b.get(row, col), expected.get(row, col), 1e-9);
+    /// Every eigenpair `(lambda, v)` `eig_general` returns must satisfy `A v = lambda v`, in
+    /// complex arithmetic, regardless of the algorithm's internal deflation order.
+    fn assert_eigenpairs_satisfy_av_eq_lambda_v(a: &Mat, result: &EigResult) {
+        let vectors = result.vectors.as_ref().expect("vectors requested");
+        for (&lambda, v) in result.values.iter().zip(vectors) {
+            for row in 0..a.rows {
+                let mut sum = Cplx::real(0.0);
+                for (col, &value) in v.iter().enumerate() {
+                    sum = sum + Cplx::real(a.get(row, col)) * value;
+                }
+                assert_close_cplx(sum, lambda * v[row], 1e-8);
             }
         }
     }
 
     #[test]
-    fn eigh_generalized_solves_a_known_system() {
-        // A x = lambda B x with A, B symmetric and B positive definite. Checked by residual
-        // (`A v ~= lambda B v` for each eigenpair) rather than a hand-computed eigenvalue, and by
-        // ascending order, matching how `jacobi_eigh` itself is documented to sort.
-        let a = mat(2, 2, &[2.0, -1.0, -1.0, 2.0]);
-        let b = mat(2, 2, &[2.0, 0.0, 0.0, 1.0]);
-        let (values, vectors) = eigh_generalized(&a, &b, true, |_| Ok(())).unwrap().unwrap();
-        let vectors = vectors.unwrap();
-        assert!(values[0] <= values[1]);
-        for (col, &value) in values.iter().enumerate() {
-            let column: Vec<f64> = (0..2).map(|row| vectors.get(row, col)).collect();
-            let v = Mat::from_row_major(2, 1, column);
-            let av = a.matmul(&v);
-            let bv = b.matmul(&v);
-            for row in 0..2 {
-                assert_close(av.get(row, 0), value * bv.get(row, 0), 1e-10);
-            }
+    fn eig_general_finds_real_eigenvalues_of_a_diagonal_matrix() {
+        let a = mat(2, 2, &[2.0, 0.0, 0.0, 3.0]);
+        let result = eig_general(&a, true, |_| Ok(())).unwrap().unwrap();
+        let mut values: Vec<f64> = result.values.iter().map(|v| v.re).collect();
+        values.sort_by(|x, y| x.partial_cmp(y).unwrap());
+        assert_close(values[0], 2.0, 1e-10);
+        assert_close(values[1], 3.0, 1e-10);
+        assert!(result.values.iter().all(|v| v.im.abs() < 1e-10));
+        assert_eigenpairs_satisfy_av_eq_lambda_v(&a, &result);
+    }
+
+    #[test]
+    fn eig_general_finds_complex_conjugate_eigenvalues_of_a_rotation() {
+        let theta: f64 = 0.7;
+        let a = mat(2, 2, &[theta.cos(), -theta.sin(), theta.sin(), theta.cos()]);
+        let result = eig_general(&a, true, |_| Ok(())).unwrap().unwrap();
+        let mut values = result.values.clone();
+        values.sort_by(|x, y| x.im.partial_cmp(&y.im).unwrap());
+        assert_close_cplx(values[0], Cplx::new(theta.cos(), -theta.sin()), 1e-10);
+        assert_close_cplx(values[1], Cplx::new(theta.cos(), theta.sin()), 1e-10);
+        assert_eigenpairs_satisfy_av_eq_lambda_v(&a, &result);
+    }
+
+    #[test]
+    fn eig_general_handles_a_nontrivial_three_by_three_matrix() {
+        let a = mat(3, 3, &[2.0, -1.0, 0.0, 1.0, 3.0, 2.0, 0.0, 1.0, 4.0]);
+        let result = eig_general(&a, true, |_| Ok(())).unwrap().unwrap();
+        assert_eq!(result.values.len(), 3);
+        assert_eigenpairs_satisfy_av_eq_lambda_v(&a, &result);
+        for v in result.vectors.as_ref().unwrap() {
+            let norm = v.iter().map(|c| c.abs() * c.abs()).sum::<f64>().sqrt();
+            assert_close(norm, 1.0, 1e-10);
         }
     }
 
     #[test]
-    fn expm_of_zero_is_identity() {
-        let a = Mat::zeros(2, 2);
-        let result = expm(&a);
-        assert_close(result.get(0, 0), 1.0, 1e-14);
-        assert_close(result.get(1, 1), 1.0, 1e-14);
-        assert_close(result.get(0, 1), 0.0, 1e-14);
+    fn eig_general_repeated_eigenvalue_of_a_defective_matrix() {
+        // A Jordan block: eigenvalue 2 with algebraic multiplicity 2 but only one independent
+        // eigenvector, so both computed eigenvectors must point the same direction (up to sign).
+        let a = mat(2, 2, &[2.0, 1.0, 0.0, 2.0]);
+        let result = eig_general(&a, true, |_| Ok(())).unwrap().unwrap();
+        for value in &result.values {
+            assert_close_cplx(*value, Cplx::real(2.0), 1e-9);
+        }
+        let vectors = result.vectors.unwrap();
+        let dot = (vectors[0][0] * vectors[1][0] + vectors[0][1] * vectors[1][1]).abs();
+        assert_close(dot, 1.0, 1e-6);
     }
 
     #[test]
-    fn expm_of_diagonal_matches_scalar_exponential() {
-        let mut a = Mat::zeros(2, 2);
-        a.set(0, 0, 1.0);
-        a.set(1, 1, 2.0);
-        let result = expm(&a);
-        assert_close(result.get(0, 0), std::f64::consts::E, 1e-12);
-        assert_close(result.get(1, 1), std::f64::consts::E.powi(2), 1e-12);
+    fn eig_general_charges_before_hessenberg_reduction_and_each_sweep() {
+        let a = mat(2, 2, &[0.0, -1.0, 1.0, 0.0]);
+        let mut charges = Vec::new();
+        let result = eig_general(&a, false, |cost| {
+            charges.push(cost);
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert!(!charges.is_empty());
+        assert_eq!(result.values.len(), 2);
     }
 }
