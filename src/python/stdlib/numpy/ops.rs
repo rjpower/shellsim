@@ -5,12 +5,12 @@
 //!
 //! - Integers wrap. Division or remainder by zero gives 0 and raises the `divide` flag, and
 //!   `MIN // -1` wraps with the `overflow` flag. Wrapping add, subtract, and multiply also set
-//!   `overflow`; array loops ignore it and scalar operations report it, as NumPy does.
+//!   `overflow`; array loops ignore it, and scalar operations report it.
 //! - Floats are IEEE. A finite nonzero value divided by zero sets `divide`; an operation that
 //!   turns non-NaN inputs into NaN sets `invalid`; one that turns finite inputs into infinity
 //!   sets `overflow`.
 //! - `float16` computes in `f32` and rounds once when stored.
-//! - Complex values order lexicographically, as NumPy sorts and compares them.
+//! - Complex values order lexicographically: real part first, then imaginary part.
 
 use std::cmp::Ordering;
 
@@ -67,7 +67,7 @@ pub(in crate::python) trait Numeric: Element {
     }
 
     /// `np.maximum`: propagates NaN. Equal operands give the second one, so
-    /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`, as in NumPy.
+    /// `maximum(-0.0, 0.0)` is `0.0` and `maximum(0.0, -0.0)` is `-0.0`.
     fn maximum(self, other: Self) -> Self {
         if self.is_nan() {
             return self;
@@ -565,7 +565,7 @@ fn remainder_f64(left: f64, right: f64) -> f64 {
 }
 
 /// Binary arithmetic at a float type's working precision: `f32` for half and single, `f64`
-/// for double, as NumPy's loops compute.
+/// for double.
 trait RealBinary: Sized {
     type Wide;
 
@@ -787,33 +787,29 @@ impl ComplexParts for C128 {
     }
 }
 
-/// `a / b` for complex values, as `np.divide` gives it for `complex128`.
+/// `a / b` for complex values.
 ///
 /// Smith's algorithm (1962): scale by the ratio of the divisor's smaller component to its
 /// larger one, so every division stays within a factor of the divisor's own magnitude instead
 /// of squaring both components the way the textbook `(ac+bd)/(c²+d²)` formula does, which
 /// overflows for a divisor whose `|c|` or `|d|` is past roughly 1e154 even when the true
 /// quotient is representable. A zero divisor (either sign of either zero) divides by a literal
-/// `+0.0` rather than by `b` itself: black-box testing against the reference interpreter showed
-/// all four sign combinations of a `0.0 + 0.0i` divisor give an identical result, matching `a /
-/// +0.0` component-wise. [`Numeric::divide`] raises the floating-point flags for that zero-
-/// divisor case (component-wise: `NaN / 0` raises none, a finite nonzero numerator component
-/// raises `divide`, and `0 / 0` raises `invalid`); flags for every other divisor are inferred
-/// generically by comparing this function's result against its operands.
+/// `+0.0` rather than by `b` itself, so all four sign combinations of a `0.0 + 0.0i` divisor
+/// give one consistent result regardless of their zeros' signs. [`Numeric::divide`] raises the
+/// floating-point flags for that zero-divisor case (component-wise: `NaN / 0` raises none, a
+/// finite nonzero numerator component raises `divide`, and `0 / 0` raises `invalid`); flags for
+/// every other divisor are inferred generically by comparing this function's result against its
+/// operands.
 ///
-/// This does not special-case divisors whose magnitude is within about 1e8 of `f64::MAX`: an
-/// intermediate `c + d*r` can overflow to infinity there even though the quotient is finite, a
-/// limitation confirmed to match NumPy's own `complex128` division bit-for-bit on such inputs
-/// (for example `(1.7e308+1.7e308i) / (1.7e308+1.7e308i)` gives `NaN+0i` in both), though NumPy
-/// additionally raises an `overflow` flag there that this module's generic flag inference cannot
-/// see, since the final result is finite.
+/// This does not special-case divisors whose magnitude is within about 1e8 of `f64::MAX`. That
+/// is a known limitation: an intermediate `c + d*r` can overflow to infinity there even though
+/// the true quotient is finite, so a divisor that large can give `NaN` instead of the finite
+/// quotient (this module's generic flag inference also cannot raise `overflow` for that case,
+/// since the final result it sees is not finite either).
 ///
 /// Scales by `1.0 / denom` once and multiplies both components, rather than dividing each
-/// component by `denom` separately: the two roundings are not equivalent (a division and a
-/// reciprocal-then-multiply can differ in their last bit), and matching NumPy's own last bit
-/// requires the multiply form — confirmed black-box, bit-for-bit against `hex()`, on
-/// `(-1 - 1.2246467991473532e-16j) / sqrt(2)`, where dividing each component by `denom` directly
-/// gives an imaginary part one ULP away from NumPy's.
+/// component by `denom` separately: the two are mathematically equivalent but round differently
+/// in the last bit, and this module always picks the multiply form for consistency.
 pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f64) {
     let (a_re, a_im) = a;
     let (b_re, b_im) = b;
@@ -833,14 +829,14 @@ pub(in crate::python) fn complex_divide(a: (f64, f64), b: (f64, f64)) -> (f64, f
 
 /// `1 / (x, y)` by Smith's algorithm specialized for a numerator of exactly `1 + 0i`.
 ///
-/// This is not simply [`complex_divide`] called with `a = (1.0, 0.0)`: NumPy's `reciprocal` and
-/// its ordinary division disagree on the sign of a resulting zero at the same inputs (black-box
-/// testing found `np.reciprocal(inf+0j)` is `0-0i` but `1/(inf+0j)` computed through division is
-/// `0+0i`). The difference traces to which IEEE 754 operation produces the imaginary part: this
-/// function negates `r` directly, where general division subtracts it from `a_im = 0.0`, and
-/// `-(+0.0) == -0.0` while `0.0 - (+0.0) == +0.0`. Like [`complex_divide`], it scales by `1.0 /
-/// denom` once and multiplies rather than dividing each component by `denom` separately, to
-/// match NumPy's last bit.
+/// This is not simply [`complex_divide`] called with `a = (1.0, 0.0)`: dividing `1 + 0i` by a
+/// value and taking its reciprocal directly can give a resulting zero a different sign, because
+/// they reach it through different IEEE 754 operations. This function negates `r` directly,
+/// where general division subtracts it from `a_im = 0.0`, and `-(+0.0) == -0.0` while `0.0 -
+/// (+0.0) == +0.0`, so `reciprocal(inf+0j)` and `1/(inf+0j)` can disagree on that sign unless
+/// `reciprocal` computes it this way. Like [`complex_divide`], it scales by `1.0 / denom` once
+/// and multiplies rather than dividing each component by `denom` separately, for the same
+/// last-bit consistency.
 fn smith_reciprocal(x: f64, y: f64) -> (f64, f64, f64) {
     if x.abs() >= y.abs() {
         let r = y / x;
@@ -855,7 +851,7 @@ fn smith_reciprocal(x: f64, y: f64) -> (f64, f64, f64) {
     }
 }
 
-/// `np.reciprocal` of a complex value, raising the floating-point flags NumPy reports for it.
+/// `np.reciprocal` of a complex value.
 ///
 /// Unlike [`complex_divide`] and [`complex_power`], whose callers infer flags by comparing the
 /// returned value against the original operands, `complex_reciprocal` sets its own: `invalid`
@@ -890,9 +886,9 @@ fn complex_exp((re, im): (f64, f64)) -> (f64, f64) {
 ///
 /// Seeds the accumulator with `base` itself at `n`'s lowest set bit instead of starting from the
 /// multiplicative identity `1 + 0i`: identity-seeded squaring computes one extra `(1+0i) *
-/// base`, which is enough to flip a resulting zero's sign. NumPy's own complex integer power
-/// does not make that extra multiplication either — confirmed against `(1 - 0i) ** 2` and `(1 -
-/// 0i) ** 3`, both of which keep the negative sign on their zero imaginary part.
+/// base`, which is enough to flip a resulting zero's sign, changing `(1 - 0i) ** 2` and `(1 -
+/// 0i) ** 3` from a negative zero imaginary part to a positive one. Skipping that extra
+/// multiplication keeps the sign of a zero component predictable.
 fn integer_power(base: (f64, f64), n: u64) -> (f64, f64) {
     let mut result = None;
     let mut square = base;
@@ -912,13 +908,12 @@ fn integer_power(base: (f64, f64), n: u64) -> (f64, f64) {
     result.unwrap_or((1.0, 0.0))
 }
 
-/// `a ** b` for complex values, as `np.power` gives it for `complex128`.
+/// `a ** b` for complex values (`np.power` for `complex128`).
 ///
-/// `0 ** b` is a pole or a removable singularity depending on `b`'s real part, confirmed
-/// black-box against the reference interpreter across `b in {0, positive, negative,
-/// positive-real complex, zero-real complex}`: `0 ** 0` is `1`, `0 ** b` is `0` when `b`'s real
-/// part is positive, and `0 ** b` is `NaN + NaNi` (with the generic flag inference below raising
-/// `invalid`) otherwise, which includes a purely imaginary `b`.
+/// `0 ** b` is a pole or a removable singularity depending on `b`'s real part: `0 ** 0` is `1`,
+/// `0 ** b` is `0` when `b`'s real part is positive, and `0 ** b` is `NaN + NaNi` (with the
+/// generic flag inference below raising `invalid`) otherwise, which includes a purely imaginary
+/// `b`.
 ///
 /// A `b` with an exactly integer value and zero imaginary part uses [`integer_power`] (inverted
 /// through [`smith_reciprocal`] for negative `b`), which is exact where the general formula
@@ -990,12 +985,10 @@ macro_rules! complex {
             fn divide(self, other: Self, flags: &mut FpFlags) -> Self {
                 let (b_real, b_imag) = other.parts();
                 if b_real == 0.0 && b_imag == 0.0 {
-                    // NumPy sets a zero-divisor's flags per component, independent of the
-                    // other component's NaN-ness: confirmed black-box, `(nan+1j) / (0+0j)`
-                    // still warns "divide by zero" from its finite `1j` alone, and `(inf+0j) /
-                    // (0+0j)` warns only "invalid" (an already-infinite component dividing by
-                    // zero raises neither flag; only a finite-nonzero component raises
-                    // `divide`, and an exact `0` raises `invalid`).
+                    // A zero divisor sets flags per component, independent of the other
+                    // component's NaN-ness: an already-infinite or NaN component dividing by
+                    // zero raises neither flag, a finite nonzero component raises `divide`, and
+                    // an exact `0` component raises `invalid`.
                     let (a_real, a_imag) = self.parts();
                     let mut classify = |component: f64| {
                         if component.is_nan() || component.is_infinite() {
@@ -1037,7 +1030,7 @@ macro_rules! complex {
                 Self::from_parts(real.hypot(imag), 0.0)
             }
             fn sign(self) -> Self {
-                // NumPy 2: z / |z|, and 0 for 0.
+                // `np.sign` for complex values: `z / |z|`, or `0` when `z` is `0`.
                 let (real, imag) = self.parts();
                 let magnitude = real.hypot(imag);
                 if magnitude == 0.0 {

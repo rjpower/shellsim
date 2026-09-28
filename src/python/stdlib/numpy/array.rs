@@ -581,8 +581,8 @@ pub(in crate::python) fn array_from_elements<T: super::element::Element>(
     )
 }
 
-/// A new Fortran-ordered array of `shape` holding `values` in column-major order, as f2py
-/// returns the arrays a Fortran routine writes.
+/// A new Fortran-ordered array of `shape` holding `values` in column-major order, the layout a
+/// LAPACK-backed routine computes its result in.
 pub(in crate::python) fn fortran_array_from_elements<T: super::element::Element>(
     runtime: &mut dyn PyRuntime,
     dtype: DType,

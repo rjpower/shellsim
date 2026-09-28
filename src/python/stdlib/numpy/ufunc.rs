@@ -202,8 +202,7 @@ pub(in crate::python) enum ObjectLoop {
     Square,
     /// `1 / x` (`Py_reciprocal`).
     Reciprocal,
-    /// The first operand if it compares `>=` to the second, else the second
-    /// (`npy_ObjectMax`).
+    /// The first operand if it compares `>=` to the second, else the second.
     Max,
     /// The first operand if it compares `<=` to the second, else the second.
     Min,
@@ -215,7 +214,7 @@ pub(in crate::python) enum ObjectLoop {
     Not,
     /// `-1`, `1` or `0` by comparison with `0`.
     Sign,
-    /// A `math` module function, as `npy_ObjectFloor` calls `math.floor`.
+    /// A `math` module function, such as `math.floor` for `floor`'s object loop.
     Math(&'static str),
     /// `x.name()` or `x.name(y)`, for the ufunc's `name`.
     Method,
