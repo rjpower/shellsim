@@ -584,6 +584,10 @@ impl PyRuntime for Vm<'_> {
         super::number::view(&self.state.heap, value)
     }
 
+    fn physical_compare(&self, left: &Value, right: &Value) -> PyResult<protocol::Comparison> {
+        protocol::compare(&self.state.heap, left, right).map_err(PyError::runtime_error)
+    }
+
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<Value> {
         self.allocate_object(Object::Complex { real, imag })
             .map_err(PyError::resource_error)

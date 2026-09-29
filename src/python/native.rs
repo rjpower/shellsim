@@ -656,6 +656,12 @@ pub(super) trait PyRuntime {
     fn is_not_implemented(&self, value: &PyValue) -> bool;
     /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
     fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
+    /// Compare builtin payloads without entering Python rich-comparison slots again.
+    fn physical_compare(
+        &self,
+        left: &PyValue,
+        right: &PyValue,
+    ) -> PyResult<super::protocol::Comparison>;
     /// Allocate a builtin `complex` in the metered object arena.
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<PyValue>;
     /// Return an exact decimal rendering for any Python integer representation.

@@ -561,12 +561,28 @@ def test_numeric_and_string_equality_slots_decline_other_types():
     assert bool.__bool__(True) is True
     assert (2.5).__bool__() is True
     assert (0j).__bool__() is False
+    assert (1).__lt__(1.0) is NotImplemented
+    assert (1.0).__lt__(2) is True
+    assert (2.0).__ge__(2) is True
+    assert float("nan").__lt__(1.0) is False
     assert "a".__eq__("a") is True
     assert "a".__eq__(1) is NotImplemented
     assert "a".__ne__("b") is True
     assert "a".__lt__("b") is True
     assert "a".__le__("a") is True
     assert "b".__gt__("a") is True
+
+
+def test_compound_hash_descriptors_use_element_hashes():
+    for value in ((1, 2), frozenset({1, 2}), range(3), slice(1, 2)):
+        assert value.__hash__() == hash(value), type(value).__name__
+
+    class Key:
+        def __hash__(self):
+            return 9
+
+    pair = (Key(),)
+    assert pair.__hash__() == hash(pair)
     assert "b".__ge__("b") is True
     assert "a".__lt__(1) is NotImplemented
 

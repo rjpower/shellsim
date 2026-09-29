@@ -250,6 +250,8 @@ pub enum SlotValue {
     VmRepr,
     /// Enum member text needs its defining class, which is stored in the VM's heap.
     VmEnumString,
+    /// Hash compound values through the VM so their elements use Python's hash protocol.
+    VmHash,
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
@@ -1399,6 +1401,9 @@ fn install_builtin_slots(types: &mut [PyType]) {
     types[BuiltinType::None as usize].slots.bool_ =
         Some(unary(super::stdlib::core::slot_none_bool));
     types[BuiltinType::None as usize].slots.hash = Some(unary(super::stdlib::core::slot_none_hash));
+    for builtin in [BuiltinType::Tuple, BuiltinType::Range, BuiltinType::Slice] {
+        types[builtin as usize].slots.hash = Some(SlotValue::VmHash);
+    }
     for builtin in [
         BuiltinType::None,
         BuiltinType::Ellipsis,
@@ -1492,6 +1497,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
         slots.not_equal = Some(intrinsic(super::number::slot_not_equal));
         slots.hash = Some(unary(super::number::slot_hash));
         slots.bool_ = Some(unary(super::number::slot_bool));
+        slots.less_than = Some(intrinsic(super::number::slot_less));
+        slots.less_equal = Some(intrinsic(super::number::slot_less_equal));
+        slots.greater_than = Some(intrinsic(super::number::slot_greater));
+        slots.greater_equal = Some(intrinsic(super::number::slot_greater_equal));
     }
     let slots = &mut types[BuiltinType::String as usize].slots;
     slots.equal = Some(intrinsic(super::stdlib::core::slot_string_equal));
@@ -1635,6 +1644,7 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.greater_equal = Some(intrinsic(super::stdlib::core::slot_set_greater_equal));
 
     types[BuiltinType::FrozenSet as usize].slots = types[BuiltinType::Set as usize].slots.clone();
+    types[BuiltinType::FrozenSet as usize].slots.hash = Some(SlotValue::VmHash);
 
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
@@ -1797,6 +1807,7 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                     | SlotValue::NativeUnary(_)
                     | SlotValue::VmRepr
                     | SlotValue::VmEnumString
+                    | SlotValue::VmHash
             )
         ) {
             ty.attributes.entry(name.into()).or_insert(Value::Native(

@@ -3,6 +3,8 @@
 //! Immediate integers, heap-backed arbitrary-precision integers, and IEEE-754 doubles all cross
 //! the native-module boundary through this owned, representation-independent view.
 
+use std::cmp::Ordering;
+
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
@@ -81,15 +83,72 @@ fn numeric_slot_equality(runtime: &dyn PyRuntime, left: PyValue, right: PyValue)
     let (Some(left), Some(right)) = (runtime.number(&left), runtime.number(&right)) else {
         return None;
     };
-    let accepts_right = match left {
+    numeric_slot_accepts(left, right).then(|| numbers_equal(left, right))
+}
+
+fn numeric_slot_accepts(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
+    match left {
         NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_) => matches!(
             right,
             NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_)
         ),
         NumberRef::Float(_) => !matches!(right, NumberRef::Complex(..)),
         NumberRef::Complex(..) => true,
+    }
+}
+
+fn slot_numeric_order(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    accepted: &[Ordering],
+) -> PyResult<Option<PyValue>> {
+    let (Some(left_number), Some(right_number)) = (runtime.number(&left), runtime.number(&right))
+    else {
+        return Ok(None);
     };
-    accepts_right.then(|| numbers_equal(left, right))
+    if !numeric_slot_accepts(left_number, right_number) {
+        return Ok(None);
+    }
+    match runtime.physical_compare(&left, &right)? {
+        super::protocol::Comparison::Ordered(ordering) => {
+            Ok(Some(PyValue::Bool(accepted.contains(&ordering))))
+        }
+        super::protocol::Comparison::Unordered => Ok(Some(PyValue::Bool(false))),
+        super::protocol::Comparison::Unsupported => Ok(None),
+    }
+}
+
+pub(super) fn slot_less(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Less])
+}
+
+pub(super) fn slot_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Less, Ordering::Equal])
+}
+
+pub(super) fn slot_greater(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Greater])
+}
+
+pub(super) fn slot_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Greater, Ordering::Equal])
 }
 
 /// Share the hash algorithm used by `hash(value)` and numeric `__hash__` wrappers.

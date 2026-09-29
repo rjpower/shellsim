@@ -2941,6 +2941,14 @@ impl Vm<'_> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
+            SlotValue::VmHash => {
+                if !arguments.is_empty() {
+                    return Err("hash slot received arguments".into());
+                }
+                let receiver = self.builtin_view(*receiver)?;
+                let hash = self.hash_value(&receiver)?;
+                return Ok(Some(Value::Int(hash)));
+            }
             SlotValue::VmEnumString => {
                 if !arguments.is_empty() {
                     return Err("enum string slot received arguments".into());
@@ -3057,10 +3065,15 @@ impl Vm<'_> {
         if matches!(implementation, SlotValue::VmEnumString) {
             return self.enum_member_string(receiver);
         }
+        if matches!(implementation, SlotValue::VmHash) {
+            let receiver = self.builtin_view(receiver)?;
+            return self.hash_value(&receiver).map(Value::Int);
+        }
         let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
             SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
             SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
+            SlotValue::VmHash => unreachable!("handled before builtin payload view"),
             SlotValue::NativeMethod(method) => {
                 return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
                     .map_err(|error| self.record_native_error(error));
