@@ -133,6 +133,19 @@ def test_norm_of_int_vector_is_float():
     assert result.dtype == np.float64
 
 
+def test_complex_norm_uses_both_components():
+    vector = np.array([3 + 4j, -5j])
+    assert_allclose(np.linalg.norm(vector), np.sqrt(50.0))
+    assert_allclose(np.linalg.norm(vector, ord=1), 10.0)
+    matrix = np.array([[3 + 4j, 0], [0, 1j]], dtype=np.complex64)
+    result = np.linalg.norm(matrix)
+    assert result.dtype == np.float32
+    assert_allclose(result, np.sqrt(26.0), rtol=1e-6)
+    assert_allclose(np.linalg.norm(matrix, axis=0), [5.0, 1.0])
+    assert_allclose(np.linalg.norm(matrix, ord=2), 5.0, atol=1e-12)
+    assert_allclose(np.linalg.norm(matrix, ord="nuc"), 6.0, atol=1e-12)
+
+
 def test_inv_times_matrix_is_identity():
     a = general_matrix()
     inverse = np.linalg.inv(a)
@@ -142,6 +155,29 @@ def test_inv_times_matrix_is_identity():
 
 def test_inv_of_simple_matrix():
     assert_allclose(np.linalg.inv(np.array([[4.0, 7.0], [2.0, 6.0]])), [[0.6, -0.7], [-0.2, 0.4]], atol=1e-15)
+
+
+def test_complex_inverse_and_solve():
+    a = np.array([[2 + 1j, 1 - 2j], [1j, 3 - 1j]])
+    inverse = np.linalg.inv(a)
+    assert_allclose(a @ inverse, np.eye(2), atol=1e-12)
+    b = np.array([1 + 2j, 3 - 1j])
+    assert_allclose(a @ np.linalg.solve(a, b), b, atol=1e-12)
+    assert_allclose(a @ np.linalg.solve(a, np.eye(2, dtype=complex)), np.eye(2), atol=1e-12)
+    stacked = np.array([a, 2 * a])
+    assert_allclose(stacked @ np.linalg.inv(stacked), np.broadcast_to(np.eye(2), (2, 2, 2)), atol=1e-12)
+    b_stacked = np.array([b, 2 * b])
+    result = np.linalg.solve(stacked, b_stacked[..., np.newaxis])
+    assert_allclose(stacked @ result, b_stacked[..., np.newaxis], atol=1e-12)
+    single = np.linalg.solve(a.astype(np.complex64), b.astype(np.complex64))
+    assert single.dtype == np.complex64
+
+
+def test_complex_linalg_rejects_vectors_where_matrices_are_required():
+    vector = np.array([1 + 1j, 2j])
+    for operation in (np.linalg.inv, np.linalg.det, np.linalg.cholesky, np.linalg.eigh, np.linalg.eig, np.linalg.svd, np.linalg.qr):
+        with pytest.raises(np.linalg.LinAlgError):
+            operation(vector)
 
 
 def test_inv_singular_raises_linalg_error():
@@ -169,6 +205,14 @@ def test_solve_vector_and_matrix_right_hand_sides():
     assert_allclose(a @ xs, rhs, atol=1e-14)
 
 
+def test_solve_batched_matrix_uses_matrix_core_dimensions():
+    a = np.array([[[2.0, 0.0], [0.0, 3.0]], [[4.0, 0.0], [0.0, 5.0]]])
+    rhs = np.eye(2)
+    result = np.linalg.solve(a, rhs)
+    assert result.shape == (2, 2, 2)
+    assert_allclose(a @ result, np.broadcast_to(rhs, (2, 2, 2)), atol=1e-14)
+
+
 def test_solve_singular_raises_linalg_error():
     with pytest.raises(np.linalg.LinAlgError):
         np.linalg.solve(np.array([[1.0, 2.0], [2.0, 4.0]]), np.array([1.0, 2.0]))
@@ -184,6 +228,19 @@ def test_det():
 def test_det_batched():
     stack = np.array([[[2.0, 0.0], [0.0, 3.0]], [[1.0, 2.0], [3.0, 4.0]]])
     assert_allclose(np.linalg.det(stack), [6.0, -2.0], rtol=1e-14)
+
+
+def test_complex_det_and_slogdet():
+    a = np.array([[2 + 1j, 1 - 2j], [1j, 3 - 1j]])
+    expected = a[0, 0] * a[1, 1] - a[0, 1] * a[1, 0]
+    assert_allclose(np.linalg.det(a), expected, atol=1e-12)
+    sign, logabs = np.linalg.slogdet(a)
+    assert_allclose(sign * np.exp(logabs), expected, atol=1e-12)
+    assert_allclose(np.abs(sign), 1.0, atol=1e-12)
+    singular = np.array([[1 + 1j, 2 + 2j], [2 + 2j, 4 + 4j]])
+    sign, logabs = np.linalg.slogdet(singular)
+    assert sign == 0
+    assert logabs == -np.inf
 
 
 def test_slogdet():
@@ -263,6 +320,18 @@ def test_pinv_of_invertible_matrix_is_inverse():
     assert_allclose(np.linalg.pinv(a), np.linalg.inv(a), atol=1e-12)
 
 
+def test_complex_pinv_and_lstsq():
+    a = np.array([[1 + 1j, 2], [0, 1 - 1j], [2j, 3]])
+    pseudo = np.linalg.pinv(a)
+    assert_allclose(a @ pseudo @ a, a, atol=1e-10)
+    b = np.array([1j, 2, 3 + 1j])
+    x, residuals, rank, values = np.linalg.lstsq(a, b)
+    assert rank == 2
+    assert values.shape == (2,)
+    assert_allclose(x, pseudo @ b, atol=1e-10)
+    assert_allclose(residuals, [np.sum(np.abs(b - a @ x) ** 2)], atol=1e-10)
+
+
 def test_qr_reconstructs_with_orthonormal_q():
     a = np.array([[12.0, -51.0, 4.0], [6.0, 167.0, -68.0], [-4.0, 24.0, -41.0]])
     q, r = np.linalg.qr(a)
@@ -283,6 +352,19 @@ def test_qr_reduced_shapes_for_tall_matrix():
     assert r[1, 0] == 0.0
 
 
+def test_complex_qr_reconstructs_and_is_unitary():
+    a = np.array([[1 + 1j, 2], [0, 1 - 1j], [2j, 3]])
+    q, r = np.linalg.qr(a)
+    assert q.shape == (3, 2)
+    assert_allclose(q.conj().T @ q, np.eye(2), atol=1e-12)
+    assert_allclose(q @ r, a, atol=1e-12)
+    q_full, r_full = np.linalg.qr(a, mode="complete")
+    assert q_full.shape == (3, 3)
+    assert_allclose(q_full.conj().T @ q_full, np.eye(3), atol=1e-12)
+    assert_allclose(q_full @ r_full, a, atol=1e-12)
+    assert_allclose(np.linalg.qr(a, mode="r"), r, atol=1e-12)
+
+
 def test_cholesky_is_lower_triangular_factor():
     a = spd_matrix()
     lower = np.linalg.cholesky(a)
@@ -290,6 +372,15 @@ def test_cholesky_is_lower_triangular_factor():
     assert np.all(np.diag(lower) > 0)
     assert_allclose(lower @ lower.T, a, atol=1e-12)
     assert_allclose(lower[0, 0], 2.0, rtol=1e-15)
+
+
+def test_complex_cholesky_reconstructs_hermitian_matrix():
+    a = np.array([[5.0, 1 - 2j], [1 + 2j, 4.0]])
+    lower = np.linalg.cholesky(a)
+    assert_allclose(lower @ lower.conj().T, a, atol=1e-12)
+    assert_array_equal(np.triu(lower, 1), np.zeros((2, 2)))
+    with pytest.raises(np.linalg.LinAlgError):
+        np.linalg.cholesky(np.array([[1.0, 2j], [-2j, 1.0]]))
 
 
 def test_cholesky_rejects_non_positive_definite():
@@ -323,6 +414,25 @@ def test_eigh_diagonal_matrix_sorts_eigenvalues():
     assert_allclose(np.abs(v), [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], atol=1e-12)
 
 
+def test_complex_hermitian_eigh_and_eigvalsh():
+    a = np.array([[2.0, 1 - 2j], [1 + 2j, 4.0]])
+    w, v = np.linalg.eigh(a)
+    assert w.dtype == np.float64
+    assert v.dtype == np.complex128
+    assert_allclose(a @ v, v * w, atol=1e-12)
+    assert_allclose(v.conj().T @ v, np.eye(2), atol=1e-12)
+    assert_allclose(w, np.linalg.eigvalsh(a), atol=1e-12)
+    upper = np.array([[2.0, 1 - 2j], [999.0, 4.0]], dtype=complex)
+    assert_allclose(np.linalg.eigvalsh(upper, UPLO="U"), w, atol=1e-12)
+
+
+def test_complex_hermitian_repeated_eigenvalues():
+    a = np.eye(3, dtype=complex) * (2 + 0j)
+    w, v = np.linalg.eigh(a)
+    assert_array_equal(w, [2.0, 2.0, 2.0])
+    assert_allclose(v.conj().T @ v, np.eye(3), atol=1e-12)
+
+
 def sorted_eigenvalues(w):
     # Eigenvalue order is not part of the contract, so comparisons sort by (real, imag) first.
     order = np.lexsort((w.imag, w.real))
@@ -347,6 +457,43 @@ def test_eig_rotation_matrix_has_complex_conjugate_pair():
     w, v = np.linalg.eig(a)
     assert_allclose(sorted_eigenvalues(w), sorted_eigenvalues(np.array([1j, -1j])), atol=1e-12)
     assert_allclose(a @ v, v * w, atol=1e-12)
+
+
+def test_complex_eig_and_eigvals_satisfy_eigenvector_equation():
+    a = np.array([[1 + 2j, 1 - 1j], [0, 3 - 1j]])
+    w, v = np.linalg.eig(a)
+    assert_allclose(a @ v, v * w, atol=1e-10)
+    assert_allclose(sorted_eigenvalues(w), sorted_eigenvalues(np.array([1 + 2j, 3 - 1j])), atol=1e-10)
+    assert_allclose(sorted_eigenvalues(np.linalg.eigvals(a)), sorted_eigenvalues(w), atol=1e-10)
+
+
+def test_complex_eig_coupled_matrix():
+    a = np.array([[1 + 1j, 2 - 1j], [3j, 4 - 2j]])
+    w, v = np.linalg.eig(a)
+    assert_allclose(a @ v, v * w, atol=1e-9)
+    assert_allclose(np.sum(w), np.trace(a), atol=1e-9)
+    assert_allclose(np.prod(w), np.linalg.det(a), atol=1e-9)
+    larger = np.array([[1 + 1j, 2, 0], [0, 3 - 2j, 1j], [1, 0, -1 + 0.5j]])
+    w, v = np.linalg.eig(larger)
+    assert_allclose(larger @ v, v * w, atol=1e-8)
+    assert_allclose(np.sum(w), np.trace(larger), atol=1e-8)
+    rotation = np.array([[0.0, -1.0], [1.0, 0.0]], dtype=complex)
+    w, v = np.linalg.eig(rotation)
+    assert_allclose(np.abs(w), [1, 1], atol=1e-9)
+    assert_allclose(np.sum(w), 0, atol=1e-9)
+    assert_allclose(np.prod(w), 1, atol=1e-9)
+    assert_allclose(rotation @ v, v * w, atol=1e-9)
+
+
+def test_complex_eig_repeated_real_eigenvalue():
+    a = np.array([[2 + 0j, 1], [0, 2]])
+    w, v = np.linalg.eig(a)
+    assert_allclose(w, [2, 2], atol=1e-8)
+    assert_allclose(a @ v, v * w, atol=1e-8)
+    repeated = np.diag(np.array([1 + 0j, 1, 2]))
+    w, v = np.linalg.eig(repeated)
+    assert_allclose(sorted_eigenvalues(w), [1, 1, 2], atol=1e-8)
+    assert_allclose(repeated @ v, v * w, atol=1e-8)
 
 
 def test_eig_defective_matrix_repeats_eigenvalue():
@@ -396,6 +543,29 @@ def test_svd_reduced_shapes():
 def test_svd_values_only():
     s = np.linalg.svd(np.array([[0.0, 2.0], [1.0, 0.0]]), compute_uv=False)
     assert_allclose(s, [2.0, 1.0], atol=1e-15)
+
+
+def test_complex_svd_reconstructs_and_preserves_dtype():
+    a = np.array([[1 + 1j, 2], [0, 1 - 1j], [2j, 3]], dtype=np.complex64)
+    u, s, vh = np.linalg.svd(a, full_matrices=False)
+    assert u.shape == (3, 2)
+    assert s.dtype == np.float32
+    assert vh.dtype == np.complex64
+    assert_allclose(u @ np.diag(s) @ vh, a, atol=1e-5)
+    assert_allclose(u.conj().T @ u, np.eye(2), atol=1e-5)
+    assert_allclose(vh @ vh.conj().T, np.eye(2), atol=1e-5)
+    assert_allclose(np.linalg.svd(a, compute_uv=False), s, atol=1e-5)
+    assert_allclose(np.linalg.svdvals(a), s, atol=1e-5)
+
+
+def test_complex_svd_rank_deficient_matrix():
+    a = np.array([[1 + 1j, 2 + 2j], [2 - 1j, 4 - 2j]])
+    u, s, vh = np.linalg.svd(a)
+    assert s[1] < 1e-7
+    assert_allclose(u @ np.diag(s) @ vh, a, atol=1e-10)
+    assert_allclose(u.conj().T @ u, np.eye(2), atol=1e-10)
+    assert_allclose(a @ np.linalg.pinv(a) @ a, a, atol=1e-10)
+    assert np.linalg.matrix_rank(a) == 1
 
 
 def test_decompositions_return_float64_for_int_input():

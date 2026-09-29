@@ -636,6 +636,14 @@ fn removed_numpy_submodules_are_missing() {
 }
 
 #[test]
+fn complex_qr_raw_mode_has_an_explicit_frontier() {
+    assert_fails_with(
+        "import numpy as np\nnp.linalg.qr(np.eye(2, dtype=complex), mode='raw')",
+        "NotImplementedError",
+    );
+}
+
+#[test]
 fn array_allocation_obeys_the_modeled_memory_limit() {
     // Importing NumPy fits in 8 MiB; the array needs 32 MB.
     let environment = Environment::with_limits(Limits {

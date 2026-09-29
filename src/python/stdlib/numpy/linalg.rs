@@ -271,9 +271,9 @@ fn solve(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     if b.ndim() == 0 {
         return Err(need_2d(0));
     }
-    // NumPy 2's gufunc solve: `b` is a batch of vectors when its rank is one less than `a`'s
-    // (signature `(m,m),(m)->(m)`), else a batch of matrices (`(m,m),(m,k)->(m,k)`).
-    let vector_rhs = b.ndim() < a.ndim();
+    // NumPy 2.5 treats only a one-dimensional `b` as a vector. A higher-rank `b` is a
+    // matrix (or stack of matrices), even when its rank is one less than `a`'s.
+    let vector_rhs = b.ndim() == 1;
     let (b_batch, k): (Vec<usize>, usize) = if vector_rhs {
         if b.shape().last().copied() != Some(n) {
             return Err(PyError::value_error(format!(

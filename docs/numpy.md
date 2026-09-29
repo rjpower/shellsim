@@ -75,7 +75,7 @@ raises `OverflowError`. NumPy scalar types form the usual hierarchy (`generic`, 
   `searchsorted`, `bincount`, `digitize`, `unique` and the set operations.
 - **Products and linear algebra.**
   - Products: `dot`, `vdot`, `inner`, `outer`, `matmul` and `@`, `tensordot` and `einsum`.
-  - `numpy.linalg`, for real arrays: `inv`, `solve`, `det`, `slogdet`, `eig`, `eigvals`, `eigh`,
+  - `numpy.linalg`, for real and complex arrays: `inv`, `solve`, `det`, `slogdet`, `eig`, `eigvals`, `eigh`,
     `eigvalsh`, `svd`, `svdvals`, `qr`, `cholesky`, `lstsq`, `pinv`, `matrix_rank`,
     `matrix_power` and `norm`.
 - **Numerical helpers.** `diff`, `gradient`, `interp`, `trapezoid`, `convolve`, `correlate`,
@@ -116,6 +116,10 @@ Some results differ from NumPy by design:
   `frombuffer` returns a read-only copy.
 - **Elements of text and object arrays** are returned as plain Python `str` values and the
   stored objects.
+- **Complex linear algebra.** These small-array paths use a real block representation for
+  solves and eigenproblems, Gram-Schmidt for QR, and eigenvectors of `A.conj().T @ A` for SVD.
+  They do more work than the real kernels and lose accuracy earlier on ill-conditioned matrices.
+  They are intended for ordinary finite scientific checks, not large or ill-conditioned systems.
 
 The portable suites in `tests/python/numpy/` state this contract. Cargo runs them under shellsim
 (see `tests/python/scientific_suites.rs`). To re-check them against real NumPy, build the pinned
@@ -127,7 +131,7 @@ frontier and resource limits.
 
 - **Unsupported dtypes and options** raise `NotImplementedError`. This covers:
   - structured, void, bytes (`S`), datetime and timedelta dtypes;
-  - complex input to `numpy.linalg`;
+  - `numpy.linalg.qr(mode="raw")` with complex input;
   - `ndarray.resize`, and `view` with a different item size.
 - **Object arrays in files.** Saving or loading object arrays in `.npy` or `.npz` files raises
   `ValueError`.
