@@ -53,6 +53,59 @@ class Random:
             self._gauss_next = math.sin(angle) * radius
         return mu + value * sigma
 
+    def expovariate(self, lambd=1.0):
+        import math
+
+        return -math.log(1.0 - self.random()) / lambd
+
+    def gammavariate(self, alpha, beta):
+        import math
+
+        if not alpha > 0.0 or not beta > 0.0:
+            raise ValueError("gammavariate requires positive shape and scale")
+
+        # Boost small shapes to at least one, then scale by an independent
+        # uniform draw. Both draws use this instance's modeled generator.
+        if alpha < 1.0:
+            return self.gammavariate(alpha + 1.0, beta) * self.random() ** (1.0 / alpha)
+
+        # Rejection sampling for the unit-scale gamma distribution. Draw its
+        # own normal value so gauss()'s cached second sample stays untouched.
+        # The VM charges every loop and call, even when no draw is accepted.
+        shape = alpha - 1.0 / 3.0
+        spread = 1.0 / math.sqrt(9.0 * shape)
+        while True:
+            angle = math.tau * self.random()
+            radius = math.sqrt(-2.0 * math.log(1.0 - self.random()))
+            normal = math.cos(angle) * radius
+            base = 1.0 + spread * normal
+            if base <= 0.0:
+                continue
+            cube = base * base * base
+            uniform = self.random()
+            if uniform == 0.0 or uniform < 1.0 - 0.0331 * normal ** 4:
+                return beta * shape * cube
+            if math.log(uniform) < 0.5 * normal * normal + shape * (1.0 - cube + math.log(cube)):
+                return beta * shape * cube
+
+    def betavariate(self, alpha, beta):
+        if not alpha > 0.0 or not beta > 0.0:
+            raise ValueError("betavariate requires positive shapes")
+        left = self.gammavariate(alpha, 1.0)
+        right = self.gammavariate(beta, 1.0)
+        if left == 0.0 and right == 0.0:
+            return 0.0
+        if left == right == float('inf'):
+            return 0.5
+        if left > right:
+            return 1.0 / (1.0 + right / left)
+        return left / right / (1.0 + left / right)
+
+    def weibullvariate(self, alpha, beta):
+        import math
+
+        return alpha * (-math.log(1.0 - self.random())) ** (1.0 / beta)
+
     def choice(self, population):
         if len(population) == 0:
             raise IndexError("cannot choose from an empty sequence")
@@ -100,6 +153,22 @@ def uniform(left, right):
 
 def gauss(mu=0.0, sigma=1.0):
     return _default.gauss(mu, sigma)
+
+
+def expovariate(lambd=1.0):
+    return _default.expovariate(lambd)
+
+
+def gammavariate(alpha, beta):
+    return _default.gammavariate(alpha, beta)
+
+
+def betavariate(alpha, beta):
+    return _default.betavariate(alpha, beta)
+
+
+def weibullvariate(alpha, beta):
+    return _default.weibullvariate(alpha, beta)
 
 
 def choice(population):

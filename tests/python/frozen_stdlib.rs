@@ -530,6 +530,42 @@ print(isinstance(random.gauss(), float))
 }
 
 #[test]
+fn frozen_random_covers_non_gaussian_distribution_variates() {
+    // The reproducer uses CPython's four public distributions. Shellsim's
+    // seeded stream differs, so assert their contracts rather than float text.
+    let source = r#"import random
+random.seed(1)
+print(random.expovariate(2.0))
+print(random.gammavariate(2.0, 1.0))
+print(random.betavariate(2.0, 1.0))
+print(random.weibullvariate(1.0, 2.0))
+"#;
+    let (status, stdout, stderr) = run(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert!(stderr.is_empty());
+    let values = stdout
+        .lines()
+        .map(|value| value.parse::<f64>().expect("finite float output"))
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 4);
+    assert!(values.iter().all(|value| value.is_finite()));
+    assert!(values[0] >= 0.0 && values[1] > 0.0);
+    assert!((0.0..=1.0).contains(&values[2]));
+    assert!(values[3] >= 0.0);
+}
+
+#[test]
+fn frozen_random_unsupported_distribution_fails_at_attribute_lookup() {
+    let source = r#"import random
+try:
+    random.paretovariate(2.0)
+except AttributeError:
+    print('unsupported')
+"#;
+    assert_eq!(run(source), (0, "unsupported\n".into(), String::new()));
+}
+
+#[test]
 fn frozen_zipfile_reads_writes_and_extracts_vfs_archives() {
     let source = r#"import io
 import zipfile

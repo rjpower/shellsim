@@ -129,6 +129,12 @@ crate, so their last bit can differ from CPython's. Poles and out-of-domain argu
 `math.floor`, `ceil`, and `trunc` defer to a class's `__round__`, `__floor__`, `__ceil__`, and
 `__trunc__`, and other `math` functions convert instances through `__float__`.
 
+The frozen `random` module provides `expovariate`, `gammavariate`, `betavariate`, and
+`weibullvariate` on both `Random` instances and the module's seeded default generator. These
+methods use shellsim's deterministic random stream, whose values differ from CPython's. Gamma
+rejection sampling consumes modeled CPU fuel on every attempt. Other distributions, including
+`paretovariate` and `triangular`, remain unsupported.
+
 The frozen `collections` module provides `namedtuple`, with `rename=`, `defaults=` and `module=`,
 CPython's argument and validation errors, and `_make`, `_replace`, `_asdict`, `_fields`,
 `_field_defaults` and `__match_args__`. `typing.NamedTuple` builds the same classes, called with

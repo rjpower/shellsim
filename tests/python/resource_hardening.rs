@@ -720,3 +720,18 @@ fn fraction_growth_stops_at_the_memory_limit() {
     assert_eq!(stdout, b"ready\n");
     assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
 }
+
+#[test]
+fn rejection_sampling_uses_modeled_cpu_fuel() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import random\nclass NeverAccept(random.Random):\n    def random(self):\n        self._toggle = not getattr(self, '_toggle', False)\n        return 0.5 if self._toggle else 0.9999999999999999\nprint('ready')\nNeverAccept(1).gammavariate(2.0, 1.0)",
+        Limits {
+            cpu: 100_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 100_000);
+    assert_eq!(stdout, b"ready\n");
+    assert!(stderr.is_empty());
+}

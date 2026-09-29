@@ -20,6 +20,7 @@ const EXCEPTIONS: &[u8] = include_bytes!("test_exceptions.py");
 const FRACTIONS: &[u8] = include_bytes!("test_fractions.py");
 const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
 const OPERATOR: &[u8] = include_bytes!("test_operator.py");
+const RANDOM: &[u8] = include_bytes!("test_random.py");
 const WARNINGS: &[u8] = include_bytes!("test_warnings.py");
 const COUNT_10_MILLION: &[u8] = include_bytes!("performance/test_count_10_million.py");
 
@@ -117,6 +118,11 @@ fn object_model() {
 #[test]
 fn operator() {
     assert_source_suite("test_operator.py", OPERATOR);
+}
+
+#[test]
+fn random() {
+    assert_source_suite("test_random.py", RANDOM);
 }
 
 #[test]
