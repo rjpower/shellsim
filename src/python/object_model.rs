@@ -252,6 +252,8 @@ pub enum SlotValue {
     VmEnumString,
     /// Hash compound values through the VM so their elements use Python's hash protocol.
     VmHash,
+    /// Compare containers through the VM so their elements use Python's comparison protocol.
+    VmCompare,
     NativeBinary(BinarySlotFn),
     NativeTernary(TernarySlotFn),
     NativeUnary(UnarySlotFn),
@@ -1543,6 +1545,12 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_bytearray_delete_item));
 
     let slots = &mut types[BuiltinType::List as usize].slots;
+    slots.equal = Some(SlotValue::VmCompare);
+    slots.not_equal = Some(SlotValue::VmCompare);
+    slots.less_than = Some(SlotValue::VmCompare);
+    slots.less_equal = Some(SlotValue::VmCompare);
+    slots.greater_than = Some(SlotValue::VmCompare);
+    slots.greater_equal = Some(SlotValue::VmCompare);
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
@@ -1560,6 +1568,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.delete_item = Some(intrinsic(super::stdlib::core::slot_list_delete_item));
 
     let slots = &mut types[BuiltinType::Dict as usize].slots;
+    slots.equal = Some(SlotValue::VmCompare);
+    slots.not_equal = Some(SlotValue::VmCompare);
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
@@ -1624,6 +1634,8 @@ fn install_builtin_slots(types: &mut [PyType]) {
     slots.iter = Some(unary(super::stdlib::mapping_views::slot_proxy_iter));
 
     let slots = &mut types[BuiltinType::Set as usize].slots;
+    slots.equal = Some(SlotValue::VmCompare);
+    slots.not_equal = Some(SlotValue::VmCompare);
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.iter = Some(unary(super::stdlib::core::slot_sequence_iter));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
@@ -1647,6 +1659,12 @@ fn install_builtin_slots(types: &mut [PyType]) {
     types[BuiltinType::FrozenSet as usize].slots.hash = Some(SlotValue::VmHash);
 
     let slots = &mut types[BuiltinType::Tuple as usize].slots;
+    slots.equal = Some(SlotValue::VmCompare);
+    slots.not_equal = Some(SlotValue::VmCompare);
+    slots.less_than = Some(SlotValue::VmCompare);
+    slots.less_equal = Some(SlotValue::VmCompare);
+    slots.greater_than = Some(SlotValue::VmCompare);
+    slots.greater_equal = Some(SlotValue::VmCompare);
     slots.length = Some(unary(super::stdlib::core::slot_builtin_length));
     slots.get_item = Some(intrinsic(super::stdlib::core::slot_builtin_get_item));
     slots.contains = Some(intrinsic(super::stdlib::core::slot_builtin_contains));
@@ -1808,6 +1826,7 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                     | SlotValue::VmRepr
                     | SlotValue::VmEnumString
                     | SlotValue::VmHash
+                    | SlotValue::VmCompare
             )
         ) {
             ty.attributes.entry(name.into()).or_insert(Value::Native(

@@ -2927,6 +2927,51 @@ impl Vm<'_> {
         )
     }
 
+    fn vm_container_compare(
+        &mut self,
+        receiver: Value,
+        slot: Slot,
+        argument: Value,
+    ) -> Result<Option<Value>, String> {
+        let (left, right) = (self.builtin_view(receiver)?, self.builtin_view(argument)?);
+        let left_type = self.type_id(&left)?;
+        let right_type = self.type_id(&right)?;
+        let compatible = match left_type {
+            id if id == BuiltinType::List.id() => right_type == BuiltinType::List.id(),
+            id if id == BuiltinType::Tuple.id() => right_type == BuiltinType::Tuple.id(),
+            id if id == BuiltinType::Dict.id() || id == BuiltinType::NamespaceDict.id() => {
+                right_type == BuiltinType::Dict.id()
+                    || right_type == BuiltinType::NamespaceDict.id()
+            }
+            id if id == BuiltinType::Set.id() || id == BuiltinType::FrozenSet.id() => {
+                right_type == BuiltinType::Set.id() || right_type == BuiltinType::FrozenSet.id()
+            }
+            _ => false,
+        };
+        if !compatible {
+            return Ok(None);
+        }
+        let result = match slot {
+            Slot::Equal => self.builtin_equality(&left, &right)?,
+            Slot::NotEqual => !self.builtin_equality(&left, &right)?,
+            Slot::LessThan | Slot::LessEqual | Slot::GreaterThan | Slot::GreaterEqual => {
+                let accepted: &[Ordering] = match slot {
+                    Slot::LessThan => &[Ordering::Less],
+                    Slot::LessEqual => &[Ordering::Less, Ordering::Equal],
+                    Slot::GreaterThan => &[Ordering::Greater],
+                    _ => &[Ordering::Greater, Ordering::Equal],
+                };
+                match self.compare_values(&left, &right)? {
+                    protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
+                    protocol::Comparison::Unordered => false,
+                    protocol::Comparison::Unsupported => return Ok(None),
+                }
+            }
+            _ => return Err("invalid container comparison slot".into()),
+        };
+        Ok(Some(Value::Bool(result)))
+    }
+
     pub(super) fn invoke_slot(
         &mut self,
         receiver: &Value,
@@ -2941,6 +2986,12 @@ impl Vm<'_> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
+            SlotValue::VmCompare => {
+                let [argument] = arguments.as_slice() else {
+                    return Err("comparison slot received the wrong number of arguments".into());
+                };
+                return self.vm_container_compare(*receiver, slot, *argument);
+            }
             SlotValue::VmHash => {
                 if !arguments.is_empty() {
                     return Err("hash slot received arguments".into());
@@ -3069,11 +3120,20 @@ impl Vm<'_> {
             let receiver = self.builtin_view(receiver)?;
             return self.hash_value(&receiver).map(Value::Int);
         }
+        if matches!(implementation, SlotValue::VmCompare) {
+            let [argument] = arguments.as_slice() else {
+                return Err("comparison slot received the wrong number of arguments".into());
+            };
+            return Ok(self
+                .vm_container_compare(receiver, slot, *argument)?
+                .unwrap_or(Value::Native(NativeValue::NotImplemented)));
+        }
         let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
             SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
             SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
             SlotValue::VmHash => unreachable!("handled before builtin payload view"),
+            SlotValue::VmCompare => unreachable!("handled before builtin payload view"),
             SlotValue::NativeMethod(method) => {
                 return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
                     .map_err(|error| self.record_native_error(error));
