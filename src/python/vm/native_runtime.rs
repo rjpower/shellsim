@@ -426,6 +426,23 @@ impl PyRuntime for Vm<'_> {
         Vm::charge_cpu(self, units).map_err(PyError::resource_error)
     }
 
+    fn class_of(&self, value: &Value) -> PyResult<Value> {
+        self.type_of(value).map_err(PyError::runtime_error)
+    }
+
+    fn dictionary_of(&mut self, value: Value) -> PyResult<Option<Value>> {
+        Vm::dictionary_of(self, value).map_err(PyError::resource_error)
+    }
+
+    fn type_metadata(
+        &mut self,
+        value: Value,
+        field: super::super::native::TypeMetadata,
+    ) -> PyResult<Option<Value>> {
+        Vm::type_metadata(self, value, field)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn kind(&self, value: &Value) -> PyResult<PyKind> {
         if value.inline_string_len().is_some() {
             return Ok(PyKind::String);
@@ -459,8 +476,10 @@ impl PyRuntime for Vm<'_> {
                 Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
                 Object::Class { .. } => PyKind::Class,
                 Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
+                Object::GenericAlias { .. } => PyKind::Native,
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::StreamIterator { .. }
@@ -565,6 +584,10 @@ impl PyRuntime for Vm<'_> {
         super::number::view(&self.state.heap, value)
     }
 
+    fn physical_compare(&self, left: &Value, right: &Value) -> PyResult<protocol::Comparison> {
+        protocol::compare(&self.state.heap, left, right).map_err(PyError::runtime_error)
+    }
+
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<Value> {
         self.allocate_object(Object::Complex { real, imag })
             .map_err(PyError::resource_error)
@@ -621,6 +644,14 @@ impl PyRuntime for Vm<'_> {
         self.repr_value(value).map_err(PyError::runtime_error)
     }
 
+    fn default_object_repr(&self, value: &Value) -> PyResult<String> {
+        Vm::default_object_repr(self, value).map_err(PyError::runtime_error)
+    }
+
+    fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
+        Vm::physical_length(self, value).map_err(PyError::runtime_error)
+    }
+
     fn format_value(
         &mut self,
         value: &Value,
@@ -635,6 +666,35 @@ impl PyRuntime for Vm<'_> {
                     PyError::unsupported(message)
                 }
             })
+    }
+
+    fn builtin_format(&mut self, value: &Value, specification: &str) -> PyResult<String> {
+        if let Some(rendered) = self
+            .format_registered_number(value, specification)
+            .map_err(|message| self.raised_or_runtime_error(message))?
+        {
+            return Ok(rendered);
+        }
+        let result = if specification.is_empty() {
+            self.display_value(value)
+        } else {
+            self.format_unconverted_value(value, specification)
+        };
+        result.map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn reverse_value(&mut self, value: Value) -> PyResult<Value> {
+        Vm::reverse_value(self, value).map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn reverse_builtin_sequence(&mut self, value: Value) -> PyResult<Value> {
+        Vm::reverse_builtin_sequence(self, value)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn new_generic_alias(&mut self, origin: Value, item: Value) -> PyResult<Value> {
+        Vm::new_generic_alias(self, origin, item)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
@@ -661,6 +721,12 @@ impl PyRuntime for Vm<'_> {
                     PyError::runtime_error(message)
                 }
             })
+    }
+
+    fn get_attribute_default(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
+        let symbol = self.state.heap.symbol_id(name);
+        self.lookup_attribute_default(value, symbol, name)
+            .map_err(|message| self.raised_or_runtime_error(message))
     }
 
     fn set_attribute(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {
@@ -1142,6 +1208,16 @@ impl PyRuntime for Vm<'_> {
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
+    fn builtin_get_item(&mut self, container: Value, key: Value) -> PyResult<Value> {
+        self.subscript_builtin(container, key)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
+    fn builtin_contains(&mut self, container: Value, item: Value) -> PyResult<bool> {
+        self.contains_value(&container, &item)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn mapping_items(&mut self, value: Value) -> PyResult<Option<Vec<(Value, Value)>>> {
         Vm::mapping_items(self, value).map_err(|message| self.raised_or_runtime_error(message))
     }
@@ -1363,16 +1439,14 @@ impl PyRuntime for Vm<'_> {
                     layout = *base_layout;
                 }
                 if let Some(base_exception) = base_exception {
-                    if exception_base.replace(*base_exception).is_some() {
-                        return Err(PyError::type_error(
-                            "multiple exception bases are unsupported",
-                        ));
-                    }
+                    exception_base.get_or_insert(*base_exception);
                 }
                 user_bases.push(id);
             } else {
                 match base.native_value() {
-                    Some(NativeValue::BuiltinType(BuiltinType::Object)) => {}
+                    Some(NativeValue::BuiltinType(
+                        BuiltinType::Object | BuiltinType::Enum | BuiltinType::TestCase,
+                    )) => {}
                     Some(NativeValue::BuiltinType(builtin))
                         if super::objects::is_subclassable_builtin(builtin)
                             && layout == ClassLayout::Object =>
@@ -1385,9 +1459,9 @@ impl PyRuntime for Vm<'_> {
                         layout = ClassLayout::Type;
                     }
                     Some(NativeValue::ExceptionType(ExceptionType(name)))
-                        if layout == ClassLayout::Object && exception_base.is_none() =>
+                        if layout == ClassLayout::Object =>
                     {
-                        exception_base = Some(name);
+                        exception_base.get_or_insert(name);
                     }
                     _ => return Err(PyError::type_error("type.__new__() bases must be classes")),
                 }
@@ -1422,6 +1496,18 @@ impl PyRuntime for Vm<'_> {
             .heap
             .replace_payload(id, Object::List(items), &mut self.interp.resources)
             .map_err(PyError::resource_error)
+    }
+
+    fn call_type_default(&mut self, class: Value, args: CallArgs) -> PyResult<Value> {
+        match Vm::call_type_default(self, class, args)
+            .map_err(|message| self.raised_or_runtime_error(message))?
+        {
+            CallResult::Value(value) => Ok(value),
+            CallResult::Exit(status) => Err(PyError::exit(status)),
+            CallResult::EnteredFrame | CallResult::Blocked(..) | CallResult::Retry(..) => {
+                Err(PyError::runtime_error("default type call did not finish"))
+            }
+        }
     }
 
     fn call_value(&mut self, callable: Value, args: CallArgs) -> PyResult<Value> {
@@ -1509,6 +1595,10 @@ impl PyRuntime for Vm<'_> {
         Vm::is_iterator(self, value).map_err(PyError::runtime_error)
     }
 
+    fn is_unbounded_iterator(&self, value: &Value) -> PyResult<bool> {
+        Vm::is_unbounded_iterator(self, value).map_err(PyError::runtime_error)
+    }
+
     fn iterator(&mut self, value: Value) -> PyResult<PyIterator> {
         if Vm::is_iterator(self, &value).map_err(PyError::runtime_error)? {
             return value.cast(self);
@@ -1549,6 +1639,7 @@ impl PyRuntime for Vm<'_> {
                 Ok(value)
             }
             Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::StreamIterator { .. } => self
                 .next_stored_iterator(id)
@@ -2163,8 +2254,8 @@ impl PyRuntime for Vm<'_> {
     fn marker(&self, marker: PyMarker) -> Value {
         Value::Native(match marker {
             PyMarker::TypingList => NativeValue::TypingList,
-            PyMarker::EnumBase => NativeValue::EnumBase,
-            PyMarker::UnitTestBase => NativeValue::UnitTestBase,
+            PyMarker::EnumType => NativeValue::BuiltinType(BuiltinType::Enum),
+            PyMarker::TestCaseType => NativeValue::BuiltinType(BuiltinType::TestCase),
             PyMarker::Environment => NativeValue::Environment,
             PyMarker::Stdin => NativeValue::Stream(Stream::Stdin),
             PyMarker::StdinBuffer => NativeValue::Stream(Stream::StdinBuffer),

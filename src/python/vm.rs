@@ -65,6 +65,11 @@ pub(super) enum NativeValue {
     /// Native method that attribute lookup binds to the type, as CPython binds a classmethod,
     /// whether it is reached through the type or through an instance.
     NativeClassMethod(&'static super::native::MethodDef),
+    /// A callable view of a native slot owned by one type, independent of subclass overrides.
+    SlotWrapper {
+        owner: TypeId,
+        slot: Slot,
+    },
     /// Read-only data descriptor stored in a native type's attribute table.
     NativeGetter(&'static super::native::GetterDef),
     ValueKind(&'static super::native::ValueKindDef),
@@ -73,10 +78,6 @@ pub(super) enum NativeValue {
     ExceptionType(ExceptionType),
     /// Runtime representation of ``typing.List`` used by the generic-alias probe.
     TypingList,
-    /// Marker used as the only supported base for the capability-free enum slice.
-    EnumBase,
-    /// Marker used as the only supported base for the capability-free unittest slice.
-    UnitTestBase,
     /// The `Ellipsis` singleton written as `...`. An immediate marker keeps identity, equality,
     /// and dictionary hashing canonical without allocating an arena object.
     Ellipsis,
@@ -94,13 +95,12 @@ impl NativeValue {
     const ENVIRONMENT: u8 = 6;
     const EXCEPTION_TYPE: u8 = 7;
     const TYPING_LIST: u8 = 8;
-    const ENUM_BASE: u8 = 9;
-    const UNITTEST_BASE: u8 = 10;
-    const VALUE_KIND: u8 = 11;
-    const NATIVE_GETTER: u8 = 12;
-    const ELLIPSIS: u8 = 13;
-    const NOT_IMPLEMENTED: u8 = 14;
-    const NATIVE_CLASS_METHOD: u8 = 15;
+    const VALUE_KIND: u8 = 9;
+    const NATIVE_GETTER: u8 = 10;
+    const ELLIPSIS: u8 = 11;
+    const NOT_IMPLEMENTED: u8 = 12;
+    const NATIVE_CLASS_METHOD: u8 = 13;
+    const SLOT_WRAPPER: u8 = 14;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -119,6 +119,10 @@ impl NativeValue {
                 value as *const super::native::MethodDef as usize as u64,
                 Self::NATIVE_CLASS_METHOD,
             ),
+            Self::SlotWrapper { owner, slot } => (
+                (u64::from(owner.raw()) << 8) | slot as u64,
+                Self::SLOT_WRAPPER,
+            ),
             Self::NativeGetter(value) => (
                 value as *const super::native::GetterDef as usize as u64,
                 Self::NATIVE_GETTER,
@@ -131,8 +135,6 @@ impl NativeValue {
             Self::Environment => (0, Self::ENVIRONMENT),
             Self::ExceptionType(value) => (exception_type_code(value.0), Self::EXCEPTION_TYPE),
             Self::TypingList => (0, Self::TYPING_LIST),
-            Self::EnumBase => (0, Self::ENUM_BASE),
-            Self::UnitTestBase => (0, Self::UNITTEST_BASE),
             Self::Ellipsis => (0, Self::ELLIPSIS),
             Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
         }
@@ -171,6 +173,10 @@ impl NativeValue {
                     &*(payload as usize as *const super::native::MethodDef)
                 })
             }
+            Self::SLOT_WRAPPER => Self::SlotWrapper {
+                owner: TypeId::from_raw((payload >> 8) as u32),
+                slot: Slot::from_index(payload as u8),
+            },
             Self::NATIVE_GETTER => {
                 // SAFETY: `encode` stores a non-null pointer to a static `GetterDef`.
                 Self::NativeGetter(unsafe {
@@ -188,8 +194,6 @@ impl NativeValue {
                 Self::ExceptionType(ExceptionType(exception_type_name(payload)))
             }
             Self::TYPING_LIST => Self::TypingList,
-            Self::ENUM_BASE => Self::EnumBase,
-            Self::UNITTEST_BASE => Self::UnitTestBase,
             Self::ELLIPSIS => Self::Ellipsis,
             Self::NOT_IMPLEMENTED => Self::NotImplemented,
             Self::VALUE_KIND => {
@@ -244,6 +248,15 @@ impl NativeValue {
                     "<method '{}' of '{}' objects>",
                     method.name, method.type_name
                 )
+            }
+            Self::SlotWrapper { owner, slot } => {
+                let name = super::object_model::SLOT_DEFS[slot as usize].1;
+                match BuiltinType::ALL.get(owner.raw() as usize) {
+                    Some(builtin) => {
+                        format!("<slot wrapper '{name}' of '{}' objects>", builtin.name())
+                    }
+                    None => format!("<slot wrapper '{name}'>"),
+                }
             }
             _ => "<native object>".into(),
         }
@@ -1091,6 +1104,9 @@ impl<'a> Vm<'a> {
     }
 
     fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+        if self.is_unbounded_iterator(value)? {
+            return Err("cannot materialize infinite itertools.count without a bound".into());
+        }
         if let Some(iterator) = self.class_iterator(value)? {
             let mut result = Vec::new();
             while let Some(item) = self.next_until_stop(&iterator)? {
@@ -1133,6 +1149,7 @@ impl<'a> Vm<'a> {
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. } => {
                     while let Some(value) = self.next_stored_iterator(id)? {
                         self.push_materialized(&mut result, value)?;
@@ -1194,6 +1211,16 @@ impl<'a> Vm<'a> {
             return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
+    }
+
+    fn is_unbounded_iterator(&self, value: &Value) -> Result<bool, String> {
+        let Some(id) = value.object_id() else {
+            return Ok(false);
+        };
+        Ok(matches!(
+            self.state.heap.get(id)?,
+            Object::CountIterator { .. }
+        ))
     }
 
     /// Iterate an instance without `__iter__` through CPython's legacy sequence protocol:

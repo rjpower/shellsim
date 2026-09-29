@@ -141,6 +141,8 @@ pub enum DictViewKind {
 pub enum ProxyTarget {
     /// A class's own attributes, for `cls.__dict__` and `vars(cls)`.
     Class(ObjectId),
+    /// A builtin or native value-kind type's fixed registry namespace.
+    RegisteredType(super::object_model::TypeId),
     /// A native module's functions and values, which cannot be rebound.
     NativeModule(&'static super::native::ModuleDef),
 }
@@ -220,6 +222,7 @@ pub enum Object {
         attributes: InstanceAttributes,
     },
     EnumMember {
+        class: Option<ObjectId>,
         name: String,
         value: Value,
     },
@@ -227,6 +230,11 @@ pub enum Object {
         receiver: Value,
         descriptor: Value,
         owner: Option<ObjectId>,
+    },
+    /// A parameterized builtin class such as `list[int]`.
+    GenericAlias {
+        origin: Value,
+        arguments: Vec<Value>,
     },
     Iterator {
         values: Vec<Value>,
@@ -237,6 +245,11 @@ pub enum Object {
     SequenceIterator {
         owner: ObjectId,
         position: usize,
+    },
+    /// Reverse traversal indexes the source on demand, preserving bounded iterator storage.
+    ReverseIterator {
+        owner: Value,
+        next: usize,
     },
     RangeIterator {
         current: i64,
@@ -1278,6 +1291,7 @@ impl Heap {
             },
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
             | Object::CountIterator { .. }
             | Object::CallableIterator { .. }
@@ -1291,6 +1305,7 @@ impl Heap {
                 DictViewKind::Items => BuiltinType::DictItems.id(),
             },
             Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
+            Object::GenericAlias { .. } => BuiltinType::GenericAlias.id(),
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
@@ -1580,7 +1595,10 @@ fn trace_object(
                 }
             }
         }
-        Object::EnumMember { value, .. } => trace_value(*value, object_work),
+        Object::EnumMember { class, value, .. } => {
+            object_work.extend(*class);
+            trace_value(*value, object_work);
+        }
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,
@@ -1589,10 +1607,15 @@ fn trace_object(
             trace_values([*receiver, *descriptor], object_work);
             object_work.extend(*owner);
         }
+        Object::GenericAlias { origin, arguments } => {
+            trace_value(*origin, object_work);
+            trace_values(arguments.iter().copied(), object_work);
+        }
         Object::Iterator { values: items, .. } => {
             trace_values(items.iter().copied(), object_work);
         }
         Object::SequenceIterator { owner, .. } => object_work.push(*owner),
+        Object::ReverseIterator { owner, .. } => trace_value(*owner, object_work),
         Object::CallableIterator {
             callable, sentinel, ..
         } => {
@@ -1619,7 +1642,7 @@ fn trace_object(
         Object::NamespaceDict(NamespaceTarget::Instance(instance)) => object_work.push(*instance),
         Object::DictView { mapping, .. } => object_work.push(*mapping),
         Object::MappingProxy(ProxyTarget::Class(class)) => object_work.push(*class),
-        Object::MappingProxy(ProxyTarget::NativeModule(_)) => {}
+        Object::MappingProxy(ProxyTarget::NativeModule(_) | ProxyTarget::RegisteredType(_)) => {}
         Object::Array { storage, base, .. } => {
             object_work.push(*storage);
             object_work.extend(*base);
@@ -1758,8 +1781,10 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(1)
             .ok_or("modeled object size overflow")?,
         Object::DescriptorBoundMethod { .. } => 3,
+        Object::GenericAlias { arguments, .. } => arguments.len().saturating_add(1),
         Object::Iterator { values, .. } => values.len(),
         Object::SequenceIterator { .. } => 2,
+        Object::ReverseIterator { .. } => 2,
         Object::RangeIterator { .. } => 4,
         Object::CountIterator { .. } => 2,
         Object::CallableIterator { .. } => 3,

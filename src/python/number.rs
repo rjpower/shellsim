@@ -3,10 +3,13 @@
 //! Immediate integers, heap-backed arbitrary-precision integers, and IEEE-754 doubles all cross
 //! the native-module boundary through this owned, representation-independent view.
 
+use std::cmp::Ordering;
+
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
+use super::hash;
 use super::heap::{Heap, InstancePayload, Object};
 use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
@@ -58,6 +61,126 @@ pub(super) fn numbers_equal(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
         }
         (left, right) => left.to_bigint() == right.to_bigint(),
     }
+}
+
+pub(super) fn slot_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(numeric_slot_equality(runtime, left, right).map(PyValue::Bool))
+}
+
+pub(super) fn slot_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(numeric_slot_equality(runtime, left, right).map(|equal| PyValue::Bool(!equal)))
+}
+
+fn numeric_slot_equality(runtime: &dyn PyRuntime, left: PyValue, right: PyValue) -> Option<bool> {
+    let (Some(left), Some(right)) = (runtime.number(&left), runtime.number(&right)) else {
+        return None;
+    };
+    numeric_slot_accepts(left, right).then(|| numbers_equal(left, right))
+}
+
+fn numeric_slot_accepts(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
+    match left {
+        NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_) => matches!(
+            right,
+            NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_)
+        ),
+        NumberRef::Float(_) => !matches!(right, NumberRef::Complex(..)),
+        NumberRef::Complex(..) => true,
+    }
+}
+
+fn slot_numeric_order(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    accepted: &[Ordering],
+) -> PyResult<Option<PyValue>> {
+    let (Some(left_number), Some(right_number)) = (runtime.number(&left), runtime.number(&right))
+    else {
+        return Ok(None);
+    };
+    if !numeric_slot_accepts(left_number, right_number) {
+        return Ok(None);
+    }
+    match runtime.physical_compare(&left, &right)? {
+        super::protocol::Comparison::Ordered(ordering) => {
+            Ok(Some(PyValue::Bool(accepted.contains(&ordering))))
+        }
+        super::protocol::Comparison::Unordered => Ok(Some(PyValue::Bool(false))),
+        super::protocol::Comparison::Unsupported => Ok(None),
+    }
+}
+
+pub(super) fn slot_less(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Less])
+}
+
+pub(super) fn slot_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Less, Ordering::Equal])
+}
+
+pub(super) fn slot_greater(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Greater])
+}
+
+pub(super) fn slot_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_numeric_order(runtime, left, right, &[Ordering::Greater, Ordering::Equal])
+}
+
+/// Share the hash algorithm used by `hash(value)` and numeric `__hash__` wrappers.
+pub(super) fn number_hash(number: NumberRef<'_>) -> i64 {
+    match number {
+        NumberRef::Int(value) => hash::integer(value),
+        NumberRef::UInt(value) => hash::big_integer(&value.into()),
+        NumberRef::BigInt(value) => hash::big_integer(value),
+        NumberRef::Float(value) => hash::float(value),
+        NumberRef::Complex(real, imag) => hash::complex(real, imag),
+    }
+}
+
+pub(super) fn slot_hash(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let Some(number) = runtime.number(&value) else {
+        return Ok(None);
+    };
+    Ok(Some(PyValue::Int(number_hash(number))))
+}
+
+pub(super) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+    let Some(number) = runtime.number(&value) else {
+        return Ok(None);
+    };
+    let truth = match number {
+        NumberRef::Int(value) => value != 0,
+        NumberRef::BigInt(value) => !value.is_zero(),
+        NumberRef::UInt(value) => value != 0,
+        NumberRef::Float(value) => value != 0.0,
+        NumberRef::Complex(real, imaginary) => real != 0.0 || imaginary != 0.0,
+    };
+    Ok(Some(PyValue::Bool(truth)))
 }
 
 /// The kind and number of a registered value with a numeric view, such as a NumPy scalar.
@@ -115,7 +238,7 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
 
 /// Numeric-tower attributes shared by one builtin real number type.
 ///
-/// `int` and `bool` also expose the `numbers.Rational` accessors. Results follow CPython:
+/// `bool` inherits the integer namespace through its MRO. Results follow CPython:
 /// `True.real` is the integer `1`, `(3).imag` is `0`, and `(1.5).imag` is `0.0`.
 macro_rules! real_number_type {
     ($name:literal, rational) => {
@@ -201,7 +324,6 @@ macro_rules! real_number_type {
     };
 }
 
-pub(super) static BOOL_TYPE: NativeTypeDef = real_number_type!("bool", rational);
 pub(super) static INT_TYPE: NativeTypeDef = real_number_type!("int", rational);
 
 /// `int.__new__(cls, value=0)`, installed on `int` alone since `bool` cannot be subclassed.
@@ -222,11 +344,6 @@ fn int_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> Py
 /// `int.from_bytes`, which receives the class so that `bool.from_bytes` returns a `bool`.
 pub(super) static INT_CLASS_METHODS: &[MethodDef] = &[MethodDef {
     type_name: "int",
-    name: "from_bytes",
-    call: int_from_bytes,
-}];
-pub(super) static BOOL_CLASS_METHODS: &[MethodDef] = &[MethodDef {
-    type_name: "bool",
     name: "from_bytes",
     call: int_from_bytes,
 }];

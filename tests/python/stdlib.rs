@@ -407,9 +407,16 @@ print(next(counter))
 
 #[test]
 fn infinite_count_cannot_be_materialized_without_a_bound() {
-    let simulated = run("import itertools\nprint(list(itertools.count()))");
-    assert_ne!(simulated.0, 0);
-    assert!(simulated.2.windows(8).any(|window| window == b"infinite"));
+    for constructor in ["list", "tuple", "set", "bytes", "bytearray"] {
+        let source = format!("import itertools\nprint({constructor}(itertools.count()))");
+        let simulated = run(&source);
+        assert_ne!(simulated.0, 0, "{constructor}");
+        assert!(
+            simulated.2.windows(8).any(|window| window == b"infinite"),
+            "{constructor}: {:?}",
+            String::from_utf8_lossy(&simulated.2)
+        );
+    }
 }
 
 #[test]

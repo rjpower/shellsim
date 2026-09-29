@@ -8,7 +8,7 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{protocol, Object, Slot, Value, ValueTag, Vm};
+use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, ValueTag, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -31,15 +31,18 @@ impl Vm<'_> {
             return Ok(hash::NONE);
         }
         // Instances of `int` subclasses have a numeric view but may define their own `__hash__`.
-        if !self.is_user_instance(value)? {
+        let user_instance = self.is_user_instance(value)?;
+        if !user_instance {
             if let Some(number) = number::view(&self.state.heap, value) {
-                return Ok(number_hash(number));
+                return Ok(number::number_hash(number));
             }
         }
-        if let Some(text) = super::super::string::string_ref(&self.state.heap, value)? {
-            let text = text.as_str().to_owned();
-            self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
-            return Ok(hash::string(&text));
+        if !user_instance {
+            if let Some(text) = super::super::string::string_ref(&self.state.heap, value)? {
+                let text = text.as_str().to_owned();
+                self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+                return Ok(hash::string(&text));
+            }
         }
         match value.tag() {
             ValueTag::Native => return Ok(hash::identity(value.payload ^ u64::from(value.aux[0]))),
@@ -61,13 +64,33 @@ impl Vm<'_> {
                 return Ok(hash::bytes(&bytes));
             }
             Object::Tuple(items) => (items.clone(), hash::tuple),
+            Object::GenericAlias { origin, arguments } => {
+                let mut items = Vec::with_capacity(arguments.len().saturating_add(1));
+                items.push(*origin);
+                items.extend(arguments.iter().copied());
+                (items, hash::tuple)
+            }
             Object::FrozenSet(items) => (items.clone(), hash::frozenset),
             Object::Range { start, stop, step } => {
                 let (start, stop, step) = (*start, *stop, *step);
                 return range_hash(start, stop, step);
             }
             Object::Slice { start, stop, step } => (vec![*start, *stop, *step], hash::slice),
-            Object::EnumMember { name, .. } => return Ok(hash::string(name)),
+            Object::EnumMember { class, name, value } => {
+                let (class, name, item) = (*class, name.clone(), *value);
+                if let Some(class) = class {
+                    if matches!(
+                        self.state.heap.get(class)?,
+                        Object::Class {
+                            layout: ClassLayout::Builtin(BuiltinType::String),
+                            ..
+                        }
+                    ) {
+                        return self.hash_nested(&item, depth + 1);
+                    }
+                }
+                return Ok(hash::string(&name));
+            }
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
             }
@@ -173,17 +196,6 @@ impl Vm<'_> {
             Err(error) => return error,
         };
         self.raise_exception("TypeError", message)
-    }
-}
-
-/// The numeric hash shared by every number type, so equal numbers hash alike.
-fn number_hash(number: NumberRef<'_>) -> i64 {
-    match number {
-        NumberRef::Int(value) => hash::integer(value),
-        NumberRef::UInt(value) => hash::big_integer(&value.into()),
-        NumberRef::BigInt(value) => hash::big_integer(value),
-        NumberRef::Float(value) => hash::float(value),
-        NumberRef::Complex(real, imag) => hash::complex(real, imag),
     }
 }
 

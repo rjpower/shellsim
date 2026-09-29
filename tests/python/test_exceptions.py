@@ -54,6 +54,31 @@ def test_user_exceptions_inherit_their_builtin_ancestors():
         assert caught is error
 
 
+def test_multiple_exception_bases_follow_c3_for_matching_and_dispatch():
+    class Combined(KeyError, AttributeError):
+        pass
+
+    assert Combined.__bases__ == (KeyError, AttributeError)
+    assert Combined.__mro__ == (
+        Combined,
+        KeyError,
+        LookupError,
+        AttributeError,
+        Exception,
+        BaseException,
+        object,
+    )
+    assert issubclass(Combined, LookupError)
+    assert issubclass(Combined, AttributeError)
+    error = Combined("missing")
+    assert isinstance(error, LookupError)
+    assert isinstance(error, AttributeError)
+    try:
+        raise error
+    except AttributeError as caught:
+        assert caught is error
+
+
 def test_except_clauses_match_builtin_ancestors():
     try:
         {}["missing"]

@@ -242,11 +242,15 @@ impl Vm<'_> {
         actual: &RaisedException,
     ) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
-            let kind = match self.user_exception_base(&actual.value)? {
-                Some(base) => base,
-                None => actual.kind.as_str(),
-            };
-            return Ok(exception_types::exception_is_subclass(kind, name));
+            let expected_type = self
+                .state
+                .types
+                .exception_type_id(name)
+                .ok_or("exception type is not registered")?;
+            return self
+                .state
+                .types
+                .is_subclass(self.type_id(&actual.value)?, expected_type);
         }
         let Some(id) = expected.object_id() else {
             return Err(
@@ -449,6 +453,14 @@ impl Vm<'_> {
                     .map(|(name, value)| (name.clone(), *value))
                     .collect()
             }
+            ProxyTarget::RegisteredType(type_id) => self
+                .state
+                .types
+                .get(type_id)?
+                .attributes
+                .iter()
+                .map(|(name, value)| (name.clone(), *value))
+                .collect(),
             ProxyTarget::NativeModule(module) => {
                 let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
                 for function in module.functions {

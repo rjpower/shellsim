@@ -176,43 +176,50 @@ impl Vm<'_> {
             self.stack.push(Value::Bool(result));
             return Ok(());
         }
-        let mut slot_result = match operator {
-            ComparisonOperator::Equal => {
-                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?
-            }
+        let comparison_slots = match operator {
+            ComparisonOperator::Equal => Some(((Slot::Equal, "__eq__"), (Slot::Equal, "__eq__"))),
             ComparisonOperator::NotEqual => {
-                self.invoke_operator_slot(&left, Slot::NotEqual, "__ne__", vec![right])?
+                Some(((Slot::NotEqual, "__ne__"), (Slot::NotEqual, "__ne__")))
             }
             ComparisonOperator::Less => {
-                self.invoke_operator_slot(&left, Slot::LessThan, "__lt__", vec![right])?
+                Some(((Slot::LessThan, "__lt__"), (Slot::GreaterThan, "__gt__")))
             }
             ComparisonOperator::LessEqual => {
-                self.invoke_operator_slot(&left, Slot::LessEqual, "__le__", vec![right])?
+                Some(((Slot::LessEqual, "__le__"), (Slot::GreaterEqual, "__ge__")))
             }
             ComparisonOperator::Greater => {
-                self.invoke_operator_slot(&left, Slot::GreaterThan, "__gt__", vec![right])?
+                Some(((Slot::GreaterThan, "__gt__"), (Slot::LessThan, "__lt__")))
             }
             ComparisonOperator::GreaterEqual => {
-                self.invoke_operator_slot(&left, Slot::GreaterEqual, "__ge__", vec![right])?
+                Some(((Slot::GreaterEqual, "__ge__"), (Slot::LessEqual, "__le__")))
             }
-            ComparisonOperator::In | ComparisonOperator::NotIn => {
-                self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?
-            }
-            ComparisonOperator::Is | ComparisonOperator::IsNot => None,
+            _ => None,
         };
-        if slot_result.is_none() {
-            let reflected = match operator {
-                ComparisonOperator::Equal => Some((Slot::Equal, "__eq__")),
-                ComparisonOperator::NotEqual => Some((Slot::NotEqual, "__ne__")),
-                ComparisonOperator::Less => Some((Slot::GreaterThan, "__gt__")),
-                ComparisonOperator::LessEqual => Some((Slot::GreaterEqual, "__ge__")),
-                ComparisonOperator::Greater => Some((Slot::LessThan, "__lt__")),
-                ComparisonOperator::GreaterEqual => Some((Slot::LessEqual, "__le__")),
-                _ => None,
-            };
-            if let Some((slot, name)) = reflected {
-                slot_result = self.invoke_operator_slot(&right, slot, name, vec![left])?;
+        let mut slot_result = None;
+        if let Some(((left_slot, left_name), (right_slot, right_name))) = comparison_slots {
+            let left_type = self.type_id(&left)?;
+            let right_type = self.type_id(&right)?;
+            let right_first = right_type != left_type
+                && self.state.types.is_subclass(right_type, left_type)?
+                && self
+                    .state
+                    .types
+                    .local_slot(right_type, right_slot)?
+                    .is_some();
+            if right_first {
+                slot_result =
+                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
             }
+            if slot_result.is_none() {
+                slot_result =
+                    self.invoke_operator_slot(&left, left_slot, left_name, vec![right])?;
+            }
+            if slot_result.is_none() && !right_first {
+                slot_result =
+                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
+            }
+        } else if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) {
+            slot_result = self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?;
         }
         if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
             let mut equality =
@@ -270,7 +277,11 @@ impl Vm<'_> {
     /// Answer `needle in container` once `__contains__` has declined. Builtin containers answer
     /// directly; any other iterable is searched item by item, stopping at the first match, as
     /// CPython does.
-    fn contains_value(&mut self, container: &Value, needle: &Value) -> Result<bool, String> {
+    pub(super) fn contains_value(
+        &mut self,
+        container: &Value,
+        needle: &Value,
+    ) -> Result<bool, String> {
         if protocol::string_ref(&self.state.heap, container)?.is_some() {
             if protocol::string_ref(&self.state.heap, needle)?.is_none() {
                 let message = format!(
@@ -501,43 +512,25 @@ impl Vm<'_> {
         left: Value,
         right: Value,
     ) -> Result<Option<Value>, String> {
-        let name = match operator {
-            BinaryOperator::Add => "__iadd__",
-            BinaryOperator::Subtract => "__isub__",
-            BinaryOperator::Multiply => "__imul__",
-            BinaryOperator::MatrixMultiply => "__imatmul__",
-            BinaryOperator::Power => "__ipow__",
-            BinaryOperator::Divide => "__itruediv__",
-            BinaryOperator::FloorDivide => "__ifloordiv__",
-            BinaryOperator::Remainder => "__imod__",
-            BinaryOperator::LeftShift => "__ilshift__",
-            BinaryOperator::RightShift => "__irshift__",
-            BinaryOperator::BitwiseAnd => "__iand__",
-            BinaryOperator::BitwiseXor => "__ixor__",
-            BinaryOperator::BitwiseOr => "__ior__",
+        let slot = match operator {
+            BinaryOperator::Add => Slot::InplaceAdd,
+            BinaryOperator::Subtract => Slot::InplaceSubtract,
+            BinaryOperator::Multiply => Slot::InplaceMultiply,
+            BinaryOperator::MatrixMultiply => Slot::InplaceMatrixMultiply,
+            BinaryOperator::Power => Slot::InplacePower,
+            BinaryOperator::Divide => Slot::InplaceDivide,
+            BinaryOperator::FloorDivide => Slot::InplaceFloorDivide,
+            BinaryOperator::Remainder => Slot::InplaceRemainder,
+            BinaryOperator::LeftShift => Slot::InplaceLeftShift,
+            BinaryOperator::RightShift => Slot::InplaceRightShift,
+            BinaryOperator::BitwiseAnd => Slot::InplaceBitwiseAnd,
+            BinaryOperator::BitwiseXor => Slot::InplaceBitwiseXor,
+            BinaryOperator::BitwiseOr => Slot::InplaceBitwiseOr,
         };
-        if let Some(id) = left.object_id() {
-            if let Object::Instance { class, .. } = self.state.heap.get(id)? {
-                let class = *class;
-                let Some((defining_class, descriptor)) = self.class_attribute_entry(class, name)?
-                else {
-                    return Ok(None);
-                };
-                let method = self.bind_descriptor(descriptor, Some(left), class, defining_class)?;
-                let result = self.invoke_value(method, vec![right])?;
-                return Ok(
-                    (result.native_value() != Some(NativeValue::NotImplemented)).then_some(result)
-                );
-            }
-        }
-        let type_id = self.type_id(&left)?;
-        if self.state.types.attribute(type_id, name)?.is_none() {
-            return Ok(None);
-        }
-        let Some(method) = self.resolve_attribute(left, name)? else {
-            return Ok(None);
-        };
-        self.invoke_value(method, vec![right]).map(Some)
+        let (_, name, _) = super::super::object_model::SLOT_DEFS[slot as usize];
+        Ok(self
+            .invoke_slot(&left, slot, name, vec![right])?
+            .filter(|result| result.native_value() != Some(NativeValue::NotImplemented)))
     }
 
     #[cold]
@@ -809,35 +802,39 @@ impl Vm<'_> {
         value: &Value,
         format_spec: &str,
     ) -> Result<String, String> {
-        if let Some(id) = value.object_id() {
-            if matches!(self.state.heap.get(id)?, Object::Instance { .. }) {
-                if let Some(method) = self.special_method(value, "__format__")? {
-                    let spec = self.allocate_string(format_spec.to_string())?;
-                    let result = self.invoke_value(method, vec![spec])?;
-                    return protocol::string_value(&self.state.heap, &result)?.ok_or_else(|| {
-                        self.raise_exception("TypeError", "__format__ must return a str")
-                    });
-                }
-            }
+        let spec = self.allocate_string(format_spec.to_string())?;
+        if let Some(result) = self.invoke_slot(value, Slot::Format, "__format__", vec![spec])? {
+            return protocol::string_value(&self.state.heap, &result)?
+                .ok_or_else(|| self.raise_exception("TypeError", "__format__ must return a str"));
         }
-        if let Some((_, number)) = super::number::registered_number(&self.state.heap, value) {
-            let number = match number {
-                KindNumber::Bool(value) => Value::Bool(value),
-                KindNumber::Int(value) => Value::Int(value),
-                KindNumber::UInt(value) => {
-                    self.allocate_object(Object::BigInt(BigInt::from(value)))?
-                }
-                KindNumber::Float(value) => Value::Float(value),
-                KindNumber::Complex(real, imag) => {
-                    self.allocate_object(Object::Complex { real, imag })?
-                }
-            };
-            return self.format_object(&number, format_spec);
+        if let Some(rendered) = self.format_registered_number(value, format_spec)? {
+            return Ok(rendered);
         }
         if format_spec.is_empty() {
             return self.display_value(value);
         }
         self.format_unconverted_value(value, format_spec)
+    }
+
+    /// Registered scalar formats use their Python numeric value, including when the spec is empty.
+    pub(super) fn format_registered_number(
+        &mut self,
+        value: &Value,
+        format_spec: &str,
+    ) -> Result<Option<String>, String> {
+        let Some((_, number)) = super::number::registered_number(&self.state.heap, value) else {
+            return Ok(None);
+        };
+        let number = match number {
+            KindNumber::Bool(value) => Value::Bool(value),
+            KindNumber::Int(value) => Value::Int(value),
+            KindNumber::UInt(value) => self.allocate_object(Object::BigInt(BigInt::from(value)))?,
+            KindNumber::Float(value) => Value::Float(value),
+            KindNumber::Complex(real, imag) => {
+                self.allocate_object(Object::Complex { real, imag })?
+            }
+        };
+        self.format_object(&number, format_spec).map(Some)
     }
 
     /// Reserve the largest width or precision before formatting can allocate padding.
@@ -863,7 +860,11 @@ impl Vm<'_> {
     /// `format(value, text)` for a builtin value with a non-empty specification: ints, bools
     /// and floats through the numeric mini-language, strings through the string one, and
     /// anything else with the `TypeError` of `object.__format__`.
-    fn format_unconverted_value(&mut self, value: &Value, text: &str) -> Result<String, String> {
+    pub(super) fn format_unconverted_value(
+        &mut self,
+        value: &Value,
+        text: &str,
+    ) -> Result<String, String> {
         let result = match super::number::view(&self.state.heap, value) {
             Some(number::NumberRef::Complex(real, imag)) => format_complex(real, imag, text),
             Some(number::NumberRef::Float(float)) => {

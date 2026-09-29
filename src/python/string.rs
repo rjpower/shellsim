@@ -6,7 +6,7 @@
 
 use std::ops::Deref;
 
-use super::heap::{Heap, Object};
+use super::heap::{Heap, InstancePayload, Object};
 use super::Value;
 
 /// Heap storage for a Python string.
@@ -133,6 +133,10 @@ pub fn string_ref<'a>(heap: &'a Heap, value: &Value) -> Result<Option<PyStringRe
         Object::String(value) => Some(PyStringRef {
             storage: StringStorage::Heap(value),
         }),
+        Object::Instance {
+            payload: InstancePayload::Builtin(value),
+            ..
+        } => return string_ref(heap, value),
         _ => None,
     })
 }

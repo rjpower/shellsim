@@ -27,10 +27,76 @@ enum ForwardedThrow {
 /// pass over `self` (a heap lookup for a sequence, or a descriptor read for a stream).
 enum SlowPathAdvance {
     Sequence(super::super::heap::ObjectId, usize),
+    Reverse(Value, usize),
     Stream(bool),
 }
 
 impl Vm<'_> {
+    /// `reversed(x)` consults the type's reverse slot before the length and indexed sequence
+    /// protocol. It does not accept an arbitrary iterable as a sequence.
+    pub(super) fn reverse_value(&mut self, value: Value) -> Result<Value, String> {
+        if let Some(iterator) =
+            self.invoke_slot(&value, Slot::Reversed, "__reversed__", Vec::new())?
+        {
+            return Ok(iterator);
+        }
+        let subject = self.builtin_view(value)?;
+        let physical_sequence = match subject.object_id() {
+            Some(id) => matches!(
+                self.state.heap.get(id)?,
+                Object::List(_)
+                    | Object::Tuple(_)
+                    | Object::Range { .. }
+                    | Object::String(_)
+                    | Object::Bytes(_)
+                    | Object::ByteArray(_)
+            ),
+            None => protocol::string_value(&self.state.heap, &subject)?.is_some(),
+        };
+        let getitem = self
+            .state
+            .types
+            .slot(self.type_id(&value)?, Slot::GetItem)?
+            .is_some();
+        if !physical_sequence && !getitem {
+            let name = self.type_name_of(&value)?;
+            return Err(
+                self.raise_exception("TypeError", format!("'{name}' object is not reversible"))
+            );
+        }
+        let length = match self.invoke_slot(&value, Slot::Length, "__len__", Vec::new())? {
+            Some(length) => {
+                let length = protocol::int_value(&self.state.heap, &length).ok_or_else(|| {
+                    self.raise_exception("TypeError", "__len__() should return an integer")
+                })?;
+                usize::try_from(length).map_err(|_| {
+                    self.raise_exception("ValueError", "__len__() should return >= 0")
+                })?
+            }
+            None => self.physical_length(value)?.ok_or_else(|| {
+                self.raise_exception("TypeError", "reversed() requires a sequence")
+            })?,
+        };
+        self.reverse_items(value, length)
+    }
+
+    /// The native list, tuple and range reverse slots use physical payload indexing, so an
+    /// inherited slot does not re-enter a subclass's `__getitem__` override.
+    pub(super) fn reverse_builtin_sequence(&mut self, value: Value) -> Result<Value, String> {
+        let subject = self.builtin_view(value)?;
+        let length = self
+            .physical_length(subject)?
+            .ok_or("native reverse slot requires a sequence")?;
+        self.reverse_items(subject, length)
+    }
+
+    fn reverse_items(&mut self, value: Value, length: usize) -> Result<Value, String> {
+        self.allocate_object(Object::ReverseIterator {
+            owner: value,
+            next: length,
+        })
+    }
+
     pub(super) fn get_iterator(&mut self) -> Result<(), String> {
         let iterable = self.pop()?;
         let iterator = self.make_iterator(iterable)?;
@@ -69,6 +135,7 @@ impl Vm<'_> {
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
                 | Object::RangeIterator { .. }
                 | Object::CountIterator { .. }
                 | Object::StreamIterator { .. }
@@ -80,6 +147,9 @@ impl Vm<'_> {
                 }
                 _ => {}
             }
+        }
+        if let Some(iterator) = self.snapshot_builtin_iterator(iterable)? {
+            return Ok(iterator);
         }
         if let Some(iterator) = self.class_iterator(&iterable)? {
             return Ok(iterator);
@@ -98,6 +168,50 @@ impl Vm<'_> {
         Ok(iterator)
     }
 
+    /// Builtin strings, byte strings and hash containers keep their existing snapshot iteration
+    /// behavior, but enter it before their new `__iter__` slots to avoid redispatching into the
+    /// native wrapper. Copying one element at a time charges its retained size before the next.
+    fn snapshot_builtin_iterator(&mut self, iterable: Value) -> Result<Option<Value>, String> {
+        if iterable
+            .object_id()
+            .is_some_and(|id| matches!(self.state.heap.get(id), Ok(Object::Instance { .. })))
+        {
+            return Ok(None);
+        }
+        let mut values = Vec::new();
+        if let Some(text) = protocol::string_value(&self.state.heap, &iterable)? {
+            for character in text.chars() {
+                let character = self.allocate_string(character.to_string())?;
+                self.push_materialized(&mut values, character)?;
+            }
+        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, &iterable)? {
+            for byte in bytes {
+                self.push_materialized(&mut values, Value::Int(i64::from(byte)))?;
+            }
+        } else if let Some(id) = iterable.object_id() {
+            let length = match self.state.heap.get(id)? {
+                Object::Set(items) | Object::FrozenSet(items) => items.len(),
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries.len(),
+                _ => return Ok(None),
+            };
+            for index in 0..length {
+                let item = match self.state.heap.get(id)? {
+                    Object::Set(items) | Object::FrozenSet(items) => items[index],
+                    Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries[index].0,
+                    _ => return Err("builtin iterator source changed object kind".into()),
+                };
+                self.push_materialized(&mut values, item)?;
+            }
+        } else {
+            return Ok(None);
+        }
+        self.allocate_object(Object::Iterator {
+            values,
+            position: 0,
+        })
+        .map(Some)
+    }
+
     /// Whether `value` is an iterator: one of the runtime's lazy iterator objects, or an object
     /// whose class defines `__next__`.
     pub(super) fn is_iterator(&self, value: &Value) -> Result<bool, String> {
@@ -106,6 +220,7 @@ impl Vm<'_> {
                 self.state.heap.get(id)?,
                 Object::Iterator { .. }
                     | Object::SequenceIterator { .. }
+                    | Object::ReverseIterator { .. }
                     | Object::RangeIterator { .. }
                     | Object::CountIterator { .. }
                     | Object::StreamIterator { .. }
@@ -206,6 +321,13 @@ impl Vm<'_> {
             Object::SequenceIterator { owner, position } => {
                 SlowPathAdvance::Sequence(*owner, *position)
             }
+            Object::ReverseIterator { owner, next } => {
+                if *next == 0 {
+                    return Ok(IteratorAdvance::Exhausted);
+                }
+                *next -= 1;
+                SlowPathAdvance::Reverse(*owner, *next)
+            }
             Object::CallableIterator {
                 callable,
                 sentinel,
@@ -240,6 +362,13 @@ impl Vm<'_> {
                 };
                 *position += 1;
                 Ok(IteratorAdvance::Yield(value))
+            }
+            SlowPathAdvance::Reverse(owner, index) => {
+                self.charge_cpu(1)?;
+                let index = i64::try_from(index)
+                    .map_err(|_| self.raise_exception("OverflowError", "sequence is too large"))?;
+                self.subscript_value(owner, Value::Int(index))
+                    .map(IteratorAdvance::Yield)
             }
             SlowPathAdvance::Stream(binary) => self.advance_stream_iterator(binary),
         }

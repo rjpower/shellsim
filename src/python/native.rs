@@ -427,8 +427,8 @@ pub(super) enum PyOperator {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PyMarker {
     TypingList,
-    EnumBase,
-    UnitTestBase,
+    EnumType,
+    TestCaseType,
     Environment,
     Stdin,
     /// `sys.stdin.buffer`: the standard-input descriptor read as raw bytes.
@@ -617,11 +617,25 @@ pub(super) struct PyFileMetadata {
     pub size: usize,
 }
 
+/// Read-only metadata supplied by the `type` data descriptors.
+#[derive(Clone, Copy)]
+pub(super) enum TypeMetadata {
+    Name,
+    Module,
+    Bases,
+    Mro,
+}
+
 /// Runtime value protocols and explicitly modeled services available to native modules.
 pub(super) trait PyRuntime {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()>;
     fn charge_cpu(&mut self, units: u64) -> PyResult<()>;
     fn kind(&self, value: &PyValue) -> PyResult<PyKind>;
+    /// The Python class of a value, including a user class's metaclass.
+    fn class_of(&self, value: &PyValue) -> PyResult<PyValue>;
+    /// A class, module or instance's live Python namespace, when it has one.
+    fn dictionary_of(&mut self, value: PyValue) -> PyResult<Option<PyValue>>;
+    fn type_metadata(&mut self, value: PyValue, field: TypeMetadata) -> PyResult<Option<PyValue>>;
     fn native_kind(&self, value: &PyValue) -> PyResult<Option<PyNativeKind>>;
     fn identity(&self, value: &PyValue) -> Option<PyIdentity>;
     fn int_value(&self, value: &PyValue) -> Option<i64>;
@@ -642,6 +656,12 @@ pub(super) trait PyRuntime {
     fn is_not_implemented(&self, value: &PyValue) -> bool;
     /// View a builtin `bool`, `int`, `float`, or `complex` without copying its storage.
     fn number(&self, value: &PyValue) -> Option<super::number::NumberRef<'_>>;
+    /// Compare builtin payloads without entering Python rich-comparison slots again.
+    fn physical_compare(
+        &self,
+        left: &PyValue,
+        right: &PyValue,
+    ) -> PyResult<super::protocol::Comparison>;
     /// Allocate a builtin `complex` in the metered object arena.
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<PyValue>;
     /// Return an exact decimal rendering for any Python integer representation.
@@ -661,6 +681,10 @@ pub(super) trait PyRuntime {
     fn truth(&mut self, value: &PyValue) -> PyResult<bool>;
     fn display(&mut self, value: &PyValue) -> PyResult<String>;
     fn repr(&mut self, value: &PyValue) -> PyResult<String>;
+    /// The base object's identity representation, without dispatching to an override.
+    fn default_object_repr(&self, value: &PyValue) -> PyResult<String>;
+    /// The physical builtin length, without invoking a user-defined `__len__` slot.
+    fn physical_length(&self, value: PyValue) -> PyResult<Option<usize>>;
     /// Render through the same bounded formatting protocol used by f-strings.
     fn format_value(
         &mut self,
@@ -668,10 +692,20 @@ pub(super) trait PyRuntime {
         conversion: Option<char>,
         specification: &str,
     ) -> PyResult<String>;
+    /// Format a builtin payload directly, without calling its `__format__` slot again.
+    fn builtin_format(&mut self, value: &PyValue, specification: &str) -> PyResult<String>;
+    /// Dispatch `reversed` through the type slot, then through the sequence protocol.
+    fn reverse_value(&mut self, value: PyValue) -> PyResult<PyValue>;
+    /// Reverse a builtin sequence directly for its native `__reversed__` slot.
+    fn reverse_builtin_sequence(&mut self, value: PyValue) -> PyResult<PyValue>;
+    /// Create a metered generic alias for a builtin container's class subscription.
+    fn new_generic_alias(&mut self, origin: PyValue, item: PyValue) -> PyResult<PyValue>;
     fn equals(&mut self, left: &PyValue, right: &PyValue) -> PyResult<bool>;
     fn compare(&mut self, left: &PyValue, right: &PyValue) -> PyResult<Ordering>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
+    /// Invoke the default object lookup directly, without `__getattr__` fallback.
+    fn get_attribute_default(&mut self, value: PyValue, name: &str) -> PyResult<Option<PyValue>>;
     /// Assign an attribute through the runtime's descriptor protocol, as `setattr` does.
     fn set_attribute(&mut self, value: PyValue, name: &str, item: PyValue) -> PyResult<()>;
     /// Assign an attribute without consulting a class's `__setattr__`, as `object.__setattr__`
@@ -716,6 +750,10 @@ pub(super) trait PyRuntime {
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
     /// `container[key]`, running the container's `__getitem__` or builtin subscript.
     fn get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// Index a builtin payload without reentering its `__getitem__` slot.
+    fn builtin_get_item(&mut self, container: PyValue, key: PyValue) -> PyResult<PyValue>;
+    /// Membership in a builtin payload without reentering its `__contains__` slot.
+    fn builtin_contains(&mut self, container: PyValue, item: PyValue) -> PyResult<bool>;
     /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no
     /// `keys` method. Mappings other than dicts are read through `keys()` and `__getitem__`, as
     /// `dict(m)` and `f(**m)` read them in CPython.
@@ -734,10 +772,14 @@ pub(super) trait PyRuntime {
     fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
     fn replace_list_items(&mut self, list: PyList, items: Vec<PyValue>) -> PyResult<()>;
     fn call_value(&mut self, callable: PyValue, args: CallArgs) -> PyResult<PyValue>;
+    /// Invoke a class through the default `type.__call__` path, bypassing a metaclass override.
+    fn call_type_default(&mut self, class: PyValue, args: CallArgs) -> PyResult<PyValue>;
     fn is_callable(&self, value: &PyValue) -> PyResult<bool>;
     /// Whether `value` is an iterator: a builtin iterator or generator, or an object whose class
     /// defines `__next__`.
     fn is_iterator(&self, value: &PyValue) -> PyResult<bool>;
+    /// Whether a native iterator is known to be unbounded and cannot be collected into memory.
+    fn is_unbounded_iterator(&self, value: &PyValue) -> PyResult<bool>;
     /// `iter(value)`: an iterator is returned as is; any other iterable produces one.
     fn iterator(&mut self, value: PyValue) -> PyResult<PyIterator>;
     /// The next item of `iterator`, or `None` once it is exhausted.
@@ -1009,10 +1051,11 @@ pub(super) struct PyByteArray(ObjectId);
 
 impl FromPyValue for PyByteArray {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             return Err(PyError::type_error("expected a bytearray"));
         };
-        if runtime.kind(&value)? == PyKind::ByteArray {
+        if runtime.kind(&payload)? == PyKind::ByteArray {
             Ok(Self(id))
         } else {
             Err(PyError::type_error("expected a bytearray"))
@@ -1209,11 +1252,12 @@ pub(super) struct PyList(ObjectId);
 
 impl FromPyValue for PyList {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected list, got {actual}")));
         };
-        if runtime.kind(&Value::Object(id))? == PyKind::List {
+        if runtime.kind(&payload)? == PyKind::List {
             Ok(Self(id))
         } else {
             let actual = runtime.type_name(&Value::Object(id))?;
@@ -1386,10 +1430,11 @@ pub(super) struct PySet(ObjectId);
 
 impl FromPyValue for PySet {
     fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
-        let Some(id) = value.object_id() else {
+        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let Some(id) = payload.object_id() else {
             return Err(PyError::type_error("expected set"));
         };
-        if runtime.kind(&Value::Object(id))? == PyKind::Set {
+        if runtime.kind(&payload)? == PyKind::Set {
             Ok(Self(id))
         } else {
             Err(PyError::type_error("expected set"))

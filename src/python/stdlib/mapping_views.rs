@@ -166,6 +166,17 @@ pub(crate) fn slot_view_iter(
     runtime.new_iterator(members).map(Some)
 }
 
+pub(crate) fn slot_view_reversed(
+    runtime: &mut dyn PyRuntime,
+    view: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (kind, mapping) = view_parts(runtime, view)?;
+    let mut members = view_members(runtime, kind, mapping)?;
+    runtime.charge_cpu(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
+    members.reverse();
+    runtime.new_iterator(members).map(Some)
+}
+
 pub(crate) fn slot_view_contains(
     runtime: &mut dyn PyRuntime,
     view: PyValue,

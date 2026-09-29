@@ -1,4 +1,4 @@
-//! Type markers for the bounded :mod:`enum` compatibility surface.
+//! The registered Enum class for the bounded :mod:`enum` compatibility surface.
 
 use super::super::native::{ModuleDef, PyMarker, PyResult, PyRuntime, ValueDef};
 
@@ -12,5 +12,5 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 };
 
 fn enum_base(runtime: &mut dyn PyRuntime) -> PyResult {
-    Ok(runtime.marker(PyMarker::EnumBase))
+    Ok(runtime.marker(PyMarker::EnumType))
 }

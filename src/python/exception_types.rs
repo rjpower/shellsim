@@ -2,10 +2,8 @@
 //! class hierarchy.
 //!
 //! Builtin exceptions, shellsim's pytest outcomes and exceptions raised by native stdlib modules
-//! share one table, so `except`, `isinstance` and `issubclass` all follow the same parent chain.
-//! Each class has exactly one parent here; CPython's multiple-inheritance exception classes are
-//! not modeled. A user class that derives from one of these records it as its exception base, and
-//! its subclass checks start from that base.
+//! share one table. The type registry linearizes their bases with C3, including NumPy's AxisError
+//! with its two parents. A user class records an exception ancestor for its instance layout.
 
 /// One exception class: its name, its parent, whether `builtins` binds the name, and the
 /// `__module__` CPython reports for it.
@@ -13,6 +11,7 @@ pub(super) struct ExceptionTypeDef {
     pub(super) name: &'static str,
     /// `None` only for `BaseException`.
     pub(super) parent: Option<&'static str>,
+    pub(super) secondary_parent: Option<&'static str>,
     pub(super) builtin: bool,
     pub(super) module: &'static str,
 }
@@ -21,6 +20,7 @@ const fn builtin(name: &'static str, parent: &'static str) -> ExceptionTypeDef {
     ExceptionTypeDef {
         name,
         parent: Some(parent),
+        secondary_parent: None,
         builtin: true,
         module: "builtins",
     }
@@ -34,6 +34,7 @@ const fn native(
     ExceptionTypeDef {
         name,
         parent: Some(parent),
+        secondary_parent: None,
         builtin: false,
         module,
     }
@@ -44,6 +45,7 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     ExceptionTypeDef {
         name: "BaseException",
         parent: None,
+        secondary_parent: None,
         builtin: true,
         module: "builtins",
     },
@@ -118,9 +120,13 @@ pub(super) const EXCEPTION_TYPES: &[ExceptionTypeDef] = &[
     native("SubprocessError", "Exception", "subprocess"),
     native("CalledProcessError", "SubprocessError", "subprocess"),
     native("TimeoutExpired", "SubprocessError", "subprocess"),
-    // NumPy's AxisError also derives from IndexError; one parent is modeled, and ValueError is
-    // the one NumPy's own documentation leads with.
-    native("AxisError", "ValueError", "numpy.exceptions"),
+    ExceptionTypeDef {
+        name: "AxisError",
+        parent: Some("ValueError"),
+        secondary_parent: Some("IndexError"),
+        builtin: false,
+        module: "numpy.exceptions",
+    },
     native("LinAlgError", "ValueError", "numpy.linalg"),
     native("ComplexWarning", "RuntimeWarning", "numpy.exceptions"),
 ];
@@ -146,17 +152,14 @@ pub(super) fn exception_is_subclass(kind: &str, base: &str) -> bool {
     if kind == base {
         return true;
     }
-    let mut parent = match exception_type(kind) {
-        Some(definition) => definition.parent,
-        None => Some("Exception"),
-    };
-    while let Some(name) = parent {
-        if name == base {
-            return true;
-        }
-        parent = exception_type(name).and_then(|definition| definition.parent);
+    if let Some(definition) = exception_type(kind) {
+        return definition
+            .parent
+            .into_iter()
+            .chain(definition.secondary_parent)
+            .any(|parent| exception_is_subclass(parent, base));
     }
-    false
+    exception_is_subclass("Exception", base)
 }
 
 #[cfg(test)]
@@ -167,6 +170,9 @@ mod tests {
     fn every_parent_is_a_modeled_class() {
         for definition in EXCEPTION_TYPES {
             if let Some(parent) = definition.parent {
+                assert!(exception_type(parent).is_some(), "{}", definition.name);
+            }
+            if let Some(parent) = definition.secondary_parent {
                 assert!(exception_type(parent).is_some(), "{}", definition.name);
             }
         }

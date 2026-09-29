@@ -14,7 +14,7 @@ use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, NativeTypeDef, OwnedPyString, PyByteArray,
     PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList, PyProperty, PyResult,
-    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast, TypeMetadata,
 };
 use super::super::number::{index_argument, PyNumber};
 use super::super::object_model::BuiltinType;
@@ -129,6 +129,7 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "bytearray",
     methods: &[
+        method("bytearray", "__init__", bytearray_init),
         method("bytearray", "append", bytearray_append),
         method("bytearray", "extend", bytearray_extend),
         method("bytearray", "insert", bytearray_insert),
@@ -168,6 +169,7 @@ pub(crate) static SLICE_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static LIST_TYPE: NativeTypeDef = NativeTypeDef {
     name: "list",
     methods: &[
+        method("list", "__init__", list_init),
         method("list", "append", list_append),
         method("list", "insert", list_insert),
         method("list", "extend", list_extend),
@@ -202,7 +204,6 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
         method("dict", "__setitem__", dict_setitem),
         method("dict", "__delitem__", dict_delitem),
         method("dict", "__contains__", dict_contains),
-        method("dict", "__len__", dict_len),
         method("dict", "__iter__", dict_iter),
         method("dict", "__repr__", dict_repr),
         method("dict", "get", dict_get),
@@ -225,6 +226,7 @@ pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys"
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
     methods: &[
+        method("set", "__init__", set_init),
         method("set", "add", set_add),
         method("set", "update", set_update),
         method("set", "remove", set_remove),
@@ -280,13 +282,72 @@ pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
     methods: &[
         method("object", "__new__", object_new),
         method("object", "__init__", object_init),
+        method("object", "__init_subclass__", object_init_subclass),
+        method("object", "__repr__", object_repr),
+        method("object", "__str__", object_str),
         method("object", "__hash__", object_hash),
+        method("object", "__getattribute__", object_getattribute),
         method("object", "__eq__", object_eq),
         method("object", "__ne__", object_ne),
         method("object", "__setattr__", object_setattr),
         method("object", "__delattr__", object_delattr),
     ],
-    getters: &[],
+    getters: &[GetterDef {
+        owner: "object",
+        name: "__class__",
+        get: object_class,
+    }],
+};
+
+fn object_class(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime.class_of(&receiver)
+}
+
+/// The read side of the class, module and heap-instance `__dict__` descriptors.
+fn object_dict(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .dictionary_of(receiver)?
+        .ok_or_else(|| PyError::exception("AttributeError", "this object has no __dict__"))
+}
+
+fn type_name(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Name)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __name__"))
+}
+
+fn type_module(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Module)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __module__"))
+}
+
+fn type_bases(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Bases)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __bases__"))
+}
+
+fn type_mro_getter(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    runtime
+        .type_metadata(receiver, TypeMetadata::Mro)?
+        .ok_or_else(|| PyError::exception("AttributeError", "type has no __mro__"))
+}
+
+pub(crate) static INSTANCE_DICT_GETTER: GetterDef = GetterDef {
+    owner: "object",
+    name: "__dict__",
+    get: object_dict,
+};
+
+pub(crate) static MODULE_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "module",
+    methods: &[],
+    getters: &[GetterDef {
+        owner: "module",
+        name: "__dict__",
+        get: object_dict,
+    }],
 };
 
 pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
@@ -348,14 +409,42 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "type",
     methods: &[
         method("type", "__new__", type_new),
+        method("type", "__call__", type_call),
         method("type", "mro", type_mro),
     ],
-    getters: &[],
+    getters: &[
+        GetterDef {
+            owner: "type",
+            name: "__dict__",
+            get: object_dict,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__name__",
+            get: type_name,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__module__",
+            get: type_module,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__bases__",
+            get: type_bases,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__mro__",
+            get: type_mro_getter,
+        },
+    ],
 };
 
 pub(crate) static GENERATOR_TYPE: NativeTypeDef = NativeTypeDef {
     name: "generator",
     methods: &[
+        method("generator", "__iter__", iterator_iter),
         method("generator", "__next__", generator_next),
         method("generator", "send", generator_send),
         method("generator", "throw", generator_throw),
@@ -1285,6 +1374,21 @@ fn bytearray_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
     Ok(PyValue::None)
 }
 
+/// Mutable builtin initialization replaces the payload after reading its source.
+fn bytearray_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("bytearray.__init__", 0, 1)?;
+    args.reject_keywords("bytearray.__init__")?;
+    let items = args
+        .positional()
+        .first()
+        .map(|source| collect_bytes(runtime, *source))
+        .transpose()?
+        .unwrap_or_default();
+    let array = receiver.cast::<PyByteArray>(runtime)?;
+    runtime.replace_bytearray_items(array, items)?;
+    Ok(Value::None)
+}
+
 fn bytearray_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("bytearray.reverse", 0, 0)?;
     args.reject_keywords("bytearray.reverse")?;
@@ -1297,6 +1401,11 @@ fn bytearray_reverse(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallA
 }
 
 fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+    if runtime.is_unbounded_iterator(&value)? {
+        return Err(PyError::resource_error(
+            "cannot materialize infinite itertools.count without a bound",
+        ));
+    }
     let iterator = runtime.iterator(value)?;
     let mut bytes = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
@@ -1309,6 +1418,11 @@ fn collect_bytes(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8
 }
 
 fn collect_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyValue>> {
+    if runtime.is_unbounded_iterator(&value)? {
+        return Err(PyError::resource_error(
+            "cannot materialize infinite itertools.count without a bound",
+        ));
+    }
     let iterator = runtime.iterator(value)?;
     let mut values = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
@@ -2600,6 +2714,20 @@ fn list_extend(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     Ok(Value::None)
 }
 
+fn list_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("list.__init__", 0, 1)?;
+    args.reject_keywords("list.__init__")?;
+    let items = args
+        .positional()
+        .first()
+        .map(|source| collect_values(runtime, *source))
+        .transpose()?
+        .unwrap_or_default();
+    let list = receiver.cast::<PyList>(runtime)?;
+    runtime.replace_list_items(list, items)?;
+    Ok(Value::None)
+}
+
 fn list_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("list.pop", 0, 1)?;
     args.reject_keywords("list.pop")?;
@@ -2887,15 +3015,6 @@ fn dict_contains(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     ))
 }
 
-fn dict_len(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
-    args.expect_positional("dict.__len__", 0, 0)?;
-    args.reject_keywords("dict.__len__")?;
-    let entries = receiver.cast::<PyDict>(runtime)?.items(runtime)?;
-    let length =
-        i64::try_from(entries.len()).map_err(|_| PyError::overflow_error("dict is too large"))?;
-    Ok(Value::Int(length))
-}
-
 fn dict_iter(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("dict.__iter__", 0, 0)?;
     args.reject_keywords("dict.__iter__")?;
@@ -3055,8 +3174,86 @@ fn dict_copy(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     runtime.dict_copy(dict)
 }
 
-/// `view[key]` for a namespace view, which the VM's builtin subscript does not cover. The view's
-/// other dict behavior comes from `dict`'s own methods, through the runtime's dict accessors.
+/// A builtin iterator. The VM handles supported physical payloads before consulting their
+/// `__iter__` slots, so this call cannot redispatch into itself.
+pub(crate) fn slot_sequence_iter(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let iterator = runtime.iterator(receiver)?;
+    Ok(Some(Value::Object(iterator.object_id())))
+}
+
+/// A builtin type's physical length, shared with `len()` after user-slot dispatch.
+pub(crate) fn slot_builtin_length(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(length) = runtime.physical_length(receiver)? else {
+        return Ok(None);
+    };
+    let length =
+        i64::try_from(length).map_err(|_| PyError::overflow_error("length is too large"))?;
+    Ok(Some(Value::Int(length)))
+}
+
+/// `__getitem__` for builtin sequences whose indexing is implemented by the VM's physical
+/// payload reader. The reader also handles slices and their resource charges.
+pub(crate) fn slot_builtin_get_item(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    index: PyValue,
+) -> PyResult<Option<PyValue>> {
+    runtime.builtin_get_item(receiver, index).map(Some)
+}
+
+/// Membership for builtin payloads, preserving the VM's bounded search and element equality.
+pub(crate) fn slot_builtin_contains(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    item: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(runtime.builtin_contains(receiver, item)?)))
+}
+
+/// The base implementation accepts only an empty format specifier and uses the type's string
+/// protocol. Builtin number and string types replace it with their own format slot.
+pub(crate) fn slot_object_format(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    spec: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let OwnedPyString(spec) = spec.cast(runtime)?;
+    if !spec.is_empty() {
+        let name = runtime.type_name(&receiver)?;
+        return Err(PyError::type_error(format!(
+            "unsupported format string passed to {name}.__format__"
+        )));
+    }
+    let rendered = runtime.display(&receiver)?;
+    runtime.new_string(rendered).map(Some)
+}
+
+/// Format a builtin payload without redispatching through `__format__`.
+pub(crate) fn slot_builtin_format(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    spec: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let OwnedPyString(spec) = spec.cast(runtime)?;
+    let rendered = runtime.builtin_format(&receiver, &spec)?;
+    runtime.new_string(rendered).map(Some)
+}
+
+/// The builtin subscription slot preserves the origin and tuple of type arguments.
+pub(crate) fn slot_generic_alias(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    item: PyValue,
+) -> PyResult<Option<PyValue>> {
+    runtime.new_generic_alias(receiver, item).map(Some)
+}
+
 pub(crate) fn slot_namespace_dict_get_item(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -3185,6 +3382,23 @@ fn set_update(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
         for value in collect_values(runtime, *source)? {
             runtime.set_insert(set, value)?;
         }
+    }
+    Ok(Value::None)
+}
+
+fn set_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("set.__init__", 0, 1)?;
+    args.reject_keywords("set.__init__")?;
+    let items = args
+        .positional()
+        .first()
+        .map(|source| collect_values(runtime, *source))
+        .transpose()?
+        .unwrap_or_default();
+    let set = mutable_set(runtime, receiver, "__init__")?;
+    runtime.replace_set_items(set, Vec::new())?;
+    for item in items {
+        runtime.set_insert(set, item)?;
     }
     Ok(Value::None)
 }
@@ -3661,15 +3875,27 @@ fn builtin_filter(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 fn builtin_reversed(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("reversed", 1, 1)?;
     args.reject_keywords("reversed")?;
-    let iterator = runtime.iterator(args.positional()[0])?;
-    let mut values = Vec::new();
-    while let Some(value) = runtime.iterator_next(iterator)? {
-        runtime.reserve_memory(64)?;
-        values.push(value);
-    }
-    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
-    values.reverse();
-    runtime.new_iterator(values)
+    runtime.reverse_value(args.positional()[0])
+}
+
+pub(crate) fn slot_sequence_reversed(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    runtime.reverse_builtin_sequence(receiver).map(Some)
+}
+
+pub(crate) fn slot_dict_reversed(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let entries = runtime
+        .mapping_items(receiver)?
+        .ok_or_else(|| PyError::type_error("descriptor requires a dict"))?;
+    let mut keys = entries.into_iter().map(|(key, _)| key).collect::<Vec<_>>();
+    runtime.charge_cpu(u64::try_from(keys.len()).unwrap_or(u64::MAX))?;
+    keys.reverse();
+    runtime.new_iterator(keys).map(Some)
 }
 
 fn builtin_getattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -3703,7 +3929,7 @@ fn builtin_id(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 /// The stand-in address of an immediate value, below the heap addresses. Equal immediates are
 /// the same object, so this is a deterministic hash of the value.
-fn immediate_identity(value: &PyValue) -> u64 {
+pub(crate) fn immediate_identity(value: &PyValue) -> u64 {
     use std::hash::{Hash, Hasher};
     const IMMEDIATE_BASE: u64 = 0x5000_0000_0000;
     let mut hasher = std::hash::DefaultHasher::new();
@@ -3909,6 +4135,32 @@ fn object_init(_runtime: &mut dyn PyRuntime, _receiver: PyValue, args: CallArgs)
     Ok(Value::None)
 }
 
+/// End a cooperative class-initialization chain after every parent has had its turn.
+fn object_init_subclass(
+    _runtime: &mut dyn PyRuntime,
+    _receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
+    args.expect_positional("object.__init_subclass__", 0, 0)?;
+    args.reject_keywords("object.__init_subclass__")?;
+    Ok(Value::None)
+}
+
+/// The base representation uses identity even when a subclass overrides `__repr__`.
+fn object_repr(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__repr__", 0, 0)?;
+    args.reject_keywords("object.__repr__")?;
+    let rendered = runtime.default_object_repr(&receiver)?;
+    runtime.new_string(rendered)
+}
+
+fn object_str(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__str__", 0, 0)?;
+    args.reject_keywords("object.__str__")?;
+    let rendered = runtime.repr(&receiver)?;
+    runtime.new_string(rendered)
+}
+
 /// `object.__hash__`: the identity hash an instance has unless its class overrides it, so a
 /// class that defines `__eq__` can keep it with `__hash__ = object.__hash__`.
 fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
@@ -3919,6 +4171,20 @@ fn object_hash(_runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
         None => immediate_identity(&receiver),
     };
     Ok(Value::Int(super::super::hash::identity(identity)))
+}
+
+/// Call the default descriptor algorithm without the outer `__getattr__` fallback.
+fn object_getattribute(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("object.__getattribute__", 1, 1)?;
+    args.reject_keywords("object.__getattribute__")?;
+    let name = runtime
+        .string_value(&args.positional()[0])?
+        .ok_or_else(|| PyError::type_error("attribute name must be a string"))?;
+    runtime
+        .get_attribute_default(receiver, &name)?
+        .ok_or_else(|| {
+            PyError::exception("AttributeError", format!("attribute {name:?} not found"))
+        })
 }
 
 /// `object.__delattr__(name)`: the default deletion, which a class's own `__delattr__` calls.
@@ -4019,6 +4285,10 @@ fn exception_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     Ok(Value::None)
 }
 
+fn type_call(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    runtime.call_type_default(receiver, args)
+}
+
 fn type_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("type.__new__", 3, 3)?;
     args.reject_keywords("type.__new__")?;
@@ -4054,6 +4324,111 @@ pub(crate) fn slot_string_add(
         .ok_or_else(|| PyError::resource_error("string result is too large"))?;
     runtime.reserve_memory(bytes)?;
     runtime.new_string(left + &right).map(Some)
+}
+
+pub(crate) fn slot_string_hash(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(text) = runtime.string_value(&value)? else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+    Ok(Some(Value::Int(super::super::hash::string(&text))))
+}
+
+pub(crate) fn slot_none_bool(
+    _runtime: &mut dyn PyRuntime,
+    _value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Bool(false)))
+}
+
+pub(crate) fn slot_none_hash(
+    _runtime: &mut dyn PyRuntime,
+    _value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    Ok(Some(Value::Int(super::super::hash::NONE)))
+}
+
+pub(crate) fn slot_string_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(left == right)))
+}
+
+pub(crate) fn slot_string_not_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(left != right)))
+}
+
+fn slot_string_order(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+    accepted: &[Ordering],
+) -> PyResult<Option<PyValue>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Value::Bool(accepted.contains(&left.cmp(&right)))))
+}
+
+pub(crate) fn slot_string_less(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Less])
+}
+
+pub(crate) fn slot_string_less_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Less, Ordering::Equal])
+}
+
+pub(crate) fn slot_string_greater(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Greater])
+}
+
+pub(crate) fn slot_string_greater_equal(
+    runtime: &mut dyn PyRuntime,
+    left: PyValue,
+    right: PyValue,
+) -> PyResult<Option<PyValue>> {
+    slot_string_order(runtime, left, right, &[Ordering::Greater, Ordering::Equal])
+}
+
+pub(crate) fn slot_bytes_hash(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
+) -> PyResult<Option<PyValue>> {
+    let Some(bytes) = runtime.bytes_value(&value)? else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(u64::try_from(bytes.len() / 32).unwrap_or(u64::MAX))?;
+    Ok(Some(Value::Int(super::super::hash::bytes(&bytes))))
 }
 
 pub(crate) fn slot_string_multiply(
