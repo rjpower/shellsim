@@ -173,6 +173,15 @@ def test_complex_inverse_and_solve():
     assert single.dtype == np.complex64
 
 
+def test_ill_conditioned_complex_solve_has_small_residual():
+    a = np.array([[1 + 1j, 1 + 1j], [1, 1 + 1e-10]])
+    expected = np.array([1 + 2j, -1 + 1j])
+    b = a @ expected
+    result = np.linalg.solve(a, b)
+    assert_allclose(a @ result, b, atol=1e-14)
+    assert_allclose(result, expected, atol=1e-5)
+
+
 def test_complex_linalg_rejects_vectors_where_matrices_are_required():
     vector = np.array([1 + 1j, 2j])
     for operation in (np.linalg.inv, np.linalg.det, np.linalg.cholesky, np.linalg.eigh, np.linalg.eig, np.linalg.svd, np.linalg.qr):
@@ -363,6 +372,14 @@ def test_complex_qr_reconstructs_and_is_unitary():
     assert_allclose(q_full.conj().T @ q_full, np.eye(3), atol=1e-12)
     assert_allclose(q_full @ r_full, a, atol=1e-12)
     assert_allclose(np.linalg.qr(a, mode="r"), r, atol=1e-12)
+
+
+def test_complex_qr_preserves_small_scaled_columns():
+    a = 1e-12 * np.array([[1 + 1j, 1 + 1j], [0, 1e-6j], [0, 0]])
+    q, r = np.linalg.qr(a)
+    assert_allclose(q.conj().T @ q, np.eye(2), atol=1e-12)
+    assert_allclose(q @ r, a, atol=1e-24)
+    assert np.abs(r[1, 1]) > 1e-19
 
 
 def test_cholesky_is_lower_triangular_factor():
@@ -566,6 +583,31 @@ def test_complex_svd_rank_deficient_matrix():
     assert_allclose(u.conj().T @ u, np.eye(2), atol=1e-10)
     assert_allclose(a @ np.linalg.pinv(a) @ a, a, atol=1e-10)
     assert np.linalg.matrix_rank(a) == 1
+
+
+def test_complex_svd_retains_small_singular_value():
+    a = np.array([[1 + 1j, 1 + 1j], [1, 1 + 1e-8]])
+    u, s, vh = np.linalg.svd(a, full_matrices=False)
+    assert_allclose(s[1], np.abs(np.linalg.det(a)) / s[0], rtol=1e-6)
+    assert_allclose(u @ np.diag(s) @ vh, a, atol=1e-12)
+    assert_allclose(u.conj().T @ u, np.eye(2), atol=1e-12)
+    assert_allclose(vh @ vh.conj().T, np.eye(2), atol=1e-12)
+    assert np.linalg.matrix_rank(a) == 2
+    assert_allclose(a @ np.linalg.pinv(a) @ a, a, atol=1e-7)
+
+
+def test_complex_svd_wide_and_zero_matrices():
+    wide = np.array([[1 + 1j, 2, 0], [0, 1j, 3 - 1j]])
+    u, s, vh = np.linalg.svd(wide)
+    assert u.shape == (2, 2)
+    assert vh.shape == (3, 3)
+    assert_allclose(u @ np.diag(s) @ vh[:2], wide, atol=1e-12)
+    assert_allclose(vh @ vh.conj().T, np.eye(3), atol=1e-12)
+    zero = np.zeros((2, 3), dtype=complex)
+    u, s, vh = np.linalg.svd(zero, full_matrices=False)
+    assert_array_equal(s, [0, 0])
+    assert_allclose(u.conj().T @ u, np.eye(2), atol=1e-12)
+    assert_allclose(vh @ vh.conj().T, np.eye(2), atol=1e-12)
 
 
 def test_decompositions_return_float64_for_int_input():

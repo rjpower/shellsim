@@ -2,7 +2,7 @@
 
 Real matrices use the metered native dense kernels. Complex operations compose from those
 kernels and NumPy arrays: block-real solves and eigensolvers, direct elimination and Cholesky,
-Gram-Schmidt QR, and an AᴴA SVD. These small, readable paths trade speed and conditioning for
+Householder QR, and a one-sided Jacobi SVD. These small, readable paths trade speed for
 coverage of ordinary scientific calculations. Array operations and interpreter loops meter
 their work; no host numerical library is called. ``_numpy_linalg`` also exposes primitives for
 ``scipy.linalg``. See ``docs/numpy.md`` for the supported frontier.
@@ -54,9 +54,37 @@ def inv(a):
 
 def solve(a, b):
     """The solution ``x`` of ``a @ x == b``."""
+    a = np.asarray(a)
+    b = np.asarray(b)
+    work_dtype = np.complex128 if np.iscomplexobj(a) or np.iscomplexobj(b) else np.float64
+    work_a = a.astype(work_dtype)
+    work_b = b.astype(work_dtype)
+    result = _solve_once(work_a, work_b)
+    if result.size:
+        vector = b.ndim == 1
+        for _ in range(2):
+            residual = work_b - _solve_product(work_a, result, vector)
+            residual_size = np.max(np.abs(residual))
+            if residual_size == 0:
+                break
+            correction = _solve_once(work_a, residual)
+            candidate = result + correction
+            next_residual = work_b - _solve_product(work_a, candidate, vector)
+            if np.max(np.abs(next_residual)) >= residual_size:
+                break
+            result = candidate
+    return result.astype(np.result_type(a, b, np.float32))
+
+
+def _solve_product(a, x, vector):
+    if vector:
+        return (a @ x[..., np.newaxis])[..., 0]
+    return a @ x
+
+
+def _solve_once(a, b):
+    """Use the real kernel for one solve, expanding complex arithmetic into a real block."""
     if np.iscomplexobj(a) or np.iscomplexobj(b):
-        a = np.asarray(a)
-        b = np.asarray(b)
         n, _ = _matrix_shape(a, square=True)
         vector = b.ndim == 1
         if vector:
@@ -68,7 +96,7 @@ def solve(a, b):
             value = result[..., :n] + 1j * result[..., n:]
         else:
             value = result[..., :n, :] + 1j * result[..., n:, :]
-        return value.astype(np.result_type(a, b, np.float32))
+        return value
     return _solve(a, b)
 
 
@@ -172,7 +200,7 @@ def qr(a, mode="reduced"):
 
 
 def _orthogonalize(vector, basis):
-    """Two Gram-Schmidt passes keep small dense complex bases usable without a new kernel."""
+    """Two passes complete an orthonormal basis at zero singular values."""
     vector = vector.copy()
     for _ in range(2):
         for column in basis:
@@ -195,6 +223,7 @@ def _complete_basis(basis, size, count):
 
 
 def _complex_qr(a, mode):
+    """Factor a complex matrix with unitary Householder reflections."""
     if mode not in ("reduced", "complete", "r"):
         if mode == "raw":
             raise NotImplementedError("raw complex QR is not supported")
@@ -206,29 +235,27 @@ def _complex_qr(a, mode):
     q_results = []
     r_results = []
     for source in a.reshape((-1, rows, cols)):
-        basis = []
-        r = np.zeros((reduced, cols), dtype=np.complex128)
-        for col in range(cols):
-            candidate = source[:, col].astype(np.complex128)
-            for prior, vector in enumerate(basis):
-                coefficient = np.vdot(vector, candidate)
-                r[prior, col] = coefficient
-                candidate -= coefficient * vector
-            if col < reduced:
-                candidate = _orthogonalize(candidate, basis)
-                length = np.sqrt(np.vdot(candidate, candidate).real)
-                if length > 1e-10:
-                    basis.append(candidate / length)
-                    r[col, col] = length
-                else:
-                    basis = _complete_basis(basis, rows, col + 1)
+        r = source.astype(np.complex128).copy()
+        q = np.eye(rows, dtype=np.complex128)
+        for col in range(reduced):
+            column = r[col:, col].copy()
+            length = _scaled_norm(column, axis=None, keepdims=False)
+            if length == 0:
+                continue
+            phase = column[0] / abs(column[0]) if column[0] != 0 else 1
+            column[0] += phase * length
+            column /= _scaled_norm(column, axis=None, keepdims=False)
+            trailing = r[col:, col:]
+            r[col:, col:] = trailing - 2 * np.outer(column, column.conj() @ trailing)
+            trailing_q = q[:, col:]
+            q[:, col:] = trailing_q - 2 * np.outer(trailing_q @ column, column.conj())
+            r[col + 1 :, col] = 0
         if mode == "complete":
-            basis = _complete_basis(basis, rows, rows)
-            full_r = np.zeros((rows, cols), dtype=np.complex128)
-            full_r[:reduced] = r
-            r = full_r
-        q_results.append(np.array(basis).T)
-        r_results.append(r)
+            q_results.append(q)
+            r_results.append(r)
+        else:
+            q_results.append(q[:, :reduced])
+            r_results.append(r[:reduced])
     r_rows = rows if mode == "complete" else reduced
     result_r = np.array(r_results, dtype=a.dtype).reshape(batch_shape + (r_rows, cols))
     if mode == "r":
@@ -416,7 +443,7 @@ def svdvals(a):
 
 
 def _complex_svd(a, full_matrices, compute_uv):
-    """Diagonalize AᴴA, then recover left vectors from A times each right vector."""
+    """Orthogonalize column pairs without forming the ill-conditioned AᴴA."""
     a = np.asarray(a)
     rows, cols = _matrix_shape(a)
     count = min(rows, cols)
@@ -425,33 +452,68 @@ def _complex_svd(a, full_matrices, compute_uv):
     left_matrices = []
     right_matrices = []
     for source in a.reshape((-1, rows, cols)):
-        source = source.astype(np.complex128)
-        scale = np.max(np.abs(source)) if rows and cols else 0.0
-        scaled = source / scale if scale else source
-        gram = scaled.conj().T @ scaled
-        eigenvalues, eigenvectors = _complex_eigh(gram, "L", True)
-        order = list(range(cols - 1, -1, -1))
-        values = [np.sqrt(max(0.0, eigenvalues[index])) * scale for index in order[:count]]
+        columns = source.astype(np.complex128).copy()
+        right = np.eye(cols, dtype=np.complex128)
+        rank_floor = _scaled_norm(columns, axis=None, keepdims=False) * max(rows, cols) * np.finfo(np.float64).eps
+        for _ in range(20 * cols):
+            changed = False
+            for first in range(cols):
+                for second in range(first + 1, cols):
+                    left_column = columns[:, first].copy()
+                    right_column = columns[:, second].copy()
+                    left_length = _scaled_norm(left_column, axis=None, keepdims=False)
+                    right_length = _scaled_norm(right_column, axis=None, keepdims=False)
+                    if left_length <= rank_floor or right_length <= rank_floor:
+                        continue
+                    cosine = np.vdot(left_column / left_length, right_column / right_length)
+                    if abs(cosine) <= 1e-14:
+                        continue
+                    scale = max(left_length, right_length)
+                    left_size = left_length / scale
+                    right_size = right_length / scale
+                    overlap = abs(cosine) * left_size * right_size
+                    if overlap == 0:
+                        continue
+                    difference = (right_size - left_size) * (right_size + left_size)
+                    half_difference = difference / 2
+                    tangent = (1 if difference >= 0 else -1) * overlap / (
+                        abs(half_difference) + np.sqrt(half_difference ** 2 + overlap ** 2)
+                    )
+                    if tangent == 0:
+                        continue
+                    changed = True
+                    cosine_angle = 1 / np.sqrt(1 + tangent * tangent)
+                    sine_angle = tangent * cosine_angle
+                    phase = cosine.conjugate() / abs(cosine)
+                    columns[:, first] = cosine_angle * left_column - sine_angle * phase * right_column
+                    columns[:, second] = sine_angle * left_column + cosine_angle * phase * right_column
+                    left_vector = right[:, first].copy()
+                    right_vector = right[:, second].copy()
+                    right[:, first] = cosine_angle * left_vector - sine_angle * phase * right_vector
+                    right[:, second] = sine_angle * left_vector + cosine_angle * phase * right_vector
+            if not changed:
+                break
+        else:
+            raise LinAlgError("SVD did not converge")
+        lengths = [_scaled_norm(columns[:, index], axis=None, keepdims=False) for index in range(cols)]
+        order = sorted(range(cols), key=lambda index: lengths[index], reverse=True)
+        values = [lengths[index] for index in order[:count]]
         singular_values.append(values)
         if not compute_uv:
             continue
-        right = [eigenvectors[:, index] for index in order]
         left = []
-        tolerance = (max(values) if values else 0.0) * max(rows, cols) * 1e-14
+        tolerance = (values[0] if values else 0.0) * max(rows, cols) * np.finfo(np.float64).eps
         for index, value in enumerate(values):
             if value > tolerance:
-                candidate = source @ right[index] / value
-                candidate = _orthogonalize(candidate, left)
-                length = np.sqrt(np.vdot(candidate, candidate).real)
-                if length > 1e-10:
-                    left.append(candidate / length)
-                    continue
+                candidate = columns[:, order[index]] / value
+                left.append(candidate)
+                continue
             left = _complete_basis(left, rows, len(left) + 1)
         if full_matrices:
             left = _complete_basis(left, rows, rows)
         left_matrices.append(np.array(left).T)
         right_count = cols if full_matrices else count
-        right_matrices.append(np.array(right[:right_count]).conj())
+        right_matrices.append(right[:, order[:right_count]].conj().T)
     real_dtype = np.float32 if a.dtype == np.complex64 else np.float64
     s = np.array(singular_values, dtype=real_dtype).reshape(batch_shape + (count,))
     if not compute_uv:
@@ -550,9 +612,24 @@ def lstsq(a, b, rcond=None):
     return x, residuals, rank, s
 
 
+def _scaled_norm(x, axis, keepdims):
+    """Scale before squaring so finite two-norms survive extreme magnitudes."""
+    magnitude = np.abs(x)
+    if magnitude.size == 0:
+        return np.sqrt(np.sum(magnitude ** 2, axis=axis, keepdims=keepdims))
+    scale = np.max(magnitude, axis=axis, keepdims=True)
+    safe_scale = np.where(scale == 0, 1, scale)
+    squares = np.sum((magnitude / safe_scale) ** 2, axis=axis, keepdims=True)
+    result = scale * np.sqrt(squares)
+    result = np.where(np.isinf(scale), scale, result)
+    if keepdims:
+        return result
+    return np.squeeze(result, axis=axis)
+
+
 def _vector_norm(x, ord, axis, keepdims):
     if ord is None or ord == 2:
-        return np.sqrt(np.sum(np.abs(x) ** 2, axis=axis, keepdims=keepdims))
+        return _scaled_norm(x, axis, keepdims)
     if ord == np.inf:
         return np.max(np.abs(x), axis=axis, keepdims=keepdims)
     if ord == -np.inf:
@@ -566,7 +643,7 @@ def _vector_norm(x, ord, axis, keepdims):
 
 def _matrix_norm(x, ord, keepdims):
     if ord is None or ord == "fro":
-        result = np.sqrt(np.sum(np.abs(x) ** 2, axis=(-2, -1)))
+        result = _scaled_norm(x, axis=(-2, -1), keepdims=False)
     elif ord == "nuc":
         result = np.sum(svdvals(x), axis=-1)
     elif ord == 1:

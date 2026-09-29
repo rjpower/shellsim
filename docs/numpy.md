@@ -117,9 +117,11 @@ Some results differ from NumPy by design:
 - **Elements of text and object arrays** are returned as plain Python `str` values and the
   stored objects.
 - **Complex linear algebra.** These small-array paths use a real block representation for
-  solves and eigenproblems, Gram-Schmidt for QR, and eigenvectors of `A.conj().T @ A` for SVD.
-  They do more work than the real kernels and lose accuracy earlier on ill-conditioned matrices.
-  They are intended for ordinary finite scientific checks, not large or ill-conditioned systems.
+  solves and eigenproblems, Householder reflections for QR, and one-sided Jacobi sweeps for SVD.
+  Solves check their residual and make up to two correction passes. Euclidean and Frobenius norms
+  scale before squaring. These methods do more work than the real kernels and cannot recover
+  digits lost to input conditioning; general complex eigenvectors remain especially sensitive
+  near repeated or defective eigenvalues. They are intended for small scientific calculations.
 
 The portable suites in `tests/python/numpy/` state this contract. Cargo runs them under shellsim
 (see `tests/python/scientific_suites.rs`). To re-check them against real NumPy, build the pinned
