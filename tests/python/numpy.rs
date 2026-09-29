@@ -32,6 +32,19 @@ fn assert_fails_with(source: &str, expected: &str) {
     );
 }
 
+#[test]
+fn scaled_linalg_norms_avoid_intermediate_overflow_and_underflow() {
+    let source = r#"import numpy as np
+large = np.linalg.norm(np.array([1e200, 1e200]))
+small = np.linalg.norm(np.array([1e-200, 1e-200]))
+complex_matrix = np.linalg.norm(np.array([[1e200 + 0j, 0], [0, 1e200j]]))
+assert abs(large / 1e200 - 2 ** 0.5) < 1e-14
+assert abs(small / 1e-200 - 2 ** 0.5) < 1e-14
+assert abs(complex_matrix / 1e200 - 2 ** 0.5) < 1e-14
+"#;
+    assert_eq!(run(source), (0, Vec::new(), Vec::new()));
+}
+
 /// Asserts that `stderr` holds one `RuntimeWarning` per listed script line, in order.
 fn assert_warning_lines(stderr: &[u8], lines: &[usize]) {
     let stderr = String::from_utf8_lossy(stderr);
@@ -633,6 +646,14 @@ fn removed_numpy_submodules_are_missing() {
             "ModuleNotFoundError",
         );
     }
+}
+
+#[test]
+fn complex_qr_raw_mode_has_an_explicit_frontier() {
+    assert_fails_with(
+        "import numpy as np\nnp.linalg.qr(np.eye(2, dtype=complex), mode='raw')",
+        "NotImplementedError",
+    );
 }
 
 #[test]

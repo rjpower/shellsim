@@ -480,6 +480,21 @@ fn numpy_linalg_charges_cubic_work_before_factoring() {
 }
 
 #[test]
+fn complex_numpy_linalg_uses_the_same_cpu_boundary() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.eye(300, dtype=complex)\nprint('built')\nnp.linalg.inv(a)",
+        Limits {
+            cpu: 5_000_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 5_000_000);
+    assert_eq!(stdout, b"built\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn numpy_jacobi_eigensolver_charges_each_sweep() {
     let limits = Limits {
         cpu: 5_000_000,
