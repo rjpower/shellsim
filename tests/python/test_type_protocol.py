@@ -571,6 +571,8 @@ def test_numeric_and_string_equality_slots_decline_other_types():
     assert "a".__lt__("b") is True
     assert "a".__le__("a") is True
     assert "b".__gt__("a") is True
+    assert "b".__ge__("b") is True
+    assert "a".__lt__(1) is NotImplemented
 
 
 def test_compound_hash_descriptors_use_element_hashes():
@@ -583,8 +585,26 @@ def test_compound_hash_descriptors_use_element_hashes():
 
     pair = (Key(),)
     assert pair.__hash__() == hash(pair)
-    assert "b".__ge__("b") is True
-    assert "a".__lt__(1) is NotImplemented
+
+
+def test_container_comparison_descriptors_use_element_protocols():
+    class Key:
+        def __init__(self, value):
+            self.value = value
+
+        def __eq__(self, other):
+            return isinstance(other, Key) and self.value == other.value
+
+        def __lt__(self, other):
+            return isinstance(other, Key) and self.value < other.value
+
+    assert [Key(1)].__eq__([Key(1)]) is True
+    assert (Key(1),).__lt__((Key(2),)) is True
+    assert [1].__le__([1]) is True
+    assert {"a": Key(1)}.__eq__({"a": Key(1)}) is True
+    assert {1}.__eq__(frozenset({1})) is True
+    assert [1].__eq__((1,)) is NotImplemented
+    assert {}.__eq__([]) is NotImplemented
 
 
 def test_metaclass_data_descriptor_precedes_class_namespace():
