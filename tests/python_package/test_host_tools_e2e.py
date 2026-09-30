@@ -158,6 +158,25 @@ def test_oversized_tool_result_is_a_guest_error() -> None:
     assert (result.returncode, result.stdout, result.stderr) == (0, b"tool response too large\n", b"")
 
 
+def test_tool_call_in_synchronous_python_frame_fails_explicitly() -> None:
+    container = shellsim.Container(tools={"ping": lambda arguments: {"ok": True}})
+    container.write_file("/work/host_tools.py", (GUEST_SOURCE / "host_tools.py").read_bytes())
+    source = (
+        "from host_tools import ToolClient\n"
+        "class Caller:\n"
+        "    def __init__(self):\n"
+        "        ToolClient().call('ping', {})\n"
+        "try:\n"
+        "    Caller()\n"
+        "except RuntimeError as error:\n"
+        "    print(str(error))\n"
+    )
+
+    result = container.run(f"python3.14 -c {shlex.quote(source)}")
+    assert result.returncode == 0
+    assert result.stdout == b"host tools require scheduler-dispatched Python\n"
+
+
 def test_completed_action_does_not_invoke_orphan_tool_calls() -> None:
     calls: list[str] = []
 
