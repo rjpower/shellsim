@@ -17,6 +17,7 @@ from ._api import (
     Usage,
     run,
 )
+from .package import Package, PackageSpec
 
 __all__ = [
     "CommandUsage",
@@ -27,6 +28,8 @@ __all__ = [
     "Invocation",
     "Limits",
     "MountResult",
+    "Package",
+    "PackageSpec",
     "RunResult",
     "ShellSession",
     "SimulationError",

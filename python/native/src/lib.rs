@@ -117,6 +117,32 @@ impl NativeContainer {
         Ok(PyBytes::new(py, &bytes).unbind())
     }
 
+    fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
+        self.apply(
+            py,
+            HarnessOperation::MakeDirectory {
+                path,
+                mode,
+                parents: true,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn snapshot_workspace(&self, py: Python<'_>) -> PyResult<String> {
+        py.detach(|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+            on_worker(&mut session, |session| {
+                let entries = session.snapshot_workspace()?;
+                serde_json::to_string(&entries).map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
     fn start_execute(&self, py: Python<'_>, source: String, stdin: Vec<u8>) -> PyResult<String> {
         self.apply(
             py,

@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shlex
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
@@ -329,6 +330,8 @@ class Container:
         if limits is not None and not isinstance(limits, Limits):
             raise TypeError("limits must be a shellsim.Limits instance")
         self._tools = dict(tools)
+        self._entrypoint: Optional[Tuple[str, ...]] = None
+        self._working_directory = "/work"
         resolved = limits or Limits()
         self._native = _native.NativeContainer(
             resolved.cpu,
@@ -355,6 +358,24 @@ class Container:
         if not isinstance(path, str):
             raise TypeError("path must be str")
         return self._native.read_file(path)
+
+    def mkdir(self, path: str, *, mode: int = 0o755) -> None:
+        """Create a directory in the guest workspace, including missing parents."""
+
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        if isinstance(mode, bool) or not isinstance(mode, int):
+            raise TypeError("mode must be int")
+        if not 0 <= mode <= 0o7777:
+            raise ValueError("mode must be between 0 and 0o7777")
+        self._native.mkdir(path, mode)
+
+    def run_entrypoint(self) -> RunResult:
+        """Run the entrypoint installed by a `.shl` package."""
+
+        if self._entrypoint is None:
+            raise SimulationError("container has no package entrypoint")
+        return self.run(f"cd {shlex.quote(self._working_directory)} && {shlex.join(self._entrypoint)}")
 
     def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
         """Run an action, servicing guest tool requests with the registered Python handlers."""
