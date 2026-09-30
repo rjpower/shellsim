@@ -1,9 +1,20 @@
-//! Capability-scoped process, clock, and environment adapters for native modules.
+//! Capability-scoped process, clock, HTTP, and environment adapters for native modules.
 
 use super::{
-    PyClock, PyEnvironment, PyError, PyProcessHandle, PyProcessOutput, PyProcessPoll,
+    PyClock, PyEnvironment, PyError, PyHttpClient, PyProcessHandle, PyProcessOutput, PyProcessPoll,
     PyProcessRunner, PyProcessStartRequest, PyResult, Vm,
 };
+use crate::python::native::{PyHttpRequest, PyHttpResponse};
+
+impl PyHttpClient for Vm<'_> {
+    fn request(&mut self, request: PyHttpRequest) -> PyResult<Option<PyHttpResponse>> {
+        super::super::http::request(
+            self.interp,
+            request,
+            self.mode.scheduler_owned && self.native_suspend_allowed,
+        )
+    }
+}
 
 impl PyProcessRunner for Vm<'_> {
     fn start(&mut self, request: PyProcessStartRequest) -> PyResult<PyProcessHandle> {

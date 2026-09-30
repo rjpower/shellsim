@@ -3,8 +3,8 @@
 //! A manager assigns host-side session identities and routes existing typed operations into one
 //! [`HarnessSession`]. Forking uses the session's complete-state
 //! clone, so active actions, processes, descriptors, timers, Python heaps, and telemetry branch
-//! together. The manager never grants simulated code a capability or shares mutable machine state
-//! between sessions.
+//! together. A host tools grant is explicit and scoped to one session; a fork of a granted
+//! session is rejected. The manager does not share mutable machine state between sessions.
 
 use std::collections::BTreeMap;
 

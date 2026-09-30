@@ -2,8 +2,8 @@
 //!
 //! This module is a trusted adapter around [`Environment`], not a simulated capability. It
 //! accepts explicit bytes, exposes only typed VFS operations and shell actions, and reports
-//! stable workspace changes and telemetry. No method makes host files, processes, environment,
-//! network, or clocks visible to simulated programs.
+//! stable workspace changes and telemetry. Host tools are an explicit, bounded request/reply
+//! capability; no method grants ambient host files, processes, network, environment, or clocks.
 
 use std::collections::BTreeSet;
 
@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::net::NetworkRequest;
+use crate::net::{HttpResponse, NetworkRequest, MAX_HOST_MESSAGE_BYTES};
 use crate::process::{ProcessRecord, ProcessStatus};
 use crate::scheduler::{TaskState, WaitReason};
 use crate::telemetry::{CommandTrust, InvocationEvent};
@@ -58,6 +58,14 @@ pub enum HarnessOperation {
         work_quanta: usize,
         #[serde(default)]
         advance_time: bool,
+    },
+    /// Supply one result or error to a tool call returned by `poll_action`.
+    RespondToolCall {
+        request_id: u64,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+        #[serde(default)]
+        error: Option<String>,
     },
     WriteStdin {
         action_id: u64,
@@ -180,6 +188,8 @@ pub struct ActionView {
     pub dropped_unsupported: u64,
     pub network_requests: Vec<NetworkRequest>,
     pub dropped_network_requests: u64,
+    /// Newly issued calls, delivered once by a poll of this action.
+    pub tool_calls: Vec<ToolCallView>,
 }
 
 /// Retained action lifecycle. A blocked action can be resumed by input, a modeled event, or a
@@ -201,6 +211,14 @@ pub struct ActionOutput {
     pub stderr_base64: String,
     pub stdout_closed: bool,
     pub stderr_closed: bool,
+}
+
+/// One generic tool invocation decoded from the guest's virtual HTTP request.
+#[derive(Debug, Serialize)]
+pub struct ToolCallView {
+    pub request_id: u64,
+    pub tool: String,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Action output and telemetry. Stream bytes use explicit base64 without UTF-8 loss.
@@ -313,6 +331,7 @@ pub enum WaitReasonView {
     InputReadable { description: u32 },
     PipeReadable { pipe: u32 },
     PipeWritable { pipe: u32 },
+    HostHttp { request_id: u64 },
     Child { pid: u32 },
     ChildActivity { pid: u32 },
     ChildDeadline { pid: u32, deadline_ns: u64 },
@@ -362,6 +381,8 @@ pub struct HarnessSession {
 struct RetainedAction {
     id: u64,
     root_pid: u32,
+    /// Children created before this action cannot use its host-tool grant.
+    first_new_pid: u32,
     execution: Option<crate::exec::ShellExecution>,
     state: ActionState,
     outcome: Option<RunOutcome>,
@@ -392,6 +413,13 @@ impl RetainedAction {
         Self {
             id,
             root_pid: environment.process.pid,
+            first_new_pid: environment
+                .processes
+                .iter()
+                .map(|record| record.pid)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
             execution: None,
             state: ActionState::Running,
             outcome: None,
@@ -502,6 +530,7 @@ impl RetainedAction {
             } else {
                 self.dropped_network_requests
             },
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -526,6 +555,14 @@ impl HarnessSession {
             active_action: None,
             next_action_id: 0,
         }
+    }
+
+    /// Construct a machine with the single host-backed tool route granted at boot.
+    /// The caller owns dispatch and must complete calls returned by `poll_action`.
+    pub fn with_clock_and_host_tools(limits: Limits, clock: crate::realtime::ClockMode) -> Self {
+        let mut session = Self::with_clock(limits, clock);
+        session.environment.net.enable_host_tools();
+        session
     }
 
     /// Apply one request without broadening simulated capabilities.
@@ -565,6 +602,9 @@ impl HarnessSession {
     /// telemetry, and resource counters. The estimate is checked before the host allocation;
     /// each returned session subsequently owns and enforces an independent copy of its limits.
     pub fn fork(&self) -> Result<Self, String> {
+        if self.environment.net.host_tools_enabled() {
+            return Err("sessions with host tools cannot be forked".into());
+        }
         let current_disk = self.environment.vfs.disk_used();
         let baseline_disk = self.baseline.disk_used();
         if current_disk > MAX_TRANSFER_RAW_BYTES as u64
@@ -636,6 +676,36 @@ impl HarnessSession {
             } => self
                 .poll_action(action_id, work_quanta, advance_time)
                 .map(HarnessResult::Action),
+            HarnessOperation::RespondToolCall {
+                request_id,
+                result,
+                error,
+            } => {
+                let (status, reply) = match (result, error) {
+                    (Some(value), None) if value.is_object() => {
+                        (200, serde_json::json!({"result": value}))
+                    }
+                    (None, Some(message)) => (200, serde_json::json!({"error": message})),
+                    _ => return Err("supply one object result or one error".into()),
+                };
+                let mut body = serde_json::to_vec(&reply).map_err(|error| error.to_string())?;
+                if body.len() > MAX_HOST_MESSAGE_BYTES {
+                    body = br#"{"error":"tool response too large"}"#.to_vec();
+                }
+                let pid = self.environment.net.complete_host_request(
+                    request_id,
+                    HttpResponse {
+                        status,
+                        headers: vec![("Content-Type".into(), "application/json".into())],
+                        body,
+                    },
+                )?;
+                self.environment
+                    .scheduler
+                    .wake_waiters(WaitReason::HostHttp(request_id));
+                debug_assert!(self.environment.processes.get(pid).is_some());
+                Ok(HarnessResult::Acknowledged)
+            }
             HarnessOperation::WriteStdin {
                 action_id,
                 data_base64,
@@ -787,6 +857,9 @@ impl HarnessSession {
     }
 
     fn execute(&mut self, source: &str, stdin: &[u8]) -> Result<HarnessResult, String> {
+        if self.environment.net.host_tools_enabled() {
+            return Err("use start_execute and poll_action with host tools".into());
+        }
         let action_id = self.start_action(source, stdin, true)?.action_id;
         while self.active_action == Some(action_id) {
             self.poll_action(action_id, MAX_POLL_QUANTA, true)?;
@@ -902,6 +975,14 @@ impl HarnessSession {
                         return Err(error);
                     }
                 };
+                let had_unanswered = self.environment.net.has_unanswered_host_requests();
+                self.reap_host_requests_for_action(&action);
+                if matches!(poll, crate::exec::MachinePoll::Blocked)
+                    && had_unanswered
+                    && !self.environment.net.has_unanswered_host_requests()
+                {
+                    continue;
+                }
                 match poll {
                     crate::exec::MachinePoll::Progress => {}
                     crate::exec::MachinePoll::Blocked => {
@@ -942,10 +1023,23 @@ impl HarnessSession {
                 execution.restore(&mut self.environment);
                 action.complete(&self.environment, status);
                 self.active_action = None;
+                self.environment.net.discard_host_requests();
             } else {
                 action.execution = Some(execution);
             }
-            Ok(action.view(&self.environment))
+            let mut view = action.view(&self.environment);
+            view.tool_calls = self
+                .environment
+                .net
+                .take_host_requests()
+                .into_iter()
+                .map(|pending| ToolCallView {
+                    request_id: pending.id,
+                    tool: pending.call.tool,
+                    arguments: pending.call.arguments,
+                })
+                .collect();
+            Ok(view)
         })();
         self.actions.insert(action_id, action);
         result
@@ -1012,6 +1106,7 @@ impl HarnessSession {
                 self.environment.last_status = status;
                 action.complete(&self.environment, status);
                 self.active_action = None;
+                self.environment.net.discard_host_requests();
                 Ok(action.view(&self.environment))
             }
             Err(error) => {
@@ -1021,6 +1116,17 @@ impl HarnessSession {
         };
         self.actions.insert(action_id, action);
         result
+    }
+
+    /// Keep only live callers from this foreground action, not older background jobs.
+    fn reap_host_requests_for_action(&mut self, action: &RetainedAction) {
+        let processes = &self.environment.processes;
+        self.environment.net.retain_host_requests(|pid| {
+            processes
+                .get(pid)
+                .is_some_and(|record| !matches!(record.status, ProcessStatus::Exited(_)))
+                && process_belongs_to_action(processes, pid, action.root_pid, action.first_new_pid)
+        });
     }
 
     fn read_action_output(&mut self, action_id: u64) -> Result<ActionOutput, String> {
@@ -1187,6 +1293,29 @@ impl HarnessSession {
     }
 }
 
+/// Check ancestry as well as PID age so an old background job cannot delegate a new child.
+fn process_belongs_to_action(
+    processes: &crate::process::ProcessTable,
+    pid: u32,
+    root_pid: u32,
+    first_new_pid: u32,
+) -> bool {
+    let mut current = pid;
+    while current != root_pid {
+        if current < first_new_pid {
+            return false;
+        }
+        let Some(record) = processes.get(current) else {
+            return false;
+        };
+        if record.ppid >= current {
+            return false;
+        }
+        current = record.ppid;
+    }
+    true
+}
+
 fn cancel_execution(
     environment: &mut Environment,
     execution: &mut crate::exec::ShellExecution,
@@ -1262,6 +1391,7 @@ fn wait_reason_view(reason: WaitReason) -> WaitReasonView {
         WaitReason::InputReadable(description) => WaitReasonView::InputReadable { description },
         WaitReason::PipeReadable(pipe) => WaitReasonView::PipeReadable { pipe },
         WaitReason::PipeWritable(pipe) => WaitReasonView::PipeWritable { pipe },
+        WaitReason::HostHttp(request_id) => WaitReasonView::HostHttp { request_id },
         WaitReason::Child(pid) => WaitReasonView::Child { pid },
         WaitReason::ChildActivity(pid) => WaitReasonView::ChildActivity { pid },
         WaitReason::ChildDeadline(pid, deadline_ns) => {
@@ -1434,6 +1564,80 @@ fn validate_mode(mode: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_calls_are_scoped_to_current_action_descendants() {
+        let mut processes =
+            crate::process::ProcessTable::new(1_000, "/work".into(), Default::default());
+        let old = processes
+            .spawn(
+                1_000,
+                crate::process::ChildPlacement::Inherit,
+                "old",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let first_new_pid = old + 1;
+        let current = processes
+            .spawn(
+                1_000,
+                crate::process::ChildPlacement::Inherit,
+                "current",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let old_descendant = processes
+            .spawn(
+                old,
+                crate::process::ChildPlacement::Inherit,
+                "old-descendant",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let current_descendant = processes
+            .spawn(
+                current,
+                crate::process::ChildPlacement::Inherit,
+                "current-descendant",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+
+        assert!(process_belongs_to_action(
+            &processes,
+            1_000,
+            1_000,
+            first_new_pid
+        ));
+        assert!(process_belongs_to_action(
+            &processes,
+            current,
+            1_000,
+            first_new_pid
+        ));
+        assert!(process_belongs_to_action(
+            &processes,
+            current_descendant,
+            1_000,
+            first_new_pid
+        ));
+        assert!(!process_belongs_to_action(
+            &processes,
+            old,
+            1_000,
+            first_new_pid
+        ));
+        assert!(!process_belongs_to_action(
+            &processes,
+            old_descendant,
+            1_000,
+            first_new_pid
+        ));
+    }
 
     #[test]
     fn session_forks_preserve_and_isolate_complete_machine_state() {

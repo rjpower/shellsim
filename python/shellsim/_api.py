@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union
 
 from . import _native
 
 SimulationError = _native.SimulationError
+
+ToolHandler = Callable[[Mapping[str, Any]], Mapping[str, Any]]
+
+
+class ToolError(Exception):
+    """An intentional tool failure whose message may be returned to the guest."""
+
 
 _MAX_U64 = (1 << 64) - 1
 
@@ -303,6 +311,104 @@ class Environment:
             files=report["files"],
             skipped_directories=tuple(report["skipped_directories"]),
         )
+
+
+class Container:
+    """A shellsim machine whose guest can call explicitly registered Python host tools.
+
+    Tool handlers run in the constructing Python process. Guest HTTP reaches only the virtual
+    ``http://host.shellsim/tools`` endpoint; no guest socket or host API handle is exposed.
+    """
+
+    def __init__(self, tools: Mapping[str, ToolHandler], limits: Optional[Limits] = None) -> None:
+        if not isinstance(tools, Mapping):
+            raise TypeError("tools must be a mapping from names to callable handlers")
+        for name, handler in tools.items():
+            if not isinstance(name, str) or not name or not callable(handler):
+                raise TypeError("tool names must be nonempty strings with callable handlers")
+        if limits is not None and not isinstance(limits, Limits):
+            raise TypeError("limits must be a shellsim.Limits instance")
+        self._tools = dict(tools)
+        resolved = limits or Limits()
+        self._native = _native.NativeContainer(
+            resolved.cpu,
+            resolved.memory,
+            resolved.disk,
+            resolved.output,
+        )
+
+    def write_file(self, path: str, data: Union[bytes, bytearray, memoryview, str], *, mode: int = 0o644) -> None:
+        """Stage one file in the guest VFS without exposing its source host path."""
+
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        encoded = data.encode() if isinstance(data, str) else _as_bytes("data", data)
+        if isinstance(mode, bool) or not isinstance(mode, int):
+            raise TypeError("mode must be int")
+        if not 0 <= mode <= 0o7777:
+            raise ValueError("mode must be between 0 and 0o7777")
+        self._native.write_file(path, encoded, mode)
+
+    def read_file(self, path: str) -> bytes:
+        """Read one file from this container's guest VFS."""
+
+        if not isinstance(path, str):
+            raise TypeError("path must be str")
+        return self._native.read_file(path)
+
+    def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
+        """Run an action, servicing guest tool requests with the registered Python handlers."""
+
+        if not isinstance(source, str):
+            raise TypeError("source must be str")
+        started = json.loads(self._native.start_execute(source, _as_bytes("stdin", stdin)))
+        action_id = started["action_id"]
+        view = started
+        try:
+            while view["state"]["state"] != "complete":
+                view = json.loads(self._native.poll_action(action_id))
+                state = view["state"]["state"]
+                if state == "complete":
+                    break
+                for call in view["tool_calls"]:
+                    self._dispatch_tool(call)
+                if state == "blocked" and not view["tool_calls"]:
+                    raise SimulationError(f"action blocked without a tool call: {view['state'].get('reason')}")
+                if state == "stopped":
+                    raise SimulationError("action stopped before completion")
+            output = json.loads(self._native.read_action_output(action_id))
+            invocations = view["invocations"]
+            for trust, key in (("unsupported", "unsupported_commands"), ("partial", "partial_commands")):
+                view[key] = sorted({item["argv"][0] for item in invocations if item["trust"] == trust and item["argv"]})
+            return _decode_result(
+                json.dumps(view),
+                base64.b64decode(output["stdout_base64"]),
+                base64.b64decode(output["stderr_base64"]),
+            )
+        finally:
+            try:
+                if view["state"]["state"] != "complete":
+                    self._native.cancel_action(action_id)
+            finally:
+                self._native.drop_action(action_id)
+
+    def _dispatch_tool(self, call: Mapping[str, Any]) -> None:
+        name = call["tool"]
+        handler = self._tools.get(name)
+        if handler is None:
+            self._native.respond_tool_call(call["request_id"], None, "unknown tool")
+            return
+        try:
+            result = handler(call["arguments"])
+            if not isinstance(result, Mapping):
+                raise TypeError("tool result must be a JSON object")
+            encoded = json.dumps(dict(result), allow_nan=False)
+        except ToolError as error:
+            self._native.respond_tool_call(call["request_id"], None, str(error))
+        except Exception:
+            self._native.respond_tool_call(call["request_id"], None, "tool failed")
+        else:
+            self._native.respond_tool_call(call["request_id"], encoded, None)
 
 
 class ShellSession:

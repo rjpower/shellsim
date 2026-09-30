@@ -1,15 +1,17 @@
 //! Deterministic HTTP emulation over explicitly registered routes.
 //!
 //! Simulated programs never acquire sockets, DNS, or host-network access. HTTP clients submit a
-//! typed [`HttpRequest`] to [`VirtualNet`], which returns a configured [`HttpResponse`] or a
-//! deterministic error. Routes match an optional method and an exact URL or small `*` glob.
+//! typed [`HttpRequest`] to [`VirtualNet`], which returns a configured [`HttpResponse`], a host
+//! wait, or a deterministic error. Routes match an optional method and an exact URL or small
+//! `*` glob.
 //! Static response bodies are bounded at registration; VFS-backed bodies are read only from the
-//! simulated filesystem at request time.
+//! simulated filesystem at request time. A host-installed exact URL queues bounded guest HTTP
+//! requests for explicit harness completion; it never grants ambient host network access.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::vfs::Vfs;
 
@@ -26,6 +28,20 @@ const MAX_ROUTE_HEADERS: usize = 128;
 const MAX_ROUTE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_LOGGED_HEADERS: usize = 16;
 const MAX_LOGGED_HEADER_FIELD_BYTES: usize = 512;
+const MAX_HOST_REQUESTS: usize = 16;
+/// Largest JSON request or response body exchanged with a host tool.
+pub const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+
+/// Exact virtual URL reserved for host-provided tools. It never resolves through DNS.
+pub const HOST_TOOLS_URL: &str = "http://host.shellsim/tools";
+
+/// The single JSON envelope accepted by the host-backed virtual route.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ToolCall {
+    pub tool: String,
+    pub arguments: serde_json::Map<String, serde_json::Value>,
+}
 
 /// One HTTP request made entirely inside the simulated environment.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +50,28 @@ pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+/// One host-bound virtual request, delivered at most once to the harness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostHttpRequest {
+    pub id: u64,
+    pub request: HttpRequest,
+    pub call: ToolCall,
+}
+
+/// One guest HTTP operation either has its response or awaits explicit host completion.
+pub enum HttpPoll {
+    Ready(HttpResponse),
+    Blocked(u64),
+}
+
+#[derive(Clone)]
+struct HostRequestSlot {
+    request: HostHttpRequest,
+    delivered: bool,
+    response: Option<HttpResponse>,
+    log_index: Option<usize>,
 }
 
 impl HttpRequest {
@@ -127,6 +165,7 @@ impl std::error::Error for RouteError {}
 pub enum RequestError {
     NoRoute,
     UnreadableVfsBody { path: String, error: String },
+    HostRejected(String),
 }
 
 impl fmt::Display for RequestError {
@@ -136,6 +175,7 @@ impl fmt::Display for RequestError {
             Self::UnreadableVfsBody { path, error } => {
                 write!(formatter, "cannot read virtual HTTP body {path}: {error}")
             }
+            Self::HostRejected(message) => formatter.write_str(message),
         }
     }
 }
@@ -168,11 +208,175 @@ pub struct VirtualNet {
     pub dropped_requests: u64,
     /// Arbitrary host:port services that tests may mark as listening.
     pub listening: HashMap<String, bool>,
+    host_tools_enabled: bool,
+    next_host_request_id: u64,
+    host_requests: BTreeMap<u32, HostRequestSlot>,
 }
 
 impl VirtualNet {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Install the one host-backed virtual endpoint for this machine.
+    pub fn enable_host_tools(&mut self) {
+        self.host_tools_enabled = true;
+    }
+
+    /// Whether the trusted host installed the exact tool transport URL.
+    pub fn host_tools_enabled(&self) -> bool {
+        self.host_tools_enabled
+    }
+
+    /// Whether a guest is waiting for an external reply that virtual time cannot produce.
+    pub fn has_unanswered_host_requests(&self) -> bool {
+        self.host_requests
+            .values()
+            .any(|slot| slot.response.is_none())
+    }
+
+    /// Dispatch guest HTTP through the route table or the exact host-backed endpoint.
+    ///
+    /// A pending host reply is reported as [`HttpPoll::Blocked`], so each guest execution model
+    /// can suspend on the same scheduler resource and retry this request.
+    pub fn request_for_process(
+        &mut self,
+        pid: u32,
+        request: HttpRequest,
+        vfs: &Vfs,
+    ) -> Result<HttpPoll, RequestError> {
+        if self.host_tools_enabled && request.url == HOST_TOOLS_URL {
+            return self
+                .host_tool_request(pid, request)
+                .map_err(RequestError::HostRejected);
+        }
+        self.request(request, vfs).map(HttpPoll::Ready)
+    }
+
+    /// Queue or resume a guest POST to the host endpoint without resending it.
+    pub fn host_tool_request(
+        &mut self,
+        pid: u32,
+        request: HttpRequest,
+    ) -> Result<HttpPoll, String> {
+        if !self.host_tools_enabled || request.url != HOST_TOOLS_URL {
+            return Err("host tools endpoint is not enabled".into());
+        }
+        if request.method != "POST" {
+            let response = HttpResponse {
+                status: 405,
+                headers: vec![("Allow".into(), "POST".into())],
+                body: Vec::new(),
+            };
+            let log_index = (self.log.len() < MAX_REQUEST_LOG).then_some(self.log.len());
+            self.record_request(&request, None);
+            if let Some(index) = log_index {
+                self.log[index].matched = true;
+                self.log[index].response_status = Some(response.status);
+            }
+            return Ok(HttpPoll::Ready(response));
+        }
+        if request.body.len() > MAX_HOST_MESSAGE_BYTES {
+            return Err("host request body exceeds 1 MiB".into());
+        }
+        let call: ToolCall = serde_json::from_slice(&request.body).map_err(|_| {
+            "host tool request must contain a tool and object arguments".to_string()
+        })?;
+        if call.tool.is_empty() || call.tool.len() > MAX_REQUEST_FIELD_BYTES {
+            return Err("host tool name is empty or too long".into());
+        }
+        if request.headers.len() > MAX_ROUTE_HEADERS
+            || request
+                .headers
+                .iter()
+                .try_fold(0usize, |bytes, (name, value)| {
+                    bytes.checked_add(name.len())?.checked_add(value.len())
+                })
+                .is_none_or(|bytes| bytes > MAX_ROUTE_HEADER_BYTES)
+        {
+            return Err("host request headers exceed their limit".into());
+        }
+        if let Some(slot) = self.host_requests.get(&pid) {
+            if slot.request.request != request {
+                return Err("a different host request is already pending for this process".into());
+            }
+            if let Some(response) = &slot.response {
+                let response = response.clone();
+                self.host_requests.remove(&pid);
+                return Ok(HttpPoll::Ready(response));
+            }
+            return Ok(HttpPoll::Blocked(slot.request.id));
+        }
+        if self.host_requests.len() >= MAX_HOST_REQUESTS {
+            return Err("host request limit reached".into());
+        }
+        let id = self.next_host_request_id;
+        self.next_host_request_id = id
+            .checked_add(1)
+            .ok_or_else(|| "host request identifier space exhausted".to_string())?;
+        let log_index = (self.log.len() < MAX_REQUEST_LOG).then_some(self.log.len());
+        self.record_request(&request, None);
+        if let Some(index) = log_index {
+            self.log[index].matched = true;
+        }
+        self.host_requests.insert(
+            pid,
+            HostRequestSlot {
+                request: HostHttpRequest { id, request, call },
+                delivered: false,
+                response: None,
+                log_index,
+            },
+        );
+        Ok(HttpPoll::Blocked(id))
+    }
+
+    /// Drain requests not yet delivered to the host; repeated reads do not duplicate calls.
+    pub fn take_host_requests(&mut self) -> Vec<HostHttpRequest> {
+        self.host_requests
+            .values_mut()
+            .filter(|slot| !slot.delivered)
+            .map(|slot| {
+                slot.delivered = true;
+                slot.request.clone()
+            })
+            .collect()
+    }
+
+    /// Complete exactly one delivered request and return the process to wake.
+    pub fn complete_host_request(
+        &mut self,
+        id: u64,
+        response: HttpResponse,
+    ) -> Result<u32, String> {
+        validate_route(HOST_TOOLS_URL, Some("POST"), &response)
+            .map_err(|error| error.to_string())?;
+        if response.body.len() > MAX_HOST_MESSAGE_BYTES {
+            return Err("host response body exceeds 1 MiB".into());
+        }
+        let (pid, slot) = self
+            .host_requests
+            .iter_mut()
+            .find(|(_, slot)| slot.request.id == id)
+            .ok_or_else(|| format!("host request {id} does not exist"))?;
+        if !slot.delivered || slot.response.is_some() {
+            return Err(format!("host request {id} cannot be completed"));
+        }
+        if let Some(index) = slot.log_index {
+            self.log[index].response_status = Some(response.status);
+        }
+        slot.response = Some(response);
+        Ok(*pid)
+    }
+
+    /// Discard requests whose caller has exited, so cancellation cannot leave stale replies.
+    pub fn retain_host_requests(&mut self, mut process_is_live: impl FnMut(u32) -> bool) {
+        self.host_requests.retain(|pid, _| process_is_live(*pid));
+    }
+
+    /// End the current action without carrying outstanding calls into a later action.
+    pub fn discard_host_requests(&mut self) {
+        self.host_requests.clear();
     }
 
     /// Register a static response for an exact URL or `*` glob.
@@ -444,6 +648,45 @@ mod tests {
         assert!(pattern_matches("https://api/*/v1", "https://api/foo/v1"));
         assert!(!pattern_matches("https://api/*/v1", "https://api/foo/v2"));
         assert!(pattern_matches("exact", "exact"));
+    }
+
+    #[test]
+    fn host_endpoint_bounds_messages_and_retries_without_redelivery() {
+        let mut net = VirtualNet::new();
+        let mut request = HttpRequest::new("POST", HOST_TOOLS_URL);
+        request.body = br#"{"tool":"workspace.read_file","arguments":{"path":"/work/a"}}"#.to_vec();
+        assert!(net.host_tool_request(7, request.clone()).is_err());
+        net.enable_host_tools();
+        let oversized = HttpRequest {
+            body: vec![0; MAX_HOST_MESSAGE_BYTES + 1],
+            ..request.clone()
+        };
+        assert!(net.host_tool_request(7, oversized).is_err());
+        let invalid = HttpRequest {
+            body: br#"{"tool":"workspace.read_file","arguments":[]}"#.to_vec(),
+            ..request.clone()
+        };
+        assert!(net.host_tool_request(7, invalid).is_err());
+        let HttpPoll::Blocked(id) = net.host_tool_request(7, request.clone()).unwrap() else {
+            panic!("host request did not block");
+        };
+        assert!(matches!(
+            net.host_tool_request(7, request.clone()),
+            Ok(HttpPoll::Blocked(pending)) if pending == id
+        ));
+        assert_eq!(net.take_host_requests().len(), 1);
+        assert!(net.take_host_requests().is_empty());
+        assert!(net
+            .complete_host_request(id, HttpResponse::ok(vec![0; MAX_HOST_MESSAGE_BYTES + 1]))
+            .is_err());
+        net.complete_host_request(id, HttpResponse::ok("done"))
+            .unwrap();
+        assert_eq!(net.log[0].response_status, Some(200));
+        assert!(matches!(
+            net.host_tool_request(7, request),
+            Ok(HttpPoll::Ready(response)) if response.body == b"done"
+        ));
+        assert!(net.take_host_requests().is_empty());
     }
 
     #[test]

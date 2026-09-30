@@ -3,6 +3,7 @@
 from . import python as python
 from ._api import (
     CommandUsage,
+    Container,
     Environment,
     HttpRequest,
     HttpResponse,
@@ -12,12 +13,14 @@ from ._api import (
     RunResult,
     ShellSession,
     SimulationError,
+    ToolError,
     Usage,
     run,
 )
 
 __all__ = [
     "CommandUsage",
+    "Container",
     "Environment",
     "HttpRequest",
     "HttpResponse",
@@ -27,6 +30,7 @@ __all__ = [
     "RunResult",
     "ShellSession",
     "SimulationError",
+    "ToolError",
     "Usage",
     "run",
     "python",

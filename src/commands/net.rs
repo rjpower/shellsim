@@ -1,24 +1,25 @@
-//! Virtual networking: `curl`/`wget` resolve the route table (no real egress), and the
+//! Virtual networking: `curl`/`wget` use resumable scoped HTTP without real egress, and the
 //! `net` control command wires up fake URLs / probes the request log from a script.
 
 use std::collections::HashMap;
 
 use crate::commands::util::{ewln, wln};
 use crate::commands::{CommandSpec, Io, Trust};
+use crate::exec::ShellPoll;
 use crate::program::ProcessContext;
 
 pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
-    use super::reg_system;
-    reg_system(m, "/usr/bin/curl", Trust::Real, cmd_curl);
-    reg_system(m, "/usr/bin/wget", Trust::Real, cmd_wget);
+    use super::{reg_system, reg_system_poll};
+    reg_system_poll(m, "/usr/bin/curl", Trust::Real, cmd_curl);
+    reg_system_poll(m, "/usr/bin/wget", Trust::Real, cmd_wget);
     reg_system(m, "/usr/bin/net", Trust::Real, cmd_net);
 }
 
-fn cmd_curl(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+fn cmd_curl(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     crate::netcmd::curl(context.system, context.args, io.out, io.err)
 }
 
-fn cmd_wget(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
+fn cmd_wget(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     crate::netcmd::wget(context.system, context.args, io.out, io.err)
 }
 

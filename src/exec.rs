@@ -2961,7 +2961,8 @@ fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, S
             return Ok(true);
         }
         // A real-time clock cannot jump; the driver waits for the next deadline instead.
-        if !advance_time || interp.real_time.is_some() {
+        if !advance_time || interp.real_time.is_some() || interp.net.has_unanswered_host_requests()
+        {
             return Ok(false);
         }
         let fired = interp

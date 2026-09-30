@@ -747,7 +747,7 @@ mod tests {
         fn http_request(
             &mut self,
             _request: crate::net::HttpRequest,
-        ) -> Result<crate::net::HttpResponse, crate::net::RequestError> {
+        ) -> Result<crate::net::HttpPoll, crate::net::RequestError> {
             unreachable!("native writer does not make HTTP requests")
         }
 

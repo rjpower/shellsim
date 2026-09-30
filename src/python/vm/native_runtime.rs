@@ -67,7 +67,7 @@ fn wait_reason_ready(
     use crate::scheduler::WaitReason;
 
     match reason {
-        WaitReason::ShellSession(_) => false,
+        WaitReason::ShellSession(_) | WaitReason::HostHttp(_) => false,
         WaitReason::Timer(deadline) => *deadline <= now,
         WaitReason::InputReadable(description) => interp.descriptors.input_readable(*description),
         WaitReason::PipeReadable(pipe) => interp.descriptors.pipe_readable(*pipe),
@@ -2672,7 +2672,7 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn http(&mut self) -> &mut dyn PyHttpClient {
-        self.interp
+        self
     }
 
     fn processes(&mut self) -> &mut dyn PyProcessRunner {

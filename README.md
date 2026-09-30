@@ -183,6 +183,13 @@ as a stdio MCP server. `shellsim replay scenario.ndjson` reruns checked action t
 `shellsim corpus manifest.json` runs frozen shell and Python workloads under a versioned stock
 environment and emits a classified JSON report. See [compatibility testing](docs/compatibility-testing.md).
 
+`shellsim serve --host-tools` grants a virtual guest-to-host tool route at construction. The
+trusted runner receives typed calls in `poll_action` and completes them with `respond_tool_call`;
+ordinary sessions have no such route. See [`.shl` package design](docs/shl-packages.md).
+
+Python hosts can instead use `shellsim.Container(tools={"name": handler})` to register handlers
+at construction and call `container.run(...)` without a CLI subprocess or manual polling.
+
 ```sh
 printf '%s\n' \
   '{"id":1,"op":"execute","source":"printf hello > result"}' \
