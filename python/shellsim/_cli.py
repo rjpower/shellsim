@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import sys
+import urllib.error
 from collections.abc import Sequence
 from typing import Any, Optional
 
-from ._api import Environment, RunResult, SimulationError
+from ._api import Environment, Limits, RunResult, SimulationError
+from .package import Package
 
 _MAX_U64 = (1 << 64) - 1
 
@@ -98,6 +100,33 @@ def _read_bytes(stream: Any) -> bytes:
     return data.encode() if isinstance(data, str) else data
 
 
+def _run_package(arguments: Sequence[str]) -> int:
+    """Fetch a remote package on the host and run its entrypoint in a fresh guest."""
+
+    parser = argparse.ArgumentParser(prog="shellsim run")
+    parser.add_argument("url", help="HTTPS URL of a .shl package")
+    parser.add_argument("--sha256", help="expected SHA-256 of the complete package blob")
+    for name in ("cpu", "memory", "disk", "output"):
+        parser.add_argument(f"--{name}", type=_quantity, help=f"host {name} limit")
+    options = parser.parse_args(arguments)
+    try:
+        package = Package.from_url(options.url, expected_sha256=options.sha256)
+        defaults = Limits()
+        limits = Limits(
+            **{
+                name: getattr(options, name) if getattr(options, name) is not None else getattr(defaults, name)
+                for name in ("cpu", "memory", "disk", "output")
+            }
+        )
+        container = package.instantiate(tools={}, limits=limits)
+        result = container.run_entrypoint()
+    except (OSError, ValueError, SimulationError, urllib.error.URLError) as error:
+        print(f"shellsim: {error}", file=sys.stderr)
+        return 2
+    _emit_result(result, sys.stdout, sys.stderr)
+    return result.returncode
+
+
 def _prepare_environment(options: argparse.Namespace, stdout: Any, stderr: Any) -> tuple[Optional[Environment], int]:
     """Create a simulated machine, import an optional host snapshot, and enter `/work`."""
 
@@ -149,6 +178,8 @@ def main(arguments: Optional[Sequence[str]] = None) -> int:
     """Run the package CLI and return the simulated or usage exit status."""
 
     parsed_arguments = list(sys.argv[1:] if arguments is None else arguments)
+    if parsed_arguments[:1] == ["run"]:
+        return _run_package(parsed_arguments[1:])
     if parsed_arguments[-1:] == ["--"]:
         parsed_arguments.pop()
     options = _parser().parse_args(parsed_arguments)

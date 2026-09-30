@@ -196,3 +196,46 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
         archive.writestr("bomb", b"x" * (6 * 1024 * 1024 + 1))
     with pytest.raises(ValueError, match="exceeds 6 MiB"):
         shellsim.Package.build_from_zip(compressed.getvalue(), spec=SPEC)
+
+
+def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+    from shellsim._cli import main
+
+    toolchain = Path(__file__).resolve().parents[1] / "fixtures" / "tinycc" / "tcc-shellsim-package.tar.gz"
+    (tmp_path / "tcc.tar.gz").write_bytes(toolchain.read_bytes())
+    (tmp_path / "hello.c").write_text(
+        "struct iovec { const char *buf; unsigned len; };\n"
+        "void *memset(void *pointer, int value, unsigned size) {\n"
+        "    unsigned char *bytes = pointer;\n"
+        "    for (unsigned index = 0; index < size; ++index) bytes[index] = value;\n"
+        "    return pointer;\n"
+        "}\n"
+        "extern int write_guest(int, const struct iovec *, unsigned, unsigned *)\n"
+        '    __asm__("wasi_snapshot_preview1.fd_write");\n'
+        "void _start(void) {\n"
+        '    static const char message[] = "compiled in guest\\n";\n'
+        "    struct iovec io = {message, sizeof(message) - 1};\n"
+        "    unsigned written = 0;\n"
+        "    write_guest(1, &io, 1, &written);\n"
+        "}\n"
+    )
+    (tmp_path / "build.sh").write_text(
+        "mkdir -p /work/tcc\n"
+        "tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
+        "chmod +x /work/tcc/tcc-shellsim.wasm\n"
+        "/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/hello.wasm /work/hello.c\n"
+        "chmod +x /work/hello.wasm\n"
+        "/work/hello.wasm\n"
+    )
+    limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
+    package = shellsim.Package.build_from_directory(
+        tmp_path,
+        spec=shellsim.PackageSpec(name="c-build", version="1", entrypoint=("sh", "/work/build.sh"), limits=limits),
+    )
+    monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
+
+    assert main([
+        "run", "https://example.com/c-build.shl", "--sha256", package.sha256,
+        "--cpu", "10g", "--memory", "128m", "--disk", "128m",
+    ]) == 0
+    assert capsys.readouterr().out == "compiled in guest\n"

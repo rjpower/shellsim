@@ -277,17 +277,17 @@ class Package:
         cls,
         url: str,
         *,
-        expected_sha256: str,
+        expected_sha256: Optional[str] = None,
         fetcher: Optional[Callable[[str], Iterable[bytes]]] = None,
     ) -> Package:
-        """Fetch on the host, cap the blob, verify its digest, then validate the package."""
+        """Fetch on the host, cap the blob, check an optional digest, and validate the package."""
 
-        if (
-            not isinstance(url, str)
-            or not isinstance(expected_sha256, str)
-            or _DIGEST.fullmatch(expected_sha256) is None
+        if not isinstance(url, str):
+            raise ValueError("package URL must be text")
+        if expected_sha256 is not None and (
+            not isinstance(expected_sha256, str) or _DIGEST.fullmatch(expected_sha256) is None
         ):
-            raise ValueError("URL and lowercase SHA-256 digest are required")
+            raise ValueError("expected SHA-256 must be a lowercase hex digest")
         chunks = _fetch_https(url) if fetcher is None else fetcher(url)
         if isinstance(chunks, bytes):
             chunks = (chunks,)

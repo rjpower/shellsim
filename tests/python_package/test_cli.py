@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 from shellsim._cli import main
+from shellsim.package import Package, PackageSpec
 
 
 def run_cli(*arguments: str, stdin: bytes = b"") -> subprocess.CompletedProcess[bytes]:
@@ -126,3 +127,24 @@ def test_limit_suffixes_match_the_rust_cli() -> None:
 
     assert completed.returncode == 0
     assert completed.stdout == b"bounded"
+
+
+def test_run_fetches_package_and_executes_guest_entrypoint(tmp_path: Path, monkeypatch, capsys) -> None:
+    (tmp_path / "app.py").write_text("print('package guest')\n")
+    package = Package.build_from_directory(
+        tmp_path,
+        spec=PackageSpec(name="cli-demo", version="1", entrypoint=("python3.14", "/work/app.py")),
+    )
+    monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
+
+    assert main(["run", "https://example.com/demo.shl", "--sha256", package.sha256]) == 0
+    assert capsys.readouterr().out == "package guest\n"
+    assert main(["run", "https://example.com/demo.shl", "--sha256", "0" * 64]) == 2
+    assert "SHA-256 mismatch" in capsys.readouterr().err
+    assert main(["run", "https://example.com/demo.shl"]) == 0
+    assert capsys.readouterr().out == "package guest\n"
+
+
+def test_run_rejects_plain_http_without_a_custom_fetcher(capsys) -> None:
+    assert main(["run", "http://example.com/demo.shl"]) == 2
+    assert "HTTPS" in capsys.readouterr().err

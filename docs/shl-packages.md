@@ -2,7 +2,7 @@
 
 ## Decision
 
-A `.shl` package should contain a `/work` VFS tree, an entry command, limits, and a declaration of required host tools. It should not contain a host process or have access to the host's ambient filesystem or network. The host constructs a guest container with an explicit tool backend, then runs the package. A rollout runtime is a separate artifact: another `.shl` or an OCI image in Docker. The host captures the rollout's outputs and exposes only approved reads to the grader guest.
+A `.shl` package contains a `/work` VFS tree, an entry command, limits, and a declaration of required host tools. It contains no host process and grants no access to the host's ambient filesystem or network. The host constructs a guest container with an explicit tool backend, then runs the package. A rollout runtime is a separate artifact: another `.shl` or an OCI image in Docker. The host captures the rollout's outputs and exposes only approved reads to the grader guest.
 
 The guest calls tools through one exact **virtual HTTP endpoint**, `http://host.shellsim/tools`. Shellsim intercepts this URL before DNS or sockets. The request becomes a typed call in the next `poll_action` result. The host invokes its registered backend and supplies one result with `respond_tool_call`. This is a small, purpose-built protocol, not MCP: there is no initialize phase, tool discovery, JSON-RPC ID, streaming, session header, or duplicate text result. The pending HTTP request already has a request ID and belongs to one machine.
 
@@ -35,7 +35,7 @@ arithmetic-grader-0.1.0.shl
   rootfs/app/private/expected.json
 ```
 
-`shl.json` is UTF-8 JSON rather than TOML so the Python SDK can read it on its supported Python 3.9 baseline without another parser dependency. The builder writes canonical JSON and a sorted ZIP with normalized metadata. The loader validates the **content**, not byte-for-byte ZIP canonicality. A shortened manifest follows; each file entry also carries its SHA-256 digest, byte size, and mode. Directory entries in the manifest preserve empty directories and their modes; they have no ZIP payload member.
+`shl.json` is UTF-8 JSON. The Python SDK reads it on its supported Python 3.9 baseline without an additional parser dependency. The builder writes canonical JSON and a sorted ZIP with normalized metadata. The loader validates the **content**, not byte-for-byte ZIP canonicality. A shortened manifest follows; each file entry also carries its SHA-256 digest, byte size, and mode. Directory entries in the manifest preserve empty directories and their modes; they have no ZIP payload member.
 
 ```json
 {
@@ -92,6 +92,10 @@ result = container.run_entrypoint()
 ```
 
 The default fetcher rejects redirects and non-HTTPS URLs, uses a 10-second timeout, and streams with the 32 MiB archive cap before parsing. A custom fetcher supplies byte chunks for `s3://`, signed URLs, or deterministic in-memory test stores; the loader applies the same cumulative cap and digest check. The host must still authorize where it fetches from: a digest detects changed bytes but does not make an attacker-chosen URL safe from SSRF. The guest never receives the blob URL or ambient network access. The package manifest names required tools; the host decides whether to provide them. An OCI rollout runtime stays a separate image identified by an [image digest](https://github.com/opencontainers/image-spec/blob/main/image-layout.md), not something wrapped in `.shl`.
+
+The installed Python console runs packages that need no host tools with `shellsim run https://example.com/app.shl --sha256 <digest>`. The digest is optional for a trusted URL, but pinning it detects a changed distribution. The `--cpu`, `--memory`, `--disk`, and `--output` flags set host ceilings; the package cannot raise them. Packages requiring host tools run through the Python API so the caller can register handlers. The separate Rust executable's `run` command runs a host script path and does not load `.shl` packages.
+
+Archive parsing, URL fetching, and manifest validation live in the Python host SDK. The Rust core provides only bounded, atomic VFS export and guest execution; it has no host URL-fetch or ZIP-distribution responsibility. `PackageSpec` uses a frozen dataclass and explicit validation, with no Pydantic runtime dependency. The format is documented independently of the implementation so another host language can implement the same loader later.
 
 ```mermaid
 flowchart LR
@@ -259,3 +263,11 @@ Each `Container` has its own registry and machine. Other machines with the same 
 The transport and Python-hosted end-to-end test exist now. `tests/python_package/test_host_tools_e2e.py` uses the public `shellsim.Container(tools=...)` API, stages package-owned source, runs `Grader().grade(ctx)` inside shellsim, and exercises the same virtual route from `curl` and `wget`. It does not launch or speak to the CLI. Run it with `uv run --with pytest pytest -q tests/python_package/test_host_tools_e2e.py`; `uv` builds the checked-out Python extension. `tests/host_tools.rs` covers one-shot delivery, cancellation, and an ungranted route.
 
 The `.shl` builder, loader, manifest validator, host-side URL fetcher, and atomic quiescent workspace snapshot exist in this slice. Docker rollout capture and application-specific tool policy are not part of the package format; a host can bind a captured rollout view to its handlers. A useful next integration is to run the same grader package against captured shellsim and Docker rollouts with identical tool names and schemas.
+
+## Doom package stress test
+
+The URL-runner test packages the pinned TinyCC fixture, C source, and a guest build script in one `.shl`. `shellsim run` fetches the blob through the host loader; the guest extracts TinyCC, compiles the source to Wasm, and runs the result. The test uses an in-memory fetcher so it is deterministic and does not depend on an external blob store.
+
+The interactive Doom demo in PR #92 cannot yet be expressed as one playable `.shl`. Its builder imports a separate WAD, source tree, compiler, sysroot, and platform adapter, then its Rust browser host starts a resumable `WasmSession` with real-time clock, frame reads, and key injection. This package version caps each input file at 6 MiB and the total unpacked payload at 32 MiB; the harness also caps individual file transfers at 6 MiB. The Python `Container` and URL runner expose neither real-time clock selection nor `WasmSession` display/key control. The Rust `shellsim run` command still accepts a host script, not a package URL. A normal foreground `run_entrypoint` cannot replace the browser host's frame/event loop.
+
+An actual Doom rewrite should retain one URL-addressed distribution while adding bounded large-file staging and a package budget suitable for the selected WAD, then expose resumable Wasm/display controls to the host or share a host-side package loader with the Rust browser host. It must keep engine source, WAD, compiler, and their licenses/provenance explicit at publish time. Splitting a WAD into arbitrary small package files merely to evade the transfer limit would hide this missing capability rather than solve it.
