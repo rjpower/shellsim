@@ -12,12 +12,16 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::thread;
 
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::Serialize;
+use shellsim::harness::{HarnessOperation, HarnessRequest, HarnessSession};
 use shellsim::net::NetworkRequest;
+use shellsim::realtime::ClockMode;
 use shellsim::{CommandTrust, InvocationEvent, Limits, RunOutcome};
 
 const ACTION_STACK_BYTES: usize = 8 * 1024 * 1024;
@@ -65,6 +69,143 @@ struct MetadataStart {
 #[pyclass(module = "shellsim._native")]
 struct NativeEnvironment {
     environment: Mutex<shellsim::Environment>,
+}
+
+/// In-process host control for a machine granted the virtual tool endpoint.
+#[pyclass(module = "shellsim._native")]
+struct NativeContainer {
+    session: Mutex<HarnessSession>,
+}
+
+#[pymethods]
+impl NativeContainer {
+    #[new]
+    fn new(cpu: u64, memory: u64, disk: u64, output: u64) -> Self {
+        Self {
+            session: Mutex::new(HarnessSession::with_clock_and_host_tools(
+                Limits {
+                    cpu,
+                    memory,
+                    disk,
+                    output,
+                },
+                ClockMode::Virtual,
+            )),
+        }
+    }
+
+    fn write_file(&self, py: Python<'_>, path: String, data: Vec<u8>, mode: u32) -> PyResult<()> {
+        self.apply(
+            py,
+            HarnessOperation::WriteFile {
+                path,
+                data_base64: STANDARD.encode(data),
+                mode,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn read_file(&self, py: Python<'_>, path: String) -> PyResult<Py<PyBytes>> {
+        let result = self.apply(py, HarnessOperation::ReadFile { path })?;
+        let encoded = result["data_base64"]
+            .as_str()
+            .ok_or_else(|| SimulationError::new_err("missing file bytes"))?;
+        let bytes = STANDARD
+            .decode(encoded)
+            .map_err(|error| SimulationError::new_err(error.to_string()))?;
+        Ok(PyBytes::new(py, &bytes).unbind())
+    }
+
+    fn start_execute(&self, py: Python<'_>, source: String, stdin: Vec<u8>) -> PyResult<String> {
+        self.apply(
+            py,
+            HarnessOperation::StartExecute {
+                source,
+                stdin_base64: STANDARD.encode(stdin),
+                stdin_closed: true,
+            },
+        )
+        .and_then(serialize_result)
+    }
+
+    fn poll_action(&self, py: Python<'_>, action_id: u64) -> PyResult<String> {
+        self.apply(
+            py,
+            HarnessOperation::PollAction {
+                action_id,
+                work_quanta: 100_000,
+                advance_time: true,
+            },
+        )
+        .and_then(serialize_result)
+    }
+
+    fn respond_tool_call(
+        &self,
+        py: Python<'_>,
+        request_id: u64,
+        result_json: Option<String>,
+        error: Option<String>,
+    ) -> PyResult<()> {
+        let result = result_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()
+            .map_err(|error| SimulationError::new_err(error.to_string()))?;
+        self.apply(
+            py,
+            HarnessOperation::RespondToolCall {
+                request_id,
+                result,
+                error,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn read_action_output(&self, py: Python<'_>, action_id: u64) -> PyResult<String> {
+        self.apply(py, HarnessOperation::ReadActionOutput { action_id })
+            .and_then(serialize_result)
+    }
+
+    fn cancel_action(&self, py: Python<'_>, action_id: u64) -> PyResult<()> {
+        self.apply(py, HarnessOperation::CancelAction { action_id })?;
+        Ok(())
+    }
+
+    fn drop_action(&self, py: Python<'_>, action_id: u64) -> PyResult<()> {
+        self.apply(py, HarnessOperation::DropAction { action_id })?;
+        Ok(())
+    }
+}
+
+impl NativeContainer {
+    fn apply(&self, py: Python<'_>, operation: HarnessOperation) -> PyResult<serde_json::Value> {
+        py.detach(|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+            on_worker(&mut session, move |session| {
+                let response = session.handle(HarnessRequest {
+                    id: None,
+                    session_id: None,
+                    operation,
+                });
+                if !response.ok {
+                    return Err(response
+                        .error
+                        .unwrap_or_else(|| "container operation failed".into()));
+                }
+                serde_json::to_value(response.result).map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+}
+
+fn serialize_result(result: serde_json::Value) -> PyResult<String> {
+    serde_json::to_string(&result).map_err(|error| SimulationError::new_err(error.to_string()))
 }
 
 #[pymethods]
@@ -380,11 +521,16 @@ fn invocation_names(events: &[InvocationEvent], trust: CommandTrust) -> Vec<Stri
 }
 
 /// Run an environment operation with a predictable native stack and contain all Rust unwinds.
-fn on_worker<T, F>(environment: &mut shellsim::Environment, operation: F) -> Result<T, String>
+fn on_worker<State, T, F>(
+    guard: &mut std::sync::MutexGuard<'_, State>,
+    operation: F,
+) -> Result<T, String>
 where
+    State: Send,
     T: Send,
-    F: FnOnce(&mut shellsim::Environment) -> Result<T, String> + Send,
+    F: FnOnce(&mut State) -> Result<T, String> + Send,
 {
+    let environment = &mut **guard;
     thread::scope(|scope| {
         let worker = thread::Builder::new()
             .name("shellsim-python".to_string())
@@ -416,6 +562,7 @@ fn panic_suffix(payload: &(dyn Any + Send)) -> String {
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
+    module.add_class::<NativeContainer>()?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     Ok(())
 }

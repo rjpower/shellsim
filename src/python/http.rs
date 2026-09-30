@@ -1,59 +1,70 @@
 //! Metered Python access to shellsim's deterministic HTTP broker.
 //!
-//! This is the only Python capability that reaches [`crate::net::VirtualNet`]. Requests and
+//! This is Python's scoped adapter to [`crate::syscalls::System::http_request`]. Requests and
 //! responses are owned, size-bounded values; missing routes stay distinguishable from malformed
 //! requests, and no error path can acquire ambient network access.
 
 use crate::interp::Interp;
-use crate::net::{HttpRequest, RequestError};
+use crate::net::{HttpPoll, HttpRequest, RequestError, HOST_TOOLS_URL};
+use crate::syscalls::{ActiveSystem, System};
 
-use super::native::{PyError, PyHttpClient, PyHttpRequest, PyHttpResponse, PyResult};
+use super::native::{PyError, PyHttpRequest, PyHttpResponse, PyResult};
 
 const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_HEADERS: usize = 128;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 8 * 1024;
 
-impl PyHttpClient for Interp {
-    fn request(&mut self, request: PyHttpRequest) -> PyResult<Option<PyHttpResponse>> {
-        let work = validate_request(&request)?;
-        let work = u64::try_from(work).unwrap_or(u64::MAX);
-        if !self.resources.charge_cpu(work) {
-            return Err(PyError::resource_error("Python CPU limit exceeded"));
-        }
-        let request = HttpRequest {
-            method: request.method,
-            url: request.url,
-            headers: request.headers,
-            body: request.body,
-        };
-        let response = match self.net.request(request, &self.vfs) {
-            Ok(response) => response,
-            Err(RequestError::NoRoute) => return Ok(None),
-            Err(error) => return Err(PyError::exception("OSError", error.to_string())),
-        };
-        if response.body.len() > MAX_BODY_BYTES {
-            return Err(PyError::resource_error(
-                "virtual HTTP response body exceeds the 8 MiB Python limit",
-            ));
-        }
-        let response_bytes = response
-            .headers
-            .iter()
-            .try_fold(response.body.len(), |total, (name, value)| {
-                total.checked_add(name.len())?.checked_add(value.len())
-            })
-            .ok_or_else(|| PyError::resource_error("virtual HTTP response is too large"))?;
-        let response_bytes = u64::try_from(response_bytes).unwrap_or(u64::MAX);
-        if !self.resources.charge_cpu(response_bytes) {
-            return Err(PyError::resource_error("Python CPU limit exceeded"));
-        }
-        Ok(Some(PyHttpResponse {
-            status: response.status,
-            headers: response.headers,
-            body: response.body,
-        }))
+pub(super) fn request(
+    interp: &mut Interp,
+    request: PyHttpRequest,
+    can_suspend: bool,
+) -> PyResult<Option<PyHttpResponse>> {
+    let work = validate_request(&request)?;
+    let work = u64::try_from(work).unwrap_or(u64::MAX);
+    if !interp.resources.charge_cpu(work) {
+        return Err(PyError::resource_error("Python CPU limit exceeded"));
     }
+    let request = HttpRequest {
+        method: request.method,
+        url: request.url,
+        headers: request.headers,
+        body: request.body,
+    };
+    if request.url == HOST_TOOLS_URL && interp.net.host_tools_enabled() && !can_suspend {
+        return Err(PyError::runtime_error(
+            "host tools require scheduler-dispatched Python",
+        ));
+    }
+    let response = match ActiveSystem::new(interp).http_request(request) {
+        Ok(HttpPoll::Ready(response)) => response,
+        Ok(HttpPoll::Blocked(id)) => {
+            return Err(PyError::suspend(crate::scheduler::WaitReason::HostHttp(id)));
+        }
+        Err(RequestError::NoRoute) => return Ok(None),
+        Err(error) => return Err(PyError::exception("OSError", error.to_string())),
+    };
+    if response.body.len() > MAX_BODY_BYTES {
+        return Err(PyError::resource_error(
+            "virtual HTTP response body exceeds the 8 MiB Python limit",
+        ));
+    }
+    let response_bytes = response
+        .headers
+        .iter()
+        .try_fold(response.body.len(), |total, (name, value)| {
+            total.checked_add(name.len())?.checked_add(value.len())
+        })
+        .ok_or_else(|| PyError::resource_error("virtual HTTP response is too large"))?;
+    let response_bytes = u64::try_from(response_bytes).unwrap_or(u64::MAX);
+    if !interp.resources.charge_cpu(response_bytes) {
+        return Err(PyError::resource_error("Python CPU limit exceeded"));
+    }
+    Ok(Some(PyHttpResponse {
+        status: response.status,
+        headers: response.headers,
+        body: response.body,
+    }))
 }
 
 fn validate_request(request: &PyHttpRequest) -> PyResult<usize> {

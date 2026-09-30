@@ -20,6 +20,8 @@ pub enum WaitReason {
     InputReadable(u32),
     PipeReadable(u32),
     PipeWritable(u32),
+    /// A virtual HTTP request awaiting an explicit host response.
+    HostHttp(u64),
     Child(ProcessId),
     /// Any descriptor progress or exit within a modeled child's process subtree.
     ChildActivity(ProcessId),

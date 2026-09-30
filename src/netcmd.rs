@@ -8,12 +8,26 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
 use crate::commands::options::{parse_options_or_report, OptionSpec};
-use crate::net::{HttpRequest, HttpResponse, RequestError};
+use crate::exec::ShellPoll;
+use crate::net::{HttpPoll, HttpRequest, HttpResponse, RequestError};
+use crate::scheduler::WaitReason;
 use crate::syscalls::System;
 
 type Out<'a> = &'a mut Vec<u8>;
 
-pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out) -> i32 {
+pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out) -> ShellPoll {
+    match curl_once(system, args, out, err) {
+        Ok(status) => ShellPoll::Ready(status),
+        Err(reason) => ShellPoll::Blocked(reason),
+    }
+}
+
+fn curl_once(
+    system: &mut dyn System,
+    args: &[String],
+    out: Out,
+    err: Out,
+) -> Result<i32, WaitReason> {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Request,
@@ -65,11 +79,11 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
         err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     if parsed.operands.len() > 1 {
         ewln(err, "curl: multiple URLs are not supported");
-        return 2;
+        return Ok(2);
     }
 
     let mut request = HttpRequest::new("GET", parsed.operands.first().cloned().unwrap_or_default());
@@ -107,7 +121,7 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
             Key::Header => {
                 let Some(header) = parse_header(&value()) else {
                     ewln(err, "curl: malformed header; expected 'Name: value'");
-                    return 2;
+                    return Ok(2);
                 };
                 request.headers.push(header);
             }
@@ -123,12 +137,13 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
     }
     if request.url.is_empty() {
         ewln(err, "curl: no URL specified");
-        return 2;
+        return Ok(2);
     }
     let url = request.url.clone();
     let report_errors = !silent || show_error;
     let response = match system.http_request(request) {
-        Ok(response) => response,
+        Ok(HttpPoll::Ready(response)) => response,
+        Ok(HttpPoll::Blocked(id)) => return Err(WaitReason::HostHttp(id)),
         Err(RequestError::NoRoute) => {
             if report_errors {
                 ewln(
@@ -136,13 +151,13 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
                     "curl: (7) Failed to connect: no matching virtual HTTP route",
                 );
             }
-            return 7;
+            return Ok(7);
         }
         Err(error) => {
             if report_errors {
                 ewln(err, &format!("curl: (23) {error}"));
             }
-            return 23;
+            return Ok(23);
         }
     };
     if response.status >= 400 && fail {
@@ -152,7 +167,7 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
                 &format!("curl: (22) HTTP response status {}", response.status),
             );
         }
-        return 22;
+        return Ok(22);
     }
 
     let payload = response_payload(&response, include_headers || head_only, head_only);
@@ -161,15 +176,27 @@ pub(crate) fn curl(system: &mut dyn System, args: &[String], out: Out, err: Out)
         let cwd = system.cwd().to_string();
         if let Err(error) = system.write_file(&cwd, &name, &payload, 0o644) {
             ewln(err, &format!("curl: (23) {error}"));
-            return 23;
+            return Ok(23);
         }
     } else {
         out.extend_from_slice(&payload);
     }
-    0
+    Ok(0)
 }
 
-pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out) -> i32 {
+pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out) -> ShellPoll {
+    match wget_once(system, args, out, err) {
+        Ok(status) => ShellPoll::Ready(status),
+        Err(reason) => ShellPoll::Blocked(reason),
+    }
+}
+
+fn wget_once(
+    system: &mut dyn System,
+    args: &[String],
+    out: Out,
+    err: Out,
+) -> Result<i32, WaitReason> {
     #[derive(Clone, Copy, PartialEq)]
     enum Key {
         Output,
@@ -202,11 +229,11 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
         err,
     ) {
         Ok(parsed) => parsed,
-        Err(status) => return status,
+        Err(status) => return Ok(status),
     };
     if parsed.operands.len() != 1 {
         ewln(err, "wget: exactly one URL is required");
-        return 2;
+        return Ok(2);
     }
 
     let mut request = HttpRequest::new("GET", &parsed.operands[0]);
@@ -223,7 +250,7 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
             Key::Header => {
                 let Some(header) = parse_header(&value()) else {
                     ewln(err, "wget: malformed header; expected 'Name: value'");
-                    return 2;
+                    return Ok(2);
                 };
                 request.headers.push(header);
             }
@@ -238,7 +265,8 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
     }
     let url = request.url.clone();
     let response = match system.http_request(request) {
-        Ok(response) => response,
+        Ok(HttpPoll::Ready(response)) => response,
+        Ok(HttpPoll::Blocked(id)) => return Err(WaitReason::HostHttp(id)),
         Err(RequestError::NoRoute) => {
             if !quiet {
                 ewln(
@@ -246,13 +274,13 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
                     "wget: unable to resolve request: no matching virtual HTTP route",
                 );
             }
-            return 4;
+            return Ok(4);
         }
         Err(error) => {
             if !quiet {
                 ewln(err, &format!("wget: {error}"));
             }
-            return 4;
+            return Ok(4);
         }
     };
     if response.status >= 400 {
@@ -262,7 +290,7 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
                 &format!("wget: server returned status {}", response.status),
             );
         }
-        return 8;
+        return Ok(8);
     }
 
     let mut name = output_file.unwrap_or_else(|| request_filename(&response, &url));
@@ -275,10 +303,10 @@ pub(crate) fn wget(system: &mut dyn System, args: &[String], out: Out, err: Out)
         let cwd = system.cwd().to_string();
         if let Err(error) = system.write_file(&cwd, &name, &response.body, 0o644) {
             ewln(err, &format!("wget: {error}"));
-            return 3;
+            return Ok(3);
         }
     }
-    0
+    Ok(0)
 }
 
 fn parse_header(value: &str) -> Option<(String, String)> {

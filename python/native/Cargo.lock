@@ -951,6 +951,7 @@ dependencies = [
 name = "shellsim-python-bindings"
 version = "0.1.21"
 dependencies = [
+ "base64",
  "pyo3",
  "serde",
  "serde_json",

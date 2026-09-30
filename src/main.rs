@@ -312,10 +312,12 @@ const MAX_SCENARIO_ACTIONS: usize = 4_096;
 struct HarnessOptions {
     machine: MachineOptions,
     host_root: Option<String>,
+    host_tools: bool,
 }
 
 fn harness_options(mut machine: MachineOptions, args: &[String], command: &str) -> HarnessOptions {
     let mut host_root = None;
+    let mut host_tools = false;
     let mut index = 0usize;
     while index < args.len() {
         if machine.accept(args, &mut index) {
@@ -331,18 +333,27 @@ fn harness_options(mut machine: MachineOptions, args: &[String], command: &str) 
                         .unwrap_or_else(|| usage_error("--root requires a path")),
                 );
             }
+            "--host-tools" if command == "serve" => host_tools = true,
             value => usage_error(&format!("unexpected {command} argument: {value}")),
         }
         index += 1;
     }
-    HarnessOptions { machine, host_root }
+    HarnessOptions {
+        machine,
+        host_root,
+        host_tools,
+    }
 }
 
 fn harness_session(options: HarnessOptions, command: &str) -> shellsim::harness::HarnessSession {
-    let mut session = shellsim::harness::HarnessSession::with_clock(
-        options.machine.limits,
-        options.machine.clock,
-    );
+    let mut session = if options.host_tools {
+        shellsim::harness::HarnessSession::with_clock_and_host_tools(
+            options.machine.limits,
+            options.machine.clock,
+        )
+    } else {
+        shellsim::harness::HarnessSession::with_clock(options.machine.limits, options.machine.clock)
+    };
     if let Some(host_root) = options.host_root {
         shellsim::host_ingest::mount_host_tree(
             &mut session.environment,
@@ -788,7 +799,7 @@ fn read_stdin_bytes() -> Vec<u8> {
 fn usage_error(message: &str) -> ! {
     eprintln!("shellsim: {message}");
     eprintln!(
-        "usage: shellsim [MACHINE] (-c SOURCE [ARGS...] | run SCRIPT [ARGS...] | shell | eval -c SOURCE | serve [--root PATH] | mcp [--root PATH] | replay SCENARIO.ndjson [--root PATH] [--transcript PATH]) | shellsim corpus MANIFEST.json\nMACHINE: [--cpu N] [--memory N] [--disk N] [--output N] [--real-time]; commands without script arguments also accept MACHINE after the command"
+        "usage: shellsim [MACHINE] (-c SOURCE [ARGS...] | run SCRIPT [ARGS...] | shell | eval -c SOURCE | serve [--root PATH] [--host-tools] | mcp [--root PATH] | replay SCENARIO.ndjson [--root PATH] [--transcript PATH]) | shellsim corpus MANIFEST.json\nMACHINE: [--cpu N] [--memory N] [--disk N] [--output N] [--real-time]; commands without script arguments also accept MACHINE after the command"
     );
     exit(2);
 }

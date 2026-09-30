@@ -6,7 +6,7 @@
 use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
-use crate::net::{HttpRequest, HttpResponse, NetworkRequest, RequestError, RouteError};
+use crate::net::{HttpPoll, HttpRequest, NetworkRequest, RequestError, RouteError};
 use crate::vfs::{resolve_against, NodeKind, VfsError};
 
 /// Virtual clock selected by a guest ABI or native process.
@@ -150,8 +150,8 @@ pub(crate) trait System {
     fn schedule_wake(&mut self, duration_ns: u64) -> Result<u64, SyscallError>;
     fn random_fill(&mut self, bytes: &mut [u8]) -> Result<(), SyscallError>;
     fn allocate_temp_id(&mut self) -> Option<u64>;
-    /// Submit a request to the configured virtual route table, never to the host network.
-    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError>;
+    /// Submit virtual HTTP, returning a typed pending reason for a host-backed route.
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpPoll, RequestError>;
     fn http_route_static(
         &mut self,
         pattern: &str,
@@ -604,8 +604,13 @@ impl System for ActiveSystem<'_> {
         self.interp.next_temp_id()
     }
 
-    fn http_request(&mut self, request: HttpRequest) -> Result<HttpResponse, RequestError> {
-        self.interp.net.request(request, &self.interp.vfs)
+    fn http_request(&mut self, request: HttpRequest) -> Result<HttpPoll, RequestError> {
+        self.interp.net.request_for_process(
+            self.interp.process.pid,
+            self.interp.process.process_group,
+            request,
+            &self.interp.vfs,
+        )
     }
 
     fn http_route_static(
