@@ -363,19 +363,19 @@ class Container:
             raise TypeError("source must be str")
         started = json.loads(self._native.start_execute(source, _as_bytes("stdin", stdin)))
         action_id = started["action_id"]
-        complete = False
+        view = started
         try:
-            view = started
             while view["state"]["state"] != "complete":
                 view = json.loads(self._native.poll_action(action_id))
+                state = view["state"]["state"]
+                if state == "complete":
+                    break
                 for call in view["tool_calls"]:
                     self._dispatch_tool(call)
-                state = view["state"]["state"]
                 if state == "blocked" and not view["tool_calls"]:
                     raise SimulationError(f"action blocked without a tool call: {view['state'].get('reason')}")
                 if state == "stopped":
                     raise SimulationError("action stopped before completion")
-            complete = True
             output = json.loads(self._native.read_action_output(action_id))
             invocations = view["invocations"]
             for trust, key in (("unsupported", "unsupported_commands"), ("partial", "partial_commands")):
@@ -386,9 +386,11 @@ class Container:
                 base64.b64decode(output["stderr_base64"]),
             )
         finally:
-            if not complete:
-                self._native.cancel_action(action_id)
-            self._native.drop_action(action_id)
+            try:
+                if view["state"]["state"] != "complete":
+                    self._native.cancel_action(action_id)
+            finally:
+                self._native.drop_action(action_id)
 
     def _dispatch_tool(self, call: Mapping[str, Any]) -> None:
         name = call["tool"]

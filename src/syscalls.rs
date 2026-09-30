@@ -605,12 +605,9 @@ impl System for ActiveSystem<'_> {
     }
 
     fn http_request(&mut self, request: HttpRequest) -> Result<HttpPoll, RequestError> {
-        self.interp.net.request_for_process(
-            self.interp.process.pid,
-            self.interp.process.process_group,
-            request,
-            &self.interp.vfs,
-        )
+        self.interp
+            .net
+            .request_for_process(self.interp.process.pid, request, &self.interp.vfs)
     }
 
     fn http_route_static(

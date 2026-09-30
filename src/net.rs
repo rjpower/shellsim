@@ -29,7 +29,8 @@ const MAX_ROUTE_HEADER_BYTES: usize = 64 * 1024;
 const MAX_LOGGED_HEADERS: usize = 16;
 const MAX_LOGGED_HEADER_FIELD_BYTES: usize = 512;
 const MAX_HOST_REQUESTS: usize = 16;
-const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
+/// Largest JSON request or response body exchanged with a host tool.
+pub const MAX_HOST_MESSAGE_BYTES: usize = 1024 * 1024;
 
 /// Exact virtual URL reserved for host-provided tools. It never resolves through DNS.
 pub const HOST_TOOLS_URL: &str = "http://host.shellsim/tools";
@@ -68,7 +69,6 @@ pub enum HttpPoll {
 #[derive(Clone)]
 struct HostRequestSlot {
     request: HostHttpRequest,
-    process_group: u32,
     delivered: bool,
     response: Option<HttpResponse>,
     log_index: Option<usize>,
@@ -228,6 +228,13 @@ impl VirtualNet {
         self.host_tools_enabled
     }
 
+    /// Whether a guest is waiting for an external reply that virtual time cannot produce.
+    pub fn has_unanswered_host_requests(&self) -> bool {
+        self.host_requests
+            .values()
+            .any(|slot| slot.response.is_none())
+    }
+
     /// Dispatch guest HTTP through the route table or the exact host-backed endpoint.
     ///
     /// A pending host reply is reported as [`HttpPoll::Blocked`], so each guest execution model
@@ -235,13 +242,12 @@ impl VirtualNet {
     pub fn request_for_process(
         &mut self,
         pid: u32,
-        process_group: u32,
         request: HttpRequest,
         vfs: &Vfs,
     ) -> Result<HttpPoll, RequestError> {
         if self.host_tools_enabled && request.url == HOST_TOOLS_URL {
             return self
-                .host_tool_request(pid, process_group, request)
+                .host_tool_request(pid, request)
                 .map_err(RequestError::HostRejected);
         }
         self.request(request, vfs).map(HttpPoll::Ready)
@@ -251,7 +257,6 @@ impl VirtualNet {
     pub fn host_tool_request(
         &mut self,
         pid: u32,
-        process_group: u32,
         request: HttpRequest,
     ) -> Result<HttpPoll, String> {
         if !self.host_tools_enabled || request.url != HOST_TOOLS_URL {
@@ -318,7 +323,6 @@ impl VirtualNet {
             pid,
             HostRequestSlot {
                 request: HostHttpRequest { id, request, call },
-                process_group,
                 delivered: false,
                 response: None,
                 log_index,
@@ -370,10 +374,9 @@ impl VirtualNet {
         self.host_requests.retain(|pid, _| process_is_live(*pid));
     }
 
-    /// Invalidate all in-flight calls owned by a cancelled foreground process group.
-    pub fn discard_host_requests_for_group(&mut self, process_group: u32) {
-        self.host_requests
-            .retain(|_, slot| slot.process_group != process_group);
+    /// End the current action without carrying outstanding calls into a later action.
+    pub fn discard_host_requests(&mut self) {
+        self.host_requests.clear();
     }
 
     /// Register a static response for an exact URL or `*` glob.
@@ -652,23 +655,23 @@ mod tests {
         let mut net = VirtualNet::new();
         let mut request = HttpRequest::new("POST", HOST_TOOLS_URL);
         request.body = br#"{"tool":"workspace.read_file","arguments":{"path":"/work/a"}}"#.to_vec();
-        assert!(net.host_tool_request(7, 7, request.clone()).is_err());
+        assert!(net.host_tool_request(7, request.clone()).is_err());
         net.enable_host_tools();
         let oversized = HttpRequest {
             body: vec![0; MAX_HOST_MESSAGE_BYTES + 1],
             ..request.clone()
         };
-        assert!(net.host_tool_request(7, 7, oversized).is_err());
+        assert!(net.host_tool_request(7, oversized).is_err());
         let invalid = HttpRequest {
             body: br#"{"tool":"workspace.read_file","arguments":[]}"#.to_vec(),
             ..request.clone()
         };
-        assert!(net.host_tool_request(7, 7, invalid).is_err());
-        let HttpPoll::Blocked(id) = net.host_tool_request(7, 7, request.clone()).unwrap() else {
+        assert!(net.host_tool_request(7, invalid).is_err());
+        let HttpPoll::Blocked(id) = net.host_tool_request(7, request.clone()).unwrap() else {
             panic!("host request did not block");
         };
         assert!(matches!(
-            net.host_tool_request(7, 7, request.clone()),
+            net.host_tool_request(7, request.clone()),
             Ok(HttpPoll::Blocked(pending)) if pending == id
         ));
         assert_eq!(net.take_host_requests().len(), 1);
@@ -680,7 +683,7 @@ mod tests {
             .unwrap();
         assert_eq!(net.log[0].response_status, Some(200));
         assert!(matches!(
-            net.host_tool_request(7, 7, request),
+            net.host_tool_request(7, request),
             Ok(HttpPoll::Ready(response)) if response.body == b"done"
         ));
         assert!(net.take_host_requests().is_empty());

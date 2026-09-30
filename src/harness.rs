@@ -11,7 +11,7 @@ use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
 
-use crate::net::{HttpResponse, NetworkRequest};
+use crate::net::{HttpResponse, NetworkRequest, MAX_HOST_MESSAGE_BYTES};
 use crate::process::{ProcessRecord, ProcessStatus};
 use crate::scheduler::{TaskState, WaitReason};
 use crate::telemetry::{CommandTrust, InvocationEvent};
@@ -381,6 +381,8 @@ pub struct HarnessSession {
 struct RetainedAction {
     id: u64,
     root_pid: u32,
+    /// Children created before this action cannot use its host-tool grant.
+    first_new_pid: u32,
     execution: Option<crate::exec::ShellExecution>,
     state: ActionState,
     outcome: Option<RunOutcome>,
@@ -411,6 +413,13 @@ impl RetainedAction {
         Self {
             id,
             root_pid: environment.process.pid,
+            first_new_pid: environment
+                .processes
+                .iter()
+                .map(|record| record.pid)
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1),
             execution: None,
             state: ActionState::Running,
             outcome: None,
@@ -679,7 +688,10 @@ impl HarnessSession {
                     (None, Some(message)) => (200, serde_json::json!({"error": message})),
                     _ => return Err("supply one object result or one error".into()),
                 };
-                let body = serde_json::to_vec(&reply).map_err(|error| error.to_string())?;
+                let mut body = serde_json::to_vec(&reply).map_err(|error| error.to_string())?;
+                if body.len() > MAX_HOST_MESSAGE_BYTES {
+                    body = br#"{"error":"tool response too large"}"#.to_vec();
+                }
                 let pid = self.environment.net.complete_host_request(
                     request_id,
                     HttpResponse {
@@ -963,6 +975,14 @@ impl HarnessSession {
                         return Err(error);
                     }
                 };
+                let had_unanswered = self.environment.net.has_unanswered_host_requests();
+                self.reap_host_requests_for_action(&action);
+                if matches!(poll, crate::exec::MachinePoll::Blocked)
+                    && had_unanswered
+                    && !self.environment.net.has_unanswered_host_requests()
+                {
+                    continue;
+                }
                 match poll {
                     crate::exec::MachinePoll::Progress => {}
                     crate::exec::MachinePoll::Blocked => {
@@ -1003,10 +1023,10 @@ impl HarnessSession {
                 execution.restore(&mut self.environment);
                 action.complete(&self.environment, status);
                 self.active_action = None;
+                self.environment.net.discard_host_requests();
             } else {
                 action.execution = Some(execution);
             }
-            self.reap_host_requests();
             let mut view = action.view(&self.environment);
             view.tool_calls = self
                 .environment
@@ -1066,11 +1086,6 @@ impl HarnessSession {
             self.actions.insert(action_id, action);
             return Err(format!("action {action_id} is complete"));
         };
-        let process_group = self
-            .environment
-            .processes
-            .get(action.root_pid)
-            .map(|record| record.process_group);
         let result = cancel_execution(
             &mut self.environment,
             &mut execution,
@@ -1091,12 +1106,7 @@ impl HarnessSession {
                 self.environment.last_status = status;
                 action.complete(&self.environment, status);
                 self.active_action = None;
-                if let Some(process_group) = process_group {
-                    self.environment
-                        .net
-                        .discard_host_requests_for_group(process_group);
-                }
-                self.reap_host_requests();
+                self.environment.net.discard_host_requests();
                 Ok(action.view(&self.environment))
             }
             Err(error) => {
@@ -1108,12 +1118,14 @@ impl HarnessSession {
         result
     }
 
-    fn reap_host_requests(&mut self) {
+    /// Keep only live callers from this foreground action, not older background jobs.
+    fn reap_host_requests_for_action(&mut self, action: &RetainedAction) {
         let processes = &self.environment.processes;
         self.environment.net.retain_host_requests(|pid| {
             processes
                 .get(pid)
                 .is_some_and(|record| !matches!(record.status, ProcessStatus::Exited(_)))
+                && process_belongs_to_action(processes, pid, action.root_pid, action.first_new_pid)
         });
     }
 
@@ -1279,6 +1291,29 @@ impl HarnessSession {
             }
         }
     }
+}
+
+/// Check ancestry as well as PID age so an old background job cannot delegate a new child.
+fn process_belongs_to_action(
+    processes: &crate::process::ProcessTable,
+    pid: u32,
+    root_pid: u32,
+    first_new_pid: u32,
+) -> bool {
+    let mut current = pid;
+    while current != root_pid {
+        if current < first_new_pid {
+            return false;
+        }
+        let Some(record) = processes.get(current) else {
+            return false;
+        };
+        if record.ppid >= current {
+            return false;
+        }
+        current = record.ppid;
+    }
+    true
 }
 
 fn cancel_execution(
@@ -1529,6 +1564,80 @@ fn validate_mode(mode: u32) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_calls_are_scoped_to_current_action_descendants() {
+        let mut processes =
+            crate::process::ProcessTable::new(1_000, "/work".into(), Default::default());
+        let old = processes
+            .spawn(
+                1_000,
+                crate::process::ChildPlacement::Inherit,
+                "old",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let first_new_pid = old + 1;
+        let current = processes
+            .spawn(
+                1_000,
+                crate::process::ChildPlacement::Inherit,
+                "current",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let old_descendant = processes
+            .spawn(
+                old,
+                crate::process::ChildPlacement::Inherit,
+                "old-descendant",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+        let current_descendant = processes
+            .spawn(
+                current,
+                crate::process::ChildPlacement::Inherit,
+                "current-descendant",
+                "/work",
+                Default::default(),
+            )
+            .unwrap();
+
+        assert!(process_belongs_to_action(
+            &processes,
+            1_000,
+            1_000,
+            first_new_pid
+        ));
+        assert!(process_belongs_to_action(
+            &processes,
+            current,
+            1_000,
+            first_new_pid
+        ));
+        assert!(process_belongs_to_action(
+            &processes,
+            current_descendant,
+            1_000,
+            first_new_pid
+        ));
+        assert!(!process_belongs_to_action(
+            &processes,
+            old,
+            1_000,
+            first_new_pid
+        ));
+        assert!(!process_belongs_to_action(
+            &processes,
+            old_descendant,
+            1_000,
+            first_new_pid
+        ));
+    }
 
     #[test]
     fn session_forks_preserve_and_isolate_complete_machine_state() {

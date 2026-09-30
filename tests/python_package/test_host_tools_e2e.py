@@ -52,12 +52,20 @@ def test_python_host_registers_tools_for_guest_and_shell_http() -> None:
     assert submissions == [1.0]
     assert calls == ["conversation.list", "workspace.read_file", "grade.submit"]
 
+    result = container.run("timeout 5 python3.14 /work/grader.py")
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"1.0\n", b"")
+    assert submissions == [1.0, 1.0]
+
     message = json.dumps({"tool": "conversation.list", "arguments": {}})
     curl = (
         "curl -s -X POST -H 'Content-Type: application/json' -d "
         f"{shlex.quote(message)} {ENDPOINT}"
     )
     result = container.run(curl)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"result": {"messages": conversation}}
+
+    result = container.run(f"timeout 5 {curl}")
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout) == {"result": {"messages": conversation}}
 
@@ -125,3 +133,54 @@ def test_host_tool_registry_is_scoped_to_each_container() -> None:
 
     assert first.run(command).stdout == b"first\n"
     assert second.run(command).stdout == b"second\n"
+
+
+def test_oversized_tool_result_is_a_guest_error() -> None:
+    container = shellsim.Container(tools={"huge": lambda arguments: {"blob": "x" * (1 << 20)}})
+    container.write_file("/work/host_tools.py", (GUEST_SOURCE / "host_tools.py").read_bytes())
+    source = (
+        "from host_tools import ToolClient\n"
+        "try:\n"
+        "    ToolClient().call(\"huge\", {})\n"
+        "except RuntimeError as error:\n"
+        "    print(str(error))\n"
+    )
+
+    result = container.run(f"python3.14 -c {shlex.quote(source)}")
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"tool response too large\n", b"")
+
+    def huge_error(arguments: dict[str, object]) -> dict[str, object]:
+        raise shellsim.ToolError("x" * (1 << 20))
+
+    container = shellsim.Container(tools={"huge": huge_error})
+    container.write_file("/work/host_tools.py", (GUEST_SOURCE / "host_tools.py").read_bytes())
+    result = container.run(f"python3.14 -c {shlex.quote(source)}")
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"tool response too large\n", b"")
+
+
+def test_completed_action_does_not_invoke_orphan_tool_calls() -> None:
+    calls: list[str] = []
+
+    def record(arguments: dict[str, object]) -> dict[str, bool]:
+        calls.append("called")
+        return {"ok": True}
+
+    container = shellsim.Container(tools={"record": record})
+    container.write_file(
+        "/work/background.py",
+        "import json\n"
+        "from urllib.request import Request, urlopen\n"
+        f"request = Request({ENDPOINT!r}, data=json.dumps({{'tool':'record','arguments':{{}}}}).encode())\n"
+        "urlopen(request)\n",
+    )
+
+    result = container.run("python3.14 /work/background.py & printf started")
+    assert (result.returncode, result.stdout) == (0, b"started")
+    assert calls == []
+    assert container.run("printf next").stdout == b"next"
+    assert calls == []
+
+    result = container.run("(sleep 1; python3.14 /work/background.py) & printf started")
+    assert (result.returncode, result.stdout) == (0, b"started")
+    assert container.run("sleep 2; printf next").stdout == b"next"
+    assert calls == []
