@@ -1249,6 +1249,12 @@ impl Vfs {
     pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) -> Result<()> {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
+        if matches!(
+            self.nodes.get(&norm).map(|node| &node.kind),
+            Some(NodeKind::Dir)
+        ) {
+            return Err(VfsError::IsADir(norm));
+        }
         let additions = match parent_of(&norm) {
             Some(parent) => self.missing_directories(&parent)?,
             None => Vec::new(),
@@ -1450,6 +1456,22 @@ mod tests {
         v.put_file("/file", b"two".to_vec(), 0o640).unwrap();
         assert_eq!(v.metadata("/", "/file", true).unwrap().mode, 0o640);
         assert_eq!(v.read_string("/", "/file").unwrap(), "two");
+    }
+
+    #[test]
+    fn put_file_rejects_directories_without_changing_them() {
+        let mut v = Vfs::new();
+        v.mkdir_all("/", "/dir/child").unwrap();
+        let usage = v.disk_used();
+
+        for path in ["/", "/dir", "/dir/child"] {
+            assert!(matches!(
+                v.put_file(path, b"data".to_vec(), 0o644),
+                Err(VfsError::IsADir(_))
+            ));
+            assert!(v.is_dir("/", path));
+        }
+        assert_eq!(v.disk_used(), usage);
     }
 
     #[test]

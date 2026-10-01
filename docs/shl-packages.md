@@ -118,20 +118,23 @@ flowchart LR
 
 `tests/python_package/test_packages_e2e.py` builds a grader from a directory and source ZIP, exports the same files from a container, fetches a `.shl` blob through an injected in-memory URL fetcher, instantiates it twice with distinct handler state, and runs its entrypoint. It checks guest tool calls, independent instance mutations, stable bytes, undeclared tools, malformed archives, and refusal to export a live action. No test needs real network or elapsed host time.
 
-## Bundled C toolchain
+## Optional C toolchain
 
-The Python wheel and sdist include a pinned, prebuilt TinyCC WebAssembly binary, its support
-files, an unpacked WASI C sysroot, corresponding TinyCC source, and license notices. Ordinary
-guests do not install these files.
-Call `shellsim.install_c_toolchain(container)` to install `/usr/bin/cc` in an existing guest, or
-set `PackageSpec(requires_c_toolchain=True)` when building a `.shl`. The latter records an explicit
-requirement in `shl.json`; `Package.instantiate()` installs the toolchain before the entrypoint
-runs. Existing version-1 packages without this field continue to load with no C toolchain.
+Install `shellsim[c]` to get the separately published `shellsim-c-toolchain` distribution. Its
+wheel and sdist contain a pinned, prebuilt TinyCC WebAssembly binary, its support files, an
+unpacked WASI C sysroot, corresponding TinyCC source, and license notices. The core `shellsim`
+wheel and sdist do not contain these files. Ordinary guests do not install them.
+Call `shellsim_c_toolchain.install_c_toolchain(container)` to install `/usr/bin/cc` in an
+existing guest. Alternatively, set `PackageSpec(requires_c_toolchain=True)` when building a
+`.shl`. This records an explicit requirement in `shl.json`; `Package.instantiate()` installs the
+toolchain before the entrypoint
+runs and reports a missing `shellsim[c]` extra if the toolchain distribution is absent. Existing
+version-1 packages without this field continue to load with no C toolchain.
 The Python host API stages each resource directly in the bounded guest VFS; no archive is made
 or extracted. The JSON harness file API remains limited to `/work`. Compilation and linked Wasm
 execution happen inside the guest. No host compiler or host filesystem path is exposed to the
 guest. Set limits high enough for installation and compilation.
-`LICENSES/README.md` records asset provenance and corresponding source.
+`toolchain/LICENSES/README.md` records asset provenance and corresponding source.
 
 ## Guest wire contract
 

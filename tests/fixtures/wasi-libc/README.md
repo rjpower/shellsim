@@ -13,5 +13,6 @@ filesystem, not a host-installed library.
 
 wasi-libc is offered under MIT, Apache-2.0, or Apache-2.0 with LLVM exceptions. The archive also
 contains code derived from musl (MIT) and Cloudlibc (BSD-2-Clause). The corresponding license
-texts and notices are in this directory and `LICENSES/`. This fixture does not include
-GPL-licensed code. The Python distribution also bundles the unpacked sysroot for opt-in guest use.
+texts and notices are in this directory and `toolchain/LICENSES/`. This fixture does not include
+GPL-licensed code. The `shellsim-c-toolchain` distribution also bundles the unpacked sysroot for
+opt-in guest use.

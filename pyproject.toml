@@ -8,8 +8,8 @@ dynamic = ["version"]
 description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "Apache-2.0 AND LGPL-2.1-only AND MIT AND BSD-2-Clause AND BSD-3-Clause"
-license-files = ["LICENSE", "LICENSES/*"]
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 authors = [{ name = "The shellsim authors" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -23,6 +23,9 @@ classifiers = [
     "Typing :: Typed",
 ]
 keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simulation", "testing"]
+
+[project.optional-dependencies]
+c = ["shellsim-c-toolchain==0.1.23"]
 
 [project.urls]
 Homepage = "https://github.com/rjpower/shellsim"
@@ -52,6 +55,7 @@ include = [
     "infra/*.py",
     "infra/**/*.py",
     "python/**/*.py",
+    "toolchain/**/*.py",
     "tests/python/test_*.py",
     "tests/python_package/**/*.py",
     "tests/tooling/**/*.py",

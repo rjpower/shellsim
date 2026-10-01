@@ -353,7 +353,12 @@ class Package:
         )
         container = Container(tools=selected, limits=effective, clock=clock)
         if self.spec.requires_c_toolchain:
-            from .c_toolchain import install_c_toolchain
+            try:
+                from shellsim_c_toolchain import install_c_toolchain
+            except ModuleNotFoundError as error:
+                if error.name != "shellsim_c_toolchain":
+                    raise
+                raise RuntimeError("C toolchain unavailable; install shellsim[c]") from error
 
             install_c_toolchain(container)
         for entry in self._entries:

@@ -82,8 +82,9 @@ from the source tree:
 
 ```sh
 uv build
+uv build --project toolchain --out-dir dist
 uv venv /tmp/shellsim-wheel-test
-uv pip install --python /tmp/shellsim-wheel-test/bin/python dist/*.whl pytest
+uv pip install --python /tmp/shellsim-wheel-test/bin/python dist/shellsim-*.whl dist/shellsim_c_toolchain-*.whl pytest
 /tmp/shellsim-wheel-test/bin/python -m pytest tests/python_package
 ```
 

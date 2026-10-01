@@ -1,4 +1,4 @@
-"""Install the bundled C-to-Wasm compiler and sysroot into a simulated guest."""
+"""Install the separately distributed C-to-Wasm compiler into a shellsim guest."""
 
 from __future__ import annotations
 
@@ -8,18 +8,20 @@ from importlib.resources import files
 from importlib.resources.abc import Traversable
 from typing import Protocol
 
-from ._api import RunResult
-
 _TREE_SHA256 = {
     "tcc": "6d9aec3bf180d260f9285f6bd63f2aff550f65baf39f62a493ac126f0ec4d203",
     "wasi-sysroot": "c8db6acd30553b74e149cf9bf23387107e7587761cc930933026000af3a03e63",
 }
 
 
+class _RunResult(Protocol):
+    def check_returncode(self) -> None: ...
+
+
 class _GuestMachine(Protocol):
     def write_file(self, path: str, data: bytes, *, mode: int = 0o644) -> None: ...
 
-    def run(self, source: str, stdin: bytes = b"") -> RunResult: ...
+    def run(self, source: str, stdin: bytes = b"") -> _RunResult: ...
 
 
 def _tree_files(root: Traversable) -> tuple[tuple[str, bytes], ...]:
@@ -37,7 +39,7 @@ def _tree_files(root: Traversable) -> tuple[tuple[str, bytes], ...]:
 
 
 def _verified_assets() -> tuple[tuple[str, tuple[tuple[str, bytes], ...]], ...]:
-    assets = files("shellsim").joinpath("_assets")
+    assets = files("shellsim_c_toolchain").joinpath("_assets")
     bundles = []
     for name, expected_digest in _TREE_SHA256.items():
         contents = _tree_files(assets.joinpath(name))
@@ -53,8 +55,8 @@ def _verified_assets() -> tuple[tuple[str, tuple[tuple[str, bytes], ...]], ...]:
 def install_c_toolchain(guest: _GuestMachine) -> None:
     """Install ``cc`` and the WASI C sysroot without granting host execution.
 
-    The pinned files are read from the installed Python distribution, never from an ambient host
-    path. The host stages each file directly in the bounded guest VFS.
+    The pinned files come from this distribution, never an ambient host path. The host stages
+    each file directly in the bounded guest VFS.
     """
 
     bundles = _verified_assets()

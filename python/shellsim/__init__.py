@@ -20,7 +20,6 @@ from ._api import (
     Usage,
     run,
 )
-from .c_toolchain import install_c_toolchain
 from .display_host import DisplayHost
 from .package import Package, PackageSpec
 
@@ -44,7 +43,6 @@ __all__ = [
     "SimulationError",
     "ToolError",
     "Usage",
-    "install_c_toolchain",
     "run",
     "python",
 ]
