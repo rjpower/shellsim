@@ -19,7 +19,7 @@ _HTML = b"""<!doctype html><html lang="en"><meta charset="utf-8"><title>shellsim
 <script>
 const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d'),status=document.querySelector('#status');
 const token=new URL(location.href).searchParams.get('token');
-const special={Escape:27,Enter:13,Tab:9,ArrowUp:61441,ArrowDown:61442,ArrowLeft:61443,ArrowRight:61444};
+const special={Escape:27,Enter:13,Tab:9,ArrowUp:61441,ArrowDown:61442,ArrowLeft:61443,ArrowRight:61444,Control:61445,Shift:61446,Alt:61447};
 const held=new Map();
 function code(event){return special[event.key] ?? (event.key.length===1 ? event.key.toLowerCase().codePointAt(0) : null)}
 function key(code,pressed){const body=new ArrayBuffer(8),view=new DataView(body);view.setUint32(0,code,true);view.setUint32(4,pressed?1:0,true);fetch('/key?token='+token,{method:'POST',headers:{'X-Shellsim-Token':token},body})}

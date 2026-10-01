@@ -174,6 +174,12 @@ The [virtual display](docs/virtual-display.md) lets a Wasm guest present RGBA fr
 bounded key events. A host-driven session can resume the guest between frames without granting it
 ambient display, input, or network access.
 
+An opt-in [Doom `.shl` demo](docs/virtual-display.md#external-doom-package) packages
+separately supplied Doomgeneric source and Freedoom data. Its single guest entrypoint extracts
+TinyCC, compiles Doom, and runs it; the Python package runner serves frames through its generic
+loopback display host. Run `./examples/play-doom.sh` to fetch pinned inputs and play, or publish
+the generated `.shl` and run it by HTTPS URL. The guest has no ambient host display or network.
+
 ## Agent harness
 
 `shellsim serve --root ./project` runs a persistent newline-delimited JSON session. It supports
