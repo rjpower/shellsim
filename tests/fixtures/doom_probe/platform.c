@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later */
 /* Shellsim's own opt-in Doomgeneric platform adapter. The engine and WAD are external inputs. */
 #include "doomgeneric.h"
 #include <stdint.h>

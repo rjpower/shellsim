@@ -39,6 +39,8 @@ instead instantiate it with virtual time for deterministic probes. Neither the G
 game data is checked into this repository. `LICENSES/` in the blob contains the Doomgeneric,
 Freedoom, TinyCC, wasi-libc, and shellsim adapter notices. `PROVENANCE.json` records upstream
 links, the optional Doom source revision, and the hashes of the bundled WAD and toolchain archives.
+The display adapter is dual-licensed `Apache-2.0 OR GPL-2.0-or-later`; its GPL option permits
+linking it into the Doom engine without relicensing the separate shellsim runtime.
 
 The proven inputs were:
 
@@ -79,6 +81,11 @@ uv run python examples/build_doom_package.py \
 uv run shellsim run ./doom.shl
 uv run shellsim run https://example.com/doom.shl --sha256 <printed-package-digest>
 ```
+
+GitHub release-asset URLs redirect to asset storage, while the default `.shl` HTTPS loader
+rejects redirects. Download a GitHub asset first with `gh release download TAG --pattern '*.shl'`,
+then run the local file with `uv run shellsim run ./doomgeneric-freedoom-0.13.0.shl --sha256 DIGEST`.
+A non-redirecting HTTPS blob URL can be passed directly to `shellsim run`.
 
 The package runner prints a loopback URL when Doom presents its first frame. Open it and click
 the canvas to capture input. WASD or arrow keys move, J or Ctrl fires, K or Space uses, Shift

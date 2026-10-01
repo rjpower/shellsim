@@ -70,6 +70,7 @@ def test_builds_one_guest_compile_and_launch_entrypoint(sample_inputs: tuple[Pat
     assert provenance["freedoom"]["release"] is None
     assert provenance["tinycc"]["archive_sha256"]
     assert provenance["wasi_libc"]["archive_sha256"]
+    assert provenance["shellsim_adapter"]["license"] == "Apache-2.0 OR GPL-2.0-or-later"
 
 
 def test_rejects_invalid_inputs(sample_inputs: tuple[Path, Path]) -> None:

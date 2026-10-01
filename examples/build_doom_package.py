@@ -202,7 +202,8 @@ def build_package(
             },
             "shellsim_adapter": {
                 "source": "doom/doomgeneric_shellsim.c",
-                "license": "LICENSES/shellsim-Apache-2.0.txt",
+                "license": "Apache-2.0 OR GPL-2.0-or-later",
+                "license_texts": ["LICENSES/shellsim-Apache-2.0.txt", "LICENSES/doomgeneric-GPL-2.0.txt"],
             },
         }
         (root / "PROVENANCE.json").write_text(json.dumps(provenance, sort_keys=True, indent=2) + "\n")
