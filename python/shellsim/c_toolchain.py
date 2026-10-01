@@ -27,6 +27,7 @@ def install_c_toolchain(guest: _GuestMachine) -> None:
     archives are read from the installed Python distribution, never from an ambient host path.
     """
 
+    guest.run("test ! -e /work/tcc-shellsim-package.tar.gz && test ! -e /work/sysroot-34.tar.gz").check_returncode()
     for name, expected_sha256 in _ASSETS.items():
         payload = files("shellsim").joinpath("_assets", name).read_bytes()
         if hashlib.sha256(payload).hexdigest() != expected_sha256:

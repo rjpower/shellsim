@@ -352,15 +352,15 @@ class Package:
             }
         )
         container = Container(tools=selected, limits=effective, clock=clock)
+        if self.spec.requires_c_toolchain:
+            from .c_toolchain import install_c_toolchain
+
+            install_c_toolchain(container)
         for entry in self._entries:
             if entry.data is None:
                 container.mkdir(f"/work/{entry.path}", mode=entry.mode)
             else:
                 container.write_file(f"/work/{entry.path}", entry.data, mode=entry.mode)
-        if self.spec.requires_c_toolchain:
-            from .c_toolchain import install_c_toolchain
-
-            install_c_toolchain(container)
         container._entrypoint = self.spec.entrypoint
         container._working_directory = self.spec.working_directory
         return container

@@ -91,3 +91,22 @@ def test_installation_respects_guest_disk_limit() -> None:
     guest = shellsim.Environment(limits=shellsim.Limits(cpu=50_000_000_000, disk=1024 * 1024))
     with pytest.raises(shellsim.SimulationError):
         shellsim.install_c_toolchain(guest)
+
+
+def test_installation_does_not_overwrite_existing_guest_files(tmp_path: Path) -> None:
+    guest = shellsim.Environment(limits=LIMITS)
+    guest.write_file("/work/tcc-shellsim-package.tar.gz", b"original")
+    with pytest.raises(shellsim.SimulationError):
+        shellsim.install_c_toolchain(guest)
+    assert guest.read_file("/work/tcc-shellsim-package.tar.gz") == b"original"
+
+    (tmp_path / "tcc-shellsim-package.tar.gz").write_bytes(b"package content")
+    package = shellsim.Package.build_from_directory(
+        tmp_path,
+        spec=shellsim.PackageSpec(
+            name="collision", version="1", entrypoint=("true",), limits=LIMITS,
+            requires_c_toolchain=True,
+        ),
+    )
+    container = package.instantiate(tools={}, limits=LIMITS)
+    assert container.read_file("/work/tcc-shellsim-package.tar.gz") == b"package content"
