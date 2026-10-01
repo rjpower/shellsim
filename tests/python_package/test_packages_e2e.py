@@ -219,13 +219,13 @@ def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch:
         "    write_guest(1, &io, 1, &written);\n"
         "}\n"
     )
-    (tmp_path / "build.sh").write_text(
-        "mkdir -p /work/tcc\n"
-        "tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
-        "chmod +x /work/tcc/tcc-shellsim.wasm\n"
-        "/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/hello.wasm /work/hello.c\n"
-        "chmod +x /work/hello.wasm\n"
-        "/work/hello.wasm\n"
+    (tmp_path / "build.sh").write_bytes(
+        b"mkdir -p /work/tcc\n"
+        b"tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
+        b"chmod +x /work/tcc/tcc-shellsim.wasm\n"
+        b"/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/hello.wasm /work/hello.c\n"
+        b"chmod +x /work/hello.wasm\n"
+        b"/work/hello.wasm\n"
     )
     limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
     package = shellsim.Package.build_from_directory(
@@ -269,13 +269,13 @@ def test_package_entrypoint_builds_and_runs_interactive_wasm(
         "    exit_guest(0);\n"
         "}\n"
     )
-    (tmp_path / "run.sh").write_text(
-        "mkdir -p /work/tcc\n"
-        "tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
-        "chmod +x /work/tcc/tcc-shellsim.wasm\n"
-        "/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c\n"
-        "chmod +x /work/display.wasm\n"
-        "/work/display.wasm\n"
+    (tmp_path / "run.sh").write_bytes(
+        b"mkdir -p /work/tcc\n"
+        b"tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
+        b"chmod +x /work/tcc/tcc-shellsim.wasm\n"
+        b"/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c\n"
+        b"chmod +x /work/display.wasm\n"
+        b"/work/display.wasm\n"
     )
     limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
     package = shellsim.Package.build_from_directory(

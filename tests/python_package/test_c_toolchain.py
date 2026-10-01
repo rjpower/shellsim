@@ -46,8 +46,8 @@ def test_installed_c_toolchain_compiles_inside_guest() -> None:
 
 def test_package_requirement_installs_toolchain_without_embedding_it(tmp_path: Path) -> None:
     (tmp_path / "hello.c").write_text(SOURCE)
-    (tmp_path / "run.sh").write_text(
-        "cc -o /work/hello.wasm /work/hello.c && chmod +x /work/hello.wasm && /work/hello.wasm\n"
+    (tmp_path / "run.sh").write_bytes(
+        b"cc -o /work/hello.wasm /work/hello.c && chmod +x /work/hello.wasm && /work/hello.wasm\n"
     )
     package = shellsim.Package.build_from_directory(
         tmp_path,
