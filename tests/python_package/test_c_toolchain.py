@@ -50,13 +50,13 @@ def test_package_requirement_installs_toolchain_without_embedding_it(tmp_path: P
 def test_toolchain_assets_and_corresponding_source_are_in_distribution() -> None:
     assets = files("shellsim").joinpath("_assets")
     expected = {
-        "tcc-shellsim-package.tar.gz": "3bd110fbdaa22682fefb89e93bee4b8941a324aa98bb4b3ae554fc50a2fb47f2",
+        "tcc-shellsim-package.tar.gz": "9405d8820ea5ff6a60065a5173284631db8f871d2e6d79e8f9c3b1a7456db720",
         "sysroot-34.tar.gz": "3d637426ef54d66dfb7a03276ecbf16f925b481145573a127d244093978b65be",
-        "tinycc-35c49ec-source.tar.gz": "2f0fb73158f7d64303885bc44a292621fdcd6a088828c8d3a0be98216af0004a",
+        "tinycc-22a2e10-source.tar.gz": "0be27686ffa17cbac5c95827941bd1715bbc88348f5bde381a8cb596ce7b427b",
     }
     for name, digest in expected.items():
         assert hashlib.sha256(assets.joinpath(name).read_bytes()).hexdigest() == digest
-    with tarfile.open(fileobj=io.BytesIO(assets.joinpath("tinycc-35c49ec-source.tar.gz").read_bytes()), mode="r:gz") as source:
+    with tarfile.open(fileobj=io.BytesIO(assets.joinpath("tinycc-22a2e10-source.tar.gz").read_bytes()), mode="r:gz") as source:
         assert {"COPYING", "Makefile", ".github/workflows/wasm.yml"} <= set(source.getnames())
 
 

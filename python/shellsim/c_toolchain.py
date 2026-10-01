@@ -9,7 +9,7 @@ from typing import Protocol
 from ._api import RunResult
 
 _ASSETS = {
-    "tcc-shellsim-package.tar.gz": "3bd110fbdaa22682fefb89e93bee4b8941a324aa98bb4b3ae554fc50a2fb47f2",
+    "tcc-shellsim-package.tar.gz": "9405d8820ea5ff6a60065a5173284631db8f871d2e6d79e8f9c3b1a7456db720",
     "sysroot-34.tar.gz": "3d637426ef54d66dfb7a03276ecbf16f925b481145573a127d244093978b65be",
 }
 

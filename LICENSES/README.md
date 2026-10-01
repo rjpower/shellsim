@@ -5,12 +5,13 @@ WASI C sysroot. Shellsim's Rust and Python code remains Apache-2.0. These resour
 only into guests that request the C toolchain; they are not loaded into the host process.
 
 `python/shellsim/_assets/tcc-shellsim-package.tar.gz` is the pinned TinyCC build from
-[rjpower/tinycc release shellsim-toolchain-0.1](https://github.com/rjpower/tinycc/releases/tag/shellsim-toolchain-0.1),
-SHA-256 `3bd110fbdaa22682fefb89e93bee4b8941a324aa98bb4b3ae554fc50a2fb47f2`.
+[rjpower/tinycc workflow run 36158843105](https://github.com/rjpower/tinycc/actions/runs/36158843105),
+repacked from its `tcc-wasm` artifact without changing member contents. Its SHA-256 is
+`9405d8820ea5ff6a60065a5173284631db8f871d2e6d79e8f9c3b1a7456db720`.
 TinyCC and `wasm32-libtcc1.a` are LGPL-2.1. The exact corresponding source and build workflow
-from commit [`35c49ecac6a5ca47e85bc6b4758f796956eb82aa`](https://github.com/rjpower/tinycc/tree/35c49ecac6a5ca47e85bc6b4758f796956eb82aa)
-are bundled as `python/shellsim/_assets/tinycc-35c49ec-source.tar.gz`, SHA-256
-`2f0fb73158f7d64303885bc44a292621fdcd6a088828c8d3a0be98216af0004a`.
+from commit [`22a2e10d6fb5be75af2863a1b9cc07b9260fe99e`](https://github.com/rjpower/tinycc/tree/22a2e10d6fb5be75af2863a1b9cc07b9260fe99e)
+are bundled as `python/shellsim/_assets/tinycc-22a2e10-source.tar.gz`, SHA-256
+`0be27686ffa17cbac5c95827941bd1715bbc88348f5bde381a8cb596ce7b427b`.
 The TinyCC license is in `tinycc-LGPL-2.1.txt`. Its separately packaged `shellsim_libc.c` bridge
 is MIT-licensed; see `tinycc-shellsim-libc-LICENSE`.
 
