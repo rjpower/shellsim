@@ -1595,9 +1595,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         }
     }
     let mut linker = build_linker(command_engine());
-    if launch.interaction.is_some() {
-        register_frame_yield(&mut linker);
-    }
+    register_frame_yield(&mut linker);
     linker
         .define_unknown_imports_as_traps(&module)
         .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
@@ -1644,7 +1642,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     })
 }
 
-/// Present a frame, then yield so a display session can show it before the guest continues.
+/// Yield after presenting a frame so an action host can inspect it before execution resumes.
 fn register_frame_yield(linker: &mut Linker<Host>) {
     linker.allow_shadowing(true);
     linker
@@ -1653,17 +1651,15 @@ fn register_frame_yield(linker: &mut Linker<Host>) {
             "display_present",
             |caller: Caller<'_, Host>, (handle, pointer, length, stride): (u32, u32, u32, u32)| {
                 Box::new(async move {
-                    let interaction = caller.data().interaction.clone().expect("interactive host");
+                    let interaction = caller.data().interaction.clone();
                     let machine = caller.data().machine.clone();
                     let result = display_present(caller, handle, pointer, length, stride);
                     if result == ERRNO_SUCCESS {
                         machine.suspend(Suspension::Yielded).await;
                     }
-                    if interaction
-                        .lock()
-                        .expect("interactive state lock")
-                        .stop_requested
-                    {
+                    if interaction.is_some_and(|state| {
+                        state.lock().expect("interactive state lock").stop_requested
+                    }) {
                         Err(Error::new(GuestExit(130)))
                     } else {
                         Ok(result)

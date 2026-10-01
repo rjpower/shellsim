@@ -18,11 +18,14 @@ use crate::telemetry::{CommandTrust, InvocationEvent};
 use crate::vfs::{Node, NodeKind, Vfs};
 use crate::{Environment, Limits, RunOutcome};
 
-const MAX_TRANSFER_RAW_BYTES: usize = 6 * 1024 * 1024;
+const MAX_TRANSFER_RAW_BYTES: usize = 64 * 1024 * 1024;
+const MAX_WORKSPACE_CLONE_BYTES: u64 = 6 * 1024 * 1024;
 const MAX_SESSION_FORK_BYTES: u64 = 96 * 1024 * 1024;
 const MAX_RETAINED_ACTIONS: usize = 64;
 const MAX_POLL_QUANTA: usize = 100_000;
 const MAX_CANCEL_QUANTA: usize = 100_000;
+const MAX_PACKAGE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
+const MAX_PACKAGE_SNAPSHOT_ENTRIES: usize = 10_000;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -177,6 +180,7 @@ pub enum HarnessResult {
 pub struct ActionView {
     pub action_id: u64,
     pub root_pid: u32,
+    pub display_generation: u64,
     pub state: ActionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub outcome: Option<RunOutcome>,
@@ -259,6 +263,21 @@ pub struct PathMetadata {
     pub size: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symlink_target: Option<String>,
+}
+
+/// One regular file or directory captured from a quiescent session's `/work` tree.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum WorkspaceSnapshotEntry {
+    File {
+        path: String,
+        mode: u32,
+        data_base64: String,
+    },
+    Directory {
+        path: String,
+        mode: u32,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -476,6 +495,7 @@ impl RetainedAction {
         ActionView {
             action_id: self.id,
             root_pid: self.root_pid,
+            display_generation: environment.display.generation(),
             state: self.state.clone(),
             outcome: self.outcome.clone(),
             invocations: if self.execution.is_some() {
@@ -536,6 +556,36 @@ impl RetainedAction {
 }
 
 impl HarnessSession {
+    /// Copy the latest complete frame associated with a retained action.
+    pub fn display_frame(
+        &self,
+        action_id: u64,
+    ) -> Result<Option<(u64, crate::display::DisplayFrame)>, String> {
+        if !self.actions.contains_key(&action_id) {
+            return Err(format!("action {action_id} does not exist"));
+        }
+        Ok(self
+            .environment
+            .display
+            .frame()
+            .cloned()
+            .map(|frame| (self.environment.display.generation(), frame)))
+    }
+
+    /// Queue one bounded host key transition for the current foreground action.
+    pub fn inject_action_key(
+        &mut self,
+        action_id: u64,
+        event: crate::display::KeyEvent,
+    ) -> Result<(), String> {
+        if self.active_action != Some(action_id) {
+            return Err(format!("action {action_id} is not active"));
+        }
+        self.environment
+            .inject_key(event)
+            .map_err(|error| format!("{error:?}"))
+    }
+
     /// Create an empty `/work` session and checkpoint its initial filesystem.
     pub fn new(limits: Limits) -> Self {
         Self::with_clock(limits, crate::realtime::ClockMode::Virtual)
@@ -586,13 +636,66 @@ impl HarnessSession {
 
     /// Replace the diff/reset baseline with the current bounded VFS state.
     pub fn checkpoint_workspace(&mut self) -> Result<(), String> {
-        if self.environment.vfs.disk_used() > MAX_TRANSFER_RAW_BYTES as u64 {
+        if self.environment.vfs.disk_used() > MAX_WORKSPACE_CLONE_BYTES {
             return Err(format!(
-                "workspace exceeds the {MAX_TRANSFER_RAW_BYTES}-byte checkpoint limit"
+                "workspace exceeds the {MAX_WORKSPACE_CLONE_BYTES}-byte checkpoint limit"
             ));
         }
         self.baseline = self.environment.vfs.clone();
         Ok(())
+    }
+
+    /// Capture only `/work` file data and modes, never process state or host tool handlers.
+    ///
+    /// Export is refused while an action or background process can mutate the tree. The returned
+    /// snapshot is bounded before its base64 representation is allocated.
+    pub fn snapshot_workspace(&self) -> Result<Vec<WorkspaceSnapshotEntry>, String> {
+        if self.active_action.is_some()
+            || self.environment.net.has_unanswered_host_requests()
+            || self.environment.processes.iter().any(|record| {
+                record.pid != self.environment.process.pid
+                    && !matches!(record.status, ProcessStatus::Exited(_))
+            })
+        {
+            return Err("workspace snapshot requires a quiescent container".into());
+        }
+        let mut entries = Vec::new();
+        let mut total_bytes = 0usize;
+        for (path, node) in self.environment.vfs.all_paths() {
+            let Some(relative) = path.strip_prefix("/work/") else {
+                continue;
+            };
+            if entries.len() >= MAX_PACKAGE_SNAPSHOT_ENTRIES {
+                return Err("workspace snapshot has too many entries".into());
+            }
+            let entry = match &node.kind {
+                NodeKind::Dir => WorkspaceSnapshotEntry::Directory {
+                    path: relative.to_string(),
+                    mode: node.mode,
+                },
+                NodeKind::File(data) => {
+                    if data.len() > MAX_TRANSFER_RAW_BYTES {
+                        return Err("workspace snapshot file exceeds transfer limit".into());
+                    }
+                    total_bytes = total_bytes
+                        .checked_add(data.len())
+                        .ok_or("workspace snapshot is too large")?;
+                    if total_bytes > MAX_PACKAGE_SNAPSHOT_BYTES {
+                        return Err("workspace snapshot is too large".into());
+                    }
+                    WorkspaceSnapshotEntry::File {
+                        path: relative.to_string(),
+                        mode: node.mode,
+                        data_base64: STANDARD.encode(data),
+                    }
+                }
+                NodeKind::Symlink(_) | NodeKind::NativeExecutable(_) => {
+                    return Err(format!("unsupported workspace package entry: {path}"));
+                }
+            };
+            entries.push(entry);
+        }
+        Ok(entries)
     }
 
     /// Clone the complete deterministic machine state for a branching evaluation.
@@ -607,11 +710,9 @@ impl HarnessSession {
         }
         let current_disk = self.environment.vfs.disk_used();
         let baseline_disk = self.baseline.disk_used();
-        if current_disk > MAX_TRANSFER_RAW_BYTES as u64
-            || baseline_disk > MAX_TRANSFER_RAW_BYTES as u64
-        {
+        if current_disk > MAX_WORKSPACE_CLONE_BYTES || baseline_disk > MAX_WORKSPACE_CLONE_BYTES {
             return Err(format!(
-                "workspace exceeds the {MAX_TRANSFER_RAW_BYTES}-byte session fork limit"
+                "workspace exceeds the {MAX_WORKSPACE_CLONE_BYTES}-byte session fork limit"
             ));
         }
         let usage = self
@@ -967,6 +1068,7 @@ impl HarnessSession {
             };
             action.state = ActionState::Running;
             let mut completed = None;
+            let frame_at_start = self.environment.display.generation();
             for _ in 0..work_quanta {
                 let poll = match execution.poll(&mut self.environment, advance_time) {
                     Ok(poll) => poll,
@@ -1012,6 +1114,9 @@ impl HarnessSession {
                         completed = Some(status);
                         break;
                     }
+                }
+                if self.environment.display.generation() != frame_at_start {
+                    break;
                 }
             }
             execution.drain_output(
@@ -1566,6 +1671,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn package_snapshot_captures_workspace_only_and_rejects_links() {
+        let mut session = HarnessSession::with_clock_and_host_tools(
+            Limits::default(),
+            crate::realtime::ClockMode::Virtual,
+        );
+        session
+            .environment
+            .vfs
+            .put_file("/work/data", b"value".to_vec(), 0o640)
+            .unwrap();
+        let entries = session.snapshot_workspace().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(
+            &entries[0],
+            WorkspaceSnapshotEntry::File { path, mode, data_base64 }
+                if path == "data" && *mode == 0o640 && data_base64 == "dmFsdWU="
+        ));
+        session
+            .environment
+            .vfs
+            .symlink("/", "data", "/work/link")
+            .unwrap();
+        assert!(session.snapshot_workspace().is_err());
+    }
+
+    #[test]
     fn host_calls_are_scoped_to_current_action_descendants() {
         let mut processes =
             crate::process::ProcessTable::new(1_000, "/work".into(), Default::default());
@@ -1701,7 +1832,11 @@ mod tests {
         oversized
             .environment
             .vfs
-            .put_file("/work/large", vec![0; MAX_TRANSFER_RAW_BYTES + 1], 0o644)
+            .put_file(
+                "/work/large",
+                vec![0; MAX_WORKSPACE_CLONE_BYTES as usize + 1],
+                0o644,
+            )
             .unwrap();
         let error = match oversized.fork() {
             Ok(_) => panic!("oversized session fork unexpectedly succeeded"),
