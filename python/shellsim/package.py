@@ -41,6 +41,7 @@ class PackageSpec:
     limits: Limits = field(default_factory=Limits)
     working_directory: str = "/work"
     requested_clock: str = "virtual"
+    requires_c_toolchain: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _NAME.fullmatch(self.name) is None:
@@ -78,6 +79,8 @@ class PackageSpec:
             raise TypeError("limits must be a shellsim.Limits instance")
         if self.requested_clock not in ("virtual", "real_time"):
             raise ValueError("requested_clock must be 'virtual' or 'real_time'")
+        if not isinstance(self.requires_c_toolchain, bool):
+            raise TypeError("requires_c_toolchain must be bool")
         if self.working_directory == "/work":
             return
         if not isinstance(self.working_directory, str) or not self.working_directory.startswith("/work/"):
@@ -354,6 +357,10 @@ class Package:
                 container.mkdir(f"/work/{entry.path}", mode=entry.mode)
             else:
                 container.write_file(f"/work/{entry.path}", entry.data, mode=entry.mode)
+        if self.spec.requires_c_toolchain:
+            from .c_toolchain import install_c_toolchain
+
+            install_c_toolchain(container)
         container._entrypoint = self.spec.entrypoint
         container._working_directory = self.spec.working_directory
         return container
@@ -432,6 +439,7 @@ def _manifest(spec: PackageSpec, entries: tuple[_Entry, ...]) -> dict[str, objec
         "working_directory": spec.working_directory,
         "requested_clock": spec.requested_clock,
         "required_tools": list(spec.required_tools),
+        "requires_c_toolchain": spec.requires_c_toolchain,
         "limits": {name: getattr(spec.limits, name) for name in ("cpu", "memory", "disk", "output")},
         "entries": described,
     }
@@ -548,7 +556,7 @@ def _parse_manifest(manifest: object) -> tuple[PackageSpec, list[dict[str, objec
     }
     if (
         not isinstance(manifest, dict)
-        or set(manifest) != fields
+        or set(manifest) not in (fields, fields | {"requires_c_toolchain"})
         or type(manifest["format"]) is not int
         or manifest["format"] != 1
     ):
@@ -565,6 +573,7 @@ def _parse_manifest(manifest: object) -> tuple[PackageSpec, list[dict[str, objec
         limits=limits,
         working_directory=manifest["working_directory"],
         requested_clock=manifest["requested_clock"],
+        requires_c_toolchain=manifest.get("requires_c_toolchain", False),
     )
     descriptions = manifest["entries"]
     if not isinstance(descriptions, list) or len(descriptions) > _MAX_ENTRIES:

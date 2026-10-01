@@ -46,6 +46,7 @@ arithmetic-grader-0.1.0.shl
   "working_directory": "/work",
   "requested_clock": "virtual",
   "required_tools": ["workspace.read_file", "conversation.list", "grade.submit"],
+  "requires_c_toolchain": false,
   "limits": {"cpu": 1000000, "memory": 16777216, "disk": 16777216, "output": 65536},
   "entries": [
     {"type": "directory", "path": "app", "mode": 493},
@@ -116,6 +117,18 @@ flowchart LR
 ```
 
 `tests/python_package/test_packages_e2e.py` builds a grader from a directory and source ZIP, exports the same files from a container, fetches a `.shl` blob through an injected in-memory URL fetcher, instantiates it twice with distinct handler state, and runs its entrypoint. It checks guest tool calls, independent instance mutations, stable bytes, undeclared tools, malformed archives, and refusal to export a live action. No test needs real network or elapsed host time.
+
+## Bundled C toolchain
+
+The Python wheel and sdist include a pinned TinyCC WebAssembly compiler, a WASI C sysroot,
+corresponding TinyCC source, and license notices. Ordinary guests do not install these files.
+Call `shellsim.install_c_toolchain(container)` to install `/usr/bin/cc` in an existing guest, or
+set `PackageSpec(requires_c_toolchain=True)` when building a `.shl`. The latter records an explicit
+requirement in `shl.json`; `Package.instantiate()` installs the toolchain before the entrypoint
+runs. Existing version-1 packages without this field continue to load with no C toolchain.
+Compilation, archive extraction, and linked Wasm execution stay inside the bounded guest; no
+host compiler or host filesystem path is exposed. Set limits high enough for installation and
+compilation. `LICENSES/README.md` records asset provenance and corresponding source.
 
 ## Guest wire contract
 

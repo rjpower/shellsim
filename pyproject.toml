@@ -8,8 +8,8 @@ dynamic = ["version"]
 description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 readme = "README.md"
 requires-python = ">=3.9"
-license = "Apache-2.0"
-license-files = ["LICENSE"]
+license = "Apache-2.0 AND LGPL-2.1-only AND MIT AND BSD-2-Clause AND BSD-3-Clause"
+license-files = ["LICENSE", "LICENSES/*"]
 authors = [{ name = "The shellsim authors" }]
 classifiers = [
     "Development Status :: 3 - Alpha",
