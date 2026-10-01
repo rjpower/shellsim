@@ -101,38 +101,67 @@ impl NativeContainer {
     }
 
     fn write_file(&self, py: Python<'_>, path: String, data: Vec<u8>, mode: u32) -> PyResult<()> {
-        self.apply(
-            py,
-            HarnessOperation::WriteFile {
-                path,
-                data_base64: STANDARD.encode(data),
-                mode,
-            },
-        )?;
-        Ok(())
+        let path = container_vfs_path(&path).map_err(SimulationError::new_err)?;
+        if mode > 0o7777 {
+            return Err(SimulationError::new_err("invalid file mode"));
+        }
+        py.detach(|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+            on_worker(&mut session, move |session| {
+                session.environment.sync_vfs_time();
+                session
+                    .environment
+                    .vfs
+                    .put_file(&path, data, mode)
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
     }
 
     fn read_file(&self, py: Python<'_>, path: String) -> PyResult<Py<PyBytes>> {
-        let result = self.apply(py, HarnessOperation::ReadFile { path })?;
-        let encoded = result["data_base64"]
-            .as_str()
-            .ok_or_else(|| SimulationError::new_err("missing file bytes"))?;
-        let bytes = STANDARD
-            .decode(encoded)
-            .map_err(|error| SimulationError::new_err(error.to_string()))?;
+        let path = container_vfs_path(&path).map_err(SimulationError::new_err)?;
+        let bytes = py
+            .detach(|| {
+                let mut session = self
+                    .session
+                    .lock()
+                    .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+                on_worker(&mut session, move |session| {
+                    session
+                        .environment
+                        .vfs
+                        .read("/", &path)
+                        .map_err(|error| error.to_string())
+                })
+            })
+            .map_err(SimulationError::new_err)?;
         Ok(PyBytes::new(py, &bytes).unbind())
     }
 
     fn mkdir(&self, py: Python<'_>, path: String, mode: u32) -> PyResult<()> {
-        self.apply(
-            py,
-            HarnessOperation::MakeDirectory {
-                path,
-                mode,
-                parents: true,
-            },
-        )?;
-        Ok(())
+        let path = container_vfs_path(&path).map_err(SimulationError::new_err)?;
+        if mode > 0o7777 {
+            return Err(SimulationError::new_err("invalid directory mode"));
+        }
+        py.detach(|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+            on_worker(&mut session, move |session| {
+                session.environment.sync_vfs_time();
+                session
+                    .environment
+                    .vfs
+                    .put_dir(&path, mode)
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
     }
 
     fn snapshot_workspace(&self, py: Python<'_>) -> PyResult<String> {
@@ -278,6 +307,13 @@ impl NativeContainer {
         })
         .map_err(SimulationError::new_err)
     }
+}
+
+fn container_vfs_path(path: &str) -> Result<String, String> {
+    if path.contains('\0') {
+        return Err("container path contains NUL".to_string());
+    }
+    Ok(shellsim::vfs::resolve_against("/work", path))
 }
 
 fn serialize_result(result: serde_json::Value) -> PyResult<String> {

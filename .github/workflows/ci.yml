@@ -52,7 +52,30 @@ jobs:
       - run: rustup show active-toolchain
       - name: Build and install wheel
         run: |
-          python -m pip install "maturin>=1.8,<2" "pytest>=8"
+          python -m pip install "maturin>=1.8,<2" "build>=1,<2" "pytest>=8"
           maturin build --release --locked --out dist
-          python -m pip install dist/*.whl
+          python -m build toolchain --outdir dist
+          python -m pip install dist/shellsim-*.whl
+          python - <<'PY'
+          import importlib.util
+          import tempfile
+          from pathlib import Path
+          import shellsim
+
+          assert importlib.util.find_spec("shellsim_c_toolchain") is None
+          assert shellsim.run("printf core").stdout == b"core"
+          with tempfile.TemporaryDirectory() as directory:
+              Path(directory, "run.sh").write_text("true\n")
+              package = shellsim.Package.build_from_directory(
+                  directory,
+                  spec=shellsim.PackageSpec(name="requires-c", version="1", entrypoint=("sh", "/work/run.sh"), requires_c_toolchain=True),
+              )
+              try:
+                  package.instantiate(tools={})
+              except RuntimeError as error:
+                  assert "shellsim[c]" in str(error)
+              else:
+                  raise AssertionError("missing toolchain was accepted")
+          PY
+          python -m pip install dist/shellsim_c_toolchain-*.whl
       - run: python -m pytest tests/python_package tests/tooling

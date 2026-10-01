@@ -3,7 +3,10 @@
 debug
 target
 dist/
+toolchain/build/
+*.egg-info/
 *.wasm
+!toolchain/src/shellsim_c_toolchain/_assets/tcc/tcc-shellsim.wasm
 
 # Python bytecode cache (from py_compile syntax-check test on src/python/*.py)
 __pycache__/

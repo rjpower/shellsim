@@ -46,6 +46,7 @@ arithmetic-grader-0.1.0.shl
   "working_directory": "/work",
   "requested_clock": "virtual",
   "required_tools": ["workspace.read_file", "conversation.list", "grade.submit"],
+  "requires_c_toolchain": false,
   "limits": {"cpu": 1000000, "memory": 16777216, "disk": 16777216, "output": 65536},
   "entries": [
     {"type": "directory", "path": "app", "mode": 493},
@@ -116,6 +117,24 @@ flowchart LR
 ```
 
 `tests/python_package/test_packages_e2e.py` builds a grader from a directory and source ZIP, exports the same files from a container, fetches a `.shl` blob through an injected in-memory URL fetcher, instantiates it twice with distinct handler state, and runs its entrypoint. It checks guest tool calls, independent instance mutations, stable bytes, undeclared tools, malformed archives, and refusal to export a live action. No test needs real network or elapsed host time.
+
+## Optional C toolchain
+
+Install `shellsim[c]` to get the separately published `shellsim-c-toolchain` distribution. Its
+wheel and sdist contain a pinned, prebuilt TinyCC WebAssembly binary, its support files, an
+unpacked WASI C sysroot, corresponding TinyCC source, and license notices. The core `shellsim`
+wheel and sdist do not contain these files. Ordinary guests do not install them.
+Call `shellsim_c_toolchain.install_c_toolchain(container)` to install `/usr/bin/cc` in an
+existing guest. Alternatively, set `PackageSpec(requires_c_toolchain=True)` when building a
+`.shl`. This records an explicit requirement in `shl.json`; `Package.instantiate()` installs the
+toolchain before the entrypoint
+runs and reports a missing `shellsim[c]` extra if the toolchain distribution is absent. Existing
+version-1 packages without this field continue to load with no C toolchain.
+The Python host API stages each resource directly in the bounded guest VFS; no archive is made
+or extracted. The JSON harness file API remains limited to `/work`. Compilation and linked Wasm
+execution happen inside the guest. No host compiler or host filesystem path is exposed to the
+guest. Set limits high enough for installation and compilation.
+`toolchain/LICENSES/README.md` records asset provenance and corresponding source.
 
 ## Guest wire contract
 

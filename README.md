@@ -61,6 +61,10 @@ shellsim -c 'printf "b\na\n" | sort'
 shellsim --root ./project -c 'python3.14 test.py'
 ```
 
+Install `shellsim[c]` instead when a `.shl` package needs the separately distributed C-to-Wasm
+toolchain. The core wheel does not contain TinyCC or the WASI sysroot. See
+[the C toolchain contract](docs/shl-packages.md#optional-c-toolchain).
+
 `--root` copies the selected host tree into a disposable `/work` snapshot. With no `-c` and a
 terminal attached, `shellsim` starts a persistent interactive session.
 
