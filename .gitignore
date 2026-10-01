@@ -4,6 +4,7 @@ debug
 target
 dist/
 *.wasm
+!python/shellsim/_assets/tcc/tcc-shellsim.wasm
 
 # Python bytecode cache (from py_compile syntax-check test on src/python/*.py)
 __pycache__/

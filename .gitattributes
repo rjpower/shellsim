@@ -4,3 +4,5 @@ tests/corpus/oils-spec/cases/** -whitespace
 tests/corpus/whole-programs/modernish/probes/** -whitespace
 tests/corpus/whole-programs/zlib/{configure,Makefile.in,zconf.h.in,zlib.h} -whitespace
 tests/fixtures/tinycc/COPYING -whitespace
+python/shellsim/_assets/tcc/** -whitespace
+python/shellsim/_assets/wasi-sysroot/** -whitespace

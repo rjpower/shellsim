@@ -120,15 +120,18 @@ flowchart LR
 
 ## Bundled C toolchain
 
-The Python wheel and sdist include a pinned TinyCC WebAssembly compiler, a WASI C sysroot,
-corresponding TinyCC source, and license notices. Ordinary guests do not install these files.
+The Python wheel and sdist include a pinned, prebuilt TinyCC WebAssembly binary, its support
+files, an unpacked WASI C sysroot, corresponding TinyCC source, and license notices. Ordinary
+guests do not install these files.
 Call `shellsim.install_c_toolchain(container)` to install `/usr/bin/cc` in an existing guest, or
 set `PackageSpec(requires_c_toolchain=True)` when building a `.shl`. The latter records an explicit
 requirement in `shl.json`; `Package.instantiate()` installs the toolchain before the entrypoint
 runs. Existing version-1 packages without this field continue to load with no C toolchain.
-Compilation, archive extraction, and linked Wasm execution stay inside the bounded guest; no
-host compiler or host filesystem path is exposed. Set limits high enough for installation and
-compilation. `LICENSES/README.md` records asset provenance and corresponding source.
+The Python host API stages each resource directly in the bounded guest VFS; no archive is made
+or extracted. The JSON harness file API remains limited to `/work`. Compilation and linked Wasm
+execution happen inside the guest. No host compiler or host filesystem path is exposed to the
+guest. Set limits high enough for installation and compilation.
+`LICENSES/README.md` records asset provenance and corresponding source.
 
 ## Guest wire contract
 

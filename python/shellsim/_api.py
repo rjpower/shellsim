@@ -393,7 +393,7 @@ class Container:
         return self._native.read_file(path)
 
     def mkdir(self, path: str, *, mode: int = 0o755) -> None:
-        """Create a directory in the guest workspace, including missing parents."""
+        """Create a directory in the guest VFS, including missing parents."""
 
         if not isinstance(path, str):
             raise TypeError("path must be str")
