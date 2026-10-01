@@ -36,7 +36,9 @@ TinyCC toolchain, a WASI sysroot, and shellsim's display adapter into one `.shl`
 package's sole entrypoint extracts the toolchain, compiles the engine inside shellsim, and runs
 the resulting Wasm program. It requests real-time clock mode for interactive play. The host may
 instead instantiate it with virtual time for deterministic probes. Neither the GPL engine nor
-game data is checked into this repository.
+game data is checked into this repository. `LICENSES/` in the blob contains the Doomgeneric,
+Freedoom, TinyCC, wasi-libc, and shellsim adapter notices. `PROVENANCE.json` records upstream
+links, the optional Doom source revision, and the hashes of the bundled WAD and toolchain archives.
 
 The proven inputs were:
 
@@ -44,15 +46,16 @@ The proven inputs were:
   `dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284`, with
   `SHELLSIM_DOOM_SOURCE` pointing to its `doomgeneric/` source directory.
 - [Freedoom 0.13.0](https://github.com/freedoom/freedoom/releases/tag/v0.13.0)
-  `freedoom1.wad`, SHA-256
+  release ZIP, containing `freedoom1.wad` with SHA-256
   `7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d`, with
-  `SHELLSIM_DOOM_WAD` pointing to that file.
+  `SHELLSIM_FREEDOOM_ARCHIVE` pointing to the release ZIP. The builder reads its IWAD,
+  `COPYING.txt`, and credits from the same archive.
 
 Run the opt-in Python package probe with both variables set:
 
 ```sh
 SHELLSIM_DOOM_SOURCE=/path/to/doomgeneric/doomgeneric \
-SHELLSIM_DOOM_WAD=/path/to/freedoom1.wad \
+SHELLSIM_FREEDOOM_ARCHIVE=/path/to/freedoom-0.13.0.zip \
 uv run --group test --reinstall-package shellsim python -m pytest -q \
   tests/python_package/test_doom_package.py
 ```
@@ -63,14 +66,16 @@ To fetch the pinned external inputs and play from the repository root, run:
 ./examples/play-doom.sh
 ```
 
-The launcher requires `curl`, `tar`, `unzip`, `shasum`, and `uv`. It downloads into a temporary
-directory, verifies the WAD hash, builds a temporary `.shl`, then runs `shellsim run` against that
+The launcher requires `curl`, `tar`, and `uv`. It downloads into a temporary
+directory, verifies the IWAD hash while building a temporary `.shl`, then runs `shellsim run` against that
 blob. The downloads and temporary package are removed after the player exits. To keep or publish
 a package from inputs you obtained separately:
 
 ```sh
 uv run python examples/build_doom_package.py \
-  /path/to/doomgeneric/doomgeneric /path/to/freedoom1.wad doom.shl
+  /path/to/doomgeneric/doomgeneric /path/to/freedoom-0.13.0.zip doom.shl \
+  --doom-revision dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284 \
+  --wad-sha256 7323bcc168c5a45ff10749b339960e98314740a734c30d4b9f3337001f9e703d
 uv run shellsim run ./doom.shl
 uv run shellsim run https://example.com/doom.shl --sha256 <printed-package-digest>
 ```
@@ -81,8 +86,8 @@ runs, and Esc opens the menu. The browser receives copied RGBA frames and sends 
 the host's generic `DisplayHost`; the guest has no network access. The host binds an ephemeral
 `127.0.0.1` port and stops the guest when the Stop button is pressed. The external
 [Freedoom release](https://github.com/freedoom/freedoom/releases/tag/v0.13.0) provides the WAD;
-only the opt-in launcher downloads it. If you publish the blob, account for the engine, toolchain,
-and game-data licenses and provide their required source and notices.
+only the opt-in launcher downloads it. Inspect `LICENSES/` and `PROVENANCE.json` before
+publishing; the source tree, toolchain, WAD, and adapter retain their respective license terms.
 
 The builder selects Doomgeneric's console-error path instead of its optional Zenity `system()`
 call. The adapter uses libc `clock_gettime` and `usleep`. The package runs at normal speed when
