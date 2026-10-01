@@ -148,3 +148,17 @@ def test_run_fetches_package_and_executes_guest_entrypoint(tmp_path: Path, monke
 def test_run_rejects_plain_http_without_a_custom_fetcher(capsys) -> None:
     assert main(["run", "http://example.com/demo.shl"]) == 2
     assert "HTTPS" in capsys.readouterr().err
+
+
+def test_run_loads_local_package(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("print('local package')\n")
+    package = Package.build_from_directory(
+        tmp_path, spec=PackageSpec(name="local", version="1", entrypoint=("python3.14", "/work/app.py"))
+    )
+    source = tmp_path.parent / "local.shl"
+    source.write_bytes(package.to_bytes())
+
+    completed = run_cli("run", str(source), "--sha256", package.sha256)
+
+    assert completed.returncode == 0
+    assert completed.stdout == b"local package\n"

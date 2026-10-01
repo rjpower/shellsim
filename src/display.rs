@@ -43,6 +43,7 @@ pub enum DisplayError {
 #[derive(Clone, Debug, Default)]
 pub struct VirtualDisplay {
     frame: Option<DisplayFrame>,
+    generation: u64,
     owner: Option<ProcessId>,
     events: VecDeque<KeyEvent>,
 }
@@ -51,6 +52,11 @@ impl VirtualDisplay {
     /// Inspect the last completed frame without granting the guest host-display access.
     pub fn frame(&self) -> Option<&DisplayFrame> {
         self.frame.as_ref()
+    }
+
+    /// Monotonic count of successful presentations, independent of frame reads.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Queue a bounded virtual key transition, including before the guest opens its display.
@@ -138,6 +144,7 @@ impl VirtualDisplay {
             return Err(DisplayError::ResourceExhausted);
         }
         frame.pixels.copy_from_slice(pixels);
+        self.generation = self.generation.saturating_add(1);
         Ok(())
     }
 

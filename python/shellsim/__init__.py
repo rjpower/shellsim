@@ -2,8 +2,11 @@
 
 from . import python as python
 from ._api import (
+    Action,
+    ActionPoll,
     CommandUsage,
     Container,
+    DisplayFrame,
     Environment,
     HttpRequest,
     HttpResponse,
@@ -17,11 +20,16 @@ from ._api import (
     Usage,
     run,
 )
+from .display_host import DisplayHost
 from .package import Package, PackageSpec
 
 __all__ = [
+    "Action",
+    "ActionPoll",
     "CommandUsage",
     "Container",
+    "DisplayFrame",
+    "DisplayHost",
     "Environment",
     "HttpRequest",
     "HttpResponse",

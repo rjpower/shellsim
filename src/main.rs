@@ -305,7 +305,7 @@ fn interactive_shell(mut machine: MachineOptions, args: &[String]) -> ! {
     exit(env.last_status);
 }
 
-const MAX_PROTOCOL_REQUEST_BYTES: usize = 20 * 1024 * 1024;
+const MAX_PROTOCOL_REQUEST_BYTES: usize = 96 * 1024 * 1024;
 const MAX_SCENARIO_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SCENARIO_ACTIONS: usize = 4_096;
 

@@ -170,8 +170,8 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
     with pytest.raises(ValueError, match="unsupported source entry"):
         shellsim.Package.build_from_directory(source_tree, spec=SPEC)
     (source_tree / "link").unlink()
-    (source_tree / "huge").write_bytes(b"x" * (6 * 1024 * 1024 + 1))
-    with pytest.raises(ValueError, match="exceeds 6 MiB"):
+    (source_tree / "huge").write_bytes(b"x" * (64 * 1024 * 1024 + 1))
+    with pytest.raises(ValueError, match="exceeds 64 MiB"):
         shellsim.Package.build_from_directory(source_tree, spec=SPEC)
 
     duplicate = io.BytesIO()
@@ -193,8 +193,8 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
 
     compressed = io.BytesIO()
     with zipfile.ZipFile(compressed, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("bomb", b"x" * (6 * 1024 * 1024 + 1))
-    with pytest.raises(ValueError, match="exceeds 6 MiB"):
+        archive.writestr("bomb", b"x" * (64 * 1024 * 1024 + 1))
+    with pytest.raises(ValueError, match="exceeds 64 MiB"):
         shellsim.Package.build_from_zip(compressed.getvalue(), spec=SPEC)
 
 
@@ -239,3 +239,118 @@ def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch:
         "--cpu", "10g", "--memory", "128m", "--disk", "128m",
     ]) == 0
     assert capsys.readouterr().out == "compiled in guest\n"
+
+
+def test_package_entrypoint_builds_and_runs_interactive_wasm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    toolchain = Path(__file__).resolve().parents[1] / "fixtures" / "tinycc" / "tcc-shellsim-package.tar.gz"
+    (tmp_path / "tcc.tar.gz").write_bytes(toolchain.read_bytes())
+    (tmp_path / "display.c").write_text(
+        "void *memset(void *pointer, int value, unsigned size) {\n"
+        "    unsigned char *bytes = pointer;\n"
+        "    for (unsigned index = 0; index < size; ++index) bytes[index] = value;\n"
+        "    return pointer;\n"
+        "}\n"
+        'extern int display_open(unsigned, unsigned, unsigned) __asm__("shellsim.display_open");\n'
+        'extern int display_present(unsigned, const void *, unsigned, unsigned) __asm__("shellsim.display_present");\n'
+        'extern int input_poll_key(unsigned, void *) __asm__("shellsim.input_poll_key");\n'
+        'extern int display_close(unsigned) __asm__("shellsim.display_close");\n'
+        'extern void exit_guest(int) __asm__("wasi_snapshot_preview1.proc_exit");\n'
+        "struct key_event { unsigned code; unsigned pressed; };\n"
+        "void _start(void) {\n"
+        "    unsigned char pixels[8] = {0};\n"
+        "    struct key_event event = {0};\n"
+        "    int handle = display_open(2, 1, 1);\n"
+        "    if (handle <= 0 || display_present(handle, pixels, 8, 8)) exit_guest(1);\n"
+        "    if (input_poll_key(handle, &event) || event.code != 27 || !event.pressed) exit_guest(2);\n"
+        "    pixels[0] = 255;\n"
+        "    if (display_present(handle, pixels, 8, 8) || display_close(handle)) exit_guest(3);\n"
+        "    exit_guest(0);\n"
+        "}\n"
+    )
+    (tmp_path / "run.sh").write_text(
+        "mkdir -p /work/tcc\n"
+        "tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
+        "chmod +x /work/tcc/tcc-shellsim.wasm\n"
+        "/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c\n"
+        "chmod +x /work/display.wasm\n"
+        "/work/display.wasm\n"
+    )
+    limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
+    package = shellsim.Package.build_from_directory(
+        tmp_path,
+        spec=shellsim.PackageSpec(name="interactive", version="1", entrypoint=("sh", "/work/run.sh"), limits=limits),
+    )
+    container = shellsim.Package.from_bytes(package.to_bytes()).instantiate(tools={}, limits=limits)
+    with container.start_entrypoint() as action:
+        first = None
+        for _ in range(100):
+            first = action.poll()
+            if first.frame is not None or first.state == "complete":
+                break
+        assert first is not None and first.frame is not None
+        assert (first.frame.width, first.frame.height, first.frame.pixels) == (2, 1, b"\0" * 8)
+        action.inject_key(27, True)
+        second = None
+        for _ in range(100):
+            second = action.poll()
+            if second.frame is not None or second.state == "complete":
+                break
+        assert second is not None and second.frame is not None
+        assert second.frame.generation == first.frame.generation + 1
+        assert second.frame.pixels[0] == 255
+        while second.state != "complete":
+            second = action.poll()
+        assert action.result.returncode == 0
+
+    from shellsim._cli import main
+
+    class FakeDisplayHost:
+        def __init__(self, action: shellsim.Action) -> None:
+            self.url = "http://127.0.0.1/display"
+            self.frame: shellsim.DisplayFrame | None = None
+            self.sent_key = False
+
+        def __enter__(self) -> FakeDisplayHost:
+            return self
+
+        def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+            pass
+
+        def publish(self, frame: shellsim.DisplayFrame) -> None:
+            self.frame = frame
+
+        def drain_keys(self) -> list[tuple[int, bool]]:
+            if self.frame is not None and not self.sent_key:
+                self.sent_key = True
+                return [(27, True)]
+            return []
+
+        def stop_requested(self) -> bool:
+            return False
+
+        def mark_stopped(self) -> None:
+            pass
+
+    monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
+    monkeypatch.setattr("shellsim._cli.DisplayHost", FakeDisplayHost)
+    assert main(["run", "https://example.com/display.shl", "--sha256", package.sha256]) == 0
+    assert "http://127.0.0.1/display" in capsys.readouterr().err
+
+
+def test_package_accepts_large_file_and_requests_host_clock(tmp_path: Path) -> None:
+    content = b"w" * (7 * 1024 * 1024)
+    (tmp_path / "large.wad").write_bytes(content)
+    package = shellsim.Package.build_from_directory(
+        tmp_path,
+        spec=shellsim.PackageSpec(
+            name="large-game", version="1", entrypoint=("true",), requested_clock="real_time"
+        ),
+    )
+    loaded = shellsim.Package.from_bytes(package.to_bytes())
+    assert loaded.spec.requested_clock == "real_time"
+    assert loaded.instantiate(tools={}).clock == "virtual"
+    real_time = loaded.instantiate(tools={}, clock="real_time")
+    assert real_time.clock == "real_time"
+    assert real_time.read_file("/work/large.wad") == content

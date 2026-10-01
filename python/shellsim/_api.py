@@ -147,6 +147,28 @@ class RunResult:
             raise SimulationError(f"shellsim action exited with status {self.returncode}{suffix}")
 
 
+@dataclass(frozen=True)
+class DisplayFrame:
+    """One complete RGBA frame copied from the virtual display."""
+
+    generation: int
+    width: int
+    height: int
+    pixels: bytes
+
+
+@dataclass(frozen=True)
+class ActionPoll:
+    """One bounded foreground-action step and any newly presented frame or output."""
+
+    state: str
+    frame: Optional[DisplayFrame]
+    stdout: bytes
+    stderr: bytes
+    returncode: Optional[int]
+    reason: Optional[Mapping[str, Any]]
+
+
 class Environment:
     """A persistent deterministic machine with an isolated in-memory filesystem.
 
@@ -321,7 +343,9 @@ class Container:
     ``http://host.shellsim/tools`` endpoint; no guest socket or host API handle is exposed.
     """
 
-    def __init__(self, tools: Mapping[str, ToolHandler], limits: Optional[Limits] = None) -> None:
+    def __init__(
+        self, tools: Mapping[str, ToolHandler], limits: Optional[Limits] = None, *, clock: str = "virtual"
+    ) -> None:
         if not isinstance(tools, Mapping):
             raise TypeError("tools must be a mapping from names to callable handlers")
         for name, handler in tools.items():
@@ -329,6 +353,8 @@ class Container:
                 raise TypeError("tool names must be nonempty strings with callable handlers")
         if limits is not None and not isinstance(limits, Limits):
             raise TypeError("limits must be a shellsim.Limits instance")
+        if clock not in ("virtual", "real_time"):
+            raise ValueError("clock must be 'virtual' or 'real_time'")
         self._tools = dict(tools)
         self._entrypoint: Optional[Tuple[str, ...]] = None
         self._working_directory = "/work"
@@ -338,7 +364,14 @@ class Container:
             resolved.memory,
             resolved.disk,
             resolved.output,
+            clock == "real_time",
         )
+
+    @property
+    def clock(self) -> str:
+        """Host-selected clock mode fixed at container construction."""
+
+        return self._native.clock_mode()
 
     def write_file(self, path: str, data: Union[bytes, bytearray, memoryview, str], *, mode: int = 0o644) -> None:
         """Stage one file in the guest VFS without exposing its source host path."""
@@ -376,6 +409,21 @@ class Container:
         if self._entrypoint is None:
             raise SimulationError("container has no package entrypoint")
         return self.run(f"cd {shlex.quote(self._working_directory)} && {shlex.join(self._entrypoint)}")
+
+    def start_entrypoint(self) -> Action:
+        """Start a package entrypoint as a host-driven foreground action."""
+
+        if self._entrypoint is None:
+            raise SimulationError("container has no package entrypoint")
+        return self.start(f"cd {shlex.quote(self._working_directory)} && {shlex.join(self._entrypoint)}")
+
+    def start(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> Action:
+        """Start a shell action without hiding frame, input, or cancellation control."""
+
+        if not isinstance(source, str):
+            raise TypeError("source must be str")
+        started = json.loads(self._native.start_execute(source, _as_bytes("stdin", stdin)))
+        return Action(self, started)
 
     def run(self, source: str, stdin: Union[bytes, bytearray, memoryview] = b"") -> RunResult:
         """Run an action, servicing guest tool requests with the registered Python handlers."""
@@ -430,6 +478,107 @@ class Container:
             self._native.respond_tool_call(call["request_id"], None, "tool failed")
         else:
             self._native.respond_tool_call(call["request_id"], encoded, None)
+
+
+class Action:
+    """One foreground action whose guest may present frames or call host tools."""
+
+    def __init__(self, container: Container, view: dict[str, Any]) -> None:
+        self._container = container
+        self._view = view
+        self._action_id = view["action_id"]
+        self._seen_generation = view["display_generation"]
+        self._stdout = bytearray()
+        self._stderr = bytearray()
+        self._closed = False
+
+    def __enter__(self) -> Action:
+        return self
+
+    def __exit__(self, exc_type: object, exc_value: object, traceback: object) -> None:
+        self.close()
+
+    def poll(self) -> ActionPoll:
+        """Advance bounded guest work, dispatch tools, and return new output and frame data."""
+
+        if self._closed:
+            raise SimulationError("action is closed")
+        if self._view["state"]["state"] != "complete":
+            self._view = json.loads(self._container._native.poll_action(self._action_id))
+        for call in self._view["tool_calls"]:
+            self._container._dispatch_tool(call)
+        self._view["tool_calls"] = []
+        output = json.loads(self._container._native.read_action_output(self._action_id))
+        stdout = base64.b64decode(output["stdout_base64"])
+        stderr = base64.b64decode(output["stderr_base64"])
+        self._stdout.extend(stdout)
+        self._stderr.extend(stderr)
+        generation = self._view["display_generation"]
+        frame = self.frame() if generation > self._seen_generation else None
+        self._seen_generation = generation
+        state = self._view["state"]
+        return ActionPoll(
+            state=state["state"],
+            frame=frame,
+            stdout=stdout,
+            stderr=stderr,
+            returncode=state.get("status"),
+            reason=state.get("reason"),
+        )
+
+    def frame(self) -> Optional[DisplayFrame]:
+        """Copy the most recent complete frame without exposing guest memory."""
+
+        if self._closed:
+            raise SimulationError("action is closed")
+        frame = self._container._native.display_frame(self._action_id)
+        if frame is None:
+            return None
+        generation, width, height, pixels = frame
+        return DisplayFrame(generation, width, height, pixels)
+
+    def inject_key(self, code: int, pressed: bool) -> None:
+        """Queue a key transition for the guest's bounded virtual input device."""
+
+        if self._closed:
+            raise SimulationError("action is closed")
+        if isinstance(code, bool) or not isinstance(code, int) or not 0 < code <= 0xFFFF:
+            raise ValueError("key code must be between 1 and 65535")
+        if not isinstance(pressed, bool):
+            raise TypeError("pressed must be bool")
+        self._container._native.inject_key(self._action_id, code, pressed)
+
+    def stop(self) -> None:
+        """Cancel the foreground action and its descendants."""
+
+        if not self._closed and self._view["state"]["state"] != "complete":
+            self._container._native.cancel_action(self._action_id)
+            self._view = json.loads(self._container._native.poll_action(self._action_id))
+
+    @property
+    def result(self) -> RunResult:
+        """Return the final action result after it completes and output has been collected."""
+
+        if self._view["state"]["state"] != "complete":
+            raise SimulationError("action is not complete")
+        view = dict(self._view)
+        for trust, key in (("unsupported", "unsupported_commands"), ("partial", "partial_commands")):
+            view[key] = sorted(
+                {item["argv"][0] for item in view["invocations"] if item["trust"] == trust and item["argv"]}
+            )
+        return _decode_result(json.dumps(view), bytes(self._stdout), bytes(self._stderr))
+
+    def close(self) -> None:
+        """Release the retained action, cancelling live work first."""
+
+        if self._closed:
+            return
+        try:
+            if self._view["state"]["state"] != "complete":
+                self._container._native.cancel_action(self._action_id)
+        finally:
+            self._container._native.drop_action(self._action_id)
+            self._closed = True
 
 
 class ShellSession:

@@ -19,12 +19,14 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::Serialize;
+use shellsim::display::KeyEvent;
 use shellsim::harness::{HarnessOperation, HarnessRequest, HarnessSession};
 use shellsim::net::NetworkRequest;
 use shellsim::realtime::ClockMode;
 use shellsim::{CommandTrust, InvocationEvent, Limits, RunOutcome};
 
 const ACTION_STACK_BYTES: usize = 8 * 1024 * 1024;
+type PythonFrame = (u64, u32, u32, Py<PyBytes>);
 
 create_exception!(
     shellsim._native,
@@ -80,7 +82,7 @@ struct NativeContainer {
 #[pymethods]
 impl NativeContainer {
     #[new]
-    fn new(cpu: u64, memory: u64, disk: u64, output: u64) -> Self {
+    fn new(cpu: u64, memory: u64, disk: u64, output: u64, real_time: bool) -> Self {
         Self {
             session: Mutex::new(HarnessSession::with_clock_and_host_tools(
                 Limits {
@@ -89,7 +91,11 @@ impl NativeContainer {
                     disk,
                     output,
                 },
-                ClockMode::Virtual,
+                if real_time {
+                    ClockMode::RealTime
+                } else {
+                    ClockMode::Virtual
+                },
             )),
         }
     }
@@ -202,6 +208,50 @@ impl NativeContainer {
     fn drop_action(&self, py: Python<'_>, action_id: u64) -> PyResult<()> {
         self.apply(py, HarnessOperation::DropAction { action_id })?;
         Ok(())
+    }
+
+    fn display_frame(&self, py: Python<'_>, action_id: u64) -> PyResult<Option<PythonFrame>> {
+        let frame = py
+            .detach(|| {
+                let mut session = self
+                    .session
+                    .lock()
+                    .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+                on_worker(&mut session, |session| session.display_frame(action_id))
+            })
+            .map_err(SimulationError::new_err)?;
+        Ok(frame.map(|(generation, frame)| {
+            (
+                generation,
+                frame.width,
+                frame.height,
+                PyBytes::new(py, &frame.pixels).unbind(),
+            )
+        }))
+    }
+
+    fn inject_key(&self, py: Python<'_>, action_id: u64, code: u32, pressed: bool) -> PyResult<()> {
+        py.detach(|| {
+            let mut session = self
+                .session
+                .lock()
+                .map_err(|_| "shellsim container lock is poisoned".to_string())?;
+            on_worker(&mut session, |session| {
+                session.inject_action_key(action_id, KeyEvent { code, pressed })
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
+    fn clock_mode(&self) -> PyResult<&'static str> {
+        let session = self
+            .session
+            .lock()
+            .map_err(|_| SimulationError::new_err("shellsim container lock is poisoned"))?;
+        Ok(match session.environment.clock_mode() {
+            ClockMode::Virtual => "virtual",
+            ClockMode::RealTime => "real_time",
+        })
     }
 }
 

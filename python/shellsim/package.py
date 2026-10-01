@@ -20,9 +20,9 @@ from typing import Optional, Union
 
 from ._api import Container, Limits, ToolHandler
 
-_MAX_ARCHIVE = 32 * 1024 * 1024
-_MAX_PAYLOAD = 32 * 1024 * 1024
-_MAX_FILE = 6 * 1024 * 1024
+_MAX_ARCHIVE = 128 * 1024 * 1024
+_MAX_PAYLOAD = 128 * 1024 * 1024
+_MAX_FILE = 64 * 1024 * 1024
 _MAX_MANIFEST = 1024 * 1024
 _MAX_ENTRIES = 10_000
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
@@ -40,6 +40,7 @@ class PackageSpec:
     required_tools: tuple[str, ...] = ()
     limits: Limits = field(default_factory=Limits)
     working_directory: str = "/work"
+    requested_clock: str = "virtual"
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or _NAME.fullmatch(self.name) is None:
@@ -75,6 +76,8 @@ class PackageSpec:
         object.__setattr__(self, "required_tools", required_tools)
         if not isinstance(self.limits, Limits):
             raise TypeError("limits must be a shellsim.Limits instance")
+        if self.requested_clock not in ("virtual", "real_time"):
+            raise ValueError("requested_clock must be 'virtual' or 'real_time'")
         if self.working_directory == "/work":
             return
         if not isinstance(self.working_directory, str) or not self.working_directory.startswith("/work/"):
@@ -134,15 +137,15 @@ class Package:
                     pending.append((Path(child.path), path))
                 elif stat.S_ISREG(metadata.st_mode):
                     if metadata.st_size > _MAX_FILE:
-                        raise ValueError("package file exceeds 6 MiB")
+                        raise ValueError("package file exceeds 64 MiB")
                     payload += metadata.st_size
                     if payload > _MAX_PAYLOAD:
-                        raise ValueError("package payload exceeds 32 MiB")
+                        raise ValueError("package payload exceeds 128 MiB")
                     with open(child.path, "rb") as source:
                         data = source.read(_MAX_FILE + 1)
                     payload += len(data) - metadata.st_size
                     if payload > _MAX_PAYLOAD:
-                        raise ValueError("package payload exceeds 32 MiB")
+                        raise ValueError("package payload exceeds 128 MiB")
                     entries.append(_Entry(path, mode, data))
                 else:
                     raise ValueError(f"unsupported source entry: {path}")
@@ -156,7 +159,7 @@ class Package:
 
         _require_spec(spec)
         if not isinstance(source_zip, bytes) or len(source_zip) > _MAX_ARCHIVE:
-            raise ValueError("source ZIP exceeds 32 MiB")
+            raise ValueError("source ZIP exceeds 128 MiB")
         if strip_prefix:
             _workspace_path(strip_prefix.rstrip("/"))
             strip_prefix = strip_prefix.rstrip("/") + "/"
@@ -179,10 +182,10 @@ class Package:
                 _workspace_path(path)
                 if not member.is_dir():
                     if member.file_size > _MAX_FILE:
-                        raise ValueError("source ZIP file exceeds 6 MiB")
+                        raise ValueError("source ZIP file exceeds 64 MiB")
                     payload += member.file_size
                     if payload > _MAX_PAYLOAD:
-                        raise ValueError("source ZIP payload exceeds 32 MiB")
+                        raise ValueError("source ZIP payload exceeds 128 MiB")
                 unix_mode = member.external_attr >> 16
                 mode = stat.S_IMODE(unix_mode) if stat.S_IFMT(unix_mode) else (0o755 if member.is_dir() else 0o644)
                 data = None if member.is_dir() else _read_member(archive, member)
@@ -218,7 +221,7 @@ class Package:
                     _write_member(archive, f"rootfs/{entry.path}", entry.data, entry.mode)
         blob = stream.getvalue()
         if len(blob) > _MAX_ARCHIVE:
-            raise ValueError("package ZIP exceeds 32 MiB")
+            raise ValueError("package ZIP exceeds 128 MiB")
         return cls.from_bytes(blob)
 
     @classmethod
@@ -226,7 +229,7 @@ class Package:
         """Validate a complete package before any guest machine is constructed."""
 
         if not isinstance(blob, bytes) or len(blob) > _MAX_ARCHIVE:
-            raise ValueError("package ZIP exceeds 32 MiB")
+            raise ValueError("package ZIP exceeds 128 MiB")
         digest = hashlib.sha256(blob).hexdigest()
         if expected_sha256 is not None and digest != expected_sha256:
             raise ValueError("package SHA-256 mismatch")
@@ -296,9 +299,20 @@ class Package:
             if not isinstance(chunk, bytes):
                 raise TypeError("fetcher must yield bytes")
             if collected.tell() + len(chunk) > _MAX_ARCHIVE:
-                raise ValueError("package download exceeds 32 MiB")
+                raise ValueError("package download exceeds 128 MiB")
             collected.write(chunk)
         return cls.from_bytes(collected.getvalue(), expected_sha256=expected_sha256)
+
+    @classmethod
+    def from_path(cls, path: Union[str, os.PathLike[str]], *, expected_sha256: Optional[str] = None) -> Package:
+        """Load a local distribution without reading more than the archive limit."""
+
+        source = Path(path)
+        if source.is_symlink() or not source.is_file():
+            raise ValueError("package path must be a regular file")
+        with source.open("rb") as stream:
+            blob = stream.read(_MAX_ARCHIVE + 1)
+        return cls.from_bytes(blob, expected_sha256=expected_sha256)
 
     @property
     def sha256(self) -> str:
@@ -311,7 +325,9 @@ class Package:
 
         return self._blob
 
-    def instantiate(self, *, tools: Mapping[str, ToolHandler], limits: Optional[Limits] = None) -> Container:
+    def instantiate(
+        self, *, tools: Mapping[str, ToolHandler], limits: Optional[Limits] = None, clock: str = "virtual"
+    ) -> Container:
         """Create an independent machine with only the declared host tools installed."""
 
         if not isinstance(tools, Mapping):
@@ -332,7 +348,7 @@ class Package:
                 for name in ("cpu", "memory", "disk", "output")
             }
         )
-        container = Container(tools=selected, limits=effective)
+        container = Container(tools=selected, limits=effective, clock=clock)
         for entry in self._entries:
             if entry.data is None:
                 container.mkdir(f"/work/{entry.path}", mode=entry.mode)
@@ -372,10 +388,10 @@ def _canonical_entries(entries: Iterable[_Entry]) -> tuple[_Entry, ...]:
             raise ValueError("invalid package mode")
         if entry.data is not None:
             if not isinstance(entry.data, bytes) or len(entry.data) > _MAX_FILE:
-                raise ValueError("package file exceeds 6 MiB")
+                raise ValueError("package file exceeds 64 MiB")
             payload += len(entry.data)
             if payload > _MAX_PAYLOAD:
-                raise ValueError("package payload exceeds 32 MiB")
+                raise ValueError("package payload exceeds 128 MiB")
         by_path[entry.path] = entry
         if len(by_path) > _MAX_ENTRIES:
             raise ValueError("package has too many entries")
@@ -414,6 +430,7 @@ def _manifest(spec: PackageSpec, entries: tuple[_Entry, ...]) -> dict[str, objec
         "version": spec.version,
         "entrypoint": list(spec.entrypoint),
         "working_directory": spec.working_directory,
+        "requested_clock": spec.requested_clock,
         "required_tools": list(spec.required_tools),
         "limits": {name: getattr(spec.limits, name) for name in ("cpu", "memory", "disk", "output")},
         "entries": described,
@@ -518,7 +535,17 @@ def _parse_json(data: bytes) -> object:
 
 
 def _parse_manifest(manifest: object) -> tuple[PackageSpec, list[dict[str, object]]]:
-    fields = {"format", "name", "version", "entrypoint", "working_directory", "required_tools", "limits", "entries"}
+    fields = {
+        "format",
+        "name",
+        "version",
+        "entrypoint",
+        "working_directory",
+        "requested_clock",
+        "required_tools",
+        "limits",
+        "entries",
+    }
     if (
         not isinstance(manifest, dict)
         or set(manifest) != fields
@@ -537,6 +564,7 @@ def _parse_manifest(manifest: object) -> tuple[PackageSpec, list[dict[str, objec
         required_tools=manifest["required_tools"],
         limits=limits,
         working_directory=manifest["working_directory"],
+        requested_clock=manifest["requested_clock"],
     )
     descriptions = manifest["entries"]
     if not isinstance(descriptions, list) or len(descriptions) > _MAX_ENTRIES:
@@ -564,7 +592,7 @@ def _parse_manifest(manifest: object) -> tuple[PackageSpec, list[dict[str, objec
                 raise ValueError("invalid package file digest")
             payload += item["size"]
             if payload > _MAX_PAYLOAD:
-                raise ValueError("package payload exceeds 32 MiB")
+                raise ValueError("package payload exceeds 128 MiB")
     return spec, descriptions
 
 
