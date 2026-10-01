@@ -163,16 +163,24 @@ Clock subscriptions to `poll_oneoff`, which back libc `sleep` and `nanosleep`, b
 virtual time like the native `sleep` command.
 
 This is not full WASI process support. Descriptor subscriptions to `poll_oneoff` fail with
-`ENOTSUP`; sockets and guest process creation remain unsupported. No C compiler is installed by default. The engine accepts Wasm
-exception instructions. A pinned external TinyCC package and permissively licensed wasi-libc
-sysroot can be installed into the VFS by a caller; integration tests compile and run C programs
-through that virtual toolchain. This is a tested subset of libc, not full POSIX support. A prebuilt
+`ENOTSUP`; sockets and guest process creation remain unsupported. No C compiler is installed by
+default. The engine accepts Wasm exception instructions. The Python distribution bundles a
+pinned TinyCC WebAssembly compiler
+and WASI libc sysroot. A caller can install them into a guest with
+`shellsim.install_c_toolchain`, or a `.shl` can request them in its manifest. This is a tested
+subset of libc, not full POSIX support. A prebuilt
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 
 The [virtual display](docs/virtual-display.md) lets a Wasm guest present RGBA frames and poll
 bounded key events. A host-driven session can resume the guest between frames without granting it
 ambient display, input, or network access.
+
+An opt-in [Doom `.shl` demo](docs/virtual-display.md#external-doom-package) packages
+separately supplied Doomgeneric source and Freedoom data. Its manifest requests the bundled C
+toolchain; the guest entrypoint compiles Doom and runs it. The Python package runner serves frames
+through its generic loopback display host. Run `./examples/play-doom.sh` to fetch pinned inputs and play, or publish
+the generated `.shl` and run it by HTTPS URL. The guest has no ambient host display or network.
 
 ## Agent harness
 
