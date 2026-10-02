@@ -561,6 +561,10 @@ struct Vm<'s> {
     err: Out<'s>,
     /// Handle-stack height when this scope opened; dropping the scope truncates back to it.
     handle_base: usize,
+    /// Host scratch reserved before this scope opened. The scope owns everything reserved above
+    /// it and releases that on each instruction boundary and when it closes, so a nested
+    /// execution never refunds scratch an enclosing native call still holds.
+    transient_base: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -610,8 +614,9 @@ struct VmState {
     /// Whether fd 0 has reported end-of-file. Once set, further reads only drain
     /// `stdin_stream_pending` and never touch the descriptor again.
     stdin_stream_eof: bool,
-    /// Host scratch charged by `reserve_result` while one instruction builds a result, released
-    /// at the next instruction boundary.
+    /// Host scratch charged by `reserve_result` while a native helper builds a result. Each
+    /// `Vm` scope releases the part reserved above its own base at every instruction boundary
+    /// and when it closes.
     transient_memory: u64,
     /// Host bytes held by the VM itself across quanta (stdin text, pipe buffers), released when
     /// the program completes.
@@ -797,11 +802,7 @@ enum MaterializeSource<'s> {
     Values(Vec<Value<'s>>),
     Range(i64, i64, i64),
     StoredIterator,
-    Callable {
-        callable: Value<'s>,
-        sentinel: Value<'s>,
-        exhausted: bool,
-    },
+    Callable,
     Generator,
     Instance,
     NotIterable,
@@ -1042,6 +1043,7 @@ impl<'s> Vm<'s> {
         err: Out<'s>,
     ) -> Self {
         let handle_base = state.heap.handle_count();
+        let transient_base = execution.transient_memory;
         Self {
             interp,
             argv: input.argv,
@@ -1052,14 +1054,17 @@ impl<'s> Vm<'s> {
             out,
             err,
             handle_base,
+            transient_base,
         }
     }
 
+    /// Release the host scratch reserved since this scope opened.
     fn release_transient_memory(&mut self) {
-        if self.transient_memory == 0 {
+        let bytes = self.transient_memory.saturating_sub(self.transient_base);
+        if bytes == 0 {
             return;
         }
-        let bytes = std::mem::take(&mut self.transient_memory);
+        self.transient_memory = self.transient_base;
         self.interp.resources.release_memory(bytes);
     }
 
@@ -1308,16 +1313,19 @@ impl<'s> Vm<'s> {
         Ok(values)
     }
 
+    /// Every item of an iterable, as handles.
+    ///
+    /// Builtin containers, strings, bytes, ranges and the runtime's own iterators are copied
+    /// natively, charging each item through `push_materialized`. Anything whose items come from
+    /// Python code (generators, classes with `__iter__`, `iter(callable, sentinel)`) is drained by
+    /// a bytecode loop in the frozen `_iteration` module instead, so the items accumulate in a
+    /// metered heap list rather than in a host vector no accounting can see while guest frames run.
     fn iterable_values(&mut self, value: &Value<'s>) -> Result<Vec<Value<'s>>, String> {
         if self.is_unbounded_iterator(value)? {
             return Err("cannot materialize infinite itertools.count without a bound".into());
         }
-        if let Some(iterator) = self.class_iterator(value)? {
-            let mut result = Vec::new();
-            while let Some(item) = self.next_until_stop(&iterator)? {
-                self.push_materialized(&mut result, item)?;
-            }
-            return Ok(result);
+        if self.has_python_iter(value)? {
+            return self.materialize_through_bytecode(*value);
         }
         if let Some(value) = protocol::builtin_payload(&self.state.heap, *value)? {
             return self.iterable_values(&value);
@@ -1355,15 +1363,7 @@ impl<'s> Vm<'s> {
                         "cannot materialize infinite itertools.count without a bound".into(),
                     )
                 }
-                Object::CallableIterator {
-                    callable,
-                    sentinel,
-                    exhausted,
-                } => MaterializeSource::Callable {
-                    callable: self.handle(callable),
-                    sentinel: self.handle(sentinel),
-                    exhausted: *exhausted,
-                },
+                Object::CallableIterator { .. } => MaterializeSource::Callable,
                 Object::Generator { .. } => MaterializeSource::Generator,
                 Object::Class(class_object) if !class_object.enum_members.is_empty() => {
                     MaterializeSource::Values(self.handles(&class_object.enum_members))
@@ -1387,36 +1387,8 @@ impl<'s> Vm<'s> {
                         self.push_materialized(&mut result, item)?;
                     }
                 }
-                MaterializeSource::Callable {
-                    callable,
-                    sentinel,
-                    exhausted,
-                } => {
-                    if !exhausted {
-                        loop {
-                            self.charge_cpu(1)?;
-                            let item = <Self as PyRuntime>::call_value(
-                                self,
-                                callable,
-                                CallArgs::new(Vec::new(), Vec::new()),
-                            )
-                            .map_err(|error| error.to_string())?;
-                            if self.values_equal(&item, &sentinel)? {
-                                if let Object::CallableIterator { exhausted, .. } =
-                                    self.get_mut(*value)?
-                                {
-                                    *exhausted = true;
-                                }
-                                break;
-                            }
-                            self.push_materialized(&mut result, item)?;
-                        }
-                    }
-                }
-                MaterializeSource::Generator => {
-                    while let Some(item) = self.resume_generator(*value)? {
-                        self.push_materialized(&mut result, item)?;
-                    }
+                MaterializeSource::Callable | MaterializeSource::Generator => {
+                    return self.materialize_through_bytecode(*value);
                 }
                 MaterializeSource::Instance
                     if self
@@ -1435,6 +1407,69 @@ impl<'s> Vm<'s> {
             return Err(self.raise_object_type_error(value, "is not iterable"));
         }
         Ok(result)
+    }
+
+    /// Whether `value` iterates through an `__iter__` slot rather than one of the builtin kinds
+    /// `iterable_values` copies natively. Native value kinds such as dict views count, since their
+    /// `__iter__` is the only way to reach their items.
+    fn has_python_iter(&self, value: &Value<'s>) -> Result<bool, String> {
+        if !value.is_object() {
+            return Ok(false);
+        }
+        if matches!(
+            self.get(*value)?,
+            Object::String(_)
+                | Object::Bytes(_)
+                | Object::ByteArray(_)
+                | Object::List(_)
+                | Object::Tuple(_)
+                | Object::Set(_)
+                | Object::FrozenSet(_)
+                | Object::Dict(_)
+                | Object::DefaultDict { .. }
+                | Object::Range { .. }
+                | Object::Iterator { .. }
+                | Object::SequenceIterator { .. }
+                | Object::ReverseIterator { .. }
+                | Object::RangeIterator { .. }
+                | Object::CountIterator { .. }
+                | Object::Class(_)
+        ) {
+            return Ok(false);
+        }
+        Ok(matches!(
+            self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
+            Some(slot) if !matches!(&slot, SlotValue::Descriptor(descriptor) if descriptor.is_none())
+        ))
+    }
+
+    /// Drain `iterable` with the frozen `_iteration.materialize` loop and return its items. The
+    /// helper runs as ordinary bytecode: each item is one instruction, and the list it builds is
+    /// charged by the heap as it grows.
+    fn materialize_through_bytecode(
+        &mut self,
+        iterable: Value<'s>,
+    ) -> Result<Vec<Value<'s>>, String> {
+        const MODULE: &str = "_iteration";
+        let module = match self.loaded_module(MODULE) {
+            Some(module) => module,
+            None => <Self as PyRuntime>::import_module(self, MODULE)
+                .map_err(|error| error.to_string())?,
+        };
+        let scope = self.module_scope(MODULE, module)?;
+        let helper = self
+            .scope_get(scope, "materialize")?
+            .ok_or("frozen _iteration module lacks materialize")?;
+        let items = <Self as PyRuntime>::call_value(
+            self,
+            helper,
+            CallArgs::new(vec![iterable], Vec::new()),
+        )
+        .map_err(|error| error.to_string())?;
+        let Object::List(items) = self.get(items)? else {
+            return Err("_iteration.materialize did not return a list".into());
+        };
+        Ok(self.handles(items))
     }
 
     fn is_unbounded_iterator(&self, value: &Value<'s>) -> Result<bool, String> {

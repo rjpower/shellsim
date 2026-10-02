@@ -33,6 +33,7 @@ macro_rules! frozen {
 pub(super) fn module_source(name: &str) -> Option<FrozenModule> {
     match name {
         "asyncio" => frozen!("asyncio.py"),
+        "_iteration" => frozen!("_iteration.py"),
         "abc" => frozen!("abc.py"),
         "base64" => frozen!("base64.py"),
         "codecs" => frozen!("codecs.py"),

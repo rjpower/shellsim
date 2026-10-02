@@ -63,18 +63,16 @@ impl<'s> Vm<'s> {
         if vm.interp.deadline_interrupt.is_some() {
             return Ok(Execution::Exit(124));
         }
-        vm.release_transient_memory();
         if let Some(execution) = vm.resume_pending_native_call()? {
             return Ok(execution);
         }
         let mut dispatch = DispatchCursor::for_active(&mut vm)
             .map_err(|error| (error, super::super::source::Span::default()))?;
         'execution: for _ in 0..budget.max(1) {
-            vm.reset_handles();
-            // Native helper snapshots live for one semantic instruction. Releasing the previous
-            // instruction's scratch here avoids double-counting a materialized result after it
+            // Handles and native scratch live for one semantic instruction. Releasing the
+            // previous instruction's here avoids double-counting a materialized result after it
             // has moved into a heap object.
-            vm.release_transient_memory();
+            vm.reset_scope();
             let instruction_pointer = dispatch.op_index;
             let code = &dispatch.code;
             let code_cache = dispatch.code_cache;

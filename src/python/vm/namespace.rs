@@ -654,7 +654,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The module object imported under `name`, if any.
-    fn loaded_module(&self, name: &str) -> Option<Value<'s>> {
+    pub(super) fn loaded_module(&self, name: &str) -> Option<Value<'s>> {
         self.handle_optional(self.state.modules.get(name))
     }
 
@@ -973,7 +973,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The scope of the module imported as `name`, for binding a submodule into it.
-    fn module_scope(&self, name: &str, module: Value<'s>) -> Result<Value<'s>, String> {
+    pub(super) fn module_scope(&self, name: &str, module: Value<'s>) -> Result<Value<'s>, String> {
         if !module.is_object() {
             return Err(format!("module {name:?} cannot contain submodules"));
         }

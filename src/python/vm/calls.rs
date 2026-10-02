@@ -842,6 +842,8 @@ impl<'s> Vm<'s> {
                 }
                 // Like CPython's sort this only asks `<`, and a reversed sort keeps equal items
                 // in their original order.
+                // Each comparison may run a Python `__lt__`; a child scope per call keeps the
+                // handles it makes from accumulating across the n log n comparisons.
                 super::super::sort::merge_sort(&mut keyed, |right, left| {
                     self.charge_cpu(1)?;
                     let (lesser, greater) = if reverse {
@@ -849,7 +851,8 @@ impl<'s> Vm<'s> {
                     } else {
                         (right.0, left.0)
                     };
-                    self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
+                    let mut vm = self.scope();
+                    vm.compare_truth(ComparisonOperator::Less, &lesser, &greater)
                 })?;
                 let values = keyed.into_iter().map(|(_, value)| value);
                 Ok(CallResult::Value(self.alloc_with(|builder| {
