@@ -960,32 +960,36 @@ fn bytes_join<'s>(
     args.reject_keywords("bytes.join")?;
     let PyBytes(separator) = receiver.cast(runtime)?;
     let iterator = runtime.iterator(args.positional()[0])?;
-    let mut parts = Vec::new();
+    let mut parts: Vec<Vec<u8>> = Vec::new();
     let mut length = 0usize;
     let mut exhausted = false;
     while !exhausted {
+        let mut part = None;
         runtime.nested(&mut |runtime, _| {
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
             };
             runtime.charge_cpu(1)?;
-            let Some(part) = runtime.bytes_value(&value)? else {
+            let Some(bytes) = runtime.bytes_value(&value)? else {
                 return Err(PyError::type_error(format!(
                     "sequence item {}: expected a bytes-like object, {} found",
                     parts.len(),
                     runtime.type_name(&value)?
                 )));
             };
-            length = length
-                .checked_add(part.len())
-                .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
-            // Each part is a host copy that lives until the join finishes, so repeating one large
-            // item must exhaust the budget as the copies accumulate.
-            runtime.reserve_memory(part.len())?;
-            parts.push(part);
+            part = Some(bytes);
             Ok(())
         })?;
+        let Some(part) = part else { continue };
+        length = length
+            .checked_add(part.len())
+            .ok_or_else(|| PyError::resource_error("joined bytes are too large"))?;
+        // Each part is a host copy that lives until the join finishes. It is reserved here, in
+        // the scope that keeps it, because scratch reserved inside the child scope is released
+        // when that scope closes.
+        runtime.reserve_memory(part.len().saturating_add(JOINED_PART_BYTES))?;
+        parts.push(part);
     }
     length = length
         .checked_add(
@@ -1623,17 +1627,20 @@ fn collect_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyR
     let mut bytes = Vec::new();
     let mut exhausted = false;
     while !exhausted {
+        let mut byte = None;
         runtime.nested(&mut |runtime, _| {
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
             };
-            let byte = byte_argument(runtime, &value)?;
-            runtime.reserve_memory(1)?;
-            runtime.charge_cpu(1)?;
-            bytes.push(byte);
-            Ok(())
+            byte = Some(byte_argument(runtime, &value)?);
+            runtime.charge_cpu(1)
         })?;
+        if let Some(byte) = byte {
+            // Reserved outside the child scope, which releases its own scratch on close.
+            runtime.reserve_memory(1)?;
+            bytes.push(byte);
+        }
     }
     Ok(bytes)
 }
@@ -1657,7 +1664,6 @@ fn collect_values<'s>(
                 exhausted = true;
                 return Ok(());
             };
-            runtime.reserve_memory(std::mem::size_of::<PyValue<'_>>())?;
             runtime.charge_cpu(1)?;
             runtime.list_append(values, value)
         })?;
@@ -2385,6 +2391,9 @@ fn string_splitlines<'s>(
     runtime.new_list(lines)
 }
 
+/// Modeled header cost of one host string held while joining, on top of its bytes.
+const JOINED_PART_BYTES: usize = 32;
+
 fn string_join<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     receiver: PyValue<'s>,
@@ -2394,10 +2403,11 @@ fn string_join<'s>(
     args.reject_keywords("str.join")?;
     let OwnedPyString(separator) = receiver.cast(runtime)?;
     let iterator = runtime.iterator(args.positional()[0])?;
-    let mut parts = Vec::new();
+    let mut parts: Vec<String> = Vec::new();
     let mut bytes = 0usize;
     let mut exhausted = false;
     while !exhausted {
+        let mut part = None;
         runtime.nested(&mut |runtime, _| {
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
@@ -2405,15 +2415,18 @@ fn string_join<'s>(
             };
             runtime.charge_cpu(1)?;
             let OwnedPyString(value) = value.cast(runtime)?;
-            bytes = bytes
-                .checked_add(value.len())
-                .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
-            // Each part is a host copy that lives until the join finishes, so repeating one large
-            // item must exhaust the budget as the copies accumulate.
-            runtime.reserve_memory(value.len())?;
-            parts.push(value);
+            part = Some(value);
             Ok(())
         })?;
+        let Some(part) = part else { continue };
+        bytes = bytes
+            .checked_add(part.len())
+            .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
+        // Each part is a host string that lives until the join finishes. It is reserved here, in
+        // the scope that keeps it, because scratch reserved inside the child scope is released
+        // when that scope closes.
+        runtime.reserve_memory(part.len().saturating_add(JOINED_PART_BYTES))?;
+        parts.push(part);
     }
     bytes = bytes
         .checked_add(
@@ -3383,9 +3396,16 @@ fn list_sort<'s>(
     } else {
         Ordering::Less
     };
+    // Each comparison may run a Python `__lt__`; a child scope per call keeps the handles it
+    // makes from accumulating across the n log n comparisons of one sort.
     super::super::sort::merge_sort(&mut keyed, |right, left| {
         runtime.charge_cpu(1)?;
-        Ok(runtime.compare(&right.0, &left.0)? == ahead)
+        let mut less = false;
+        runtime.nested(&mut |runtime, _| {
+            less = runtime.compare(&right.0, &left.0)? == ahead;
+            Ok(())
+        })?;
+        Ok(less)
     })?;
     runtime.replace_list_items(list, keyed.into_iter().map(|(_, value)| value).collect())?;
     Ok(Value::None)
@@ -4424,7 +4444,6 @@ fn builtin_map<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
                 };
                 values.push(value);
             }
-            runtime.reserve_memory(64)?;
             let mapped = function.call(runtime, CallArgs::new(values, Vec::new()))?;
             runtime.list_append(result, mapped)
         })?;
@@ -4457,7 +4476,6 @@ fn builtin_filter<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
                 None => runtime.truth(&value)?,
             };
             if selected {
-                runtime.reserve_memory(64)?;
                 runtime.list_append(result, value)?;
             }
             Ok(())

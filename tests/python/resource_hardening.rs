@@ -867,3 +867,52 @@ fn quadratic_copies_are_charged_by_bytes_moved() {
         assert_eq!(usage.cpu_used, limits.cpu, "{program}");
     }
 }
+
+#[test]
+fn generator_fed_builtins_are_bounded_by_the_memory_limit() {
+    // `list()` drains the generator from a bytecode loop, so each item lands in a metered heap
+    // list instead of host scratch that the generator's own instructions could release.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "def g():\n    while True:\n        yield 1\nlist(g())",
+        Limits {
+            memory: 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 1024 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn join_over_a_generator_is_bounded_by_the_memory_limit() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "def g():\n    while True:\n        yield 'x'\n''.join(g())",
+        Limits {
+            memory: 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 1024 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn native_scratch_survives_nested_python_frames() {
+    // `repr(list)` accumulates its output as host scratch while each element's Python `__repr__`
+    // runs its own instructions. Those instructions must not refund the enclosing reservation.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "class A:\n    def __repr__(self):\n        return 'x' * 1000\nrepr([A()] * 20000)",
+        Limits {
+            memory: 4 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(usage.memory_peak <= 4 * 1024 * 1024);
+    assert!(stdout.is_empty());
+    assert!(stderr.is_empty());
+}

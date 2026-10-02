@@ -45,7 +45,7 @@ impl Roots for VmRoots<'_> {
 
 impl Drop for Vm<'_> {
     fn drop(&mut self) {
-        self.state.heap.truncate_handles(self.handle_base);
+        self.reset_scope();
     }
 }
 
@@ -56,6 +56,7 @@ impl<'s> Vm<'s> {
     /// parent's handles stay usable inside it.
     pub(super) fn scope(&mut self) -> Vm<'_> {
         let handle_base = self.state.heap.handle_count();
+        let transient_base = self.execution.transient_memory;
         Vm {
             interp: &mut *self.interp,
             argv: self.argv,
@@ -66,13 +67,16 @@ impl<'s> Vm<'s> {
             out: &mut *self.out,
             err: &mut *self.err,
             handle_base,
+            transient_base,
         }
     }
 
-    /// Release every handle this scope created so far. Only for a loop that owns its scope and
-    /// keeps no handle across iterations, such as the bytecode dispatch loop.
-    pub(super) fn reset_handles(&mut self) {
+    /// Release every handle and every byte of host scratch this scope created so far. Only for a
+    /// loop that owns its scope and keeps nothing across iterations, such as the bytecode
+    /// dispatch loop; dropping the scope does the same.
+    pub(super) fn reset_scope(&mut self) {
         self.state.heap.truncate_handles(self.handle_base);
+        self.release_transient_memory();
     }
 
     // ----- heap access ---------------------------------------------------------------------

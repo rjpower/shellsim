@@ -77,7 +77,6 @@ fn drain_into<'s>(
                 return Ok(());
             };
             runtime.charge_cpu(1)?;
-            runtime.reserve_memory(64)?;
             runtime.list_append(output, value)
         })?;
     }
@@ -336,7 +335,6 @@ fn native_islice<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
                 return Ok(());
             };
             if position >= start && (position - start) % step == 0 {
-                runtime.reserve_memory(64)?;
                 runtime.list_append(output, value)?;
             }
             Ok(())
