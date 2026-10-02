@@ -33,7 +33,7 @@ use super::convert;
 use super::dtype::{Category, DType, Kind};
 
 /// One parsed index component.
-enum Item {
+enum Item<'s> {
     Int(i64),
     /// A 0-d integer array, which indexes like an integer.
     ScalarArray(i64),
@@ -41,14 +41,14 @@ enum Item {
     NewAxis,
     Ellipsis,
     /// An integer index array, as int64.
-    Array(Array),
+    Array(Array<'s>),
     /// A boolean mask.
-    Mask(Array),
+    Mask(Array<'s>),
     /// A boolean scalar or 0-d mask.
     Bool(bool),
 }
 
-impl Item {
+impl Item<'_> {
     /// Array axes the item consumes.
     fn consumes(&self) -> usize {
         match self {
@@ -67,7 +67,7 @@ fn index_error(message: impl Into<String>) -> PyError {
 }
 
 /// Parse a subscript into items. A tuple indexes several axes; anything else indexes one.
-fn parse(runtime: &mut dyn PyRuntime, index: PyValue) -> PyResult<Vec<Item>> {
+fn parse<'s>(runtime: &mut dyn PyRuntime<'s>, index: PyValue<'s>) -> PyResult<'s, Vec<Item<'s>>> {
     if runtime.kind(&index)? == PyKind::Tuple {
         let tuple = index.cast(runtime)?;
         let values = runtime.tuple_items(tuple)?;
@@ -79,7 +79,7 @@ fn parse(runtime: &mut dyn PyRuntime, index: PyValue) -> PyResult<Vec<Item>> {
     Ok(vec![parse_item(runtime, index)?])
 }
 
-fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
+fn parse_item<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Item<'s>> {
     if value.is_none() {
         return Ok(Item::NewAxis);
     }
@@ -140,10 +140,10 @@ fn parse_item(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Item> {
 }
 
 /// Where an index points.
-pub(in crate::python) enum Selection {
+pub(in crate::python) enum Selection<'s> {
     /// A view of the indexed array. `scalar` means every axis took an integer, so reading
     /// returns an element instead of a 0-d array.
-    View { view: Array, scalar: bool },
+    View { view: Array<'s>, scalar: bool },
     /// Byte offsets of the selected elements in C order of `shape`.
     Gather {
         shape: Vec<usize>,
@@ -152,11 +152,11 @@ pub(in crate::python) enum Selection {
 }
 
 /// Resolve `index` against `array`.
-pub(in crate::python) fn select(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    index: PyValue,
-) -> PyResult<Selection> {
+pub(in crate::python) fn select<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    index: PyValue<'s>,
+) -> PyResult<'s, Selection<'s>> {
     let items = parse(runtime, index)?;
     let ndim = array.ndim();
     let ellipses = items
@@ -291,7 +291,7 @@ pub(in crate::python) fn select(
 }
 
 /// Normalize one integer index against an axis, with NumPy's error text.
-fn normalize_index(value: i64, length: usize, axis: usize) -> PyResult<usize> {
+fn normalize_index<'s>(value: i64, length: usize, axis: usize) -> PyResult<'s, usize> {
     let signed = length as i64;
     let position = if value < 0 { value + signed } else { value };
     if (0..signed).contains(&position) {
@@ -304,12 +304,12 @@ fn normalize_index(value: i64, length: usize, axis: usize) -> PyResult<usize> {
 }
 
 /// Integer index arrays for a boolean mask applied at `axis`.
-fn mask_indices(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    mask: &Array,
+fn mask_indices<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    mask: &Array<'s>,
     axis: usize,
-) -> PyResult<Vec<Array>> {
+) -> PyResult<'s, Vec<Array<'s>>> {
     for (offset, length) in mask.shape().iter().enumerate() {
         let size = array.shape()[axis + offset];
         if *length != size {
@@ -332,10 +332,10 @@ fn mask_indices(
 
 /// Coordinates of the true elements of `array`, one vector per axis, in C order. A 0-d array
 /// yields one coordinate list per axis of a 1-d view, as `np.nonzero` does for `atleast_1d`.
-pub(in crate::python) fn nonzero(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-) -> PyResult<Vec<Vec<i64>>> {
+pub(in crate::python) fn nonzero<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+) -> PyResult<'s, Vec<Vec<i64>>> {
     let truth = truth_values(runtime, array)?;
     let ndim = array.ndim().max(1);
     let shape = if array.ndim() == 0 {
@@ -365,10 +365,10 @@ pub(in crate::python) fn nonzero(
 }
 
 /// The truth value of every element in C order.
-pub(in crate::python) fn truth_values(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-) -> PyResult<Vec<bool>> {
+pub(in crate::python) fn truth_values<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+) -> PyResult<'s, Vec<bool>> {
     match array.dtype.kind() {
         Kind::Object => {
             let values = super::array::read_objects(runtime, array)?;
@@ -390,13 +390,13 @@ pub(in crate::python) fn truth_values(
 ///
 /// `arrays` holds `(view axis, source axis, int64 index array)` for each advanced item; the
 /// view built by the basic pass keeps those axes whole.
-fn gather_plan(
-    runtime: &mut dyn PyRuntime,
+fn gather_plan<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     shape: &[usize],
     strides: &[isize],
     offset: isize,
-    arrays: &[(usize, usize, Array)],
-) -> PyResult<Selection> {
+    arrays: &[(usize, usize, Array<'s>)],
+) -> PyResult<'s, Selection<'s>> {
     let shapes = arrays
         .iter()
         .map(|(_, _, indices)| indices.shape())
@@ -491,11 +491,11 @@ pub(in crate::python) fn relative_offsets(shape: &[usize], strides: &[isize]) ->
 }
 
 /// `array[index]`.
-pub(in crate::python) fn get_item(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    index: PyValue,
-) -> PyResult<PyValue> {
+pub(in crate::python) fn get_item<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    index: PyValue<'s>,
+) -> PyResult<'s, PyValue<'s>> {
     match select(runtime, array, index)? {
         Selection::View { view, scalar: true } => {
             convert::element_to_scalar(runtime, &view, view.view.offset)
@@ -508,29 +508,29 @@ pub(in crate::python) fn get_item(
 }
 
 /// A new array holding the elements of `array` at byte `offsets`.
-pub(in crate::python) fn gather(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn gather<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offsets: &[usize],
     shape: Vec<usize>,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     reserve_elements(runtime, array.dtype, offsets.len())?;
     runtime.charge_cpu(offsets.len() as u64 + 1)?;
     let mut buffer = super::array::buffer_with_capacity(array.dtype, offsets.len());
-    runtime.read_arrays(&[array.handle], &mut |arrays| {
-        gather_into(&arrays[0], offsets.iter().copied(), &mut buffer);
+    runtime.read_arrays(&[array.handle], &mut |refs, arrays| {
+        gather_into(refs, &arrays[0], offsets.iter().copied(), &mut buffer);
         Ok(())
     })?;
     new_array(runtime, buffer, array.dtype, shape)
 }
 
 /// `array[index] = value`.
-pub(in crate::python) fn set_item(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    index: PyValue,
-    value: PyValue,
-) -> PyResult<()> {
+pub(in crate::python) fn set_item<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    index: PyValue<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, ()> {
     if !array.view.writeable {
         return Err(PyError::value_error("assignment destination is read-only"));
     }
@@ -577,7 +577,11 @@ pub(in crate::python) fn set_item(
 /// Whether `index`, alone or as a 1-tuple, is one boolean array of `array`'s shape, which NumPy
 /// assigns through with its own rules (`array_assign_boolean_subscript`) rather than by
 /// broadcasting.
-fn is_full_mask(runtime: &mut dyn PyRuntime, array: &Array, index: PyValue) -> PyResult<bool> {
+fn is_full_mask<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    index: PyValue<'s>,
+) -> PyResult<'s, bool> {
     let index = if runtime.kind(&index)? == PyKind::Tuple {
         let tuple = index.cast(runtime)?;
         match runtime.tuple_items(tuple)?.as_slice() {
@@ -596,7 +600,7 @@ fn is_full_mask(runtime: &mut dyn PyRuntime, array: &Array, index: PyValue) -> P
 
 /// A value assigned through a full boolean mask is a scalar, one value, or one value for each
 /// `True` element.
-fn check_mask_assignment(source: &Array, selected: usize) -> PyResult<()> {
+fn check_mask_assignment<'s>(source: &Array<'s>, selected: usize) -> PyResult<'s, ()> {
     if source.ndim() > 1 {
         return Err(PyError::type_error(format!(
             "NumPy boolean array indexing assignment requires a 0 or 1-dimensional input, input \
@@ -616,7 +620,11 @@ fn check_mask_assignment(source: &Array, selected: usize) -> PyResult<()> {
 }
 
 /// The array an assigned value stands for, converted with the destination's rules.
-fn assignment_source(runtime: &mut dyn PyRuntime, value: PyValue, dtype: DType) -> PyResult<Array> {
+fn assignment_source<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    dtype: DType,
+) -> PyResult<'s, Array<'s>> {
     if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
         return Array::from_value(runtime, value);
     }
@@ -633,10 +641,10 @@ pub(in crate::python) enum ClipMode {
 
 impl ClipMode {
     /// Parse `mode=` as `PyArray_ClipmodeConverter` does; `None` means `raise`.
-    pub(in crate::python) fn parse(
-        runtime: &mut dyn PyRuntime,
-        value: Option<PyValue>,
-    ) -> PyResult<Self> {
+    pub(in crate::python) fn parse<'s>(
+        runtime: &mut dyn PyRuntime<'s>,
+        value: Option<PyValue<'s>>,
+    ) -> PyResult<'s, Self> {
         let Some(value) = value.filter(|value| !value.is_none()) else {
             return Ok(Self::Raise);
         };
@@ -665,13 +673,13 @@ impl ClipMode {
 
 /// Resolve positions against `size` under `mode`, with NumPy's `take` error text for
 /// `raise`. `wrap` reduces modulo `size`; `clip` clamps into `[0, size)`.
-pub(in crate::python) fn flat_positions(
-    runtime: &mut dyn PyRuntime,
-    indices: &Array,
+pub(in crate::python) fn flat_positions<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    indices: &Array<'s>,
     size: usize,
     axis: Option<usize>,
     mode: ClipMode,
-) -> PyResult<Vec<usize>> {
+) -> PyResult<'s, Vec<usize>> {
     let values = read_elements::<i64>(runtime, indices)?;
     let signed = size as i64;
     values
@@ -697,10 +705,10 @@ pub(in crate::python) fn flat_positions(
 }
 
 /// An int64 index array from any integer array-like.
-pub(in crate::python) fn index_array(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Array> {
+pub(in crate::python) fn index_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Array<'s>> {
     let array = convert::array_from_python(runtime, value, None, false)?;
     if array.size() == 0 {
         return convert::cast_array(runtime, &array, DType::INT64, false);

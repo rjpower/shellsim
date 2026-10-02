@@ -82,27 +82,39 @@ pub(in crate::python) static MATCH_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn pattern_search(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_search<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     compiled_capture(runtime, receiver, args, CaptureMode::Search)
 }
 
-fn pattern_match(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_match<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     compiled_capture(runtime, receiver, args, CaptureMode::Match)
 }
 
-fn pattern_fullmatch(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_fullmatch<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     compiled_capture(runtime, receiver, args, CaptureMode::FullMatch)
 }
 
-fn compiled_capture(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
+fn compiled_capture<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
     mode: CaptureMode,
-) -> PyResult {
+) -> PyResult<'s> {
     args.expect_positional("compiled regex match", 1, 1)?;
     args.reject_keywords("compiled regex match")?;
-    let regex = receiver.cast::<PyRegex>(runtime)?;
+    let regex = receiver.cast::<PyRegex<'s>>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
     let pattern = runtime.new_string(pattern)?;
     capture(
@@ -115,23 +127,31 @@ fn compiled_capture(
     )
 }
 
-fn pattern_findall(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_findall<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     compiled_find(runtime, receiver, args, false)
 }
 
-fn pattern_finditer(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_finditer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     compiled_find(runtime, receiver, args, true)
 }
 
-fn compiled_find(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
+fn compiled_find<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
     return_matches: bool,
-) -> PyResult {
+) -> PyResult<'s> {
     args.expect_positional("compiled regex find", 1, 1)?;
     args.reject_keywords("compiled regex find")?;
-    let regex = receiver.cast::<PyRegex>(runtime)?;
+    let regex = receiver.cast::<PyRegex<'s>>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
     let pattern = runtime.new_string(pattern)?;
     find(
@@ -144,10 +164,14 @@ fn compiled_find(
     )
 }
 
-fn pattern_sub(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn pattern_sub<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("compiled regex sub", 2, 3)?;
     args.reject_keywords("compiled regex sub")?;
-    let regex = receiver.cast::<PyRegex>(runtime)?;
+    let regex = receiver.cast::<PyRegex<'s>>(runtime)?;
     let (pattern, flags) = runtime.regex_parts(regex)?;
     let count = args.positional().get(2).cloned().unwrap_or(Value::Int(0));
     let pattern = runtime.new_string(pattern)?;
@@ -166,10 +190,14 @@ fn pattern_sub(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     )
 }
 
-fn match_group(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn match_group<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("re.Match.group", 0, 1)?;
     args.reject_keywords("re.Match.group")?;
-    let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
+    let data = runtime.match_data(receiver.cast::<PyMatch<'s>>(runtime)?)?;
     let index = match args.positional().first() {
         None => 0,
         Some(value) => {
@@ -192,10 +220,14 @@ fn match_group(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     }
 }
 
-fn match_groups(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn match_groups<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("re.Match.groups", 0, 0)?;
     args.reject_keywords("re.Match.groups")?;
-    let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
+    let data = runtime.match_data(receiver.cast::<PyMatch<'s>>(runtime)?)?;
     let mut groups = Vec::new();
     for group in data.groups.into_iter().skip(1) {
         groups.push(match group {
@@ -206,20 +238,28 @@ fn match_groups(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     runtime.new_tuple(groups)
 }
 
-fn match_start(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn match_start<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     match_position(runtime, receiver, args, true)
 }
 
-fn match_end(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn match_end<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     match_position(runtime, receiver, args, false)
 }
 
-fn match_position(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
+fn match_position<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
     start: bool,
-) -> PyResult {
+) -> PyResult<'s> {
     args.expect_positional("regex match position", 0, 1)?;
     args.reject_keywords("regex match position")?;
     if let Some(group) = args.positional().first().cloned() {
@@ -230,7 +270,7 @@ fn match_position(
             ));
         }
     }
-    let data = runtime.match_data(receiver.cast::<PyMatch>(runtime)?)?;
+    let data = runtime.match_data(receiver.cast::<PyMatch<'s>>(runtime)?)?;
     let position = if start { data.start } else { data.end };
     i64::try_from(position)
         .map(Value::Int)
@@ -309,7 +349,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
-fn compile(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn compile<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("re.compile", 1, 2)?;
     args.reject_unknown_keywords("re.compile", &["flags"])?;
     let pattern = string_arg(runtime, &args.positional()[0], "regex pattern", MAX_PATTERN)?;
@@ -318,13 +358,13 @@ fn compile(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_regex(pattern, flags)
 }
 
-fn search(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn search<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     capture(runtime, args, CaptureMode::Search)
 }
-fn match_(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn match_<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     capture(runtime, args, CaptureMode::Match)
 }
-fn fullmatch(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn fullmatch<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     capture(runtime, args, CaptureMode::FullMatch)
 }
 
@@ -335,7 +375,11 @@ enum CaptureMode {
     FullMatch,
 }
 
-fn capture(runtime: &mut dyn PyRuntime, args: CallArgs, mode: CaptureMode) -> PyResult {
+fn capture<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+    mode: CaptureMode,
+) -> PyResult<'s> {
     let name = match mode {
         CaptureMode::Search => "re.search",
         CaptureMode::Match => "re.match",
@@ -363,14 +407,18 @@ fn capture(runtime: &mut dyn PyRuntime, args: CallArgs, mode: CaptureMode) -> Py
     }
 }
 
-fn findall(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn findall<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     find(runtime, args, false)
 }
-fn finditer(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn finditer<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     find(runtime, args, true)
 }
 
-fn find(runtime: &mut dyn PyRuntime, args: CallArgs, return_matches: bool) -> PyResult {
+fn find<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+    return_matches: bool,
+) -> PyResult<'s> {
     let name = if return_matches {
         "re.finditer"
     } else {
@@ -426,7 +474,7 @@ fn find(runtime: &mut dyn PyRuntime, args: CallArgs, return_matches: bool) -> Py
     }
 }
 
-fn sub(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn sub<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("re.sub", 3, 5)?;
     args.reject_unknown_keywords("re.sub", &["flags"])?;
     let pattern = string_arg(runtime, &args.positional()[0], "regex pattern", MAX_PATTERN)?;
@@ -477,7 +525,7 @@ fn sub(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_string(rendered)
 }
 
-fn escape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn escape<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("re.escape", 1, 1)?;
     args.reject_keywords("re.escape")?;
     let text = string_arg(runtime, &args.positional()[0], "escape input", MAX_INPUT)?;
@@ -485,12 +533,12 @@ fn escape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_string(python_escape(&text))
 }
 
-fn flags_arg(
-    runtime: &dyn PyRuntime,
-    args: &CallArgs,
+fn flags_arg<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    args: &CallArgs<'s>,
     positional_index: usize,
     function: &str,
-) -> PyResult<u32> {
+) -> PyResult<'s, u32> {
     let positional = args.positional().get(positional_index).cloned();
     let keyword = args.keyword(function, "flags")?.cloned();
     if positional.is_some() && keyword.is_some() {
@@ -511,12 +559,12 @@ fn flags_arg(
     Ok(flags)
 }
 
-fn string_arg(
-    runtime: &dyn PyRuntime,
-    value: &Value,
+fn string_arg<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &Value<'s>,
     label: &str,
     maximum: usize,
-) -> PyResult<String> {
+) -> PyResult<'s, String> {
     let OwnedPyString(value) = (*value).cast(runtime)?;
     if value.len() > maximum {
         Err(PyError::value_error(format!(
@@ -527,7 +575,7 @@ fn string_arg(
     }
 }
 
-pub(in crate::python) fn build_regex(pattern: &str, flags: u32) -> PyResult<Regex> {
+pub(in crate::python) fn build_regex<'s>(pattern: &str, flags: u32) -> PyResult<'s, Regex> {
     if pattern.len() > MAX_PATTERN {
         return Err(PyError::value_error(
             "regex pattern exceeds the bounded pattern limit",
@@ -541,12 +589,12 @@ pub(in crate::python) fn build_regex(pattern: &str, flags: u32) -> PyResult<Rege
         .map_err(|error| PyError::value_error(format!("unsupported regex pattern: {error}")))
 }
 
-fn allocate_match(
-    runtime: &mut dyn PyRuntime,
+fn allocate_match<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     regex: &Regex,
     text: &str,
     captures: &regex::Captures<'_>,
-) -> PyResult {
+) -> PyResult<'s> {
     let whole = captures
         .get(0)
         .ok_or_else(|| PyError::runtime_error("regex engine returned no whole match"))?;
@@ -563,7 +611,7 @@ fn allocate_match(
     runtime.new_match(whole.as_str().to_string(), groups, group_names, start, end)
 }
 
-pub(in crate::python) fn normalize_replacement(replacement: &str) -> PyResult<String> {
+pub(in crate::python) fn normalize_replacement<'s>(replacement: &str) -> PyResult<'s, String> {
     let mut output = String::with_capacity(replacement.len());
     let mut chars = replacement.chars();
     while let Some(character) = chars.next() {

@@ -8,7 +8,7 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, ValueTag, Vm};
+use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -16,13 +16,13 @@ type Combine = fn(&[i64]) -> i64;
 /// Nesting bound for tuples and frozensets, matching the VM's call-depth limit.
 const MAX_HASH_DEPTH: usize = 256;
 
-impl Vm<'_> {
+impl<'s> Vm<'s> {
     /// `hash(value)` with CPython's results for builtin values.
-    pub(super) fn hash_value(&mut self, value: &Value) -> Result<i64, String> {
+    pub(super) fn hash_value(&mut self, value: &Value<'s>) -> Result<i64, String> {
         self.hash_nested(value, 0)
     }
 
-    fn hash_nested(&mut self, value: &Value, depth: usize) -> Result<i64, String> {
+    fn hash_nested(&mut self, value: &Value<'s>, depth: usize) -> Result<i64, String> {
         if depth == MAX_HASH_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
@@ -33,54 +33,54 @@ impl Vm<'_> {
         // Instances of `int` subclasses have a numeric view but may define their own `__hash__`.
         let user_instance = self.is_user_instance(value)?;
         if !user_instance {
-            if let Some(number) = number::view(&self.state.heap, value) {
+            if let Some(number) = number::view(self.heap(), value) {
                 return Ok(number::number_hash(number));
             }
         }
         if !user_instance {
-            if let Some(text) = super::super::string::string_ref(&self.state.heap, value)? {
+            if let Some(text) = super::super::string::string_ref(self.heap(), *value)? {
                 let text = text.as_str().to_owned();
                 self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
                 return Ok(hash::string(&text));
             }
         }
-        match value.tag() {
-            ValueTag::Native => return Ok(hash::identity(value.payload ^ u64::from(value.aux[0]))),
-            ValueTag::Registered => {
-                return Ok(hash::identity(
-                    value.payload ^ u64::from(value.aux[0]) << 56,
-                ))
-            }
-            _ => {}
+        if let Some(native) = value.native_value() {
+            let (payload, tag) = native.encode();
+            return Ok(hash::identity(payload ^ u64::from(tag)));
         }
-        let Some(id) = value.object_id() else {
+        if let Some((kind, payload)) = value.registered_parts() {
+            return Ok(hash::identity(payload ^ u64::from(kind) << 56));
+        }
+        if !value.is_object() {
             return Err(format!("hash() does not support {value:?}"));
-        };
-        let object = self.state.heap.get(id)?;
-        let (items, combine): (Vec<Value>, Combine) = match object {
+        }
+        let object = self.get(*value)?;
+        let (items, combine): (Vec<Value<'s>>, Combine) = match object {
             Object::Bytes(bytes) => {
                 let bytes = bytes.clone();
                 self.charge_cpu(u64::try_from(bytes.len() / 32).unwrap_or(u64::MAX))?;
                 return Ok(hash::bytes(&bytes));
             }
-            Object::Tuple(items) => (items.clone(), hash::tuple),
-            Object::GenericAlias { origin, arguments } => {
-                let mut items = Vec::with_capacity(arguments.len().saturating_add(1));
-                items.push(*origin);
-                items.extend(arguments.iter().copied());
-                (items, hash::tuple)
-            }
-            Object::FrozenSet(items) => (items.to_vec(), hash::frozenset),
+            Object::Tuple(items) => (self.handles(items), hash::tuple),
+            Object::GenericAlias { origin, arguments } => (
+                self.handles(std::iter::once(origin).chain(arguments)),
+                hash::tuple,
+            ),
+            Object::FrozenSet(items) => (self.handles(items.iter()), hash::frozenset),
             Object::Range { start, stop, step } => {
                 let (start, stop, step) = (*start, *stop, *step);
                 return range_hash(start, stop, step);
             }
-            Object::Slice { start, stop, step } => (vec![*start, *stop, *step], hash::slice),
+            Object::Slice { start, stop, step } => (self.handles([start, stop, step]), hash::slice),
             Object::EnumMember { class, name, value } => {
-                let (class, name, item) = (*class, name.clone(), *value);
+                let (class, name, item) = (
+                    self.handle_optional(class.as_ref()),
+                    name.clone(),
+                    self.handle(value),
+                );
                 if let Some(class) = class {
                     if matches!(
-                        self.state.heap.get(class)?,
+                        self.get(class)?,
                         Object::Class(class_object)
                             if class_object.layout == ClassLayout::Builtin(BuiltinType::String)
                     ) {
@@ -104,10 +104,10 @@ impl Vm<'_> {
                 ..
             } => return Err(self.unhashable(value)),
             Object::Instance { class, .. } => {
-                let class = *class;
+                let class = self.handle(class);
                 return self.instance_hash(value, class);
             }
-            _ => return Ok(hash::identity(id.as_raw() as u64)),
+            _ => return Ok(hash::identity(self.identity_bits(value)?)),
         };
         let mut hashes = Vec::with_capacity(items.len());
         for item in &items {
@@ -116,29 +116,25 @@ impl Vm<'_> {
         Ok(combine(&hashes))
     }
 
-    fn is_user_instance(&self, value: &Value) -> Result<bool, String> {
-        let Some(id) = value.object_id() else {
+    fn is_user_instance(&self, value: &Value<'s>) -> Result<bool, String> {
+        if !value.is_object() {
             return Ok(false);
-        };
-        Ok(matches!(self.state.heap.get(id)?, Object::Instance { .. }))
+        }
+        Ok(matches!(self.get(*value)?, Object::Instance { .. }))
     }
 
     /// CPython's `object.__hash__` resolution for an instance of a user class.
-    fn instance_hash(
-        &mut self,
-        value: &Value,
-        class: super::super::heap::ObjectId,
-    ) -> Result<i64, String> {
-        let Object::Class(class_object) = self.state.heap.get(class)? else {
+    fn instance_hash(&mut self, value: &Value<'s>, class: Value<'s>) -> Result<i64, String> {
+        let Object::Class(class_object) = self.get(class)? else {
             return Err("instance has an invalid class".into());
         };
         let is_dataclass = class_object.is_dataclass;
         let lineage: Vec<_> = std::iter::once(class)
-            .chain(class_object.mro.iter().copied())
+            .chain(self.handles(&class_object.mro))
             .collect();
         for ancestor in lineage {
             self.charge_cpu(1)?;
-            let Object::Class(ancestor) = self.state.heap.get(ancestor)? else {
+            let Object::Class(ancestor) = self.get(ancestor)? else {
                 return Err("class MRO contains a non-class object".into());
             };
             let attributes = &ancestor.attributes;
@@ -161,24 +157,27 @@ impl Vm<'_> {
         }
         // An `int` or `tuple` subclass hashes as the value it holds; a `dict` subclass is
         // unhashable like `dict`, and the error names the subclass.
-        if let Some(payload) = protocol::builtin_payload(&self.state.heap, value)? {
-            let holds_dict = match payload.object_id() {
-                Some(id) => matches!(self.state.heap.get(id)?, Object::Dict(_)),
-                None => false,
-            };
+        if let Some(payload) = protocol::builtin_payload(self.heap(), *value)? {
+            let holds_dict = payload.is_object() && matches!(self.get(payload)?, Object::Dict(_));
             if holds_dict {
                 return Err(self.unhashable(value));
             }
             return self.hash_value(&payload);
         }
-        let id = value.object_id().expect("instances are arena objects");
-        Ok(hash::identity(id.as_raw() as u64))
+        Ok(hash::identity(self.identity_bits(value)?))
+    }
+
+    /// The stable identity of a heap object, as identity hashing consumes it.
+    fn identity_bits(&self, value: &Value<'s>) -> Result<u64, String> {
+        self.identity(*value)?
+            .map(u64::from)
+            .ok_or_else(|| "identity hash of an immediate value".into())
     }
 
     /// Convert a `__hash__` result as CPython's `slot_tp_hash` does: machine-sized integers are
     /// kept, larger ones are reduced with the integer hash, and `-1` becomes `-2`.
-    fn hash_result(&mut self, result: &Value) -> Result<i64, String> {
-        match number::index(&self.state.heap, result) {
+    fn hash_result(&mut self, result: &Value<'s>) -> Result<i64, String> {
+        match number::index(self.heap(), result) {
             Some(NumberRef::Int(-1)) => Ok(-2),
             Some(NumberRef::Int(value)) => Ok(value),
             Some(number @ (NumberRef::BigInt(_) | NumberRef::UInt(_))) => Ok(hash::big_integer(
@@ -188,7 +187,7 @@ impl Vm<'_> {
         }
     }
 
-    fn unhashable(&mut self, value: &Value) -> String {
+    fn unhashable(&mut self, value: &Value<'s>) -> String {
         let message = match self.type_name_of(value) {
             Ok(name) => format!("unhashable type: '{name}'"),
             Err(error) => return error,

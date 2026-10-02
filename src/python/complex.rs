@@ -72,7 +72,7 @@ impl Operand {
 }
 
 /// Read one builtin number as a complex operand, or `None` for a non-numeric value.
-fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+fn operand<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, Option<Operand>> {
     Ok(match super::number::complex_operand(runtime, value) {
         Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
@@ -85,7 +85,10 @@ fn operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>
 
 /// Read any number as a `complex()` argument, including registered numbers such as NumPy
 /// scalars, which CPython reads through `__complex__`, `__float__` and `__index__`.
-fn constructor_operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+fn constructor_operand<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Operand>> {
     Ok(match runtime.number(value) {
         Some(NumberRef::Int(value)) => Some(Operand::Real(value as f64)),
         Some(NumberRef::BigInt(value)) => Some(Operand::Real(bigint_to_f64(value)?)),
@@ -97,7 +100,10 @@ fn constructor_operand(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Opt
 }
 
 /// A `complex()` argument: a number, or an object with a conversion method.
-fn number_or_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+fn number_or_method<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Operand>> {
     match constructor_operand(runtime, value)? {
         Some(operand) => Ok(Some(operand)),
         None if runtime.string_value(value)?.is_some() => Ok(None),
@@ -107,7 +113,10 @@ fn number_or_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Op
 
 /// Read an object that is not a number through `__complex__`, then `__float__`, then
 /// `__index__`, as CPython's `complex()` does, checking each method's result type.
-fn operand_by_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Operand>> {
+fn operand_by_method<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Operand>> {
     for (method, expected) in [
         ("__complex__", PyKind::Complex),
         ("__float__", PyKind::Float),
@@ -135,7 +144,7 @@ fn operand_by_method(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<O
     Ok(None)
 }
 
-fn bigint_to_f64(value: &num_bigint::BigInt) -> PyResult<f64> {
+fn bigint_to_f64(value: &num_bigint::BigInt) -> PyResult<'static, f64> {
     value
         .to_f64()
         .filter(|value| value.is_finite())
@@ -143,7 +152,7 @@ fn bigint_to_f64(value: &num_bigint::BigInt) -> PyResult<f64> {
 }
 
 /// Read the receiver of a `complex` method, slot, or getter.
-fn receiver(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Complex> {
+fn receiver<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, Complex> {
     match runtime.number(value) {
         Some(NumberRef::Complex(real, imag)) => Ok(Complex::new(real, imag)),
         _ => Err(PyError::type_error(
@@ -152,15 +161,19 @@ fn receiver(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Complex> {
     }
 }
 
-fn real_part(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn real_part<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(PyValue::Float(receiver(runtime, &value)?.real))
 }
 
-fn imaginary_part(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn imaginary_part<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(PyValue::Float(receiver(runtime, &value)?.imag))
 }
 
-fn conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn conjugate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("complex.conjugate", 0, 0)?;
     args.reject_keywords("complex.conjugate")?;
     let value = receiver(runtime, &value)?;
@@ -172,7 +185,7 @@ fn conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyR
 /// Accepts a string in CPython's literal-like syntax (`"1+2j"`, `"(-j)"`, `"inf+nanj"`), or up
 /// to two numbers. Complex arguments are combined as `real + imag * 1j`, which CPython still
 /// accepts with a deprecation warning.
-pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(super) fn construct<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("complex", 0, 2)?;
     args.reject_unknown_keywords("complex", &["real", "imag"])?;
     let mut real = args.positional().first().copied();
@@ -253,7 +266,7 @@ pub(super) fn construct(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult
 /// The grammar is CPython's: optional surrounding whitespace and one pair of parentheses around
 /// `<float>`, `<float>j`, `<float><signed-float>j`, `<float><sign>j`, or `[<sign>]j`, with
 /// underscores allowed only between digits.
-pub(super) fn parse(text: &str) -> PyResult<Complex> {
+pub(super) fn parse(text: &str) -> PyResult<'static, Complex> {
     let malformed = || PyError::value_error("complex() arg is a malformed string");
     let cleaned = strip_digit_underscores(text).ok_or_else(|| {
         PyError::value_error(format!("could not convert string to complex: {text:?}"))
@@ -579,7 +592,7 @@ enum Operation {
 }
 
 /// Evaluate `left <operation> right` where at least one operand is complex.
-fn evaluate(operation: Operation, left: Operand, right: Operand) -> PyResult<Complex> {
+fn evaluate(operation: Operation, left: Operand, right: Operand) -> PyResult<'static, Complex> {
     use Operand::{Complex as C, Real as R};
     Ok(match (operation, left, right) {
         (Operation::Add, C(left), R(right)) | (Operation::Add, R(right), C(left)) => {
@@ -618,12 +631,12 @@ fn evaluate(operation: Operation, left: Operand, right: Operand) -> PyResult<Com
     })
 }
 
-fn binary(
-    runtime: &mut dyn PyRuntime,
+fn binary<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     operation: Operation,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (Some(left), Some(right)) = (operand(runtime, &left)?, operand(runtime, &right)?) else {
         return Ok(None);
     };
@@ -631,77 +644,77 @@ fn binary(
     runtime.new_complex(result.real, result.imag).map(Some)
 }
 
-pub(super) fn slot_add(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_add<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Add, left, right)
 }
 
-pub(super) fn slot_subtract(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_subtract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Subtract, left, right)
 }
 
-pub(super) fn slot_reflected_subtract(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_subtract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Subtract, left, right)
 }
 
-pub(super) fn slot_multiply(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_multiply<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Multiply, left, right)
 }
 
-pub(super) fn slot_divide(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Divide, left, right)
 }
 
-pub(super) fn slot_reflected_divide(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Divide, left, right)
 }
 
-pub(super) fn slot_power(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Power, left, right)
 }
 
-pub(super) fn slot_reflected_power(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     binary(runtime, Operation::Power, left, right)
 }
 
 /// Raise CPython's `TypeError` for an operator that complex numbers do not define.
-fn unsupported(
-    runtime: &mut dyn PyRuntime,
+fn unsupported<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     symbol: &str,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let left = runtime.type_name(&left)?;
     let right = runtime.type_name(&right)?;
     Err(PyError::type_error(format!(
@@ -709,58 +722,58 @@ fn unsupported(
     )))
 }
 
-pub(super) fn slot_floor_divide(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_floor_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     unsupported(runtime, "//", left, right)
 }
 
-pub(super) fn slot_reflected_floor_divide(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_floor_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     unsupported(runtime, "//", left, right)
 }
 
-pub(super) fn slot_remainder(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_remainder<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     unsupported(runtime, "%", left, right)
 }
 
-pub(super) fn slot_reflected_remainder(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_remainder<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     unsupported(runtime, "%", left, right)
 }
 
-pub(super) fn slot_positive(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_positive<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     receiver(runtime, &value)?;
     Ok(Some(value))
 }
 
-pub(super) fn slot_negative(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_negative<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let value = receiver(runtime, &value)?;
     runtime.new_complex(-value.real, -value.imag).map(Some)
 }
 
-pub(super) fn slot_absolute(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_absolute<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let value = receiver(runtime, &value)?;
     let magnitude = value.real.hypot(value.imag);
     if magnitude.is_infinite() && value.real.is_finite() && value.imag.is_finite() {
@@ -769,7 +782,10 @@ pub(super) fn slot_absolute(
     Ok(Some(PyValue::Float(magnitude)))
 }
 
-pub(super) fn slot_hash(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_hash<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     Ok(Some(PyValue::Int(hash(receiver(runtime, &value)?))))
 }
 

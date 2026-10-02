@@ -105,11 +105,11 @@ const fn typing_value(name: &'static str) -> ValueDef {
     }
 }
 
-fn list(runtime: &mut dyn PyRuntime) -> PyResult {
+fn list<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.marker(PyMarker::TypingList))
 }
 
-fn type_var(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn type_var<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("typing.TypeVar", 1, usize::MAX)?;
     let name = runtime
         .string_value(&args.positional()[0])?
@@ -119,25 +119,25 @@ fn type_var(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_string(format!("~{name}"))
 }
 
-fn cast(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn cast<'s>(_runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("typing.cast", 2, 2)?;
     args.reject_keywords("typing.cast")?;
     Ok(args.positional()[1])
 }
 
-fn identity_decorator(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn identity_decorator<'s>(_runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("typing decorator", 1, 1)?;
     args.reject_keywords("typing decorator")?;
     Ok(args.positional()[0])
 }
 
-fn get_origin(_runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn get_origin<'s>(_runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("typing.get_origin", 1, 1)?;
     args.reject_keywords("typing.get_origin")?;
     Ok(super::super::native::PyValue::None)
 }
 
-fn get_args(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn get_args<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("typing.get_args", 1, 1)?;
     args.reject_keywords("typing.get_args")?;
     runtime.new_tuple(Vec::new())
@@ -151,7 +151,7 @@ pub(in crate::python) fn is_named_tuple(function: &FunctionDef) -> bool {
 /// `typing.NamedTuple(typename, fields)`: the `collections.namedtuple` class for a list of
 /// `(name, type)` pairs, recorded in the calling module. The keyword and field-less forms, which
 /// CPython 3.14 deprecates, are not modeled.
-fn named_tuple(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn named_tuple<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     if !args.keywords().is_empty() {
         return Err(PyError::unsupported(
             "typing.NamedTuple with keyword-argument fields is not supported",

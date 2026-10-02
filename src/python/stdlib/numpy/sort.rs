@@ -31,8 +31,9 @@ use std::cmp::Ordering;
 
 use super::super::super::ast::ComparisonOperator;
 use super::super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, PyArrayBuffer, PyArrayData,
-    PyArrayDtype, PyError, PyKind, PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue,
+    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeFn, NativeMethodFn, NativeTypeDef,
+    PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyOperator, PyResult,
+    PyRuntime, PyValue,
 };
 use super::args::{self, Signature};
 use super::array::{self, Array};
@@ -48,10 +49,7 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-const fn function(
-    name: &'static str,
-    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
-) -> FunctionDef {
+const fn function(name: &'static str, call: NativeFn) -> FunctionDef {
     FunctionDef {
         module: "numpy",
         name,
@@ -69,10 +67,7 @@ static FUNCTIONS: &[FunctionDef] = &[
     function("bincount", bincount::module_bincount),
 ];
 
-const fn method(
-    name: &'static str,
-    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
-) -> MethodDef {
+const fn method(name: &'static str, call: NativeMethodFn) -> MethodDef {
     MethodDef {
         type_name: "numpy.ndarray",
         name,
@@ -93,7 +88,7 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn receiver(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Array> {
+fn receiver<'s>(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Array<'s>> {
     Array::from_value(runtime, value)
 }
 
@@ -224,10 +219,10 @@ fn absolute_lane_offsets(
 /// A stable sort of `items` by a fallible `less` predicate, ties keeping their original
 /// relative order: a plain top-down merge sort, so a Python-level comparator (`object`
 /// elements) runs `O(n log n)` times, matching the CPU already charged for the lane.
-fn merge_sort_by<T: Copy>(
+fn merge_sort_by<'s, T: Copy>(
     items: &mut [T],
-    less: &mut impl FnMut(&T, &T) -> PyResult<bool>,
-) -> PyResult<()> {
+    less: &mut impl FnMut(&T, &T) -> PyResult<'s, bool>,
+) -> PyResult<'s, ()> {
     let n = items.len();
     if n <= 1 {
         return Ok(());
@@ -255,7 +250,11 @@ fn merge_sort_by<T: Copy>(
 }
 
 /// `a < b` for `object` elements, NumPy's sort comparator for that dtype.
-fn less_than(runtime: &mut dyn PyRuntime, a: PyValue, b: PyValue) -> PyResult<bool> {
+fn less_than<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    a: PyValue<'s>,
+    b: PyValue<'s>,
+) -> PyResult<'s, bool> {
     let result = runtime.apply_operator(PyOperator::Compare(ComparisonOperator::Less), &[a, b])?;
     runtime.truth(&result)
 }
@@ -309,16 +308,16 @@ fn str_lane_order(
     apply_descending(order, 0, descending)
 }
 
-fn object_lane_orders(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn object_lane_orders<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offsets: &[isize],
     n: usize,
     descending: bool,
-) -> PyResult<Vec<usize>> {
+) -> PyResult<'s, Vec<usize>> {
     let base = array.view.offset;
-    let mut snapshots: Vec<Vec<PyValue>> = Vec::new();
-    runtime.read_arrays(&[array.handle], &mut |arrays| {
+    let mut snapshots: Vec<Vec<PyValue<'s>>> = Vec::new();
+    runtime.read_arrays(&[array.handle], &mut |refs, arrays| {
         let PyArrayData::Values(values) = arrays[0].data else {
             return Err(PyError::runtime_error(
                 "sort saw byte storage for an object dtype",
@@ -328,7 +327,10 @@ fn object_lane_orders(
             snapshots.push(
                 lane.iter()
                     .map(|&relative| {
-                        values[((base as isize + relative) as usize) / PyArrayDtype::VALUE_ITEMSIZE]
+                        refs.handle(
+                            &values[((base as isize + relative) as usize)
+                                / PyArrayDtype::VALUE_ITEMSIZE],
+                        )
                     })
                     .collect(),
             );
@@ -349,12 +351,12 @@ fn object_lane_orders(
 /// The ascending- (or, if `descending`, mostly-descending-) stable permutation of every lane of
 /// `array` along `axis`: for each lane, the `n` local positions `0..n` in sorted order, lanes
 /// concatenated in the [`lane_offsets`] enumeration.
-fn lane_orders(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn lane_orders<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     axis: usize,
     descending: bool,
-) -> PyResult<Vec<usize>> {
+) -> PyResult<'s, Vec<usize>> {
     let n = array.shape()[axis];
     let offsets = lane_offsets(array.shape(), array.strides(), axis);
     let lanes = offsets.len().checked_div(n).unwrap_or(0);
@@ -371,7 +373,7 @@ fn lane_orders(
     let kind = array.dtype.kind();
     let width = array.dtype.itemsize();
     let mut result = Vec::with_capacity(offsets.len());
-    runtime.read_arrays(&[array.handle], &mut |arrays| {
+    runtime.read_arrays(&[array.handle], &mut |_refs, arrays| {
         let PyArrayData::Bytes(bytes) = arrays[0].data else {
             return Err(PyError::runtime_error(
                 "sort saw object storage for a numeric dtype",
@@ -395,19 +397,19 @@ fn lane_orders(
 
 /// A buffer holding, for every output lane position (in the [`lane_offsets`] enumeration), the
 /// element `source` had at the `chosen` local position of that same lane.
-fn gather_chosen(
-    runtime: &mut dyn PyRuntime,
-    source: &Array,
+fn gather_chosen<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    source: &Array<'s>,
     source_offsets: &[isize],
     n: usize,
     chosen: &[usize],
-) -> PyResult<PyArrayBuffer> {
+) -> PyResult<'s, PyArrayBuffer<'s>> {
     let count = chosen.len();
     array::reserve_elements(runtime, source.dtype, count)?;
     runtime.charge_cpu(count as u64 + 1)?;
     let mut buffer = array::buffer_with_capacity(source.dtype, count);
     let base = source.view.offset;
-    runtime.read_arrays(&[source.handle], &mut |arrays| {
+    runtime.read_arrays(&[source.handle], &mut |refs, arrays| {
         match (&arrays[0].data, &mut buffer) {
             (PyArrayData::Bytes(bytes), PyArrayBuffer::Bytes(out)) => {
                 let itemsize = source.itemsize();
@@ -423,7 +425,7 @@ fn gather_chosen(
                     let lane = i / n.max(1);
                     let relative = source_offsets[lane * n + k];
                     let offset = (base as isize + relative) as usize;
-                    out.push(values[offset / PyArrayDtype::VALUE_ITEMSIZE]);
+                    out.push(refs.handle(&values[offset / PyArrayDtype::VALUE_ITEMSIZE]));
                 }
             }
             _ => unreachable!("gather copies between storages of one element kind"),
@@ -435,13 +437,13 @@ fn gather_chosen(
 
 /// Write each of `source`'s lanes, permuted by `chosen`, into `target` (of the same shape and
 /// dtype — `source` itself for an in-place sort, or a fresh array for a copying one).
-fn write_sorted(
-    runtime: &mut dyn PyRuntime,
-    source: &Array,
-    target: &Array,
+fn write_sorted<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    source: &Array<'s>,
+    target: &Array<'s>,
     axis: usize,
     chosen: &[usize],
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     let n = source.shape()[axis];
     let source_offsets = lane_offsets(source.shape(), source.strides(), axis);
     let buffer = gather_chosen(runtime, source, &source_offsets, n, chosen)?;
@@ -452,12 +454,12 @@ fn write_sorted(
 
 /// A fresh array of `source`'s shape and dtype holding its elements sorted along `axis` by
 /// `chosen`.
-fn sorted_copy(
-    runtime: &mut dyn PyRuntime,
-    source: &Array,
+fn sorted_copy<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    source: &Array<'s>,
     axis: usize,
     chosen: &[usize],
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let buffer = array::zeroed_buffer(runtime, source.dtype, source.size())?;
     let target = array::new_array(runtime, buffer, source.dtype, source.shape().to_vec())?;
     write_sorted(runtime, source, &target, axis, chosen)?;
@@ -466,12 +468,12 @@ fn sorted_copy(
 
 /// A fresh int64 array of `shape` holding `chosen` (local axis positions) placed along `axis`
 /// the same way [`sorted_copy`] places values — `argsort`'s and `lexsort`'s result.
-fn indices_array(
-    runtime: &mut dyn PyRuntime,
+fn indices_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     shape: Vec<usize>,
     axis: usize,
     chosen: &[usize],
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let count = chosen.len();
     array::reserve_elements(runtime, DType::INT64, count)?;
     runtime.charge_cpu(count as u64 + 1)?;
@@ -492,11 +494,11 @@ fn indices_array(
 /// `axis=None` flattens (`np.sort`/`np.argsort`/`np.partition`/`np.argpartition`, module and
 /// method forms except in-place `sort`/`partition`); an omitted axis defaults to -1; otherwise
 /// the axis is normalized.
-fn resolve_axis_flatten(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    axis: Option<PyValue>,
-) -> PyResult<(Array, usize)> {
+fn resolve_axis_flatten<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    axis: Option<PyValue<'s>>,
+) -> PyResult<'s, (Array<'s>, usize)> {
     match axis {
         None => Ok((array.clone(), array::normalize_axis(-1, array.ndim())?)),
         Some(value) if value.is_none() => {
@@ -514,11 +516,11 @@ fn resolve_axis_flatten(
 /// does not accept `axis=None`: an omitted axis defaults to -1, and any explicit value —
 /// including `None` — goes through the ordinary integer conversion, so `None` raises NumPy's
 /// "cannot be interpreted as an integer" `TypeError` instead of flattening.
-fn resolve_axis_strict(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
-    axis: Option<PyValue>,
-) -> PyResult<usize> {
+fn resolve_axis_strict<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    axis: Option<PyValue<'s>>,
+) -> PyResult<'s, usize> {
     let raw = match axis {
         None => -1,
         Some(value) => args::index_int(runtime, &value)?,
@@ -526,7 +528,7 @@ fn resolve_axis_strict(
     array::normalize_axis(raw, array.ndim())
 }
 
-fn kind_type_error(runtime: &dyn PyRuntime, value: &PyValue, noun: &str) -> PyError {
+fn kind_type_error<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>, noun: &str) -> PyError {
     let type_name = runtime
         .type_name(value)
         .unwrap_or_else(|_| "object".to_string());
@@ -537,7 +539,7 @@ fn kind_type_error(runtime: &dyn PyRuntime, value: &PyValue, noun: &str) -> PyEr
 /// letter, so any spelling of `quicksort`, `heapsort`, `mergesort`, or `stable` (and anything
 /// else starting the same way) is accepted; shellsim always sorts stably, which is a valid
 /// result for every one of them.
-fn check_sort_kind(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<()> {
+fn check_sort_kind<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, ()> {
     let text = runtime
         .string_value(&value)?
         .ok_or_else(|| kind_type_error(runtime, &value, "sort"))?;
@@ -551,7 +553,10 @@ fn check_sort_kind(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<()> 
 
 /// `kind=` for `partition`/`argpartition`: NumPy accepts only the exact string `'introselect'`
 /// (its default), so an explicit `None` is a `TypeError` rather than "use the default".
-fn check_select_kind(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<()> {
+fn check_select_kind<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, ()> {
     let Some(value) = value else { return Ok(()) };
     let text = runtime
         .string_value(&value)?
@@ -565,7 +570,7 @@ fn check_select_kind(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyR
     }
 }
 
-fn reject_order(bound: &args::Bound) -> PyResult<()> {
+fn reject_order<'s>(bound: &args::Bound<'s>) -> PyResult<'s, ()> {
     if bound.value("order").is_some() {
         return Err(PyError::value_error(
             "Cannot specify order when the array has no fields.",
@@ -578,7 +583,10 @@ fn reject_order(bound: &args::Bound) -> PyResult<()> {
 /// either keyword parameter (whether that parameter is `True` or `False`; an explicit `None` on
 /// either side counts as "not given"), and otherwise applies whichever of `stable`/`descending`
 /// was given (both default to ascending, stably — this implementation's only mode).
-fn sort_direction(runtime: &mut dyn PyRuntime, bound: &args::Bound) -> PyResult<bool> {
+fn sort_direction<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    bound: &args::Bound<'s>,
+) -> PyResult<'s, bool> {
     let kind = bound.value("kind");
     let stable = bound.value("stable");
     let descending = bound.value("descending");
@@ -615,7 +623,7 @@ static ARGPARTITION_SIGNATURE: Signature =
 static ARGPARTITION_METHOD_SIGNATURE: Signature =
     Signature::new("argpartition", &["kth", "axis", "kind", "order"], 1);
 
-fn module_sort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_sort<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     let bound = SORT_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     let descending = sort_direction(runtime, &bound)?;
@@ -625,7 +633,11 @@ fn module_sort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(sorted_copy(runtime, &target, axis, &order)?.value())
 }
 
-fn method_sort(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_sort<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let bound = SORT_METHOD_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     let descending = sort_direction(runtime, &bound)?;
@@ -636,7 +648,7 @@ fn method_sort(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallA
     Ok(super::super::super::Value::None)
 }
 
-fn module_argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_argsort<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     let bound = ARGSORT_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     let descending = sort_direction(runtime, &bound)?;
@@ -646,11 +658,11 @@ fn module_argsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
 }
 
-fn method_argsort(
-    runtime: &mut dyn PyRuntime,
-    receiver_value: PyValue,
-    args: CallArgs,
-) -> PyResult {
+fn method_argsort<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let bound = ARGSORT_METHOD_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     let descending = sort_direction(runtime, &bound)?;
@@ -662,7 +674,7 @@ fn method_argsort(
 
 /// `kth=`: one `int`, or a sequence/array of them (each checked, since our full sort already
 /// puts every position in its final place regardless of which `kth` NumPy would have picked).
-fn kth_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>> {
+fn kth_values<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Vec<i64>> {
     if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
         let array = Array::from_value(runtime, value)?;
         if array.ndim() == 0 {
@@ -692,7 +704,7 @@ fn kth_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<i64>>
     }
 }
 
-fn kth_int(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+fn kth_int<'s>(runtime: &mut dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, i64> {
     if let Some(value) = runtime.int_value(value) {
         return Ok(value);
     }
@@ -704,7 +716,7 @@ fn kth_int(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
     Err(PyError::type_error("Partition index must be integer"))
 }
 
-fn check_kth(kth: PyValue, runtime: &mut dyn PyRuntime, n: usize) -> PyResult<()> {
+fn check_kth<'s>(kth: PyValue<'s>, runtime: &mut dyn PyRuntime<'s>, n: usize) -> PyResult<'s, ()> {
     for k in kth_values(runtime, kth)? {
         let normalized = if k < 0 { k + n as i64 } else { k };
         if !(0..n as i64).contains(&normalized) {
@@ -716,7 +728,7 @@ fn check_kth(kth: PyValue, runtime: &mut dyn PyRuntime, n: usize) -> PyResult<()
     Ok(())
 }
 
-fn module_partition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_partition<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     let bound = PARTITION_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     check_select_kind(runtime, bound.get("kind"))?;
@@ -727,11 +739,11 @@ fn module_partition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(sorted_copy(runtime, &target, axis, &order)?.value())
 }
 
-fn method_partition(
-    runtime: &mut dyn PyRuntime,
-    receiver_value: PyValue,
-    args: CallArgs,
-) -> PyResult {
+fn method_partition<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let bound = PARTITION_METHOD_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     check_select_kind(runtime, bound.get("kind"))?;
@@ -743,7 +755,7 @@ fn method_partition(
     Ok(super::super::super::Value::None)
 }
 
-fn module_argpartition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_argpartition<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     let bound = ARGPARTITION_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     check_select_kind(runtime, bound.get("kind"))?;
@@ -754,11 +766,11 @@ fn module_argpartition(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult 
     Ok(indices_array(runtime, target.shape().to_vec(), axis, &order)?.value())
 }
 
-fn method_argpartition(
-    runtime: &mut dyn PyRuntime,
-    receiver_value: PyValue,
-    args: CallArgs,
-) -> PyResult {
+fn method_argpartition<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let bound = ARGPARTITION_METHOD_SIGNATURE.bind(&args)?;
     reject_order(&bound)?;
     check_select_kind(runtime, bound.get("kind"))?;
@@ -771,10 +783,10 @@ fn method_argpartition(
 
 /// One `lexsort` key element, tagged with enough of its dtype family to compare correctly.
 /// Columns are homogeneous (each key array has one dtype), so mixing variants never compares.
-enum Key {
+enum Key<'s> {
     Number(Number),
     Str(Vec<u32>),
-    Object(PyValue),
+    Object(PyValue<'s>),
 }
 
 fn number_sort_cmp(a: Number, b: Number) -> Ordering {
@@ -788,7 +800,11 @@ fn number_sort_cmp(a: Number, b: Number) -> Ordering {
     }
 }
 
-fn key_ordering(runtime: &mut dyn PyRuntime, a: &Key, b: &Key) -> PyResult<Ordering> {
+fn key_ordering<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    a: &Key<'s>,
+    b: &Key<'s>,
+) -> PyResult<'s, Ordering> {
     match (a, b) {
         (Key::Number(a), Key::Number(b)) => Ok(number_sort_cmp(*a, *b)),
         (Key::Str(a), Key::Str(b)) => Ok(a.cmp(b)),
@@ -805,28 +821,32 @@ fn key_ordering(runtime: &mut dyn PyRuntime, a: &Key, b: &Key) -> PyResult<Order
     }
 }
 
-fn read_key_column(runtime: &mut dyn PyRuntime, key: &Array, axis: usize) -> PyResult<Vec<Key>> {
+fn read_key_column<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    key: &Array<'s>,
+    axis: usize,
+) -> PyResult<'s, Vec<Key<'s>>> {
     let offsets = lane_offsets(key.shape(), key.strides(), axis);
     let base = key.view.offset;
     let kind = key.dtype.kind();
     let mut values = Vec::with_capacity(offsets.len());
     if kind == Kind::Object {
-        runtime.read_arrays(&[key.handle], &mut |arrays| {
+        runtime.read_arrays(&[key.handle], &mut |refs, arrays| {
             let PyArrayData::Values(data) = arrays[0].data else {
                 return Err(PyError::runtime_error(
                     "lexsort saw byte storage for an object dtype",
                 ));
             };
             values.extend(offsets.iter().map(|&relative| {
-                Key::Object(
-                    data[((base as isize + relative) as usize) / PyArrayDtype::VALUE_ITEMSIZE],
-                )
+                Key::Object(refs.handle(
+                    &data[((base as isize + relative) as usize) / PyArrayDtype::VALUE_ITEMSIZE],
+                ))
             }));
             Ok(())
         })?;
         return Ok(values);
     }
-    runtime.read_arrays(&[key.handle], &mut |arrays| {
+    runtime.read_arrays(&[key.handle], &mut |_refs, arrays| {
         let PyArrayData::Bytes(bytes) = arrays[0].data else {
             return Err(PyError::runtime_error(
                 "lexsort saw object storage for a numeric dtype",
@@ -858,11 +878,11 @@ fn read_key_column(runtime: &mut dyn PyRuntime, key: &Array, axis: usize) -> PyR
 
 /// `np.lexsort(keys, axis=-1)`: an ascending-stable order along `axis`, comparing the last key
 /// first (most significant) down to the first (a final tie-break).
-fn lexicographic_lane_orders(
-    runtime: &mut dyn PyRuntime,
-    keys: &[Array],
+fn lexicographic_lane_orders<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    keys: &[Array<'s>],
     axis: usize,
-) -> PyResult<Vec<usize>> {
+) -> PyResult<'s, Vec<usize>> {
     let shape = keys[0].shape();
     let n = shape[axis];
     let lanes = array::element_count(shape)?.checked_div(n).unwrap_or(0);
@@ -875,7 +895,7 @@ fn lexicographic_lane_orders(
     let columns = keys
         .iter()
         .map(|key| read_key_column(runtime, key, axis))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let mut result = Vec::with_capacity(lanes * n);
     for lane in 0..lanes {
         let base = lane * n;
@@ -895,7 +915,10 @@ fn lexicographic_lane_orders(
     Ok(result)
 }
 
-fn key_arrays(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<Array>> {
+fn key_arrays<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Vec<Array<'s>>> {
     match runtime.kind(&value)? {
         PyKind::List => {
             let list = super::super::super::native::PyValueCast::cast(value, runtime)?;
@@ -926,7 +949,7 @@ fn key_arrays(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<Array
     }
 }
 
-fn module_lexsort(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_lexsort<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("lexsort", &["keys", "axis"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let keys = key_arrays(runtime, bound.required("keys"))?;

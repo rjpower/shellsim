@@ -19,7 +19,7 @@ pub(super) fn request(
     interp: &mut Interp,
     request: PyHttpRequest,
     can_suspend: bool,
-) -> PyResult<Option<PyHttpResponse>> {
+) -> PyResult<'static, Option<PyHttpResponse>> {
     let work = validate_request(&request)?;
     let work = u64::try_from(work).unwrap_or(u64::MAX);
     if !interp.resources.charge_cpu(work) {
@@ -67,7 +67,7 @@ pub(super) fn request(
     }))
 }
 
-fn validate_request(request: &PyHttpRequest) -> PyResult<usize> {
+fn validate_request(request: &PyHttpRequest) -> PyResult<'static, usize> {
     if request.method.is_empty()
         || !request
             .method

@@ -21,7 +21,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn dataclass(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn dataclass<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("dataclass", 1, 1)?;
     args.reject_keywords("dataclass")?;
     let value = args.positional()[0];
@@ -30,7 +30,7 @@ fn dataclass(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(value)
 }
 
-fn fields(_runtime: &mut dyn PyRuntime, _args: CallArgs) -> PyResult {
+fn fields<'s>(_runtime: &mut dyn PyRuntime<'s>, _args: CallArgs<'s>) -> PyResult<'s> {
     Err(PyError::runtime_error(
         "dataclasses.fields is not implemented",
     ))

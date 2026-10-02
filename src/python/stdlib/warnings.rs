@@ -21,7 +21,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 
 /// `caller(stacklevel)`: the `(filename, lineno)` executing `stacklevel` frames above the Python
 /// function that calls this helper, or `None` when the stack is not that deep.
-fn caller(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn caller<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("caller", 1, 1)?;
     args.reject_keywords("caller")?;
     let PyIndex(stacklevel) = args.positional()[0].cast(runtime)?;

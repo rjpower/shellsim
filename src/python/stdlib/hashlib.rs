@@ -17,7 +17,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn hexdigest(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn hexdigest<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_hashlib.hexdigest", 2, 2)?;
     args.reject_keywords("_hashlib.hexdigest")?;
     let OwnedPyString(algorithm) = args.positional()[0].cast(runtime)?;

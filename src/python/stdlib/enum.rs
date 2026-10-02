@@ -11,6 +11,6 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     }],
 };
 
-fn enum_base(runtime: &mut dyn PyRuntime) -> PyResult {
+fn enum_base<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.marker(PyMarker::EnumType))
 }

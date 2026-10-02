@@ -722,7 +722,7 @@ pub(in crate::python) static UFUNC: ValueKindDef = ValueKindDef {
 
 const fn ufunc_method(
     name: &'static str,
-    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
+    call: for<'s> fn(&mut dyn PyRuntime<'s>, PyValue<'s>, CallArgs<'s>) -> PyResult<'s>,
 ) -> MethodDef {
     MethodDef {
         type_name: "numpy.ufunc",
@@ -733,7 +733,7 @@ const fn ufunc_method(
 
 const fn ufunc_getter(
     name: &'static str,
-    get: fn(&mut dyn PyRuntime, PyValue) -> PyResult,
+    get: for<'s> fn(&mut dyn PyRuntime<'s>, PyValue<'s>) -> PyResult<'s>,
 ) -> GetterDef {
     GetterDef {
         owner: "numpy.ufunc",
@@ -742,45 +742,51 @@ const fn ufunc_getter(
     }
 }
 
-fn construct_ufunc(_runtime: &mut dyn PyRuntime, _args: CallArgs) -> PyResult {
+fn construct_ufunc<'s>(_runtime: &mut dyn PyRuntime<'s>, _args: CallArgs<'s>) -> PyResult<'s> {
     Err(PyError::type_error("cannot create 'numpy.ufunc' instances"))
 }
 
 /// The ufunc index carried by a `numpy.ufunc` value.
-pub(in crate::python) fn ufunc_index(runtime: &dyn PyRuntime, value: &PyValue) -> Option<usize> {
+pub(in crate::python) fn ufunc_index<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> Option<usize> {
     let index = runtime.value_kind_payload(value, &UFUNC)? as usize;
     (index < UFUNCS.len()).then_some(index)
 }
 
-fn receiver(runtime: &dyn PyRuntime, value: &PyValue) -> usize {
+fn receiver<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> usize {
     ufunc_index(runtime, value).expect("ufunc methods receive ufunc values")
 }
 
-fn slot_ufunc_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+fn slot_ufunc_repr<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let name = UFUNCS[receiver(runtime, &value)].name;
     runtime.new_string(format!("<ufunc '{name}'>")).map(Some)
 }
 
-fn get_name(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn get_name<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     let name = UFUNCS[receiver(runtime, &value)].name;
     runtime.new_string(name.to_string())
 }
 
-fn get_nin(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn get_nin<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::Int(UFUNCS[receiver(runtime, &value)].nin() as i64))
 }
 
-fn get_nout(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
+fn get_nout<'s>(_runtime: &mut dyn PyRuntime<'s>, _value: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::Int(1))
 }
 
-fn get_nargs(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn get_nargs<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::Int(
         UFUNCS[receiver(runtime, &value)].nin() as i64 + 1,
     ))
 }
 
-fn get_identity(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn get_identity<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     let ufunc = &UFUNCS[receiver(runtime, &value)];
     Ok(match ufunc.family {
         Family::Arith {
@@ -798,31 +804,39 @@ fn get_identity(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
     })
 }
 
-fn call_ufunc_value(
-    runtime: &mut dyn PyRuntime,
-    receiver_value: PyValue,
-    args: CallArgs,
-) -> PyResult {
+fn call_ufunc_value<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let index = receiver(runtime, &receiver_value);
     call(runtime, index, args)
 }
 
-fn method_reduce(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_reduce<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let index = receiver(runtime, &receiver_value);
     super::reduce::ufunc_reduce(runtime, index, args)
 }
 
-fn method_accumulate(
-    runtime: &mut dyn PyRuntime,
-    receiver_value: PyValue,
-    args: CallArgs,
-) -> PyResult {
+fn method_accumulate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let index = receiver(runtime, &receiver_value);
     super::reduce::ufunc_accumulate(runtime, index, args)
 }
 
 /// `ufunc.outer(a, b)`: apply the ufunc to every pair, with shape `a.shape + b.shape`.
-fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: CallArgs) -> PyResult {
+fn method_outer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver_value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let index = receiver(runtime, &receiver_value);
     let name = UFUNCS[index].name;
     if UFUNCS[index].nin() != 2 {
@@ -850,8 +864,8 @@ fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Call
 
 /// Keyword options shared by every ufunc call.
 #[derive(Clone, Default)]
-pub(in crate::python) struct Options {
-    pub out: Option<Array>,
+pub(in crate::python) struct Options<'s> {
+    pub out: Option<Array<'s>>,
     pub dtype: Option<DType>,
     pub casting: Option<Casting>,
     /// The call comes from a Python operator such as `a + b`. When every operand is a scalar,
@@ -860,12 +874,12 @@ pub(in crate::python) struct Options {
     /// `out=...`: return a 0-d result as an array rather than a scalar.
     pub keep_array: bool,
     /// `where=`, unless it is the literal `True`.
-    pub mask: Option<PyValue>,
+    pub mask: Option<PyValue<'s>>,
     /// `order=` for an allocated output; `None` is NumPy's default, `K`.
     pub order: Option<Order>,
 }
 
-impl Options {
+impl<'s> Options<'s> {
     fn operator() -> Self {
         Self {
             operator: true,
@@ -875,11 +889,11 @@ impl Options {
 }
 
 /// `np.<ufunc>(*inputs, out=None, dtype=None, casting='same_kind')`.
-pub(in crate::python) fn call(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn call<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     index: usize,
-    args: CallArgs,
-) -> PyResult {
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let ufunc = &UFUNCS[index];
     let nin = ufunc.nin();
     let positional = args.positional();
@@ -904,12 +918,12 @@ pub(in crate::python) fn call(
 
 /// Parse a ufunc call's keywords. Returns the options and the `out` argument, positional or
 /// keyword, still unparsed.
-fn keyword_options(
-    runtime: &mut dyn PyRuntime,
+fn keyword_options<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     name: &str,
-    args: &CallArgs,
-    positional_out: Option<&PyValue>,
-) -> PyResult<(Options, Option<PyValue>)> {
+    args: &CallArgs<'s>,
+    positional_out: Option<&PyValue<'s>>,
+) -> PyResult<'s, (Options<'s>, Option<PyValue<'s>>)> {
     let mut options = Options::default();
     let mut out = positional_out.copied();
     for (keyword, value) in args.keywords() {
@@ -942,7 +956,10 @@ fn keyword_options(
 }
 
 /// Accept `out=array`, `out=(array,)`, or `out=None`.
-fn out_array(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<Array>> {
+fn out_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, Option<Array<'s>>> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(None);
     };
@@ -969,16 +986,16 @@ fn out_array(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Op
 use super::super::super::native::PyValueCast;
 
 /// One prepared ufunc operand.
-pub(in crate::python) enum Operand {
-    Array(Array),
+pub(in crate::python) enum Operand<'s> {
+    Array(Array<'s>),
     Weak {
-        value: PyValue,
+        value: PyValue<'s>,
         leaf: Leaf,
         weak: Weak,
     },
 }
 
-impl Operand {
+impl<'s> Operand<'s> {
     pub(in crate::python) fn dtype(&self) -> Option<DType> {
         match self {
             Self::Array(array) => Some(array.dtype),
@@ -995,10 +1012,10 @@ impl Operand {
 }
 
 /// Prepare one input, reporting whether it is a scalar (a Python number or a NumPy scalar).
-pub(in crate::python) fn operand(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<(Operand, bool)> {
+pub(in crate::python) fn operand<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, (Operand<'s>, bool)> {
     if let Some((weak, leaf)) = convert::weak_scalar(runtime, &value)? {
         return Ok((Operand::Weak { value, leaf, weak }, true));
     }
@@ -1008,7 +1025,7 @@ pub(in crate::python) fn operand(
 }
 
 /// The dtype operands promote to under NEP 50.
-pub(in crate::python) fn common_dtype(operands: &[Operand]) -> PyResult<DType> {
+pub(in crate::python) fn common_dtype<'s>(operands: &[Operand<'s>]) -> PyResult<'s, DType> {
     let strong = operands
         .iter()
         .filter_map(Operand::dtype)
@@ -1036,8 +1053,8 @@ fn no_loop(name: &str, inputs: &[DType]) -> PyError {
 /// A ufunc that mixes `str` with numbers shares no loop for either type. `multiply` by an
 /// integer gets a more specific message pointing at `numpy.strings`, since that combination has
 /// its own dedicated replacement; every other mix falls through to [`no_loop`].
-fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
-    let kind = |operand: &Operand| operand.dtype().map(DType::kind);
+fn string_mix_error<'s>(ufunc: &UfuncDef, operands: &[Operand<'s>]) -> Option<PyError> {
+    let kind = |operand: &Operand<'s>| operand.dtype().map(DType::kind);
     let strings = operands
         .iter()
         .filter(|operand| kind(operand) == Some(Kind::Str))
@@ -1048,7 +1065,7 @@ fn string_mix_error(ufunc: &UfuncDef, operands: &[Operand]) -> Option<PyError> {
     if strings == 0 || strings == operands.len() || objects {
         return None;
     }
-    let integer = |operand: &Operand| match operand {
+    let integer = |operand: &Operand<'s>| match operand {
         Operand::Array(array) => array.dtype.is_integer(),
         Operand::Weak { weak, .. } => *weak == Weak::Int,
     };
@@ -1089,12 +1106,12 @@ pub(in crate::python) struct Resolved {
     pub output: DType,
 }
 
-pub(in crate::python) fn resolve(
+pub(in crate::python) fn resolve<'s>(
     ufunc: &UfuncDef,
     common: DType,
     inputs: &[DType],
     requested: Option<DType>,
-) -> PyResult<Resolved> {
+) -> PyResult<'s, Resolved> {
     // Loops run in native byte order, so results are native even for big-endian operands.
     let common = common.native();
     let requested = requested.map(DType::native);
@@ -1212,11 +1229,11 @@ pub(in crate::python) fn resolve(
 /// The loop dtype of a `scipy.special` function. SciPy registers `float32` and `float64`
 /// loops, and NumPy takes the first one every input casts to safely, unless one matches the
 /// inputs exactly: `int16` computes in `float32`, `int32` in `float64`.
-fn resolve_special(
+fn resolve_special<'s>(
     function: SpecialFunction,
     common: DType,
     requested: Option<DType>,
-) -> PyResult<DType> {
+) -> PyResult<'s, DType> {
     let name = function.name();
     let complex = function.supports_complex();
     let complex_error = || {
@@ -1246,7 +1263,12 @@ fn resolve_special(
     })
 }
 
-fn bool_loop(name: &str, dtype: DType, bools: BoolLoop, inputs: &[DType]) -> PyResult<DType> {
+fn bool_loop<'s>(
+    name: &str,
+    dtype: DType,
+    bools: BoolLoop,
+    inputs: &[DType],
+) -> PyResult<'s, DType> {
     if dtype.kind() != Kind::Bool {
         return Ok(dtype);
     }
@@ -1259,20 +1281,20 @@ fn bool_loop(name: &str, dtype: DType, bools: BoolLoop, inputs: &[DType]) -> PyR
 }
 
 /// Run ufunc `index` on `inputs` and report its floating-point errors.
-pub(in crate::python) fn apply(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn apply<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     index: usize,
-    inputs: &[PyValue],
-    options: &Options,
-) -> PyResult {
+    inputs: &[PyValue<'s>],
+    options: &Options<'s>,
+) -> PyResult<'s> {
     let evaluated = evaluate(runtime, index, inputs, options)?;
     evaluated.report(runtime, UFUNCS[index].name)?;
     Ok(evaluated.value)
 }
 
 /// A ufunc result whose floating-point errors are not reported yet.
-pub(in crate::python) struct Evaluated {
-    pub value: PyValue,
+pub(in crate::python) struct Evaluated<'s> {
+    pub value: PyValue<'s>,
     /// Flags to report; integer overflow is already dropped where NumPy ignores it.
     pub flags: FpFlags,
     /// Every operand was a scalar and the call came from an operator, so NumPy's scalar math
@@ -1280,12 +1302,12 @@ pub(in crate::python) struct Evaluated {
     pub scalar_math: bool,
 }
 
-impl Evaluated {
+impl<'s> Evaluated<'s> {
     pub(in crate::python) fn report(
         &self,
-        runtime: &mut dyn PyRuntime,
+        runtime: &mut dyn PyRuntime<'s>,
         name: &str,
-    ) -> PyResult<()> {
+    ) -> PyResult<'s, ()> {
         if !self.flags.any() {
             return Ok(());
         }
@@ -1300,12 +1322,12 @@ impl Evaluated {
 
 /// Run ufunc `index` on `inputs`, storing into `out=` when given, and return the flags its
 /// loop raised without reporting them.
-pub(in crate::python) fn evaluate(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn evaluate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     index: usize,
-    inputs: &[PyValue],
-    options: &Options,
-) -> PyResult<Evaluated> {
+    inputs: &[PyValue<'s>],
+    options: &Options<'s>,
+) -> PyResult<'s, Evaluated<'s>> {
     if let Some(mask) = options.mask {
         return masked::evaluate(runtime, index, inputs, options, mask);
     }
@@ -1372,7 +1394,7 @@ pub(in crate::python) fn evaluate(
     let prepared = operands
         .iter()
         .map(|operand| prepare(runtime, operand, resolved.input))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     // The loop fills the output in its memory order: C order over the permuted axes.
     let axes = match options.out {
         Some(_) => (0..shape.len()).collect(),
@@ -1382,7 +1404,7 @@ pub(in crate::python) fn evaluate(
     let prepared = prepared
         .iter()
         .map(|input| layout::broadcast_reading_order(input, &shape, &axes))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     // NumPy's scalar math calls `pow` directly, without the loops' constant-exponent cases.
     let constant_exponent = matches!(
         ufunc.family,
@@ -1432,7 +1454,7 @@ pub(in crate::python) fn evaluate(
 /// Whether an operand is the same for every element of NumPy's inner loop, where its stride is
 /// zero: a scalar or 0-d array, or a one-element array broadcast to `count > 1` elements. A
 /// one-element array that is not stretched keeps its stride.
-fn constant_operand(operand: &Operand, count: usize) -> bool {
+fn constant_operand<'s>(operand: &Operand<'s>, count: usize) -> bool {
     match operand {
         Operand::Array(array) => array.size() == 1 && (array.ndim() == 0 || count > 1),
         Operand::Weak { .. } => true,
@@ -1442,7 +1464,11 @@ fn constant_operand(operand: &Operand, count: usize) -> bool {
 /// The memory order of an allocated output of `shape`, as NumPy's iterator applies `order`:
 /// `A` means Fortran order when every array operand is Fortran-contiguous, and `K` follows
 /// the operands' strides.
-fn output_axes(operands: &[Operand], shape: &[usize], order: Order) -> PyResult<Vec<usize>> {
+fn output_axes<'s>(
+    operands: &[Operand<'s>],
+    shape: &[usize],
+    order: Order,
+) -> PyResult<'s, Vec<usize>> {
     let arrays = operands.iter().filter_map(|operand| match operand {
         Operand::Array(array) => Some(array),
         Operand::Weak { .. } => None,
@@ -1457,17 +1483,17 @@ fn output_axes(operands: &[Operand], shape: &[usize], order: Order) -> PyResult<
     }
     let strides = arrays
         .map(|array| broadcast_strides(&array.view, shape))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     Ok(layout::iteration_axes(&strides, shape))
 }
 
 /// Check that a loop's `output` dtype casts to `out=` under `casting`.
-fn check_output_cast(
+fn check_output_cast<'s>(
     ufunc: &UfuncDef,
     output: DType,
-    out: &Array,
+    out: &Array<'s>,
     casting: Casting,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     if dtype::can_cast(output, out.dtype, casting) {
         return Ok(());
     }
@@ -1484,12 +1510,12 @@ fn check_output_cast(
 /// remainder(x1, x2))` from one pass, so floating-point errors are reported once under the name
 /// `divmod`. `np.divmod` itself is frozen Python (`numpy._math.divmod`), two independent ufunc
 /// calls; this function exists only for `divmod(array, array)`, a different call path.
-pub(in crate::python) fn divmod(
-    runtime: &mut dyn PyRuntime,
-    inputs: &[PyValue],
-    options: &Options,
-    outs: [Option<Array>; 2],
-) -> PyResult {
+pub(in crate::python) fn divmod<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    inputs: &[PyValue<'s>],
+    options: &Options<'s>,
+    outs: [Option<Array<'s>>; 2],
+) -> PyResult<'s> {
     let [quotient_out, remainder_out] = outs;
     let quotient_options = Options {
         out: quotient_out,
@@ -1512,22 +1538,22 @@ pub(in crate::python) fn divmod(
     Ok(combined.value)
 }
 
-pub(in crate::python) fn slot_divmod(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_divmod<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if defers_to(runtime, right)? {
         return Ok(None);
     }
     divmod(runtime, &[left, right], &Options::operator(), [None, None]).map(Some)
 }
 
-pub(in crate::python) fn slot_reflected_divmod(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_reflected_divmod<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if defers_to(runtime, right)? {
         return Ok(None);
     }
@@ -1536,7 +1562,7 @@ pub(in crate::python) fn slot_reflected_divmod(
 
 /// Comparisons with Python ints outside the array's integer range compare exactly instead of
 /// raising, as NumPy 2 does.
-fn comparison_safe_common(ufunc: &UfuncDef, operands: &[Operand]) -> PyResult<DType> {
+fn comparison_safe_common<'s>(ufunc: &UfuncDef, operands: &[Operand<'s>]) -> PyResult<'s, DType> {
     let common = common_dtype(operands)?;
     if !matches!(ufunc.family, Family::Compare(_)) || !common.is_integer() {
         return Ok(common);
@@ -1564,7 +1590,10 @@ fn comparison_safe_common(ufunc: &UfuncDef, operands: &[Operand]) -> PyResult<DT
     )
 }
 
-fn reject_negative_exponent(runtime: &mut dyn PyRuntime, exponent: &Operand) -> PyResult<()> {
+fn reject_negative_exponent<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    exponent: &Operand<'s>,
+) -> PyResult<'s, ()> {
     let negative = match exponent {
         Operand::Weak {
             leaf: Leaf::Int(value),
@@ -1588,11 +1617,11 @@ fn reject_negative_exponent(runtime: &mut dyn PyRuntime, exponent: &Operand) -> 
     Ok(())
 }
 
-pub(in crate::python) fn prepare(
-    runtime: &mut dyn PyRuntime,
-    operand: &Operand,
+pub(in crate::python) fn prepare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    operand: &Operand<'s>,
     dtype: DType,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     match operand {
         Operand::Array(array) if dtype.kind() == Kind::Str && array.dtype.kind() == Kind::Str => {
             Ok(array.clone())
@@ -1622,14 +1651,14 @@ fn element_cost(family: Family) -> u64 {
 
 /// Execute the loop into a fresh C-contiguous buffer. `constant_exponent` says that a `power`
 /// exponent is the same for every element (see [`constant_operand`]).
-fn run(
-    runtime: &mut dyn PyRuntime,
+fn run<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     ufunc: &UfuncDef,
     resolved: &Resolved,
-    inputs: &[Array],
+    inputs: &[Array<'s>],
     shape: &[usize],
     constant_exponent: bool,
-) -> PyResult<(PyArrayBuffer, DType, FpFlags)> {
+) -> PyResult<'s, (PyArrayBuffer<'s>, DType, FpFlags)> {
     let count = element_count(shape)?;
     runtime.charge_cpu((count as u64).saturating_mul(element_cost(ufunc.family)) + 1)?;
     if resolved.input.kind() == Kind::Object {
@@ -1645,7 +1674,7 @@ fn run(
     let strides = inputs
         .iter()
         .map(|input| broadcast_strides(&input.view, shape))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let handles = inputs.iter().map(|input| input.handle).collect::<Vec<_>>();
     let kind = resolved.input.kind();
     let family = ufunc.family;
@@ -1670,14 +1699,14 @@ fn run(
         }
         return Ok((PyArrayBuffer::Bytes(bytes), output, flags));
     }
-    runtime.read_arrays(&handles, &mut |arrays| {
+    runtime.read_arrays(&handles, &mut |_refs, arrays| {
         let data = arrays
             .iter()
             .map(|array| match array.data {
                 PyArrayData::Bytes(bytes) => Ok(bytes),
                 PyArrayData::Values(_) => Err(PyError::runtime_error("numeric loop saw objects")),
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .collect::<PyResult<'s, Vec<_>>>()?;
         let offsets = inputs
             .iter()
             .zip(&strides)
@@ -1697,7 +1726,7 @@ fn run(
 }
 
 /// Dispatch one numeric family to its monomorphized kernel.
-fn numeric_loop(
+fn numeric_loop<'s>(
     family: Family,
     kind: Kind,
     data: &[&[u8]],
@@ -1705,7 +1734,7 @@ fn numeric_loop(
     output: &mut [u8],
     flags: &mut FpFlags,
     constant_exponent: bool,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     let unsupported = || {
         Err(PyError::runtime_error(
             "ufunc loop has no kernel for its dtype",
@@ -1834,19 +1863,19 @@ const SPECIAL_CHUNK: usize = 1024;
 /// A loop over any number of inputs of one element type, for `scipy.special` kernels, which
 /// raise no floating-point flags. Arguments are copied out a chunk at a time so that kernels run
 /// outside the operand borrow, where each element can be charged for the work it reports.
-fn special_loop<T: Element>(
-    runtime: &mut dyn PyRuntime,
-    handles: &[PyArray],
+fn special_loop<'s, T: Element>(
+    runtime: &mut dyn PyRuntime<'s>,
+    handles: &[PyArray<'s>],
     mut offsets: Vec<Offsets>,
     output: &mut [u8],
     kernel: impl Fn(&[T]) -> T,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     let nin = handles.len();
     let mut args = Vec::with_capacity(SPECIAL_CHUNK * nin);
     for chunk in output.chunks_mut(SPECIAL_CHUNK * T::SIZE) {
         let elements = chunk.len() / T::SIZE;
         args.clear();
-        runtime.read_arrays(handles, &mut |arrays| {
+        runtime.read_arrays(handles, &mut |_refs, arrays| {
             for _ in 0..elements {
                 for (array, offsets) in arrays.iter().zip(offsets.iter_mut()) {
                     let PyArrayData::Bytes(bytes) = array.data else {
@@ -1887,13 +1916,13 @@ impl ComplexMagnitude for super::element::C128 {
     }
 }
 
-fn binary_loop<T: Element, O: Element>(
+fn binary_loop<'s, T: Element, O: Element>(
     data: &[&[u8]],
     offsets: &mut [Offsets],
     output: &mut [u8],
     flags: &mut FpFlags,
     operation: impl Fn(T, T, &mut FpFlags) -> O,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     let (left, right) = (data[0], data[1]);
     let (first, rest) = offsets.split_at_mut(1);
     for ((a, b), chunk) in first[0]
@@ -1906,13 +1935,13 @@ fn binary_loop<T: Element, O: Element>(
     Ok(())
 }
 
-fn unary_loop<T: Element, O: Element>(
+fn unary_loop<'s, T: Element, O: Element>(
     data: &[&[u8]],
     offsets: &mut [Offsets],
     output: &mut [u8],
     flags: &mut FpFlags,
     operation: impl Fn(T, &mut FpFlags) -> O,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     let input = data[0];
     for (a, chunk) in offsets[0].by_ref().zip(output.chunks_exact_mut(O::SIZE)) {
         operation(T::read(&input[a..]), flags).write(chunk);
@@ -2265,13 +2294,13 @@ fn predicate(op: PredicateOp, value: super::element::Number) -> bool {
 }
 
 /// Apply the ufunc's Python operator to every element of object arrays.
-fn object_loop(
-    runtime: &mut dyn PyRuntime,
+fn object_loop<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     ufunc: &UfuncDef,
     resolved: &Resolved,
-    inputs: &[Array],
+    inputs: &[Array<'s>],
     shape: &[usize],
-) -> PyResult<(PyArrayBuffer, DType, FpFlags)> {
+) -> PyResult<'s, (PyArrayBuffer<'s>, DType, FpFlags)> {
     let broadcast = inputs
         .iter()
         .map(|input| {
@@ -2285,11 +2314,11 @@ fn object_loop(
                 input.view.offset,
             )
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let columns = broadcast
         .iter()
         .map(|input| super::array::read_objects(runtime, input))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let count = element_count(shape)?;
     reserve_elements(runtime, resolved.output, count)?;
     let mut values = Vec::with_capacity(count);
@@ -2314,11 +2343,11 @@ fn object_loop(
     ))
 }
 
-pub(in crate::python) fn object_element(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn object_element<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     ufunc: &UfuncDef,
-    operands: &[PyValue],
-) -> PyResult {
+    operands: &[PyValue<'s>],
+) -> PyResult<'s> {
     match ufunc.object {
         ObjectLoop::Missing => Err(not_supported(ufunc.name)),
         ObjectLoop::Operator(operator) => runtime.apply_operator(operator, operands),
@@ -2368,7 +2397,7 @@ pub(in crate::python) fn object_element(
 
 /// NumPy's `OBJECT_sign`: `-1`, `1` or `0` by comparing with `0`, and a `TypeError` for a value
 /// such as NaN that compares false every way.
-fn object_sign(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn object_sign<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     for (operator, sign) in [
         (ComparisonOperator::Less, -1),
         (ComparisonOperator::Greater, 1),
@@ -2386,7 +2415,11 @@ fn object_sign(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
 /// A `P` loop: call the first operand's method `name` with the other operands. A unary loop
 /// reports a missing method as NumPy's `TypeError`; a binary one lets the `AttributeError`
 /// through, as `PyObject_CallMethod` does.
-fn object_method(runtime: &mut dyn PyRuntime, name: &str, operands: &[PyValue]) -> PyResult {
+fn object_method<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    name: &str,
+    operands: &[PyValue<'s>],
+) -> PyResult<'s> {
     let receiver = operands[0];
     let method = runtime.get_attribute(receiver, name)?;
     let method = match method {
@@ -2409,19 +2442,19 @@ fn object_method(runtime: &mut dyn PyRuntime, name: &str, operands: &[PyValue]) 
 }
 
 /// `str` loops: concatenation, comparison, and `maximum`/`minimum` by code point order.
-fn string_loop(
-    runtime: &mut dyn PyRuntime,
+fn string_loop<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     ufunc: &UfuncDef,
-    inputs: &[Array],
+    inputs: &[Array<'s>],
     shape: &[usize],
-) -> PyResult<(PyArrayBuffer, DType, FpFlags)> {
+) -> PyResult<'s, (PyArrayBuffer<'s>, DType, FpFlags)> {
     let columns = inputs
         .iter()
-        .map(|input| -> PyResult<Vec<String>> {
+        .map(|input| -> PyResult<'s, Vec<String>> {
             let strides = broadcast_strides(&input.view, shape)?;
             let itemsize = input.itemsize();
             let mut texts = Vec::new();
-            runtime.read_arrays(&[input.handle], &mut |arrays| {
+            runtime.read_arrays(&[input.handle], &mut |_refs, arrays| {
                 let PyArrayData::Bytes(bytes) = arrays[0].data else {
                     return Err(PyError::runtime_error("string array has object storage"));
                 };
@@ -2433,7 +2466,7 @@ fn string_loop(
             })?;
             Ok(texts)
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let count = element_count(shape)?;
     match ufunc.family {
         Family::Compare(op) => {
@@ -2476,22 +2509,22 @@ fn string_loop(
 macro_rules! operator_slots {
     ($($slot:ident, $reflected:ident => $name:literal;)*) => {
         $(
-            pub(in crate::python) fn $slot(
-                runtime: &mut dyn PyRuntime,
-                left: PyValue,
-                right: PyValue,
-            ) -> PyResult<Option<PyValue>> {
+            pub(in crate::python) fn $slot<'s>(
+                runtime: &mut dyn PyRuntime<'s>,
+                left: PyValue<'s>,
+                right: PyValue<'s>,
+            ) -> PyResult<'s, Option<PyValue<'s>>> {
                 if defers_to(runtime, right)? {
                     return Ok(None);
                 }
                 apply(runtime, named($name), &[left, right], &Options::operator()).map(Some)
             }
 
-            pub(in crate::python) fn $reflected(
-                runtime: &mut dyn PyRuntime,
-                left: PyValue,
-                right: PyValue,
-            ) -> PyResult<Option<PyValue>> {
+            pub(in crate::python) fn $reflected<'s>(
+                runtime: &mut dyn PyRuntime<'s>,
+                left: PyValue<'s>,
+                right: PyValue<'s>,
+            ) -> PyResult<'s, Option<PyValue<'s>>> {
                 if defers_to(runtime, right)? {
                     return Ok(None);
                 }
@@ -2506,7 +2539,10 @@ macro_rules! operator_slots {
 /// tries the operand's reflected method instead. `pytest.approx` relies on this to compare
 /// arrays itself. Every operator slot receives the array as `left` and the other operand as
 /// `right`, reflected slots included.
-pub(in crate::python) fn defers_to(runtime: &mut dyn PyRuntime, other: PyValue) -> PyResult<bool> {
+pub(in crate::python) fn defers_to<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    other: PyValue<'s>,
+) -> PyResult<'s, bool> {
     if runtime.kind(&other)? != PyKind::Instance {
         return Ok(false);
     }
@@ -2531,11 +2567,11 @@ operator_slots! {
 }
 
 /// `a ** b` for an array `a`.
-pub(in crate::python) fn slot_power(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if defers_to(runtime, right)? {
         return Ok(None);
     }
@@ -2551,11 +2587,11 @@ pub(in crate::python) fn slot_power(
     .map(Some)
 }
 
-pub(in crate::python) fn slot_reflected_power(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_reflected_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if defers_to(runtime, right)? {
         return Ok(None);
     }
@@ -2580,11 +2616,11 @@ pub(in crate::python) fn slot_reflected_power(
 /// `0.5` warns "invalid value encountered in **sqrt**", while `np.float64(0.5)` warns
 /// "...in **power**". Integer and boolean bases are never fast-pathed, matching NumPy's
 /// restriction of the optimization to inexact loops.
-fn fast_power(
-    runtime: &mut dyn PyRuntime,
-    base: PyValue,
-    exponent: PyValue,
-) -> PyResult<Option<&'static str>> {
+fn fast_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    base: PyValue<'s>,
+    exponent: PyValue<'s>,
+) -> PyResult<'s, Option<&'static str>> {
     let name = match runtime.kind(&exponent)? {
         PyKind::Int => match runtime.int_value(&exponent) {
             Some(-1) => "reciprocal",
@@ -2616,11 +2652,11 @@ fn fast_power(
 macro_rules! comparison_slots {
     ($($slot:ident => $name:literal;)*) => {
         $(
-            pub(in crate::python) fn $slot(
-                runtime: &mut dyn PyRuntime,
-                left: PyValue,
-                right: PyValue,
-            ) -> PyResult<Option<PyValue>> {
+            pub(in crate::python) fn $slot<'s>(
+                runtime: &mut dyn PyRuntime<'s>,
+                left: PyValue<'s>,
+                right: PyValue<'s>,
+            ) -> PyResult<'s, Option<PyValue<'s>>> {
                 if defers_to(runtime, right)? {
                     return Ok(None);
                 }
@@ -2630,32 +2666,32 @@ macro_rules! comparison_slots {
     };
 }
 
-pub(in crate::python) fn slot_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     equality(runtime, left, right, "equal", false)
 }
 
-pub(in crate::python) fn slot_not_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(in crate::python) fn slot_not_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     equality(runtime, left, right, "not_equal", true)
 }
 
 /// `==` and `!=` on arrays. When the operands share no comparison loop, such as a string array
 /// and a number, shellsim answers "unequal" everywhere instead of raising; operands that do not
 /// broadcast still raise.
-fn equality(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
+fn equality<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
     name: &str,
     unequal: bool,
-) -> PyResult<Option<PyValue>> {
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if defers_to(runtime, right)? {
         return Ok(None);
     }
@@ -2694,10 +2730,10 @@ comparison_slots! {
 macro_rules! unary_slots {
     ($($slot:ident => $name:literal;)*) => {
         $(
-            pub(in crate::python) fn $slot(
-                runtime: &mut dyn PyRuntime,
-                value: PyValue,
-            ) -> PyResult<Option<PyValue>> {
+            pub(in crate::python) fn $slot<'s>(
+                runtime: &mut dyn PyRuntime<'s>,
+                value: PyValue<'s>,
+            ) -> PyResult<'s, Option<PyValue<'s>>> {
                 apply(runtime, named($name), &[value], &Options::operator()).map(Some)
             }
         )*
@@ -2712,12 +2748,12 @@ unary_slots! {
 }
 
 /// In-place operator on an array: `a += b` is `np.add(a, b, out=a)` with `same_kind` casting.
-pub(in crate::python) fn inplace(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn inplace<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     name: &str,
-    target: PyValue,
-    other: PyValue,
-) -> PyResult {
+    target: PyValue<'s>,
+    other: PyValue<'s>,
+) -> PyResult<'s> {
     let out = Array::from_value(runtime, target)?;
     apply(
         runtime,

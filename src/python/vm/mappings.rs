@@ -7,32 +7,45 @@
 
 use super::{Object, Value, Vm};
 
-impl Vm<'_> {
+impl<'s> Vm<'s> {
     /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no `keys`
     /// method. A dict subclass is read from the dict it holds, as CPython's `dict_merge` reads a
     /// subclass that keeps `dict.__iter__`.
     pub(super) fn mapping_items(
         &mut self,
-        value: Value,
-    ) -> Result<Option<Vec<(Value, Value)>>, String> {
+        value: Value<'s>,
+    ) -> Result<Option<Vec<(Value<'s>, Value<'s>)>>, String> {
         let stored = self.builtin_view(value)?;
-        if let Some(id) = stored.object_id() {
-            let length = match self.state.heap.get(id)? {
+        if stored.is_object() {
+            let length = match self.get(stored)? {
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => Some(entries.len()),
                 _ => None,
             };
             if let Some(length) = length {
-                self.reserve_result(length.saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
+                self.reserve_result(
+                    length.saturating_mul(std::mem::size_of::<(Value<'s>, Value<'s>)>()),
+                )?;
                 let (Object::Dict(entries) | Object::DefaultDict { entries, .. }) =
-                    self.state.heap.get(id)?
+                    self.get(stored)?
                 else {
                     unreachable!("dict kind was checked above")
                 };
-                return Ok(Some(entries.to_vec()));
+                return Ok(Some(
+                    entries
+                        .iter()
+                        .map(|(key, value)| (self.handle(key), self.handle(value)))
+                        .collect(),
+                ));
             }
-            match *self.state.heap.get(id)? {
-                Object::NamespaceDict(target) => return self.namespace_items(target).map(Some),
-                Object::MappingProxy(target) => return self.proxy_items(target).map(Some),
+            match self.get(stored)? {
+                Object::NamespaceDict(target) => {
+                    let target = self.namespace_handle(target);
+                    return self.namespace_items(target).map(Some);
+                }
+                Object::MappingProxy(target) => {
+                    let target = self.proxy_handle(target);
+                    return self.proxy_items(target).map(Some);
+                }
                 _ => {}
             }
         }

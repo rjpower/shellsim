@@ -52,7 +52,7 @@ struct Format {
     values: usize,
 }
 
-fn parse_format(text: &str) -> PyResult<Format> {
+fn parse_format<'s>(text: &str) -> PyResult<'s, Format> {
     let bytes = text.as_bytes();
     let (endian, mut position) = match bytes.first() {
         Some(b'<') | Some(b'=') => (Endian::Little, 1),
@@ -122,7 +122,7 @@ fn parse_format(text: &str) -> PyResult<Format> {
     })
 }
 
-fn calcsize(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn calcsize<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("struct.calcsize", 1, 1)?;
     args.reject_keywords("struct.calcsize")?;
     let OwnedPyString(format) = args.positional()[0].cast(runtime)?;
@@ -132,7 +132,7 @@ fn calcsize(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     ))
 }
 
-fn pack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn pack<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     if args.positional().is_empty() {
         return Err(PyError::type_error("struct.pack requires a format"));
     }
@@ -188,13 +188,13 @@ fn pack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_bytes(output)
 }
 
-fn pack_value(
-    runtime: &mut dyn PyRuntime,
+fn pack_value<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     code: u8,
     endian: Endian,
-    value: PyValue,
+    value: PyValue<'s>,
     output: &mut Vec<u8>,
-) -> PyResult<()> {
+) -> PyResult<'s, ()> {
     macro_rules! integer {
         ($type:ty) => {{
             let value = integer_value(runtime, value)?;
@@ -248,7 +248,7 @@ fn pack_value(
     Ok(())
 }
 
-fn integer_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i128> {
+fn integer_value<'s>(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, i128> {
     if let Some(value) = runtime.int_value(&value) {
         return Ok(i128::from(value));
     }
@@ -258,7 +258,7 @@ fn integer_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i128> {
         .ok_or_else(|| PyError::type_error("required argument is not an integer"))
 }
 
-fn unpack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn unpack<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("struct.unpack", 2, 2)?;
     args.reject_keywords("struct.unpack")?;
     let OwnedPyString(format_text) = args.positional()[0].cast(runtime)?;
@@ -270,7 +270,11 @@ fn unpack(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
             format!("unpack requires a buffer of {} bytes", format.size),
         ));
     }
-    runtime.reserve_memory(format.values.saturating_mul(std::mem::size_of::<PyValue>()))?;
+    runtime.reserve_memory(
+        format
+            .values
+            .saturating_mul(std::mem::size_of::<PyValue<'s>>()),
+    )?;
     runtime.charge_cpu(u64::try_from(format.size).unwrap_or(u64::MAX))?;
     let mut offset = 0usize;
     let mut values = Vec::with_capacity(format.values);
@@ -313,12 +317,12 @@ fn field_size(code: u8) -> usize {
     }
 }
 
-fn unpack_value(
-    runtime: &mut dyn PyRuntime,
+fn unpack_value<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     code: u8,
     endian: Endian,
     input: &[u8],
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     macro_rules! integer {
         ($type:ty, $size:expr) => {{
             let bytes: [u8; $size] = input.try_into().expect("format size selected input width");
