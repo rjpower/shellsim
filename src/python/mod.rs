@@ -9,6 +9,7 @@ mod bytecode;
 mod compiler;
 mod complex;
 mod cpython_names;
+mod definitions;
 mod exception_types;
 mod filesystem;
 mod float_text;

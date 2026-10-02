@@ -3,6 +3,8 @@
 //! Host filesystem access ends at project ingestion. The selected tree is copied into a fresh
 //! VFS before Python starts, and simulated code receives no path back to the host.
 
+#![forbid(unsafe_code)]
+
 use std::fs;
 use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
