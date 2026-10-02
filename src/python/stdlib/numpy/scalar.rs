@@ -10,8 +10,8 @@
 //! Python values rather than `np.str_` and `np.object_` instances.
 
 use super::super::super::native::{
-    CallArgs, GetterDef, KindBase, KindNumber, MethodDef, PyError, PyErrorKind, PyKind, PyResult,
-    PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, KindBase, KindNumber, MethodDef, NativeGetterFn, NativeMethodFn, PyError,
+    PyErrorKind, PyKind, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
 use super::super::super::Value;
 use super::dtype::{Category, DType, Kind};
@@ -74,7 +74,7 @@ const fn abstract_kind(name: &'static str, bases: &'static [KindBase]) -> ValueK
     }
 }
 
-fn construct_abstract(_runtime: &mut dyn PyRuntime, _args: CallArgs) -> PyResult {
+fn construct_abstract<'s>(_runtime: &mut dyn PyRuntime<'s>, _args: CallArgs<'s>) -> PyResult<'s> {
     Err(PyError::type_error(
         "cannot create instances of an abstract NumPy scalar type",
     ))
@@ -137,7 +137,7 @@ macro_rules! scalar_kind {
 macro_rules! scalar_constructors {
     ($($function:ident => $dtype:expr;)*) => {
         $(
-            fn $function(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+            fn $function<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
                 construct(runtime, args, $dtype)
             }
         )*
@@ -299,7 +299,11 @@ const SCALAR_SLOTS: ValueKindSlots = ValueKindSlots {
 macro_rules! generic_methods {
     ([$($fixed:expr),* $(,)?], [$($function:ident => $name:literal),* $(,)?]) => {
         $(
-            fn $function(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+            fn $function<'s>(
+                runtime: &mut dyn PyRuntime<'s>,
+                receiver: PyValue<'s>,
+                args: CallArgs<'s>,
+            ) -> PyResult<'s> {
                 forward_to_array(runtime, receiver, $name, args)
             }
         )*
@@ -359,12 +363,12 @@ generic_methods!(
 
 /// Call the array method `name` on `receiver` as a 0-d array; a 0-d array result becomes a
 /// scalar again, as `PyArray_Return` does.
-fn forward_to_array(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
+fn forward_to_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
     name: &str,
-    args: CallArgs,
-) -> PyResult {
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let array = super::convert::as_array(runtime, receiver)?;
     let method = runtime
         .get_attribute(array.value(), name)?
@@ -395,14 +399,11 @@ static GENERIC_GETTERS: &[GetterDef] = &[
     getter("size", get_size),
 ];
 
-fn get_flags(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn get_flags<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     super::ndarray::python_helper(runtime, "_scalar_flags", value)
 }
 
-const fn method(
-    name: &'static str,
-    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
-) -> MethodDef {
+const fn method(name: &'static str, call: NativeMethodFn) -> MethodDef {
     MethodDef {
         type_name: "numpy.generic",
         name,
@@ -410,7 +411,7 @@ const fn method(
     }
 }
 
-const fn getter(name: &'static str, get: fn(&mut dyn PyRuntime, PyValue) -> PyResult) -> GetterDef {
+const fn getter(name: &'static str, get: NativeGetterFn) -> GetterDef {
     GetterDef {
         owner: "numpy.generic",
         name,
@@ -432,11 +433,11 @@ pub(in crate::python) fn kind_dtype(kind: &'static ValueKindDef) -> Option<DType
 }
 
 /// Box one element of a numeric dtype as a NumPy scalar.
-pub(in crate::python) fn box_bytes(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn box_bytes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     dtype: DType,
     bytes: &[u8],
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     let kind = scalar_kind(dtype.kind())
         .ok_or_else(|| PyError::runtime_error("only numeric elements box as NumPy scalars"))?;
     let itemsize = dtype.itemsize();
@@ -453,20 +454,20 @@ pub(in crate::python) fn box_bytes(
 }
 
 /// Box a number as a NumPy scalar of `dtype`, with unsafe-cast semantics.
-pub(in crate::python) fn box_number(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn box_number<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     dtype: DType,
     value: Number,
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     let mut bytes = [0u8; 16];
     super::element::write_number(dtype.kind(), value, &mut bytes);
     box_bytes(runtime, dtype, &bytes)
 }
 
 /// The dtype and element bytes of a NumPy scalar.
-pub(in crate::python) fn unbox(
-    runtime: &dyn PyRuntime,
-    value: &PyValue,
+pub(in crate::python) fn unbox<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
 ) -> Option<(DType, [u8; 16])> {
     let kind = runtime.value_kind_of(value)?;
     let dtype = kind_dtype(kind)?;
@@ -483,9 +484,9 @@ pub(in crate::python) fn unbox(
 }
 
 /// The dtype and numeric value of a NumPy scalar.
-pub(in crate::python) fn unbox_number(
-    runtime: &dyn PyRuntime,
-    value: &PyValue,
+pub(in crate::python) fn unbox_number<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
 ) -> Option<(DType, Number)> {
     let (dtype, bytes) = unbox(runtime, value)?;
     Some((dtype, super::element::read_number(dtype.kind(), &bytes)))
@@ -509,11 +510,11 @@ fn scalar_numeric(kind: &'static ValueKindDef, payload: [u64; 2]) -> Option<Kind
 /// `scalar[index]`, which indexes the scalar as a 0-d array, as `gen_arrtype_subscript` does:
 /// `scalar[()]` is the scalar, `scalar[...]` a 0-d array, and `scalar[..., None]` a 1-d array.
 /// NumPy reports every failed index as the same IndexError.
-fn slot_get_item(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    index: PyValue,
-) -> PyResult<Option<PyValue>> {
+fn slot_get_item<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    index: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let array = super::convert::as_array(runtime, receiver)?;
     match super::index::get_item(runtime, &array, index) {
         Ok(value) => Ok(Some(value)),
@@ -567,28 +568,40 @@ pub(in crate::python) fn scalar_repr(dtype: DType, value: Number) -> String {
     }
 }
 
-fn receiver_number(runtime: &dyn PyRuntime, receiver: &PyValue) -> PyResult<(DType, Number)> {
+fn receiver_number<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    receiver: &PyValue<'s>,
+) -> PyResult<'s, (DType, Number)> {
     unbox_number(runtime, receiver).ok_or_else(|| PyError::type_error("expected a NumPy scalar"))
 }
 
-fn slot_repr(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+fn slot_repr<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (dtype, number) = receiver_number(runtime, &value)?;
     runtime.new_string(scalar_repr(dtype, number)).map(Some)
 }
 
-fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+fn slot_bool<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (_, number) = receiver_number(runtime, &value)?;
     Ok(Some(Value::Bool(number.is_true())))
 }
 
-fn slot_str(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult<Option<PyValue>> {
+fn slot_str<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (dtype, number) = receiver_number(runtime, &receiver)?;
     runtime.new_string(scalar_str(dtype, number)).map(Some)
 }
 
 /// The real part of a scalar for a conversion to a real Python type, warning as NumPy does when
 /// an imaginary part is dropped.
-fn real_value(runtime: &mut dyn PyRuntime, receiver: &PyValue) -> PyResult<Number> {
+fn real_value<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: &PyValue<'s>) -> PyResult<'s, Number> {
     let (_, number) = receiver_number(runtime, receiver)?;
     Ok(match number {
         Number::Complex(real, _) => {
@@ -600,7 +613,11 @@ fn real_value(runtime: &mut dyn PyRuntime, receiver: &PyValue) -> PyResult<Numbe
 }
 
 /// `int(scalar)`: exact for integers; floats truncate toward zero.
-fn method_int(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_int<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("__int__", 0, 0)?;
     match real_value(runtime, &receiver)? {
         Number::Float(value) => python_int_from_float(runtime, value),
@@ -608,18 +625,30 @@ fn method_int(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) ->
     }
 }
 
-fn method_index(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_index<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("__index__", 0, 0)?;
     let (_, number) = receiver_number(runtime, &receiver)?;
     number_to_python_int(runtime, number)
 }
 
-fn method_float(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_float<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("__float__", 0, 0)?;
     Ok(Value::Float(real_value(runtime, &receiver)?.as_f64()))
 }
 
-fn method_complex(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_complex<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("__complex__", 0, 0)?;
     let (_, number) = receiver_number(runtime, &receiver)?;
     let (real, imag) = number.as_complex();
@@ -628,7 +657,11 @@ fn method_complex(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 
 /// `round(scalar)` gives a Python `int`, rounding half to even; `round(scalar, n)` keeps the
 /// scalar's dtype and follows `np.round`.
-fn method_round(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_round<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("__round__", 0, 1)?;
     args.reject_unknown_keywords("__round__", &["ndigits"])?;
     let ndigits = match args
@@ -659,7 +692,7 @@ fn method_round(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
 }
 
 /// A Python `int` from an integral NumPy number.
-fn number_to_python_int(runtime: &mut dyn PyRuntime, number: Number) -> PyResult {
+fn number_to_python_int<'s>(runtime: &mut dyn PyRuntime<'s>, number: Number) -> PyResult<'s> {
     match number {
         Number::Bool(value) => Ok(Value::Int(i64::from(value))),
         Number::Int(value) => Ok(Value::Int(value)),
@@ -670,7 +703,7 @@ fn number_to_python_int(runtime: &mut dyn PyRuntime, number: Number) -> PyResult
 }
 
 /// A Python `int` truncated from a float, with CPython's errors for NaN and infinities.
-fn python_int_from_float(runtime: &mut dyn PyRuntime, value: f64) -> PyResult {
+fn python_int_from_float<'s>(runtime: &mut dyn PyRuntime<'s>, value: f64) -> PyResult<'s> {
     if value.is_nan() {
         return Err(PyError::value_error("cannot convert float NaN to integer"));
     }
@@ -683,10 +716,10 @@ fn python_int_from_float(runtime: &mut dyn PyRuntime, value: f64) -> PyResult {
 }
 
 /// The Python value `item()` returns for a number of `dtype`.
-pub(in crate::python) fn number_to_python(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn number_to_python<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     value: Number,
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     Ok(match value {
         Number::Bool(value) => Value::Bool(value),
         Number::Int(value) => Value::Int(value),
@@ -699,7 +732,11 @@ pub(in crate::python) fn number_to_python(
     })
 }
 
-fn method_item(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_item<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let (_, number) = receiver_number(runtime, &receiver)?;
     if !args.positional().is_empty() {
         let index = args.positional()[0];
@@ -720,7 +757,11 @@ fn method_item(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
     number_to_python(runtime, number)
 }
 
-fn method_conjugate(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_conjugate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("conjugate", 0, 0)?;
     let (dtype, number) = receiver_number(runtime, &receiver)?;
     match number {
@@ -729,12 +770,12 @@ fn method_conjugate(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallAr
     }
 }
 
-fn get_dtype(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+fn get_dtype<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
     let (dtype, _) = receiver_number(runtime, &receiver)?;
     super::dtype_object::new(runtime, dtype)
 }
 
-fn get_real(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+fn get_real<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
     let (dtype, number) = receiver_number(runtime, &receiver)?;
     match number {
         Number::Complex(real, _) => box_number(runtime, dtype.real_part(), Number::Float(real)),
@@ -742,7 +783,7 @@ fn get_real(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     }
 }
 
-fn get_imag(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+fn get_imag<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
     let (dtype, number) = receiver_number(runtime, &receiver)?;
     match number {
         Number::Complex(_, imag) => box_number(runtime, dtype.real_part(), Number::Float(imag)),
@@ -750,33 +791,37 @@ fn get_imag(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     }
 }
 
-fn get_itemsize(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+fn get_itemsize<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
     let (dtype, _) = receiver_number(runtime, &receiver)?;
     Ok(Value::Int(dtype.itemsize() as i64))
 }
 
-fn get_self(_runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+fn get_self<'s>(_runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
     Ok(receiver)
 }
 
-fn get_base(_runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {
+fn get_base<'s>(_runtime: &mut dyn PyRuntime<'s>, _receiver: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::None)
 }
 
-fn get_ndim(_runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {
+fn get_ndim<'s>(_runtime: &mut dyn PyRuntime<'s>, _receiver: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::Int(0))
 }
 
-fn get_shape(runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {
+fn get_shape<'s>(runtime: &mut dyn PyRuntime<'s>, _receiver: PyValue<'s>) -> PyResult<'s> {
     runtime.new_tuple(Vec::new())
 }
 
-fn get_size(_runtime: &mut dyn PyRuntime, _receiver: PyValue) -> PyResult {
+fn get_size<'s>(_runtime: &mut dyn PyRuntime<'s>, _receiver: PyValue<'s>) -> PyResult<'s> {
     Ok(Value::Int(1))
 }
 
 /// `np.float32(x)` and friends: convert one Python or NumPy value, or cast an array-like.
-fn construct(runtime: &mut dyn PyRuntime, args: CallArgs, dtype: DType) -> PyResult {
+fn construct<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+    dtype: DType,
+) -> PyResult<'s> {
     let positional = args.positional();
     if !args.keywords().is_empty() || positional.len() > 1 {
         return Err(PyError::type_error(format!(

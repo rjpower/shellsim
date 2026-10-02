@@ -63,13 +63,13 @@ enum Item {
     Other,
 }
 
-impl Vm<'_> {
+impl<'s> Vm<'s> {
     /// `sum(iterable, start=0)`.
     pub(super) fn builtin_sum(
         &mut self,
-        values: Vec<Value>,
-        start: Value,
-    ) -> Result<Value, String> {
+        values: Vec<Value<'s>>,
+        start: Value<'s>,
+    ) -> Result<Value<'s>, String> {
         self.reject_sequence_start(&start)?;
         let mut items = values.into_iter();
         let mut total = start;
@@ -139,15 +139,11 @@ impl Vm<'_> {
         Ok(total)
     }
 
-    fn reject_sequence_start(&mut self, start: &Value) -> Result<(), String> {
-        let kind = if string::string_ref(&self.state.heap, start)?.is_some() {
+    fn reject_sequence_start(&mut self, start: &Value<'s>) -> Result<(), String> {
+        let kind = if string::string_ref(self.heap(), *start)?.is_some() {
             "strings [use ''.join(seq) instead]"
         } else {
-            match start
-                .object_id()
-                .map(|id| self.state.heap.get(id))
-                .transpose()?
-            {
+            match start.is_object().then(|| self.get(*start)).transpose()? {
                 Some(Object::Bytes(_)) => "bytes [use b''.join(seq) instead]",
                 Some(Object::ByteArray(_)) => "bytearray [use b''.join(seq) instead]",
                 _ => return Ok(()),
@@ -158,23 +154,24 @@ impl Vm<'_> {
 
     /// Classify `value` for the fast paths. Registered numbers such as NumPy scalars are not
     /// Python `int`, `float`, or `complex` objects, so they take the generic path.
-    fn sum_item(&self, value: &Value) -> Result<Item, String> {
-        if number::registered_number(&self.state.heap, value).is_some() {
+    fn sum_item(&self, value: &Value<'s>) -> Result<Item, String> {
+        if number::registered_number(self.heap(), value).is_some() {
             return Ok(Item::Other);
         }
-        Ok(match number::view(&self.state.heap, value) {
+        Ok(match number::view(self.heap(), value) {
             Some(NumberRef::Int(value)) => Item::Word(value),
             Some(NumberRef::UInt(value)) => Item::Integer(Some(value as f64)),
             Some(NumberRef::BigInt(value)) => {
                 Item::Integer(value.to_f64().filter(|value| value.is_finite()))
             }
             Some(NumberRef::Float(value)) => Item::Float(value),
-            Some(NumberRef::Complex(real, imag)) => match value.object_id() {
-                Some(id) if matches!(self.state.heap.get(id)?, Object::Complex { .. }) => {
+            Some(NumberRef::Complex(real, imag)) => {
+                if value.is_object() && matches!(self.get(*value)?, Object::Complex { .. }) {
                     Item::Complex(real, imag)
+                } else {
+                    Item::Other
                 }
-                _ => Item::Other,
-            },
+            }
             None => Item::Other,
         })
     }

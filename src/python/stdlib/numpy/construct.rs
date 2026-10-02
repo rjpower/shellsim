@@ -20,7 +20,10 @@ use super::element::{self, Number};
 use super::layout::{self, Order};
 
 /// `np.array(object, dtype=None, *, copy=True, order='K', subok=False, ndmin=0, like=None)`.
-pub(in crate::python) fn array(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("array", &["object", "dtype"], 1)
         .keyword_only(&["copy", "order", "subok", "ndmin", "like"]);
     let bound = SIGNATURE.bind(&args)?;
@@ -46,7 +49,7 @@ enum Copy {
     Never,
 }
 
-fn copy_mode(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Copy> {
+fn copy_mode<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Copy> {
     Ok(if value.is_none() {
         Copy::IfNeeded
     } else if runtime.truth(&value)? {
@@ -60,14 +63,14 @@ fn copy_mode(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Copy> {
 /// contiguous variants. An existing array is returned unchanged when neither its dtype nor its
 /// layout needs to change and `copy` allows it; otherwise it is copied in `order`, resolved
 /// against the source. Nested sequences are built in C order, or Fortran order when asked.
-fn from_object(
-    runtime: &mut dyn PyRuntime,
-    object: PyValue,
+fn from_object<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    object: PyValue<'s>,
     dtype: Option<DType>,
     copy: Copy,
     order: Order,
     ndmin: usize,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let no_copy =
         || PyError::value_error("Unable to avoid copy while creating an array as requested.");
     let result = if runtime.native_kind(&object)? == Some(PyNativeKind::Array) {
@@ -107,12 +110,12 @@ fn from_object(
 /// Prepend length-one axes until the array has `ndmin` dimensions, as NumPy's `_prepend_ones`
 /// does: the new axes take the item size as their stride for Fortran order, and the extent of
 /// the outermost axis otherwise.
-fn with_ndmin(
-    runtime: &mut dyn PyRuntime,
-    array: Array,
+fn with_ndmin<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: Array<'s>,
     ndmin: usize,
     order: Order,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let missing = ndmin.saturating_sub(array.ndim());
     if missing == 0 {
         return Ok(array);
@@ -137,7 +140,10 @@ fn with_ndmin(
 }
 
 /// `np.asarray(a, dtype=None, order=None, *, copy=None)`, which `np.asanyarray` shares.
-pub(in crate::python) fn asarray(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn asarray<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("asarray", &["a", "dtype", "order"], 1)
         .keyword_only(&["copy", "like", "device"]);
     let bound = SIGNATURE.bind(&args)?;
@@ -152,25 +158,28 @@ pub(in crate::python) fn asarray(runtime: &mut dyn PyRuntime, args: CallArgs) ->
 
 /// `np.ascontiguousarray(a, dtype=None)`: a C-contiguous array of at least one dimension,
 /// copying only when needed.
-pub(in crate::python) fn ascontiguousarray(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
-) -> PyResult {
+pub(in crate::python) fn ascontiguousarray<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     contiguous(runtime, &args, "ascontiguousarray", Order::C)
 }
 
 /// `np.asfortranarray(a, dtype=None)`: a Fortran-contiguous array of at least one dimension,
 /// copying only when needed.
-pub(in crate::python) fn asfortranarray(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn asfortranarray<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     contiguous(runtime, &args, "asfortranarray", Order::F)
 }
 
-fn contiguous(
-    runtime: &mut dyn PyRuntime,
-    args: &CallArgs,
+fn contiguous<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: &CallArgs<'s>,
     name: &'static str,
     order: Order,
-) -> PyResult {
+) -> PyResult<'s> {
     static C: Signature =
         Signature::new("ascontiguousarray", &["a", "dtype"], 1).keyword_only(&["like"]);
     static F: Signature =
@@ -182,7 +191,10 @@ fn contiguous(
 }
 
 /// `np.copy(a, order='K', subok=False)`.
-pub(in crate::python) fn copy(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn copy<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("copy", &["a", "order", "subok"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let order = Order::parse(runtime, bound.value("order"), Order::K)?;
@@ -191,23 +203,23 @@ pub(in crate::python) fn copy(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
 
 /// What a new array's elements start as.
 #[derive(Clone, Copy)]
-enum Fill {
+enum Fill<'s> {
     /// Zero bytes, which `object` arrays read as `None`, as `np.empty` leaves them.
     Empty,
     /// Zero, which `object` arrays hold as the int `0`, as `np.zeros` fills them.
     Zero,
-    Value(PyValue),
+    Value(PyValue<'s>),
 }
 
 /// An array of `shape`, laid out in `axes` order, whose every element is `fill`, already
 /// converted to `dtype` storage.
-fn filled(
-    runtime: &mut dyn PyRuntime,
+fn filled<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     shape: Vec<usize>,
     axes: &[usize],
     dtype: DType,
-    fill: Fill,
-) -> PyResult<Array> {
+    fill: Fill<'s>,
+) -> PyResult<'s, Array<'s>> {
     let count = array::element_count(&shape)?;
     let fill = match fill {
         Fill::Zero if dtype.kind() == Kind::Object => Value::Int(0),
@@ -230,12 +242,12 @@ fn filled(
 }
 
 /// `np.zeros`, `np.ones`, and `np.empty` share one signature; `empty` is zero-filled.
-fn shaped(
-    runtime: &mut dyn PyRuntime,
-    args: &CallArgs,
+fn shaped<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: &CallArgs<'s>,
     name: &'static str,
-    fill: Fill,
-) -> PyResult {
+    fill: Fill<'s>,
+) -> PyResult<'s> {
     static ZEROS: Signature =
         Signature::new("zeros", &["shape", "dtype", "order"], 1).keyword_only(&["like", "device"]);
     static ONES: Signature =
@@ -257,20 +269,32 @@ fn shaped(
     Ok(filled(runtime, shape, &axes, dtype, fill)?.value())
 }
 
-pub(in crate::python) fn zeros(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn zeros<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     shaped(runtime, &args, "zeros", Fill::Zero)
 }
 
-pub(in crate::python) fn empty(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn empty<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     shaped(runtime, &args, "empty", Fill::Empty)
 }
 
-pub(in crate::python) fn ones(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn ones<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     shaped(runtime, &args, "ones", Fill::Value(Value::Int(1)))
 }
 
 /// `np.full(shape, fill_value, dtype=None, order='C')`: the dtype defaults to the fill value's.
-pub(in crate::python) fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn full<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("full", &["shape", "fill_value", "dtype", "order"], 2)
             .keyword_only(&["like", "device"]);
@@ -289,7 +313,10 @@ pub(in crate::python) fn full(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
 }
 
 /// A float or int argument of a range constructor. A 0-d array stands for its element.
-fn range_number(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(Number, bool)> {
+fn range_number<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, (Number, bool)> {
     if runtime.native_kind(value)? == Some(PyNativeKind::Array) {
         let array = Array::from_value(runtime, *value)?;
         if array.view.shape.is_empty() {
@@ -323,7 +350,10 @@ fn range_number(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<(Numbe
 }
 
 /// `np.arange([start, ]stop[, step], dtype=None)`.
-pub(in crate::python) fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn arange<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("arange", &["start", "stop", "step", "dtype"], 0)
         .keyword_only(&["like", "device"]);
     let bound = SIGNATURE.bind(&args)?;
@@ -390,12 +420,12 @@ pub(in crate::python) fn arange(runtime: &mut dyn PyRuntime, args: CallArgs) -> 
 
 /// A new array from numbers, cast into `dtype`. An `object` array holds them as Python
 /// numbers, as `np.arange(3, dtype=object)` holds ints.
-pub(in crate::python) fn numbers_array(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn numbers_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     dtype: DType,
     shape: Vec<usize>,
     values: impl Iterator<Item = Number>,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     if dtype.kind() == Kind::Object {
         let count = array::element_count(&shape)?;
         array::reserve_elements(runtime, dtype, count)?;
@@ -428,7 +458,10 @@ pub(in crate::python) fn numbers_array(
 }
 
 /// `np.fromiter(iter, dtype, count=-1)`.
-pub(in crate::python) fn fromiter(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn fromiter<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("fromiter", &["iter", "dtype", "count"], 2).keyword_only(&["like"]);
     let bound = SIGNATURE.bind(&args)?;
@@ -463,12 +496,12 @@ pub(in crate::python) fn fromiter(runtime: &mut dyn PyRuntime, args: CallArgs) -
 
 /// Whether two arrays can share memory, and whether they do. `exact` compares the bytes each
 /// element covers; otherwise overlapping extents are enough.
-fn memory_overlap(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
+fn memory_overlap<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
     name: &str,
     exact: bool,
-) -> PyResult {
+) -> PyResult<'s> {
     args.expect_positional(name, 2, 2)?;
     let values = args.positional();
     let arrays = values
@@ -480,7 +513,7 @@ fn memory_overlap(
                 Ok(None)
             }
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     let (Some(left), Some(right)) = (&arrays[0], &arrays[1]) else {
         return Ok(Value::Bool(false));
     };
@@ -529,7 +562,10 @@ fn memory_overlap(
     Ok(Value::Bool(false))
 }
 
-pub(in crate::python) fn shares_memory(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn shares_memory<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let (positional, _) = args.into_parts();
     memory_overlap(
         runtime,
@@ -539,7 +575,10 @@ pub(in crate::python) fn shares_memory(runtime: &mut dyn PyRuntime, args: CallAr
     )
 }
 
-pub(in crate::python) fn may_share_memory(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn may_share_memory<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let (positional, _) = args.into_parts();
     memory_overlap(
         runtime,
@@ -550,13 +589,19 @@ pub(in crate::python) fn may_share_memory(runtime: &mut dyn PyRuntime, args: Cal
 }
 
 /// `np.ndim(a)`, `np.shape(a)`, and `np.size(a)` accept any array-like.
-pub(in crate::python) fn ndim(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn ndim<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("ndim", 1, 1)?;
     let array = convert::as_array(runtime, args.positional()[0])?;
     Ok(Value::Int(array.ndim() as i64))
 }
 
-pub(in crate::python) fn shape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn shape<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("shape", 1, 1)?;
     let array = convert::as_array(runtime, args.positional()[0])?;
     super::ndarray::int_tuple(
@@ -565,7 +610,10 @@ pub(in crate::python) fn shape(runtime: &mut dyn PyRuntime, args: CallArgs) -> P
     )
 }
 
-pub(in crate::python) fn size(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn size<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("size", &["a", "axis"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -578,7 +626,10 @@ pub(in crate::python) fn size(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
 }
 
 /// `np.take(a, indices, axis=None, out=None, mode='raise')`.
-pub(in crate::python) fn take(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn take<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("take", &["a", "indices", "axis", "out", "mode"], 2);
     let bound = SIGNATURE.bind(&args)?;
@@ -594,7 +645,10 @@ pub(in crate::python) fn take(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
 }
 
 /// `np.put(a, ind, v, mode='raise')`.
-pub(in crate::python) fn put(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn put<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("put", &["a", "ind", "v", "mode"], 3);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, bound.required("a"))
@@ -615,7 +669,10 @@ enum TypeOperand {
     Weak(Weak),
 }
 
-fn type_operand(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<TypeOperand> {
+fn type_operand<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, TypeOperand> {
     if let Some((weak, _)) = convert::weak_scalar(runtime, &value)? {
         return Ok(TypeOperand::Weak(weak));
     }
@@ -631,7 +688,10 @@ fn type_operand(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<TypeOpe
 }
 
 /// `np.result_type(*arrays_and_dtypes)` under NEP 50.
-pub(in crate::python) fn result_type(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn result_type<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.reject_keywords("result_type")?;
     if args.positional().is_empty() {
         return Err(PyError::value_error(
@@ -651,7 +711,10 @@ pub(in crate::python) fn result_type(runtime: &mut dyn PyRuntime, args: CallArgs
 }
 
 /// `np.promote_types(type1, type2)`.
-pub(in crate::python) fn promote_types(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn promote_types<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("promote_types", 2, 2)?;
     let left = args::dtype(runtime, args.positional()[0])?;
     let right = args::dtype(runtime, args.positional()[1])?;
@@ -660,7 +723,10 @@ pub(in crate::python) fn promote_types(runtime: &mut dyn PyRuntime, args: CallAr
 }
 
 /// `np.can_cast(from_, to, casting='safe')`.
-pub(in crate::python) fn can_cast(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn can_cast<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("can_cast", &["from_", "to", "casting"], 2);
     let bound = SIGNATURE.bind(&args)?;
     let from =
@@ -683,10 +749,10 @@ pub(in crate::python) fn can_cast(runtime: &mut dyn PyRuntime, args: CallArgs) -
 /// The scalar type an `issubdtype` argument names: a NumPy type, or the scalar type of a
 /// dtype specification. `None` stands for the `str` and `object` dtypes, which box to builtin
 /// values and sit directly below `generic`.
-fn issubdtype_kind(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<&'static ValueKindDef>> {
+fn issubdtype_kind<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<&'static ValueKindDef>> {
     if let Some(PyTypeObject::Kind(kind)) = runtime.type_object(&value) {
         return Ok(Some(kind));
     }
@@ -703,7 +769,10 @@ fn is_subkind(kind: &'static ValueKindDef, ancestor: &'static ValueKindDef) -> b
 }
 
 /// `np.issubdtype(arg1, arg2)`.
-pub(in crate::python) fn issubdtype(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn issubdtype<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("issubdtype", 2, 2)?;
     let child = issubdtype_kind(runtime, args.positional()[0])?;
     let parent = issubdtype_kind(runtime, args.positional()[1])?;
@@ -721,7 +790,10 @@ pub(in crate::python) fn issubdtype(runtime: &mut dyn PyRuntime, args: CallArgs)
 }
 
 /// `np.isscalar(element)`: NumPy scalars and Python numbers, strings, and bytes.
-pub(in crate::python) fn isscalar(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn isscalar<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("isscalar", 1, 1)?;
     let value = args.positional()[0];
     if super::scalar::unbox(runtime, &value).is_some() {

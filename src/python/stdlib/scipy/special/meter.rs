@@ -55,10 +55,10 @@ pub(in crate::python) fn tick() -> bool {
 
 /// Run `kernel` under a growing iteration allowance, charging CPU for the steps it actually
 /// took. `kernel` is called again, from scratch, each time it exhausts its allowance.
-pub(in crate::python) fn evaluate<T>(
-    runtime: &mut dyn PyRuntime,
+pub(in crate::python) fn evaluate<'s, T>(
+    runtime: &mut dyn PyRuntime<'s>,
     kernel: impl Fn() -> T,
-) -> PyResult<T> {
+) -> PyResult<'s, T> {
     let mut allowance = INITIAL_ALLOWANCE;
     loop {
         ALLOWANCE.with(|cell| cell.set(allowance));

@@ -120,29 +120,29 @@ impl PyStringRef<'_> {
 }
 
 /// Borrow a Python string without materializing an owned Rust string.
-pub fn string_ref<'a>(heap: &'a Heap, value: &Value) -> Result<Option<PyStringRef<'a>>, String> {
+pub fn string_ref<'a>(heap: &'a Heap, value: Value<'_>) -> Result<Option<PyStringRef<'a>>, String> {
     if let Some(value) = value.inline_string_ref() {
         return Ok(Some(PyStringRef {
             storage: StringStorage::Inline(value),
         }));
     }
-    let Some(id) = value.object_id() else {
+    if !value.is_object() {
         return Ok(None);
-    };
-    Ok(match heap.get(id)? {
+    }
+    Ok(match heap.get(value)? {
         Object::String(value) => Some(PyStringRef {
             storage: StringStorage::Heap(value),
         }),
         Object::Instance {
             payload: InstancePayload::Builtin(value),
             ..
-        } => return string_ref(heap, value),
+        } => return string_ref(heap, heap.handle(value)),
         _ => None,
     })
 }
 
 /// Copy a Python string for an API that must outlive its heap borrow.
-pub fn string_value(heap: &Heap, value: &Value) -> Result<Option<String>, String> {
+pub fn string_value(heap: &Heap, value: Value<'_>) -> Result<Option<String>, String> {
     Ok(string_ref(heap, value)?.map(|value| value.as_str().to_owned()))
 }
 
@@ -157,17 +157,18 @@ mod tests {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
         let stored = heap
-            .allocate(
+            .alloc(
                 Object::String(PyString::new("snowman: ☃".into())),
+                &mut (),
                 &mut resources,
             )
             .unwrap();
 
-        let inline = string_ref(&heap, &inline).unwrap().unwrap();
+        let inline = string_ref(&heap, inline).unwrap().unwrap();
         assert_eq!(inline.as_str(), "small");
         assert!(inline.is_ascii());
 
-        let stored = string_ref(&heap, &stored).unwrap().unwrap();
+        let stored = string_ref(&heap, stored).unwrap().unwrap();
         assert_eq!(stored.as_str(), "snowman: ☃");
         assert!(!stored.is_ascii());
     }

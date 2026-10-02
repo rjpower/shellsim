@@ -1,11 +1,17 @@
 //! Python semantic types and bootstrapped builtin type metadata.
 //!
-//! `TypeId` is independent of storage shape: immediate values, arena objects, and native markers
+//! `TypeId` is independent of storage shape: immediate values, heap objects, and native markers
 //! all identify their Python type through the same registry. The registry stores only modeled
 //! metadata and Python values, so looking up a type cannot acquire host capabilities.
+//!
+//! The registry is a heap root: it holds stored references ([`Ref`]) to class objects, class
+//! attributes and cached descriptors, and reports them to the collector through
+//! [`Roots`](heap::Roots). Slot tables copy descriptor references out of the attribute maps
+//! with [`Ref::dup`], which is sound only because every copy stays inside this root.
 
 use std::collections::HashMap;
 
+use super::heap::{self, Ref};
 use super::native::{
     BinarySlotFn, MethodDef, PyError, PyResult, PyRuntime, TernarySlotFn, UnarySlotFn,
 };
@@ -182,7 +188,7 @@ impl BuiltinType {
 /// A user slot holds its ordinary Python descriptor. Builtin operator slots hold a direct native
 /// function with the erased runtime ABI. Empty slots mean the type does not implement the
 /// protocol.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct TypeSlots {
     pub call: Option<SlotValue>,
     pub new: Option<SlotValue>,
@@ -242,9 +248,9 @@ pub struct TypeSlots {
 }
 
 /// A cached Python descriptor or a native implementation attached directly to a builtin type.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub enum SlotValue {
-    Descriptor(Value),
+    Descriptor(Ref),
     NativeMethod(&'static MethodDef),
     /// The VM's representation renderer, which shares cycle tracking across nested values.
     VmRepr,
@@ -498,11 +504,13 @@ pub(super) const SLOT_DEFS: [(Slot, &str, u8); 72] = [
 ];
 
 impl TypeSlots {
-    fn from_attributes(attributes: &HashMap<String, Value>) -> Self {
+    fn from_attributes(attributes: &HashMap<String, Ref>) -> Self {
         let mut slots = Self::default();
         for (slot, name, _) in SLOT_DEFS {
             if let Some(value) = attributes.get(name) {
-                slots.set(slot, SlotValue::Descriptor(*value));
+                // The slot table lives in the registry root alongside the attributes, so the
+                // duplicate reference is traced and rewritten with them.
+                slots.set(slot, SlotValue::Descriptor(value.dup()));
             }
         }
         slots
@@ -632,7 +640,11 @@ impl TypeSlots {
     }
 
     fn set(&mut self, slot: Slot, value: SlotValue) {
-        *match slot {
+        *self.entry(slot) = Some(value);
+    }
+
+    fn entry(&mut self, slot: Slot) -> &mut Option<SlotValue> {
+        match slot {
             Slot::Call => &mut self.call,
             Slot::New => &mut self.new,
             Slot::Init => &mut self.init,
@@ -688,30 +700,121 @@ impl TypeSlots {
             Slot::Contains => &mut self.contains,
             Slot::DeleteItem => &mut self.delete_item,
             _ => &mut self.extra[slot as usize - 54],
-        } = Some(value);
+        }
+    }
+
+    /// Every cached descriptor reference, for the registry's root set.
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        for slot in Slot::ALL {
+            if let Some(SlotValue::Descriptor(value)) = self.entry(slot) {
+                visitor(value);
+            }
+        }
     }
 }
 
+impl Clone for TypeSlots {
+    fn clone(&self) -> Self {
+        let mut slots = Self::default();
+        for slot in Slot::ALL {
+            if let Some(value) = self.get(slot) {
+                slots.set(slot, value.clone());
+            }
+        }
+        slots
+    }
+}
+
+/// Copies descriptor references with [`Ref::dup`]: slot values live only in the registry root.
+impl Clone for SlotValue {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Descriptor(value) => Self::Descriptor(value.dup()),
+            Self::NativeMethod(method) => Self::NativeMethod(method),
+            Self::VmRepr => Self::VmRepr,
+            Self::VmEnumString => Self::VmEnumString,
+            Self::VmHash => Self::VmHash,
+            Self::VmCompare => Self::VmCompare,
+            Self::NativeBinary(function) => Self::NativeBinary(*function),
+            Self::NativeTernary(function) => Self::NativeTernary(*function),
+            Self::NativeUnary(function) => Self::NativeUnary(*function),
+        }
+    }
+}
+
+/// Duplicate the stored references of an attribute map that stays inside the registry root.
+fn dup_attributes(attributes: &HashMap<String, Ref>) -> HashMap<String, Ref> {
+    attributes
+        .iter()
+        .map(|(name, value)| (name.clone(), value.dup()))
+        .collect()
+}
+
 /// Metadata shared by builtin, native, and user-defined Python types.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct PyType {
     pub name: String,
     pub bases: Vec<TypeId>,
     pub mro: Vec<TypeId>,
-    pub attributes: HashMap<String, Value>,
+    pub attributes: HashMap<String, Ref>,
     /// Slots defined by this type, before MRO resolution.
     pub local_slots: TypeSlots,
     pub slots: TypeSlots,
-    value: Option<Value>,
+    value: Option<Ref>,
+}
+
+impl Clone for PyType {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            bases: self.bases.clone(),
+            mro: self.mro.clone(),
+            attributes: dup_attributes(&self.attributes),
+            local_slots: self.local_slots.clone(),
+            slots: self.slots.clone(),
+            value: self.value.as_ref().map(Ref::dup),
+        }
+    }
 }
 
 /// Per-runtime registry containing all semantic Python types.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct TypeRegistry {
     types: Vec<PyType>,
     value_kinds: Vec<&'static super::native::ValueKindDef>,
     exception_types: HashMap<&'static str, TypeId>,
     modeled_bytes: u64,
+}
+
+/// A copy of the registry is a separate root; the heap it describes must be copied with it.
+impl Clone for TypeRegistry {
+    fn clone(&self) -> Self {
+        Self {
+            types: self.types.clone(),
+            value_kinds: self.value_kinds.clone(),
+            exception_types: self.exception_types.clone(),
+            modeled_bytes: self.modeled_bytes,
+        }
+    }
+}
+
+/// Heap values retained by semantic type metadata.
+///
+/// Completed user class objects own their Python-visible namespace. The registry roots those
+/// class objects, builtin attributes, and cached protocol descriptors in both slot tables.
+impl heap::Roots for TypeRegistry {
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        for ty in &mut self.types {
+            for value in ty.attributes.values_mut() {
+                visitor(value);
+            }
+            if let Some(value) = &mut ty.value {
+                visitor(value);
+            }
+            ty.local_slots.visit_refs(visitor);
+            ty.slots.visit_refs(visitor);
+        }
+    }
 }
 
 fn modeled_type_bytes(ty: &PyType) -> u64 {
@@ -737,7 +840,9 @@ impl Default for TypeRegistry {
                 attributes: HashMap::new(),
                 local_slots: TypeSlots::default(),
                 slots: TypeSlots::default(),
-                value: Some(Value::Native(super::vm::NativeValue::BuiltinType(builtin))),
+                value: Some(Ref::from_immediate(Value::Native(
+                    super::vm::NativeValue::BuiltinType(builtin),
+                ))),
             });
         }
         install_native_attributes(
@@ -860,7 +965,7 @@ impl Default for TypeRegistry {
         // instance's attributes. The runtime's dict accessors read and write that storage, so
         // `dict`'s own methods serve it unchanged.
         types[BuiltinType::NamespaceDict as usize].attributes =
-            types[BuiltinType::Dict as usize].attributes.clone();
+            dup_attributes(&types[BuiltinType::Dict as usize].attributes);
         for ty in &mut types {
             install_native_method_slots(ty);
         }
@@ -913,8 +1018,8 @@ impl TypeRegistry {
         use super::vm::{ExceptionType, NativeValue};
 
         let base = BuiltinType::Exception.id();
-        self.types[base.raw() as usize].value = Some(Value::Native(NativeValue::ExceptionType(
-            ExceptionType("BaseException"),
+        self.types[base.raw() as usize].value = Some(Ref::from_immediate(Value::Native(
+            NativeValue::ExceptionType(ExceptionType("BaseException")),
         )));
         self.exception_types.insert("BaseException", base);
         for definition in super::exception_types::EXCEPTION_TYPES.iter().skip(1) {
@@ -927,7 +1032,9 @@ impl TypeRegistry {
             let mro = self
                 .linearize_bases(&bases)
                 .expect("exception MRO is valid");
-            let value = Value::Native(NativeValue::ExceptionType(ExceptionType(definition.name)));
+            let value = Ref::from_immediate(Value::Native(NativeValue::ExceptionType(
+                ExceptionType(definition.name),
+            )));
             let ty = PyType {
                 name: definition.name.into(),
                 bases,
@@ -953,33 +1060,17 @@ impl TypeRegistry {
         self.modeled_bytes
     }
 
-    /// Heap values retained by semantic type metadata.
-    ///
-    /// Completed user class objects own their Python-visible namespace. The registry roots those
-    /// class objects, builtin attributes, and cached protocol descriptors at every safe point.
-    pub fn heap_roots(&self) -> Vec<Value> {
-        let mut roots = Vec::new();
-        for ty in &self.types {
-            roots.extend(ty.attributes.values().copied());
-            roots.extend(ty.value);
-            for slot in Slot::ALL {
-                if let Some(SlotValue::Descriptor(value)) = ty.slots.get(slot) {
-                    roots.push(*value);
-                }
-            }
-        }
-        roots
-    }
-
     pub fn get(&self, id: TypeId) -> Result<&PyType, String> {
         self.types
             .get(id.0 as usize)
             .ok_or_else(|| "invalid type reference".into())
     }
 
-    pub fn value(&self, id: TypeId) -> Result<Value, String> {
+    /// The stored reference to the type object registered for `id`.
+    pub fn value_ref(&self, id: TypeId) -> Result<&Ref, String> {
         self.get(id)?
             .value
+            .as_ref()
             .ok_or_else(|| "type construction is incomplete".into())
     }
 
@@ -988,7 +1079,7 @@ impl TypeRegistry {
         name: String,
         bases: Vec<TypeId>,
         mro: Vec<TypeId>,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Ref>,
     ) -> Result<TypeId, String> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
         let local_slots = TypeSlots::from_attributes(attributes);
@@ -1044,7 +1135,7 @@ impl TypeRegistry {
     pub fn replace_slots(
         &mut self,
         id: TypeId,
-        attributes: &HashMap<String, Value>,
+        attributes: &HashMap<String, Ref>,
     ) -> Result<(), String> {
         let mro = self.get(id)?.mro.clone();
         let local_slots = TypeSlots::from_attributes(attributes);
@@ -1064,7 +1155,7 @@ impl TypeRegistry {
         Ok(())
     }
 
-    pub fn finish(&mut self, id: TypeId, value: Value) -> Result<(), String> {
+    pub fn finish(&mut self, id: TypeId, value: Ref) -> Result<(), String> {
         let ty = self
             .types
             .get_mut(id.0 as usize)
@@ -1167,7 +1258,9 @@ impl TypeRegistry {
             attributes: HashMap::new(),
             local_slots,
             slots,
-            value: Some(Value::Native(super::vm::NativeValue::ValueKind(kind))),
+            value: Some(Ref::from_immediate(Value::Native(
+                super::vm::NativeValue::ValueKind(kind),
+            ))),
         };
         insert_native_attributes(&mut ty, kind.methods, kind.getters);
         install_slot_wrappers_for_type(&mut ty, type_id);
@@ -1316,13 +1409,13 @@ fn insert_native_attributes(
     for method in methods {
         ty.attributes.insert(
             method.name.into(),
-            Value::Native(super::vm::NativeValue::NativeMethod(method)),
+            Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeMethod(method))),
         );
     }
     for getter in getters {
         ty.attributes.insert(
             getter.name.into(),
-            Value::Native(super::vm::NativeValue::NativeGetter(getter)),
+            Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeGetter(getter))),
         );
     }
 }
@@ -1344,13 +1437,13 @@ fn install_native_method_slots(ty: &mut PyType) {
         ) {
             continue;
         }
-        if let Some(method) = ty
-            .attributes
-            .get(name)
-            .and_then(|value| match value.native_value() {
-                Some(super::vm::NativeValue::NativeMethod(method)) => Some(method),
-                _ => None,
-            })
+        if let Some(method) =
+            ty.attributes
+                .get(name)
+                .and_then(|value| match value.immediate()?.native_value() {
+                    Some(super::vm::NativeValue::NativeMethod(method)) => Some(method),
+                    _ => None,
+                })
         {
             ty.slots.set(slot, SlotValue::NativeMethod(method));
         }
@@ -1363,7 +1456,9 @@ fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::nativ
     for method in methods {
         ty.attributes.insert(
             method.name.into(),
-            Value::Native(super::vm::NativeValue::NativeClassMethod(method)),
+            Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeClassMethod(
+                method,
+            ))),
         );
     }
 }
@@ -1829,16 +1924,22 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                     | SlotValue::VmCompare
             )
         ) {
-            ty.attributes.entry(name.into()).or_insert(Value::Native(
-                super::vm::NativeValue::SlotWrapper { owner, slot },
-            ));
+            ty.attributes.entry(name.into()).or_insert_with(|| {
+                Ref::from_immediate(Value::Native(super::vm::NativeValue::SlotWrapper {
+                    owner,
+                    slot,
+                }))
+            });
         }
     }
 }
 
 /// CPython 3.14 rejects `NotImplemented` in a boolean context. Truth-testing it usually means an
 /// operator method's result was used without checking whether the method declined.
-fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Value>> {
+fn not_implemented_bool<'s>(
+    _: &mut dyn PyRuntime<'s>,
+    _: Value<'s>,
+) -> PyResult<'s, Option<Value<'s>>> {
     Err(PyError::type_error(
         "NotImplemented should not be used in a boolean context",
     ))
@@ -1928,7 +2029,7 @@ mod tests {
                 "Example".into(),
                 vec![BuiltinType::Object.id()],
                 vec![BuiltinType::Object.id()],
-                &HashMap::from([("value".into(), Value::Int(1))]),
+                &HashMap::from([("value".into(), Ref::from_immediate(Value::Int(1)))]),
             )
             .unwrap();
         let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
@@ -1938,7 +2039,9 @@ mod tests {
             before.saturating_add(registered_bytes)
         );
 
-        registry.finish(id, Value::None).unwrap();
+        registry
+            .finish(id, Ref::from_immediate(Value::None))
+            .unwrap();
         assert_eq!(
             registry.modeled_bytes(),
             before.saturating_add(registered_bytes)

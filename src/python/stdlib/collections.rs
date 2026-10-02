@@ -17,7 +17,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn defaultdict(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn defaultdict<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("defaultdict", 1, 1)?;
     args.reject_keywords("defaultdict")?;
     let factory = args.positional()[0].cast::<PyCallable>(runtime)?;

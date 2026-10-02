@@ -10,15 +10,13 @@ use crate::interp::Interp;
 use crate::process::{LiveChild, ProcessStatus, Signal};
 use crate::vfs::resolve_against;
 
-use super::native::{
-    PyError, PyProcessHandle, PyProcessOutput, PyProcessStartRequest, PyResult, PyStdio,
-};
+use super::native::{PyError, PyProcessHandle, PyProcessOutput, PyProcessStartRequest, PyStdio};
 
 /// Start a modeled argv child and retain its parent-side pipe endpoints by logical PID.
 pub(super) fn start(
     interp: &mut Interp,
     request: PyProcessStartRequest,
-) -> PyResult<PyProcessHandle> {
+) -> Result<PyProcessHandle, PyError> {
     validate_argv(&request.argv)?;
     let cwd = validated_cwd(interp, request.cwd.as_deref())?;
     if request.stdin == PyStdio::MergeStdout || request.stdout == PyStdio::MergeStdout {
@@ -84,7 +82,7 @@ pub(super) fn start(
     Ok(PyProcessHandle { pid })
 }
 
-pub(super) fn poll(interp: &mut Interp, handle: PyProcessHandle) -> PyResult<Option<i32>> {
+pub(super) fn poll(interp: &mut Interp, handle: PyProcessHandle) -> Result<Option<i32>, PyError> {
     checked_owner(interp, handle)?;
     record_status(interp, handle.pid)
 }
@@ -93,7 +91,7 @@ pub(super) fn wait(
     interp: &mut Interp,
     handle: PyProcessHandle,
     timeout_ns: Option<u64>,
-) -> PyResult<PyProcessOutput> {
+) -> Result<PyProcessOutput, PyError> {
     checked_owner(interp, handle)?;
     let deadline = deadline(interp, timeout_ns)?;
     let mut child = interp
@@ -113,7 +111,7 @@ pub(super) fn wait_if_ready(
     interp: &mut Interp,
     process: PyProcessHandle,
     timeout_ns: Option<u64>,
-) -> PyResult<Result<PyProcessOutput, crate::scheduler::WaitReason>> {
+) -> Result<Result<PyProcessOutput, crate::scheduler::WaitReason>, PyError> {
     checked_owner(interp, process)?;
     let mut handle = interp
         .live_children
@@ -153,7 +151,7 @@ fn wait_inner(
     pid: u32,
     deadline: Option<u64>,
     handle: &mut LiveChild,
-) -> PyResult<PyProcessOutput> {
+) -> Result<PyProcessOutput, PyError> {
     loop {
         drain_output(interp, handle, 1)?;
         drain_output(interp, handle, 2)?;
@@ -175,7 +173,7 @@ pub(super) fn communicate(
     process: PyProcessHandle,
     input: Vec<u8>,
     timeout_ns: Option<u64>,
-) -> PyResult<PyProcessOutput> {
+) -> Result<PyProcessOutput, PyError> {
     checked_owner(interp, process)?;
     let deadline = deadline(interp, timeout_ns)?;
     let mut handle = interp
@@ -196,7 +194,7 @@ pub(super) fn communicate_if_ready(
     process: PyProcessHandle,
     input: Vec<u8>,
     timeout_ns: Option<u64>,
-) -> PyResult<Result<PyProcessOutput, crate::scheduler::WaitReason>> {
+) -> Result<Result<PyProcessOutput, crate::scheduler::WaitReason>, PyError> {
     checked_owner(interp, process)?;
     let mut handle = interp
         .live_children
@@ -233,7 +231,7 @@ fn communicate_inner(
     input: Vec<u8>,
     deadline: Option<u64>,
     handle: &mut LiveChild,
-) -> PyResult<PyProcessOutput> {
+) -> Result<PyProcessOutput, PyError> {
     prepare_communicate(handle, input)?;
     loop {
         if let Some(output) = communicate_progress(interp, pid, handle)? {
@@ -247,7 +245,7 @@ fn communicate_inner(
     }
 }
 
-fn prepare_communicate(handle: &mut LiveChild, input: Vec<u8>) -> PyResult<()> {
+fn prepare_communicate(handle: &mut LiveChild, input: Vec<u8>) -> Result<(), PyError> {
     if handle.communicated {
         return Ok(());
     }
@@ -272,7 +270,7 @@ fn communicate_progress(
     interp: &mut Interp,
     pid: u32,
     handle: &mut LiveChild,
-) -> PyResult<Option<PyProcessOutput>> {
+) -> Result<Option<PyProcessOutput>, PyError> {
     if handle.communicated {
         return Ok(Some(output_from_handle(handle, false)));
     }
@@ -298,7 +296,7 @@ pub(super) fn send_signal(
     interp: &mut Interp,
     handle: PyProcessHandle,
     signal: Signal,
-) -> PyResult<()> {
+) -> Result<(), PyError> {
     checked_owner(interp, handle)?;
     if live_status(interp, handle.pid).is_some() {
         return Ok(());
@@ -320,7 +318,7 @@ pub(super) fn read_pipe(
     process: PyProcessHandle,
     fd: i32,
     amount: Option<usize>,
-) -> PyResult<Vec<u8>> {
+) -> Result<Vec<u8>, PyError> {
     checked_owner(interp, process)?;
     if !matches!(fd, 1 | 2) {
         return Err(PyError::value_error("only stdout and stderr are readable"));
@@ -340,7 +338,7 @@ pub(super) fn read_pipe_if_ready(
     process: PyProcessHandle,
     fd: i32,
     amount: Option<usize>,
-) -> PyResult<Result<Vec<u8>, crate::scheduler::WaitReason>> {
+) -> Result<Result<Vec<u8>, crate::scheduler::WaitReason>, PyError> {
     checked_owner(interp, process)?;
     if !matches!(fd, 1 | 2) {
         return Err(PyError::value_error("only stdout and stderr are readable"));
@@ -396,7 +394,7 @@ fn read_pipe_inner(
     fd: i32,
     amount: Option<usize>,
     handle: &mut LiveChild,
-) -> PyResult<Vec<u8>> {
+) -> Result<Vec<u8>, PyError> {
     let captured = if fd == 1 {
         handle.stdout_pipe
     } else {
@@ -434,7 +432,7 @@ pub(super) fn write_pipe(
     interp: &mut Interp,
     process: PyProcessHandle,
     input: Vec<u8>,
-) -> PyResult<usize> {
+) -> Result<usize, PyError> {
     checked_owner(interp, process)?;
     let input_len = input.len();
     let mut handle = interp
@@ -451,7 +449,7 @@ pub(super) fn write_pipe_if_ready(
     interp: &mut Interp,
     process: PyProcessHandle,
     input: Vec<u8>,
-) -> PyResult<Result<usize, crate::scheduler::WaitReason>> {
+) -> Result<Result<usize, crate::scheduler::WaitReason>, PyError> {
     checked_owner(interp, process)?;
     let mut handle = interp
         .live_children
@@ -510,7 +508,7 @@ fn write_pipe_inner(
     pid: u32,
     input: &[u8],
     handle: &mut LiveChild,
-) -> PyResult<()> {
+) -> Result<(), PyError> {
     if !handle.stdin_pipe {
         return Err(PyError::value_error("stdin was not opened with PIPE"));
     }
@@ -542,7 +540,11 @@ fn write_pipe_inner(
 }
 
 /// Close a parent-side pipe and wake a child waiting for EOF or broken-pipe delivery.
-pub(super) fn close_pipe(interp: &mut Interp, process: PyProcessHandle, fd: i32) -> PyResult<()> {
+pub(super) fn close_pipe(
+    interp: &mut Interp,
+    process: PyProcessHandle,
+    fd: i32,
+) -> Result<(), PyError> {
     checked_owner(interp, process)?;
     if !matches!(fd, 0..=2) {
         return Err(PyError::value_error("invalid subprocess stream"));
@@ -560,7 +562,7 @@ pub(super) fn close_pipe(interp: &mut Interp, process: PyProcessHandle, fd: i32)
     result
 }
 
-fn validate_argv(argv: &[String]) -> PyResult<()> {
+fn validate_argv(argv: &[String]) -> Result<(), PyError> {
     if argv.is_empty() || argv[0].is_empty() {
         Err(PyError::value_error("subprocess argv must not be empty"))
     } else {
@@ -568,7 +570,7 @@ fn validate_argv(argv: &[String]) -> PyResult<()> {
     }
 }
 
-fn validated_cwd(interp: &Interp, cwd: Option<&str>) -> PyResult<Option<String>> {
+fn validated_cwd(interp: &Interp, cwd: Option<&str>) -> Result<Option<String>, PyError> {
     let cwd = cwd.map(|path| resolve_against(&interp.cwd, path));
     if let Some(path) = &cwd {
         if !interp.vfs.is_dir("/", path) {
@@ -648,7 +650,7 @@ fn install_null(interp: &mut Interp, pid: u32, fd: i32) -> Result<(), String> {
     Ok(())
 }
 
-fn checked_owner(interp: &Interp, handle: PyProcessHandle) -> PyResult<u32> {
+fn checked_owner(interp: &Interp, handle: PyProcessHandle) -> Result<u32, PyError> {
     let child = interp
         .live_children
         .get(&handle.pid)
@@ -676,7 +678,7 @@ fn live_status(interp: &Interp, pid: u32) -> Option<i32> {
         .or_else(|| process_status(interp, pid))
 }
 
-fn record_status(interp: &mut Interp, pid: u32) -> PyResult<Option<i32>> {
+fn record_status(interp: &mut Interp, pid: u32) -> Result<Option<i32>, PyError> {
     let status = live_status(interp, pid);
     if let Some(status) = status {
         let handle = interp
@@ -702,7 +704,7 @@ fn reap_process(interp: &mut Interp, pid: u32) {
     }
 }
 
-fn deadline(interp: &Interp, timeout_ns: Option<u64>) -> PyResult<Option<u64>> {
+fn deadline(interp: &Interp, timeout_ns: Option<u64>) -> Result<Option<u64>, PyError> {
     timeout_ns
         .map(|duration| {
             interp
@@ -718,7 +720,7 @@ fn operation_deadline(
     interp: &mut Interp,
     event: &mut Option<crate::clock::EventId>,
     timeout_ns: Option<u64>,
-) -> PyResult<Option<u64>> {
+) -> Result<Option<u64>, PyError> {
     let Some(timeout_ns) = timeout_ns else {
         return Ok(None);
     };
@@ -744,7 +746,7 @@ fn cancel_event(interp: &mut Interp, event: &mut Option<crate::clock::EventId>) 
     }
 }
 
-fn write_communicate_input(interp: &mut Interp, handle: &mut LiveChild) -> PyResult<()> {
+fn write_communicate_input(interp: &mut Interp, handle: &mut LiveChild) -> Result<(), PyError> {
     let Ok(description) = handle.endpoints.get(0) else {
         return Ok(());
     };
@@ -773,7 +775,7 @@ fn write_communicate_input(interp: &mut Interp, handle: &mut LiveChild) -> PyRes
     Ok(())
 }
 
-fn drain_output(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> PyResult<()> {
+fn drain_output(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> Result<(), PyError> {
     let Ok(description) = handle.endpoints.get(fd) else {
         return Ok(());
     };
@@ -800,7 +802,7 @@ fn drain_output(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> PyResul
     }
 }
 
-fn close_endpoint(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> PyResult<()> {
+fn close_endpoint(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> Result<(), PyError> {
     let description = handle
         .endpoints
         .get(fd)
@@ -821,7 +823,7 @@ fn close_endpoint(interp: &mut Interp, handle: &mut LiveChild, fd: i32) -> PyRes
     Ok(())
 }
 
-fn pipe_id(interp: &Interp, description: u32) -> PyResult<u32> {
+fn pipe_id(interp: &Interp, description: u32) -> Result<u32, PyError> {
     interp
         .descriptors
         .pipe_endpoint(description)

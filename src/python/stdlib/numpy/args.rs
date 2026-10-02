@@ -46,7 +46,10 @@ impl Signature {
         self
     }
 
-    pub(in crate::python) fn bind(&'static self, args: &CallArgs) -> PyResult<Bound> {
+    pub(in crate::python) fn bind<'s>(
+        &'static self,
+        args: &CallArgs<'s>,
+    ) -> PyResult<'s, Bound<'s>> {
         let positional = args.positional();
         let function = self.function;
         if positional.len() > self.parameters.len() {
@@ -98,12 +101,12 @@ impl Signature {
 }
 
 /// Arguments bound to a [`Signature`].
-pub(in crate::python) struct Bound {
+pub(in crate::python) struct Bound<'s> {
     signature: &'static Signature,
-    values: Vec<Option<PyValue>>,
+    values: Vec<Option<PyValue<'s>>>,
 }
 
-impl Bound {
+impl<'s> Bound<'s> {
     fn index(&self, name: &str) -> usize {
         self.signature
             .parameters
@@ -114,17 +117,17 @@ impl Bound {
     }
 
     /// The argument, if one was passed. An explicit `None` is returned as `Some(None)`.
-    pub(in crate::python) fn get(&self, name: &str) -> Option<PyValue> {
+    pub(in crate::python) fn get(&self, name: &str) -> Option<PyValue<'s>> {
         self.values[self.index(name)]
     }
 
     /// The argument unless it was omitted or passed as `None`.
-    pub(in crate::python) fn value(&self, name: &str) -> Option<PyValue> {
+    pub(in crate::python) fn value(&self, name: &str) -> Option<PyValue<'s>> {
         self.get(name).filter(|value| !value.is_none())
     }
 
     /// A required argument.
-    pub(in crate::python) fn required(&self, name: &str) -> PyValue {
+    pub(in crate::python) fn required(&self, name: &str) -> PyValue<'s> {
         self.get(name)
             .expect("required arguments are checked when binding")
     }
@@ -149,11 +152,11 @@ impl Axes {
 }
 
 /// Parse `axis=None | int | tuple[int, ...]` for an array of rank `ndim`.
-pub(in crate::python) fn axes(
-    runtime: &mut dyn PyRuntime,
-    value: Option<PyValue>,
+pub(in crate::python) fn axes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
     ndim: usize,
-) -> PyResult<Axes> {
+) -> PyResult<'s, Axes> {
     let Some(value) = value.filter(|value| !value.is_none()) else {
         return Ok(Axes::All);
     };
@@ -163,14 +166,14 @@ pub(in crate::python) fn axes(
             .tuple_items(tuple)?
             .iter()
             .map(|item| index_int(runtime, item))
-            .collect::<PyResult<Vec<_>>>()?
+            .collect::<PyResult<'s, Vec<_>>>()?
     } else {
         vec![index_int(runtime, &value)?]
     };
     let mut axes = raw
         .into_iter()
         .map(|axis| normalize_axis(axis, ndim))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     axes.sort_unstable();
     if axes.windows(2).any(|pair| pair[0] == pair[1]) {
         return Err(PyError::value_error("duplicate value in 'axis'"));
@@ -179,11 +182,11 @@ pub(in crate::python) fn axes(
 }
 
 /// A single optional axis, normalized.
-pub(in crate::python) fn axis(
-    runtime: &mut dyn PyRuntime,
-    value: Option<PyValue>,
+pub(in crate::python) fn axis<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
     ndim: usize,
-) -> PyResult<Option<usize>> {
+) -> PyResult<'s, Option<usize>> {
     value
         .filter(|value| !value.is_none())
         .map(|value| normalize_axis(index_int(runtime, &value)?, ndim))
@@ -193,7 +196,10 @@ pub(in crate::python) fn axis(
 use super::super::super::native::PyValueCast;
 
 /// An integer argument accepting Python ints, bools, and NumPy integer scalars.
-pub(in crate::python) fn index_int(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+pub(in crate::python) fn index_int<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, i64> {
     if let Some(value) = runtime.int_value(value) {
         return Ok(value);
     }
@@ -209,10 +215,10 @@ pub(in crate::python) fn index_int(runtime: &mut dyn PyRuntime, value: &PyValue)
 }
 
 /// An optional integer; `None` counts as omitted.
-pub(in crate::python) fn optional_int(
-    runtime: &mut dyn PyRuntime,
-    value: Option<PyValue>,
-) -> PyResult<Option<i64>> {
+pub(in crate::python) fn optional_int<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, Option<i64>> {
     value
         .filter(|value| !value.is_none())
         .map(|value| index_int(runtime, &value))
@@ -220,11 +226,11 @@ pub(in crate::python) fn optional_int(
 }
 
 /// Truth of a flag argument such as `keepdims`.
-pub(in crate::python) fn flag(
-    runtime: &mut dyn PyRuntime,
-    value: Option<PyValue>,
+pub(in crate::python) fn flag<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
     default: bool,
-) -> PyResult<bool> {
+) -> PyResult<'s, bool> {
     match value {
         Some(value) => runtime.truth(&value),
         None => Ok(default),
@@ -232,10 +238,10 @@ pub(in crate::python) fn flag(
 }
 
 /// A shape given as an int or a sequence of ints, with NumPy's negative-dimension error.
-pub(in crate::python) fn shape(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Vec<usize>> {
+pub(in crate::python) fn shape<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Vec<usize>> {
     let dimensions = match runtime.kind(&value)? {
         PyKind::Tuple => {
             let tuple = value.cast(runtime)?;
@@ -254,13 +260,16 @@ pub(in crate::python) fn shape(
             usize::try_from(dimension)
                 .map_err(|_| PyError::value_error("negative dimensions are not allowed"))
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     super::array::element_count(&shape)?;
     Ok(shape)
 }
 
 /// A `dtype=` argument: a dtype, a dtype string, a Python type, or a NumPy scalar type.
-pub(in crate::python) fn dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<DType> {
+pub(in crate::python) fn dtype<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, DType> {
     if let Some(dtype) = super::dtype_object::unpack(runtime, &value) {
         return Ok(dtype);
     }
@@ -307,10 +316,10 @@ pub(in crate::python) fn dtype(runtime: &mut dyn PyRuntime, value: PyValue) -> P
 }
 
 /// An optional `dtype=` argument; `None` counts as omitted.
-pub(in crate::python) fn optional_dtype(
-    runtime: &mut dyn PyRuntime,
-    value: Option<PyValue>,
-) -> PyResult<Option<DType>> {
+pub(in crate::python) fn optional_dtype<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, Option<DType>> {
     value
         .filter(|value| !value.is_none())
         .map(|value| dtype(runtime, value))

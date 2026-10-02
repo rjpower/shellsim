@@ -1,35 +1,96 @@
 //! Name, scope, import, and per-code cache operations used by bytecode execution.
+//!
+//! Lexical scopes are heap objects. The VM's scope stacks hold stored references to them, and
+//! every operation here takes a handle from those roots before it touches the heap, so a scope
+//! stays valid while a lookup or store allocates.
 
+use super::super::heap::Builder;
+use super::super::object_model::TypeId;
+use super::super::scopes;
 use super::{
     cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
-    HashMap, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader, PyRuntime,
-    RaisedException, ScopeId, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
+    HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader,
+    PyRuntime, RaisedException, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 
-impl Vm<'_> {
+/// A [`NamespaceTarget`] whose references are handles in the current scope, so it can be held
+/// across allocation. Store it back into an object with [`NamespaceHandle::store`].
+#[derive(Clone, Copy)]
+pub(super) enum NamespaceHandle<'s> {
+    Scope(Value<'s>),
+    Repl,
+    Instance(Value<'s>),
+}
+
+impl NamespaceHandle<'_> {
+    /// The stored form, for an `Object::NamespaceDict` built with `alloc_with` or `modify`.
+    pub(super) fn store(self, builder: &Builder<'_>) -> NamespaceTarget {
+        match self {
+            Self::Scope(scope) => NamespaceTarget::Scope(builder.store(scope)),
+            Self::Repl => NamespaceTarget::Repl,
+            Self::Instance(instance) => NamespaceTarget::Instance(builder.store(instance)),
+        }
+    }
+}
+
+/// A [`ProxyTarget`] whose references are handles in the current scope.
+#[derive(Clone, Copy)]
+pub(super) enum ProxyHandle<'s> {
+    Class(Value<'s>),
+    RegisteredType(TypeId),
+    NativeModule(&'static ModuleDef),
+}
+
+impl<'s> Vm<'s> {
+    /// Handles for a namespace view's target, read while the view object is borrowed.
+    pub(super) fn namespace_handle(&self, target: &NamespaceTarget) -> NamespaceHandle<'s> {
+        match target {
+            NamespaceTarget::Scope(scope) => NamespaceHandle::Scope(self.handle(scope)),
+            NamespaceTarget::Repl => NamespaceHandle::Repl,
+            NamespaceTarget::Instance(instance) => NamespaceHandle::Instance(self.handle(instance)),
+        }
+    }
+
+    /// Handles for a mapping proxy's target, read while the proxy object is borrowed.
+    pub(super) fn proxy_handle(&self, target: &ProxyTarget) -> ProxyHandle<'s> {
+        match target {
+            ProxyTarget::Class(class) => ProxyHandle::Class(self.handle(class)),
+            ProxyTarget::RegisteredType(type_id) => ProxyHandle::RegisteredType(*type_id),
+            ProxyTarget::NativeModule(module) => ProxyHandle::NativeModule(module),
+        }
+    }
+
+    /// The innermost lexical scope, if code is running inside one.
+    pub(super) fn current_scope(&self) -> Option<Value<'s>> {
+        self.local_scopes.last().map(|scope| self.handle(scope))
+    }
+
     pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         if name == "__class__" {
             let class = self
                 .method_frames
                 .last()
-                .map(|(class, _)| *class)
+                .map(|(class, _)| self.handle(class))
                 .ok_or("__class__ is only defined inside a class method body")?;
-            self.stack.push(Value::Object(class));
+            self.push(class);
             return Ok(());
         }
-        let local_scope = self.local_scopes.last().copied();
-        let scoped = local_scope.and_then(|scope| self.state.heap.scope_get(scope, name).cloned());
+        let local_scope = self.current_scope();
+        let scoped = match local_scope {
+            Some(scope) => self.scope_get(scope, name)?,
+            None => None,
+        };
         let can_use_globals = local_scope
-            .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
+            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
             .unwrap_or(true);
         let value = scoped.or_else(|| {
             can_use_globals
-                .then(|| self.state.globals.get(symbol))
+                .then(|| self.state.globals.get(&self.state.heap, symbol))
                 .flatten()
         });
         if let Some(value) = value {
-            self.stack.push(value);
+            self.push(value);
             return Ok(());
         }
         self.load_builtin(name)
@@ -43,8 +104,8 @@ impl Vm<'_> {
         name: NameId,
     ) -> Result<(), String> {
         if self.local_scopes.is_empty() {
-            if let Some(value) = self.state.globals.get(symbol) {
-                self.stack.push(value);
+            if let Some(value) = self.state.globals.get_ref(symbol) {
+                self.execution.stack.push_ref(value);
                 return Ok(());
             }
             return self.load_builtin(code.name(name));
@@ -60,15 +121,15 @@ impl Vm<'_> {
         code: &CodeRef,
         name: NameId,
     ) -> Result<(), String> {
-        let scope = *self.local_scopes.last().expect("checked by load_global");
-        let root = self.state.heap.scope_root(scope)?;
-        let value = if self.state.heap.scope_uses_repl_globals(root)? {
-            self.state.globals.get(symbol)
+        let scope = self.current_scope().expect("checked by load_global");
+        let root = scopes::root(self.heap(), scope)?;
+        let value = if scopes::uses_repl_globals(self.heap(), root)? {
+            self.state.globals.get(&self.state.heap, symbol)
         } else {
-            self.state.heap.scope_get(root, code.name(name)).copied()
+            self.scope_get(root, code.name(name))?
         };
         if let Some(value) = value {
-            self.stack.push(value);
+            self.push(value);
             return Ok(());
         }
         self.load_builtin(code.name(name))
@@ -81,7 +142,7 @@ impl Vm<'_> {
             let callable = self.resolve_attribute(module, attribute)?.ok_or_else(|| {
                 format!("frozen module {module_name:?} does not define {attribute:?}")
             })?;
-            self.stack.push(callable);
+            self.push(callable);
             return Ok(());
         }
         let value = (|| {
@@ -134,48 +195,25 @@ impl Vm<'_> {
             }
             return Err(self.raise_exception("NameError", format!("name '{name}' is not defined")));
         };
-        self.stack.push(value);
+        self.push(value);
         Ok(())
-    }
-
-    pub(super) fn load_local(&mut self, slot: usize) -> Result<(), String> {
-        let scope = self
-            .local_scopes
-            .last()
-            .copied()
-            .ok_or("local bytecode requires a lexical scope")?;
-        let value = self
-            .state
-            .heap
-            .scope_get_local(scope, slot)?
-            .ok_or_else(|| "local variable referenced before assignment".to_string())?;
-        self.stack.push(value);
-        Ok(())
-    }
-
-    pub(super) fn store_local(&mut self, slot: usize) -> Result<(), String> {
-        let value = self.pop()?;
-        let scope = self
-            .local_scopes
-            .last()
-            .copied()
-            .ok_or("local bytecode requires a lexical scope")?;
-        self.state.heap.scope_store_local(scope, slot, value)
     }
 
     pub(super) fn delete_local(&mut self, slot: usize) -> Result<(), String> {
         let scope = self
-            .local_scopes
-            .last()
-            .copied()
+            .current_scope()
             .ok_or("local bytecode requires a lexical scope")?;
-        self.state.heap.scope_remove_local(scope, slot).map(|_| ())
+        scopes::remove_local(&mut self.state.heap, scope, slot).map(|_| ())
     }
 
     pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         let value = self.pop()?;
-        if let Some(scope) = self.local_scopes.last().copied() {
-            if self.class_scopes.last().copied() == Some(scope)
+        if let Some(scope) = self.current_scope() {
+            let in_class_body = self
+                .class_scopes
+                .last()
+                .is_some_and(|class_scope| self.state.heap.identical_ref(scope, class_scope));
+            if in_class_body
                 && self
                     .class_bindings
                     .last()
@@ -186,16 +224,14 @@ impl Vm<'_> {
                     .expect("class binding stack is present")
                     .push(name.to_string());
             }
-            self.state.heap.scope_insert(
-                scope,
-                name.to_string(),
+            self.scope_insert(scope, name.to_string(), value)?;
+        } else {
+            self.state.globals.insert(
+                &self.state.heap,
+                symbol,
                 value,
                 &mut self.interp.resources,
             )?;
-        } else {
-            self.state
-                .globals
-                .insert(symbol, value, &mut self.interp.resources)?;
         }
         Ok(())
     }
@@ -207,21 +243,22 @@ impl Vm<'_> {
         scope_hops: usize,
     ) -> Result<(), String> {
         let value = self.pop()?;
-        let mut target = self.local_scopes.last().copied();
+        let mut target = self.current_scope();
         for _ in 0..scope_hops {
             target = target
-                .map(|scope| self.state.heap.scope_parent(scope))
+                .map(|scope| scopes::parent(self.heap(), scope))
                 .transpose()?
                 .flatten();
         }
         if let Some(scope) = target {
-            self.state
-                .heap
-                .scope_insert(scope, name.to_string(), value, &mut self.interp.resources)
+            self.scope_insert(scope, name.to_string(), value)
         } else {
-            self.state
-                .globals
-                .insert(symbol, value, &mut self.interp.resources)?;
+            self.state.globals.insert(
+                &self.state.heap,
+                symbol,
+                value,
+                &mut self.interp.resources,
+            )?;
             Ok(())
         }
     }
@@ -229,16 +266,14 @@ impl Vm<'_> {
     pub(super) fn store_nonlocal(&mut self, name: &str) -> Result<(), String> {
         let value = self.pop()?;
         let scope = self
-            .local_scopes
-            .last()
-            .copied()
+            .current_scope()
             .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
-        self.state.heap.scope_store_nonlocal(scope, name, value)
+        scopes::store_nonlocal(&mut self.state.heap, scope, name, value)
     }
 
     pub(super) fn exception_type_matches(
         &mut self,
-        expected: Value,
+        expected: Value<'s>,
         actual: &RaisedException,
     ) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
@@ -247,24 +282,39 @@ impl Vm<'_> {
                 .types
                 .exception_type_id(name)
                 .ok_or("exception type is not registered")?;
+            let actual_value = self.handle(&actual.value);
             return self
                 .state
                 .types
-                .is_subclass(self.type_id(&actual.value)?, expected_type);
+                .is_subclass(self.type_id(&actual_value)?, expected_type);
         }
-        let Some(id) = expected.object_id() else {
+        if !expected.is_object() {
             return Err(
                 "catching classes that do not inherit from BaseException is not allowed".into(),
             );
-        };
-        match self.state.heap.get(id)?.clone() {
+        }
+        enum Expected<'v> {
+            Class(TypeId),
+            Tuple(Vec<Value<'v>>),
+        }
+        let expected = match self.get(expected)? {
             Object::Class(class_object) if class_object.exception_base.is_some() => {
-                let actual_type = self.type_id(&actual.value)?;
-                self.state
-                    .types
-                    .is_subclass(actual_type, class_object.instance_type)
+                Expected::Class(class_object.instance_type)
             }
-            Object::Tuple(types) => {
+            Object::Tuple(types) => Expected::Tuple(self.handles(types)),
+            _ => {
+                return Err(
+                    "catching classes that do not inherit from BaseException is not allowed".into(),
+                )
+            }
+        };
+        match expected {
+            Expected::Class(instance_type) => {
+                let actual_value = self.handle(&actual.value);
+                let actual_type = self.type_id(&actual_value)?;
+                self.state.types.is_subclass(actual_type, instance_type)
+            }
+            Expected::Tuple(types) => {
                 for expected in types {
                     self.charge_cpu(1)?;
                     if self.exception_type_matches(expected, actual)? {
@@ -273,20 +323,17 @@ impl Vm<'_> {
                 }
                 Ok(false)
             }
-            _ => {
-                Err("catching classes that do not inherit from BaseException is not allowed".into())
-            }
         }
     }
 
-    pub(super) fn user_exception_kind(&self, value: &Value) -> Result<Option<String>, String> {
-        let Some(id) = value.object_id() else {
+    pub(super) fn user_exception_kind(&self, value: &Value<'_>) -> Result<Option<String>, String> {
+        if !value.is_object() {
+            return Ok(None);
+        }
+        let Object::Instance { class, .. } = self.get(*value)? else {
             return Ok(None);
         };
-        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
-            return Ok(None);
-        };
-        let Object::Class(class_object) = self.state.heap.get(*class)? else {
+        let Object::Class(class_object) = self.get(self.handle(class))? else {
             return Ok(None);
         };
         Ok(class_object
@@ -297,15 +344,15 @@ impl Vm<'_> {
     /// The modeled exception class a user exception instance derives from, if `value` is one.
     pub(super) fn user_exception_base(
         &self,
-        value: &Value,
+        value: &Value<'_>,
     ) -> Result<Option<&'static str>, String> {
-        let Some(id) = value.object_id() else {
+        if !value.is_object() {
+            return Ok(None);
+        }
+        let Object::Instance { class, .. } = self.get(*value)? else {
             return Ok(None);
         };
-        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
-            return Ok(None);
-        };
-        let Object::Class(class_object) = self.state.heap.get(*class)? else {
+        let Object::Class(class_object) = self.get(self.handle(class))? else {
             return Ok(None);
         };
         Ok(class_object.exception_base)
@@ -317,12 +364,15 @@ impl Vm<'_> {
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-        value: Value,
+        value: Value<'s>,
     ) -> Result<(), String> {
-        let Some(scope) = self.local_scopes.last().copied() else {
-            self.state
-                .globals
-                .insert(symbol, value, &mut self.interp.resources)?;
+        let Some(scope) = self.current_scope() else {
+            self.state.globals.insert(
+                &self.state.heap,
+                symbol,
+                value,
+                &mut self.interp.resources,
+            )?;
             return Ok(());
         };
         self.store_scoped_global(scope, symbol, code, name, value)
@@ -332,25 +382,23 @@ impl Vm<'_> {
     #[inline(never)]
     fn store_scoped_global(
         &mut self,
-        scope: ScopeId,
+        scope: Value<'s>,
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-        value: Value,
+        value: Value<'s>,
     ) -> Result<(), String> {
-        let root = self.state.heap.scope_root(scope)?;
-        if self.state.heap.scope_uses_repl_globals(root)? {
-            self.state
-                .globals
-                .insert(symbol, value, &mut self.interp.resources)?;
-            Ok(())
-        } else {
-            self.state.heap.scope_insert(
-                root,
-                code.name(name).to_owned(),
+        let root = scopes::root(self.heap(), scope)?;
+        if scopes::uses_repl_globals(self.heap(), root)? {
+            self.state.globals.insert(
+                &self.state.heap,
+                symbol,
                 value,
                 &mut self.interp.resources,
-            )
+            )?;
+            Ok(())
+        } else {
+            self.scope_insert(root, code.name(name).to_owned(), value)
         }
     }
 
@@ -360,15 +408,15 @@ impl Vm<'_> {
         code: &CodeRef,
         name: NameId,
     ) -> Result<(), String> {
-        let Some(scope) = self.local_scopes.last().copied() else {
-            self.state.globals.remove(symbol);
+        let Some(scope) = self.current_scope() else {
+            self.state.globals.remove(&self.state.heap, symbol);
             return Ok(());
         };
-        let root = self.state.heap.scope_root(scope)?;
-        if self.state.heap.scope_uses_repl_globals(root)? {
-            self.state.globals.remove(symbol);
+        let root = scopes::root(self.heap(), scope)?;
+        if scopes::uses_repl_globals(self.heap(), root)? {
+            self.state.globals.remove(&self.state.heap, symbol);
         } else {
-            self.state.heap.scope_remove(root, code.name(name))?;
+            scopes::remove(&mut self.state.heap, root, code.name(name))?;
         }
         Ok(())
     }
@@ -378,15 +426,15 @@ impl Vm<'_> {
     /// (the entry-point program) or the root scope defers to it (a function or class body defined
     /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
     /// exactly, so `globals()` always names the same namespace a bare name lookup would.
-    pub(super) fn current_globals_target(&self) -> Result<NamespaceTarget, String> {
-        let Some(scope) = self.local_scopes.last().copied() else {
-            return Ok(NamespaceTarget::Repl);
+    pub(super) fn current_globals_target(&self) -> Result<NamespaceHandle<'s>, String> {
+        let Some(scope) = self.current_scope() else {
+            return Ok(NamespaceHandle::Repl);
         };
-        let root = self.state.heap.scope_root(scope)?;
-        if self.state.heap.scope_uses_repl_globals(root)? {
-            Ok(NamespaceTarget::Repl)
+        let root = scopes::root(self.heap(), scope)?;
+        if scopes::uses_repl_globals(self.heap(), root)? {
+            Ok(NamespaceHandle::Repl)
         } else {
-            Ok(NamespaceTarget::Scope(root))
+            Ok(NamespaceHandle::Scope(root))
         }
     }
 
@@ -394,25 +442,27 @@ impl Vm<'_> {
     /// is the same live view `globals()` returns, as `locals() is globals()` there in CPython.
     /// Inside a function it is a detached `dict` of that call's local variables: CPython's
     /// `locals()` there is a snapshot too, and writing to it never rebinds a local.
-    pub(super) fn current_locals(&mut self) -> Result<Value, String> {
-        let Some(scope) = self.local_scopes.last().copied() else {
-            return self.allocate_object(Object::NamespaceDict(NamespaceTarget::Repl));
+    pub(super) fn current_locals(&mut self) -> Result<Value<'s>, String> {
+        let Some(scope) = self.current_scope() else {
+            return self.alloc(Object::NamespaceDict(NamespaceTarget::Repl));
         };
         // A module's own scope is the only one with no parent that does not defer to the
         // REPL/script table; function calls either have a lexical parent or defer to it.
-        let is_module_scope = !self.state.heap.scope_uses_repl_globals(scope)?
-            && self.state.heap.scope_parent(scope)?.is_none();
+        let is_module_scope = !scopes::uses_repl_globals(self.heap(), scope)?
+            && scopes::parent(self.heap(), scope)?.is_none();
         if is_module_scope {
-            return self.allocate_object(Object::NamespaceDict(NamespaceTarget::Scope(scope)));
+            return self.alloc_with(|builder| {
+                Object::NamespaceDict(NamespaceTarget::Scope(builder.store(scope)))
+            });
         }
-        self.namespace_snapshot_dict(NamespaceTarget::Scope(scope))
+        self.namespace_snapshot_dict(NamespaceHandle::Scope(scope))
     }
 
     /// A detached `dict` holding `target`'s current bindings.
     pub(super) fn namespace_snapshot_dict(
         &mut self,
-        target: NamespaceTarget,
-    ) -> Result<Value, String> {
+        target: NamespaceHandle<'s>,
+    ) -> Result<Value<'s>, String> {
         let items = self.namespace_items(target)?;
         self.allocate_dict(items)
     }
@@ -421,8 +471,8 @@ impl Vm<'_> {
     /// order [`Self::namespace_entries`] gives.
     pub(super) fn namespace_items(
         &mut self,
-        target: NamespaceTarget,
-    ) -> Result<Vec<(Value, Value)>, String> {
+        target: NamespaceHandle<'s>,
+    ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
         let entries = self.namespace_entries(target)?;
         let mut items = Vec::with_capacity(entries.len());
         for (name, value) in entries {
@@ -436,28 +486,28 @@ impl Vm<'_> {
     /// declare functions apart from values, so neither keeps CPython's definition order.
     pub(super) fn proxy_items(
         &mut self,
-        target: ProxyTarget,
-    ) -> Result<Vec<(Value, Value)>, String> {
-        let mut entries: Vec<(String, Value)> = match target {
-            ProxyTarget::Class(class) => {
-                let Object::Class(class_object) = self.state.heap.get(class)? else {
+        target: ProxyHandle<'s>,
+    ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
+        let mut entries: Vec<(String, Value<'s>)> = match target {
+            ProxyHandle::Class(class) => {
+                let Object::Class(class_object) = self.get(class)? else {
                     return Err("mappingproxy target is not a class".into());
                 };
                 class_object
                     .attributes
                     .iter()
-                    .map(|(name, value)| (name.clone(), *value))
+                    .map(|(name, value)| (name.clone(), self.handle(value)))
                     .collect()
             }
-            ProxyTarget::RegisteredType(type_id) => self
+            ProxyHandle::RegisteredType(type_id) => self
                 .state
                 .types
                 .get(type_id)?
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), *value))
+                .map(|(name, value)| (name.clone(), self.handle(value)))
                 .collect(),
-            ProxyTarget::NativeModule(module) => {
+            ProxyHandle::NativeModule(module) => {
                 let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
                 for function in module.functions {
                     let value = Value::Native(NativeValue::NativeFunction(function));
@@ -484,21 +534,22 @@ impl Vm<'_> {
     /// Module and REPL/script namespaces are sorted by name. Neither backing store keeps
     /// Python's insertion order cheaply: a module scope keeps its dynamic bindings in a
     /// `HashMap`, and the REPL/script table is indexed by interned symbol. Instance attributes
-    /// come in the order [`Heap::instance_attribute_names`] gives.
-    ///
-    /// [`Heap::instance_attribute_names`]: super::super::heap::Heap::instance_attribute_names
+    /// come in the order [`Vm::instance_attribute_names`] gives.
     pub(super) fn namespace_entries(
         &self,
-        target: NamespaceTarget,
-    ) -> Result<Vec<(String, Value)>, String> {
-        let mut entries: Vec<(String, Value)> = match target {
-            NamespaceTarget::Scope(scope) => {
-                self.state.heap.scope_values(scope)?.into_iter().collect()
+        target: NamespaceHandle<'s>,
+    ) -> Result<Vec<(String, Value<'s>)>, String> {
+        let mut entries: Vec<(String, Value<'s>)> = match target {
+            NamespaceHandle::Scope(scope) => {
+                scopes::values(self.heap(), scope)?.into_iter().collect()
             }
-            NamespaceTarget::Repl => self.state.globals.entries(&self.state.heap),
-            NamespaceTarget::Instance(id) => {
+            NamespaceHandle::Repl => self
+                .state
+                .globals
+                .entries(&self.state.heap, &self.state.symbols),
+            NamespaceHandle::Instance(instance) => {
                 let mut entries = Vec::new();
-                for name in self.state.heap.instance_attribute_names(id)? {
+                for name in self.instance_attribute_names(instance)? {
                     if let Some(value) = self.namespace_lookup(target, &name)? {
                         entries.push((name, value));
                     }
@@ -512,23 +563,21 @@ impl Vm<'_> {
 
     pub(super) fn namespace_lookup(
         &self,
-        target: NamespaceTarget,
+        target: NamespaceHandle<'s>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
-        if let NamespaceTarget::Scope(scope) = target {
-            return Ok(self.state.heap.scope_get(scope, name).copied());
+    ) -> Result<Option<Value<'s>>, String> {
+        if let NamespaceHandle::Scope(scope) = target {
+            return self.scope_get(scope, name);
         }
         // REPL/script names and instance attributes are keyed by interned symbol, so a name that
         // was never interned is not bound there.
-        let Some(symbol) = self.state.heap.symbol_id(name) else {
+        let Some(symbol) = self.symbol_id(name) else {
             return Ok(None);
         };
         Ok(match target {
-            NamespaceTarget::Repl => self.state.globals.get(symbol),
-            NamespaceTarget::Instance(id) => {
-                self.state.heap.attribute_by_symbol(id, symbol)?.copied()
-            }
-            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
+            NamespaceHandle::Repl => self.state.globals.get(&self.state.heap, symbol),
+            NamespaceHandle::Instance(instance) => self.attribute_by_symbol(instance, symbol)?,
+            NamespaceHandle::Scope(_) => unreachable!("scope targets returned above"),
         })
     }
 
@@ -537,69 +586,58 @@ impl Vm<'_> {
     /// `obj.__dict__` does.
     pub(super) fn namespace_store(
         &mut self,
-        target: NamespaceTarget,
+        target: NamespaceHandle<'s>,
         name: String,
-        value: Value,
+        value: Value<'s>,
     ) -> Result<(), String> {
-        if let NamespaceTarget::Scope(scope) = target {
-            return self
-                .state
-                .heap
-                .scope_insert(scope, name, value, &mut self.interp.resources);
+        if let NamespaceHandle::Scope(scope) = target {
+            return self.scope_insert(scope, name, value);
         }
-        let symbol = self
-            .state
-            .heap
-            .intern_symbol(&name, &mut self.interp.resources)?;
+        let symbol = self.intern_symbol(&name)?;
         match target {
-            NamespaceTarget::Repl => {
-                self.state
-                    .globals
-                    .insert(symbol, value, &mut self.interp.resources)
-            }
-            NamespaceTarget::Instance(id) => self.state.heap.insert_attribute_by_symbol(
-                id,
+            NamespaceHandle::Repl => self.state.globals.insert(
+                &self.state.heap,
                 symbol,
                 value,
                 &mut self.interp.resources,
             ),
-            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
+            NamespaceHandle::Instance(instance) => {
+                self.insert_attribute_by_symbol(instance, symbol, value)
+            }
+            NamespaceHandle::Scope(_) => unreachable!("scope targets returned above"),
         }
     }
 
     pub(super) fn namespace_delete(
         &mut self,
-        target: NamespaceTarget,
+        target: NamespaceHandle<'s>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
-        if let NamespaceTarget::Scope(scope) = target {
-            return self.state.heap.scope_remove(scope, name);
+    ) -> Result<Option<Value<'s>>, String> {
+        if let NamespaceHandle::Scope(scope) = target {
+            return scopes::remove(&mut self.state.heap, scope, name);
         }
-        let Some(symbol) = self.state.heap.symbol_id(name) else {
+        let Some(symbol) = self.symbol_id(name) else {
             return Ok(None);
         };
         match target {
-            NamespaceTarget::Repl => Ok(self.state.globals.remove(symbol)),
-            NamespaceTarget::Instance(id) => {
-                self.state
-                    .heap
-                    .remove_attribute_by_symbol(id, symbol, &mut self.interp.resources)
+            NamespaceHandle::Repl => Ok(self.state.globals.remove(&self.state.heap, symbol)),
+            NamespaceHandle::Instance(instance) => {
+                self.remove_attribute_by_symbol(instance, symbol)
             }
-            NamespaceTarget::Scope(_) => unreachable!("scope targets returned above"),
+            NamespaceHandle::Scope(_) => unreachable!("scope targets returned above"),
         }
     }
 
     fn import_roots(&mut self) -> Result<Vec<String>, String> {
         let mut roots = self.state.temporary_import_paths.clone();
-        if let Some(path) = self.state.sys_path {
-            let Object::List(values) = self
-                .state
-                .heap
-                .get(path.object_id().ok_or("sys.path lost list identity")?)?
-            else {
+        if let Some(path) = self.handle_optional(self.state.sys_path.as_ref()) {
+            if !path.is_object() {
+                return Err("sys.path lost list identity".into());
+            }
+            let Object::List(values) = self.get(path)? else {
                 return Err("sys.path must remain a list".into());
             };
-            for value in values.clone() {
+            for value in self.handles(values) {
                 let path = self
                     .string_value(&value)
                     .map_err(|error| self.record_native_error(error))?
@@ -615,6 +653,25 @@ impl Vm<'_> {
         Ok(roots)
     }
 
+    /// The module object imported under `name`, if any.
+    fn loaded_module(&self, name: &str) -> Option<Value<'s>> {
+        self.handle_optional(self.state.modules.get(name))
+    }
+
+    /// Allocate a module object over a fresh module scope binding `values`.
+    fn allocate_module(
+        &mut self,
+        name: String,
+        values: HashMap<String, Value<'s>>,
+    ) -> Result<(Value<'s>, Value<'s>), String> {
+        let scope = self.alloc_scope(None, false, Arc::from([]), Vec::new(), values)?;
+        let module = self.alloc_with(|builder| Object::Module {
+            name,
+            scope: builder.store(scope),
+        })?;
+        Ok((module, scope))
+    }
+
     pub(super) fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
         let name = self.resolve_import_name(name)?;
         if let Some(module) = super::super::stdlib::native_module(&name) {
@@ -624,14 +681,14 @@ impl Vm<'_> {
                 bind_root,
             );
         }
-        if let Some(module) = self.state.modules.get(&name).cloned() {
+        if let Some(module) = self.loaded_module(&name) {
             return self.finish_import(&name, module, bind_root);
         }
 
         self.ensure_package_parent(&name)?;
         // A package initializer may import the requested child itself. Reuse that exact module
         // object so classes and exceptions retain identity across the import cycle.
-        if let Some(module) = self.state.modules.get(&name).copied() {
+        if let Some(module) = self.loaded_module(&name) {
             return self.finish_import(&name, module, bind_root);
         }
 
@@ -694,22 +751,16 @@ impl Vm<'_> {
         let module_name = self.allocate_string(name.clone())?;
         let module_package = self.allocate_string(package_name)?;
         let module_file = self.allocate_string(path.clone())?;
-        let scope = self.state.heap.allocate_scope(
-            None,
-            false,
-            Arc::from([]),
+        let (module, scope) = self.allocate_module(
+            name.clone(),
             HashMap::from([
                 ("__name__".into(), module_name),
                 ("__package__".into(), module_package),
                 ("__file__".into(), module_file),
             ]),
-            &mut self.interp.resources,
         )?;
-        let module = self.allocate_object(Object::Module {
-            name: name.clone(),
-            scope,
-        })?;
-        self.state.modules.insert(name.clone(), module);
+        let stored = self.store(module);
+        self.state.modules.insert(name.clone(), stored);
 
         let temporary_import_path = (!path.starts_with('<')).then(|| {
             path.rsplit_once('/')
@@ -718,7 +769,8 @@ impl Vm<'_> {
         if let Some(path) = &temporary_import_path {
             self.state.temporary_import_paths.insert(0, path.clone());
         }
-        self.local_scopes.push(scope);
+        let stored_scope = self.store(scope);
+        self.local_scopes.push(stored_scope);
         let execution = self.execute_code(&code);
         self.local_scopes.pop();
         if temporary_import_path.is_some() {
@@ -759,14 +811,10 @@ impl Vm<'_> {
             return Ok(requested.to_string());
         }
         let scope = self
-            .local_scopes
-            .last()
-            .copied()
+            .current_scope()
             .ok_or("relative import requires a package context")?;
         let package = self
-            .state
-            .heap
-            .scope_get(scope, "__package__")
+            .scope_get(scope, "__package__")?
             .ok_or("relative import requires __package__")?;
         let package = protocol::string_value(&self.state.heap, package)?
             .filter(|package| !package.is_empty())
@@ -803,7 +851,10 @@ impl Vm<'_> {
         };
         if standard || vfs_package {
             self.import(parent, false)?;
-            self.stack.pop().ok_or("parent import produced no value")?;
+            self.execution
+                .stack
+                .pop_ref()
+                .ok_or("parent import produced no value")?;
         }
         Ok(())
     }
@@ -811,18 +862,18 @@ impl Vm<'_> {
     /// `from module import name` with the module on top of the stack: push the module attribute,
     /// else the submodule `module.name`, else raise CPython's `ImportError`.
     pub(super) fn import_from(&mut self, name: &str) -> Result<(), String> {
-        let module = *self.stack.last().ok_or("import stack underflow")?;
+        let module = self
+            .execution
+            .stack
+            .peek(&self.state.heap, 0)
+            .ok_or("import stack underflow")?;
         if let Some(value) = self.resolve_optional_attribute(module, name)? {
-            self.stack.push(value);
+            self.push(value);
             return Ok(());
         }
         let module_name = match module.native_value() {
             Some(NativeValue::Module(definition)) => definition.name.to_string(),
-            _ => match module
-                .object_id()
-                .map(|id| self.state.heap.get(id))
-                .transpose()?
-            {
+            _ => match module.is_object().then(|| self.get(module)).transpose()? {
                 Some(Object::Module { name, .. }) => name.clone(),
                 _ => return Err(self.missing_attribute(&module, name)),
             },
@@ -857,22 +908,16 @@ impl Vm<'_> {
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
             _ => {
-                let Some(Object::Module { scope, name }) = module
-                    .object_id()
-                    .map(|id| self.state.heap.get(id))
-                    .transpose()?
+                let Some(Object::Module { scope, name }) =
+                    module.is_object().then(|| self.get(module)).transpose()?
                 else {
                     return Err(self.missing_attribute(&module, "__all__"));
                 };
-                let (scope, module_name) = (*scope, name.clone());
-                match self.state.heap.scope_get(scope, "__all__").copied() {
+                let (scope, module_name) = (self.handle(scope), name.clone());
+                match self.scope_get(scope, "__all__")? {
                     Some(all) => {
-                        let items = match all
-                            .object_id()
-                            .map(|id| self.state.heap.get(id))
-                            .transpose()?
-                        {
-                            Some(Object::List(items) | Object::Tuple(items)) => items.clone(),
+                        let items = match all.is_object().then(|| self.get(all)).transpose()? {
+                            Some(Object::List(items) | Object::Tuple(items)) => self.handles(items),
                             // CPython indexes `__all__`; lists and tuples are what modules use.
                             _ => {
                                 let message = format!(
@@ -884,8 +929,7 @@ impl Vm<'_> {
                         };
                         let mut names = Vec::with_capacity(items.len());
                         for item in items {
-                            let Some(name) = protocol::string_value(&self.state.heap, &item)?
-                            else {
+                            let Some(name) = protocol::string_value(&self.state.heap, item)? else {
                                 let message = format!(
                                     "Item in {module_name}.__all__ must be str, not {}",
                                     self.type_name_of(&item)?
@@ -897,10 +941,7 @@ impl Vm<'_> {
                         names
                     }
                     None => {
-                        let mut names = self
-                            .state
-                            .heap
-                            .scope_values(scope)?
+                        let mut names = scopes::values(self.heap(), scope)?
                             .into_keys()
                             .filter(|name| !name.starts_with('_'))
                             .collect::<Vec<_>>();
@@ -916,44 +957,48 @@ impl Vm<'_> {
             let Some(value) = self.resolve_attribute(module, &name)? else {
                 return Err(self.missing_attribute(&module, &name));
             };
-            if let Some(scope) = self.local_scopes.last().copied() {
-                self.state
-                    .heap
-                    .scope_insert(scope, name, value, &mut self.interp.resources)?;
+            if let Some(scope) = self.current_scope() {
+                self.scope_insert(scope, name, value)?;
             } else {
-                let symbol = self
-                    .state
-                    .heap
-                    .intern_symbol(&name, &mut self.interp.resources)?;
-                self.state
-                    .globals
-                    .insert(symbol, value, &mut self.interp.resources)?;
+                let symbol = self.intern_symbol(&name)?;
+                self.state.globals.insert(
+                    &self.state.heap,
+                    symbol,
+                    value,
+                    &mut self.interp.resources,
+                )?;
             }
         }
         Ok(())
     }
 
+    /// The scope of the module imported as `name`, for binding a submodule into it.
+    fn module_scope(&self, name: &str, module: Value<'s>) -> Result<Value<'s>, String> {
+        if !module.is_object() {
+            return Err(format!("module {name:?} cannot contain submodules"));
+        }
+        let Object::Module { scope, .. } = self.get(module)? else {
+            return Err(format!("module {name:?} changed object kind"));
+        };
+        Ok(self.handle(scope))
+    }
+
     /// Install synthetic package parents for a dotted import and push the value selected by
     /// Python's ordinary import binding rule. Package objects contain only VM module references.
-    fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {
+    fn finish_import(
+        &mut self,
+        name: &str,
+        leaf: Value<'s>,
+        bind_root: bool,
+    ) -> Result<(), String> {
         if let Some((parent_name, child_name)) = name.rsplit_once('.') {
-            if let Some(parent) = self.state.modules.get(parent_name).copied() {
-                let parent_id = parent
-                    .object_id()
-                    .ok_or_else(|| format!("module {parent_name:?} cannot contain submodules"))?;
-                let Object::Module { scope, .. } = self.state.heap.get(parent_id)? else {
-                    return Err(format!("module {parent_name:?} changed object kind"));
-                };
-                self.state.heap.scope_insert(
-                    *scope,
-                    child_name.to_string(),
-                    leaf,
-                    &mut self.interp.resources,
-                )?;
+            if let Some(parent) = self.loaded_module(parent_name) {
+                let scope = self.module_scope(parent_name, parent)?;
+                self.scope_insert(scope, child_name.to_string(), leaf)?;
             }
         }
         if !bind_root || !name.contains('.') {
-            self.stack.push(leaf);
+            self.push(leaf);
             return Ok(());
         }
         let parts = name.split('.').collect::<Vec<_>>();
@@ -961,43 +1006,26 @@ impl Vm<'_> {
         for parent_end in (1..parts.len()).rev() {
             let parent_name = parts[..parent_end].join(".");
             let child_name = parts[parent_end];
-            let parent = if let Some(parent) = self.state.modules.get(&parent_name).copied() {
-                let Some(parent_id) = parent.object_id() else {
-                    return Err(format!("module {parent_name:?} cannot contain submodules"));
-                };
-                let Object::Module { scope, .. } = self.state.heap.get(parent_id)? else {
-                    return Err(format!("module {parent_name:?} changed object kind"));
-                };
-                let scope = *scope;
-                self.state.heap.scope_insert(
-                    scope,
-                    child_name.to_string(),
-                    child,
-                    &mut self.interp.resources,
-                )?;
+            let parent = if let Some(parent) = self.loaded_module(&parent_name) {
+                let scope = self.module_scope(&parent_name, parent)?;
+                self.scope_insert(scope, child_name.to_string(), child)?;
                 parent
             } else {
                 let module_name = self.allocate_string(parent_name.clone())?;
-                let scope = self.state.heap.allocate_scope(
-                    None,
-                    false,
-                    Arc::from([]),
+                let (parent, _) = self.allocate_module(
+                    parent_name.clone(),
                     HashMap::from([
                         ("__name__".into(), module_name),
                         (child_name.to_string(), child),
                     ]),
-                    &mut self.interp.resources,
                 )?;
-                let parent = self.allocate_object(Object::Module {
-                    name: parent_name.clone(),
-                    scope,
-                })?;
-                self.state.modules.insert(parent_name, parent);
+                let stored = self.store(parent);
+                self.state.modules.insert(parent_name, stored);
                 parent
             };
             child = parent;
         }
-        self.stack.push(child);
+        self.push(child);
         Ok(())
     }
 }

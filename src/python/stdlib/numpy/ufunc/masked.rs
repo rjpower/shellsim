@@ -18,7 +18,7 @@ use super::super::select::broadcast_truth;
 use super::{check_output_cast, evaluate as evaluate_all, Evaluated, Options, UFUNCS};
 
 /// The mask as a boolean array.
-fn mask_array(runtime: &mut dyn PyRuntime, mask: PyValue) -> PyResult<Array> {
+fn mask_array<'s>(runtime: &mut dyn PyRuntime<'s>, mask: PyValue<'s>) -> PyResult<'s, Array<'s>> {
     if runtime.native_kind(&mask)? != Some(PyNativeKind::Array) {
         return convert::array_from_python(runtime, mask, Some(DType::BOOL), false);
     }
@@ -34,7 +34,7 @@ fn mask_array(runtime: &mut dyn PyRuntime, mask: PyValue) -> PyResult<Array> {
 }
 
 /// Byte offsets of the elements of `array` where `truth`, which is in C order, holds.
-fn selected_offsets(array: &Array, truth: &[bool]) -> Vec<usize> {
+fn selected_offsets<'s>(array: &Array<'s>, truth: &[bool]) -> Vec<usize> {
     array
         .offsets()
         .zip(truth)
@@ -43,13 +43,13 @@ fn selected_offsets(array: &Array, truth: &[bool]) -> Vec<usize> {
 }
 
 /// Run ufunc `index` on `inputs` where `mask` is true.
-pub(super) fn evaluate(
-    runtime: &mut dyn PyRuntime,
+pub(super) fn evaluate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     index: usize,
-    inputs: &[PyValue],
-    options: &Options,
-    mask: PyValue,
-) -> PyResult<Evaluated> {
+    inputs: &[PyValue<'s>],
+    options: &Options<'s>,
+    mask: PyValue<'s>,
+) -> PyResult<'s, Evaluated<'s>> {
     let ufunc = &UFUNCS[index];
     let mask = mask_array(runtime, mask)?;
     // Python scalars stay as they are, so they promote as weak scalars in the inner call.

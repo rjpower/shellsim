@@ -15,20 +15,20 @@ use super::super::convert;
 use super::super::dtype::{self, Casting, DType};
 
 /// Where the joined result goes: a new array of an optional dtype, or an existing array.
-enum Target {
+enum Target<'s> {
     New(Option<DType>),
-    Out(Array),
+    Out(Array<'s>),
 }
 
 /// Join `arrays` along `axis` (flattening first when `None`), checking every input against
 /// `casting`.
-fn concatenate(
-    runtime: &mut dyn PyRuntime,
-    arrays: Vec<Array>,
+fn concatenate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    arrays: Vec<Array<'s>>,
     axis: Option<i64>,
-    target: Target,
+    target: Target<'s>,
     casting: Casting,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     if arrays.is_empty() {
         return Err(PyError::value_error(
             "need at least one array to concatenate",
@@ -39,7 +39,7 @@ fn concatenate(
             arrays
                 .iter()
                 .map(|array| array::ravel(runtime, array))
-                .collect::<PyResult<Vec<_>>>()?,
+                .collect::<PyResult<'s, Vec<_>>>()?,
             0,
         ),
         Some(axis) => {
@@ -111,7 +111,7 @@ fn concatenate(
 }
 
 /// The shape of the joined result, with NumPy's errors for mismatched inputs.
-fn joined_shape(arrays: &[Array], axis: usize) -> PyResult<Vec<usize>> {
+fn joined_shape<'s>(arrays: &[Array<'s>], axis: usize) -> PyResult<'s, Vec<usize>> {
     let first = arrays[0].shape();
     let mut shape = first.to_vec();
     for (position, array) in arrays.iter().enumerate().skip(1) {
@@ -140,7 +140,10 @@ fn joined_shape(arrays: &[Array], axis: usize) -> PyResult<Vec<usize>> {
 }
 
 /// The arrays of `concatenate`'s first argument: a list, a tuple, or the rows of an ndarray.
-fn input_arrays(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<Array>> {
+fn input_arrays<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Vec<Array<'s>>> {
     let items = if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
         let array = Array::from_value(runtime, value)?;
         if array.ndim() == 0 {
@@ -160,7 +163,10 @@ fn input_arrays(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<Arr
 }
 
 /// NumPy's `casting=` parsing for joining functions.
-fn casting_arg(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Casting> {
+fn casting_arg<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, Casting> {
     let Some(value) = value else {
         return Ok(Casting::SameKind);
     };
@@ -173,7 +179,10 @@ fn casting_arg(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<
 }
 
 /// `np.concatenate(arrays, axis=0, out=None, *, dtype=None, casting="same_kind")`.
-pub(super) fn module_concatenate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(super) fn module_concatenate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("concatenate", &["arrays", "axis", "out"], 1)
         .keyword_only(&["dtype", "casting"]);
     let bound = SIGNATURE.bind(&args)?;

@@ -21,13 +21,13 @@ use super::super::convert;
 /// The diagonal's length follows NumPy's clamp, letting `offset` run past either axis down to
 /// an empty (not an error) result: `min(d1, d2 - offset)` for `offset >= 0`, or `min(d1 +
 /// offset, d2)` for `offset < 0`, floored at `0`.
-fn diagonal_view(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn diagonal_view<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offset: i64,
     axis1: i64,
     axis2: i64,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     if array.ndim() < 2 {
         return Err(PyError::value_error(
             "diag requires an array of at least two dimensions",
@@ -66,7 +66,10 @@ fn diagonal_view(
     Ok(view)
 }
 
-pub(super) fn module_diagonal(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(super) fn module_diagonal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("diagonal", &["a", "offset", "axis1", "axis2"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -76,11 +79,11 @@ pub(super) fn module_diagonal(runtime: &mut dyn PyRuntime, args: CallArgs) -> Py
     Ok(diagonal_view(runtime, &array, offset, axis1, axis2)?.value())
 }
 
-pub(super) fn method_diagonal(
-    runtime: &mut dyn PyRuntime,
-    receiver: PyValue,
-    args: CallArgs,
-) -> PyResult {
+pub(super) fn method_diagonal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("diagonal", &["offset", "axis1", "axis2"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
