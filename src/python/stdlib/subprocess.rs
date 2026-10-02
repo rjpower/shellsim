@@ -68,15 +68,15 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
-fn called_process_error(runtime: &mut dyn PyRuntime) -> PyResult {
+fn called_process_error<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.exception_type("CalledProcessError"))
 }
 
-fn timeout_expired(runtime: &mut dyn PyRuntime) -> PyResult {
+fn timeout_expired<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.exception_type("TimeoutExpired"))
 }
 
-fn start(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn start<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.start", 7, 7)?;
     args.reject_keywords("_shellsim_subprocess.start")?;
     let values = args.positional();
@@ -95,7 +95,7 @@ fn start(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(PyValue::Int(i64::from(handle.pid)))
 }
 
-fn poll(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn poll<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.poll", 1, 1)?;
     args.reject_keywords("_shellsim_subprocess.poll")?;
     let handle = process_handle(runtime, args.positional()[0])?;
@@ -105,7 +105,7 @@ fn poll(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         .map_or(PyValue::None, |status| PyValue::Int(i64::from(status))))
 }
 
-fn wait(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn wait<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.wait", 2, 2)?;
     args.reject_keywords("_shellsim_subprocess.wait")?;
     let values = args.positional();
@@ -115,7 +115,7 @@ fn wait(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     process_output(runtime, output)
 }
 
-fn communicate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn communicate<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.communicate", 3, 3)?;
     args.reject_keywords("_shellsim_subprocess.communicate")?;
     let values = args.positional();
@@ -126,7 +126,7 @@ fn communicate(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     process_output(runtime, output)
 }
 
-fn read_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn read_pipe<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.read_pipe", 3, 3)?;
     args.reject_keywords("_shellsim_subprocess.read_pipe")?;
     let values = args.positional();
@@ -147,7 +147,7 @@ fn read_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_bytes(bytes)
 }
 
-fn write_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn write_pipe<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.write_pipe", 2, 2)?;
     args.reject_keywords("_shellsim_subprocess.write_pipe")?;
     let values = args.positional();
@@ -159,7 +159,7 @@ fn write_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(PyValue::Int(written))
 }
 
-fn close_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn close_pipe<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.close_pipe", 2, 2)?;
     args.reject_keywords("_shellsim_subprocess.close_pipe")?;
     let values = args.positional();
@@ -169,7 +169,7 @@ fn close_pipe(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(PyValue::None)
 }
 
-fn send_signal(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn send_signal<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_subprocess.send_signal", 2, 2)?;
     args.reject_keywords("_shellsim_subprocess.send_signal")?;
     let values = args.positional();
@@ -183,7 +183,10 @@ fn send_signal(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(PyValue::None)
 }
 
-fn process_handle(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<PyProcessHandle> {
+fn process_handle<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, PyProcessHandle> {
     let pid = runtime
         .int_value(&value)
         .and_then(|value| u32::try_from(value).ok())
@@ -191,7 +194,7 @@ fn process_handle(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<PyProcess
     Ok(PyProcessHandle { pid })
 }
 
-fn stream_fd(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i32> {
+fn stream_fd<'s>(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, i32> {
     let fd = runtime
         .int_value(&value)
         .and_then(|value| i32::try_from(value).ok())
@@ -203,7 +206,7 @@ fn stream_fd(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i32> {
     }
 }
 
-fn process_output(runtime: &mut dyn PyRuntime, output: PyProcessOutput) -> PyResult {
+fn process_output<'s>(runtime: &mut dyn PyRuntime<'s>, output: PyProcessOutput) -> PyResult<'s> {
     let stdout = output
         .stdout
         .map(|bytes| runtime.new_bytes(bytes))
@@ -222,7 +225,10 @@ fn process_output(runtime: &mut dyn PyRuntime, output: PyProcessOutput) -> PyRes
     ])
 }
 
-fn string_sequence(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<String>> {
+fn string_sequence<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Vec<String>> {
     let items = match runtime.kind(&value)? {
         PyKind::List => value.cast::<PyList>(runtime)?.items(runtime)?,
         PyKind::Tuple => value.cast::<PyTuple>(runtime)?.items(runtime)?,
@@ -247,7 +253,10 @@ fn string_sequence(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<
     Ok(argv)
 }
 
-fn optional_input(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+fn optional_input<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Vec<u8>> {
     match runtime.kind(&value)? {
         PyKind::None => Ok(Vec::new()),
         PyKind::Bytes | PyKind::ByteArray => value.cast::<PyBytes>(runtime).map(|value| value.0),
@@ -255,11 +264,11 @@ fn optional_input(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u
     }
 }
 
-fn optional_string(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+fn optional_string<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     name: &str,
-) -> PyResult<Option<String>> {
+) -> PyResult<'s, Option<String>> {
     if runtime.kind(&value)? == PyKind::None {
         Ok(None)
     } else {
@@ -270,10 +279,10 @@ fn optional_string(
     }
 }
 
-fn optional_environment(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<BTreeMap<String, String>>> {
+fn optional_environment<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<BTreeMap<String, String>>> {
     if runtime.kind(&value)? == PyKind::None {
         return Ok(None);
     }
@@ -290,7 +299,10 @@ fn optional_environment(
     Ok(Some(environment))
 }
 
-fn optional_timeout(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<u64>> {
+fn optional_timeout<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<u64>> {
     if runtime.kind(&value)? == PyKind::None {
         return Ok(None);
     }
@@ -303,7 +315,11 @@ fn optional_timeout(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Opt
     Ok(Some((seconds * 1_000_000_000.0).ceil() as u64))
 }
 
-fn stdio(runtime: &mut dyn PyRuntime, value: PyValue, allow_merge: bool) -> PyResult<PyStdio> {
+fn stdio<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    allow_merge: bool,
+) -> PyResult<'s, PyStdio> {
     if runtime.kind(&value)? == PyKind::None {
         return Ok(PyStdio::Inherit);
     }

@@ -23,7 +23,7 @@ pub(in crate::python) mod dense;
 use dense::{Cplx, Mat, Trans};
 
 use super::super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, PyArrayBuffer, PyError, PyResult, PyRuntime,
+    CallArgs, FunctionDef, ModuleDef, NativeFn, PyArrayBuffer, PyError, PyResult, PyRuntime,
 };
 use super::super::super::Value;
 use super::args::Signature;
@@ -38,10 +38,7 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-const fn function(
-    name: &'static str,
-    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
-) -> FunctionDef {
+const fn function(name: &'static str, call: NativeFn) -> FunctionDef {
     FunctionDef {
         module: "numpy.linalg",
         name,
@@ -96,7 +93,7 @@ fn need_2d(ndim: usize) -> PyError {
 }
 
 /// Check that a real operand's dtype is usable, and report whether it is `float32`.
-fn check_dtype(array: &Array, function: &str) -> PyResult<Precision> {
+fn check_dtype<'s>(array: &Array<'s>, function: &str) -> PyResult<'s, Precision> {
     if array.dtype.kind() == Kind::Float16 {
         return Err(PyError::type_error(
             "array type float16 is unsupported in linalg",
@@ -115,19 +112,19 @@ fn check_dtype(array: &Array, function: &str) -> PyResult<Precision> {
 }
 
 /// `array`'s elements as `f64`, gathered in C order (works for any strided view).
-fn as_f64(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<f64>> {
+fn as_f64<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'s, Vec<f64>> {
     let cast = convert::cast_array(runtime, array, DType::FLOAT64, false)?;
     array::read_elements::<f64>(runtime, &cast)
 }
 
 /// `array` broadcast to `batch_shape ++ core_shape` and read as `f64` in C order. `array`'s own
 /// shape must already end with `core_shape`.
-fn broadcast_f64(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn broadcast_f64<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     batch_shape: &[usize],
     core_shape: &[usize],
-) -> PyResult<Vec<f64>> {
+) -> PyResult<'s, Vec<f64>> {
     let mut shape = batch_shape.to_vec();
     shape.extend_from_slice(core_shape);
     let buffer = array::broadcast_buffer(runtime, array, DType::FLOAT64, &shape)?;
@@ -152,7 +149,7 @@ fn chunks(flat: &[f64], rows: usize, cols: usize) -> Vec<Mat> {
 
 /// `array`'s shape split into leading batch dimensions and a trailing square `n x n` core,
 /// requiring at least two dimensions and an equal last two.
-fn square_shape(array: &Array) -> PyResult<(Vec<usize>, usize)> {
+fn square_shape<'s>(array: &Array<'s>) -> PyResult<'s, (Vec<usize>, usize)> {
     if array.ndim() < 2 {
         return Err(need_2d(array.ndim()));
     }
@@ -163,7 +160,7 @@ fn square_shape(array: &Array) -> PyResult<(Vec<usize>, usize)> {
     Ok((array.shape()[..array.ndim() - 2].to_vec(), n))
 }
 
-fn rect_shape(array: &Array) -> PyResult<(Vec<usize>, usize, usize)> {
+fn rect_shape<'s>(array: &Array<'s>) -> PyResult<'s, (Vec<usize>, usize, usize)> {
     if array.ndim() < 2 {
         return Err(need_2d(array.ndim()));
     }
@@ -175,14 +172,14 @@ fn rect_shape(array: &Array) -> PyResult<(Vec<usize>, usize, usize)> {
 }
 
 /// Build a new array from batched `n x n`-shaped `f64` matrices, casting to `precision`.
-fn array_from_batches(
-    runtime: &mut dyn PyRuntime,
+fn array_from_batches<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     batch_shape: &[usize],
     rows: usize,
     cols: usize,
     mats: &[Mat],
     precision: Precision,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let mut flat = Vec::with_capacity(mats.len() * rows * cols);
     for mat in mats {
         flat.extend_from_slice(&mat.data);
@@ -198,13 +195,13 @@ fn array_from_batches(
 }
 
 /// Build a new array from batched length-`n` `f64` vectors, casting to `precision`.
-fn array_from_vectors(
-    runtime: &mut dyn PyRuntime,
+fn array_from_vectors<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     batch_shape: &[usize],
     n: usize,
     vectors: &[Vec<f64>],
     precision: Precision,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let mut flat = Vec::with_capacity(vectors.len() * n);
     for vector in vectors {
         flat.extend_from_slice(vector);
@@ -220,7 +217,7 @@ fn array_from_vectors(
 
 /// A 0-d result unboxes to a NumPy scalar, as `det` and the like return; other shapes stay
 /// arrays.
-fn scalar_or_array(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult {
+fn scalar_or_array<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'s> {
     if array.ndim() == 0 {
         return convert::element_to_scalar(runtime, array, array.view.offset);
     }
@@ -235,7 +232,7 @@ fn singular_error() -> PyError {
 // inv
 // ---------------------------------------------------------------------------------------------
 
-fn inv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn inv<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("inv", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -261,7 +258,7 @@ fn inv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 // solve
 // ---------------------------------------------------------------------------------------------
 
-fn solve(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn solve<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("solve", &["a", "b"], 2);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -334,7 +331,7 @@ fn solve(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 // det / slogdet
 // ---------------------------------------------------------------------------------------------
 
-fn det(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn det<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("det", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -353,7 +350,7 @@ fn det(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     scalar_or_array(runtime, &result)
 }
 
-fn slogdet(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn slogdet<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("slogdet", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -383,7 +380,10 @@ fn wrap(values: &[f64]) -> Vec<Vec<f64>> {
     values.iter().map(|v| vec![*v]).collect()
 }
 
-fn drop_last_axis(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Array> {
+fn drop_last_axis<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+) -> PyResult<'s, Array<'s>> {
     let shape = array.shape()[..array.ndim() - 1].to_vec();
     let strides = array.strides()[..array.ndim() - 1].to_vec();
     array::new_view(
@@ -400,7 +400,7 @@ fn drop_last_axis(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Array>
 // cholesky
 // ---------------------------------------------------------------------------------------------
 
-fn cholesky(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn cholesky<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("cholesky", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -426,7 +426,7 @@ fn cholesky(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 // qr
 // ---------------------------------------------------------------------------------------------
 
-fn qr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn qr<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("qr", &["a", "mode"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -497,7 +497,7 @@ fn qr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 // eigh
 // ---------------------------------------------------------------------------------------------
 
-fn eigh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn eigh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("eigh", &["a", "UPLO", "compute_vectors"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -553,7 +553,7 @@ fn symmetrize(mat: &Mat, lower: bool) -> Mat {
 // svd
 // ---------------------------------------------------------------------------------------------
 
-fn svd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn svd<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("svd", &["a", "full_matrices", "compute_uv"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -604,7 +604,7 @@ fn non_convergence_error() -> PyError {
     PyError::exception("LinAlgError", "Eigenvalues did not converge")
 }
 
-fn eig(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn eig<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("eig", &["a", "compute_vectors"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -640,13 +640,13 @@ fn eig(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 /// Build a new array from batched length-`n` complex vectors (eigenvalues), narrowing to
 /// `complex64` when `precision` is `Single`, matching how the real primitives narrow to
 /// `float32`.
-fn complex_array_from_vectors(
-    runtime: &mut dyn PyRuntime,
+fn complex_array_from_vectors<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     batch_shape: &[usize],
     n: usize,
     vectors: &[Vec<Cplx>],
     precision: Precision,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let mut shape = batch_shape.to_vec();
     shape.push(n);
     let flat: Vec<C128> = vectors
@@ -677,13 +677,13 @@ fn complex_array_from_vectors(
 /// Build a new array from batched `n x n` complex matrices, each given as `n` length-`n`
 /// eigenvector columns (`columns[k]` is column `k`, as [`dense::eig_general`] returns them),
 /// narrowing to `complex64` when `precision` is `Single`.
-fn complex_array_from_columns(
-    runtime: &mut dyn PyRuntime,
+fn complex_array_from_columns<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     batch_shape: &[usize],
     n: usize,
     batches: &[Vec<Vec<Cplx>>],
     precision: Precision,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let mut shape = batch_shape.to_vec();
     shape.push(n);
     shape.push(n);
@@ -725,7 +725,7 @@ fn complex_array_from_columns(
 /// computes (`lu`, and the 0-based `piv` such that step `k` swapped row `k` with row `piv[k]`),
 /// batched like this module's other primitives. `a` need not be square. `scipy.linalg.lu_factor`
 /// returns this pair directly; `scipy.linalg.lu` and `.lu_solve` build on it in Python.
-fn lu(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn lu<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("lu", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let a = convert::as_array(runtime, bound.required("a"))?;
@@ -755,12 +755,12 @@ fn lu(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 /// Build a new C-ordered `int32` array from batched length-`n` pivot vectors.
-fn array_from_int_vectors(
-    runtime: &mut dyn PyRuntime,
+fn array_from_int_vectors<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     batch_shape: &[usize],
     n: usize,
     vectors: &[Vec<i32>],
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let mut flat = Vec::with_capacity(vectors.len() * n);
     for vector in vectors {
         flat.extend_from_slice(vector);
@@ -778,7 +778,7 @@ fn array_from_int_vectors(
 /// triangular system `a @ x == b` (or, if `transpose`, `a.T @ x == b`), batched like `solve`.
 /// Real NumPy has no public triangular solve; this exists for `scipy.linalg.solve_triangular`
 /// and, applied twice, `scipy.linalg.cho_solve`.
-fn solve_triangular(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn solve_triangular<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new(
         "solve_triangular",
         &["a", "b", "lower", "transpose", "unit_diagonal"],

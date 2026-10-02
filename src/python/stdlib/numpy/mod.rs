@@ -150,7 +150,7 @@ static MODULE: ModuleDef = ModuleDef {
 macro_rules! kind_types {
     ($($function:ident => $kind:expr;)*) => {
         $(
-            fn $function(runtime: &mut dyn PyRuntime) -> PyResult {
+            fn $function<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
                 runtime.value_kind_type($kind)
             }
         )*
@@ -184,21 +184,21 @@ kind_types! {
     ufunc_type => &ufunc::UFUNC;
 }
 
-fn ndarray_type(runtime: &mut dyn PyRuntime) -> PyResult {
+fn ndarray_type<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.marker(PyMarker::ArrayType))
 }
 
 /// `np.str_` and `np.object_`: `str` and `object` elements box to builtin values, so their
 /// scalar types are the builtin types.
-fn str_type(runtime: &mut dyn PyRuntime) -> PyResult {
+fn str_type<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     builtin(runtime, "str")
 }
 
-fn object_type(runtime: &mut dyn PyRuntime) -> PyResult {
+fn object_type<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     builtin(runtime, "object")
 }
 
-fn builtin(runtime: &mut dyn PyRuntime, name: &str) -> PyResult {
+fn builtin<'s>(runtime: &mut dyn PyRuntime<'s>, name: &str) -> PyResult<'s> {
     runtime.builtin_type(name).ok_or_else(|| {
         super::super::native::PyError::runtime_error(format!("builtin {name} is missing"))
     })
@@ -207,7 +207,7 @@ fn builtin(runtime: &mut dyn PyRuntime, name: &str) -> PyResult {
 macro_rules! exception_types {
     ($($function:ident => $name:literal;)*) => {
         $(
-            fn $function(runtime: &mut dyn PyRuntime) -> PyResult {
+            fn $function<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
                 Ok(runtime.exception_type($name))
             }
         )*
@@ -220,7 +220,10 @@ exception_types! {
     complex_warning => "ComplexWarning";
 }
 
-const fn factory(name: &'static str, get: fn(&mut dyn PyRuntime) -> PyResult) -> ValueDef {
+const fn factory(
+    name: &'static str,
+    get: for<'s> fn(&mut dyn PyRuntime<'s>) -> PyResult<'s>,
+) -> ValueDef {
     ValueDef::Factory { name, get }
 }
 

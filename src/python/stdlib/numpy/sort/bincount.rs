@@ -15,7 +15,10 @@ use super::super::dtype::{Casting, DType};
 static SIGNATURE: Signature =
     Signature::new("bincount", &["x"], 1).keyword_only(&["weights", "minlength"]);
 
-pub(in crate::python) fn module_bincount(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+pub(in crate::python) fn module_bincount<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let bound = SIGNATURE.bind(&args)?;
     bincount(
         runtime,
@@ -33,12 +36,12 @@ fn depth_error(ndim: usize) -> PyError {
     }
 }
 
-fn bincount(
-    runtime: &mut dyn PyRuntime,
-    x: PyValue,
-    weights: Option<PyValue>,
-    minlength: Option<PyValue>,
-) -> PyResult {
+fn bincount<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    x: PyValue<'s>,
+    weights: Option<PyValue<'s>>,
+    minlength: Option<PyValue<'s>>,
+) -> PyResult<'s> {
     let x = convert::as_array(runtime, x)?;
     if x.ndim() != 1 {
         return Err(depth_error(x.ndim()));
@@ -95,7 +98,11 @@ fn bincount(
     }
 }
 
-fn weights_array(runtime: &mut dyn PyRuntime, weights: PyValue, n: usize) -> PyResult<Vec<f64>> {
+fn weights_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    weights: PyValue<'s>,
+    n: usize,
+) -> PyResult<'s, Vec<f64>> {
     let weights = convert::as_array(runtime, weights)?;
     if weights.size() != n {
         return Err(PyError::value_error(

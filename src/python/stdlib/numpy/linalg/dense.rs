@@ -588,11 +588,11 @@ const JACOBI_MAX_SWEEPS: usize = 100;
 /// Eigenvalues (ascending) and, if requested, eigenvectors of symmetric `a`, by the classical
 /// cyclic Jacobi method. `charge_sweep(cost)` is called with each sweep's cost before running
 /// it, so a caller that runs out of budget stops before doing that sweep's work.
-pub(in crate::python) fn jacobi_eigh(
+pub(in crate::python) fn jacobi_eigh<'s>(
     a: &Mat,
     compute_vectors: bool,
-    mut charge_sweep: impl FnMut(u64) -> PyResult<()>,
-) -> PyResult<(Vec<f64>, Option<Mat>)> {
+    mut charge_sweep: impl FnMut(u64) -> PyResult<'s, ()>,
+) -> PyResult<'s, (Vec<f64>, Option<Mat>)> {
     debug_assert_eq!(a.rows, a.cols);
     let n = a.rows;
     let mut work = a.clone();
@@ -724,12 +724,12 @@ fn normalize_paired_column_signs(u: &mut Mat, v: &mut Mat) {
 /// Singular values (descending) and, if requested, singular vectors of `a` (`m x n`), by
 /// one-sided Jacobi orthogonalization of its columns. `charge_sweep` behaves as in
 /// [`jacobi_eigh`].
-pub(in crate::python) fn jacobi_svd(
+pub(in crate::python) fn jacobi_svd<'s>(
     a: &Mat,
     full_matrices: bool,
     compute_uv: bool,
-    mut charge_sweep: impl FnMut(u64) -> PyResult<()>,
-) -> PyResult<(Option<Mat>, Vec<f64>, Option<Mat>)> {
+    mut charge_sweep: impl FnMut(u64) -> PyResult<'s, ()>,
+) -> PyResult<'s, (Option<Mat>, Vec<f64>, Option<Mat>)> {
     if a.rows < a.cols {
         // Work on the taller orientation and swap U/V back at the end.
         let (u, s, vt) = jacobi_svd(&a.transpose(), full_matrices, compute_uv, charge_sweep)?;
@@ -1000,11 +1000,11 @@ const SCHUR_MAX_SWEEPS_PER_VALUE: usize = 40;
 /// accurate once `lambda` is known to near machine precision from the QR iteration. Every
 /// eigenvector is normalized to unit 2-norm and rotated so its largest-magnitude entry is a
 /// positive real number, generalizing this module's real sign convention to a phase convention.
-pub(in crate::python) fn eig_general(
+pub(in crate::python) fn eig_general<'s>(
     a: &Mat,
     compute_vectors: bool,
-    mut charge: impl FnMut(u64) -> PyResult<()>,
-) -> PyResult<Option<EigResult>> {
+    mut charge: impl FnMut(u64) -> PyResult<'s, ()>,
+) -> PyResult<'s, Option<EigResult>> {
     debug_assert_eq!(a.rows, a.cols);
     let n = a.rows;
     if n == 0 {
@@ -1139,11 +1139,11 @@ fn eigenvalues_2x2(h: &Mat, k: usize) -> (Cplx, Cplx) {
 /// Deflate upper Hessenberg `h` down to its real Schur form by explicit double-shift QR steps
 /// (see [`eig_general`]'s doc), returning the eigenvalues read off the resulting `1x1`/`2x2`
 /// diagonal blocks, or `None` if a block fails to deflate within its sweep budget.
-fn schur_eigenvalues(
+fn schur_eigenvalues<'s>(
     mut h: Mat,
     scale: f64,
-    charge: &mut impl FnMut(u64) -> PyResult<()>,
-) -> PyResult<Option<Vec<Cplx>>> {
+    charge: &mut impl FnMut(u64) -> PyResult<'s, ()>,
+) -> PyResult<'s, Option<Vec<Cplx>>> {
     let n = h.rows;
     let mut values = vec![Cplx::real(0.0); n];
     let mut active_end = n;

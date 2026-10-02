@@ -70,7 +70,11 @@ fn swap_elements(bytes: &mut [u8], dtype: DType) {
 
 /// `a.tobytes(order='C')`: the elements' bytes in C order, or Fortran order for `F` (and for
 /// `A` when the array is Fortran-contiguous), in the dtype's byte order.
-fn method_tobytes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_tobytes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("tobytes", &["order"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -98,7 +102,11 @@ fn method_tobytes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 
 /// `a.byteswap(inplace=False)`: reverse the bytes of every element, keeping the dtype, so the
 /// values change. Object arrays hold references, which NumPy leaves alone.
-fn method_byteswap(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_byteswap<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("byteswap", &["inplace"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -112,7 +120,7 @@ fn method_byteswap(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
         if array.dtype.kind() != Kind::Object {
             runtime.charge_cpu(array.size() as u64 + 1)?;
             let itemsize = array.itemsize();
-            runtime.write_array(array.handle, &mut |target| {
+            runtime.write_array(array.handle, &mut |_, target| {
                 let PyArrayDataMut::Bytes(bytes) = target.data else {
                     unreachable!("numeric arrays have byte storage")
                 };
@@ -135,7 +143,7 @@ fn method_byteswap(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArg
 
 /// `np.frombuffer(buffer, dtype=float, count=-1, offset=0)`: a read-only 1-d array of the
 /// elements packed in a `bytes` or `bytearray`, read in the dtype's byte order.
-fn frombuffer(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn frombuffer<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("frombuffer", &["buffer", "dtype", "count", "offset"], 1)
             .keyword_only(&["like"]);

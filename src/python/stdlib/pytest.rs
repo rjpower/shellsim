@@ -22,20 +22,20 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn fail(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn fail<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     control_error(runtime, args, "pytest.fail", "Failed")
 }
 
-fn skip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn skip<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     control_error(runtime, args, "pytest.skip", "Skipped")
 }
 
-fn control_error(
-    runtime: &mut dyn PyRuntime,
-    args: CallArgs,
+fn control_error<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
     function: &str,
     kind: &'static str,
-) -> PyResult {
+) -> PyResult<'s> {
     args.expect_positional(function, 0, 1)?;
     args.reject_keywords(function)?;
     let message = args

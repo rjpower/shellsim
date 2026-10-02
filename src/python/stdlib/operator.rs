@@ -18,7 +18,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 };
 
 /// `operator.index(a)`: `a` as an exact `int`, through `__index__` for other types.
-fn index(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn index<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("index", 1, 1)?;
     args.reject_keywords("index")?;
     let value = args.positional()[0];

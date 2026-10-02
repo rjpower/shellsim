@@ -1,28 +1,38 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::super::ast::{Program, Statement, StatementKind};
-use super::super::heap::{ClassObject, FunctionObject, GeneratorObject};
+use super::super::heap::{GeneratorObject, InstanceAttributes, InstancePayload};
+use super::super::scopes;
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
     BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
-    ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, InstanceAttributes,
-    InstancePayload, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
-    PyStreamRead, RaisedException, ScopeId, Slot, Stream, Value, Vm,
+    ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, NativeValue, Object,
+    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot,
+    StoredCallArgs, Stream, Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
 
-impl Vm<'_> {
+/// The parts of a Python function object a call needs, as handles in the caller's scope.
+struct FunctionParts<'s> {
+    name: String,
+    code: CodeRef,
+    closure: Option<Value<'s>>,
+    defaults: Vec<Value<'s>>,
+    defining_class: Option<Value<'s>>,
+}
+
+impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
-    pub(super) fn physical_length(&self, value: Value) -> Result<Option<usize>, String> {
+    pub(super) fn physical_length(&self, value: Value<'s>) -> Result<Option<usize>, String> {
         let subject = self.builtin_view(value)?;
-        if let Some(length) = protocol::string_length(&self.state.heap, &subject)? {
+        if let Some(length) = protocol::string_length(&self.state.heap, subject)? {
             return Ok(Some(length));
         }
-        let Some(id) = subject.object_id() else {
+        if !subject.is_object() {
             return Ok(None);
-        };
-        Ok(match self.state.heap.get(id)? {
+        }
+        Ok(match self.get(subject)? {
             Object::List(values) | Object::Tuple(values) => Some(values.len()),
             Object::Set(values) | Object::FrozenSet(values) => Some(values.len()),
             Object::Range { start, stop, step } => Some(range_length(*start, *stop, *step)?),
@@ -32,7 +42,7 @@ impl Vm<'_> {
     }
 
     /// The builtin `abs(value)`, through the `__abs__` slot.
-    pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
+    pub(super) fn absolute(&mut self, value: Value<'s>) -> Result<Value<'s>, String> {
         if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
             return Ok(result);
         }
@@ -46,8 +56,12 @@ impl Vm<'_> {
     /// Parse the source string passed to `exec` or `eval` (`builtin`). Parsing is charged
     /// before it runs, and nesting is bounded so dynamic source cannot recurse without limit.
     /// `eval` ignores leading spaces and tabs, as CPython does.
-    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> Result<Program, String> {
-        let source = protocol::string_value(&self.state.heap, source)?.ok_or_else(|| {
+    fn parse_dynamic_source(
+        &mut self,
+        builtin: &str,
+        source: &Value<'s>,
+    ) -> Result<Program, String> {
+        let source = protocol::string_value(&self.state.heap, *source)?.ok_or_else(|| {
             self.record_native_error(PyError::type_error(format!(
                 "{builtin}() arg 1 must be a string, bytes or code object"
             )))
@@ -80,7 +94,7 @@ impl Vm<'_> {
         })
     }
 
-    fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
+    fn pow_integer_argument(&self, value: &Value<'s>) -> Result<(BigInt, usize), PyError> {
         let integer = <Self as PyRuntime>::integer_bigint(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
         })?;
@@ -90,14 +104,14 @@ impl Vm<'_> {
 
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
     /// sorted, or `None` when the class defines none.
-    fn custom_dir(&mut self, value: &Value) -> Result<Option<Value>, String> {
-        let Some(id) = value.object_id() else {
+    fn custom_dir(&mut self, value: &Value<'s>) -> Result<Option<Value<'s>>, String> {
+        if !value.is_object() {
+            return Ok(None);
+        }
+        let Object::Instance { class, .. } = self.get(*value)? else {
             return Ok(None);
         };
-        let Object::Instance { class, .. } = self.state.heap.get(id)? else {
-            return Ok(None);
-        };
-        let class = *class;
+        let class = self.handle(class);
         if self.class_attribute(class, "__dir__")?.is_none() {
             return Ok(None);
         }
@@ -107,18 +121,19 @@ impl Vm<'_> {
         let result = self.invoke_value(method, Vec::new())?;
         let mut names = Vec::new();
         for item in self.iterable_values(&result)? {
-            let Some(name) = protocol::string_value(&self.state.heap, &item)? else {
+            let Some(name) = protocol::string_value(&self.state.heap, item)? else {
                 return Err(self.raise_exception("TypeError", "__dir__() must return strings"));
             };
             names.push((name, item));
         }
         self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
         names.sort_by(|left, right| left.0.cmp(&right.0));
-        let values = names.into_iter().map(|(_, item)| item).collect();
-        self.allocate_object(Object::List(values)).map(Some)
+        let values = names.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
+        self.alloc_with(|builder| Object::List(builder.refs(values)))
+            .map(Some)
     }
 
-    fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
+    fn dir_names(&self, value: &Value<'s>) -> Result<Vec<String>, String> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
                 .functions
@@ -127,28 +142,28 @@ impl Vm<'_> {
                 .chain(module.values.iter().map(|value| value.name().to_string()))
                 .collect());
         }
-        let Some(id) = value.object_id() else {
+        if !value.is_object() {
             return Ok(Vec::new());
-        };
-        match self.state.heap.get(id)? {
-            Object::Module { scope, .. } => {
-                Ok(self.state.heap.scope_values(*scope)?.into_keys().collect())
-            }
+        }
+        match self.get(*value)? {
+            Object::Module { scope, .. } => Ok(scopes::values(self.heap(), self.handle(scope))?
+                .into_keys()
+                .collect()),
             Object::Class(class_object) => {
                 let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
                 for ancestor in &class_object.mro {
-                    if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                    if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
                         names.extend(ancestor.attributes.keys().cloned());
                     }
                 }
                 Ok(names)
             }
             Object::Instance { class, .. } => {
-                let mut names = self.state.heap.instance_attribute_names(id)?;
-                if let Object::Class(class_object) = self.state.heap.get(*class)? {
+                let mut names = self.instance_attribute_names(*value)?;
+                if let Object::Class(class_object) = self.get(self.handle(class))? {
                     names.extend(class_object.attributes.keys().cloned());
                     for ancestor in &class_object.mro {
-                        if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                        if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
                             names.extend(ancestor.attributes.keys().cloned());
                         }
                     }
@@ -165,7 +180,7 @@ impl Vm<'_> {
         keyword_names: &[Option<String>],
         starred: &[bool],
         mode: CallMode,
-    ) -> Result<CallResult, String> {
+    ) -> Result<CallResult<'s>, String> {
         let count = positional
             .checked_add(keyword_names.len())
             .ok_or("too many call arguments")?;
@@ -176,7 +191,10 @@ impl Vm<'_> {
             return Err("invalid bytecode stack effect".into());
         }
         let arguments_start = self.stack.len() - count;
-        let mut raw_arguments = self.stack.split_off(arguments_start);
+        let mut raw_arguments = self
+            .execution
+            .stack
+            .split_off(&self.state.heap, arguments_start);
         let keyword_values = raw_arguments.split_off(positional);
         let positional_starred = &starred[..positional];
         let mut arguments = Vec::new();
@@ -208,7 +226,7 @@ impl Vm<'_> {
                     self.reserve_result(entries.len().saturating_mul(64))?;
                     let mut additions = Vec::with_capacity(entries.len());
                     for (key, value) in entries {
-                        let Some(name) = protocol::string_value(&self.state.heap, &key)? else {
+                        let Some(name) = protocol::string_value(&self.state.heap, key)? else {
                             return Err(
                                 self.raise_exception("TypeError", "keywords must be strings")
                             );
@@ -240,20 +258,51 @@ impl Vm<'_> {
                 .map(CallResult::Value)
                 .map_err(|error| self.record_native_error(error));
         }
-        if let Some(id) = function.object_id() {
-            return match self.state.heap.get(id)?.clone() {
-                Object::Function(function_object) => {
-                    let FunctionObject {
+        if function.is_object() {
+            /// What a heap callable is, with the handles its call needs.
+            enum Callee<'v> {
+                Function,
+                BoundMethod {
+                    receiver: Value<'v>,
+                    descriptor: Value<'v>,
+                    owner: Option<Value<'v>>,
+                },
+                GenericAlias(Value<'v>),
+                Instance(Value<'v>),
+                Class,
+                Other,
+            }
+            let callee = match self.get(function)? {
+                Object::Function(_) => Callee::Function,
+                Object::DescriptorBoundMethod {
+                    receiver,
+                    descriptor,
+                    owner,
+                } => Callee::BoundMethod {
+                    receiver: self.handle(receiver),
+                    descriptor: self.handle(descriptor),
+                    owner: self.handle_optional(owner.as_ref()),
+                },
+                Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.handle(origin)),
+                Object::Instance { class, .. } => Callee::Instance(self.handle(class)),
+                Object::Class(_) => Callee::Class,
+                _ => Callee::Other,
+            };
+            return match callee {
+                Callee::Function => {
+                    let FunctionParts {
                         name,
                         code,
                         closure,
                         defaults,
                         defining_class,
-                        ..
-                    } = *function_object;
-                    let method_frame = defining_class.zip(arguments.first().cloned());
+                    } = self
+                        .function_parts(function)?
+                        .ok_or("function changed object kind")?;
+                    let method_frame = defining_class.zip(arguments.first().copied());
                     if let Some((owner, receiver)) = method_frame {
-                        self.method_frames.push((owner, receiver));
+                        let frame = (self.store(owner), self.store(receiver));
+                        self.method_frames.push(frame);
                     }
                     let result = self.call_python_function(
                         &name,
@@ -272,27 +321,26 @@ impl Vm<'_> {
                     }
                     result
                 }
-                Object::DescriptorBoundMethod {
+                Callee::BoundMethod {
                     receiver,
                     descriptor,
                     owner,
                 } => {
-                    if let Some(function) = descriptor.object_id() {
-                        let Object::Function(function_object) =
-                            self.state.heap.get(function)?.clone()
-                        else {
-                            return Err("bound descriptor is not callable".into());
-                        };
-                        let FunctionObject {
+                    if descriptor.is_object() {
+                        let Some(FunctionParts {
                             name,
                             code,
                             closure,
                             defaults,
                             ..
-                        } = *function_object;
+                        }) = self.function_parts(descriptor)?
+                        else {
+                            return Err("bound descriptor is not callable".into());
+                        };
                         arguments.insert(0, receiver);
                         if let Some(owner) = owner {
-                            self.method_frames.push((owner, receiver));
+                            let frame = (self.store(owner), self.store(receiver));
+                            self.method_frames.push(frame);
                         }
                         let result = self.call_python_function(
                             &name,
@@ -318,70 +366,41 @@ impl Vm<'_> {
                     } else if let Some(NativeValue::NativeMethod(method)) =
                         descriptor.native_value()
                     {
-                        let call = CallArgs::new(arguments, keyword_arguments);
-                        let retry = match mode {
-                            CallMode::Deferred(call_span) => Some(PendingNativeCall::Method {
-                                method,
-                                receiver,
-                                arguments: call.clone(),
-                                call_span,
-                            }),
-                            CallMode::Immediate => None,
-                        };
-                        let previous_suspend = self.native_suspend_allowed;
-                        self.native_suspend_allowed = self.may_suspend(mode);
-                        let native_receiver = if receiver.object_id().is_some_and(|id| {
-                            matches!(self.state.heap.get(id), Ok(Object::EnumMember { .. }))
-                        }) {
+                        let native_receiver = if receiver.is_object()
+                            && matches!(self.get(receiver), Ok(Object::EnumMember { .. }))
+                        {
                             self.builtin_view(receiver)?
                         } else {
                             receiver
                         };
-                        let result = (method.call)(self, native_receiver, call);
-                        self.native_suspend_allowed = previous_suspend;
-                        match result {
-                            Ok(value) => Ok(CallResult::Value(value)),
-                            Err(PyError {
-                                kind: PyErrorKind::Exit(status),
-                                ..
-                            }) => Ok(CallResult::Exit(status)),
-                            Err(PyError {
-                                kind: PyErrorKind::Suspend(reason),
-                                ..
-                            }) => retry
-                                .map(|pending| CallResult::Retry(reason, pending))
-                                .ok_or_else(|| {
-                                    "native call suspended outside scheduler dispatch".into()
-                                }),
-                            Err(error) => Err(self.record_native_error(error)),
-                        }
+                        self.call_native_method(
+                            method,
+                            receiver,
+                            native_receiver,
+                            CallArgs::new(arguments, keyword_arguments),
+                            mode,
+                        )
                     } else {
                         Err("bound descriptor is not callable".into())
                     }
                 }
-                Object::GenericAlias { origin, .. } => {
+                Callee::GenericAlias(origin) => {
                     self.invoke_call(origin, arguments, keyword_arguments)
                 }
-                Object::Instance { class, .. } => {
-                    let type_id = self.state.heap.type_id(id)?;
+                Callee::Instance(class) => {
+                    let type_id = self.object_type_id(function)?;
                     if self.state.types.slot(type_id, Slot::Call)?.is_none() {
                         return Err(self.raise_object_type_error(&function, "is not callable"));
                     }
                     let (defining_class, descriptor) = self
                         .class_attribute_entry(class, "__call__")?
                         .ok_or("call slot has no descriptor")?;
-                    let callable = self.bind_descriptor(
-                        descriptor,
-                        Some(Value::Object(id)),
-                        class,
-                        defining_class,
-                    )?;
+                    let callable =
+                        self.bind_descriptor(descriptor, Some(function), class, defining_class)?;
                     self.invoke_call(callable, arguments, keyword_arguments)
                 }
-                Object::Class { .. } => {
-                    self.call_user_class(id, arguments, keyword_arguments, true)
-                }
-                _ => Err(self.raise_object_type_error(&function, "is not callable")),
+                Callee::Class => self.call_user_class(function, arguments, keyword_arguments, true),
+                Callee::Other => Err(self.raise_object_type_error(&function, "is not callable")),
             };
         }
         if let Some(NativeValue::BuiltinType(builtin_type)) = function.native_value() {
@@ -398,12 +417,12 @@ impl Vm<'_> {
                 let message = format!("{}() takes no keyword arguments", exception_type.0);
                 return Err(self.raise_exception("TypeError", message));
             }
-            return Ok(CallResult::Value(self.allocate_object(
+            return Ok(CallResult::Value(self.alloc_with(|builder| {
                 Object::Exception {
                     kind: exception_type.0.to_string(),
-                    args: arguments,
-                },
-            )?));
+                    args: builder.refs(arguments),
+                }
+            })?));
         }
         if let Some(NativeValue::SlotWrapper { owner, slot }) = function.native_value() {
             if arguments.is_empty() {
@@ -419,45 +438,18 @@ impl Vm<'_> {
                 return Err("unbound native method requires a receiver".into());
             }
             let receiver = arguments.remove(0);
-            let call = CallArgs::new(arguments, keyword_arguments);
-            let retry = match mode {
-                CallMode::Deferred(call_span) => Some(PendingNativeCall::Method {
-                    method,
-                    receiver,
-                    arguments: call.clone(),
-                    call_span,
-                }),
-                CallMode::Immediate => None,
-            };
-            let previous_suspend = self.native_suspend_allowed;
-            self.native_suspend_allowed = self.may_suspend(mode);
-            let result = (method.call)(self, receiver, call);
-            self.native_suspend_allowed = previous_suspend;
-            return match result {
-                Ok(value) => Ok(CallResult::Value(value)),
-                Err(PyError {
-                    kind: PyErrorKind::Exit(status),
-                    ..
-                }) => Ok(CallResult::Exit(status)),
-                Err(PyError {
-                    kind: PyErrorKind::Suspend(reason),
-                    ..
-                }) => retry
-                    .map(|pending| CallResult::Retry(reason, pending))
-                    .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
-                Err(error) => Err(self.record_native_error(error)),
-            };
+            return self.call_native_method(
+                method,
+                receiver,
+                receiver,
+                CallArgs::new(arguments, keyword_arguments),
+                mode,
+            );
         }
         if let Some(NativeValue::NativeFunction(function)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
-            let retry = match mode {
-                CallMode::Deferred(call_span) => Some(PendingNativeCall::Function {
-                    function,
-                    arguments: call.clone(),
-                    call_span,
-                }),
-                CallMode::Immediate => None,
-            };
+            // Kept as handles so a suspension can store them for the retry.
+            let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
             let previous_suspend = self.native_suspend_allowed;
             self.native_suspend_allowed = self.may_suspend(mode);
             let result = (function.call)(self, call);
@@ -474,9 +466,17 @@ impl Vm<'_> {
                 Err(PyError {
                     kind: PyErrorKind::Suspend(reason),
                     ..
-                }) => retry
-                    .map(|pending| CallResult::Retry(reason, pending))
-                    .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
+                }) => match (mode, retry_arguments) {
+                    (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
+                        reason,
+                        PendingNativeCall::Function {
+                            function,
+                            arguments: StoredCallArgs::store(self, &arguments),
+                            call_span,
+                        },
+                    )),
+                    _ => Err("native call suspended outside scheduler dispatch".into()),
+                },
                 Err(error) => Err(self.record_native_error(error)),
             };
         }
@@ -506,14 +506,14 @@ impl Vm<'_> {
                             if value.is_none() {
                                 continue;
                             }
-                            separator = protocol::string_value(&self.state.heap, value)?
+                            separator = protocol::string_value(&self.state.heap, *value)?
                                 .ok_or("sep must be None or a string")?;
                         }
                         "end" => {
                             if value.is_none() {
                                 continue;
                             }
-                            ending = protocol::string_value(&self.state.heap, value)?
+                            ending = protocol::string_value(&self.state.heap, *value)?
                                 .ok_or("end must be None or a string")?;
                         }
                         "file" => match value.native_value() {
@@ -595,7 +595,7 @@ impl Vm<'_> {
                 };
                 let code = super::super::compiler::compile_expression(expression);
                 match self.execute_code(&code) {
-                    Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
+                    Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
                     Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
                     Ok(
                         Execution::Halt
@@ -613,13 +613,13 @@ impl Vm<'_> {
                 expect_arity(&arguments, 0, 1)?;
                 let status = arguments
                     .first()
-                    .and_then(Value::as_int)
+                    .and_then(|value| value.as_int())
                     .unwrap_or_default();
                 Ok(CallResult::Exit(status as i32))
             }
             Builtin::Character => {
                 expect_arity(&arguments, 1, 1)?;
-                let value = protocol::int_value(&self.state.heap, &arguments[0])
+                let value = protocol::int_value(&self.state.heap, arguments[0])
                     .ok_or("an integer is required for chr()")?;
                 let Some(codepoint) = u32::try_from(value).ok().and_then(char::from_u32) else {
                     return Err(
@@ -633,7 +633,7 @@ impl Vm<'_> {
             Builtin::Ordinal => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = if let Some(text) =
-                    protocol::string_value(&self.state.heap, &arguments[0])?
+                    protocol::string_value(&self.state.heap, arguments[0])?
                 {
                     let mut characters = text.chars();
                     let character = characters.next().ok_or("ord() expected a character")?;
@@ -704,7 +704,7 @@ impl Vm<'_> {
                 }
                 let spec = match arguments.get(1) {
                     Some(spec) => {
-                        protocol::string_value(&self.state.heap, spec)?.ok_or_else(|| {
+                        protocol::string_value(&self.state.heap, *spec)?.ok_or_else(|| {
                             let message = format!(
                                 "format() argument 2 must be str, not {}",
                                 self.type_name_of(spec).unwrap_or_default()
@@ -739,9 +739,9 @@ impl Vm<'_> {
                         .iter()
                         .enumerate()
                         .filter_map(|(index, value)| {
-                            value.and_then(|_| {
-                                let symbol = super::super::heap::SymbolId::from_index(index)?;
-                                self.state.heap.symbol_name(symbol).map(str::to_string)
+                            value.as_ref().and_then(|_| {
+                                let symbol = super::super::symbols::SymbolId::from_index(index)?;
+                                self.symbol_name(symbol).map(str::to_string)
                             })
                         })
                         .collect()
@@ -759,9 +759,9 @@ impl Vm<'_> {
                     .into_iter()
                     .map(|name| self.allocate_string(name))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(values))?,
-                ))
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::List(builder.refs(values))
+                })?))
             }
             Builtin::IsInstance => {
                 expect_arity(&arguments, 2, 2)?;
@@ -780,7 +780,7 @@ impl Vm<'_> {
                 if let Some(value) =
                     self.invoke_slot(&arguments[0], Slot::Length, "__len__", Vec::new())?
                 {
-                    let length = protocol::int_value(&self.state.heap, &value)
+                    let length = protocol::int_value(&self.state.heap, value)
                         .ok_or("__len__() should return an integer")?;
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
@@ -822,8 +822,8 @@ impl Vm<'_> {
                 let mut keyed = Vec::new();
                 for value in values {
                     let key = if let Some(function) = &key_function {
-                        self.stack.push(*function);
-                        self.stack.push(value);
+                        self.push(*function);
+                        self.push(value);
                         match self.call(1, &[], &[false], CallMode::Immediate)? {
                             CallResult::Value(key) => key,
                             CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
@@ -851,10 +851,10 @@ impl Vm<'_> {
                     };
                     self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
                 })?;
-                let values = keyed.into_iter().map(|(_, value)| value).collect();
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(values))?,
-                ))
+                let values = keyed.into_iter().map(|(_, value)| value);
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::List(builder.refs(values))
+                })?))
             }
             Builtin::Minimum | Builtin::Maximum => {
                 let (name, operator) = match function {
@@ -891,13 +891,13 @@ impl Vm<'_> {
                 };
                 // CPython keeps the first of equal items: only a strictly smaller (for `min`) or
                 // larger (for `max`) key replaces the selection.
-                let mut selected: Option<(Value, Value)> = None;
+                let mut selected: Option<(Value<'s>, Value<'s>)> = None;
                 for value in values {
                     self.charge_cpu(1)?;
                     let key = match key_function {
                         Some(function) => {
-                            self.stack.push(function);
-                            self.stack.push(value);
+                            self.push(function);
+                            self.push(value);
                             match self.call(1, &[], &[false], CallMode::Immediate)? {
                                 CallResult::Value(key) => key,
                                 CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
@@ -942,7 +942,7 @@ impl Vm<'_> {
             }
             Builtin::Power => {
                 expect_arity(&arguments, 2, 3)?;
-                if arguments.len() == 3 && arguments[2] != Value::None {
+                if arguments.len() == 3 && !arguments[2].is_none() {
                     let parsed = self.pow_integer_argument(&arguments[0]);
                     let (base, base_len) =
                         parsed.map_err(|error| self.record_native_error(error))?;
@@ -1002,7 +1002,7 @@ impl Vm<'_> {
                     let message = format!("setattr expected 3 arguments, got {}", arguments.len());
                     return Err(self.raise_exception("TypeError", message));
                 }
-                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                let Some(name) = protocol::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
@@ -1010,10 +1010,7 @@ impl Vm<'_> {
                     return Err(self.raise_exception("TypeError", message));
                 };
                 // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
-                let symbol = self
-                    .state
-                    .heap
-                    .intern_symbol(&name, &mut self.interp.resources)?;
+                let symbol = self.intern_symbol(&name)?;
                 self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
                 Ok(CallResult::Value(Value::None))
             }
@@ -1022,17 +1019,14 @@ impl Vm<'_> {
                     let message = format!("delattr expected 2 arguments, got {}", arguments.len());
                     return Err(self.raise_exception("TypeError", message));
                 }
-                let Some(name) = protocol::string_value(&self.state.heap, &arguments[1])? else {
+                let Some(name) = protocol::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
                     );
                     return Err(self.raise_exception("TypeError", message));
                 };
-                let symbol = self
-                    .state
-                    .heap
-                    .intern_symbol(&name, &mut self.interp.resources)?;
+                let symbol = self.intern_symbol(&name)?;
                 self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
                 Ok(CallResult::Value(Value::None))
             }
@@ -1050,13 +1044,13 @@ impl Vm<'_> {
                     {
                         return Err("iter(v, w): v must be callable".into());
                     }
-                    return Ok(CallResult::Value(self.allocate_object(
+                    return Ok(CallResult::Value(self.alloc_with(|builder| {
                         Object::CallableIterator {
-                            callable: arguments[0],
-                            sentinel: arguments[1],
+                            callable: builder.store(arguments[0]),
+                            sentinel: builder.store(arguments[1]),
                             exhausted: false,
-                        },
-                    )?));
+                        }
+                    })?));
                 }
                 Ok(CallResult::Value(self.make_iterator(arguments[0])?))
             }
@@ -1094,12 +1088,13 @@ impl Vm<'_> {
                     let index = start
                         .checked_add(offset)
                         .ok_or("enumerate index exceeds the bounded integer range")?;
-                    result
-                        .push(self.allocate_object(Object::Tuple(vec![Value::Int(index), value]))?);
+                    result.push(self.alloc_with(|builder| {
+                        Object::Tuple(vec![builder.store(Value::Int(index)), builder.store(value)])
+                    })?);
                 }
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(result))?,
-                ))
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::List(builder.refs(result))
+                })?))
             }
             Builtin::Zip => {
                 let sequences = arguments
@@ -1111,12 +1106,12 @@ impl Vm<'_> {
                 for index in 0..length {
                     self.reserve_result(64)?;
                     self.charge_cpu(1)?;
-                    let tuple = sequences.iter().map(|values| values[index]).collect();
-                    result.push(self.allocate_object(Object::Tuple(tuple))?);
+                    let tuple = sequences.iter().map(|values| values[index]);
+                    result.push(self.alloc_with(|builder| Object::Tuple(builder.refs(tuple)))?);
                 }
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::List(result))?,
-                ))
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::List(builder.refs(result))
+                })?))
             }
             Builtin::Any | Builtin::All => {
                 expect_arity(&arguments, 1, 1)?;
@@ -1138,28 +1133,28 @@ impl Vm<'_> {
             }
             Builtin::Property => {
                 expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.allocate_object(
+                Ok(CallResult::Value(self.alloc_with(|builder| {
                     Object::Property {
-                        getter: arguments[0],
+                        getter: builder.store(arguments[0]),
                         setter: None,
-                    },
-                )?))
+                    }
+                })?))
             }
             Builtin::StaticMethod => {
                 expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.allocate_object(
+                Ok(CallResult::Value(self.alloc_with(|builder| {
                     Object::StaticMethod {
-                        callable: arguments[0],
-                    },
-                )?))
+                        callable: builder.store(arguments[0]),
+                    }
+                })?))
             }
             Builtin::ClassMethod => {
                 expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.allocate_object(
+                Ok(CallResult::Value(self.alloc_with(|builder| {
                     Object::ClassMethod {
-                        callable: arguments[0],
-                    },
-                )?))
+                        callable: builder.store(arguments[0]),
+                    }
+                })?))
             }
             Builtin::Super => {
                 expect_arity(&arguments, 0, 2)?;
@@ -1167,28 +1162,29 @@ impl Vm<'_> {
                     [] => self
                         .method_frames
                         .last()
-                        .cloned()
+                        .map(|(class, receiver)| (self.handle(class), self.handle(receiver)))
                         .ok_or("super(): no current method context")?,
                     [start_class, receiver]
-                        if start_class.object_id().is_some_and(|id| {
-                            matches!(self.state.heap.get(id), Ok(Object::Class { .. }))
-                        }) =>
+                        if start_class.is_object()
+                            && matches!(self.get(*start_class), Ok(Object::Class { .. })) =>
                     {
-                        (start_class.object_id().unwrap(), *receiver)
+                        (*start_class, *receiver)
                     }
                     _ => return Err("super() expects a class and instance".into()),
                 };
-                Ok(CallResult::Value(self.allocate_object(Object::Super {
-                    start_class,
-                    receiver,
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::Super {
+                        start_class: builder.store(start_class),
+                        receiver: builder.store(receiver),
+                    }
                 })?))
             }
             Builtin::Globals => {
                 expect_arity(&arguments, 0, 0)?;
                 let target = self.current_globals_target()?;
-                Ok(CallResult::Value(
-                    self.allocate_object(Object::NamespaceDict(target))?,
-                ))
+                Ok(CallResult::Value(self.alloc_with(|builder| {
+                    Object::NamespaceDict(target.store(builder))
+                })?))
             }
             Builtin::Locals => {
                 expect_arity(&arguments, 0, 0)?;
@@ -1216,14 +1212,12 @@ impl Vm<'_> {
     /// construction and the native type constructors.
     pub(super) fn call_type_default(
         &mut self,
-        class: Value,
-        args: CallArgs,
-    ) -> Result<CallResult, String> {
+        class: Value<'s>,
+        args: CallArgs<'s>,
+    ) -> Result<CallResult<'s>, String> {
         let (arguments, keyword_arguments) = args.into_parts();
-        if let Some(id) = class.object_id() {
-            if matches!(self.state.heap.get(id)?, Object::Class { .. }) {
-                return self.call_user_class(id, arguments, keyword_arguments, false);
-            }
+        if class.is_object() && matches!(self.get(class)?, Object::Class { .. }) {
+            return self.call_user_class(class, arguments, keyword_arguments, false);
         }
         if matches!(
             class.native_value(),
@@ -1238,41 +1232,92 @@ impl Vm<'_> {
         Err(self.raise_exception("TypeError", "type.__call__ requires a class"))
     }
 
+    /// The name, code, closure, defaults and defining class of a Python function object, or
+    /// `None` when `function` is some other value.
+    fn function_parts(&self, function: Value<'s>) -> Result<Option<FunctionParts<'s>>, String> {
+        if !function.is_object() {
+            return Ok(None);
+        }
+        let Object::Function(function_object) = self.get(function)? else {
+            return Ok(None);
+        };
+        Ok(Some(FunctionParts {
+            name: function_object.name.clone(),
+            code: function_object.code.clone(),
+            closure: self.handle_optional(function_object.closure.as_ref()),
+            defaults: self.handles(&function_object.defaults),
+            defining_class: self.handle_optional(function_object.defining_class.as_ref()),
+        }))
+    }
+
+    /// Call a native method. A deferred call that suspends returns a retry that passes
+    /// `receiver` and the same arguments again; this call passes `native_receiver`.
+    fn call_native_method(
+        &mut self,
+        method: &'static super::super::native::MethodDef,
+        receiver: Value<'s>,
+        native_receiver: Value<'s>,
+        call: CallArgs<'s>,
+        mode: CallMode,
+    ) -> Result<CallResult<'s>, String> {
+        // Kept as handles so a suspension can store them for the retry.
+        let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
+        let previous_suspend = self.native_suspend_allowed;
+        self.native_suspend_allowed = self.may_suspend(mode);
+        let result = (method.call)(self, native_receiver, call);
+        self.native_suspend_allowed = previous_suspend;
+        match result {
+            Ok(value) => Ok(CallResult::Value(value)),
+            Err(PyError {
+                kind: PyErrorKind::Exit(status),
+                ..
+            }) => Ok(CallResult::Exit(status)),
+            Err(PyError {
+                kind: PyErrorKind::Suspend(reason),
+                ..
+            }) => match (mode, retry_arguments) {
+                (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
+                    reason,
+                    PendingNativeCall::Method {
+                        method,
+                        receiver: self.store(receiver),
+                        arguments: StoredCallArgs::store(self, &arguments),
+                        call_span,
+                    },
+                )),
+                _ => Err("native call suspended outside scheduler dispatch".into()),
+            },
+            Err(error) => Err(self.record_native_error(error)),
+        }
+    }
+
     /// Apply the default class constructor after any metaclass `__call__` override has had
     /// its turn. Direct `type.__call__` enters here with metaclass dispatch disabled.
     fn call_user_class(
         &mut self,
-        id: super::super::heap::ObjectId,
-        mut arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
+        class: Value<'s>,
+        mut arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
         dispatch_metaclass: bool,
-    ) -> Result<CallResult, String> {
-        let Object::Class(class_object) = self.state.heap.get(id)? else {
+    ) -> Result<CallResult<'s>, String> {
+        let Object::Class(class_object) = self.get(class)? else {
             return Err("type.__call__ requires a class".into());
         };
-        let ClassObject {
-            name,
-            metaclass,
-            layout,
-            exception_base,
-            is_dataclass,
-            dataclass_fields,
-            enum_members,
-            ..
-        } = (**class_object).clone();
-        if dispatch_metaclass {
-            if let Some(metaclass_id) = metaclass.object_id() {
-                if let Some((owner, descriptor)) =
-                    self.class_attribute_entry(metaclass_id, "__call__")?
-                {
-                    let callable = self.bind_descriptor(
-                        descriptor,
-                        Some(Value::Object(id)),
-                        metaclass_id,
-                        owner,
-                    )?;
-                    return self.invoke_call(callable, arguments, keyword_arguments);
-                }
+        let name = class_object.name.clone();
+        let metaclass = self.handle(&class_object.metaclass);
+        let layout = class_object.layout;
+        let exception_base = class_object.exception_base;
+        let is_dataclass = class_object.is_dataclass;
+        let dataclass_fields = class_object
+            .dataclass_fields
+            .iter()
+            .map(|(field, default)| (field.clone(), self.handle_optional(default.as_ref())))
+            .collect::<Vec<_>>();
+        let enum_members = self.handles(&class_object.enum_members);
+        if dispatch_metaclass && metaclass.is_object() {
+            if let Some((owner, descriptor)) = self.class_attribute_entry(metaclass, "__call__")? {
+                let callable = self.bind_descriptor(descriptor, Some(class), metaclass, owner)?;
+                return self.invoke_call(callable, arguments, keyword_arguments);
             }
         }
         if !enum_members.is_empty() {
@@ -1280,14 +1325,13 @@ impl Vm<'_> {
                 return Err(format!("{name}() expects one value"));
             }
             for member in enum_members {
-                let Object::EnumMember { value, .. } = self
-                    .state
-                    .heap
-                    .get(member.object_id().ok_or("invalid enum member")?)?
-                else {
+                if !member.is_object() {
+                    return Err("invalid enum member".into());
+                }
+                let Object::EnumMember { value, .. } = self.get(member)? else {
                     return Err("invalid enum member".into());
                 };
-                let value = *value;
+                let value = self.handle(value);
                 if self.values_equal(&value, &arguments[0])? {
                     return Ok(CallResult::Value(member));
                 }
@@ -1296,15 +1340,15 @@ impl Vm<'_> {
         }
         if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
             let class_type = self
-                .class_type_id(&Value::Object(id))?
+                .class_type_id(&class)?
                 .ok_or("class has no registered type")?;
             let use_type_constructor = layout == ClassLayout::Object;
-            if use_type_constructor || self.class_attribute_entry(id, "__new__")?.is_some() {
+            if use_type_constructor || self.class_attribute_entry(class, "__new__")?.is_some() {
                 let (owner, constructor) = self
                     .type_lookup(class_type, "__new__")?
                     .ok_or("class constructor has no descriptor")?;
                 return self.construct_with_new(
-                    id,
+                    class,
                     class_type,
                     owner,
                     constructor,
@@ -1313,8 +1357,9 @@ impl Vm<'_> {
                 );
             }
         }
-        let payload = match layout {
-            ClassLayout::Object => InstancePayload::Object,
+        // The builtin value an instance of a builtin subclass carries.
+        let builtin_payload = match layout {
+            ClassLayout::Object => None,
             // Mutable builtin `__new__` creates empty storage. An override can then
             // populate it, usually through the base `__init__`.
             ClassLayout::Builtin(
@@ -1322,20 +1367,18 @@ impl Vm<'_> {
                 | BuiltinType::Set
                 | BuiltinType::Dict
                 | BuiltinType::ByteArray),
-            ) if self.class_attribute(id, "__init__")?.is_some() => {
-                InstancePayload::Builtin(self.builtin_value(builtin, Vec::new(), Vec::new())?)
+            ) if self.class_attribute(class, "__init__")?.is_some() => {
+                Some(self.builtin_value(builtin, Vec::new(), Vec::new())?)
             }
-            ClassLayout::Builtin(builtin) => InstancePayload::Builtin(self.builtin_value(
-                builtin,
-                arguments.clone(),
-                keyword_arguments.clone(),
-            )?),
+            ClassLayout::Builtin(builtin) => {
+                Some(self.builtin_value(builtin, arguments.clone(), keyword_arguments.clone())?)
+            }
             ClassLayout::Type => {
                 let created = if let Some((owner, constructor)) =
-                    self.class_attribute_entry(id, "__new__")?
+                    self.class_attribute_entry(class, "__new__")?
                 {
                     let constructor =
-                        self.bind_descriptor(constructor, Some(Value::Object(id)), id, owner)?;
+                        self.bind_descriptor(constructor, Some(class), class, owner)?;
                     match self.invoke_call(
                         constructor,
                         arguments.clone(),
@@ -1354,19 +1397,17 @@ impl Vm<'_> {
                     if !keyword_arguments.is_empty() || arguments.len() != 3 {
                         return Err("type construction expects name, bases, and namespace".into());
                     }
-                    let name = protocol::string_value(&self.state.heap, &arguments[0])?
+                    let name = protocol::string_value(&self.state.heap, arguments[0])?
                         .ok_or("type name must be a string")?;
-                    self.new_type(Value::Object(id), name, arguments[1], arguments[2])
+                    self.new_type(class, name, arguments[1], arguments[2])
                         .map_err(|error| error.to_string())?
                 };
-                if created.object_id().is_some_and(|created_id| {
-                    matches!(self.state.heap.get(created_id), Ok(Object::Class { .. }))
-                }) {
+                if created.is_object() && matches!(self.get(created), Ok(Object::Class { .. })) {
                     if let Some((owner, initializer)) =
-                        self.class_attribute_entry(id, "__init__")?
+                        self.class_attribute_entry(class, "__init__")?
                     {
                         let initializer =
-                            self.bind_descriptor(initializer, Some(created), id, owner)?;
+                            self.bind_descriptor(initializer, Some(created), class, owner)?;
                         let result =
                             match self.invoke_call(initializer, arguments, keyword_arguments)? {
                                 CallResult::Value(value) => value,
@@ -1386,19 +1427,18 @@ impl Vm<'_> {
                 return Ok(CallResult::Value(created));
             }
         };
-        let instance = self.allocate_object(Object::Instance {
-            class: id,
-            payload,
+        let instance = self.alloc_with(|builder| Object::Instance {
+            class: builder.store(class),
+            payload: match builtin_payload {
+                Some(value) => InstancePayload::Builtin(builder.store(value)),
+                None => InstancePayload::Object,
+            },
             attributes: InstanceAttributes::default(),
         })?;
         if exception_base.is_some() {
-            let exception_args = self.allocate_object(Object::Tuple(arguments.clone()))?;
-            self.state.heap.insert_attribute(
-                instance.object_id().expect("instances are heap objects"),
-                "args".into(),
-                exception_args,
-                &mut self.interp.resources,
-            )?;
+            let exception_args =
+                self.alloc_with(|builder| Object::Tuple(builder.refs(arguments.iter().copied())))?;
+            self.insert_attribute(instance, "args", exception_args)?;
         }
         if is_dataclass {
             let mut values = Vec::new();
@@ -1414,7 +1454,7 @@ impl Vm<'_> {
                     .iter()
                     .find(|(name, _)| name == field)
                     .map(|(_, value)| *value)
-                    .or_else(|| arguments.get(index).cloned())
+                    .or_else(|| arguments.get(index).copied())
                     .or(*default)
                     .ok_or_else(|| format!("{name}() missing required argument: {field:?}"))?;
                 if keyword_arguments
@@ -1443,30 +1483,26 @@ impl Vm<'_> {
                     ));
                 }
             }
-            self.state.heap.extend_attributes(
-                instance.object_id().expect("instances are heap objects"),
-                values,
-                &mut self.interp.resources,
-            )?;
-        } else if let Some(initializer) = self.class_attribute(id, "__init__")? {
-            let Some(function) = initializer.object_id() else {
+            self.with_attributes(|store| store.extend(instance, values))?;
+        } else if let Some(initializer) = self.class_attribute(class, "__init__")? {
+            if !initializer.is_object() {
                 return Err(format!("{name}.__init__ is not callable"));
-            };
-            let Object::Function(function_object) = self.state.heap.get(function)?.clone() else {
-                return Err(format!("{name}.__init__ is not a function"));
-            };
-            let FunctionObject {
+            }
+            let Some(FunctionParts {
                 name: function_name,
                 code,
                 closure,
                 defaults,
                 defining_class,
-                ..
-            } = *function_object;
+            }) = self.function_parts(initializer)?
+            else {
+                return Err(format!("{name}.__init__ is not a function"));
+            };
             arguments.insert(0, instance);
             // Zero-argument `super()` in the initializer reads this frame.
             if let Some(owner) = defining_class {
-                self.method_frames.push((owner, instance));
+                let frame = (self.store(owner), self.store(instance));
+                self.method_frames.push(frame);
             }
             let result = self.call_python_function(
                 &function_name,
@@ -1509,10 +1545,10 @@ impl Vm<'_> {
         &mut self,
         name: &str,
         code: &CodeRef,
-        closure: Option<ScopeId>,
-        defaults: &[Value],
-        invocation: FunctionInvocation,
-    ) -> Result<CallResult, String> {
+        closure: Option<Value<'s>>,
+        defaults: &[Value<'s>],
+        invocation: FunctionInvocation<'s>,
+    ) -> Result<CallResult<'s>, String> {
         let FunctionInvocation {
             arguments,
             keyword_arguments,
@@ -1535,6 +1571,7 @@ impl Vm<'_> {
         }
         let scope =
             self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
+        let scope = self.store(scope);
         self.local_scopes.push(scope);
         self.call_depth += 1;
         if let CallMode::Deferred(call_span) = mode {
@@ -1559,7 +1596,7 @@ impl Vm<'_> {
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
-            Ok(Execution::Return(value)) => Ok(CallResult::Value(value)),
+            Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
             Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
             Ok(Execution::Yield(_, _)) => {
                 Err(format!("unexpected yield in ordinary function {name}"))
@@ -1576,38 +1613,41 @@ impl Vm<'_> {
         &mut self,
         name: &str,
         code: &CodeRef,
-        closure: Option<ScopeId>,
-        defaults: &[Value],
-        arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<CallResult, String> {
+        closure: Option<Value<'s>>,
+        defaults: &[Value<'s>],
+        arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<CallResult<'s>, String> {
         let scope =
             self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
-        let generator = self.allocate_object(Object::Generator(Box::new(GeneratorObject {
-            name: name.to_string(),
-            code: code.clone(),
-            scope,
-            instruction_pointer: 0,
-            handlers: Vec::new(),
-            exceptions: Vec::new(),
-            stack: Vec::new(),
-            exhausted: false,
-            running: false,
-            return_value: Value::None,
-        })))?;
+        let generator = self.alloc_with(|builder| {
+            Object::Generator(Box::new(GeneratorObject {
+                name: name.to_string(),
+                code: code.clone(),
+                scope: builder.store(scope),
+                instruction_pointer: 0,
+                handlers: Vec::new(),
+                exceptions: Vec::new(),
+                stack: Vec::new(),
+                exhausted: false,
+                running: false,
+                return_value: builder.store(Value::None),
+            }))
+        })?;
         Ok(CallResult::Value(generator))
     }
 
-    /// Bind one invocation directly into the compiler's local-slot layout.
+    /// Bind one invocation directly into the compiler's local-slot layout, returning the new
+    /// scope.
     fn bind_function_scope(
         &mut self,
         name: &str,
         code: &CodeRef,
-        closure: Option<ScopeId>,
-        defaults: &[Value],
-        mut arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<ScopeId, String> {
+        closure: Option<Value<'s>>,
+        defaults: &[Value<'s>],
+        mut arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<Value<'s>, String> {
         let signature = &code.call_signature;
         if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
             let required = code.parameters[..signature.positional_count]
@@ -1660,7 +1700,8 @@ impl Vm<'_> {
             locals[slot] = Some(value);
         }
         if let Some(slot) = signature.variadic_slot {
-            locals[slot] = Some(self.allocate_object(Object::Tuple(extra_positional))?);
+            locals[slot] =
+                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extra_positional)))?);
         }
         let mut extra_keywords = Vec::new();
         for (keyword, value) in keyword_arguments {
@@ -1739,16 +1780,15 @@ impl Vm<'_> {
             return Err(self.raise_exception("TypeError", message));
         }
         let uses_repl_globals = closure
-            .map(|scope| self.state.heap.scope_uses_repl_globals(scope))
+            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
             .unwrap_or(true);
-        self.state.heap.allocate_scope_slots(
+        self.alloc_scope(
             closure,
             uses_repl_globals,
             code.local_names.clone(),
             locals,
             HashMap::new(),
-            &mut self.interp.resources,
         )
     }
 
@@ -1760,19 +1800,19 @@ impl Vm<'_> {
     /// when the result is an instance of the class. Any other result is returned as is.
     fn construct_with_new(
         &mut self,
-        class: super::super::heap::ObjectId,
+        class: Value<'s>,
         class_type: super::super::object_model::TypeId,
         owner: super::super::object_model::TypeId,
-        constructor: Value,
-        arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<CallResult, String> {
+        constructor: Value<'s>,
+        arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<CallResult<'s>, String> {
         // `__new__` is a static method that receives the class explicitly.
         let constructor = self
             .bind_type_attribute(constructor, None, class_type, owner)?
             .ok_or("__new__ descriptor has no value")?;
         let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
-        new_arguments.push(Value::Object(class));
+        new_arguments.push(class);
         new_arguments.extend(arguments.iter().copied());
         let created =
             match self.invoke_call(constructor, new_arguments, keyword_arguments.clone())? {
@@ -1783,10 +1823,10 @@ impl Vm<'_> {
                     unreachable!("immediate call cannot suspend")
                 }
             };
-        if !self.is_instance(&created, &Value::Object(class))? {
+        if !self.is_instance(&created, &class)? {
             return Ok(CallResult::Value(created));
         }
-        let layout = match self.state.heap.get(class)? {
+        let layout = match self.get(class)? {
             Object::Class(class_object) => class_object.layout,
             _ => return Err("type.__call__ requires a class".into()),
         };
@@ -1800,7 +1840,7 @@ impl Vm<'_> {
         } else {
             self.class_attribute_entry(class, "__init__")?
                 .map(|(owner, value)| {
-                    self.class_type_id(&Value::Object(owner))
+                    self.class_type_id(&owner)
                         .and_then(|owner| owner.ok_or("initializer class has no type".into()))
                         .map(|owner| (owner, value))
                 })
@@ -1834,9 +1874,9 @@ impl Vm<'_> {
     fn builtin_value(
         &mut self,
         builtin: BuiltinType,
-        arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+        arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<Value<'s>, String> {
         match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
             CallResult::Value(value) => Ok(value),
             _ => Err(format!("{}() did not produce a value", builtin.name())),
@@ -1849,10 +1889,10 @@ impl Vm<'_> {
     pub(super) fn new_builtin_instance(
         &mut self,
         builtin: BuiltinType,
-        class: Value,
-        arguments: Vec<Value>,
-        keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+        class: Value<'s>,
+        arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<Value<'s>, String> {
         let name = builtin.name();
         let subclass = match class.native_value() {
             Some(NativeValue::BuiltinType(class_type)) if class_type == builtin => None,
@@ -1875,13 +1915,13 @@ impl Vm<'_> {
                 );
                 return Err(self.raise_exception("TypeError", message));
             }
-            _ => match class.object_id().map(|id| (id, self.state.heap.get(id))) {
-                Some((id, Ok(Object::Class(class_object))))
+            _ => match class.is_object().then(|| self.get(class)) {
+                Some(Ok(Object::Class(class_object)))
                     if class_object.layout == ClassLayout::Builtin(builtin) =>
                 {
-                    Some(id)
+                    Some(class)
                 }
-                Some((_, Ok(Object::Class(class_object)))) => {
+                Some(Ok(Object::Class(class_object))) => {
                     let class_name = &class_object.name;
                     let message = format!(
                         "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
@@ -1900,9 +1940,9 @@ impl Vm<'_> {
         let Some(class) = subclass else {
             return Ok(value);
         };
-        self.allocate_object(Object::Instance {
-            class,
-            payload: InstancePayload::Builtin(value),
+        self.alloc_with(|builder| Object::Instance {
+            class: builder.store(class),
+            payload: InstancePayload::Builtin(builder.store(value)),
             attributes: InstanceAttributes::default(),
         })
     }
@@ -1915,9 +1955,9 @@ impl Vm<'_> {
     /// by that builtin's `__new__`.
     pub(super) fn new_instance(
         &mut self,
-        class: Value,
+        class: Value<'s>,
         has_arguments: bool,
-    ) -> Result<Value, String> {
+    ) -> Result<Value<'s>, String> {
         if matches!(
             class.native_value(),
             Some(NativeValue::BuiltinType(BuiltinType::Object))
@@ -1925,7 +1965,7 @@ impl Vm<'_> {
             if has_arguments {
                 return Err(self.raise_exception("TypeError", "object() takes no arguments"));
             }
-            return self.allocate_object(Object::Bare);
+            return self.alloc(Object::Bare);
         }
         let builtin = match class.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.name()),
@@ -1938,18 +1978,17 @@ impl Vm<'_> {
                 format!("object.__new__({name}) is not safe, use {name}.__new__()"),
             ));
         }
-        let Some((id, name, layout, exception_base)) =
-            class
-                .object_id()
-                .and_then(|id| match self.state.heap.get(id) {
-                    Ok(Object::Class(class_object)) => Some((
-                        id,
-                        class_object.name.clone(),
-                        class_object.layout,
-                        class_object.exception_base,
-                    )),
-                    _ => None,
-                })
+        let Some((name, layout, exception_base)) = class
+            .is_object()
+            .then(|| match self.get(class) {
+                Ok(Object::Class(class_object)) => Some((
+                    class_object.name.clone(),
+                    class_object.layout,
+                    class_object.exception_base,
+                )),
+                _ => None,
+            })
+            .flatten()
         else {
             let type_name = self.type_name_of(&class)?;
             return Err(self.raise_exception(
@@ -1964,35 +2003,39 @@ impl Vm<'_> {
             ));
         }
         if has_arguments {
-            if self.class_attribute_entry(id, "__new__")?.is_some() {
+            if self.class_attribute_entry(class, "__new__")?.is_some() {
                 return Err(self.raise_exception(
                     "TypeError",
                     "object.__new__() takes exactly one argument (the type to instantiate)",
                 ));
             }
-            if self.class_attribute_entry(id, "__init__")?.is_none() {
+            if self.class_attribute_entry(class, "__init__")?.is_none() {
                 return Err(
                     self.raise_exception("TypeError", format!("{name}() takes no arguments"))
                 );
             }
         }
-        self.allocate_object(Object::Instance {
-            class: id,
+        self.alloc_with(|builder| Object::Instance {
+            class: builder.store(class),
             payload: InstancePayload::Object,
             attributes: InstanceAttributes::default(),
         })
     }
 
-    pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
-        let Some(id) = iterator.object_id() else {
+    pub(super) fn iterator_next(
+        &mut self,
+        iterator: &Value<'s>,
+    ) -> Result<Option<Value<'s>>, String> {
+        if !iterator.is_object() {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
-        };
+        }
+        let iterator = *iterator;
         // Copy out only the fields a step needs. Cloning a materialized iterator, generator or
         // instance payload on every step would make iteration quadratic in host time.
-        enum Step {
+        enum Step<'v> {
             Callable {
-                callable: Value,
-                sentinel: Value,
+                callable: Value<'v>,
+                sentinel: Value<'v>,
                 exhausted: bool,
             },
             Count {
@@ -2001,26 +2044,26 @@ impl Vm<'_> {
             },
             Protocol,
         }
-        let step = match self.state.heap.get(id)? {
+        let step = match self.get(iterator)? {
             Object::CallableIterator {
                 callable,
                 sentinel,
                 exhausted,
             } => Step::Callable {
-                callable: *callable,
-                sentinel: *sentinel,
+                callable: self.handle(callable),
+                sentinel: self.handle(sentinel),
                 exhausted: *exhausted,
             },
             Object::CountIterator { current, step } => Step::Count {
                 current: *current,
                 step: *step,
             },
-            Object::Generator { .. } => return self.resume_generator(id),
+            Object::Generator { .. } => return self.resume_generator(iterator),
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
             | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
-            | Object::StreamIterator { .. } => return self.next_stored_iterator(id),
+            | Object::StreamIterator { .. } => return self.next_stored_iterator(iterator),
             _ => Step::Protocol,
         };
         Ok(match step {
@@ -2041,7 +2084,7 @@ impl Vm<'_> {
                     .map_err(|error| error.to_string())?;
                     if self.values_equal(&value, &sentinel)? {
                         if let Object::CallableIterator { exhausted, .. } =
-                            self.state.heap.get_mut(id)?
+                            self.get_mut(iterator)?
                         {
                             *exhausted = true;
                         }
@@ -2054,16 +2097,16 @@ impl Vm<'_> {
             Step::Count { current, step } => {
                 let next = super::super::stdlib::itertools::count_next(current, step)
                     .map_err(str::to_string)?;
-                if let Object::CountIterator { current, .. } = self.state.heap.get_mut(id)? {
+                if let Object::CountIterator { current, .. } = self.get_mut(iterator)? {
                     *current = next;
                 }
                 Some(Value::Int(current))
             }
             Step::Protocol => {
-                match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
+                match self.invoke_slot(&iterator, Slot::Next, "__next__", Vec::new())? {
                     Some(value) => Some(value),
                     None => {
-                        return Err(self.raise_object_type_error(iterator, "is not an iterator"))
+                        return Err(self.raise_object_type_error(&iterator, "is not an iterator"))
                     }
                 }
             }
@@ -2099,6 +2142,7 @@ impl Vm<'_> {
         };
         if let Some(kind) = kind {
             if let Ok(value) = self.allocate_exception(kind.to_string(), error.message.clone()) {
+                let value = self.store(value);
                 self.pending_exception = Some(RaisedException {
                     kind: kind.to_string(),
                     value,
@@ -2117,26 +2161,41 @@ impl Vm<'_> {
     pub(super) fn resume_native_call(
         &mut self,
         pending: PendingNativeCall,
-    ) -> Result<CallResult, String> {
+    ) -> Result<CallResult<'s>, String> {
+        /// The native a retried call invokes, with its receiver as a handle.
+        #[derive(Clone, Copy)]
+        enum Target<'v> {
+            Function(&'static super::FunctionDef),
+            Method(&'static super::super::native::MethodDef, Value<'v>),
+        }
         if matches!(pending, PendingNativeCall::Input { .. }) {
             return self.resume_input(pending);
         }
-        let retry = pending.clone();
-        let previous_suspend = self.native_suspend_allowed;
-        self.native_suspend_allowed = self.synchronous_frames == 0;
-        let result = match pending {
+        let call_span = pending.call_span();
+        // Take handles for the stored arguments before anything can allocate.
+        let (target, arguments) = match pending {
             PendingNativeCall::Function {
                 function,
                 arguments,
                 ..
-            } => (function.call)(self, arguments),
+            } => (Target::Function(function), arguments.load(self)),
             PendingNativeCall::Method {
                 method,
                 receiver,
                 arguments,
                 ..
-            } => (method.call)(self, receiver, arguments),
+            } => (
+                Target::Method(method, self.handle(&receiver)),
+                arguments.load(self),
+            ),
             PendingNativeCall::Input { .. } => unreachable!("handled above"),
+        };
+        let retry_arguments = arguments.clone();
+        let previous_suspend = self.native_suspend_allowed;
+        self.native_suspend_allowed = self.synchronous_frames == 0;
+        let result = match target {
+            Target::Function(function) => (function.call)(self, arguments),
+            Target::Method(method, receiver) => (method.call)(self, receiver, arguments),
         };
         self.native_suspend_allowed = previous_suspend;
         match result {
@@ -2151,12 +2210,28 @@ impl Vm<'_> {
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
-            }) => Ok(CallResult::Retry(reason, retry)),
+            }) => {
+                let arguments = StoredCallArgs::store(self, &retry_arguments);
+                let retry = match target {
+                    Target::Function(function) => PendingNativeCall::Function {
+                        function,
+                        arguments,
+                        call_span,
+                    },
+                    Target::Method(method, receiver) => PendingNativeCall::Method {
+                        method,
+                        receiver: self.store(receiver),
+                        arguments,
+                        call_span,
+                    },
+                };
+                Ok(CallResult::Retry(reason, retry))
+            }
             Err(error) => Err(self.record_native_error(error)),
         }
     }
 
-    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<CallResult, String> {
+    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<CallResult<'s>, String> {
         let PendingNativeCall::Input { call_span } = pending else {
             unreachable!("caller checked the variant");
         };
@@ -2179,7 +2254,7 @@ impl Vm<'_> {
     }
 
     /// Strip the trailing newline `input()` reads and raise `EOFError` on an empty read.
-    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value, String> {
+    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value<'s>, String> {
         let mut text = match read {
             PyStreamRead::Text(text) => text,
             PyStreamRead::Bytes(_) => {

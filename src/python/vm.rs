@@ -15,37 +15,39 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
+use super::attributes::InstanceAttributeSlot;
 use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
 use super::cpython_names;
 use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, NamespaceTarget,
-    Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
+    Builder, ClassLayout, InstancePayload, KeyHash, NamespaceTarget, Object, OrderedMap,
+    OrderedSet, ProxyTarget, Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES,
     MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
 };
-use super::mapping::{KeyHash, OrderedMap, OrderedSet};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
-    PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
-    PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError,
-    PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker,
-    PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle, PyProcessOutput,
-    PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty, PyRaisesContext, PyRegex,
-    PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
-    PyTypeObject, PyValueCast,
+    PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader,
+    PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
+    PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
+    PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessHandle,
+    PyProcessOutput, PyProcessPoll, PyProcessRunner, PyProcessStartRequest, PyProperty,
+    PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec,
+    PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
 };
 use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::slice::SlicePlan;
 use super::source::Span;
-use super::{protocol, ExecResult, Out, ReplState, Value, ValueTag};
+use super::symbols::SymbolId;
+use super::{protocol, ExecResult, Out, ReplState, Value};
 
 mod calls;
 mod dispatch;
 mod equality;
 mod format;
+mod handles;
 mod hashing;
 mod host;
 mod iteration;
@@ -81,7 +83,7 @@ pub(super) enum NativeValue {
     /// Runtime representation of ``typing.List`` used by the generic-alias probe.
     TypingList,
     /// The `Ellipsis` singleton written as `...`. An immediate marker keeps identity, equality,
-    /// and dictionary hashing canonical without allocating an arena object.
+    /// and dictionary hashing canonical without allocating a heap object.
     Ellipsis,
     /// The `NotImplemented` singleton returned by binary and comparison methods that decline.
     NotImplemented,
@@ -240,10 +242,19 @@ impl NativeValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExceptionType(pub &'static str);
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct RaisedException {
     kind: String,
-    value: Value,
+    value: Ref,
+}
+
+impl Clone for RaisedException {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            value: self.value.dup(),
+        }
+    }
 }
 
 /// One call-chain entry captured while an uncaught exception unwinds the frame stack, rendered
@@ -399,14 +410,15 @@ pub(super) fn execute(
     out: Out,
     err: Out,
 ) -> ExecResult {
-    let name_symbol = match state.heap.intern_symbol("__name__", &mut interp.resources) {
+    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
         Ok(symbol) => symbol,
         Err(_) => return ExecResult::Exit(137),
     };
-    if state.globals.get(name_symbol).is_none()
+    if state.globals.get(&state.heap, name_symbol).is_none()
         && state
             .globals
             .insert(
+                &state.heap,
                 name_symbol,
                 Value::inline_string("__main__").expect("short builtin string"),
                 &mut interp.resources,
@@ -518,14 +530,6 @@ impl VmProgram {
             });
             self.started = true;
         }
-        if vm.state.heap.should_collect(
-            vm.interp.resources.limits().memory,
-            vm.interp.resources.memory_remaining(),
-        ) {
-            if let Err(error) = vm.collect_heap() {
-                return VmPoll::Ready(ExecResult::Unsupported(error));
-            }
-        }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
         vm.release_transient_memory();
         if !vm.state.sync_type_memory(&mut vm.interp.resources) {
@@ -544,15 +548,19 @@ impl VmProgram {
     }
 }
 
-struct Vm<'a> {
-    interp: &'a mut Interp,
-    argv: &'a [String],
-    stdin: &'a [u8],
-    state: &'a mut ReplState,
-    execution: &'a mut VmState,
+/// The interpreter for one scheduler quantum, and the handle scope for every value it touches.
+/// See [`handles`] for the scope discipline.
+struct Vm<'s> {
+    interp: &'s mut Interp,
+    argv: &'s [String],
+    stdin: &'s [u8],
+    state: &'s mut ReplState,
+    execution: &'s mut VmState,
     mode: VmMode,
-    out: Out<'a>,
-    err: Out<'a>,
+    out: Out<'s>,
+    err: Out<'s>,
+    /// Handle-stack height when this scope opened; dropping the scope truncates back to it.
+    handle_base: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -567,12 +575,12 @@ pub(super) struct ProcessInput<'a> {
 /// Python process resumable. `Interp`, output descriptors, and the persistent Python heap are
 /// borrowed only while a scheduler quantum is being polled; operand and semantic stacks belong to
 /// the process continuation.
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct VmState {
-    stack: Vec<Value>,
+    stack: ValueStack,
     bytecode_frames: Vec<BytecodeFrame>,
-    local_scopes: Vec<ScopeId>,
-    class_scopes: Vec<ScopeId>,
+    local_scopes: Vec<Ref>,
+    class_scopes: Vec<Ref>,
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
@@ -587,8 +595,9 @@ struct VmState {
     /// any is active, natives finish blocking operations instead of suspending.
     synchronous_frames: usize,
     exception_stack: Vec<RaisedException>,
-    with_contexts: Vec<Value>,
-    method_frames: Vec<(super::heap::ObjectId, Value)>,
+    with_contexts: Vec<Ref>,
+    /// (class, receiver) pairs for frames executing a method, for zero-argument `super()`.
+    method_frames: Vec<(Ref, Ref)>,
     code_caches: Vec<CodeCaches>,
     stdin_position: usize,
     stdin_text: Option<String>,
@@ -601,20 +610,124 @@ struct VmState {
     /// Whether fd 0 has reported end-of-file. Once set, further reads only drain
     /// `stdin_stream_pending` and never touch the descriptor again.
     stdin_stream_eof: bool,
+    /// Host scratch charged by `reserve_result` while one instruction builds a result, released
+    /// at the next instruction boundary.
     transient_memory: u64,
+    /// Host bytes held by the VM itself across quanta (stdin text, pipe buffers), released when
+    /// the program completes.
     retained_memory: u64,
 }
 
-#[derive(Clone)]
+impl Clone for VmState {
+    fn clone(&self) -> Self {
+        Self {
+            stack: self.stack.clone(),
+            bytecode_frames: self.bytecode_frames.clone(),
+            local_scopes: self.local_scopes.iter().map(Ref::dup).collect(),
+            class_scopes: self.class_scopes.iter().map(Ref::dup).collect(),
+            class_bindings: self.class_bindings.clone(),
+            call_depth: self.call_depth,
+            pending_exception: self.pending_exception.clone(),
+            traceback_frames: self.traceback_frames.clone(),
+            pending_wait: self.pending_wait.clone(),
+            async_timer_deadlines: self.async_timer_deadlines.clone(),
+            native_suspend_allowed: self.native_suspend_allowed,
+            synchronous_frames: self.synchronous_frames,
+            exception_stack: self.exception_stack.clone(),
+            with_contexts: self.with_contexts.iter().map(Ref::dup).collect(),
+            method_frames: self
+                .method_frames
+                .iter()
+                .map(|(class, receiver)| (class.dup(), receiver.dup()))
+                .collect(),
+            code_caches: self.code_caches.clone(),
+            stdin_position: self.stdin_position,
+            stdin_text: self.stdin_text.clone(),
+            stdin_stream_pending: self.stdin_stream_pending.clone(),
+            stdin_stream_eof: self.stdin_stream_eof,
+            transient_memory: self.transient_memory,
+            retained_memory: self.retained_memory,
+        }
+    }
+}
+
+impl Roots for VmState {
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        self.stack.visit_refs(visitor);
+        for slot in self
+            .local_scopes
+            .iter_mut()
+            .chain(&mut self.class_scopes)
+            .chain(&mut self.with_contexts)
+        {
+            visitor(slot);
+        }
+        if let Some(exception) = &mut self.pending_exception {
+            visitor(&mut exception.value);
+        }
+        for exception in &mut self.exception_stack {
+            visitor(&mut exception.value);
+        }
+        for (class, receiver) in &mut self.method_frames {
+            visitor(class);
+            visitor(receiver);
+        }
+        for caches in &mut self.code_caches {
+            if let Some(attributes) = &mut caches.attributes {
+                for cache in attributes.iter_mut().flatten() {
+                    visitor(&mut cache.class);
+                }
+            }
+        }
+        for frame in &mut self.bytecode_frames {
+            match &mut frame.pending_native_call {
+                Some(PendingNativeCall::Function { arguments, .. }) => {
+                    arguments.visit_refs(visitor);
+                }
+                Some(PendingNativeCall::Method {
+                    receiver,
+                    arguments,
+                    ..
+                }) => {
+                    visitor(receiver);
+                    arguments.visit_refs(visitor);
+                }
+                Some(PendingNativeCall::Input { .. }) | None => {}
+            }
+        }
+    }
+}
+
 struct CodeCaches {
     code: CodeRef,
     names: Vec<Option<SymbolId>>,
     attributes: Option<Vec<Option<LoadAttributeCache>>>,
 }
 
-#[derive(Clone, Copy)]
+impl Clone for CodeCaches {
+    fn clone(&self) -> Self {
+        Self {
+            code: self.code.clone(),
+            names: self.names.clone(),
+            attributes: self.attributes.as_ref().map(|caches| {
+                caches
+                    .iter()
+                    .map(|cache| {
+                        cache.as_ref().map(|cache| LoadAttributeCache {
+                            class: cache.class.dup(),
+                            location: cache.location,
+                        })
+                    })
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// One `LoadAttribute` site's last shaped lookup: valid while the receiver has this class and
+/// shape.
 struct LoadAttributeCache {
-    class: ObjectId,
+    class: Ref,
     location: InstanceAttributeSlot,
 }
 
@@ -649,13 +762,13 @@ enum DispatchControl {
     Complete(Execution),
 }
 
-/// Result of classifying one arena-backed iterator at its mutation boundary.
-enum IteratorAdvance {
-    Yield(Value),
+/// Result of classifying one heap iterator at its mutation boundary.
+enum IteratorAdvance<'s> {
+    Yield(Value<'s>),
     Exhausted,
     Callable {
-        callable: Value,
-        sentinel: Value,
+        callable: Value<'s>,
+        sentinel: Value<'s>,
     },
     Generator,
     /// An object of a class that defines `__next__`, advanced by calling it.
@@ -672,11 +785,63 @@ pub(super) enum ForIterOutcome {
     Blocked(crate::scheduler::WaitReason),
 }
 
-enum BuiltinSubscript {
-    Value(Value),
-    Mapping { factory: Option<Value> },
+enum BuiltinSubscript<'s> {
+    Value(Value<'s>),
+    Mapping { factory: Option<Value<'s>> },
     Set,
     Unsupported,
+}
+
+/// What [`Vm::iterable_values`] read from a heap object before it starts running guest code.
+enum MaterializeSource<'s> {
+    Values(Vec<Value<'s>>),
+    Range(i64, i64, i64),
+    StoredIterator,
+    Callable {
+        callable: Value<'s>,
+        sentinel: Value<'s>,
+        exhausted: bool,
+    },
+    Generator,
+    Instance,
+    NotIterable,
+}
+
+/// Distinct set members in first-seen order with their hashes, from [`Vm::distinct_members`].
+/// Hashing and comparison run guest code that can allocate, so members stay handles until
+/// [`Self::into_set`] stores them inside an allocation or mutation builder.
+pub(super) struct HashedMembers<'s>(Vec<(KeyHash, Value<'s>)>);
+
+impl HashedMembers<'_> {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(super) fn into_set(self, builder: &Builder<'_>) -> OrderedSet {
+        let mut set = OrderedSet::default();
+        for (hash, member) in self.0 {
+            set.push(hash, builder.store(member));
+        }
+        set
+    }
+}
+
+/// Deduplicated dict entries in first-seen key order with their key hashes, from
+/// [`Vm::ordered_map`]; [`Self::into_map`] stores them inside a builder.
+pub(super) struct HashedEntries<'s>(Vec<(KeyHash, Value<'s>, Value<'s>)>);
+
+impl HashedEntries<'_> {
+    pub(super) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(super) fn into_map(self, builder: &Builder<'_>) -> OrderedMap {
+        let mut map = OrderedMap::default();
+        for (hash, key, value) in self.0 {
+            map.push(hash, (builder.store(key), builder.store(value)));
+        }
+        map
+    }
 }
 
 #[inline(always)]
@@ -725,23 +890,107 @@ impl DispatchCursor {
 /// wake retries exactly the native operation without repeating Python-visible argument work.
 /// Both module-level functions and bound methods (e.g. `sys.stdin.readline()`) can suspend, so
 /// this covers either shape of native call.
-#[derive(Clone)]
 enum PendingNativeCall {
     Function {
         function: &'static FunctionDef,
-        arguments: CallArgs,
+        arguments: StoredCallArgs,
         call_span: super::source::Span,
     },
     Method {
         method: &'static super::native::MethodDef,
-        receiver: Value,
-        arguments: CallArgs,
+        receiver: Ref,
+        arguments: StoredCallArgs,
         call_span: super::source::Span,
     },
     /// `input()`: not a table-driven native call, but it reads the same modeled stdin stream and
     /// so can suspend the same way. The prompt (if any) is already written by the time this is
     /// installed, so retrying only re-attempts the read.
     Input { call_span: super::source::Span },
+}
+
+impl Clone for PendingNativeCall {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Function {
+                function,
+                arguments,
+                call_span,
+            } => Self::Function {
+                function,
+                arguments: arguments.clone(),
+                call_span: *call_span,
+            },
+            Self::Method {
+                method,
+                receiver,
+                arguments,
+                call_span,
+            } => Self::Method {
+                method,
+                receiver: receiver.dup(),
+                arguments: arguments.clone(),
+                call_span: *call_span,
+            },
+            Self::Input { call_span } => Self::Input {
+                call_span: *call_span,
+            },
+        }
+    }
+}
+
+/// Native call arguments kept across a scheduler suspension, as stored references.
+struct StoredCallArgs {
+    positional: Vec<Ref>,
+    keywords: Vec<(String, Ref)>,
+}
+
+impl StoredCallArgs {
+    fn store(vm: &Vm<'_>, arguments: &CallArgs<'_>) -> Self {
+        Self {
+            positional: arguments
+                .positional()
+                .iter()
+                .map(|value| vm.store(*value))
+                .collect(),
+            keywords: arguments
+                .keywords()
+                .iter()
+                .map(|(name, value)| (name.clone(), vm.store(*value)))
+                .collect(),
+        }
+    }
+
+    fn load<'s>(&self, vm: &Vm<'s>) -> CallArgs<'s> {
+        CallArgs::new(
+            vm.handles(&self.positional),
+            self.keywords
+                .iter()
+                .map(|(name, value)| (name.clone(), vm.handle(value)))
+                .collect(),
+        )
+    }
+
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        for slot in &mut self.positional {
+            visitor(slot);
+        }
+        for (_, slot) in &mut self.keywords {
+            visitor(slot);
+        }
+    }
+}
+
+impl Clone for StoredCallArgs {
+    fn clone(&self) -> Self {
+        Self {
+            positional: self.positional.iter().map(Ref::dup).collect(),
+            keywords: self
+                .keywords
+                .iter()
+                .map(|(name, value)| (name.clone(), value.dup()))
+                .collect(),
+        }
+    }
 }
 
 impl PendingNativeCall {
@@ -761,9 +1010,9 @@ struct FunctionReturn {
     pop_method_frame: bool,
 }
 
-struct FunctionInvocation {
-    arguments: Vec<Value>,
-    keyword_arguments: Vec<(String, Value)>,
+struct FunctionInvocation<'s> {
+    arguments: Vec<Value<'s>>,
+    keyword_arguments: Vec<(String, Value<'s>)>,
     mode: CallMode,
     pop_method_frame: bool,
 }
@@ -782,16 +1031,17 @@ impl DerefMut for Vm<'_> {
     }
 }
 
-impl<'a> Vm<'a> {
+impl<'s> Vm<'s> {
     fn new(
-        interp: &'a mut Interp,
-        input: ProcessInput<'a>,
-        state: &'a mut ReplState,
-        execution: &'a mut VmState,
+        interp: &'s mut Interp,
+        input: ProcessInput<'s>,
+        state: &'s mut ReplState,
+        execution: &'s mut VmState,
         mode: VmMode,
-        out: Out<'a>,
-        err: Out<'a>,
+        out: Out<'s>,
+        err: Out<'s>,
     ) -> Self {
+        let handle_base = state.heap.handle_count();
         Self {
             interp,
             argv: input.argv,
@@ -801,47 +1051,8 @@ impl<'a> Vm<'a> {
             mode,
             out,
             err,
+            handle_base,
         }
-    }
-
-    fn collect_heap(&mut self) -> Result<(), String> {
-        let mut values = self.state.globals.values().collect::<Vec<_>>();
-        values.extend(self.state.modules.values().copied());
-        values.extend(self.state.sys_path);
-        values.extend(self.state.types.heap_roots());
-        values.extend(self.stack.iter().copied());
-        values.extend(self.with_contexts.iter().copied());
-        if let Some(exception) = &self.pending_exception {
-            values.push(exception.value);
-        }
-        values.extend(self.exception_stack.iter().map(|exception| exception.value));
-        for (owner, value) in &self.method_frames {
-            values.extend([Value::Object(*owner), *value]);
-        }
-        for frame in &self.bytecode_frames {
-            if let Some(pending) = &frame.pending_native_call {
-                let arguments = match pending {
-                    PendingNativeCall::Function { arguments, .. } => arguments,
-                    PendingNativeCall::Method {
-                        receiver,
-                        arguments,
-                        ..
-                    } => {
-                        values.push(*receiver);
-                        arguments
-                    }
-                    PendingNativeCall::Input { .. } => continue,
-                };
-                values.extend(arguments.positional().iter().copied());
-                values.extend(arguments.keywords().iter().map(|(_, value)| *value));
-            }
-        }
-        let mut scopes = self.local_scopes.clone();
-        scopes.extend(self.class_scopes.iter().copied());
-        self.state
-            .heap
-            .collect(&values, &scopes, &mut self.interp.resources)?;
-        Ok(())
     }
 
     fn release_transient_memory(&mut self) {
@@ -893,7 +1104,8 @@ impl<'a> Vm<'a> {
                         .pending_exception
                         .as_ref()
                         .expect("SystemExit exception checked above");
-                    let rendered = protocol::display(&self.state.heap, &exception.value)
+                    let value = self.handle(&exception.value);
+                    let rendered = protocol::display(self.state, value)
                         .unwrap_or_else(|_| "SystemExit".to_string());
                     let status = rendered.parse::<i32>().unwrap_or_else(|_| {
                         self.err.extend_from_slice(rendered.as_bytes());
@@ -920,10 +1132,10 @@ impl<'a> Vm<'a> {
         // `protocol::display` renders a message-less builtin exception as its type name (to match
         // `print(exc)` elsewhere), which would duplicate the type name we print explicitly below.
         // Read the raw message instead so an empty `ValueError()` prints as bare `ValueError`.
-        let message = match protocol::exception_parts(&self.state.heap, &exception.value) {
+        let value = self.handle(&exception.value);
+        let message = match protocol::exception_parts(self.state, value) {
             Ok(Some((_, message))) => message,
-            _ => protocol::display(&self.state.heap, &exception.value)
-                .unwrap_or_else(|_| String::new()),
+            _ => protocol::display(self.state, value).unwrap_or_else(|_| String::new()),
         };
         let filename = self.traceback_filename();
         let frames = std::mem::take(&mut self.traceback_frames);
@@ -971,11 +1183,11 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn allocate_object(&mut self, object: Object) -> Result<Value, String> {
-        self.state.heap.allocate(object, &mut self.interp.resources)
+    fn allocate_object(&mut self, object: Object) -> Result<Value<'s>, String> {
+        self.alloc(object)
     }
 
-    fn allocate_string(&mut self, value: String) -> Result<Value, String> {
+    fn allocate_string(&mut self, value: String) -> Result<Value<'s>, String> {
         if let Some(value) = Value::inline_string(&value) {
             Ok(value)
         } else {
@@ -983,42 +1195,45 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn allocate_bytes(&mut self, value: Vec<u8>) -> Result<Value, String> {
+    fn allocate_bytes(&mut self, value: Vec<u8>) -> Result<Value<'s>, String> {
         self.allocate_object(Object::Bytes(value))
     }
 
-    fn allocate_bytearray(&mut self, value: Vec<u8>) -> Result<Value, String> {
+    fn allocate_bytearray(&mut self, value: Vec<u8>) -> Result<Value<'s>, String> {
         self.allocate_object(Object::ByteArray(value))
     }
 
     /// A builtin exception whose only argument is `message`, or with no arguments when the
     /// message is empty, as the VM and native code raise them.
-    fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value, String> {
+    fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value<'s>, String> {
         let args = if message.is_empty() {
             Vec::new()
         } else {
             vec![self.allocate_string(message)?]
         };
-        self.allocate_object(Object::Exception { kind, args })
+        self.alloc_with(|builder| Object::Exception {
+            kind,
+            args: builder.refs(args),
+        })
     }
 
     /// Raise a builtin exception with the constructor arguments `args`.
-    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> String {
-        let value = match self.allocate_object(Object::Exception {
+    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value<'s>>) -> String {
+        let value = match self.alloc_with(|builder| Object::Exception {
             kind: kind.to_string(),
-            args,
+            args: builder.refs(args),
         }) {
             Ok(value) => value,
             Err(error) => return error,
         };
-        let message = protocol::exception_parts(&self.state.heap, &value)
+        let message = protocol::exception_parts(self.state, value)
             .ok()
             .flatten()
             .map(|(_, message)| message)
             .unwrap_or_default();
         self.pending_exception = Some(RaisedException {
             kind: kind.to_string(),
-            value,
+            value: self.store(value),
         });
         message
     }
@@ -1031,7 +1246,7 @@ impl<'a> Vm<'a> {
     }
 
     /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
-    fn raise_object_type_error(&mut self, value: &Value, complaint: &str) -> String {
+    fn raise_object_type_error(&mut self, value: &Value<'s>, complaint: &str) -> String {
         match self.type_name_of(value) {
             Ok(name) => self.raise_exception("TypeError", format!("'{name}' object {complaint}")),
             Err(error) => error,
@@ -1039,14 +1254,14 @@ impl<'a> Vm<'a> {
     }
 
     /// The type name CPython prints in error messages, such as `int` or a user class name.
-    fn type_name_of(&self, value: &Value) -> Result<String, String> {
-        if let Some((kind, _)) = protocol::exception_parts(&self.state.heap, value)? {
+    fn type_name_of(&self, value: &Value<'s>) -> Result<String, String> {
+        if let Some((kind, _)) = protocol::exception_parts(self.state, *value)? {
             return Ok(kind);
         }
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
     }
 
-    fn value_from_constant(&mut self, value: &Constant) -> Result<Value, String> {
+    fn value_from_constant(&mut self, value: &Constant) -> Result<Value<'s>, String> {
         Ok(match value {
             Constant::None => Value::None,
             Constant::Ellipsis => Value::Native(NativeValue::Ellipsis),
@@ -1069,7 +1284,7 @@ impl<'a> Vm<'a> {
         })
     }
 
-    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value>, String> {
+    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value<'s>>, String> {
         let count = range_length(start, stop, step)?;
         let start = i128::from(start);
         let step = i128::from(step);
@@ -1093,7 +1308,7 @@ impl<'a> Vm<'a> {
         Ok(values)
     }
 
-    fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+    fn iterable_values(&mut self, value: &Value<'s>) -> Result<Vec<Value<'s>>, String> {
         if self.is_unbounded_iterator(value)? {
             return Err("cannot materialize infinite itertools.count without a bound".into());
         }
@@ -1104,55 +1319,75 @@ impl<'a> Vm<'a> {
             }
             return Ok(result);
         }
-        if let Some(value) = protocol::builtin_payload(&self.state.heap, value)? {
+        if let Some(value) = protocol::builtin_payload(&self.state.heap, *value)? {
             return self.iterable_values(&value);
         }
         let mut result = Vec::new();
-        if let Some(value) = protocol::string_value(&self.state.heap, value)? {
+        if let Some(value) = protocol::string_value(&self.state.heap, *value)? {
             for character in value.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut result, character)?;
             }
-        } else if let Some(value) = protocol::bytes_value(&self.state.heap, value)? {
+        } else if let Some(value) = protocol::bytes_value(&self.state.heap, *value)? {
             for byte in value {
                 self.push_materialized(&mut result, Value::Int(i64::from(byte)))?;
             }
-        } else if let Some(id) = value.object_id() {
-            match self.state.heap.get(id)?.clone() {
+        } else if value.is_object() {
+            let source = match self.get(*value)? {
                 Object::List(values) | Object::Tuple(values) => {
-                    for value in values {
-                        self.push_materialized(&mut result, value)?;
-                    }
+                    MaterializeSource::Values(self.handles(values))
                 }
                 Object::Set(values) | Object::FrozenSet(values) => {
-                    for value in values {
-                        self.push_materialized(&mut result, value)?;
-                    }
+                    MaterializeSource::Values(self.handles(values.iter()))
                 }
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                    for (key, _) in entries {
-                        self.push_materialized(&mut result, key)?;
-                    }
+                    MaterializeSource::Values(self.handles(entries.iter().map(|(key, _)| key)))
                 }
                 Object::Range { start, stop, step } => {
-                    for value in self.range_values(start, stop, step)? {
-                        self.push_materialized(&mut result, value)?;
-                    }
+                    MaterializeSource::Range(*start, *stop, *step)
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
                 | Object::ReverseIterator { .. }
-                | Object::RangeIterator { .. } => {
-                    while let Some(value) = self.next_stored_iterator(id)? {
-                        self.push_materialized(&mut result, value)?;
-                    }
-                }
+                | Object::RangeIterator { .. } => MaterializeSource::StoredIterator,
                 Object::CountIterator { .. } => {
                     return Err(
                         "cannot materialize infinite itertools.count without a bound".into(),
                     )
                 }
                 Object::CallableIterator {
+                    callable,
+                    sentinel,
+                    exhausted,
+                } => MaterializeSource::Callable {
+                    callable: self.handle(callable),
+                    sentinel: self.handle(sentinel),
+                    exhausted: *exhausted,
+                },
+                Object::Generator { .. } => MaterializeSource::Generator,
+                Object::Class(class_object) if !class_object.enum_members.is_empty() => {
+                    MaterializeSource::Values(self.handles(&class_object.enum_members))
+                }
+                Object::Instance { .. } => MaterializeSource::Instance,
+                _ => MaterializeSource::NotIterable,
+            };
+            match source {
+                MaterializeSource::Values(values) => {
+                    for value in values {
+                        self.push_materialized(&mut result, value)?;
+                    }
+                }
+                MaterializeSource::Range(start, stop, step) => {
+                    for value in self.range_values(start, stop, step)? {
+                        self.push_materialized(&mut result, value)?;
+                    }
+                }
+                MaterializeSource::StoredIterator => {
+                    while let Some(item) = self.next_stored_iterator(*value)? {
+                        self.push_materialized(&mut result, item)?;
+                    }
+                }
+                MaterializeSource::Callable {
                     callable,
                     sentinel,
                     exhausted,
@@ -1168,7 +1403,7 @@ impl<'a> Vm<'a> {
                             .map_err(|error| error.to_string())?;
                             if self.values_equal(&item, &sentinel)? {
                                 if let Object::CallableIterator { exhausted, .. } =
-                                    self.state.heap.get_mut(id)?
+                                    self.get_mut(*value)?
                                 {
                                     *exhausted = true;
                                 }
@@ -1178,17 +1413,12 @@ impl<'a> Vm<'a> {
                         }
                     }
                 }
-                Object::Generator { .. } => {
-                    while let Some(value) = self.resume_generator(id)? {
-                        self.push_materialized(&mut result, value)?;
+                MaterializeSource::Generator => {
+                    while let Some(item) = self.resume_generator(*value)? {
+                        self.push_materialized(&mut result, item)?;
                     }
                 }
-                Object::Class(class_object) if !class_object.enum_members.is_empty() => {
-                    for value in class_object.enum_members {
-                        self.push_materialized(&mut result, value)?;
-                    }
-                }
-                Object::Instance { .. }
+                MaterializeSource::Instance
                     if self
                         .state
                         .types
@@ -1197,7 +1427,9 @@ impl<'a> Vm<'a> {
                 {
                     self.legacy_sequence_values(value, &mut result)?;
                 }
-                _ => return Err(self.raise_object_type_error(value, "is not iterable")),
+                MaterializeSource::Instance | MaterializeSource::NotIterable => {
+                    return Err(self.raise_object_type_error(value, "is not iterable"))
+                }
             }
         } else {
             return Err(self.raise_object_type_error(value, "is not iterable"));
@@ -1205,14 +1437,11 @@ impl<'a> Vm<'a> {
         Ok(result)
     }
 
-    fn is_unbounded_iterator(&self, value: &Value) -> Result<bool, String> {
-        let Some(id) = value.object_id() else {
+    fn is_unbounded_iterator(&self, value: &Value<'s>) -> Result<bool, String> {
+        if !value.is_object() {
             return Ok(false);
-        };
-        Ok(matches!(
-            self.state.heap.get(id)?,
-            Object::CountIterator { .. }
-        ))
+        }
+        Ok(matches!(self.get(*value)?, Object::CountIterator { .. }))
     }
 
     /// Iterate an instance without `__iter__` through CPython's legacy sequence protocol:
@@ -1221,8 +1450,8 @@ impl<'a> Vm<'a> {
     /// `__getitem__` that never raises exhausts the CPU budget instead of looping forever.
     fn legacy_sequence_values(
         &mut self,
-        value: &Value,
-        result: &mut Vec<Value>,
+        value: &Value<'s>,
+        result: &mut Vec<Value<'s>>,
     ) -> Result<(), String> {
         let mut index: i64 = 0;
         loop {
@@ -1233,7 +1462,8 @@ impl<'a> Vm<'a> {
                     let Some(exception) = self.pending_exception.as_ref() else {
                         return Err(error);
                     };
-                    let kind = match self.user_exception_base(&exception.value)? {
+                    let exception_value = self.handle(&exception.value);
+                    let kind = match self.user_exception_base(&exception_value)? {
                         Some(base) => base,
                         None => exception.kind.as_str(),
                     };
@@ -1252,11 +1482,15 @@ impl<'a> Vm<'a> {
         }
     }
 
-    fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> Result<(), String> {
+    fn push_materialized(
+        &mut self,
+        values: &mut Vec<Value<'s>>,
+        value: Value<'s>,
+    ) -> Result<(), String> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
-        let payload = protocol::string_ref(&self.state.heap, &value)?
+        let payload = protocol::string_ref(&self.state.heap, value)?
             .map_or(0, |text| text.byte_len().saturating_mul(2));
         self.reserve_result(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;
@@ -1266,17 +1500,18 @@ impl<'a> Vm<'a> {
 
     /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
     /// keep them. Each candidate is hashed once and compared only with members of equal hash.
-    fn distinct_members(&mut self, candidates: Vec<Value>) -> Result<OrderedSet, String> {
-        let mut members = OrderedSet::default();
+    fn distinct_members(
+        &mut self,
+        candidates: Vec<Value<'s>>,
+    ) -> Result<HashedMembers<'s>, String> {
+        let mut members = Vec::new();
+        let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for candidate in candidates {
             let hash = self.hash_value(&candidate)?;
             let mut present = false;
             // `members` is local, so a guest `__eq__` cannot change the candidate positions.
-            for index in 0..members.candidate_positions(hash).len() {
-                let position = members.candidate_positions(hash)[index];
-                let member = *members
-                    .get(position)
-                    .ok_or("set member position out of range")?;
+            for position in index.get(&hash).cloned().unwrap_or_default() {
+                let (_, member) = members[position];
                 self.charge_cpu(1)?;
                 if self.values_equal(&member, &candidate)? {
                     present = true;
@@ -1284,25 +1519,26 @@ impl<'a> Vm<'a> {
                 }
             }
             if !present {
-                members.push(hash, candidate);
+                index.entry(hash).or_default().push(members.len());
+                members.push((hash, candidate));
             }
         }
-        Ok(members)
+        Ok(HashedMembers(members))
     }
 
-    /// Dict storage for `entries` in order. A repeated key keeps its first position and takes
+    /// Dict entries for `entries` in order. A repeated key keeps its first position and takes
     /// the last value, as a dict display does.
-    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> Result<OrderedMap, String> {
-        let mut map = OrderedMap::default();
+    fn ordered_map(
+        &mut self,
+        entries: Vec<(Value<'s>, Value<'s>)>,
+    ) -> Result<HashedEntries<'s>, String> {
+        let mut map: Vec<(KeyHash, Value<'s>, Value<'s>)> = Vec::new();
+        let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for (key, value) in entries {
             let hash = self.hash_value(&key)?;
             let mut existing = None;
-            for index in 0..map.candidate_positions(hash).len() {
-                let position = map.candidate_positions(hash)[index];
-                let member = map
-                    .get(position)
-                    .ok_or("dict entry position out of range")?
-                    .0;
+            for position in index.get(&hash).cloned().unwrap_or_default() {
+                let member = map[position].1;
                 self.charge_cpu(1)?;
                 if self.values_equal(&member, &key)? {
                     existing = Some(position);
@@ -1310,26 +1546,29 @@ impl<'a> Vm<'a> {
                 }
             }
             match existing {
-                Some(position) => map.set_value(position, value),
-                None => map.push(hash, (key, value)),
+                Some(position) => map[position].2 = value,
+                None => {
+                    index.entry(hash).or_default().push(map.len());
+                    map.push((hash, key, value));
+                }
             }
         }
-        Ok(map)
+        Ok(HashedEntries(map))
     }
 
     /// Allocate a dict holding `entries`, deduplicated as [`Self::ordered_map`] does.
-    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, String> {
+    fn allocate_dict(&mut self, entries: Vec<(Value<'s>, Value<'s>)>) -> Result<Value<'s>, String> {
         let entries = self.ordered_map(entries)?;
-        self.allocate_object(Object::Dict(entries))
+        self.alloc_with(|builder| Object::Dict(entries.into_map(builder)))
     }
 
     /// The position of the entry whose key equals `needle`.
     fn find_mapping_entry(
         &mut self,
-        id: ObjectId,
-        needle: &Value,
+        mapping: Value<'s>,
+        needle: &Value<'s>,
     ) -> Result<Option<usize>, String> {
-        Ok(self.lookup_mapping_entry(id, needle)?.1)
+        Ok(self.lookup_mapping_entry(mapping, needle)?.1)
     }
 
     /// `needle`'s hash and the position of the entry whose key equals it. Hashing and a user
@@ -1337,11 +1576,11 @@ impl<'a> Vm<'a> {
     /// before it is compared.
     fn lookup_mapping_entry(
         &mut self,
-        id: ObjectId,
-        needle: &Value,
+        mapping: Value<'s>,
+        needle: &Value<'s>,
     ) -> Result<(KeyHash, Option<usize>), String> {
         let hash = self.hash_value(needle)?;
-        let candidates = match self.state.heap.get(id)? {
+        let candidates = match self.get(mapping)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 entries.candidate_positions(hash).to_vec()
             }
@@ -1349,9 +1588,9 @@ impl<'a> Vm<'a> {
         };
         for position in candidates {
             self.charge_cpu(1)?;
-            let candidate = match self.state.heap.get(id)? {
+            let candidate = match self.get(mapping)? {
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                    entries.get(position).map(|entry| entry.0)
+                    entries.get(position).map(|entry| self.handle(&entry.0))
                 }
                 _ => return Err("dict handle changed object kind".into()),
             };
@@ -1366,28 +1605,32 @@ impl<'a> Vm<'a> {
     }
 
     /// The position of the member equal to `needle`.
-    fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
-        Ok(self.lookup_set_entry(id, needle)?.1)
+    fn find_set_entry(
+        &mut self,
+        set: Value<'s>,
+        needle: &Value<'s>,
+    ) -> Result<Option<usize>, String> {
+        Ok(self.lookup_set_entry(set, needle)?.1)
     }
 
     /// `needle`'s hash and the position of the member equal to it, rereading each candidate
     /// because guest code may mutate the set during the comparison.
     fn lookup_set_entry(
         &mut self,
-        id: ObjectId,
-        needle: &Value,
+        set: Value<'s>,
+        needle: &Value<'s>,
     ) -> Result<(KeyHash, Option<usize>), String> {
         let hash = self.hash_value(needle)?;
-        let candidates = match self.state.heap.get(id)? {
+        let candidates = match self.get(set)? {
             Object::Set(values) | Object::FrozenSet(values) => {
                 values.candidate_positions(hash).to_vec()
             }
             _ => return Err("set handle changed object kind".into()),
         };
         for position in candidates {
-            let candidate = match self.state.heap.get(id)? {
+            let candidate = match self.get(set)? {
                 Object::Set(values) | Object::FrozenSet(values) => match values.get(position) {
-                    Some(value) => *value,
+                    Some(value) => self.handle(value),
                     None => continue,
                 },
                 _ => return Err("set handle changed object kind".into()),
@@ -1400,27 +1643,30 @@ impl<'a> Vm<'a> {
         Ok((hash, None))
     }
 
-    fn pop(&mut self) -> Result<Value, String> {
+    fn pop(&mut self) -> Result<Value<'s>, String> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
-        Ok(self.stack.pop().expect("non-empty frame stack was checked"))
+        Ok(self
+            .execution
+            .stack
+            .pop(&self.state.heap)
+            .expect("non-empty frame stack was checked"))
     }
 
-    fn take(&mut self, count: usize) -> Result<Vec<Value>, String> {
+    fn take(&mut self, count: usize) -> Result<Vec<Value<'s>>, String> {
         if self.frame_stack_len() < count {
             return Err("invalid bytecode stack effect".into());
         }
-        let start = self.stack.len() - count;
-        Ok(self.stack.split_off(start))
+        self.pop_many(count)
     }
 
     fn copy(&mut self, depth: usize) -> Result<(), String> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
-        let value = self.stack[self.stack.len() - depth];
-        self.stack.push(value);
+        let value = self.peek(depth - 1)?;
+        self.push(value);
         Ok(())
     }
 
@@ -1429,14 +1675,14 @@ impl<'a> Vm<'a> {
             return Err("invalid bytecode stack effect".into());
         }
         let value = self
+            .execution
             .stack
-            .last()
-            .cloned()
+            .peek(&self.state.heap, 0)
             .ok_or("invalid bytecode stack effect")?;
         if self.truth_value(&value)? == jump_when {
             Ok(true)
         } else {
-            self.stack.pop();
+            self.execution.stack.pop_ref();
             Ok(false)
         }
     }
@@ -1506,11 +1752,11 @@ impl<'a> Vm<'a> {
     }
 }
 
-enum CallResult {
-    Value(Value),
+enum CallResult<'s> {
+    Value(Value<'s>),
     Exit(i32),
     EnteredFrame,
-    Blocked(crate::scheduler::WaitReason, Value),
+    Blocked(crate::scheduler::WaitReason, Value<'s>),
     Retry(crate::scheduler::WaitReason, PendingNativeCall),
 }
 
@@ -1520,12 +1766,15 @@ enum CallMode {
     Deferred(super::source::Span),
 }
 
+/// Outcome of executing a frame. `Return` and `Yield` carry stored references because they
+/// cross the boundary of the scope that produced them; the receiver re-roots them with
+/// `Vm::handle` before anything can allocate.
 enum Execution {
     Pending,
     Blocked(crate::scheduler::WaitReason),
     Halt,
-    Return(Value),
-    Yield(Value, usize),
+    Return(Ref),
+    Yield(Ref, usize),
     Exit(i32),
 }
 
@@ -1537,16 +1786,16 @@ enum SequenceKind {
 
 /// Fully resolved inputs to the single class allocator shared by class statements and
 /// `type.__new__`.
-struct ClassDefinition {
+struct ClassDefinition<'s> {
     name: String,
-    bases: Vec<Value>,
-    mro: Vec<super::heap::ObjectId>,
-    metaclass: Value,
+    bases: Vec<Value<'s>>,
+    mro: Vec<Value<'s>>,
+    metaclass: Value<'s>,
     layout: ClassLayout,
     exception_base: Option<&'static str>,
-    attributes: HashMap<String, Value>,
-    dataclass_fields: Vec<(String, Option<Value>)>,
-    enum_members: Vec<Value>,
+    attributes: HashMap<String, Value<'s>>,
+    dataclass_fields: Vec<(String, Option<Value<'s>>)>,
+    enum_members: Vec<Value<'s>>,
 }
 
 fn select_string_slice(
@@ -1597,7 +1846,7 @@ fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
     usize::try_from(count).map_err(|_| "range is too large".into())
 }
 
-fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(), String> {
+fn expect_arity(arguments: &[Value<'_>], minimum: usize, maximum: usize) -> Result<(), String> {
     if (minimum..=maximum).contains(&arguments.len()) {
         Ok(())
     } else {

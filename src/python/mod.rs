@@ -5,6 +5,7 @@
 //! syntax fails explicitly; there is no host-Python or ad-hoc evaluation fallback.
 
 mod ast;
+mod attributes;
 mod bytecode;
 mod compiler;
 mod complex;
@@ -17,18 +18,19 @@ mod hash;
 mod heap;
 mod http;
 mod lexer;
-mod mapping;
 mod native;
 mod number;
 mod object_model;
 mod parser;
 mod process;
 mod protocol;
+mod scopes;
 mod slice;
 mod sort;
 mod source;
 mod stdlib;
 mod string;
+mod symbols;
 mod token;
 mod unicode;
 mod vm;
@@ -38,6 +40,7 @@ use std::collections::HashMap;
 use crate::interp::Interp;
 
 use ast::StatementKind;
+use heap::Value;
 
 type Out<'a> = &'a mut Vec<u8>;
 
@@ -53,328 +56,96 @@ pub(crate) fn is_bundled_distribution(name: &str) -> bool {
     matches!(name, "numpy" | "pytest" | "pytest_json_ctrf")
 }
 
-/// Physical storage discriminator kept separate from Python's semantic [`object_model::TypeId`].
-///
-/// Tags describe storage only. Python semantics come from the value's registered `TypeId`, so a
-/// short string and a heap string have the same Python type despite different physical tags.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-#[repr(u8)]
-enum ValueTag {
-    SmallString0,
-    SmallString1,
-    SmallString2,
-    SmallString3,
-    SmallString4,
-    SmallString5,
-    SmallString6,
-    SmallString7,
-    SmallString8,
-    SmallString9,
-    SmallString10,
-    SmallString11,
-    SmallString12,
-    SmallString13,
-    SmallString14,
-    SmallString15,
-    Int,
-    Float,
-    Bool,
-    None,
-    Object,
-    Native,
-    Registered,
-}
-
-/// Compact, copyable Python value used by the VM and native-module ABI.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(C)]
-struct Value {
-    payload: u64,
-    aux: [u8; 7],
-    tag: ValueTag,
-}
-
-impl Value {
-    #[allow(non_snake_case)]
-    const fn Int(value: i64) -> Self {
-        Self {
-            payload: value as u64,
-            aux: [0; 7],
-            tag: ValueTag::Int,
-        }
-    }
-
-    #[allow(non_snake_case)]
-    const fn Float(value: f64) -> Self {
-        Self {
-            payload: value.to_bits(),
-            aux: [0; 7],
-            tag: ValueTag::Float,
-        }
-    }
-
-    #[allow(non_snake_case)]
-    const fn Bool(value: bool) -> Self {
-        Self {
-            payload: value as u64,
-            aux: [0; 7],
-            tag: ValueTag::Bool,
-        }
-    }
-
-    fn registered(kind: u8, payload: u64) -> Self {
-        let mut aux = [0; 7];
-        aux[0] = kind;
-        Self {
-            payload,
-            aux,
-            tag: ValueTag::Registered,
-        }
-    }
-
-    const fn registered_parts(&self) -> Option<(u8, u64)> {
-        match self.tag {
-            ValueTag::Registered => Some((self.aux[0], self.payload)),
-            _ => None,
-        }
-    }
-
-    #[allow(non_upper_case_globals)]
-    const None: Self = Self {
-        payload: 0,
-        aux: [0; 7],
-        tag: ValueTag::None,
-    };
-
-    #[allow(non_snake_case)]
-    const fn Object(value: heap::ObjectId) -> Self {
-        Self {
-            payload: value.as_raw() as u64,
-            aux: [0; 7],
-            tag: ValueTag::Object,
-        }
-    }
-
-    #[allow(non_snake_case)]
-    fn Native(value: vm::NativeValue) -> Self {
-        let (payload, native_tag) = value.encode();
-        let mut aux = [0; 7];
-        aux[0] = native_tag;
-        Self {
-            payload,
-            aux,
-            tag: ValueTag::Native,
-        }
-    }
-
-    fn inline_string(value: &str) -> Option<Self> {
-        if value.len() > 15 {
-            return None;
-        }
-        let mut bytes = [0; 15];
-        bytes[..value.len()].copy_from_slice(value.as_bytes());
-        let mut payload = [0; 8];
-        payload.copy_from_slice(&bytes[..8]);
-        let mut aux = [0; 7];
-        aux.copy_from_slice(&bytes[8..]);
-        Some(Self {
-            payload: u64::from_ne_bytes(payload),
-            aux,
-            tag: string_tag(value.len()),
-        })
-    }
-
-    fn inline_string_value(&self) -> Option<String> {
-        Some(self.inline_string_ref()?.as_str().to_owned())
-    }
-
-    fn inline_string_ref(&self) -> Option<string::InlineString> {
-        let length = self.inline_string_len()?;
-        let mut bytes = [0; 15];
-        bytes[..8].copy_from_slice(&self.payload.to_ne_bytes());
-        bytes[8..].copy_from_slice(&self.aux);
-        Some(string::InlineString::from_parts(bytes, length))
-    }
-
-    const fn inline_string_len(&self) -> Option<usize> {
-        let raw = self.tag as u8;
-        if raw <= ValueTag::SmallString15 as u8 {
-            Some(raw as usize)
-        } else {
-            None
-        }
-    }
-
-    const fn tag(&self) -> ValueTag {
-        self.tag
-    }
-
-    const fn immediate_int(&self) -> Option<i64> {
-        match self.tag {
-            ValueTag::Int => Some(self.payload as i64),
-            ValueTag::Bool => Some(self.payload as i64),
-            _ => None,
-        }
-    }
-
-    const fn float_value(&self) -> Option<f64> {
-        match self.tag {
-            ValueTag::Float => Some(f64::from_bits(self.payload)),
-            _ => None,
-        }
-    }
-
-    const fn bool_value(&self) -> Option<bool> {
-        match self.tag {
-            ValueTag::Bool => Some(self.payload != 0),
-            _ => None,
-        }
-    }
-
-    const fn object_id(&self) -> Option<heap::ObjectId> {
-        match self.tag {
-            ValueTag::Object => Some(heap::ObjectId::from_raw(self.payload as usize)),
-            _ => None,
-        }
-    }
-
-    fn native_value(&self) -> Option<vm::NativeValue> {
-        match self.tag {
-            ValueTag::Native => Some(vm::NativeValue::decode(self.payload, self.aux[0])),
-            _ => None,
-        }
-    }
-
-    const fn is_none(&self) -> bool {
-        matches!(self.tag, ValueTag::None)
-    }
-
-    fn as_int(&self) -> Option<i64> {
-        if let Some(value) = self.immediate_int() {
-            return Some(value);
-        }
-        if let Some(value) = self.float_value().filter(|value| value.is_finite()) {
-            return Some(value as i64);
-        }
-        self.inline_string_value()?.parse().ok()
-    }
-}
-
-impl std::fmt::Debug for Value {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if let Some(value) = self.inline_string_value() {
-            return formatter.debug_tuple("String").field(&value).finish();
-        }
-        match self.tag {
-            ValueTag::Int => formatter
-                .debug_tuple("Int")
-                .field(&(self.payload as i64))
-                .finish(),
-            ValueTag::Float => formatter
-                .debug_tuple("Float")
-                .field(&f64::from_bits(self.payload))
-                .finish(),
-            ValueTag::Bool => formatter
-                .debug_tuple("Bool")
-                .field(&(self.payload != 0))
-                .finish(),
-            ValueTag::None => formatter.write_str("None"),
-            ValueTag::Object => formatter
-                .debug_tuple("Object")
-                .field(&self.object_id())
-                .finish(),
-            ValueTag::Native => formatter
-                .debug_tuple("Native")
-                .field(&self.native_value())
-                .finish(),
-            ValueTag::Registered => formatter
-                .debug_struct("Registered")
-                .field("kind", &self.aux[0])
-                .field("payload", &self.payload)
-                .finish(),
-            _ => unreachable!("small strings returned above"),
-        }
-    }
-}
-
-const fn string_tag(length: usize) -> ValueTag {
-    match length {
-        0 => ValueTag::SmallString0,
-        1 => ValueTag::SmallString1,
-        2 => ValueTag::SmallString2,
-        3 => ValueTag::SmallString3,
-        4 => ValueTag::SmallString4,
-        5 => ValueTag::SmallString5,
-        6 => ValueTag::SmallString6,
-        7 => ValueTag::SmallString7,
-        8 => ValueTag::SmallString8,
-        9 => ValueTag::SmallString9,
-        10 => ValueTag::SmallString10,
-        11 => ValueTag::SmallString11,
-        12 => ValueTag::SmallString12,
-        13 => ValueTag::SmallString13,
-        14 => ValueTag::SmallString14,
-        15 => ValueTag::SmallString15,
-        _ => panic!("inline string length exceeds payload"),
-    }
-}
-
-const _: () = assert!(std::mem::size_of::<Value>() == 16);
-
-#[cfg(test)]
-mod value_layout_tests {
-    use super::*;
-
-    #[test]
-    fn compact_values_are_exactly_sixteen_bytes() {
-        assert_eq!(std::mem::size_of::<Value>(), 16);
-        assert_eq!(
-            Value::inline_string("123456789012345")
-                .unwrap()
-                .inline_string_len(),
-            Some(15)
-        );
-        assert!(Value::inline_string("1234567890123456").is_none());
-    }
-}
-
 /// Persistent locals for the deliberately-small foreground Python REPL.
-#[derive(Clone, Default, Debug)]
+#[derive(Default, Debug)]
 pub struct ReplState {
     globals: GlobalBindings,
     heap: heap::Heap,
+    symbols: symbols::Symbols,
+    shapes: attributes::Shapes,
     types: object_model::TypeRegistry,
-    modules: HashMap<String, Value>,
+    modules: HashMap<String, heap::Ref>,
     import_paths: Vec<String>,
-    sys_path: Option<Value>,
+    sys_path: Option<heap::Ref>,
     temporary_import_paths: Vec<String>,
     original_cwd: Option<String>,
     type_memory: u64,
 }
 
-#[derive(Clone, Default, Debug)]
+impl Clone for ReplState {
+    fn clone(&self) -> Self {
+        Self {
+            globals: self.globals.clone(),
+            heap: self.heap.clone(),
+            symbols: self.symbols.clone(),
+            shapes: self.shapes.clone(),
+            types: self.types.clone(),
+            modules: self
+                .modules
+                .iter()
+                .map(|(name, module)| (name.clone(), module.dup()))
+                .collect(),
+            import_paths: self.import_paths.clone(),
+            sys_path: self.sys_path.as_ref().map(heap::Ref::dup),
+            temporary_import_paths: self.temporary_import_paths.clone(),
+            original_cwd: self.original_cwd.clone(),
+            type_memory: self.type_memory,
+        }
+    }
+}
+
+/// The flat global table of the entry-point script or REPL, indexed by symbol.
+#[derive(Default, Debug)]
 struct GlobalBindings {
-    values: Vec<Option<Value>>,
+    values: Vec<Option<heap::Ref>>,
     modeled_bytes: u64,
+}
+
+impl Clone for GlobalBindings {
+    fn clone(&self) -> Self {
+        Self {
+            values: self
+                .values
+                .iter()
+                .map(|value| value.as_ref().map(heap::Ref::dup))
+                .collect(),
+            modeled_bytes: self.modeled_bytes,
+        }
+    }
+}
+
+impl heap::Roots for GlobalBindings {
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut heap::Ref)) {
+        for value in self.values.iter_mut().flatten() {
+            visitor(value);
+        }
+    }
 }
 
 impl GlobalBindings {
     #[inline(always)]
-    fn get(&self, symbol: heap::SymbolId) -> Option<Value> {
-        self.values.get(symbol.index()).copied().flatten()
+    fn get<'s>(&self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
+        heap.handle_optional(self.values.get(symbol.index()).and_then(Option::as_ref))
+    }
+
+    /// The stored reference of a binding, for pushing onto the operand stack directly.
+    #[inline(always)]
+    fn get_ref(&self, symbol: symbols::SymbolId) -> Option<&heap::Ref> {
+        self.values.get(symbol.index()).and_then(Option::as_ref)
     }
 
     #[inline(always)]
     fn insert(
         &mut self,
-        symbol: heap::SymbolId,
-        value: Value,
+        heap: &heap::Heap,
+        symbol: symbols::SymbolId,
+        value: Value<'_>,
         resources: &mut crate::resources::Resources,
     ) -> Result<(), String> {
         if self.values.len() <= symbol.index() {
             self.grow(symbol, resources)?;
         }
-        self.values[symbol.index()] = Some(value);
+        self.values[symbol.index()] = Some(heap.store(value));
         Ok(())
     }
 
@@ -382,7 +153,7 @@ impl GlobalBindings {
     #[inline(never)]
     fn grow(
         &mut self,
-        symbol: heap::SymbolId,
+        symbol: symbols::SymbolId,
         resources: &mut crate::resources::Resources,
     ) -> Result<(), String> {
         let required_len = symbol
@@ -392,7 +163,7 @@ impl GlobalBindings {
         let added = required_len - self.values.len();
         let bytes = u64::try_from(added)
             .unwrap_or(u64::MAX)
-            .checked_mul(std::mem::size_of::<Value>() as u64)
+            .checked_mul(std::mem::size_of::<heap::Ref>() as u64)
             .ok_or("global binding size overflow")?;
         let modeled_bytes = self
             .modeled_bytes
@@ -401,32 +172,33 @@ impl GlobalBindings {
         if !resources.reserve_memory(bytes) {
             return Err("memory limit exceeded".into());
         }
-        self.values.resize(required_len, None);
+        self.values.resize_with(required_len, || None);
         self.modeled_bytes = modeled_bytes;
         Ok(())
     }
 
-    fn remove(&mut self, symbol: heap::SymbolId) -> Option<Value> {
-        self.values.get_mut(symbol.index()).and_then(Option::take)
-    }
-
-    fn values(&self) -> impl Iterator<Item = Value> + '_ {
-        self.values.iter().flatten().copied()
+    fn remove<'s>(&mut self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
+        let removed = self.values.get_mut(symbol.index()).and_then(Option::take);
+        heap.handle_optional(removed.as_ref())
     }
 
     /// Every populated `(name, value)` binding, resolved through the heap's symbol table, for
     /// `globals()` on the entry-point script or REPL. Slot order here just follows `SymbolId`
     /// allocation order, not Python's per-dict insertion order; callers that need a stable order
     /// sort the result themselves.
-    fn entries(&self, heap: &heap::Heap) -> Vec<(String, Value)> {
+    fn entries<'s>(
+        &self,
+        heap: &heap::Heap,
+        symbols: &symbols::Symbols,
+    ) -> Vec<(String, Value<'s>)> {
         self.values
             .iter()
             .enumerate()
             .filter_map(|(index, value)| {
-                let value = (*value)?;
-                let symbol = heap::SymbolId::from_index(index)?;
-                let name = heap.symbol_name(symbol)?.to_string();
-                Some((name, value))
+                let value = value.as_ref()?;
+                let symbol = symbols::SymbolId::from_index(index)?;
+                let name = symbols.name(symbol)?.to_string();
+                Some((name, heap.handle(value)))
             })
             .collect()
     }
@@ -455,6 +227,8 @@ impl ReplState {
         let heap = self.heap.take_modeled_bytes();
         resources.release_memory(
             heap.saturating_add(self.globals.take_modeled_bytes())
+                .saturating_add(self.symbols.take_modeled_bytes())
+                .saturating_add(self.shapes.take_modeled_bytes())
                 .saturating_add(std::mem::take(&mut self.type_memory)),
         );
     }
@@ -658,13 +432,14 @@ pub(crate) fn start_python(
         }
     };
     state.import_paths.push(import_root);
-    let name_symbol = match state.heap.intern_symbol("__name__", &mut interp.resources) {
+    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
         Ok(symbol) => symbol,
         Err(_) => return PythonCommandStart::Ready(137),
     };
     if state
         .globals
         .insert(
+            &state.heap,
             name_symbol,
             Value::inline_string("__main__").expect("short builtin string"),
             &mut interp.resources,
@@ -677,25 +452,29 @@ pub(crate) fn start_python(
         .first()
         .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
     {
+        // No VM scope exists yet, so release the handle once the global table holds the value.
+        let handle_base = state.heap.handle_count();
         let file = match Value::inline_string(script) {
             Some(value) => value,
-            None => match state.heap.allocate(
+            // The fresh state's only references are its globals.
+            None => match state.heap.alloc(
                 heap::Object::String(script.clone().into()),
+                &mut state.globals,
                 &mut interp.resources,
             ) {
                 Ok(value) => value,
                 Err(_) => return PythonCommandStart::Ready(137),
             },
         };
-        let file_symbol = match state.heap.intern_symbol("__file__", &mut interp.resources) {
+        let file_symbol = match state.symbols.intern("__file__", &mut interp.resources) {
             Ok(symbol) => symbol,
             Err(_) => return PythonCommandStart::Ready(137),
         };
-        if state
+        let inserted = state
             .globals
-            .insert(file_symbol, file, &mut interp.resources)
-            .is_err()
-        {
+            .insert(&state.heap, file_symbol, file, &mut interp.resources);
+        state.heap.truncate_handles(handle_base);
+        if inserted.is_err() {
             return PythonCommandStart::Ready(137);
         }
     }
@@ -1701,16 +1480,18 @@ mod tests {
             memory: 32,
             ..Limits::unlimited()
         });
-        let mut heap = heap::Heap::default();
-        let symbol = heap.intern_symbol("x", &mut resources).unwrap();
+        let heap = heap::Heap::default();
+        let symbol = symbols::Symbols::default()
+            .intern("x", &mut resources)
+            .unwrap();
         let mut globals = GlobalBindings::default();
 
         assert_eq!(
             globals
-                .insert(symbol, Value::Int(1), &mut resources)
+                .insert(&heap, symbol, Value::Int(1), &mut resources)
                 .unwrap_err(),
             "memory limit exceeded"
         );
-        assert_eq!(globals.get(symbol), None);
+        assert!(globals.get(&heap, symbol).is_none());
     }
 }

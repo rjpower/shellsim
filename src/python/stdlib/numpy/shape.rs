@@ -37,7 +37,7 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
 
 const fn function(
     name: &'static str,
-    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
+    call: for<'s> fn(&mut dyn PyRuntime<'s>, CallArgs<'s>) -> PyResult<'s>,
 ) -> FunctionDef {
     FunctionDef {
         module: "numpy",
@@ -59,7 +59,7 @@ static FUNCTIONS: &[FunctionDef] = &[
 
 const fn method(
     name: &'static str,
-    call: fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult,
+    call: for<'s> fn(&mut dyn PyRuntime<'s>, PyValue<'s>, CallArgs<'s>) -> PyResult<'s>,
 ) -> MethodDef {
     MethodDef {
         type_name: "numpy.ndarray",
@@ -88,25 +88,37 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn method_squeeze(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_squeeze<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     super::reduce::python_method(runtime, "numpy._shapes", "squeeze", receiver, args)
 }
 
-fn method_swapaxes(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_swapaxes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     super::reduce::python_method(runtime, "numpy._shapes", "swapaxes", receiver, args)
 }
 
-fn method_trace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_trace<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     super::reduce::python_method(runtime, "numpy._shapes", "trace", receiver, args)
 }
 
 /// Normalize `axis` against rank `ndim`, raising NumPy's `AxisError`. `prefix` names the
 /// argument in the message, as in `axis1: axis 3 is out of bounds for array of dimension 2`.
-pub(in crate::python) fn axis_index(
+pub(in crate::python) fn axis_index<'s>(
     axis: i64,
     ndim: usize,
     prefix: Option<&str>,
-) -> PyResult<usize> {
+) -> PyResult<'s, usize> {
     array::normalize_axis(axis, ndim).map_err(|error| match prefix {
         Some(prefix) => PyError::exception("AxisError", format!("{prefix}: {}", error.message)),
         None => error,
@@ -114,10 +126,10 @@ pub(in crate::python) fn axis_index(
 }
 
 /// Items of a tuple or list, or `None` for any other value.
-pub(in crate::python) fn sequence_items(
-    runtime: &mut dyn PyRuntime,
-    value: &PyValue,
-) -> PyResult<Option<Vec<PyValue>>> {
+pub(in crate::python) fn sequence_items<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Vec<PyValue<'s>>>> {
     Ok(match runtime.kind(value)? {
         PyKind::Tuple => {
             let tuple = value.cast(runtime)?;
@@ -133,7 +145,10 @@ pub(in crate::python) fn sequence_items(
 
 /// Items of an iterable argument (tuple, list, ndarray, generator), or `None` for a value that
 /// is not iterable. This is NumPy's `tuple(value)` with a fallback for scalars.
-fn iterable_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Vec<PyValue>>> {
+fn iterable_items<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Vec<PyValue<'s>>>> {
     if let Some(items) = sequence_items(runtime, value)? {
         return Ok(Some(items));
     }
@@ -170,7 +185,7 @@ fn iterable_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Opti
 }
 
 /// Integers from an int or an iterable of ints, as `tuple(value)` or `(value,)` in NumPy.
-fn int_list(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Vec<i64>> {
+fn int_list<'s>(runtime: &mut dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, Vec<i64>> {
     match iterable_items(runtime, value)? {
         Some(items) => items
             .iter()
@@ -181,7 +196,10 @@ fn int_list(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Vec<i64>> 
 }
 
 /// `_normalize_axis_index(axis, ndim, msg_prefix=None)`, for the frozen Python composites.
-fn module_normalize_axis_index(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_normalize_axis_index<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("normalize_axis_index", &["axis", "ndim", "msg_prefix"], 2);
     let bound = SIGNATURE.bind(&args)?;
@@ -196,7 +214,7 @@ fn module_normalize_axis_index(runtime: &mut dyn PyRuntime, args: CallArgs) -> P
 }
 
 /// `A` order means Fortran order for arrays that are only Fortran-contiguous.
-fn resolve_any_order(array: &Array, order: Order) -> Order {
+fn resolve_any_order<'s>(array: &Array<'s>, order: Order) -> Order {
     match order {
         Order::A if layout::is_fortran(array) => Order::F,
         Order::A => Order::C,
@@ -205,7 +223,10 @@ fn resolve_any_order(array: &Array, order: Order) -> Order {
 }
 
 /// Resolve a requested shape, which may contain one `-1`, against `size` elements.
-pub(in crate::python) fn resolve_shape(requested: &[i64], size: usize) -> PyResult<Vec<usize>> {
+pub(in crate::python) fn resolve_shape<'s>(
+    requested: &[i64],
+    size: usize,
+) -> PyResult<'s, Vec<usize>> {
     if requested
         .iter()
         .filter(|dimension| **dimension == -1)
@@ -239,7 +260,7 @@ pub(in crate::python) fn resolve_shape(requested: &[i64], size: usize) -> PyResu
             -1 => Ok(size / known),
             dimension => Ok(dimension as usize),
         })
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     if shape.iter().product::<usize>() != size {
         return Err(mismatch());
     }
@@ -318,11 +339,11 @@ fn nocopy_strides(
 }
 
 /// A C-order view of `array` with `shape`, when the layout allows one.
-fn reshape_view(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn reshape_view<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     shape: &[usize],
-) -> PyResult<Option<Array>> {
+) -> PyResult<'s, Option<Array<'s>>> {
     let strides = if array.is_c_contiguous() {
         Some(array::contiguous_strides(shape, array.itemsize()))
     } else {
@@ -343,13 +364,13 @@ fn reshape_view(
 }
 
 /// `reshape` with NumPy's `order` and `copy` (`None`: copy only when needed).
-fn reshape_with(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn reshape_with<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     requested: &[i64],
     order: Order,
     copy: Option<bool>,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let shape = resolve_shape(requested, array.size())?;
     array::element_count(&shape)?;
     match resolve_any_order(array, order) {
@@ -389,7 +410,10 @@ fn reshape_with(
 
 /// Parse `reshape(2, 3)`, `reshape((2, 3))`, `reshape([2, 3])`, or an integer array, as
 /// `PyArray_IntpConverter` does.
-fn requested_shape(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<Vec<i64>> {
+fn requested_shape<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    values: &[PyValue<'s>],
+) -> PyResult<'s, Vec<i64>> {
     let values = match values {
         [single] => iterable_items(runtime, single)?.unwrap_or_else(|| vec![*single]),
         values => values.to_vec(),
@@ -401,7 +425,10 @@ fn requested_shape(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<
 }
 
 /// `copy=None | bool` as used by `reshape`.
-fn copy_arg(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Option<bool>> {
+fn copy_arg<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: Option<PyValue<'s>>,
+) -> PyResult<'s, Option<bool>> {
     match value {
         None => Ok(None),
         Some(value) if value.is_none() => Ok(None),
@@ -409,7 +436,11 @@ fn copy_arg(runtime: &mut dyn PyRuntime, value: Option<PyValue>) -> PyResult<Opt
     }
 }
 
-fn method_reshape(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_reshape<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.reject_unknown_keywords("reshape", &["order", "copy", "shape"])?;
     let array = Array::from_value(runtime, receiver)?;
     let mut positional = args.positional().to_vec();
@@ -431,7 +462,7 @@ fn method_reshape(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
     Ok(reshape_with(runtime, &array, &requested, order, copy)?.value())
 }
 
-fn module_reshape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_reshape<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("reshape", &["a", "shape", "order"], 1).keyword_only(&["newshape", "copy"]);
     let bound = SIGNATURE.bind(&args)?;
@@ -450,7 +481,11 @@ fn module_reshape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 /// `array` as one dimension in `order`: a view when the layout allows, otherwise a copy.
 /// `K` reads elements in memory order: axes sorted by decreasing absolute stride.
-fn ravel_order(runtime: &mut dyn PyRuntime, array: &Array, order: Order) -> PyResult<Array> {
+fn ravel_order<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    order: Order,
+) -> PyResult<'s, Array<'s>> {
     match resolve_any_order(array, order) {
         Order::C | Order::A => array::ravel(runtime, array),
         Order::F => {
@@ -465,7 +500,11 @@ fn ravel_order(runtime: &mut dyn PyRuntime, array: &Array, order: Order) -> PyRe
     }
 }
 
-fn method_ravel(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_ravel<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("ravel", &["order"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -473,7 +512,7 @@ fn method_ravel(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     Ok(ravel_order(runtime, &array, order)?.value())
 }
 
-fn module_ravel(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_ravel<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("ravel", &["a", "order"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -482,7 +521,11 @@ fn module_ravel(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 /// `a.flatten(order='C')`: always a copy.
-fn method_flatten(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_flatten<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("flatten", &["order"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -492,7 +535,11 @@ fn method_flatten(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs
 }
 
 /// A view with the axes of `array` in `order`, which must be a permutation.
-fn permute(runtime: &mut dyn PyRuntime, array: &Array, order: &[usize]) -> PyResult<Array> {
+fn permute<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    order: &[usize],
+) -> PyResult<'s, Array<'s>> {
     let shape = order.iter().map(|axis| array.shape()[*axis]).collect();
     let strides = order.iter().map(|axis| array.strides()[*axis]).collect();
     array::new_view(
@@ -506,11 +553,11 @@ fn permute(runtime: &mut dyn PyRuntime, array: &Array, order: &[usize]) -> PyRes
 }
 
 /// A view with axes permuted; `axes` defaults to reversing them.
-pub(in crate::python) fn transpose(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn transpose<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     axes: Option<Vec<i64>>,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let ndim = array.ndim();
     let order = match axes {
         None => (0..ndim).rev().collect::<Vec<_>>(),
@@ -521,7 +568,7 @@ pub(in crate::python) fn transpose(
             let order = axes
                 .iter()
                 .map(|axis| array::normalize_axis(*axis, ndim))
-                .collect::<PyResult<Vec<_>>>()?;
+                .collect::<PyResult<'s, Vec<_>>>()?;
             let mut seen = vec![false; ndim];
             for axis in &order {
                 if std::mem::replace(&mut seen[*axis], true) {
@@ -534,7 +581,10 @@ pub(in crate::python) fn transpose(
     permute(runtime, array, &order)
 }
 
-fn transpose_axes(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<Option<Vec<i64>>> {
+fn transpose_axes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    values: &[PyValue<'s>],
+) -> PyResult<'s, Option<Vec<i64>>> {
     match values {
         [] => Ok(None),
         [single] if single.is_none() => Ok(None),
@@ -542,14 +592,18 @@ fn transpose_axes(runtime: &mut dyn PyRuntime, values: &[PyValue]) -> PyResult<O
     }
 }
 
-fn method_transpose(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_transpose<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.reject_keywords("transpose")?;
     let array = Array::from_value(runtime, receiver)?;
     let axes = transpose_axes(runtime, args.positional())?;
     Ok(transpose(runtime, &array, axes)?.value())
 }
 
-fn module_transpose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_transpose<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("transpose", &["a", "axes"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -562,7 +616,11 @@ fn module_transpose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 
 /// `a.resize(new_shape)` changes an array's storage in place, which shellsim's array model
 /// does not allow; `np.resize` returns a new array instead.
-fn method_resize(_runtime: &mut dyn PyRuntime, _receiver: PyValue, _args: CallArgs) -> PyResult {
+fn method_resize<'s>(
+    _runtime: &mut dyn PyRuntime<'s>,
+    _receiver: PyValue<'s>,
+    _args: CallArgs<'s>,
+) -> PyResult<'s> {
     Err(PyError::not_implemented_error(
         "ndarray.resize is not supported: arrays cannot change size in place; use np.resize",
     ))

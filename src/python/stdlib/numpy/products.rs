@@ -36,7 +36,7 @@ pub(in crate::python) static MODULE: ModuleDef = ModuleDef {
 
 const fn function(
     name: &'static str,
-    call: fn(&mut dyn PyRuntime, CallArgs) -> PyResult,
+    call: for<'s> fn(&mut dyn PyRuntime<'s>, CallArgs<'s>) -> PyResult<'s>,
 ) -> FunctionDef {
     FunctionDef {
         module: "numpy",
@@ -86,11 +86,11 @@ impl Plan {
 }
 
 /// Offsets of a strided shape relative to its first element, after reserving their memory.
-fn offset_table(
-    runtime: &mut dyn PyRuntime,
+fn offset_table<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     shape: &[usize],
     strides: &[isize],
-) -> PyResult<Vec<isize>> {
+) -> PyResult<'s, Vec<isize>> {
     let count = array::element_count(shape)?;
     runtime.reserve_memory(count.saturating_mul(std::mem::size_of::<isize>()))?;
     runtime.charge_cpu(count as u64 / 8 + 1)?;
@@ -108,7 +108,11 @@ fn work_dtype(dtype: DType) -> DType {
 
 /// Cast an operand to the kernel's working dtype. Object operands are made C-contiguous so a
 /// relative byte offset divided by the slot size indexes the C-order snapshot of the array.
-fn prepare(runtime: &mut dyn PyRuntime, array: &Array, dtype: DType) -> PyResult<Array> {
+fn prepare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+    dtype: DType,
+) -> PyResult<'s, Array<'s>> {
     let cast = convert::cast_array(runtime, array, work_dtype(dtype), false)?;
     if cast.dtype.kind() == Kind::Object && !cast.is_c_contiguous() {
         return array::copy_array(runtime, &cast);
@@ -118,7 +122,7 @@ fn prepare(runtime: &mut dyn PyRuntime, array: &Array, dtype: DType) -> PyResult
 
 /// Promote two operand dtypes for a product; `str` operands have no product loop and raise
 /// `no_loop` instead.
-fn product_dtype(a: DType, b: DType, no_loop: impl Fn() -> PyError) -> PyResult<DType> {
+fn product_dtype<'s>(a: DType, b: DType, no_loop: impl Fn() -> PyError) -> PyResult<'s, DType> {
     if a.kind() == Kind::Str || b.kind() == Kind::Str {
         return Err(no_loop());
     }
@@ -128,15 +132,15 @@ fn product_dtype(a: DType, b: DType, no_loop: impl Fn() -> PyError) -> PyResult<
 /// Evaluate `plan` over `a` and `b`, already prepared for `dtype`, into a new array of `shape`.
 /// An object product with nothing to sum (an empty contraction axis) gives `0`, as `dot` and
 /// `matmul` do.
-fn run_plan(
-    runtime: &mut dyn PyRuntime,
+fn run_plan<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     name: &str,
-    a: &Array,
-    b: &Array,
+    a: &Array<'s>,
+    b: &Array<'s>,
     dtype: DType,
     plan: &Plan,
     shape: Vec<usize>,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let count = array::element_count(&shape)?;
     runtime.charge_cpu(plan.cost(count) + 1)?;
     if dtype.kind() == Kind::Object {
@@ -148,7 +152,7 @@ fn run_plan(
     let mut bytes = vec![0u8; count * work.itemsize()];
     let mut flags = FpFlags::default();
     let (a_start, b_start) = (a.view.offset as isize, b.view.offset as isize);
-    runtime.read_arrays(&[a.handle, b.handle], &mut |arrays| {
+    runtime.read_arrays(&[a.handle, b.handle], &mut |_, arrays| {
         let (PyArrayData::Bytes(left), PyArrayData::Bytes(right)) =
             (&arrays[0].data, &arrays[1].data)
         else {
@@ -218,13 +222,13 @@ fn narrow_to_half(bytes: &[u8], flags: &mut FpFlags) -> Vec<u8> {
 
 /// Object products through the Python operators, summing from the first product as NumPy's
 /// object loops do.
-fn object_products(
-    runtime: &mut dyn PyRuntime,
-    a: &Array,
-    b: &Array,
+fn object_products<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    a: &Array<'s>,
+    b: &Array<'s>,
     plan: &Plan,
     count: usize,
-) -> PyResult<Vec<PyValue>> {
+) -> PyResult<'s, Vec<PyValue<'s>>> {
     let left = array::read_objects(runtime, a)?;
     let right = array::read_objects(runtime, b)?;
     array::reserve_elements(runtime, DType::OBJECT, count)?;
@@ -254,18 +258,18 @@ fn object_products(
 
 /// Contract `a` and `b` over paired axes. The result's axes are `a`'s remaining axes followed
 /// by `b`'s, each in their original order. Callers check that paired axes have equal lengths.
-fn contract(
-    runtime: &mut dyn PyRuntime,
+fn contract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     name: &str,
-    a: &Array,
-    b: &Array,
+    a: &Array<'s>,
+    b: &Array<'s>,
     dtype: DType,
     a_axes: &[usize],
     b_axes: &[usize],
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let a = prepare(runtime, a, dtype)?;
     let b = prepare(runtime, b, dtype)?;
-    let free = |array: &Array, summed: &[usize]| -> (Vec<usize>, Vec<isize>) {
+    let free = |array: &Array<'s>, summed: &[usize]| -> (Vec<usize>, Vec<isize>) {
         (0..array.ndim())
             .filter(|axis| !summed.contains(axis))
             .map(|axis| (array.shape()[axis], array.strides()[axis]))
@@ -299,7 +303,7 @@ fn contract(
 }
 
 /// A 0-d result as the scalar NumPy returns; other arrays as themselves.
-fn scalar_or_array(runtime: &mut dyn PyRuntime, result: &Array) -> PyResult {
+fn scalar_or_array<'s>(runtime: &mut dyn PyRuntime<'s>, result: &Array<'s>) -> PyResult<'s> {
     if result.ndim() == 0 {
         return convert::element_to_scalar(runtime, result, result.view.offset);
     }
@@ -307,7 +311,12 @@ fn scalar_or_array(runtime: &mut dyn PyRuntime, result: &Array) -> PyResult {
 }
 
 /// `multiply(a, b)`, which `dot` and `inner` use when either operand is 0-d.
-fn multiply(runtime: &mut dyn PyRuntime, a: &Array, b: &Array, out: Option<Array>) -> PyResult {
+fn multiply<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    a: &Array<'s>,
+    b: &Array<'s>,
+    out: Option<Array<'s>>,
+) -> PyResult<'s> {
     let index = ufunc::find("multiply").expect("multiply is a ufunc");
     let options = ufunc::Options {
         out,
@@ -316,7 +325,7 @@ fn multiply(runtime: &mut dyn PyRuntime, a: &Array, b: &Array, out: Option<Array
     ufunc::apply(runtime, index, &[a.value(), b.value()], &options)
 }
 
-fn not_aligned(a: &Array, b: &Array, a_axis: usize, b_axis: usize) -> PyError {
+fn not_aligned<'s>(a: &Array<'s>, b: &Array<'s>, a_axis: usize, b_axis: usize) -> PyError {
     PyError::value_error(format!(
         "shapes {} and {} not aligned: {} (dim {a_axis}) != {} (dim {b_axis})",
         array::format_shape(a.shape()),
@@ -332,12 +341,12 @@ fn dot_unavailable() -> PyError {
 
 /// `np.dot(a, b, out=None)`: a sum product over the last axis of `a` and the second-to-last
 /// axis of `b` (its only axis when `b` is 1-D). A 0-d operand multiplies elementwise.
-fn dot(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-    out: Option<PyValue>,
-) -> PyResult {
+fn dot<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    out: Option<PyValue<'s>>,
+) -> PyResult<'s> {
     let a = convert::as_array(runtime, left)?;
     let b = convert::as_array(runtime, right)?;
     let out = out
@@ -370,7 +379,7 @@ fn dot(
     Ok(out.value())
 }
 
-fn module_dot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_dot<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("dot", &["a", "b", "out"], 2);
     let bound = SIGNATURE.bind(&args)?;
     dot(
@@ -381,23 +390,27 @@ fn module_dot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     )
 }
 
-fn method_dot(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn method_dot<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     static SIGNATURE: Signature = Signature::new("dot", &["b", "out"], 1);
     let bound = SIGNATURE.bind(&args)?;
     dot(runtime, receiver, bound.required("b"), bound.get("out"))
 }
 
 /// `a @ b` and `np.matmul(a, b)`.
-pub(in crate::python) fn matmul(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult {
+pub(in crate::python) fn matmul<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s> {
     matmul_values(runtime, left, right, None, None)
 }
 
 /// `np.matmul(x1, x2, /, out=None, *, casting='same_kind', order='K', dtype=None, subok=True)`.
-fn module_matmul(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn module_matmul<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     static SIGNATURE: Signature =
         Signature::new("matmul", &["x1", "x2", "out"], 2).keyword_only(&[
             "casting",
@@ -438,13 +451,13 @@ fn module_matmul(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     )
 }
 
-fn matmul_values(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
+fn matmul_values<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
     requested: Option<(DType, Casting)>,
-    out: Option<(Array, Casting)>,
-) -> PyResult {
+    out: Option<(Array<'s>, Casting)>,
+) -> PyResult<'s> {
     let a = convert::as_array(runtime, left)?;
     let b = convert::as_array(runtime, right)?;
     for (position, operand) in [&a, &b].into_iter().enumerate() {
@@ -547,7 +560,7 @@ fn matmul_values(
 }
 
 /// Strides of an operand's leading `rank` batch axes, broadcast to `batch`.
-fn batch_strides(array: &Array, rank: usize, batch: &[usize]) -> Vec<isize> {
+fn batch_strides<'s>(array: &Array<'s>, rank: usize, batch: &[usize]) -> Vec<isize> {
     let mut strides = vec![0isize; batch.len()];
     let extra = batch.len() - rank;
     for axis in 0..rank {
@@ -560,9 +573,9 @@ fn batch_strides(array: &Array, rank: usize, batch: &[usize]) -> Vec<isize> {
 
 /// NumPy's gufunc broadcasting error, which lists each operand's batch axes followed by one
 /// `newaxis` per core output axis.
-fn remapped_broadcast_error(a: &Array, b: &Array) -> PyError {
+fn remapped_broadcast_error<'s>(a: &Array<'s>, b: &Array<'s>) -> PyError {
     let core = usize::from(a.ndim() >= 2) + usize::from(b.ndim() >= 2);
-    let remapped = |array: &Array| {
+    let remapped = |array: &Array<'s>| {
         let batch = &array.shape()[..array.ndim().saturating_sub(2)];
         let parts = batch
             .iter()

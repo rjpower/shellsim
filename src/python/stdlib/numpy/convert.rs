@@ -39,7 +39,10 @@ pub(in crate::python) enum Leaf {
 }
 
 /// Classify one non-sequence Python value.
-pub(in crate::python) fn leaf(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<Leaf> {
+pub(in crate::python) fn leaf<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Leaf> {
     if let Some((dtype, number)) = scalar::unbox_number(runtime, value) {
         return Ok(Leaf::NumPy(dtype, number));
     }
@@ -74,7 +77,7 @@ pub(in crate::python) fn leaf(runtime: &dyn PyRuntime, value: &PyValue) -> PyRes
 
 impl Leaf {
     /// The dtype NumPy infers for this leaf on its own.
-    fn dtype(&self) -> PyResult<DType> {
+    fn dtype<'s>(&self) -> PyResult<'s, DType> {
         Ok(match self {
             Self::Bool(_) => DType::BOOL,
             Self::Int(value) if i64::try_from(*value).is_ok() => DType::INT64,
@@ -102,7 +105,7 @@ impl Leaf {
 
 /// Combine two inferred dtypes the way array construction does: strings absorb numbers at
 /// their printed width instead of failing.
-pub(in crate::python) fn infer_promote(left: DType, right: DType) -> PyResult<DType> {
+pub(in crate::python) fn infer_promote<'s>(left: DType, right: DType) -> PyResult<'s, DType> {
     match (left.category(), right.category()) {
         (Category::Str, Category::Str) | (Category::Object, _) | (_, Category::Object) => {
             dtype::promote(left, right)
@@ -114,13 +117,16 @@ pub(in crate::python) fn infer_promote(left: DType, right: DType) -> PyResult<DT
 }
 
 /// Nodes of one breadth-first level while discovering an array's shape.
-enum Level {
-    Values(Vec<PyValue>),
+enum Level<'s> {
+    Values(Vec<PyValue<'s>>),
     /// Every node was an ndarray of the same shape; their elements finish the shape.
-    Blocks(Vec<Array>),
+    Blocks(Vec<Array<'s>>),
 }
 
-fn sequence_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Option<Vec<PyValue>>> {
+fn sequence_items<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<Vec<PyValue<'s>>>> {
     match runtime.kind(value)? {
         PyKind::List => {
             let list = value.cast(runtime)?;
@@ -144,14 +150,17 @@ fn sequence_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Opti
     }
 }
 
-fn is_tuple_subclass(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<bool> {
+fn is_tuple_subclass<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, bool> {
     match runtime.builtin_payload(value)? {
         Some(payload) => Ok(runtime.kind(&payload)? == PyKind::Tuple),
         None => Ok(false),
     }
 }
 
-fn iterated_items(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<Vec<PyValue>> {
+fn iterated_items<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Vec<PyValue<'s>>> {
     let iterator = runtime.iterator(*value)?;
     let mut items = Vec::new();
     while let Some(item) = runtime.iterator_next(iterator)? {
@@ -171,11 +180,11 @@ fn inhomogeneous(shape: &[usize], depth: usize) -> PyError {
 }
 
 /// Discover the shape and leaves of a nested Python value.
-fn discover(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+fn discover<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     object_dtype: bool,
-) -> PyResult<(Vec<usize>, Level)> {
+) -> PyResult<'s, (Vec<usize>, Level<'s>)> {
     let mut shape = Vec::new();
     let mut nodes = vec![value];
     loop {
@@ -186,7 +195,7 @@ fn discover(
                     .then(|| Array::from_value(runtime, *node))
                     .transpose()
             })
-            .collect::<PyResult<Vec<_>>>()?;
+            .collect::<PyResult<'s, Vec<_>>>()?;
         if !nodes.is_empty() && arrays.iter().all(Option::is_some) {
             let blocks = arrays.into_iter().map(Option::unwrap).collect::<Vec<_>>();
             if blocks
@@ -250,7 +259,10 @@ fn discover(
 
 /// Split an array into Python values along its first axis: sub-array views, or scalars for
 /// 1-d arrays.
-fn array_rows(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<PyValue>> {
+fn array_rows<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
+) -> PyResult<'s, Vec<PyValue<'s>>> {
     let length = array.shape()[0];
     let mut rows = Vec::with_capacity(length);
     for index in 0..length {
@@ -274,12 +286,12 @@ fn array_rows(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<PyValu
 
 /// `np.array(value, dtype=dtype)`. An ndarray input is copied, or returned unchanged when
 /// `copy` is false and no cast is needed.
-pub(in crate::python) fn array_from_python(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+pub(in crate::python) fn array_from_python<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     dtype: Option<DType>,
     copy: bool,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     if runtime.native_kind(&value)? == Some(PyNativeKind::Array) {
         let array = Array::from_value(runtime, value)?;
         let target = dtype.unwrap_or(array.dtype);
@@ -304,8 +316,8 @@ pub(in crate::python) fn array_from_python(
             let mut output = buffer_with_capacity(target, count);
             for block in &blocks {
                 let block = cast_array(runtime, block, target, false)?;
-                runtime.read_arrays(&[block.handle], &mut |arrays| {
-                    gather_into(&arrays[0], block.offsets(), &mut output);
+                runtime.read_arrays(&[block.handle], &mut |refs, arrays| {
+                    gather_into(refs, &arrays[0], block.offsets(), &mut output);
                     Ok(())
                 })?;
             }
@@ -315,7 +327,7 @@ pub(in crate::python) fn array_from_python(
             let leaves = values
                 .iter()
                 .map(|value| leaf(runtime, value))
-                .collect::<PyResult<Vec<_>>>()?;
+                .collect::<PyResult<'s, Vec<_>>>()?;
             let target = match dtype {
                 Some(dtype) if dtype.kind() == Kind::Str && dtype.chars() == 0 => {
                     let mut widest = 1;
@@ -345,11 +357,11 @@ pub(in crate::python) fn array_from_python(
 }
 
 /// `np.array(arrays, dtype=str)` sizes the strings from the widest block.
-fn widen_unsized_str(
-    runtime: &mut dyn PyRuntime,
+fn widen_unsized_str<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     target: DType,
-    blocks: &[Array],
-) -> PyResult<DType> {
+    blocks: &[Array<'s>],
+) -> PyResult<'s, DType> {
     if target.kind() != Kind::Str || target.chars() != 0 {
         return Ok(target);
     }
@@ -361,7 +373,10 @@ fn widen_unsized_str(
 }
 
 /// `np.asarray(value)`: the array itself, or a new array.
-pub(in crate::python) fn as_array(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Array> {
+pub(in crate::python) fn as_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Array<'s>> {
     array_from_python(runtime, value, None, false)
 }
 
@@ -373,7 +388,7 @@ fn overflow(value: &dyn std::fmt::Display, dtype: DType) -> PyError {
 }
 
 /// Check that a Python int fits an integer dtype, as NumPy 2 does for weak ints.
-pub(in crate::python) fn checked_int(value: WideInt, dtype: DType) -> PyResult<Number> {
+pub(in crate::python) fn checked_int<'s>(value: WideInt, dtype: DType) -> PyResult<'s, Number> {
     let bits = dtype.kind().bits();
     let fits = match dtype.category() {
         Category::Signed => {
@@ -410,7 +425,11 @@ fn not_a_number(target: DType, type_name: &str) -> PyError {
 /// NaN for `None` in an inexact dtype, and otherwise the result of `int()`, `float()` or
 /// `complex()`, so `__float__`, `__index__` and 0-d arrays convert. Lists, tuples and arrays
 /// with dimensions are rejected first, as NumPy's element setters do.
-fn object_number(runtime: &mut dyn PyRuntime, value: &PyValue, target: DType) -> PyResult<Number> {
+fn object_number<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+    target: DType,
+) -> PyResult<'s, Number> {
     match target.category() {
         Category::Bool => return Ok(Number::Bool(runtime.truth(value)?)),
         Category::Float if value.is_none() => return Ok(Number::Float(f64::NAN)),
@@ -447,7 +466,7 @@ fn object_number(runtime: &mut dyn PyRuntime, value: &PyValue, target: DType) ->
 }
 
 /// The number a leaf stands for when stored into a numeric dtype.
-pub(in crate::python) fn leaf_number(leaf: &Leaf, target: DType) -> PyResult<Number> {
+pub(in crate::python) fn leaf_number<'s>(leaf: &Leaf, target: DType) -> PyResult<'s, Number> {
     let integer_target = target.is_integer();
     Ok(match leaf {
         Leaf::Bool(value) => Number::Bool(*value),
@@ -488,7 +507,7 @@ pub(in crate::python) fn leaf_number(leaf: &Leaf, target: DType) -> PyResult<Num
 }
 
 /// Parse text as NumPy does when casting strings to numbers.
-pub(in crate::python) fn parse_number(text: &str, target: DType) -> PyResult<Number> {
+pub(in crate::python) fn parse_number<'s>(text: &str, target: DType) -> PyResult<'s, Number> {
     let trimmed = text.trim();
     match target.category() {
         Category::Bool => Ok(Number::Bool(!text.is_empty())),
@@ -529,7 +548,11 @@ fn parse_float(text: &str) -> Result<f64, ()> {
 }
 
 /// Text a leaf becomes in a string array: Python `str()` of the value.
-fn leaf_text(runtime: &mut dyn PyRuntime, leaf: &Leaf, value: &PyValue) -> PyResult<String> {
+fn leaf_text<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    leaf: &Leaf,
+    value: &PyValue<'s>,
+) -> PyResult<'s, String> {
     Ok(match leaf {
         Leaf::Bool(value) => if *value { "True" } else { "False" }.to_string(),
         Leaf::Int(value) => value.to_string(),
@@ -567,12 +590,12 @@ pub(in crate::python) fn read_str(bytes: &[u8]) -> String {
 }
 
 /// Write converted leaves into new storage of `target`.
-fn write_leaves(
-    runtime: &mut dyn PyRuntime,
-    values: &[PyValue],
+fn write_leaves<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    values: &[PyValue<'s>],
     leaves: &[Leaf],
     target: DType,
-) -> PyResult<PyArrayBuffer> {
+) -> PyResult<'s, PyArrayBuffer<'s>> {
     reserve_elements(runtime, target, leaves.len())?;
     runtime.charge_cpu(leaves.len() as u64 + 1)?;
     Ok(match target.kind() {
@@ -605,22 +628,22 @@ fn write_leaves(
 }
 
 /// Encode one Python value as an element of `target`, for item assignment and `fill`.
-pub(in crate::python) fn value_to_buffer(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+pub(in crate::python) fn value_to_buffer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     target: DType,
-) -> PyResult<PyArrayBuffer> {
+) -> PyResult<'s, PyArrayBuffer<'s>> {
     let leaf = leaf(runtime, &value)?;
     write_leaves(runtime, &[value], &[leaf], target)
 }
 
 /// Box the element at byte `offset` of `array` as the value indexing returns: a NumPy scalar
 /// for numbers, `str` for strings, and the stored object for `object` arrays.
-pub(in crate::python) fn element_to_scalar(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn element_to_scalar<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offset: usize,
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     match read_element(runtime, array, offset)? {
         Element::Number(bytes) => scalar::box_bytes(runtime, array.dtype, &bytes),
         Element::Str(text) => runtime.new_string(text),
@@ -629,11 +652,11 @@ pub(in crate::python) fn element_to_scalar(
 }
 
 /// The builtin Python value `item()` and `tolist()` return for the element at `offset`.
-pub(in crate::python) fn element_to_python(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn element_to_python<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offset: usize,
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     match read_element(runtime, array, offset)? {
         Element::Number(bytes) => {
             let number = element::read_number(array.dtype.kind(), &bytes);
@@ -645,24 +668,24 @@ pub(in crate::python) fn element_to_python(
 }
 
 /// One element copied out of array storage.
-pub(in crate::python) enum Element {
+pub(in crate::python) enum Element<'s> {
     Number([u8; 16]),
     Str(String),
-    Object(PyValue),
+    Object(PyValue<'s>),
 }
 
-pub(in crate::python) fn read_element(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn read_element<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     offset: usize,
-) -> PyResult<Element> {
+) -> PyResult<'s, Element<'s>> {
     let itemsize = array.itemsize();
     let kind = array.dtype.kind();
     let mut element = None;
-    runtime.read_arrays(&[array.handle], &mut |arrays| {
+    runtime.read_arrays(&[array.handle], &mut |refs, arrays| {
         element = Some(match &arrays[0].data {
             PyArrayData::Values(values) => {
-                Element::Object(values[offset / PyArrayDtype::VALUE_ITEMSIZE])
+                Element::Object(refs.handle(&values[offset / PyArrayDtype::VALUE_ITEMSIZE]))
             }
             PyArrayData::Bytes(bytes) if kind == Kind::Str => {
                 Element::Str(read_str(&bytes[offset..offset + itemsize]))
@@ -680,12 +703,12 @@ pub(in crate::python) fn read_element(
 
 /// `array.astype(target)`: a converted copy, or `array` itself when no conversion or copy is
 /// needed. Casting is NumPy's `unsafe` rule: integers wrap, floats truncate toward zero.
-pub(in crate::python) fn cast_array(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn cast_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     target: DType,
     copy: bool,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let target = cast_target(runtime, array, target)?;
     if target == array.dtype && !copy {
         return Ok(array.clone());
@@ -696,12 +719,12 @@ pub(in crate::python) fn cast_array(
 
 /// `array` converted to `target` in new storage laid out in `axes` order (see
 /// [`super::layout`]). `target` must already be resolved by [`cast_target`].
-pub(in crate::python) fn cast_array_in(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn cast_array_in<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     target: DType,
     axes: &[usize],
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let source = layout::reading_order(array, axes);
     let buffer = if target == array.dtype {
         contiguous_buffer(runtime, &source)?
@@ -713,11 +736,11 @@ pub(in crate::python) fn cast_array_in(
 
 /// The dtype an `astype(target)` produces: an unsized `str` target is as wide as the widest
 /// element's text.
-pub(in crate::python) fn cast_target(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+pub(in crate::python) fn cast_target<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     target: DType,
-) -> PyResult<DType> {
+) -> PyResult<'s, DType> {
     if target.kind() != Kind::Str || target.chars() != 0 {
         return Ok(target);
     }
@@ -730,7 +753,7 @@ pub(in crate::python) fn cast_target(
 
 /// The longest `str()` of an `object` array's elements, which sizes an unsized `str` cast as
 /// NumPy's string discovery does.
-fn object_str_width(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<usize> {
+fn object_str_width<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'s, usize> {
     let mut widest = 0;
     for value in super::array::read_objects(runtime, array)? {
         widest = widest.max(runtime.display(&value)?.chars().count());
@@ -739,11 +762,11 @@ fn object_str_width(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<usiz
 }
 
 /// Convert every element of `array`, in C order, into new storage of `target`.
-fn cast_buffer(
-    runtime: &mut dyn PyRuntime,
-    array: &Array,
+fn cast_buffer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    array: &Array<'s>,
     target: DType,
-) -> PyResult<PyArrayBuffer> {
+) -> PyResult<'s, PyArrayBuffer<'s>> {
     let count = array.size();
     let source = array.dtype;
     if source.is_numeric() && target.is_numeric() {
@@ -751,7 +774,7 @@ fn cast_buffer(
         runtime.charge_cpu(count as u64 + 1)?;
         let mut output = vec![0u8; count * target.itemsize()];
         let (from, to, size) = (source.kind(), target.kind(), target.itemsize());
-        runtime.read_arrays(&[array.handle], &mut |arrays| {
+        runtime.read_arrays(&[array.handle], &mut |_refs, arrays| {
             let PyArrayData::Bytes(bytes) = arrays[0].data else {
                 return Err(PyError::runtime_error("numeric array has object storage"));
             };
@@ -799,15 +822,15 @@ fn cast_buffer(
     let leaves = values
         .iter()
         .map(|value| leaf(runtime, value))
-        .collect::<PyResult<Vec<_>>>()?;
+        .collect::<PyResult<'s, Vec<_>>>()?;
     write_leaves(runtime, &values, &leaves, target)
 }
 
 /// Whether `value` is a Python number usable as a weak scalar, and which kind.
-pub(in crate::python) fn weak_scalar(
-    runtime: &dyn PyRuntime,
-    value: &PyValue,
-) -> PyResult<Option<(dtype::Weak, Leaf)>> {
+pub(in crate::python) fn weak_scalar<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<(dtype::Weak, Leaf)>> {
     if scalar::unbox(runtime, value).is_some() {
         return Ok(None);
     }
@@ -822,12 +845,12 @@ pub(in crate::python) fn weak_scalar(
 
 /// A weak Python scalar as a 0-d array of the dtype chosen by promotion, checking that Python
 /// ints fit an integer target.
-pub(in crate::python) fn weak_array(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+pub(in crate::python) fn weak_array<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     leaf: &Leaf,
     target: DType,
-) -> PyResult<Array> {
+) -> PyResult<'s, Array<'s>> {
     let buffer = write_leaves(runtime, &[value], std::slice::from_ref(leaf), target)?;
     new_array(runtime, buffer, target, Vec::new())
 }

@@ -31,7 +31,7 @@ fn kind_name(kind: ParameterKind) -> &'static str {
     }
 }
 
-fn parameters(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn parameters<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("parameters", 1, 1)?;
     args.reject_keywords("parameters")?;
     let Some(parameters) = runtime.function_parameters(&args.positional()[0])? else {

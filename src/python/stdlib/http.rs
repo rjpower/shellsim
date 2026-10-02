@@ -20,7 +20,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn request(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn request<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_http.request", 4, 4)?;
     args.reject_keywords("_shellsim_http.request")?;
     let values = args.positional();

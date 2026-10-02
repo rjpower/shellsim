@@ -60,14 +60,14 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     }],
 };
 
-fn getcwd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn getcwd<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.getcwd", 0, 0)?;
     args.reject_keywords("os.getcwd")?;
     let directory = runtime.filesystem().current_dir();
     runtime.new_string(directory)
 }
 
-fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn chdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.chdir", 1, 1)?;
     args.reject_keywords("os.chdir")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -75,7 +75,7 @@ fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(Value::None)
 }
 
-fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn getenv<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.getenv", 1, 2)?;
     args.reject_keywords("os.getenv")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
@@ -86,19 +86,19 @@ fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     }
 }
 
-fn getpid(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn getpid<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.getpid", 0, 0)?;
     args.reject_keywords("os.getpid")?;
     Ok(Value::Int(i64::from(runtime.current_pid())))
 }
 
-fn getppid(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn getppid<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.getppid", 0, 0)?;
     args.reject_keywords("os.getppid")?;
     Ok(Value::Int(i64::from(runtime.current_ppid())))
 }
 
-fn kill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn kill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("os.kill", 2, 2)?;
     args.reject_keywords("os.kill")?;
     let pid = runtime
@@ -115,11 +115,15 @@ fn kill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     Ok(Value::None)
 }
 
-fn environ(runtime: &mut dyn PyRuntime) -> PyResult {
+fn environ<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
     Ok(runtime.marker(PyMarker::Environment))
 }
 
-fn environment_get(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
+fn environment_get<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    _receiver: Value<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("environ.get", 1, 2)?;
     args.reject_keywords("environ.get")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;

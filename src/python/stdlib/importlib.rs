@@ -33,14 +33,14 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
 
 /// `_importlib.import_module(name)`: import the module with absolute dotted `name` through the
 /// ordinary importer and return that module itself, not its top-level package.
-fn import_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn import_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_importlib.import_module", 1, 1)?;
     args.reject_keywords("_importlib.import_module")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     runtime.import_module(&name)
 }
 
-fn new_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn new_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_importlib.new_module", 4, 4)?;
     args.reject_keywords("_importlib.new_module")?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
@@ -48,7 +48,7 @@ fn new_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.new_module(name, path, args.positional()[2], args.positional()[3])
 }
 
-fn exec_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn exec_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_importlib.exec_module", 2, 2)?;
     args.reject_keywords("_importlib.exec_module")?;
     let module = args.positional()[0].cast::<PyModule>(runtime)?;

@@ -15,7 +15,6 @@ use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
     PyResult, PyRuntime, PyValue, ValueKindDef,
 };
-use super::ValueTag;
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
 #[derive(Clone, Copy, Debug)]
@@ -63,23 +62,27 @@ pub(super) fn numbers_equal(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
     }
 }
 
-pub(super) fn slot_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     Ok(numeric_slot_equality(runtime, left, right).map(PyValue::Bool))
 }
 
-pub(super) fn slot_not_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_not_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     Ok(numeric_slot_equality(runtime, left, right).map(|equal| PyValue::Bool(!equal)))
 }
 
-fn numeric_slot_equality(runtime: &dyn PyRuntime, left: PyValue, right: PyValue) -> Option<bool> {
+fn numeric_slot_equality<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> Option<bool> {
     let (Some(left), Some(right)) = (runtime.number(&left), runtime.number(&right)) else {
         return None;
     };
@@ -97,12 +100,12 @@ fn numeric_slot_accepts(left: NumberRef<'_>, right: NumberRef<'_>) -> bool {
     }
 }
 
-fn slot_numeric_order(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
+fn slot_numeric_order<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
     accepted: &[Ordering],
-) -> PyResult<Option<PyValue>> {
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (Some(left_number), Some(right_number)) = (runtime.number(&left), runtime.number(&right))
     else {
         return Ok(None);
@@ -119,35 +122,35 @@ fn slot_numeric_order(
     }
 }
 
-pub(super) fn slot_less(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_less<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_numeric_order(runtime, left, right, &[Ordering::Less])
 }
 
-pub(super) fn slot_less_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_less_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_numeric_order(runtime, left, right, &[Ordering::Less, Ordering::Equal])
 }
 
-pub(super) fn slot_greater(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_greater<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_numeric_order(runtime, left, right, &[Ordering::Greater])
 }
 
-pub(super) fn slot_greater_equal(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_greater_equal<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_numeric_order(runtime, left, right, &[Ordering::Greater, Ordering::Equal])
 }
 
@@ -162,14 +165,20 @@ pub(super) fn number_hash(number: NumberRef<'_>) -> i64 {
     }
 }
 
-pub(super) fn slot_hash(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_hash<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let Some(number) = runtime.number(&value) else {
         return Ok(None);
     };
     Ok(Some(PyValue::Int(number_hash(number))))
 }
 
-pub(super) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_bool<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let Some(number) = runtime.number(&value) else {
         return Ok(None);
     };
@@ -184,16 +193,17 @@ pub(super) fn slot_bool(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult
 }
 
 /// The kind and number of a registered value with a numeric view, such as a NumPy scalar.
-pub(super) fn registered_number(
+pub(super) fn registered_number<'s>(
     heap: &Heap,
-    value: &PyValue,
+    value: &PyValue<'s>,
 ) -> Option<(&'static ValueKindDef, KindNumber)> {
     let (index, payload) = match value.registered_parts() {
         Some((index, payload)) => (index, [payload, 0]),
-        None => match heap.get(value.object_id()?).ok()? {
+        None if value.is_object() => match heap.get(*value).ok()? {
             Object::WideValue { kind, payload, .. } => (*kind, *payload),
             _ => return None,
         },
+        None => return None,
     };
     let kind = super::stdlib::value_kind(index)?;
     Some((kind, (kind.numeric?)(kind, payload)?))
@@ -203,7 +213,7 @@ pub(super) fn registered_number(
 ///
 /// Registered values with a numeric view take part as the Python number they stand for, so a
 /// NumPy `int64` indexes a list and a NumPy `float64` formats like a float.
-pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
+pub(super) fn view<'s, 'a>(heap: &'a Heap, value: &PyValue<'s>) -> Option<NumberRef<'a>> {
     if let Some((_, number)) = registered_number(heap, value) {
         return Some(match number {
             KindNumber::Bool(value) => NumberRef::Int(i64::from(value)),
@@ -222,16 +232,23 @@ pub(super) fn view<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>>
     if let Some(value) = value.bool_value() {
         return Some(NumberRef::Int(i64::from(value)));
     }
-    if matches!(value.tag(), super::ValueTag::Int) {
-        return Some(NumberRef::Int(value.immediate_int().expect("tag checked")));
+    // Booleans returned above, so an immediate integer here is an `int`.
+    if let Some(value) = value.immediate_int() {
+        return Some(NumberRef::Int(value));
     }
-    match value.object_id().and_then(|id| heap.get(id).ok())? {
+    if !value.is_object() {
+        return None;
+    }
+    match heap.get(*value).ok()? {
         Object::BigInt(value) => Some(NumberRef::BigInt(value)),
         Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
         Object::Instance {
             payload: InstancePayload::Builtin(value),
             ..
-        } => view(heap, value),
+        } => {
+            let value: PyValue<'s> = heap.handle(value);
+            view(heap, &value)
+        }
         _ => None,
     }
 }
@@ -337,7 +354,11 @@ pub(super) static INT_CONSTRUCTOR: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn int_new(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+fn int_new<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     runtime.new_builtin_instance(super::object_model::BuiltinType::Int, receiver, args)
 }
 
@@ -374,7 +395,11 @@ pub(super) static FLOAT_TYPE: NativeTypeDef = NativeTypeDef {
 };
 
 /// `float.as_integer_ratio()`: the exact fraction in lowest terms with a positive denominator.
-fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn float_as_integer_ratio<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("float.as_integer_ratio", 0, 0)?;
     let Some(NumberRef::Float(value)) = runtime.number(&value) else {
         return Err(PyError::type_error(
@@ -426,7 +451,11 @@ fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: Cal
 /// (0.1).hex() == '0x1.999999999999ap-4'
 /// (5e-324).hex() == '0x0.0000000000001p-1022'
 /// ```
-fn float_hex(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn float_hex<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.reject_keywords("float.hex")?;
     if !args.positional().is_empty() {
         return Err(PyError::type_error(format!(
@@ -466,7 +495,11 @@ fn float_hex_text(value: f64) -> String {
 }
 
 /// `float.is_integer()`: whether a finite float has no fractional part.
-fn float_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn float_is_integer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("float.is_integer", 0, 0)?;
     let Some(NumberRef::Float(value)) = runtime.number(&value) else {
         return Err(PyError::type_error(
@@ -477,7 +510,7 @@ fn float_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs)
 }
 
 /// Return a real number as itself, normalizing `bool` and `int` subclasses to the equal `int`.
-fn real_part(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn real_part<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(match runtime.number(&value) {
         Some(NumberRef::Int(value)) => PyValue::Int(value),
         _ => value,
@@ -485,7 +518,7 @@ fn real_part(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
 }
 
 /// Return the zero imaginary component with the receiver's int-or-float result type.
-fn real_imaginary_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult {
+fn real_imaginary_part<'s>(_runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s> {
     Ok(if value.float_value().is_some() {
         PyValue::Float(0.0)
     } else {
@@ -493,18 +526,26 @@ fn real_imaginary_part(_runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult
     })
 }
 
-fn integer_denominator(_runtime: &mut dyn PyRuntime, _value: PyValue) -> PyResult {
+fn integer_denominator<'s>(_runtime: &mut dyn PyRuntime<'s>, _value: PyValue<'s>) -> PyResult<'s> {
     Ok(PyValue::Int(1))
 }
 
-fn real_conjugate(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn real_conjugate<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     args.expect_positional("conjugate", 0, 0)?;
     args.reject_keywords("conjugate")?;
     real_part(runtime, value)
 }
 
 /// The receiver of an `int` method as an exact integer; `bool` receivers are 0 or 1.
-fn integer_receiver(runtime: &dyn PyRuntime, value: &PyValue, method: &str) -> PyResult<BigInt> {
+fn integer_receiver<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+    method: &str,
+) -> PyResult<'s, BigInt> {
     runtime
         .number(value)
         .and_then(NumberRef::to_bigint)
@@ -513,7 +554,7 @@ fn integer_receiver(runtime: &dyn PyRuntime, value: &PyValue, method: &str) -> P
         })
 }
 
-fn expect_no_arguments(method: &str, args: &CallArgs) -> PyResult<()> {
+fn expect_no_arguments<'s>(method: &str, args: &CallArgs<'s>) -> PyResult<'s, ()> {
     if !args.keywords().is_empty() {
         return Err(PyError::type_error(format!(
             "{method}() takes no keyword arguments"
@@ -528,7 +569,11 @@ fn expect_no_arguments(method: &str, args: &CallArgs) -> PyResult<()> {
 }
 
 /// `int.bit_length()`: the number of bits in the absolute value, so `(-255).bit_length() == 8`.
-fn int_bit_length(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn int_bit_length<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     expect_no_arguments("int.bit_length", &args)?;
     let value = integer_receiver(runtime, &value, "bit_length")?;
     let bits = i64::try_from(value.bits())
@@ -537,7 +582,11 @@ fn int_bit_length(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -
 }
 
 /// `int.bit_count()`: the number of one bits in the absolute value.
-fn int_bit_count(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn int_bit_count<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     expect_no_arguments("int.bit_count", &args)?;
     let value = integer_receiver(runtime, &value, "bit_count")?;
     let ones = i64::try_from(value.magnitude().count_ones())
@@ -546,7 +595,11 @@ fn int_bit_count(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) ->
 }
 
 /// `int.as_integer_ratio()`: the pair `(int(self), 1)`.
-fn int_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn int_as_integer_ratio<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     expect_no_arguments("int.as_integer_ratio", &args)?;
     integer_receiver(runtime, &value, "as_integer_ratio")?;
     let numerator = real_part(runtime, value)?;
@@ -554,7 +607,11 @@ fn int_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: CallA
 }
 
 /// `int.is_integer()`: always true, for duck-typing compatibility with `float.is_integer`.
-fn int_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn int_is_integer<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     expect_no_arguments("int.is_integer", &args)?;
     integer_receiver(runtime, &value, "is_integer")?;
     Ok(PyValue::Bool(true))
@@ -563,11 +620,11 @@ fn int_is_integer(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -
 /// Bind the `(first, byteorder='big', *, signed=False)` parameters shared by `int.to_bytes` and
 /// `int.from_bytes`, positionally or by name. The result holds the value bound to each of the
 /// three parameters, in order.
-fn bind_byte_conversion(
+fn bind_byte_conversion<'s>(
     function: &str,
     first: &str,
-    args: &CallArgs,
-) -> PyResult<[Option<PyValue>; 3]> {
+    args: &CallArgs<'s>,
+) -> PyResult<'s, [Option<PyValue<'s>>; 3]> {
     let positional = args.positional();
     let given = positional.len().saturating_add(args.keywords().len());
     if given > 3 {
@@ -609,11 +666,11 @@ fn bind_byte_conversion(
 }
 
 /// Whether a `byteorder` argument selects little-endian order; the default is `'big'`.
-fn little_endian(
-    runtime: &dyn PyRuntime,
+fn little_endian<'s>(
+    runtime: &dyn PyRuntime<'s>,
     function: &str,
-    byteorder: Option<PyValue>,
-) -> PyResult<bool> {
+    byteorder: Option<PyValue<'s>>,
+) -> PyResult<'s, bool> {
     let Some(byteorder) = byteorder else {
         return Ok(false);
     };
@@ -638,7 +695,11 @@ fn little_endian(
 /// (-1).to_bytes(2, 'little', signed=True) == b'\xff\xff'
 /// (256).to_bytes(1) -> OverflowError: int too big to convert
 /// ```
-fn int_to_bytes(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> PyResult {
+fn int_to_bytes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let [length, byteorder, signed] = bind_byte_conversion("to_bytes", "length", &args)?;
     let length = length.map_or(Ok(1), |length| index_argument(runtime, &length))?;
     let little = little_endian(runtime, "to_bytes", byteorder)?;
@@ -676,7 +737,11 @@ fn int_to_bytes(runtime: &mut dyn PyRuntime, value: PyValue, args: CallArgs) -> 
 ///
 /// The receiver is the class. As in CPython, a subclass such as `bool` converts the integer by
 /// calling the class, so `bool.from_bytes(b'\x01')` is `True`.
-fn int_from_bytes(runtime: &mut dyn PyRuntime, class: PyValue, args: CallArgs) -> PyResult {
+fn int_from_bytes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    class: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
     let [data, byteorder, signed] = bind_byte_conversion("from_bytes", "bytes", &args)?;
     let Some(data) = data else {
         return Err(PyError::type_error(
@@ -702,7 +767,7 @@ fn int_from_bytes(runtime: &mut dyn PyRuntime, class: PyValue, args: CallArgs) -
 /// The bytes `int.from_bytes` decodes: a `bytes` or `bytearray` as is, or any other iterable of
 /// byte values converted as `bytes(value)` does. Integers and strings, which `bytes()` would
 /// treat as a length or text, are rejected as in CPython.
-fn byte_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>> {
+fn byte_values<'s>(runtime: &mut dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Vec<u8>> {
     if let Some(bytes) = runtime.bytes_value(&value)? {
         return Ok(bytes);
     }
@@ -725,7 +790,10 @@ fn byte_values(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<u8>>
 }
 
 /// Convert an index argument as CPython's `__index__` protocol does for builtin methods.
-pub(super) fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResult<i64> {
+pub(super) fn index_argument<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, i64> {
     if let Some(index) = runtime.int_value(value) {
         return Ok(index);
     }
@@ -742,7 +810,7 @@ pub(super) fn index_argument(runtime: &dyn PyRuntime, value: &PyValue) -> PyResu
 
 /// Return the exact index value accepted by sequence protocols. A registered boolean, like
 /// NumPy's `bool`, converts with `int()` but is not an index.
-pub(super) fn index<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>> {
+pub(super) fn index<'s, 'a>(heap: &'a Heap, value: &PyValue<'s>) -> Option<NumberRef<'a>> {
     if let Some((_, KindNumber::Bool(_))) = registered_number(heap, value) {
         return None;
     }
@@ -757,9 +825,9 @@ pub(super) fn index<'a>(heap: &'a Heap, value: &PyValue) -> Option<NumberRef<'a>
 /// Like CPython's `complex` slots, it accepts registered `float` and `complex` subclasses such
 /// as NumPy's `float64`, and declines other registered numbers so that their own reflected
 /// operators run.
-pub(super) fn complex_operand<'a>(
-    runtime: &'a dyn PyRuntime,
-    value: &PyValue,
+pub(super) fn complex_operand<'s, 'a>(
+    runtime: &'a dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
 ) -> Option<NumberRef<'a>> {
     if let Some(kind) = runtime.value_kind_of(value) {
         if !(kind.is_float_subclass() || kind.is_complex_subclass()) {
@@ -770,7 +838,7 @@ pub(super) fn complex_operand<'a>(
 }
 
 /// Coerce a real numeric value to `f64`, rejecting complex and non-numeric storage.
-pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
+pub(super) fn as_f64<'s>(heap: &Heap, value: &PyValue<'s>) -> Option<f64> {
     match view(heap, value)? {
         NumberRef::Int(value) => Some(value as f64),
         NumberRef::BigInt(value) => num_traits::ToPrimitive::to_f64(value),
@@ -781,18 +849,18 @@ pub(super) fn as_f64(heap: &Heap, value: &PyValue) -> Option<f64> {
 }
 
 /// Whether a value is a builtin `complex`, for real-only paths that reject it explicitly.
-pub(super) fn is_complex(heap: &Heap, value: &PyValue) -> bool {
+pub(super) fn is_complex<'s>(heap: &Heap, value: &PyValue<'s>) -> bool {
     registered_number(heap, value).is_none()
         && matches!(view(heap, value), Some(NumberRef::Complex(..)))
 }
 
 /// Allocate a builtin complex value, e.g. for an imaginary literal or a negative base raised
 /// to a fractional power.
-pub(super) fn create_complex(
-    runtime: &mut dyn PyRuntime,
+pub(super) fn create_complex<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     real: f64,
     imaginary: f64,
-) -> PyResult<PyValue> {
+) -> PyResult<'s, PyValue<'s>> {
     runtime.new_complex(real, imaginary)
 }
 
@@ -823,7 +891,7 @@ pub(super) fn exceeds_str_digits(value: &BigInt) -> bool {
     }
 }
 
-pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<BigInt> {
+pub(super) fn parse_integer_text<'s>(text: &str, requested_base: i64) -> PyResult<'s, BigInt> {
     if requested_base != 0 && !(2..=36).contains(&requested_base) {
         return Err(PyError::value_error(
             "int() base must be >= 2 and <= 36, or 0",
@@ -894,8 +962,8 @@ pub(super) enum PyNumber {
 
 /// Any real number, including registered numbers such as NumPy scalars, as functions like
 /// `math.sqrt` accept through `__float__` and `__index__`.
-impl FromPyValue for PyNumber {
-    fn from_py_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+impl<'s> FromPyValue<'s> for PyNumber {
+    fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
         if let Some(number) = runtime.number(&value).and_then(real_number) {
             return Ok(number);
         }
@@ -907,7 +975,7 @@ impl FromPyValue for PyNumber {
 }
 
 impl PyNumber {
-    pub fn into_f64(self) -> PyResult<f64> {
+    pub fn into_f64<'s>(self) -> PyResult<'s, f64> {
         match self {
             Self::Int(value) => Ok(value as f64),
             Self::BigInt(value) => {
@@ -925,152 +993,152 @@ impl PyNumber {
     }
 }
 
-pub(super) fn slot_positive(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_positive<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_unary(runtime, value, UnaryNumericOperation::Positive)
 }
 
-pub(super) fn slot_negative(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_negative<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_unary(runtime, value, UnaryNumericOperation::Negative)
 }
 
-pub(super) fn slot_invert(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_invert<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_unary(runtime, value, UnaryNumericOperation::Invert)
 }
 
-pub(super) fn slot_absolute(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_absolute<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_unary(runtime, value, UnaryNumericOperation::Absolute)
 }
 
-pub(super) fn slot_add(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_add<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Add)
 }
 
-pub(super) fn slot_subtract(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_subtract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Subtract)
 }
 
-pub(super) fn slot_reflected_subtract(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_subtract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Subtract)
 }
 
-pub(super) fn slot_multiply(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_multiply<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Multiply)
 }
 
-pub(super) fn slot_power(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Power)
 }
 
-pub(super) fn slot_reflected_power(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_power<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Power)
 }
 
-pub(super) fn slot_divide(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Divide)
 }
 
-pub(super) fn slot_reflected_divide(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Divide)
 }
 
-pub(super) fn slot_floor_divide(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_floor_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::FloorDivide)
 }
 
-pub(super) fn slot_reflected_floor_divide(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_floor_divide<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::FloorDivide)
 }
 
-pub(super) fn slot_remainder(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_remainder<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
-pub(super) fn slot_reflected_remainder(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_remainder<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::Remainder)
 }
 
 /// `int.__divmod__` and `float.__divmod__`: the pair `(left // right, left % right)`.
-pub(super) fn slot_divmod(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_divmod<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     divmod_numbers(runtime, left, right)
 }
 
-pub(super) fn slot_reflected_divmod(
-    runtime: &mut dyn PyRuntime,
-    right: PyValue,
-    left: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_reflected_divmod<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    right: PyValue<'s>,
+    left: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     divmod_numbers(runtime, left, right)
 }
 
-fn divmod_numbers(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+fn divmod_numbers<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let (Some(left), Some(right)) = (try_number(runtime, left)?, try_number(runtime, right)?)
     else {
         return Ok(None);
@@ -1090,43 +1158,43 @@ fn divmod_numbers(
     }
 }
 
-pub(super) fn slot_bitwise_and(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_bitwise_and<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::BitwiseAnd)
 }
 
-pub(super) fn slot_left_shift(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_left_shift<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::LeftShift)
 }
 
-pub(super) fn slot_right_shift(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_right_shift<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::RightShift)
 }
 
-pub(super) fn slot_bitwise_xor(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_bitwise_xor<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::BitwiseXor)
 }
 
-pub(super) fn slot_bitwise_or(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+pub(super) fn slot_bitwise_or<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     slot_binary(runtime, left, right, BinaryOperator::BitwiseOr)
 }
 
@@ -1136,12 +1204,12 @@ pub(super) fn slot_bitwise_or(
 /// or floats enter this path. Heap-backed subclasses and registered value kinds return `None` and
 /// retain normal reflected-operation dispatch.
 #[inline]
-pub(super) fn exact_binary(
-    runtime: &mut dyn PyRuntime,
+pub(super) fn exact_binary<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     operation: BinaryOperator,
-    left: PyValue,
-    right: PyValue,
-) -> PyResult<Option<PyValue>> {
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if matches!(operation, BinaryOperator::MatrixMultiply) {
         return Ok(None);
     }
@@ -1164,10 +1232,10 @@ pub(super) fn exact_binary(
 /// Float and heap-backed integer comparison stays on the general protocol path, which owns NaN
 /// and arbitrary-precision ordering semantics.
 #[inline]
-pub(super) fn exact_integer_comparison(
+pub(super) fn exact_integer_comparison<'s>(
     operation: ComparisonOperator,
-    left: PyValue,
-    right: PyValue,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
 ) -> Option<bool> {
     let left = exact_integer(left)?;
     let right = exact_integer(right)?;
@@ -1185,12 +1253,12 @@ pub(super) fn exact_integer_comparison(
     })
 }
 
-fn slot_binary(
-    runtime: &mut dyn PyRuntime,
-    left: PyValue,
-    right: PyValue,
+fn slot_binary<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
     operation: BinaryOperator,
-) -> PyResult<Option<PyValue>> {
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let Some(left) = try_number(runtime, left)? else {
         return Ok(None);
     };
@@ -1223,12 +1291,12 @@ fn float_divmod(left: f64, right: f64) -> (f64, f64) {
     (quotient.round(), remainder)
 }
 
-fn binary_numbers(
-    runtime: &mut dyn PyRuntime,
+fn binary_numbers<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
     left: PyNumber,
     right: PyNumber,
     operation: BinaryOperator,
-) -> PyResult<Option<PyValue>> {
+) -> PyResult<'s, Option<PyValue<'s>>> {
     if matches!(left, PyNumber::Float(_)) || matches!(right, PyNumber::Float(_)) {
         if matches!(
             operation,
@@ -1408,24 +1476,16 @@ fn binary_numbers(
 }
 
 #[inline]
-fn exact_number(value: PyValue) -> Option<PyNumber> {
-    match value.tag() {
-        ValueTag::Int | ValueTag::Bool => Some(PyNumber::Int(
-            value.immediate_int().expect("integer tag checked"),
-        )),
-        ValueTag::Float => Some(PyNumber::Float(
-            value.float_value().expect("float tag checked"),
-        )),
-        _ => None,
+fn exact_number(value: PyValue<'_>) -> Option<PyNumber> {
+    if let Some(value) = value.immediate_int() {
+        return Some(PyNumber::Int(value));
     }
+    value.float_value().map(PyNumber::Float)
 }
 
 #[inline]
-fn exact_integer(value: PyValue) -> Option<i64> {
-    match value.tag() {
-        ValueTag::Int | ValueTag::Bool => value.immediate_int(),
-        _ => None,
-    }
+fn exact_integer(value: PyValue<'_>) -> Option<i64> {
+    value.immediate_int()
 }
 
 #[inline]
@@ -1480,11 +1540,11 @@ enum UnaryNumericOperation {
     Absolute,
 }
 
-fn slot_unary(
-    runtime: &mut dyn PyRuntime,
-    value: PyValue,
+fn slot_unary<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyValue<'s>,
     operation: UnaryNumericOperation,
-) -> PyResult<Option<PyValue>> {
+) -> PyResult<'s, Option<PyValue<'s>>> {
     let Some(value) = try_number(runtime, value)? else {
         return Ok(None);
     };
@@ -1539,7 +1599,10 @@ fn bigint_floor_div(left: &BigInt, right: &BigInt) -> BigInt {
 /// The operand of a builtin `int` or `float` operator. Registered numbers decline, as CPython's
 /// `int.__add__` declines anything but `int`, so `1 + np.int8(127)` reaches NumPy's reflected
 /// operator and keeps int8 wrapping.
-fn try_number(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Option<PyNumber>> {
+fn try_number<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyNumber>> {
     if runtime.value_kind_of(&value).is_some() {
         return Ok(None);
     }
@@ -1585,7 +1648,7 @@ fn multiply_work(left: u64, right: u64) -> u64 {
     large.saturating_mul(small.isqrt().max(1))
 }
 
-fn word_bytes(words: u64) -> PyResult<usize> {
+fn word_bytes<'s>(words: u64) -> PyResult<'s, usize> {
     words
         .checked_mul(8)
         .and_then(|bytes| usize::try_from(bytes).ok())
@@ -1602,10 +1665,10 @@ pub(super) fn decimal_digits(value: &BigInt) -> usize {
 }
 
 /// Resolve the Python integer protocol to a bounded repetition count at the erased ABI boundary.
-pub(super) fn runtime_repeat_count(
-    runtime: &mut dyn PyRuntime,
-    value: &PyValue,
-) -> PyResult<Option<usize>> {
+pub(super) fn runtime_repeat_count<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: &PyValue<'s>,
+) -> PyResult<'s, Option<usize>> {
     if let Some(value) = runtime.int_value(value) {
         return usize::try_from(value.max(0))
             .map(Some)

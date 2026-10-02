@@ -48,15 +48,19 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn native_bisect_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn native_bisect_left<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     native_bisect(runtime, args, false)
 }
 
-fn native_bisect_right(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn native_bisect_right<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     native_bisect(runtime, args, true)
 }
 
-fn native_bisect(runtime: &mut dyn PyRuntime, args: CallArgs, right: bool) -> PyResult {
+fn native_bisect<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+    right: bool,
+) -> PyResult<'s> {
     args.expect_positional("bisect", 2, 4)?;
     args.reject_keywords("bisect")?;
     let values = args.positional()[0]
@@ -79,11 +83,11 @@ fn native_bisect(runtime: &mut dyn PyRuntime, args: CallArgs, right: bool) -> Py
         .map_err(|_| PyError::overflow_error("bisect result exceeds bounded integer range"))
 }
 
-fn bisect_bounds(
-    runtime: &dyn PyRuntime,
-    args: &CallArgs,
+fn bisect_bounds<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    args: &CallArgs<'s>,
     length: usize,
-) -> PyResult<(usize, usize)> {
+) -> PyResult<'s, (usize, usize)> {
     let low = args
         .positional()
         .get(2)
@@ -118,15 +122,19 @@ fn bisect_bounds(
     Ok((low, high))
 }
 
-fn native_insort_left(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn native_insort_left<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     native_insort(runtime, args, false)
 }
 
-fn native_insort_right(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
+fn native_insort_right<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     native_insort(runtime, args, true)
 }
 
-fn native_insort(runtime: &mut dyn PyRuntime, args: CallArgs, right: bool) -> PyResult {
+fn native_insort<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    args: CallArgs<'s>,
+    right: bool,
+) -> PyResult<'s> {
     let list = args
         .positional()
         .first()
