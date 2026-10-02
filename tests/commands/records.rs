@@ -203,3 +203,16 @@ fn sort_uses_child_cwd_and_reports_named_input_errors() {
         event.pid != 1_234 && event.argv.first().is_some_and(|arg| arg == "sort")
     }));
 }
+
+#[test]
+fn uniq_skip_counts_beyond_the_line_compare_empty_keys() {
+    // Skipping more fields or characters than a line has leaves an empty key, as in GNU uniq,
+    // without doing work proportional to the requested count.
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "printf 'a 1\\nb 2\\n' | uniq -f 99999999999; printf 'ab\\ncd\\n' | uniq -s 99999999999",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"a 1\nab\n");
+}
