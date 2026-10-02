@@ -130,6 +130,29 @@ struct Part {
     field_break: bool,
 }
 
+/// Charge `bytes` of expansion output to the machine memory budget before it is used.
+///
+/// The charge lasts until the next shell node starts (see
+/// [`Interp::release_expansion_memory`]). On failure the machine stops with
+/// `MemoryExhausted` and expansion produces nothing further.
+fn charge_expansion(interp: &mut Interp, bytes: usize) -> bool {
+    let bytes = bytes as u64;
+    if !interp.resources.reserve_memory(bytes) {
+        return false;
+    }
+    interp.process.expansion_reserved = interp.process.expansion_reserved.saturating_add(bytes);
+    true
+}
+
+/// Charge an expanded value, returning it, or nothing when the budget cannot hold it.
+fn charged(interp: &mut Interp, value: String) -> String {
+    if charge_expansion(interp, value.len()) {
+        value
+    } else {
+        String::new()
+    }
+}
+
 pub fn expand_word(interp: &mut Interp, word: &str, do_split_glob: bool) -> Vec<String> {
     let mut out = Vec::new();
     for expanded in brace_expand(word, 0) {
@@ -408,7 +431,7 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
             i = 1;
         }
     }
-    while i < chars.len() {
+    while i < chars.len() && !interp.resources.is_stopped() {
         let c = chars[i];
         match c {
             '\\' => {
@@ -450,12 +473,13 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
                     if !buf.is_empty() {
                         buf.push(' ');
                     }
-                    buf.push_str(&words.join(" "));
+                    let joined = charged(interp, words.join(" "));
+                    buf.push_str(&joined);
                     continue;
                 }
                 let (val, consumed, _glob) = expand_dollar(interp, &chars[i..], false);
                 i += consumed;
-                buf.push_str(&val);
+                buf.push_str(&charged(interp, val));
             }
             '`' => {
                 i += 1;
@@ -466,7 +490,7 @@ fn expand_to_parts(interp: &mut Interp, word: &str) -> Vec<Part> {
                 let cmd: String = chars[start..i].iter().collect();
                 i += 1;
                 let out = run_capture(interp, &cmd);
-                buf.push_str(&out);
+                buf.push_str(&charged(interp, out));
             }
             '*' | '?' => {
                 buf.push(c);
@@ -509,7 +533,7 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
     let mut array_expansion = false;
     // Whether the field currently accumulating in `out` should start a new word.
     let mut cur_break = false;
-    while i < chars.len() {
+    while i < chars.len() && !interp.resources.is_stopped() {
         let c = chars[i];
         match c {
             '"' => {
@@ -536,6 +560,10 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
                 if let Some((words, consumed)) = try_array_words(interp, &chars[i..], true) {
                     i += consumed;
                     array_expansion = true;
+                    let total = words.iter().map(String::len).sum::<usize>();
+                    if !charge_expansion(interp, total) {
+                        continue;
+                    }
                     if !words.is_empty() {
                         any_content = true;
                         for (k, wv) in words.into_iter().enumerate() {
@@ -557,7 +585,7 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
                     continue;
                 }
                 let (val, consumed, _) = expand_dollar(interp, &chars[i..], true);
-                out.push_str(&val);
+                out.push_str(&charged(interp, val));
                 any_content = true;
                 i += consumed;
             }
@@ -569,7 +597,8 @@ fn expand_double(interp: &mut Interp, chars: &[char]) -> (Vec<Part>, usize) {
                 }
                 let cmd: String = chars[start..i].iter().collect();
                 i += 1;
-                out.push_str(&run_capture(interp, &cmd));
+                let captured = run_capture(interp, &cmd);
+                out.push_str(&charged(interp, captured));
                 any_content = true;
             }
             _ => {
@@ -611,7 +640,7 @@ fn try_array_words(
             let separator = ifs.chars().next().unwrap_or(' ').to_string();
             return Some((vec![items.join(&separator)], 2));
         }
-        return Some((items, 2));
+        return Some((items.to_vec(), 2));
     }
     if chars.get(1) != Some(&'{') {
         return None;
@@ -982,6 +1011,18 @@ fn apply_param_op(
             };
             if pat.is_empty() {
                 return v;
+            }
+            // Charge the growth before building, since one replacement can multiply the size.
+            let matches = if op == "//" {
+                v.matches(pat.as_str()).count()
+            } else {
+                usize::from(v.contains(pat.as_str()))
+            };
+            let growth = rep.len().saturating_sub(pat.len()).saturating_mul(matches);
+            if !interp.resources.charge_cpu(v.len() as u64)
+                || !charge_expansion(interp, v.len().saturating_add(growth))
+            {
+                return String::new();
             }
             if op == "//" {
                 v.replace(&pat, &rep)

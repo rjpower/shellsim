@@ -792,9 +792,13 @@ fn detached_output_is_delivered_once_when_the_child_later_exits() {
     assert_eq!(second.exit_status, 0);
     assert_eq!(stdout, b"delayedforeground");
     assert!(stderr.is_empty());
-    assert_eq!(second.usage.memory_current, 0);
-
-    assert_eq!(run(&mut env, "true").1, "");
+    // Once the child exits, only shell variables the actions created, such as `$!`, remain
+    // charged, and further actions do not grow them.
+    assert!(second.usage.memory_current < first.usage.memory_current);
+    let (third, stdout, _) = env.run_script_capture("true");
+    assert_eq!(stdout, b"");
+    let (fourth, _, _) = env.run_script_capture("true");
+    assert_eq!(fourth.usage.memory_current, third.usage.memory_current);
 }
 
 #[test]

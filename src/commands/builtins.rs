@@ -1126,7 +1126,7 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
                 }
             }
             "--" => {
-                interp.positional = args[i + 1..].to_vec();
+                interp.positional = args[i + 1..].to_vec().into();
                 break;
             }
             s if s.starts_with('-') && s.len() > 1 => {
@@ -1155,7 +1155,7 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
             }
             s if !s.starts_with('-') && !s.starts_with('+') => {
                 // set positional params
-                interp.positional = args[i..].to_vec();
+                interp.positional = args[i..].to_vec().into();
                 break;
             }
             _ => {}
@@ -1424,12 +1424,7 @@ fn cmd_shift(interp: &mut CommandContext<'_>, args: &[String], _io: &mut Io) -> 
     if n > interp.positional.len() {
         return 1;
     }
-    for _ in 0..n {
-        if interp.positional.is_empty() {
-            break;
-        }
-        interp.positional.remove(0);
-    }
+    interp.positional.shift(n);
     0
 }
 
@@ -1443,7 +1438,7 @@ fn cmd_getopts(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) ->
     let operands = if args.len() > 2 {
         args[2..].to_vec()
     } else {
-        interp.positional.clone()
+        interp.positional.to_vec()
     };
     let visible_optind = interp
         .get_var("OPTIND")

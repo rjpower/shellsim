@@ -240,6 +240,7 @@ pub(super) fn execute(
         io,
         state,
         literal_regexes: HashMap::new(),
+        state_reserved: 0,
     };
 
     let mut requested_exit = match runtime.phase(program, Phase::Begin) {
@@ -283,9 +284,58 @@ struct Runtime<'a, 'io> {
     io: &'a mut Io<'io>,
     state: State,
     literal_regexes: HashMap<String, regex::Regex>,
+    /// Machine memory reserved for variables and array elements assigned by the program.
+    state_reserved: u64,
+}
+
+impl Drop for Runtime<'_, '_> {
+    fn drop(&mut self) {
+        self.system.release_memory(self.state_reserved);
+    }
+}
+
+/// Modeled bookkeeping cost of one stored variable or array element beyond its text.
+const SLOT_OVERHEAD: u64 = 64;
+
+/// Modeled bytes of one variable or array element stored under `key`.
+fn slot_bytes(key: &str, value: &Scalar) -> u64 {
+    (key.len() as u64)
+        .saturating_add(value.text.len() as u64)
+        .saturating_add(SLOT_OVERHEAD)
 }
 
 impl Runtime<'_, '_> {
+    /// Reserve growth, or release shrinkage, of program state before the change is stored.
+    fn resize_state(&mut self, old: u64, new: u64) -> Result<(), Flow> {
+        if new > old {
+            if !self.system.reserve_memory(new - old) {
+                return Err(Flow::Exhausted);
+            }
+            self.state_reserved = self.state_reserved.saturating_add(new - old);
+        } else {
+            self.system.release_memory(old - new);
+            self.state_reserved = self.state_reserved.saturating_sub(old - new);
+        }
+        Ok(())
+    }
+
+    /// Store one array element, charging its size first.
+    fn store_element(&mut self, name: &str, key: String, value: Scalar) -> Result<(), Flow> {
+        let old = self
+            .state
+            .arrays
+            .get(name)
+            .and_then(|array| array.get(&key))
+            .map_or(0, |old| slot_bytes(&key, old));
+        self.resize_state(old, slot_bytes(&key, &value))?;
+        self.state
+            .arrays
+            .entry(name.to_string())
+            .or_default()
+            .insert(key, value);
+        Ok(())
+    }
+
     fn phase(&mut self, program: &Program, phase: Phase) -> Flow {
         for rule in &program.rules {
             let selected = match (&rule.pattern, phase) {
@@ -406,8 +456,13 @@ impl Runtime<'_, '_> {
             Stmt::Continue => Flow::Continue,
             Stmt::Delete(target) => match self.array_target(target) {
                 Ok((name, key)) => {
-                    if let Some(array) = self.state.arrays.get_mut(&name) {
-                        array.remove(&key);
+                    let removed = self
+                        .state
+                        .arrays
+                        .get_mut(&name)
+                        .and_then(|array| array.remove(&key));
+                    if let Some(removed) = removed {
+                        let _ = self.resize_state(slot_bytes(&key, &removed), 0);
                     }
                     Flow::Normal
                 }
@@ -759,12 +814,22 @@ impl Runtime<'_, '_> {
             self.state.fs.clone()
         };
         let values = split_fields(&input, &separator)?;
-        let array = self.state.arrays.entry(array_name.clone()).or_default();
-        array.clear();
-        for (index, value) in values.iter().enumerate() {
-            array.insert((index + 1).to_string(), Scalar::string(value.clone()));
+        let released = self
+            .state
+            .arrays
+            .remove(array_name.as_str())
+            .map_or(0, |array| {
+                array.iter().fold(0_u64, |total, (key, value)| {
+                    total.saturating_add(slot_bytes(key, value))
+                })
+            });
+        self.resize_state(released, 0)?;
+        self.state.arrays.insert(array_name.clone(), HashMap::new());
+        let count = values.len();
+        for (index, value) in values.into_iter().enumerate() {
+            self.store_element(array_name, (index + 1).to_string(), Scalar::string(value))?;
         }
-        Ok(Scalar::number(values.len() as f64))
+        Ok(Scalar::number(count as f64))
     }
 
     fn substitute(&mut self, args: &[Expr], global: bool) -> Result<Scalar, Flow> {
@@ -869,6 +934,12 @@ impl Runtime<'_, '_> {
                 )))
             }
             _ => {
+                let old = self
+                    .state
+                    .vars
+                    .get(name)
+                    .map_or(0, |old| slot_bytes(name, old));
+                self.resize_state(old, slot_bytes(name, &value))?;
                 self.state.vars.insert(name.to_string(), value);
             }
         }
@@ -954,11 +1025,7 @@ impl Runtime<'_, '_> {
             }
             LValue::Array { name, indices } => {
                 let key = self.array_key(indices)?;
-                self.state
-                    .arrays
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(key, value);
+                self.store_element(name, key, value)?;
             }
         }
         Ok(())

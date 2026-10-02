@@ -41,6 +41,7 @@ pub mod shell;
 pub(crate) mod stack;
 mod syscalls;
 pub mod telemetry;
+pub mod variables;
 pub mod vfs;
 
 pub use clock::{

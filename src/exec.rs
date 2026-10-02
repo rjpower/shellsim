@@ -362,7 +362,7 @@ enum ShellFrame {
     FinishLoop,
     RestoreRedirect(RedirectScope),
     FinishFunction {
-        positional: Vec<String>,
+        positional: crate::variables::Positional,
         variables: Vec<(String, Option<String>)>,
     },
     FinishInlineCommand {
@@ -643,6 +643,10 @@ impl ShellContinuation {
                     variables,
                 } => {
                     interp.leave_function_scope();
+                    interp.process.frame_saved_bytes = interp
+                        .process
+                        .frame_saved_bytes
+                        .saturating_sub(saved_call_bytes(&positional, &variables));
                     interp.positional = positional;
                     restore_command_variables(interp, variables);
                 }
@@ -1631,6 +1635,10 @@ impl ShellContinuation {
                 variables,
             } => {
                 interp.leave_function_scope();
+                interp.process.frame_saved_bytes = interp
+                    .process
+                    .frame_saved_bytes
+                    .saturating_sub(saved_call_bytes(&positional, &variables));
                 interp.positional = positional;
                 self.status = interp.returning.take().unwrap_or(self.status);
                 restore_command_variables(interp, variables);
@@ -1960,7 +1968,9 @@ impl ShellContinuation {
     }
 
     fn eval(&mut self, interp: &mut Interp, node: Node) {
-        if !interp.resources.charge_cpu(10) {
+        // Loop variables, `read`, and other setters grow shell state between commands.
+        interp.release_expansion_memory();
+        if !interp.resources.charge_cpu(10) || !interp.sync_shell_memory() {
             self.status = interp
                 .resources
                 .stop_reason()
@@ -2196,6 +2206,12 @@ impl ShellContinuation {
         if argv.is_empty() {
             for (key, value) in &assigns {
                 apply_assignment(interp, key, value);
+                interp.release_expansion_memory();
+                if !interp.sync_shell_memory() {
+                    restore_command_variables(interp, temporary_variables);
+                    self.status = crate::resources::StopReason::MemoryExhausted.exit_status();
+                    return;
+                }
                 if let Some(error) = interp.expansion_error.take() {
                     write_diagnostic(interp, &error.message);
                     restore_command_variables(interp, temporary_variables);
@@ -2226,12 +2242,17 @@ impl ShellContinuation {
         if argv[0] == "exec" && !interp.funcs.contains_key("exec") {
             self.exec_builtin(interp, argv, variables);
         } else if let Some(body) = interp.funcs.get(&argv[0]).cloned() {
-            let positional = std::mem::replace(&mut interp.positional, argv[1..].to_vec());
+            let positional = interp.positional.replace(argv[1..].to_vec());
             if !self.ensure_capacity(interp, 2) {
                 interp.positional = positional;
                 restore_command_variables(interp, variables);
                 return;
             }
+            // The caller's parameters and command variables stay alive in the frame.
+            interp.process.frame_saved_bytes = interp
+                .process
+                .frame_saved_bytes
+                .saturating_add(saved_call_bytes(&positional, &variables));
             interp.enter_function_scope();
             self.frames.push(ShellFrame::FinishFunction {
                 positional,
@@ -3475,6 +3496,21 @@ fn install_command_variables(
     saved
 }
 
+/// Modeled bytes a function-call frame keeps for the caller: its positional parameters and
+/// the variables its command assignments replaced.
+fn saved_call_bytes(
+    positional: &crate::variables::Positional,
+    variables: &[(String, Option<String>)],
+) -> u64 {
+    variables
+        .iter()
+        .fold(positional.bytes(), |total, (name, value)| {
+            total
+                .saturating_add(crate::variables::string_bytes(name))
+                .saturating_add(value.as_deref().map_or(0, crate::variables::string_bytes))
+        })
+}
+
 fn restore_command_variables(interp: &mut Interp, saved: Vec<(String, Option<String>)>) {
     for (key, value) in saved {
         match value {
@@ -3579,16 +3615,10 @@ pub fn apply_assignment(interp: &mut Interp, raw_key: &str, raw_val: &str) {
         );
         if !append {
             // fresh array
-            if assoc_existing {
-                if let Some(crate::interp::ArrayVal::Assoc(m)) = interp.arrays.get_mut(name) {
-                    m.clear();
-                }
-            } else {
+            if !assoc_existing {
                 interp.declare_indexed(name);
-                if let Some(crate::interp::ArrayVal::Indexed(v)) = interp.arrays.get_mut(name) {
-                    v.clear();
-                }
             }
+            interp.arrays.clear_elements(name);
         }
         for (subkey, val) in parse_array_elems(interp, inner, assoc_existing) {
             match subkey {

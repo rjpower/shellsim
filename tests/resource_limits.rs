@@ -169,3 +169,50 @@ fn exhaustion_is_sticky_across_shell_actions() {
     assert_eq!(second.usage.cpu_used, 150);
     assert!(stdout.is_empty());
 }
+
+/// Run `source` under a small memory budget and require it to stop on memory, not abort.
+fn assert_stops_on_memory(source: &str) {
+    const MEMORY: u64 = 1024 * 1024;
+    let mut env = Environment::with_limits(Limits {
+        cpu: 200_000_000,
+        memory: MEMORY,
+        ..Limits::unlimited()
+    });
+    let (outcome, _, _) = env.run_script_capture(source);
+    assert_eq!(
+        outcome.stop_reason,
+        Some(StopReason::MemoryExhausted),
+        "{source}"
+    );
+    assert_eq!(outcome.exit_status, 137, "{source}");
+    assert!(outcome.usage.memory_peak <= MEMORY, "{source}");
+}
+
+#[test]
+fn shell_state_and_expansions_are_charged_before_they_are_retained() {
+    for source in [
+        "x=a; while :; do x=$x$x; done",
+        "x=$(printf %01000d 0); while :; do x=${x//0/00}; done",
+        "i=0; while :; do eval \"v$i=0123456789012345678901234567890123456789\"; i=$((i+1)); done",
+        "a=(); while :; do a+=(0123456789012345678901234567890123456789); done",
+        "f() { local v=$1$1; f \"$v\"; }; f 0123456789",
+        "printf '%*d' 2000000000 1",
+        "printf '%.*f' 2000000000 1",
+        "awk 'BEGIN { for (i = 0; ; i++) a[i] = i }'",
+    ] {
+        assert_stops_on_memory(source);
+    }
+}
+
+#[test]
+fn sparse_indexed_arrays_store_only_assigned_elements() {
+    let mut env = Environment::with_limits(Limits {
+        memory: 1024 * 1024,
+        ..Limits::unlimited()
+    });
+    let (outcome, stdout, _) = env.run_script_capture(
+        "a[9999999999]=1; a[3]=x; a+=(y); echo ${#a[@]} ${!a[@]} ${a[9999999999]} ${a[10000000000]}",
+    );
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(stdout, b"3 3 9999999999 10000000000 1 y\n");
+}

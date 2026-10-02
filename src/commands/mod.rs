@@ -904,6 +904,8 @@ fn dispatch(
         );
         let _ = interp.resources.charge_output(unaccounted_output);
         interp.resources.release_memory(working_memory);
+        // Builtins such as `read`, `declare`, and `set` grow shell state directly.
+        let _ = interp.sync_shell_memory();
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());

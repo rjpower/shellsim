@@ -735,15 +735,21 @@ fn cpu_bound_guest_does_not_starve_the_shell_and_can_be_killed() {
     let mut environment = Environment::new();
     install(&mut environment, WAT_SPIN);
     let memory = environment.resources.memory_mark();
-    assert_eq!(
-        run(
-            &mut environment,
-            "/app & echo started; kill $!; wait $!; echo $?"
-        ),
-        (0, b"started\n143\n".to_vec(), Vec::new())
-    );
-    // Killing the guest returns its linear-memory reservation.
-    assert_eq!(environment.resources.memory_mark(), memory);
+    let mut retained = Vec::new();
+    for _ in 0..2 {
+        assert_eq!(
+            run(
+                &mut environment,
+                "/app & echo started; kill $!; wait $!; echo $?"
+            ),
+            (0, b"started\n143\n".to_vec(), Vec::new())
+        );
+        retained.push(environment.resources.memory_mark());
+    }
+    // Killing the guest returns its 64 KiB linear-memory reservation; only shell variables
+    // such as `$!` stay charged, and running the guest again does not grow them.
+    assert!(retained[0] < memory + 4096, "{retained:?}");
+    assert_eq!(retained[1], retained[0]);
 }
 
 #[test]
