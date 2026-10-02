@@ -1,5 +1,6 @@
 //! Iteration, generator suspension, and sequence unpacking.
 
+use super::super::heap::GeneratorObject;
 use super::{
     protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode,
     PyError, PyErrorKind, PyRuntime, PyStreamRead, Slot, SlotValue, Stream, Value, Vm,
@@ -666,7 +667,8 @@ impl Vm<'_> {
     /// Take the value a generator returned, leaving `None` behind so that it is reported once.
     fn take_return_value(&mut self, id: super::super::heap::ObjectId) -> Result<Value, String> {
         match self.state.heap.get_mut(id)? {
-            Object::Generator { return_value, .. } => {
+            Object::Generator(generator) => {
+                let GeneratorObject { return_value, .. } = &mut **generator;
                 Ok(std::mem::replace(return_value, Value::None))
             }
             _ => Err("object is not a generator".into()),
@@ -809,8 +811,8 @@ impl Vm<'_> {
     /// other iterators, raise it without arguments.
     pub(super) fn raise_stop_iteration(&mut self, iterator: &Value) -> String {
         let returned = match iterator.object_id().map(|id| self.state.heap.get_mut(id)) {
-            Some(Ok(Object::Generator { return_value, .. })) => {
-                std::mem::replace(return_value, Value::None)
+            Some(Ok(Object::Generator(generator))) => {
+                std::mem::replace(&mut generator.return_value, Value::None)
             }
             _ => Value::None,
         };
@@ -833,7 +835,8 @@ impl Vm<'_> {
         id: super::super::heap::ObjectId,
         value: bool,
     ) -> Result<(), String> {
-        if let Object::Generator { running, .. } = self.state.heap.get_mut(id)? {
+        if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+            let GeneratorObject { running, .. } = &mut **generator;
             *running = value;
         }
         Ok(())
@@ -866,26 +869,29 @@ impl Vm<'_> {
             exhausted,
             running,
         ) = match self.state.heap.get(id)?.clone() {
-            Object::Generator {
-                code,
-                scope,
-                instruction_pointer,
-                handlers,
-                exceptions,
-                stack,
-                exhausted,
-                running,
-                ..
-            } => (
-                code,
-                scope,
-                instruction_pointer,
-                handlers,
-                exceptions,
-                stack,
-                exhausted,
-                running,
-            ),
+            Object::Generator(generator) => {
+                let GeneratorObject {
+                    code,
+                    scope,
+                    instruction_pointer,
+                    handlers,
+                    exceptions,
+                    stack,
+                    exhausted,
+                    running,
+                    ..
+                } = *generator;
+                (
+                    code,
+                    scope,
+                    instruction_pointer,
+                    handlers,
+                    exceptions,
+                    stack,
+                    exhausted,
+                    running,
+                )
+            }
             _ => return Err("object is not a generator".into()),
         };
         if running {
@@ -939,7 +945,8 @@ impl Vm<'_> {
         if let GeneratorResume::Throw(exception) = &resume {
             if handler.is_none() {
                 // Nothing at the suspension point handles it, so it leaves the generator at once.
-                if let Object::Generator { exhausted, .. } = self.state.heap.get_mut(id)? {
+                if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+                    let GeneratorObject { exhausted, .. } = &mut **generator;
                     *exhausted = true;
                 }
                 self.pending_exception = Some(exception.clone());
@@ -985,15 +992,15 @@ impl Vm<'_> {
             Ok(Execution::Pending) => unreachable!("execute_code_from drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("generator execution cannot suspend"),
             Ok(Execution::Yield(value, next_instruction)) => {
-                if let Object::Generator {
-                    instruction_pointer,
-                    handlers: saved_handlers,
-                    exceptions: saved_exceptions,
-                    stack: saved_stack,
-                    running,
-                    ..
-                } = self.state.heap.get_mut(id)?
-                {
+                if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+                    let GeneratorObject {
+                        instruction_pointer,
+                        handlers: saved_handlers,
+                        exceptions: saved_exceptions,
+                        stack: saved_stack,
+                        running,
+                        ..
+                    } = &mut **generator;
                     *instruction_pointer = next_instruction;
                     *saved_handlers = handlers;
                     *saved_exceptions = generator_exceptions;
@@ -1003,13 +1010,13 @@ impl Vm<'_> {
                 Ok(Some(value))
             }
             Ok(Execution::Return(value)) => {
-                if let Object::Generator {
-                    exhausted,
-                    running,
-                    return_value,
-                    ..
-                } = self.state.heap.get_mut(id)?
-                {
+                if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+                    let GeneratorObject {
+                        exhausted,
+                        running,
+                        return_value,
+                        ..
+                    } = &mut **generator;
                     *exhausted = true;
                     *running = false;
                     *return_value = value;
@@ -1017,20 +1024,20 @@ impl Vm<'_> {
                 Ok(None)
             }
             Ok(Execution::Halt) | Ok(Execution::Exit(_)) => {
-                if let Object::Generator {
-                    exhausted, running, ..
-                } = self.state.heap.get_mut(id)?
-                {
+                if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+                    let GeneratorObject {
+                        exhausted, running, ..
+                    } = &mut **generator;
                     *exhausted = true;
                     *running = false;
                 }
                 Ok(None)
             }
             Err((error, span)) => {
-                if let Object::Generator {
-                    exhausted, running, ..
-                } = self.state.heap.get_mut(id)?
-                {
+                if let Object::Generator(generator) = self.state.heap.get_mut(id)? {
+                    let GeneratorObject {
+                        exhausted, running, ..
+                    } = &mut **generator;
                     *exhausted = true;
                     *running = false;
                 }

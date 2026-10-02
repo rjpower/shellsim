@@ -176,10 +176,12 @@ fn combinatorial_iterators_reserve_before_materializing_results() {
 
 #[test]
 fn direct_list_growth_does_not_require_a_full_container_snapshot() {
+    // The list's 720 KB of values fits beside the interpreter's startup heap and collector
+    // slack, but a second copy of the list would not.
     let (status, stdout, stderr, usage) = run_with_limits(
-        "items = []\nfor value in range(3000):\n    items.append(value)\nprint(len(items))",
+        "items = []\nfor value in range(30000):\n    items.append(value)\nprint(len(items))",
         Limits {
-            memory: 256 * 1024,
+            memory: 1024 * 1024,
             ..Limits::unlimited()
         },
     );
@@ -189,8 +191,8 @@ fn direct_list_growth_does_not_require_a_full_container_snapshot() {
         "stderr={} usage={usage:?}",
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(stdout, b"3000\n");
-    assert!(usage.memory_peak <= 256 * 1024);
+    assert_eq!(stdout, b"30000\n");
+    assert!(usage.memory_peak <= 1024 * 1024);
 }
 
 #[test]

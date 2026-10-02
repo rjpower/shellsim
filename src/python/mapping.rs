@@ -153,10 +153,11 @@ impl<T> Slots<T> {
     }
 }
 
-/// Ordered key/value entries for `dict` and mapping-derived objects.
+/// Ordered key/value entries for `dict` and mapping-derived objects. The storage is boxed so
+/// a dict costs one pointer inside its heap object, keeping every object slot small.
 #[derive(Clone, Debug, Default)]
 pub(super) struct OrderedMap {
-    entries: Slots<(Value, Value)>,
+    entries: Box<Slots<(Value, Value)>>,
 }
 
 impl OrderedMap {
@@ -210,10 +211,10 @@ impl OrderedMap {
     }
 }
 
-/// Insertion-ordered members of a `set` or `frozenset`, indexed like [`OrderedMap`] keys.
+/// Insertion-ordered members of a `set` or `frozenset`, indexed and boxed like [`OrderedMap`].
 #[derive(Clone, Debug, Default)]
 pub(super) struct OrderedSet {
-    values: Slots<Value>,
+    values: Box<Slots<Value>>,
 }
 
 impl OrderedSet {

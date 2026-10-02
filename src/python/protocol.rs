@@ -22,8 +22,8 @@ fn alias_item_repr(
         return Ok(builtin.name().into());
     }
     if let Some(id) = value.object_id() {
-        if let Object::Class { name, .. } = heap.get(id)? {
-            return Ok(name.clone());
+        if let Object::Class(class_object) = heap.get(id)? {
+            return Ok(class_object.name.clone());
         }
     }
     render(heap, value, active)
@@ -222,10 +222,10 @@ fn user_exception_parts(heap: &Heap, value: &Value) -> Result<Option<UserExcepti
     let Object::Instance { class, .. } = heap.get(id)? else {
         return Ok(None);
     };
-    let Object::Class { exception_base, .. } = heap.get(*class)? else {
+    let Object::Class(class_object) = heap.get(*class)? else {
         return Ok(None);
     };
-    let Some(base) = *exception_base else {
+    let Some(base) = class_object.exception_base else {
         return Ok(None);
     };
     let args = if let Some(symbol) = heap.symbol_id("args") {
@@ -392,29 +392,26 @@ fn render_inner(
                     format!("range({start}, {stop}, {step})")
                 }
             }
-            Object::Function { name, .. } => format!("<function {name}>"),
-            Object::Class {
-                name, attributes, ..
-            } => match attributes.get("__module__") {
+            Object::Function(function) => format!("<function {}>", function.name),
+            Object::Class(class_object) => match class_object.attributes.get("__module__") {
                 Some(module) => match string_value(heap, module)? {
-                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
-                    _ => format!("<class '{name}'>"),
+                    Some(module) if module != "builtins" => {
+                        format!("<class '{module}.{}'>", class_object.name)
+                    }
+                    _ => format!("<class '{}'>", class_object.name),
                 },
-                None => format!("<class '{name}'>"),
+                None => format!("<class '{}'>", class_object.name),
             },
             Object::Instance { class, payload, .. } => match payload {
                 InstancePayload::Builtin(value) => render(heap, value, active)?,
                 InstancePayload::Object => match heap.get(*class)? {
-                    Object::Class {
-                        name,
-                        exception_base: Some(_),
-                        ..
-                    } => {
+                    Object::Class(class_object) if class_object.exception_base.is_some() => {
                         let UserException { args, .. } = user_exception_parts(heap, value)?
                             .ok_or("exception instance lost its native base")?;
-                        format!("{name}({})", render_values(heap, &args, active)?.join(", "))
+                        let args = render_values(heap, &args, active)?.join(", ");
+                        format!("{}({args})", class_object.name)
                     }
-                    Object::Class { name, .. } => format!("<{name} object>"),
+                    Object::Class(class_object) => format!("<{} object>", class_object.name),
                     _ => return Err("instance has an invalid class".into()),
                 },
             },
@@ -478,13 +475,11 @@ fn render_inner(
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
             Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
-            Object::Match {
-                text, start, end, ..
-            } => format!(
+            Object::Match(found) => format!(
                 "<re.Match object; span=({}, {}), match={}>",
-                start,
-                end,
-                quote_string(text)
+                found.start,
+                found.end,
+                quote_string(&found.text)
             ),
             Object::ArgumentParser { .. } => "<argparse.ArgumentParser>".into(),
             Object::Namespace { values } => {
@@ -499,12 +494,10 @@ fn render_inner(
                 name,
                 value,
             } => {
-                let Object::Class {
-                    name: class_name, ..
-                } = heap.get(*class)?
-                else {
+                let Object::Class(class_object) = heap.get(*class)? else {
                     return Err("enum member has an invalid class".into());
                 };
+                let class_name = &class_object.name;
                 format!("<{class_name}.{name}: {}>", render(heap, value, active)?)
             }
             Object::EnumMember { name, .. } => format!("<enum member {name}>"),

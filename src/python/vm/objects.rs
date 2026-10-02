@@ -2,7 +2,10 @@
 
 use std::collections::BTreeSet;
 
-use super::super::heap::{DictViewKind, NamespaceTarget, ObjectId, ProxyTarget};
+use super::super::heap::{
+    ArgumentParserObject, ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ObjectId,
+    ProxyTarget,
+};
 use super::{
     expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
     CallArgs, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
@@ -90,9 +93,10 @@ impl Vm<'_> {
             Some(Ok(Object::Module { name: module, .. })) => {
                 format!("module '{module}' has no attribute '{name}'")
             }
-            Some(Ok(Object::Class {
-                name: class_name, ..
-            })) => format!("type object '{class_name}' has no attribute '{name}'"),
+            Some(Ok(Object::Class(class_object))) => {
+                let class_name = &class_object.name;
+                format!("type object '{class_name}' has no attribute '{name}'")
+            }
             Some(Ok(Object::Instance { .. } | Object::Bare)) => match self.type_name_of(owner) {
                 Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
                 Err(error) => return error,
@@ -486,12 +490,13 @@ impl Vm<'_> {
                     let name = self.allocate_string(name.to_string())?;
                     return self.invoke_value(hook, vec![name]).map(Some);
                 }
-                Object::Function {
-                    name: function_name,
-                    closure,
-                    attributes,
-                    ..
-                } => {
+                Object::Function(function_object) => {
+                    let FunctionObject {
+                        name: function_name,
+                        closure,
+                        attributes,
+                        ..
+                    } = *function_object;
                     if name == "__name__" {
                         return Ok(Some(self.allocate_string(function_name)?));
                     }
@@ -618,7 +623,8 @@ impl Vm<'_> {
                     };
                 }
                 Object::Match { .. } => {}
-                Object::ArgumentParser { prog, .. } => {
+                Object::ArgumentParser(parser_object) => {
+                    let ArgumentParserObject { prog, .. } = *parser_object;
                     if name == "prog" {
                         let prog = self.allocate_string(prog)?;
                         return Ok(Some(prog));
@@ -717,13 +723,13 @@ impl Vm<'_> {
     ) -> Result<Option<Value>, String> {
         use super::super::native::TypeMetadata;
         if let Some(id) = owner.object_id() {
-            if let Object::Class {
-                name, attributes, ..
-            } = self.state.heap.get(id)?
-            {
+            if let Object::Class(class_object) = self.state.heap.get(id)? {
                 return match field {
-                    TypeMetadata::Name => self.allocate_string(name.clone()).map(Some),
-                    TypeMetadata::Module => Ok(attributes.get("__module__").copied()),
+                    TypeMetadata::Name => {
+                        let name = class_object.name.clone();
+                        self.allocate_string(name).map(Some)
+                    }
+                    TypeMetadata::Module => Ok(class_object.attributes.get("__module__").copied()),
                     TypeMetadata::Bases => self.class_metadata(id, "__bases__"),
                     TypeMetadata::Mro => self.class_metadata(id, "__mro__"),
                 };
@@ -1054,15 +1060,17 @@ impl Vm<'_> {
                     self.raise_exception("TypeError", "__name__ must be set to a string object")
                 );
             };
-            let Object::Function { name, .. } = self.state.heap.get_mut(function)? else {
+            let Object::Function(function_object) = self.state.heap.get_mut(function)? else {
                 unreachable!("checked by the caller")
             };
+            let FunctionObject { name, .. } = &mut **function_object;
             *name = text;
             return Ok(());
         }
-        let Object::Function { attributes, .. } = self.state.heap.get(function)? else {
+        let Object::Function(function_object) = self.state.heap.get(function)? else {
             return Err("function attribute store on a non-function".into());
         };
+        let FunctionObject { attributes, .. } = &**function_object;
         let exists = attributes.contains_key(name);
         match value {
             Some(value) => {
@@ -1076,15 +1084,17 @@ impl Vm<'_> {
                         &mut self.interp.resources,
                     )?;
                 }
-                let Object::Function { attributes, .. } = self.state.heap.get_mut(function)? else {
+                let Object::Function(function_object) = self.state.heap.get_mut(function)? else {
                     unreachable!("checked above")
                 };
+                let FunctionObject { attributes, .. } = &mut **function_object;
                 attributes.insert(name.to_string(), value);
             }
             None if exists => {
-                let Object::Function { attributes, .. } = self.state.heap.get_mut(function)? else {
+                let Object::Function(function_object) = self.state.heap.get_mut(function)? else {
                     unreachable!("checked above")
                 };
+                let FunctionObject { attributes, .. } = &mut **function_object;
                 attributes.remove(name);
             }
             None => {
@@ -1106,15 +1116,10 @@ impl Vm<'_> {
                 "assigning or deleting a class's {name} is not supported"
             ));
         }
-        let Object::Class {
-            attributes,
-            instance_type,
-            ..
-        } = self.state.heap.get(class)?
-        else {
+        let Object::Class(class_object) = self.state.heap.get(class)? else {
             return Err("class attribute store on a non-class".into());
         };
-        let instance_type = *instance_type;
+        let (attributes, instance_type) = (&class_object.attributes, class_object.instance_type);
         match value {
             Some(value) => {
                 if !attributes.contains_key(name) {
@@ -1127,16 +1132,16 @@ impl Vm<'_> {
                         &mut self.interp.resources,
                     )?;
                 }
-                let Object::Class { attributes, .. } = self.state.heap.get_mut(class)? else {
+                let Object::Class(class_object) = self.state.heap.get_mut(class)? else {
                     unreachable!("checked above")
                 };
-                attributes.insert(name.to_string(), value);
+                class_object.attributes.insert(name.to_string(), value);
             }
             None => {
-                let Object::Class { attributes, .. } = self.state.heap.get_mut(class)? else {
+                let Object::Class(class_object) = self.state.heap.get_mut(class)? else {
                     unreachable!("checked above")
                 };
-                if attributes.remove(name).is_none() {
+                if class_object.attributes.remove(name).is_none() {
                     return Err(self.missing_attribute(&Value::Object(class), name));
                 }
             }
@@ -1147,10 +1152,12 @@ impl Vm<'_> {
                 continue;
             };
             let state = &mut *self.state;
-            let Object::Class { attributes, .. } = state.heap.get(id)? else {
+            let Object::Class(class_object) = state.heap.get(id)? else {
                 continue;
             };
-            state.types.replace_slots(type_id, attributes)?;
+            state
+                .types
+                .replace_slots(type_id, &class_object.attributes)?;
         }
         for cache in &mut self.execution.code_caches {
             cache.attributes = None;
@@ -1858,14 +1865,14 @@ impl Vm<'_> {
                 .scope_parent(closure.expect("checked above"))?;
         }
         let function = self.state.heap.allocate(
-            Object::Function {
+            Object::Function(Box::new(FunctionObject {
                 name: name.clone(),
                 code,
                 closure,
                 defaults,
                 defining_class: None,
                 attributes: HashMap::new(),
-            },
+            })),
             &mut self.interp.resources,
         )?;
         self.stack.push(function);
@@ -1986,12 +1993,10 @@ impl Vm<'_> {
             })
             .collect::<Vec<_>>();
         for base in &user_bases {
-            if let Object::Class {
-                layout: ClassLayout::Builtin(builtin),
-                ..
-            } = self.state.heap.get(*base)?
-            {
-                builtin_layouts.push(*builtin);
+            if let Object::Class(class_object) = self.state.heap.get(*base)? {
+                if let ClassLayout::Builtin(builtin) = class_object.layout {
+                    builtin_layouts.push(builtin);
+                }
             }
         }
         builtin_layouts.dedup();
@@ -2004,7 +2009,7 @@ impl Vm<'_> {
         let inherited_exception_bases = user_bases
             .iter()
             .filter_map(|base| match self.state.heap.get(*base) {
-                Ok(Object::Class { exception_base, .. }) => *exception_base,
+                Ok(Object::Class(class_object)) => class_object.exception_base,
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -2027,7 +2032,7 @@ impl Vm<'_> {
         let inherited_type_layouts = user_bases
             .iter()
             .filter_map(|base| match self.state.heap.get(*base) {
-                Ok(Object::Class { layout, .. }) => Some(*layout == ClassLayout::Type),
+                Ok(Object::Class(class_object)) => Some(class_object.layout == ClassLayout::Type),
                 _ => None,
             })
             .filter(|is_type| *is_type)
@@ -2048,14 +2053,10 @@ impl Vm<'_> {
         let mut metaclass = explicit_metaclass
             .unwrap_or(Value::Native(NativeValue::BuiltinType(BuiltinType::Type)));
         for base in &user_bases {
-            let Object::Class {
-                metaclass: base_metaclass,
-                ..
-            } = self.state.heap.get(*base)?
-            else {
+            let Object::Class(class_object) = self.state.heap.get(*base)? else {
                 unreachable!()
             };
-            let base_metaclass = *base_metaclass;
+            let base_metaclass = class_object.metaclass;
             let winner_type = self
                 .class_type_id(&metaclass)?
                 .ok_or("metaclass must be a type")?;
@@ -2079,10 +2080,7 @@ impl Vm<'_> {
         ) || metaclass.object_id().is_some_and(|id| {
             matches!(
                 self.state.heap.get(id),
-                Ok(Object::Class {
-                    layout: ClassLayout::Type,
-                    ..
-                })
+                Ok(Object::Class(class_object)) if class_object.layout == ClassLayout::Type
             )
         });
         if !valid_metaclass {
@@ -2335,9 +2333,10 @@ impl Vm<'_> {
     fn class_metadata(&mut self, class: ObjectId, name: &str) -> Result<Option<Value>, String> {
         let items = match name {
             "__bases__" => {
-                let Object::Class { bases, .. } = self.state.heap.get(class)? else {
+                let Object::Class(class_object) = self.state.heap.get(class)? else {
                     return Err("class metadata requested for a non-class".into());
                 };
+                let bases = &class_object.bases;
                 if bases.is_empty() {
                     vec![Value::Native(NativeValue::BuiltinType(BuiltinType::Object))]
                 } else {
@@ -2353,11 +2352,12 @@ impl Vm<'_> {
     /// A user class's method resolution order: the class and its C3-linearized user ancestors,
     /// then the native types their bases derive from, ending with `object`.
     fn class_mro(&self, class: ObjectId) -> Result<Vec<Value>, String> {
-        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
+        let Object::Class(class_object) = self.state.heap.get(class)? else {
             return Err("class metadata requested for a non-class".into());
         };
-        let ty = self.state.types.get(*instance_type)?;
-        std::iter::once(*instance_type)
+        let instance_type = class_object.instance_type;
+        let ty = self.state.types.get(instance_type)?;
+        std::iter::once(instance_type)
             .chain(ty.mro.iter().copied())
             .map(|id| self.state.types.value(id))
             .collect()
@@ -2541,7 +2541,7 @@ impl Vm<'_> {
             .iter()
             .map(|(name, value)| (name.clone(), *value))
             .collect::<Vec<_>>();
-        let class = self.allocate_object(Object::Class {
+        let class = self.allocate_object(Object::Class(Box::new(ClassObject {
             instance_type,
             name,
             bases,
@@ -2553,7 +2553,7 @@ impl Vm<'_> {
             is_dataclass: false,
             dataclass_fields,
             enum_members,
-        })?;
+        })))?;
         self.state.types.finish(instance_type, class)?;
         let class_id = class.object_id().expect("allocated class has an object id");
         for member in enum_member_ids {
@@ -2566,7 +2566,8 @@ impl Vm<'_> {
             let Some(function_id) = descriptor.object_id() else {
                 continue;
             };
-            if let Object::Function { defining_class, .. } = self.state.heap.get_mut(function_id)? {
+            if let Object::Function(function_object) = self.state.heap.get_mut(function_id)? {
+                let FunctionObject { defining_class, .. } = &mut **function_object;
                 *defining_class = Some(class_id);
             }
         }
@@ -2605,9 +2606,10 @@ impl Vm<'_> {
         }
         let mut sequences = Vec::with_capacity(bases.len().saturating_add(1));
         for base in bases {
-            let Object::Class { mro, .. } = self.state.heap.get(*base)? else {
+            let Object::Class(class_object) = self.state.heap.get(*base)? else {
                 return Err("class base changed object kind".into());
             };
+            let mro = &class_object.mro;
             let mut sequence = Vec::with_capacity(mro.len().saturating_add(1));
             sequence.push(*base);
             sequence.extend(mro.iter().copied());
@@ -2656,11 +2658,12 @@ impl Vm<'_> {
         class: super::super::heap::ObjectId,
         name: &str,
     ) -> Result<Option<(super::super::heap::ObjectId, Value)>, String> {
-        let Object::Class { instance_type, .. } = self.state.heap.get(class)? else {
+        let Object::Class(class_object) = self.state.heap.get(class)? else {
             return Err("instance has an invalid class".into());
         };
-        let ancestors = std::iter::once(*instance_type)
-            .chain(self.state.types.get(*instance_type)?.mro.iter().copied())
+        let instance_type = class_object.instance_type;
+        let ancestors = std::iter::once(instance_type)
+            .chain(self.state.types.get(instance_type)?.mro.iter().copied())
             .collect::<Vec<_>>();
         for ancestor in ancestors {
             self.charge_cpu(1)?;
@@ -2710,7 +2713,7 @@ impl Vm<'_> {
         let ty = self.state.types.get(type_id)?;
         match self.state.types.value(type_id)?.object_id() {
             Some(id) => match self.state.heap.get(id)? {
-                Object::Class { attributes, .. } => Ok(attributes.get(name).copied()),
+                Object::Class(class_object) => Ok(class_object.attributes.get(name).copied()),
                 _ => Ok(ty.attributes.get(name).copied()),
             },
             None => Ok(ty.attributes.get(name).copied()),
@@ -3062,7 +3065,7 @@ impl Vm<'_> {
         };
         let class = match self.state.heap.get(id)? {
             Object::Instance { class, .. } => *class,
-            Object::Class { metaclass, .. } => match metaclass.object_id() {
+            Object::Class(class_object) => match class_object.metaclass.object_id() {
                 Some(class) => class,
                 None => return Ok(None),
             },
@@ -3203,8 +3206,8 @@ impl Vm<'_> {
         let mut name = self.type_name_of(value)?;
         if let Some(id) = value.object_id() {
             if let Object::Instance { class, .. } = self.state.heap.get(id)? {
-                if let Object::Class { attributes, .. } = self.state.heap.get(*class)? {
-                    if let Some(module) = attributes.get("__module__") {
+                if let Object::Class(class_object) = self.state.heap.get(*class)? {
+                    if let Some(module) = class_object.attributes.get("__module__") {
                         if let Some(module) = protocol::string_value(&self.state.heap, module)? {
                             if module != "builtins" {
                                 name = format!("{module}.{name}");
@@ -3256,10 +3259,7 @@ impl Vm<'_> {
                     ..
                 } if matches!(
                     self.state.heap.get(class),
-                    Ok(Object::Class {
-                        exception_base: None,
-                        ..
-                    })
+                    Ok(Object::Class(class_object)) if class_object.exception_base.is_none()
                 ) =>
                 {
                     return self.default_object_repr(value)
@@ -3323,7 +3323,7 @@ impl Vm<'_> {
             return Err("enum string slot requires a member".into());
         };
         let class_name = match self.state.heap.get(*class)? {
-            Object::Class { name, .. } => name.clone(),
+            Object::Class(class_object) => class_object.name.clone(),
             _ => return Err("enum member has an invalid class".into()),
         };
         self.allocate_string(format!("{class_name}.{name}"))
@@ -3486,10 +3486,7 @@ impl Vm<'_> {
                     ..
                 } => matches!(
                     self.state.heap.get(*class)?,
-                    Object::Class {
-                        exception_base: None,
-                        ..
-                    }
+                    Object::Class(class_object) if class_object.exception_base.is_none()
                 ),
                 _ => false,
             },
@@ -4134,7 +4131,7 @@ impl Vm<'_> {
             }
             _ if value.object_id().is_some() => {
                 match self.state.heap.get(value.object_id().unwrap())? {
-                    Object::Class { instance_type, .. } => Some(*instance_type),
+                    Object::Class(class_object) => Some(class_object.instance_type),
                     _ => None,
                 }
             }
@@ -4269,7 +4266,7 @@ impl Vm<'_> {
             return Ok(None);
         };
         Ok(match self.state.heap.get(id)? {
-            Object::Class { exception_base, .. } => *exception_base,
+            Object::Class(class_object) => class_object.exception_base,
             _ => None,
         })
     }

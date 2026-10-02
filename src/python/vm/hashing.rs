@@ -81,10 +81,8 @@ impl Vm<'_> {
                 if let Some(class) = class {
                     if matches!(
                         self.state.heap.get(class)?,
-                        Object::Class {
-                            layout: ClassLayout::Builtin(BuiltinType::String),
-                            ..
-                        }
+                        Object::Class(class_object)
+                            if class_object.layout == ClassLayout::Builtin(BuiltinType::String)
                     ) {
                         return self.hash_nested(&item, depth + 1);
                     }
@@ -131,19 +129,19 @@ impl Vm<'_> {
         value: &Value,
         class: super::super::heap::ObjectId,
     ) -> Result<i64, String> {
-        let Object::Class {
-            mro, is_dataclass, ..
-        } = self.state.heap.get(class)?
-        else {
+        let Object::Class(class_object) = self.state.heap.get(class)? else {
             return Err("instance has an invalid class".into());
         };
-        let is_dataclass = *is_dataclass;
-        let lineage: Vec<_> = std::iter::once(class).chain(mro.iter().copied()).collect();
+        let is_dataclass = class_object.is_dataclass;
+        let lineage: Vec<_> = std::iter::once(class)
+            .chain(class_object.mro.iter().copied())
+            .collect();
         for ancestor in lineage {
             self.charge_cpu(1)?;
-            let Object::Class { attributes, .. } = self.state.heap.get(ancestor)? else {
+            let Object::Class(ancestor) = self.state.heap.get(ancestor)? else {
                 return Err("class MRO contains a non-class object".into());
             };
+            let attributes = &ancestor.attributes;
             match attributes.get("__hash__") {
                 Some(method) if method.is_none() => return Err(self.unhashable(value)),
                 Some(_) => {

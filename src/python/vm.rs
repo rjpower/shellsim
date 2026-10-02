@@ -23,7 +23,7 @@ use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, NamespaceTarget,
     Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_VALUE_BYTES,
+    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
 };
 use super::mapping::{KeyHash, OrderedMap, OrderedSet};
 use super::native::{
@@ -1183,8 +1183,8 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
-                Object::Class { enum_members, .. } if !enum_members.is_empty() => {
-                    for value in enum_members {
+                Object::Class(class_object) if !class_object.enum_members.is_empty() => {
+                    for value in class_object.enum_members {
                         self.push_materialized(&mut result, value)?;
                     }
                 }

@@ -1,6 +1,7 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::super::ast::{Program, Statement, StatementKind};
+use super::super::heap::{ClassObject, FunctionObject, GeneratorObject};
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
     BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
@@ -133,27 +134,22 @@ impl Vm<'_> {
             Object::Module { scope, .. } => {
                 Ok(self.state.heap.scope_values(*scope)?.into_keys().collect())
             }
-            Object::Class {
-                attributes, mro, ..
-            } => {
-                let mut names = attributes.keys().cloned().collect::<Vec<_>>();
-                for ancestor in mro {
-                    if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
-                        names.extend(attributes.keys().cloned());
+            Object::Class(class_object) => {
+                let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
+                for ancestor in &class_object.mro {
+                    if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                        names.extend(ancestor.attributes.keys().cloned());
                     }
                 }
                 Ok(names)
             }
             Object::Instance { class, .. } => {
                 let mut names = self.state.heap.instance_attribute_names(id)?;
-                if let Object::Class {
-                    attributes, mro, ..
-                } = self.state.heap.get(*class)?
-                {
-                    names.extend(attributes.keys().cloned());
-                    for ancestor in mro {
-                        if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
-                            names.extend(attributes.keys().cloned());
+                if let Object::Class(class_object) = self.state.heap.get(*class)? {
+                    names.extend(class_object.attributes.keys().cloned());
+                    for ancestor in &class_object.mro {
+                        if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                            names.extend(ancestor.attributes.keys().cloned());
                         }
                     }
                 }
@@ -246,14 +242,15 @@ impl Vm<'_> {
         }
         if let Some(id) = function.object_id() {
             return match self.state.heap.get(id)?.clone() {
-                Object::Function {
-                    name,
-                    code,
-                    closure,
-                    defaults,
-                    defining_class,
-                    ..
-                } => {
+                Object::Function(function_object) => {
+                    let FunctionObject {
+                        name,
+                        code,
+                        closure,
+                        defaults,
+                        defining_class,
+                        ..
+                    } = *function_object;
                     let method_frame = defining_class.zip(arguments.first().cloned());
                     if let Some((owner, receiver)) = method_frame {
                         self.method_frames.push((owner, receiver));
@@ -281,16 +278,18 @@ impl Vm<'_> {
                     owner,
                 } => {
                     if let Some(function) = descriptor.object_id() {
-                        let Object::Function {
+                        let Object::Function(function_object) =
+                            self.state.heap.get(function)?.clone()
+                        else {
+                            return Err("bound descriptor is not callable".into());
+                        };
+                        let FunctionObject {
                             name,
                             code,
                             closure,
                             defaults,
                             ..
-                        } = self.state.heap.get(function)?.clone()
-                        else {
-                            return Err("bound descriptor is not callable".into());
-                        };
+                        } = *function_object;
                         arguments.insert(0, receiver);
                         if let Some(owner) = owner {
                             self.method_frames.push((owner, receiver));
@@ -1248,7 +1247,10 @@ impl Vm<'_> {
         keyword_arguments: Vec<(String, Value)>,
         dispatch_metaclass: bool,
     ) -> Result<CallResult, String> {
-        let Object::Class {
+        let Object::Class(class_object) = self.state.heap.get(id)? else {
+            return Err("type.__call__ requires a class".into());
+        };
+        let ClassObject {
             name,
             metaclass,
             layout,
@@ -1257,10 +1259,7 @@ impl Vm<'_> {
             dataclass_fields,
             enum_members,
             ..
-        } = self.state.heap.get(id)?.clone()
-        else {
-            return Err("type.__call__ requires a class".into());
-        };
+        } = (**class_object).clone();
         if dispatch_metaclass {
             if let Some(metaclass_id) = metaclass.object_id() {
                 if let Some((owner, descriptor)) =
@@ -1453,17 +1452,17 @@ impl Vm<'_> {
             let Some(function) = initializer.object_id() else {
                 return Err(format!("{name}.__init__ is not callable"));
             };
-            let Object::Function {
+            let Object::Function(function_object) = self.state.heap.get(function)?.clone() else {
+                return Err(format!("{name}.__init__ is not a function"));
+            };
+            let FunctionObject {
                 name: function_name,
                 code,
                 closure,
                 defaults,
                 defining_class,
                 ..
-            } = self.state.heap.get(function)?.clone()
-            else {
-                return Err(format!("{name}.__init__ is not a function"));
-            };
+            } = *function_object;
             arguments.insert(0, instance);
             // Zero-argument `super()` in the initializer reads this frame.
             if let Some(owner) = defining_class {
@@ -1584,7 +1583,7 @@ impl Vm<'_> {
     ) -> Result<CallResult, String> {
         let scope =
             self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
-        let generator = self.allocate_object(Object::Generator {
+        let generator = self.allocate_object(Object::Generator(Box::new(GeneratorObject {
             name: name.to_string(),
             code: code.clone(),
             scope,
@@ -1595,7 +1594,7 @@ impl Vm<'_> {
             exhausted: false,
             running: false,
             return_value: Value::None,
-        })?;
+        })))?;
         Ok(CallResult::Value(generator))
     }
 
@@ -1788,7 +1787,7 @@ impl Vm<'_> {
             return Ok(CallResult::Value(created));
         }
         let layout = match self.state.heap.get(class)? {
-            Object::Class { layout, .. } => *layout,
+            Object::Class(class_object) => class_object.layout,
             _ => return Err("type.__call__ requires a class".into()),
         };
         let initializer = if layout == ClassLayout::Object {
@@ -1877,19 +1876,13 @@ impl Vm<'_> {
                 return Err(self.raise_exception("TypeError", message));
             }
             _ => match class.object_id().map(|id| (id, self.state.heap.get(id))) {
-                Some((
-                    id,
-                    Ok(Object::Class {
-                        layout: ClassLayout::Builtin(layout),
-                        ..
-                    }),
-                )) if *layout == builtin => Some(id),
-                Some((
-                    _,
-                    Ok(Object::Class {
-                        name: class_name, ..
-                    }),
-                )) => {
+                Some((id, Ok(Object::Class(class_object))))
+                    if class_object.layout == ClassLayout::Builtin(builtin) =>
+                {
+                    Some(id)
+                }
+                Some((_, Ok(Object::Class(class_object)))) => {
+                    let class_name = &class_object.name;
                     let message = format!(
                         "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
                     );
@@ -1949,12 +1942,12 @@ impl Vm<'_> {
             class
                 .object_id()
                 .and_then(|id| match self.state.heap.get(id) {
-                    Ok(Object::Class {
-                        name,
-                        layout,
-                        exception_base,
-                        ..
-                    }) => Some((id, name.clone(), *layout, *exception_base)),
+                    Ok(Object::Class(class_object)) => Some((
+                        id,
+                        class_object.name.clone(),
+                        class_object.layout,
+                        class_object.exception_base,
+                    )),
                     _ => None,
                 })
         else {

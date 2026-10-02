@@ -1,5 +1,6 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
+use super::super::heap::{ArgumentParserObject, FunctionObject, MatchObject};
 use super::{
     protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
     ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
@@ -10,7 +11,7 @@ use super::{
     PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet,
     PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast,
     RaisedException, Stream, ToPrimitive, Value, ValueTag, Vm, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_VALUE_BYTES,
+    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::heap::{DictViewKind, NamespaceTarget, ObjectId};
@@ -1323,7 +1324,7 @@ impl PyRuntime for Vm<'_> {
         }
         self.state
             .heap
-            .reserve_object_growth(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .reserve_object_growth(id, MODELED_SET_MEMBER_BYTES, &mut self.interp.resources)
             .map_err(PyError::resource_error)?;
         let Object::Set(items) = self
             .state
@@ -1370,7 +1371,7 @@ impl PyRuntime for Vm<'_> {
         }
         self.state
             .heap
-            .release_object_shrink(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
+            .release_object_shrink(id, MODELED_SET_MEMBER_BYTES, &mut self.interp.resources)
             .map_err(PyError::runtime_error)?;
         Ok(true)
     }
@@ -1469,14 +1470,12 @@ impl PyRuntime for Vm<'_> {
         let mut exception_base = None;
         for base in &bases {
             if let Some(id) = base.object_id() {
-                let Object::Class {
-                    layout: base_layout,
-                    exception_base: base_exception,
-                    ..
-                } = self.state.heap.get(id).map_err(PyError::runtime_error)?
+                let Object::Class(base) =
+                    self.state.heap.get(id).map_err(PyError::runtime_error)?
                 else {
                     return Err(PyError::type_error("type.__new__() bases must be classes"));
                 };
+                let (base_layout, base_exception) = (&base.layout, &base.exception_base);
                 if layout != ClassLayout::Object
                     && *base_layout != ClassLayout::Object
                     && layout != *base_layout
@@ -1622,13 +1621,13 @@ impl PyRuntime for Vm<'_> {
                         let defines_call = |class: &crate::python::heap::ObjectId| {
                             matches!(
                                 heap.get(*class),
-                                Ok(Object::Class { attributes, .. })
-                                    if attributes.contains_key("__call__")
+                                Ok(Object::Class(class_object))
+                                    if class_object.attributes.contains_key("__call__")
                             )
                         };
                         match heap.get(*class).map_err(PyError::runtime_error)? {
-                            Object::Class { mro, .. } => {
-                                defines_call(class) || mro.iter().any(defines_call)
+                            Object::Class(class_object) => {
+                                defines_call(class) || class_object.mro.iter().any(defines_call)
                             }
                             _ => false,
                         }
@@ -1789,12 +1788,8 @@ impl PyRuntime for Vm<'_> {
             .get(generator.object_id())
             .map_err(PyError::runtime_error)?
         {
-            Object::Generator {
-                exhausted: true,
-                return_value,
-                ..
-            } => Ok(*return_value),
-            Object::Generator { .. } => Err(PyError::runtime_error("coroutine has not completed")),
+            Object::Generator(generator) if generator.exhausted => Ok(generator.return_value),
+            Object::Generator(_) => Err(PyError::runtime_error("coroutine has not completed")),
             _ => Err(PyError::type_error("expected a coroutine")),
         }
     }
@@ -2093,7 +2088,7 @@ impl PyRuntime for Vm<'_> {
             self,
             Object::Array {
                 storage,
-                view,
+                view: Box::new(view),
                 base: None,
             },
         )
@@ -2127,7 +2122,7 @@ impl PyRuntime for Vm<'_> {
             self,
             Object::Array {
                 storage,
-                view,
+                view: Box::new(view),
                 base: Some(owner),
             },
         )
@@ -2136,7 +2131,7 @@ impl PyRuntime for Vm<'_> {
 
     fn array_view(&self, array: PyArray) -> PyResult<PyArrayView> {
         match self.array_object(array)? {
-            Object::Array { view, .. } => Ok(view.clone()),
+            Object::Array { view, .. } => Ok((**view).clone()),
             _ => unreachable!("array_object checks the kind"),
         }
     }
@@ -2280,13 +2275,13 @@ impl PyRuntime for Vm<'_> {
     ) -> PyResult<Value> {
         Vm::allocate_object(
             self,
-            Object::Match {
+            Object::Match(Box::new(MatchObject {
                 text,
                 groups,
                 group_names,
                 start,
                 end,
-            },
+            })),
         )
         .map_err(PyError::resource_error)
     }
@@ -2307,13 +2302,7 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn match_data(&mut self, matched: PyMatch) -> PyResult<PyMatchData> {
-        let Object::Match {
-            groups,
-            group_names,
-            start,
-            end,
-            ..
-        } = self
+        let Object::Match(match_object) = self
             .state
             .heap
             .get(matched.object_id())
@@ -2321,6 +2310,13 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("match handle changed object kind"));
         };
+        let MatchObject {
+            groups,
+            group_names,
+            start,
+            end,
+            ..
+        } = &**match_object;
         let bytes = groups
             .iter()
             .chain(group_names)
@@ -2356,7 +2352,7 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()> {
-        let Object::Class { is_dataclass, .. } = self
+        let Object::Class(class_object) = self
             .state
             .heap
             .get_mut(class.object_id())
@@ -2364,7 +2360,7 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("class handle changed object kind"));
         };
-        *is_dataclass = true;
+        class_object.is_dataclass = true;
         Ok(())
     }
 
@@ -2389,14 +2385,14 @@ impl PyRuntime for Vm<'_> {
     ) -> PyResult<Value> {
         Vm::allocate_object(
             self,
-            Object::ArgumentParser {
+            Object::ArgumentParser(Box::new(ArgumentParserObject {
                 prog: program,
                 description,
                 add_help,
                 is_subcommand,
                 arguments: Vec::new(),
                 subparsers: None,
-            },
+            })),
         )
         .map_err(PyError::resource_error)
     }
@@ -2405,14 +2401,7 @@ impl PyRuntime for Vm<'_> {
         &mut self,
         parser: PyArgumentParser,
     ) -> PyResult<PyArgumentParserData> {
-        let Object::ArgumentParser {
-            prog,
-            description,
-            add_help,
-            arguments,
-            subparsers,
-            ..
-        } = self
+        let Object::ArgumentParser(parser_object) = self
             .state
             .heap
             .get(parser.object_id())
@@ -2420,6 +2409,14 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("parser handle changed object kind"));
         };
+        let ArgumentParserObject {
+            prog,
+            description,
+            add_help,
+            arguments,
+            subparsers,
+            ..
+        } = &**parser_object;
         let bytes = prog
             .len()
             .saturating_add(description.as_ref().map_or(0, String::len))
@@ -2449,7 +2446,7 @@ impl PyRuntime for Vm<'_> {
             .heap
             .reserve_object_growth(parser.object_id(), 96, &mut self.interp.resources)
             .map_err(PyError::resource_error)?;
-        let Object::ArgumentParser { arguments, .. } = self
+        let Object::ArgumentParser(parser_object) = self
             .state
             .heap
             .get_mut(parser.object_id())
@@ -2457,6 +2454,7 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("parser handle changed object kind"));
         };
+        let ArgumentParserObject { arguments, .. } = &mut **parser_object;
         arguments.push(argument);
         Ok(())
     }
@@ -2466,11 +2464,7 @@ impl PyRuntime for Vm<'_> {
         parser: PyArgumentParser,
         subparsers: PySubparsersSpec,
     ) -> PyResult<()> {
-        let Object::ArgumentParser {
-            is_subcommand,
-            subparsers: current,
-            ..
-        } = self
+        let Object::ArgumentParser(parser_object) = self
             .state
             .heap
             .get_mut(parser.object_id())
@@ -2478,6 +2472,11 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("parser handle changed object kind"));
         };
+        let ArgumentParserObject {
+            is_subcommand,
+            subparsers: current,
+            ..
+        } = &mut **parser_object;
         if *is_subcommand {
             return Err(PyError::value_error(
                 "nested argparse subparsers are not supported",
@@ -2499,7 +2498,7 @@ impl PyRuntime for Vm<'_> {
             .heap
             .reserve_object_growth(parser.object_id(), 96, &mut self.interp.resources)
             .map_err(PyError::resource_error)?;
-        let Object::ArgumentParser { subparsers, .. } = self
+        let Object::ArgumentParser(parser_object) = self
             .state
             .heap
             .get_mut(parser.object_id())
@@ -2507,6 +2506,7 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("parser handle changed object kind"));
         };
+        let ArgumentParserObject { subparsers, .. } = &mut **parser_object;
         let subparsers = subparsers
             .as_mut()
             .ok_or_else(|| PyError::value_error("add_subparsers() must be called first"))?;
@@ -2808,11 +2808,12 @@ impl PyRuntime for Vm<'_> {
             },
             _ => return Ok(None),
         };
-        let Object::Function { code, defaults, .. } =
+        let Object::Function(function_object) =
             heap.get(function).map_err(PyError::runtime_error)?
         else {
             return Ok(None);
         };
+        let FunctionObject { code, defaults, .. } = &**function_object;
         let mut parameters = code
             .parameters
             .iter()
