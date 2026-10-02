@@ -1580,26 +1580,47 @@ fn eval_test_cmd(interp: &mut Interp, cmd: &str, args: &[String], io: &mut Io) -
         ewln(io.err, &format!("{cmd}: integer expression expected"));
         return 2;
     }
-    let r = eval_test(interp, &a);
-    if r {
-        0
-    } else {
-        1
+    match eval_test(interp, &a, 0) {
+        Ok(true) => 0,
+        Ok(false) => 1,
+        Err(TestError::TooDeep) => {
+            ewln(io.err, &format!("{cmd}: expression is nested too deeply"));
+            2
+        }
+        Err(TestError::Stopped) => 2,
     }
 }
 
-fn eval_test(interp: &mut Interp, a: &[&str]) -> bool {
-    let a = strip_test_parens(a);
+/// Why a `test` expression could not be evaluated.
+enum TestError {
+    /// Operators or parentheses nest deeper than [`crate::stack::MAX_SYNTAX_DEPTH`].
+    TooDeep,
+    /// The machine's CPU budget ran out while scanning operands.
+    Stopped,
+}
+
+/// Evaluate `a` at nesting `depth`. Each level rescans its operands, so the scan is charged as
+/// CPU and the nesting is bounded.
+fn eval_test(interp: &mut Interp, a: &[&str], depth: usize) -> Result<bool, TestError> {
+    if depth >= crate::stack::MAX_SYNTAX_DEPTH {
+        return Err(TestError::TooDeep);
+    }
+    let a = strip_test_parens(interp, a)?;
+    if !interp.resources.charge_cpu(a.len() as u64) {
+        return Err(TestError::Stopped);
+    }
+    let nested =
+        |interp: &mut Interp, a: &[&str]| crate::stack::grow(|| eval_test(interp, a, depth + 1));
     if let Some(pos) = top_level_test_operator(a, &["-o", "||"]) {
-        return eval_test(interp, &a[..pos]) || eval_test(interp, &a[pos + 1..]);
+        return Ok(nested(interp, &a[..pos])? || nested(interp, &a[pos + 1..])?);
     }
     if let Some(pos) = top_level_test_operator(a, &["-a", "&&"]) {
-        return eval_test(interp, &a[..pos]) && eval_test(interp, &a[pos + 1..]);
+        return Ok(nested(interp, &a[..pos])? && nested(interp, &a[pos + 1..])?);
     }
     if a.first() == Some(&"!") {
-        return !eval_test(interp, &a[1..]);
+        return Ok(!nested(interp, &a[1..])?);
     }
-    match a.len() {
+    Ok(match a.len() {
         0 => false,
         1 => !a[0].is_empty(),
         2 => {
@@ -1639,7 +1660,7 @@ fn eval_test(interp: &mut Interp, a: &[&str]) -> bool {
                     Ok(crate::vfs::NodeKind::Symlink(_))
                 ),
                 "-v" => interp.get_var(x).is_some() || interp.arrays.contains_key(x),
-                "!" => !eval_test(interp, &a[1..]),
+                "!" => !nested(interp, &a[1..])?,
                 _ => !op.is_empty(),
             }
         }
@@ -1688,11 +1709,18 @@ fn eval_test(interp: &mut Interp, a: &[&str]) -> bool {
             }
         }
         _ => false,
-    }
+    })
 }
 
-fn strip_test_parens<'a>(mut args: &'a [&'a str]) -> &'a [&'a str] {
+/// Remove parentheses that enclose the whole expression, charging each rescan as CPU.
+fn strip_test_parens<'a>(
+    interp: &mut Interp,
+    mut args: &'a [&'a str],
+) -> Result<&'a [&'a str], TestError> {
     while args.first() == Some(&"(") && args.last() == Some(&")") {
+        if !interp.resources.charge_cpu(args.len() as u64) {
+            return Err(TestError::Stopped);
+        }
         let mut depth = 0_i32;
         let wraps_all = args.iter().enumerate().all(|(index, token)| {
             match *token {
@@ -1707,7 +1735,7 @@ fn strip_test_parens<'a>(mut args: &'a [&'a str]) -> &'a [&'a str] {
         }
         args = &args[1..args.len() - 1];
     }
-    args
+    Ok(args)
 }
 
 fn top_level_test_operator(args: &[&str], operators: &[&str]) -> Option<usize> {

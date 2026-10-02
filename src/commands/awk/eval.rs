@@ -95,6 +95,11 @@ pub(super) fn validate(program: &Program) -> Result<(), String> {
 }
 
 fn validate_stmt(statement: &Stmt) -> Result<(), String> {
+    // The parser bounds tree depth; growth keeps that depth safe on small host stacks.
+    crate::stack::grow(|| validate_stmt_inner(statement))
+}
+
+fn validate_stmt_inner(statement: &Stmt) -> Result<(), String> {
     match statement {
         Stmt::Block(statements) => {
             for statement in statements {
@@ -167,6 +172,11 @@ fn validate_lvalue(target: &LValue) -> Result<(), String> {
 }
 
 fn validate_expr(expression: &Expr) -> Result<(), String> {
+    // The parser bounds tree depth; growth keeps that depth safe on small host stacks.
+    crate::stack::grow(|| validate_expr_inner(expression))
+}
+
+fn validate_expr_inner(expression: &Expr) -> Result<(), String> {
     match expression {
         Expr::Regex(pattern) => regex::Regex::new(pattern)
             .map(|_| ())
@@ -309,6 +319,10 @@ impl Runtime<'_, '_> {
     }
 
     fn statement(&mut self, statement: &Stmt) -> Flow {
+        crate::stack::grow(|| self.statement_inner(statement))
+    }
+
+    fn statement_inner(&mut self, statement: &Stmt) -> Flow {
         if !self.system.charge_cpu(1) {
             return Flow::Exhausted;
         }
@@ -457,6 +471,10 @@ impl Runtime<'_, '_> {
     }
 
     fn expr(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
+        crate::stack::grow(|| self.expr_inner(expression))
+    }
+
+    fn expr_inner(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
         if !self.system.charge_cpu(1) {
             return Err(Flow::Exhausted);
         }

@@ -38,6 +38,7 @@ pub mod sandbox;
 pub mod scenario;
 pub mod scheduler;
 pub mod shell;
+pub(crate) mod stack;
 mod syscalls;
 pub mod telemetry;
 pub mod vfs;

@@ -741,7 +741,21 @@ fn expand_dollar(interp: &mut Interp, chars: &[char], _in_quotes: bool) -> (Stri
         '{' => {
             // ${...}
             let (inner, consumed) = read_balanced(&chars[1..], '{', '}');
-            let val = expand_param(interp, &inner);
+            // An operand such as `${x:-${y}}` expands recursively; bound that nesting.
+            let val = crate::stack::descend(
+                interp,
+                |interp| &mut interp.expansion_depth,
+                crate::stack::MAX_SYNTAX_DEPTH,
+                |interp| expand_param(interp, &inner),
+            )
+            .unwrap_or_else(|| {
+                interp.expansion_error.get_or_insert_with(|| {
+                    ShellExpansionError::parameter(
+                        "shellsim: parameter expansions are nested too deeply\n".to_string(),
+                    )
+                });
+                String::new()
+            });
             (val, 1 + consumed, false)
         }
         c if matches!(c, '?' | '$' | '#' | '@' | '*' | '!') => {

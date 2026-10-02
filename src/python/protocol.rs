@@ -250,7 +250,18 @@ fn bigint_value<'a>(heap: &'a Heap, value: &Value) -> Option<&'a BigInt> {
     }
 }
 
+/// Nesting bound for heap-only rendering, matching the VM's call-depth limit.
+const MAX_RENDER_DEPTH: usize = 256;
+
 fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result<String, String> {
+    crate::stack::grow(|| render_inner(heap, value, active))
+}
+
+fn render_inner(
+    heap: &Heap,
+    value: &Value,
+    active: &mut BTreeSet<ObjectId>,
+) -> Result<String, String> {
     if let Some(value) = string_value(heap, value)? {
         return Ok(quote_string(&value));
     }
@@ -270,6 +281,12 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         return Ok(value.repr());
     }
     if let Some(id) = value.object_id() {
+        // `active` holds the objects on the current path, so its size is the nesting depth.
+        if !active.contains(&id) && active.len() >= MAX_RENDER_DEPTH {
+            return Err(
+                "maximum recursion depth exceeded while getting the repr of an object".into(),
+            );
+        }
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
                 Object::Bare => "<object ...>",

@@ -205,6 +205,8 @@ pub struct ProcessState {
     pub opt_xtrace: bool,
     /// Diagnostic and control-flow effect raised while expanding the current shell word.
     pub(crate) expansion_error: Option<ShellExpansionError>,
+    /// Nesting of `${...}` expansions in progress, bounded by [`crate::stack::MAX_SYNTAX_DEPTH`].
+    pub(crate) expansion_depth: usize,
     /// `set -o pipefail`
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
@@ -422,6 +424,7 @@ impl ProcessState {
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
             expansion_error: None,
+            expansion_depth: 0,
             opt_pipefail: self.opt_pipefail,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -739,6 +742,7 @@ impl Environment {
                 opt_nounset: false,
                 opt_xtrace: false,
                 expansion_error: None,
+                expansion_depth: 0,
                 opt_pipefail: false,
                 jobs: Vec::new(),
                 next_job_id: 1,

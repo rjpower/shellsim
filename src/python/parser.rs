@@ -9,6 +9,7 @@ use super::ast::{
 use super::lexer::{text_escape, TextEscape};
 use super::source::Span;
 use super::token::{Token, TokenKind};
+use crate::stack::MAX_SYNTAX_DEPTH;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseError {
@@ -22,6 +23,7 @@ pub fn parse(tokens: Vec<Token>) -> Result<Program, ParseError> {
         current: 0,
         expression_depth: 0,
         compound_depth: 0,
+        depth: 0,
         scope_depth: 0,
     }
     .program()
@@ -32,6 +34,9 @@ struct Parser {
     current: usize,
     expression_depth: usize,
     compound_depth: usize,
+    /// Depth of the syntax tree under construction, counting every nested node including links
+    /// of loop-built operator chains, so recursive passes over the finished tree are bounded.
+    depth: usize,
     /// Number of enclosing `def` and `class` bodies, which forbid `from module import *`.
     scope_depth: usize,
 }
@@ -633,7 +638,13 @@ impl Parser {
         let body = self.suite()?;
         let otherwise = if self.take(|kind| matches!(kind, TokenKind::Elif)).is_some() {
             let nested_start = self.previous().span;
-            let nested_kind = self.if_statement(nested_start)?;
+            let nested_kind = crate::stack::descend(
+                self,
+                |parser| &mut parser.depth,
+                MAX_SYNTAX_DEPTH,
+                |parser| parser.if_statement(nested_start),
+            )
+            .unwrap_or_else(|| Err(self.error("compound-statement nesting limit exceeded")))?;
             vec![Statement {
                 kind: nested_kind,
                 span: nested_start.through(self.previous().span),
@@ -657,7 +668,13 @@ impl Parser {
             return Err(self.error("compound-statement nesting limit exceeded"));
         }
         self.compound_depth += 1;
-        let result = self.suite_inner();
+        let result = crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::suite_inner,
+        )
+        .unwrap_or_else(|| Err(self.error("compound-statement nesting limit exceeded")));
         self.compound_depth -= 1;
         result
     }
@@ -725,22 +742,52 @@ impl Parser {
         Ok(statements)
     }
 
+    /// Run `parse`, then release the tree depth that loop-built chains inside it claimed.
+    fn chain_scope(
+        &mut self,
+        parse: fn(&mut Self) -> Result<Expression, ParseError>,
+    ) -> Result<Expression, ParseError> {
+        let entry = self.depth;
+        let result = parse(self);
+        self.depth = entry;
+        result
+    }
+
+    /// Claim one more tree level for a link of a loop-built chain such as `a + b + c`.
+    fn link(&mut self) -> Result<(), ParseError> {
+        if self.depth >= MAX_SYNTAX_DEPTH {
+            return Err(self.error("expression nesting limit exceeded"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
     fn expression(&mut self) -> Result<Expression, ParseError> {
         const MAX_EXPRESSION_DEPTH: usize = 256;
         if self.expression_depth == MAX_EXPRESSION_DEPTH {
             return Err(self.error("expression nesting limit exceeded"));
         }
         self.expression_depth += 1;
-        let result = if self
+        let result = crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::expression_inner,
+        )
+        .unwrap_or_else(|| Err(self.error("expression nesting limit exceeded")));
+        self.expression_depth -= 1;
+        result
+    }
+
+    fn expression_inner(&mut self) -> Result<Expression, ParseError> {
+        if self
             .take(|kind| matches!(kind, TokenKind::Lambda))
             .is_some()
         {
             self.lambda_expression()
         } else {
             self.named_expression()
-        };
-        self.expression_depth -= 1;
-        result
+        }
     }
 
     fn named_expression(&mut self) -> Result<Expression, ParseError> {
@@ -1093,8 +1140,13 @@ impl Parser {
     }
 
     fn boolean_or(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::boolean_or_inner)
+    }
+
+    fn boolean_or_inner(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.boolean_and()?;
         while self.take(|kind| matches!(kind, TokenKind::Or)).is_some() {
+            self.link()?;
             let right = self.boolean_and()?;
             let span = left.span.through(right.span);
             left = Expression {
@@ -1131,8 +1183,13 @@ impl Parser {
     }
 
     fn boolean_and(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::boolean_and_inner)
+    }
+
+    fn boolean_and_inner(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.boolean_not()?;
         while self.take(|kind| matches!(kind, TokenKind::And)).is_some() {
+            self.link()?;
             let right = self.boolean_not()?;
             let span = left.span.through(right.span);
             left = Expression {
@@ -1148,6 +1205,16 @@ impl Parser {
     }
 
     fn boolean_not(&mut self) -> Result<Expression, ParseError> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::boolean_not_inner,
+        )
+        .unwrap_or_else(|| Err(self.error("expression nesting limit exceeded")))
+    }
+
+    fn boolean_not_inner(&mut self) -> Result<Expression, ParseError> {
         let start = self.peek().span;
         if self.take(|kind| matches!(kind, TokenKind::Not)).is_some() {
             let operand = self.boolean_not()?;
@@ -1256,6 +1323,10 @@ impl Parser {
     }
 
     fn shift(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::shift_inner)
+    }
+
+    fn shift_inner(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.additive()?;
         loop {
             let operator = if self
@@ -1271,6 +1342,7 @@ impl Parser {
             } else {
                 break;
             };
+            self.link()?;
             let right = self.additive()?;
             left = Expression {
                 span: left.span.through(right.span),
@@ -1290,11 +1362,24 @@ impl Parser {
         token: TokenKind,
         operator: BinaryOperator,
     ) -> Result<Expression, ParseError> {
+        let entry = self.depth;
+        let result = self.binary_chain_links(operand, token, operator);
+        self.depth = entry;
+        result
+    }
+
+    fn binary_chain_links(
+        &mut self,
+        operand: fn(&mut Self) -> Result<Expression, ParseError>,
+        token: TokenKind,
+        operator: BinaryOperator,
+    ) -> Result<Expression, ParseError> {
         let mut left = operand(self)?;
         while self
             .take(|kind| std::mem::discriminant(kind) == std::mem::discriminant(&token))
             .is_some()
         {
+            self.link()?;
             let right = operand(self)?;
             left = Expression {
                 span: left.span.through(right.span),
@@ -1309,6 +1394,10 @@ impl Parser {
     }
 
     fn additive(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::additive_inner)
+    }
+
+    fn additive_inner(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.multiplicative()?;
         loop {
             let operator = if self.take(|kind| matches!(kind, TokenKind::Plus)).is_some() {
@@ -1319,6 +1408,7 @@ impl Parser {
                 None
             };
             let Some(operator) = operator else { break };
+            self.link()?;
             let right = self.multiplicative()?;
             let span = left.span.through(right.span);
             left = Expression {
@@ -1334,6 +1424,10 @@ impl Parser {
     }
 
     fn multiplicative(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::multiplicative_inner)
+    }
+
+    fn multiplicative_inner(&mut self) -> Result<Expression, ParseError> {
         let mut left = self.unary()?;
         loop {
             let operator = if self.take(|kind| matches!(kind, TokenKind::Star)).is_some() {
@@ -1356,6 +1450,7 @@ impl Parser {
                 None
             };
             let Some(operator) = operator else { break };
+            self.link()?;
             let right = self.unary()?;
             let span = left.span.through(right.span);
             left = Expression {
@@ -1371,6 +1466,16 @@ impl Parser {
     }
 
     fn unary(&mut self) -> Result<Expression, ParseError> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::unary_inner,
+        )
+        .unwrap_or_else(|| Err(self.error("expression nesting limit exceeded")))
+    }
+
+    fn unary_inner(&mut self) -> Result<Expression, ParseError> {
         let start = self.peek().span;
         if self.take(|kind| matches!(kind, TokenKind::Await)).is_some() {
             let value = self.postfix()?;
@@ -1443,8 +1548,21 @@ impl Parser {
     }
 
     fn postfix(&mut self) -> Result<Expression, ParseError> {
+        self.chain_scope(Self::postfix_inner)
+    }
+
+    fn postfix_inner(&mut self) -> Result<Expression, ParseError> {
         let mut value = self.atom()?;
         loop {
+            if !self.at(|kind| {
+                matches!(
+                    kind,
+                    TokenKind::Dot | TokenKind::LeftBracket | TokenKind::LeftParen
+                )
+            }) {
+                break;
+            }
+            self.link()?;
             if self.take(|kind| matches!(kind, TokenKind::Dot)).is_some() {
                 let name = self.name("expected an attribute name after '.'")?;
                 let span = value.span.through(self.previous().span);

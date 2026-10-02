@@ -22,6 +22,9 @@ enum ContainerItems {
 
 /// Modeled bytes for one class attribute added after the class statement, beyond its name.
 const CLASS_ATTRIBUTE_BYTES: u64 = 48;
+
+/// Container nesting bound for `repr()`, matching the VM's call-depth limit.
+const MAX_REPR_DEPTH: usize = 256;
 impl ContainerItems {
     fn len(&self) -> usize {
         match self {
@@ -3224,6 +3227,14 @@ impl Vm<'_> {
         value: &Value,
         active: &mut BTreeSet<ObjectId>,
     ) -> Result<String, String> {
+        crate::stack::grow(|| self.repr_nested_inner(value, active))
+    }
+
+    fn repr_nested_inner(
+        &mut self,
+        value: &Value,
+        active: &mut BTreeSet<ObjectId>,
+    ) -> Result<String, String> {
         if !matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Repr)?,
             Some(SlotValue::VmRepr)
@@ -3264,9 +3275,17 @@ impl Vm<'_> {
         let Some((id, container)) = self.container_items(value)? else {
             return protocol::repr(&self.state.heap, value);
         };
-        if !active.insert(id) {
+        if active.contains(&id) {
             return Ok(container.placeholder().into());
         }
+        // `active` holds the containers on the current path, so its size is the nesting depth.
+        if active.len() >= MAX_REPR_DEPTH {
+            return Err(self.raise_exception(
+                "RecursionError",
+                "maximum recursion depth exceeded while getting the repr of an object",
+            ));
+        }
+        active.insert(id);
         self.charge_cpu(u64::try_from(container.len()).unwrap_or(u64::MAX))?;
         let rendered = match container {
             ContainerItems::List(items) => format!("[{}]", self.repr_items(&items, active)?),

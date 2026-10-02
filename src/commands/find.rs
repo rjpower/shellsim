@@ -85,7 +85,12 @@ pub(crate) struct Parser<'a> {
     explicit_action: bool,
     delete: bool,
     exec_batches: usize,
+    /// Depth of the expression tree under construction, bounded by
+    /// [`crate::stack::MAX_SYNTAX_DEPTH`].
+    depth: usize,
 }
+
+const TOO_DEEP: &str = "expression is nested too deeply";
 
 impl<'a> Parser<'a> {
     pub(crate) fn parse(arguments: &'a [String]) -> Result<Parsed, String> {
@@ -108,6 +113,7 @@ impl<'a> Parser<'a> {
             explicit_action: false,
             delete: false,
             exec_batches: 0,
+            depth: 0,
         };
         let expression = if offset == arguments.len() {
             Expr::True
@@ -130,25 +136,64 @@ impl<'a> Parser<'a> {
 
     fn or(&mut self) -> Result<Expr, String> {
         let mut expression = self.and()?;
-        while self.take_any(&["-o", "-or"]) {
-            expression = Expr::Or(Box::new(expression), Box::new(self.and()?));
-        }
-        Ok(expression)
+        let mut links = 0;
+        let result = loop {
+            if !self.take_any(&["-o", "-or"]) {
+                break Ok(expression);
+            }
+            if let Err(error) = self.deepen(&mut links) {
+                break Err(error);
+            }
+            match self.and() {
+                Ok(right) => expression = Expr::Or(Box::new(expression), Box::new(right)),
+                Err(error) => break Err(error),
+            }
+        };
+        self.depth -= links;
+        result
     }
 
     fn and(&mut self) -> Result<Expr, String> {
         let mut expression = self.not()?;
-        loop {
-            if self.take_any(&["-a", "-and"]) || self.peek().is_some_and(starts_primary) {
-                expression = Expr::And(Box::new(expression), Box::new(self.not()?));
-            } else {
-                break;
+        let mut links = 0;
+        let result = loop {
+            if !(self.take_any(&["-a", "-and"]) || self.peek().is_some_and(starts_primary)) {
+                break Ok(expression);
             }
-        }
-        Ok(expression)
+            if let Err(error) = self.deepen(&mut links) {
+                break Err(error);
+            }
+            match self.not() {
+                Ok(right) => expression = Expr::And(Box::new(expression), Box::new(right)),
+                Err(error) => break Err(error),
+            }
+        };
+        self.depth -= links;
+        result
     }
 
+    /// Record one more level of a loop-built `-a`/`-o` chain, which deepens the tree.
+    fn deepen(&mut self, links: &mut usize) -> Result<(), String> {
+        if self.depth >= crate::stack::MAX_SYNTAX_DEPTH {
+            return Err(TOO_DEEP.to_string());
+        }
+        self.depth += 1;
+        *links += 1;
+        Ok(())
+    }
+
+    /// `!` and parenthesized groups recurse through here.
     fn not(&mut self) -> Result<Expr, String> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            crate::stack::MAX_SYNTAX_DEPTH,
+            Self::not_inner,
+        )
+        .unwrap_or_else(|| Err(TOO_DEEP.to_string()))
+    }
+
+    fn not_inner(&mut self) -> Result<Expr, String> {
         if self.take_any(&["!", "-not"]) {
             Ok(Expr::Not(Box::new(self.not()?)))
         } else {

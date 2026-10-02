@@ -8,6 +8,8 @@
 use crate::interp::Interp;
 use std::fmt;
 
+use crate::stack::MAX_SYNTAX_DEPTH;
+
 /// A syntax error found before shell execution begins.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShellError {
@@ -17,6 +19,8 @@ pub enum ShellError {
     UnexpectedToken { found: String, expected: String },
     /// A quoted word was not terminated.
     UnclosedQuote(char),
+    /// Commands nest deeper than the simulator's fixed syntax nesting limit.
+    NestingTooDeep,
 }
 
 impl fmt::Display for ShellError {
@@ -29,6 +33,7 @@ impl fmt::Display for ShellError {
                 write!(f, "unexpected token {found} (expected {expected})")
             }
             Self::UnclosedQuote(quote) => write!(f, "unclosed {quote} quote"),
+            Self::NestingTooDeep => f.write_str("commands are nested too deeply"),
         }
     }
 }
@@ -910,6 +915,8 @@ struct Parser {
     toks: Vec<Tok>,
     i: usize,
     error: Option<ShellError>,
+    /// Depth of the syntax tree under construction, bounded by [`MAX_SYNTAX_DEPTH`].
+    depth: usize,
 }
 
 const RESERVED: &[&str] = &[
@@ -950,6 +957,7 @@ impl Parser {
             toks,
             i: 0,
             error: None,
+            depth: 0,
         }
     }
 
@@ -1021,31 +1029,63 @@ impl Parser {
 
     fn parse_and_or(&mut self) -> Node {
         let mut left = self.parse_pipeline();
+        // Each link wraps the tree built so far, so the chain deepens it by one level per link.
+        let mut links = 0;
         loop {
-            match self.peek() {
-                Tok::Op(o) if o == "&&" => {
-                    self.i += 1;
-                    self.skip_blank_newlines();
-                    let right = self.parse_pipeline();
-                    left = Node::And(Box::new(left), Box::new(right));
-                }
-                Tok::Op(o) if o == "||" => {
-                    self.i += 1;
-                    self.skip_blank_newlines();
-                    let right = self.parse_pipeline();
-                    left = Node::Or(Box::new(left), Box::new(right));
-                }
+            let wrap: fn(Box<Node>, Box<Node>) -> Node = match self.peek() {
+                Tok::Op(o) if o == "&&" => Node::And,
+                Tok::Op(o) if o == "||" => Node::Or,
                 Tok::Op(o) if o == "&" => {
                     self.i += 1;
+                    if !self.deepen(&mut links) {
+                        break;
+                    }
                     left = Node::Background(Box::new(left));
+                    continue;
                 }
                 _ => break,
+            };
+            self.i += 1;
+            if !self.deepen(&mut links) {
+                break;
             }
+            self.skip_blank_newlines();
+            let right = self.parse_pipeline();
+            left = wrap(Box::new(left), Box::new(right));
         }
+        self.depth -= links;
         left
     }
 
+    /// Record one more level of a loop-built chain, reporting an error at the nesting limit.
+    fn deepen(&mut self, links: &mut usize) -> bool {
+        if self.depth >= MAX_SYNTAX_DEPTH {
+            self.too_deep();
+            return false;
+        }
+        self.depth += 1;
+        *links += 1;
+        true
+    }
+
+    fn too_deep(&mut self) -> Node {
+        if self.error.is_none() {
+            self.error = Some(ShellError::NestingTooDeep);
+        }
+        Node::Empty
+    }
+
     fn parse_pipeline(&mut self) -> Node {
+        crate::stack::descend(
+            self,
+            |p| &mut p.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::parse_pipeline_inner,
+        )
+        .unwrap_or_else(|| self.too_deep())
+    }
+
+    fn parse_pipeline_inner(&mut self) -> Node {
         // `time [-p] [!] pipeline`, as a reserved word in command position.
         if self.word_is("time") {
             self.i += 1;
@@ -1101,6 +1141,16 @@ impl Parser {
     }
 
     fn parse_command(&mut self) -> Node {
+        crate::stack::descend(
+            self,
+            |p| &mut p.depth,
+            MAX_SYNTAX_DEPTH,
+            Self::parse_command_inner,
+        )
+        .unwrap_or_else(|| self.too_deep())
+    }
+
+    fn parse_command_inner(&mut self) -> Node {
         self.skip_blank_newlines();
         if matches!(self.peek(), Tok::Eof)
             || matches!(self.peek(), Tok::Op(op) if [")", "|", "&&", "||"].contains(&op.as_str()))
