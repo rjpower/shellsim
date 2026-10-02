@@ -1,6 +1,7 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::super::ast::{Program, Statement, StatementKind};
+use super::super::heap::{ClassObject, FunctionObject, GeneratorObject};
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
     BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
@@ -22,10 +23,8 @@ impl Vm<'_> {
             return Ok(None);
         };
         Ok(match self.state.heap.get(id)? {
-            Object::List(values)
-            | Object::Tuple(values)
-            | Object::Set(values)
-            | Object::FrozenSet(values) => Some(values.len()),
+            Object::List(values) | Object::Tuple(values) => Some(values.len()),
+            Object::Set(values) | Object::FrozenSet(values) => Some(values.len()),
             Object::Range { start, stop, step } => Some(range_length(*start, *stop, *step)?),
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => Some(entries.len()),
             _ => None,
@@ -82,13 +81,11 @@ impl Vm<'_> {
     }
 
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
-        let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
+        let integer = <Self as PyRuntime>::integer_bigint(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
         })?;
-        let integer = decimal
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
-        Ok((integer, decimal.len()))
+        let digits = super::super::number::decimal_digits(&integer);
+        Ok((integer, digits))
     }
 
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
@@ -137,27 +134,22 @@ impl Vm<'_> {
             Object::Module { scope, .. } => {
                 Ok(self.state.heap.scope_values(*scope)?.into_keys().collect())
             }
-            Object::Class {
-                attributes, mro, ..
-            } => {
-                let mut names = attributes.keys().cloned().collect::<Vec<_>>();
-                for ancestor in mro {
-                    if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
-                        names.extend(attributes.keys().cloned());
+            Object::Class(class_object) => {
+                let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
+                for ancestor in &class_object.mro {
+                    if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                        names.extend(ancestor.attributes.keys().cloned());
                     }
                 }
                 Ok(names)
             }
             Object::Instance { class, .. } => {
                 let mut names = self.state.heap.instance_attribute_names(id)?;
-                if let Object::Class {
-                    attributes, mro, ..
-                } = self.state.heap.get(*class)?
-                {
-                    names.extend(attributes.keys().cloned());
-                    for ancestor in mro {
-                        if let Object::Class { attributes, .. } = self.state.heap.get(*ancestor)? {
-                            names.extend(attributes.keys().cloned());
+                if let Object::Class(class_object) = self.state.heap.get(*class)? {
+                    names.extend(class_object.attributes.keys().cloned());
+                    for ancestor in &class_object.mro {
+                        if let Object::Class(ancestor) = self.state.heap.get(*ancestor)? {
+                            names.extend(ancestor.attributes.keys().cloned());
                         }
                     }
                 }
@@ -250,14 +242,15 @@ impl Vm<'_> {
         }
         if let Some(id) = function.object_id() {
             return match self.state.heap.get(id)?.clone() {
-                Object::Function {
-                    name,
-                    code,
-                    closure,
-                    defaults,
-                    defining_class,
-                    ..
-                } => {
+                Object::Function(function_object) => {
+                    let FunctionObject {
+                        name,
+                        code,
+                        closure,
+                        defaults,
+                        defining_class,
+                        ..
+                    } = *function_object;
                     let method_frame = defining_class.zip(arguments.first().cloned());
                     if let Some((owner, receiver)) = method_frame {
                         self.method_frames.push((owner, receiver));
@@ -285,16 +278,18 @@ impl Vm<'_> {
                     owner,
                 } => {
                     if let Some(function) = descriptor.object_id() {
-                        let Object::Function {
+                        let Object::Function(function_object) =
+                            self.state.heap.get(function)?.clone()
+                        else {
+                            return Err("bound descriptor is not callable".into());
+                        };
+                        let FunctionObject {
                             name,
                             code,
                             closure,
                             defaults,
                             ..
-                        } = self.state.heap.get(function)?.clone()
-                        else {
-                            return Err("bound descriptor is not callable".into());
-                        };
+                        } = *function_object;
                         arguments.insert(0, receiver);
                         if let Some(owner) = owner {
                             self.method_frames.push((owner, receiver));
@@ -660,15 +655,12 @@ impl Vm<'_> {
             }
             Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
                 expect_arity(&arguments, 1, 1)?;
-                let decimal = <Self as PyRuntime>::integer_text(self, &arguments[0])
+                let integer = <Self as PyRuntime>::integer_bigint(self, &arguments[0])
                     .map_err(|error| error.to_string())?
                     .ok_or("integer argument expected")?;
-                let integer = decimal
-                    .parse::<BigInt>()
-                    .map_err(|_| "invalid internal integer representation")?;
-                let output_bound = decimal
-                    .len()
-                    .checked_mul(4)
+                // Binary needs one digit per bit, the widest of the three spellings.
+                let output_bound = usize::try_from(integer.bits())
+                    .ok()
                     .and_then(|length| length.checked_add(3))
                     .ok_or("integer representation is too large")?;
                 <Self as PyRuntime>::reserve_memory(self, output_bound)
@@ -848,24 +840,17 @@ impl Vm<'_> {
                     self.reserve_result(64)?;
                     keyed.push((key, value));
                 }
-                // Stable insertion sort keeps comparison dispatch and failure order obvious. Like
-                // CPython's sort it only asks `<`, and a reversed sort keeps equal items in order.
-                for index in 1..keyed.len() {
-                    let mut current = index;
-                    while current > 0 {
-                        self.charge_cpu(1)?;
-                        let (left, right) = if reverse {
-                            (keyed[current - 1].0, keyed[current].0)
-                        } else {
-                            (keyed[current].0, keyed[current - 1].0)
-                        };
-                        if !self.compare_truth(ComparisonOperator::Less, &left, &right)? {
-                            break;
-                        }
-                        keyed.swap(current, current - 1);
-                        current -= 1;
-                    }
-                }
+                // Like CPython's sort this only asks `<`, and a reversed sort keeps equal items
+                // in their original order.
+                super::super::sort::merge_sort(&mut keyed, |right, left| {
+                    self.charge_cpu(1)?;
+                    let (lesser, greater) = if reverse {
+                        (left.0, right.0)
+                    } else {
+                        (right.0, left.0)
+                    };
+                    self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
+                })?;
                 let values = keyed.into_iter().map(|(_, value)| value).collect();
                 Ok(CallResult::Value(
                     self.allocate_object(Object::List(values))?,
@@ -996,7 +981,7 @@ impl Vm<'_> {
                     if modulus.is_negative() && !result.is_zero() {
                         result += modulus;
                     }
-                    let result = <Self as PyRuntime>::new_integer(self, &result.to_string())
+                    let result = <Self as PyRuntime>::new_bigint(self, result)
                         .map_err(|error| error.to_string())?;
                     return Ok(CallResult::Value(result));
                 }
@@ -1262,7 +1247,10 @@ impl Vm<'_> {
         keyword_arguments: Vec<(String, Value)>,
         dispatch_metaclass: bool,
     ) -> Result<CallResult, String> {
-        let Object::Class {
+        let Object::Class(class_object) = self.state.heap.get(id)? else {
+            return Err("type.__call__ requires a class".into());
+        };
+        let ClassObject {
             name,
             metaclass,
             layout,
@@ -1271,10 +1259,7 @@ impl Vm<'_> {
             dataclass_fields,
             enum_members,
             ..
-        } = self.state.heap.get(id)?.clone()
-        else {
-            return Err("type.__call__ requires a class".into());
-        };
+        } = (**class_object).clone();
         if dispatch_metaclass {
             if let Some(metaclass_id) = metaclass.object_id() {
                 if let Some((owner, descriptor)) =
@@ -1467,17 +1452,17 @@ impl Vm<'_> {
             let Some(function) = initializer.object_id() else {
                 return Err(format!("{name}.__init__ is not callable"));
             };
-            let Object::Function {
+            let Object::Function(function_object) = self.state.heap.get(function)?.clone() else {
+                return Err(format!("{name}.__init__ is not a function"));
+            };
+            let FunctionObject {
                 name: function_name,
                 code,
                 closure,
                 defaults,
                 defining_class,
                 ..
-            } = self.state.heap.get(function)?.clone()
-            else {
-                return Err(format!("{name}.__init__ is not a function"));
-            };
+            } = *function_object;
             arguments.insert(0, instance);
             // Zero-argument `super()` in the initializer reads this frame.
             if let Some(owner) = defining_class {
@@ -1598,7 +1583,7 @@ impl Vm<'_> {
     ) -> Result<CallResult, String> {
         let scope =
             self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
-        let generator = self.allocate_object(Object::Generator {
+        let generator = self.allocate_object(Object::Generator(Box::new(GeneratorObject {
             name: name.to_string(),
             code: code.clone(),
             scope,
@@ -1609,7 +1594,7 @@ impl Vm<'_> {
             exhausted: false,
             running: false,
             return_value: Value::None,
-        })?;
+        })))?;
         Ok(CallResult::Value(generator))
     }
 
@@ -1714,7 +1699,7 @@ impl Vm<'_> {
             }
         }
         if let Some(slot) = signature.keyword_variadic_slot {
-            locals[slot] = Some(self.allocate_object(Object::Dict(extra_keywords.into()))?);
+            locals[slot] = Some(self.allocate_dict(extra_keywords)?);
         }
         if defaults.len() != signature.default_slots.len() {
             return Err(format!("{name}() has invalid default argument metadata"));
@@ -1802,7 +1787,7 @@ impl Vm<'_> {
             return Ok(CallResult::Value(created));
         }
         let layout = match self.state.heap.get(class)? {
-            Object::Class { layout, .. } => *layout,
+            Object::Class(class_object) => class_object.layout,
             _ => return Err("type.__call__ requires a class".into()),
         };
         let initializer = if layout == ClassLayout::Object {
@@ -1891,19 +1876,13 @@ impl Vm<'_> {
                 return Err(self.raise_exception("TypeError", message));
             }
             _ => match class.object_id().map(|id| (id, self.state.heap.get(id))) {
-                Some((
-                    id,
-                    Ok(Object::Class {
-                        layout: ClassLayout::Builtin(layout),
-                        ..
-                    }),
-                )) if *layout == builtin => Some(id),
-                Some((
-                    _,
-                    Ok(Object::Class {
-                        name: class_name, ..
-                    }),
-                )) => {
+                Some((id, Ok(Object::Class(class_object))))
+                    if class_object.layout == ClassLayout::Builtin(builtin) =>
+                {
+                    Some(id)
+                }
+                Some((_, Ok(Object::Class(class_object)))) => {
+                    let class_name = &class_object.name;
                     let message = format!(
                         "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
                     );
@@ -1963,12 +1942,12 @@ impl Vm<'_> {
             class
                 .object_id()
                 .and_then(|id| match self.state.heap.get(id) {
-                    Ok(Object::Class {
-                        name,
-                        layout,
-                        exception_base,
-                        ..
-                    }) => Some((id, name.clone(), *layout, *exception_base)),
+                    Ok(Object::Class(class_object)) => Some((
+                        id,
+                        class_object.name.clone(),
+                        class_object.layout,
+                        class_object.exception_base,
+                    )),
                     _ => None,
                 })
         else {
@@ -2008,8 +1987,44 @@ impl Vm<'_> {
         let Some(id) = iterator.object_id() else {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
         };
-        Ok(match self.state.heap.get(id)?.clone() {
+        // Copy out only the fields a step needs. Cloning a materialized iterator, generator or
+        // instance payload on every step would make iteration quadratic in host time.
+        enum Step {
+            Callable {
+                callable: Value,
+                sentinel: Value,
+                exhausted: bool,
+            },
+            Count {
+                current: i64,
+                step: i64,
+            },
+            Protocol,
+        }
+        let step = match self.state.heap.get(id)? {
             Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => Step::Callable {
+                callable: *callable,
+                sentinel: *sentinel,
+                exhausted: *exhausted,
+            },
+            Object::CountIterator { current, step } => Step::Count {
+                current: *current,
+                step: *step,
+            },
+            Object::Generator { .. } => return self.resume_generator(id),
+            Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => return self.next_stored_iterator(id),
+            _ => Step::Protocol,
+        };
+        Ok(match step {
+            Step::Callable {
                 callable,
                 sentinel,
                 exhausted,
@@ -2036,7 +2051,7 @@ impl Vm<'_> {
                     }
                 }
             }
-            Object::CountIterator { current, step } => {
+            Step::Count { current, step } => {
                 let next = super::super::stdlib::itertools::count_next(current, step)
                     .map_err(str::to_string)?;
                 if let Object::CountIterator { current, .. } = self.state.heap.get_mut(id)? {
@@ -2044,16 +2059,14 @@ impl Vm<'_> {
                 }
                 Some(Value::Int(current))
             }
-            Object::Generator { .. } => self.resume_generator(id)?,
-            Object::Iterator { .. }
-            | Object::SequenceIterator { .. }
-            | Object::ReverseIterator { .. }
-            | Object::RangeIterator { .. }
-            | Object::StreamIterator { .. } => self.next_stored_iterator(id)?,
-            _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
-                Some(value) => Some(value),
-                None => return Err(self.raise_object_type_error(iterator, "is not an iterator")),
-            },
+            Step::Protocol => {
+                match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
+                    Some(value) => Some(value),
+                    None => {
+                        return Err(self.raise_object_type_error(iterator, "is not an iterator"))
+                    }
+                }
+            }
         })
     }
 

@@ -15,14 +15,8 @@ use crate::scheduler::{Scheduler, WaitReason};
 use crate::telemetry::InvocationLog;
 use crate::vfs::Vfs;
 
-/// A bash array value. Indexed arrays are sparse (`arr[5]=x` on an empty array is legal),
-/// so unset slots are `None`. Associative arrays preserve sorted key order (bash uses an
-/// unspecified hash order; sorted is deterministic and good enough for our checks).
-#[derive(Clone, Debug)]
-pub enum ArrayVal {
-    Indexed(Vec<Option<String>>),
-    Assoc(BTreeMap<String, String>),
-}
+pub use crate::variables::ArrayVal;
+use crate::variables::{string_bytes, ArrayKey, Arrays, Positional, Variables};
 
 /// Cursor retained between calls to the `getopts` shell builtin.
 #[derive(Clone, Debug)]
@@ -63,6 +57,15 @@ struct LocalBinding {
     scalar: Option<String>,
     array: Option<ArrayVal>,
     exported: bool,
+}
+
+impl LocalBinding {
+    /// Modeled bytes this saved binding holds outside the live variables.
+    fn bytes(&self, name: &str) -> u64 {
+        string_bytes(name)
+            .saturating_add(self.scalar.as_deref().map_or(0, string_bytes))
+            .saturating_add(self.array.as_ref().map_or(0, ArrayVal::bytes))
+    }
 }
 
 /// Non-default shell behavior installed for one modeled signal.
@@ -166,10 +169,10 @@ pub struct ProcessState {
     pub shell_pid: ProcessId,
     /// shell + environment variables (we don't distinguish exported vs not for simplicity,
     /// except that `env`/child python only sees exported ones, tracked in `exported`)
-    pub vars: HashMap<String, String>,
+    pub vars: Variables,
     /// bash arrays (indexed + associative), keyed by variable name. A name present here is an
     /// array; it shadows any scalar `vars` entry of the same name for `${name[...]}` access.
-    pub arrays: HashMap<String, ArrayVal>,
+    pub arrays: Arrays,
     pub exported: std::collections::BTreeSet<String>,
     /// Variable names protected by the `readonly` builtin.
     pub readonly: std::collections::BTreeSet<String>,
@@ -197,7 +200,7 @@ pub struct ProcessState {
     /// `$0`: the shell or script name given when a shell image was loaded.
     pub(crate) arg0: String,
     /// positional parameters `$1 $2 ... $@`
-    pub positional: Vec<String>,
+    pub positional: Positional,
     pub(crate) getopts: GetoptsState,
     /// `set -e` / `set -u` / `set -x`
     pub opt_errexit: bool,
@@ -205,6 +208,8 @@ pub struct ProcessState {
     pub opt_xtrace: bool,
     /// Diagnostic and control-flow effect raised while expanding the current shell word.
     pub(crate) expansion_error: Option<ShellExpansionError>,
+    /// Nesting of `${...}` expansions in progress, bounded by [`crate::stack::MAX_SYNTAX_DEPTH`].
+    pub(crate) expansion_depth: usize,
     /// `set -o pipefail`
     pub opt_pipefail: bool,
     pub jobs: Vec<Job>,
@@ -246,6 +251,16 @@ pub struct ProcessState {
     handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
+    /// Modeled bytes of bindings saved by `local` in active function scopes.
+    local_saved_bytes: u64,
+    /// Modeled bytes of positional parameters and variables saved by active function calls.
+    pub(crate) frame_saved_bytes: u64,
+    /// Shell state bytes already paid for when this context was created.
+    state_baseline: u64,
+    /// Memory reserved for shell state growth beyond [`Self::state_baseline`].
+    state_reserved: u64,
+    /// Memory reserved for words expanded since the current node started.
+    pub(crate) expansion_reserved: u64,
     detached_output: bool,
 }
 
@@ -422,6 +437,7 @@ impl ProcessState {
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
             expansion_error: None,
+            expansion_depth: 0,
             opt_pipefail: self.opt_pipefail,
             jobs: Vec::new(),
             next_job_id: 1,
@@ -458,8 +474,32 @@ impl ProcessState {
             },
             handling_signal: false,
             fork_allocation_bytes,
+            local_saved_bytes: self.local_saved_bytes,
+            frame_saved_bytes: 0,
+            state_baseline: 0,
+            state_reserved: 0,
+            expansion_reserved: 0,
             detached_output,
         }
+        .with_state_baseline()
+    }
+
+    /// Treat the current shell state as already paid for, as the fork charge covers it.
+    fn with_state_baseline(mut self) -> Self {
+        self.state_baseline = self.state_bytes();
+        self
+    }
+
+    /// Modeled bytes of guest-sized shell state: variables, arrays, positional parameters,
+    /// bindings saved by function scopes and calls, and the buffered `read` input stream.
+    pub(crate) fn state_bytes(&self) -> u64 {
+        self.vars
+            .bytes()
+            .saturating_add(self.arrays.bytes())
+            .saturating_add(self.positional.bytes())
+            .saturating_add(self.local_saved_bytes)
+            .saturating_add(self.frame_saved_bytes)
+            .saturating_add(self.input_stream.len() as u64)
     }
 
     fn fork_memory_bytes(&self) -> u64 {
@@ -490,12 +530,12 @@ impl ProcessState {
             )
             .saturating_add(self.input_stream.len() as u64);
         bytes = bytes.saturating_add((self.fds.iter().count() as u64).saturating_mul(16));
-        for (name, value) in &self.arrays {
+        for (name, value) in self.arrays.iter() {
             bytes = bytes.saturating_add(string(name));
             bytes = bytes.saturating_add(match value {
-                ArrayVal::Indexed(values) => values.iter().fold(0, |total, value| {
-                    total.saturating_add(value.as_ref().map_or(0, string))
-                }),
+                ArrayVal::Indexed(values) => values
+                    .values()
+                    .fold(0, |total, value| total.saturating_add(string(value))),
                 ArrayVal::Assoc(values) => values.iter().fold(0, |total, (name, value)| {
                     total
                         .saturating_add(string(name))
@@ -536,9 +576,9 @@ impl ProcessState {
                 bytes = bytes.saturating_add(binding.scalar.as_ref().map_or(0, string));
                 if let Some(array) = &binding.array {
                     bytes = bytes.saturating_add(match array {
-                        ArrayVal::Indexed(values) => values.iter().fold(0, |total, value| {
-                            total.saturating_add(value.as_ref().map_or(0, string))
-                        }),
+                        ArrayVal::Indexed(values) => values
+                            .values()
+                            .fold(0, |total, value| total.saturating_add(string(value))),
                         ArrayVal::Assoc(values) => values.iter().fold(0, |total, (key, value)| {
                             total
                                 .saturating_add(string(key))
@@ -612,7 +652,7 @@ impl Environment {
     }
 
     pub fn with_limits(limits: Limits) -> Self {
-        let mut vars: HashMap<String, String> = HashMap::new();
+        let mut vars = Variables::default();
         vars.insert("HOME".into(), "/root".into());
         vars.insert(
             "PATH".into(),
@@ -696,7 +736,7 @@ impl Environment {
             .collect();
         let mut processes = ProcessTable::new(ROOT_PID, "/".to_string(), process_environment);
         processes.update_descriptors(ROOT_PID, descriptor_snapshot);
-        Environment {
+        let mut environment = Environment {
             vfs,
             hostname: "sandbox".to_string(),
             clock,
@@ -715,7 +755,7 @@ impl Environment {
                 session_id: ROOT_PID,
                 shell_pid: ROOT_PID,
                 vars,
-                arrays: HashMap::new(),
+                arrays: Arrays::default(),
                 exported,
                 readonly: std::collections::BTreeSet::new(),
                 umask: 0o022,
@@ -730,7 +770,7 @@ impl Environment {
                 random_state: Cell::new(1),
                 syscall_random_state: 0x5eed_5eed_5eed_5eed,
                 arg0: "shellsim".to_string(),
-                positional: Vec::new(),
+                positional: Positional::default(),
                 getopts: GetoptsState {
                     optind: 1,
                     offset: 1,
@@ -739,6 +779,7 @@ impl Environment {
                 opt_nounset: false,
                 opt_xtrace: false,
                 expansion_error: None,
+                expansion_depth: 0,
                 opt_pipefail: false,
                 jobs: Vec::new(),
                 next_job_id: 1,
@@ -761,6 +802,11 @@ impl Environment {
                 exit_disposition: None,
                 handling_signal: false,
                 fork_allocation_bytes: 0,
+                local_saved_bytes: 0,
+                frame_saved_bytes: 0,
+                state_baseline: 0,
+                state_reserved: 0,
+                expansion_reserved: 0,
                 detached_output: false,
             }),
             live_children: BTreeMap::new(),
@@ -771,7 +817,11 @@ impl Environment {
             packages: std::collections::BTreeSet::new(),
             pending_stdout: Vec::new(),
             pending_stderr: Vec::new(),
-        }
+        };
+        // The default environment is part of the machine image; only state a script adds on
+        // top of it is charged as retained memory.
+        environment.process.state_baseline = environment.process.state_bytes();
+        environment
     }
 
     /// Enter a synchronous logical child while retaining the parent shell state.
@@ -1114,7 +1164,7 @@ impl Environment {
             offset: 1,
         };
         state.arg0 = image.arg0;
-        state.positional = image.positional;
+        state.positional = image.positional.into();
         state.opt_errexit = image.errexit;
         state.opt_nounset = image.nounset;
         state.opt_xtrace = image.xtrace;
@@ -1438,7 +1488,11 @@ impl Environment {
     /// Restore the parent after a synchronous child and optionally retain the exited record.
     pub(crate) fn finish_child(&mut self, pid: ProcessId, status: i32) {
         let child_deadline_interrupt = self.process.deadline_interrupt;
-        let fork_allocation_bytes = self.process.fork_allocation_bytes;
+        let fork_allocation_bytes = self
+            .process
+            .fork_allocation_bytes
+            .saturating_add(self.process.state_reserved)
+            .saturating_add(self.process.expansion_reserved);
         let parent_pid = self.process.ppid;
         if self.process.detached_output {
             let stdout = self.process.fds.get(1).ok();
@@ -1679,6 +1733,39 @@ impl Environment {
         }
     }
 
+    /// Release the memory charged for words the previous node expanded.
+    ///
+    /// Expansion results stay charged while the command that consumed them runs; by the time
+    /// the next node starts they have been dropped or moved into shell state.
+    pub(crate) fn release_expansion_memory(&mut self) {
+        let reserved = std::mem::take(&mut self.process.expansion_reserved);
+        self.resources.release_memory(reserved);
+    }
+
+    /// Reserve or release machine memory for growth in the active process's shell state.
+    ///
+    /// Variables, arrays, positional parameters, and saved function bindings keep exact
+    /// running byte counts, so this is constant time. Values reach that state through charged
+    /// expansions or bounded input, so syncing at assignment and command boundaries bounds the
+    /// host memory a script can hold. Returns false, with the machine stopped, when the memory
+    /// budget cannot cover the state.
+    pub(crate) fn sync_shell_memory(&mut self) -> bool {
+        let target = self
+            .process
+            .state_bytes()
+            .saturating_sub(self.process.state_baseline);
+        let reserved = self.process.state_reserved;
+        if target > reserved {
+            if !self.resources.reserve_memory(target - reserved) {
+                return false;
+            }
+        } else {
+            self.resources.release_memory(reserved - target);
+        }
+        self.process.state_reserved = target;
+        true
+    }
+
     /// Mark the active shell's caught-signal handler complete.
     pub(crate) fn finish_signal_handler(&mut self) {
         self.process.handling_signal = false;
@@ -1689,7 +1776,12 @@ impl Environment {
         if let Some(mut child) = self.process.remove(pid) {
             child.fds.close_all(&mut self.descriptors);
             self.vfs.retain_orphans(&self.descriptors.live_orphans());
-            self.resources.release_memory(child.fork_allocation_bytes);
+            self.resources.release_memory(
+                child
+                    .fork_allocation_bytes
+                    .saturating_add(child.state_reserved)
+                    .saturating_add(child.expansion_reserved),
+            );
         }
         let _ = self.scheduler.discard_runnable(pid);
         self.processes.exit(pid, 125, &self.process.cwd);
@@ -2116,6 +2208,7 @@ impl Environment {
             array: self.arrays.get(name).cloned(),
             exported: self.exported.contains(name),
         };
+        let saved_bytes = binding.bytes(name);
         let Some(scope) = self.local_scopes.last_mut() else {
             return;
         };
@@ -2123,6 +2216,7 @@ impl Environment {
             return;
         }
         scope.insert(name.to_string(), binding);
+        self.local_saved_bytes = self.local_saved_bytes.saturating_add(saved_bytes);
         self.vars.remove(name);
         self.arrays.remove(name);
         self.exported.remove(name);
@@ -2134,6 +2228,7 @@ impl Environment {
             return;
         };
         for (name, binding) in scope {
+            self.local_saved_bytes = self.local_saved_bytes.saturating_sub(binding.bytes(&name));
             self.vars.remove(&name);
             self.arrays.remove(&name);
             self.exported.remove(&name);
@@ -2163,11 +2258,12 @@ impl Environment {
     /// so that the old scalar becomes element 0 (`x=1; x[2]=3` ⇒ x[0]=1).
     fn ensure_indexed(&mut self, name: &str) {
         if !self.arrays.contains_key(name) {
-            let mut v: Vec<Option<String>> = Vec::new();
-            if let Some(s) = self.vars.get(name).cloned() {
-                v.push(Some(s));
+            let mut values = BTreeMap::new();
+            if let Some(value) = self.vars.get(name).cloned() {
+                values.insert(0, value);
             }
-            self.arrays.insert(name.to_string(), ArrayVal::Indexed(v));
+            self.arrays
+                .insert(name.to_string(), ArrayVal::Indexed(values));
         }
     }
 
@@ -2189,7 +2285,7 @@ impl Environment {
         self.vars.remove(name);
         self.arrays.insert(
             name.to_string(),
-            ArrayVal::Indexed(elems.into_iter().map(Some).collect()),
+            ArrayVal::Indexed(elems.into_iter().enumerate().collect()),
         );
     }
 
@@ -2197,31 +2293,22 @@ impl Environment {
     /// associative array, callers should use `array_set` per key; this is indexed-only.
     pub fn array_append(&mut self, name: &str, elems: Vec<String>) {
         self.ensure_indexed(name);
-        if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
-            for e in elems {
-                v.push(Some(e));
-            }
+        for value in elems {
+            let index = self.arrays.get(name).map_or(0, ArrayVal::end_index);
+            self.arrays.set_element(name, ArrayKey::Index(index), value);
         }
     }
 
     /// Assign `value` to a subscript. For an associative array `key` is the literal key; for an
     /// indexed array `key` is parsed as an integer index (sparse — gaps become `None`).
     pub fn array_set(&mut self, name: &str, key: &str, value: String) {
-        match self.arrays.get_mut(name) {
-            Some(ArrayVal::Assoc(m)) => {
-                m.insert(key.to_string(), value);
-            }
-            _ => {
-                self.ensure_indexed(name);
-                if let Some(ArrayVal::Indexed(v)) = self.arrays.get_mut(name) {
-                    let idx = key.trim().parse::<usize>().unwrap_or(0);
-                    if idx >= v.len() {
-                        v.resize(idx + 1, None);
-                    }
-                    v[idx] = Some(value);
-                }
-            }
-        }
+        let key = if matches!(self.arrays.get(name), Some(ArrayVal::Assoc(_))) {
+            ArrayKey::Name(key.to_string())
+        } else {
+            self.ensure_indexed(name);
+            ArrayKey::Index(key.trim().parse::<usize>().unwrap_or(0))
+        };
+        self.arrays.set_element(name, key, value);
     }
 
     /// Look up one subscript value.
@@ -2230,7 +2317,7 @@ impl Environment {
             Some(ArrayVal::Assoc(m)) => m.get(key).cloned(),
             Some(ArrayVal::Indexed(v)) => {
                 let idx = key.trim().parse::<usize>().ok()?;
-                v.get(idx).and_then(|o| o.clone())
+                v.get(&idx).cloned()
             }
             None => None,
         }
@@ -2240,7 +2327,7 @@ impl Environment {
     pub fn array_all(&self, name: &str) -> Vec<String> {
         match self.arrays.get(name) {
             Some(ArrayVal::Assoc(m)) => m.values().cloned().collect(),
-            Some(ArrayVal::Indexed(v)) => v.iter().filter_map(|o| o.clone()).collect(),
+            Some(ArrayVal::Indexed(v)) => v.values().cloned().collect(),
             None => Vec::new(),
         }
     }
@@ -2249,11 +2336,7 @@ impl Environment {
     pub fn array_keys(&self, name: &str) -> Vec<String> {
         match self.arrays.get(name) {
             Some(ArrayVal::Assoc(m)) => m.keys().cloned().collect(),
-            Some(ArrayVal::Indexed(v)) => v
-                .iter()
-                .enumerate()
-                .filter_map(|(i, o)| o.as_ref().map(|_| i.to_string()))
-                .collect(),
+            Some(ArrayVal::Indexed(v)) => v.keys().map(usize::to_string).collect(),
             None => Vec::new(),
         }
     }
@@ -2262,26 +2345,22 @@ impl Environment {
     pub fn array_len(&self, name: &str) -> usize {
         match self.arrays.get(name) {
             Some(ArrayVal::Assoc(m)) => m.len(),
-            Some(ArrayVal::Indexed(v)) => v.iter().filter(|o| o.is_some()).count(),
+            Some(ArrayVal::Indexed(v)) => v.len(),
             None => 0,
         }
     }
 
     /// Unset one subscript (an element); returns true if the name remained an array.
     pub fn array_unset_elem(&mut self, name: &str, key: &str) {
-        match self.arrays.get_mut(name) {
-            Some(ArrayVal::Assoc(m)) => {
-                m.remove(key);
-            }
-            Some(ArrayVal::Indexed(v)) => {
-                if let Ok(idx) = key.trim().parse::<usize>() {
-                    if idx < v.len() {
-                        v[idx] = None;
-                    }
-                }
-            }
-            None => {}
-        }
+        let key = match self.arrays.get(name) {
+            Some(ArrayVal::Assoc(_)) => ArrayKey::Name(key.to_string()),
+            Some(ArrayVal::Indexed(_)) => match key.trim().parse::<usize>() {
+                Ok(index) => ArrayKey::Index(index),
+                Err(_) => return,
+            },
+            None => return,
+        };
+        self.arrays.unset_element(name, key);
     }
 
     /// Environment map visible to a child process (e.g. the python engine).

@@ -532,10 +532,11 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
     let Some(requested) = argv.first() else {
         return false;
     };
-    if resolves_to_process_image(interp, requested) {
-        return false;
-    }
-    if !builtins::is_shell_builtin_name(requested) {
+    // A bare builtin name never consults PATH, so it skips the filesystem lookups below.
+    if requested.contains('/') || !builtins::is_shell_builtin_name(requested) {
+        if resolves_to_process_image(interp, requested) {
+            return false;
+        }
         if let util::ExecutableLookup::Found(path) = util::resolve_executable(interp, requested) {
             if matches!(
                 interp
@@ -781,8 +782,10 @@ fn dispatch(
     // Bare shell builtins remain in the shell process. An explicit path always invokes the
     // corresponding external image, even if its basename is also a builtin.
     let builtin = !requested.contains('/') && builtins::is_shell_builtin_name(requested);
-    let native = resolved_native_image(interp, requested);
-    if execs_native_image(interp, requested) {
+    let native = (!builtin)
+        .then(|| resolved_native_image(interp, requested))
+        .flatten();
+    if !builtin && execs_native_image(interp, requested) {
         return start_child_sequence(
             interp,
             vec![ChildCommand {
@@ -904,6 +907,8 @@ fn dispatch(
         );
         let _ = interp.resources.charge_output(unaccounted_output);
         interp.resources.release_memory(working_memory);
+        // Builtins such as `read`, `declare`, and `set` grow shell state directly.
+        let _ = interp.sync_shell_memory();
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());

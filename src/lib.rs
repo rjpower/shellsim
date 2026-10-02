@@ -10,6 +10,10 @@
 //!   * [`commands`] — native coreutils + builtins
 //!   * [`python`] — metered Python 3.14 source-to-bytecode compatibility engine
 
+// Simulated programs must never reach host memory, so the crate is free of `unsafe` code
+// except one audited host-side site in `sandbox`.
+#![deny(unsafe_code)]
+
 pub(crate) mod arith;
 pub mod clock;
 pub mod commands;
@@ -38,8 +42,10 @@ pub mod sandbox;
 pub mod scenario;
 pub mod scheduler;
 pub mod shell;
+pub(crate) mod stack;
 mod syscalls;
 pub mod telemetry;
+pub mod variables;
 pub mod vfs;
 
 pub use clock::{

@@ -61,6 +61,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> i32 {
         tokens: &owned,
         pos: 0,
         meter: SystemMeter(context.system),
+        depth: 0,
     };
     let result = parser.parse_expr().and_then(|value| {
         if parser.pos != parser.tokens.len() {
@@ -202,6 +203,9 @@ struct Parser<'a, M: CpuMeter> {
     tokens: &'a [String],
     pos: usize,
     meter: M,
+    /// Nesting of parentheses and keyword operands, bounded by
+    /// [`crate::stack::MAX_SYNTAX_DEPTH`].
+    depth: usize,
 }
 
 impl<'a, M: CpuMeter> Parser<'a, M> {
@@ -339,6 +343,20 @@ impl<'a, M: CpuMeter> Parser<'a, M> {
     }
 
     fn parse_primary(&mut self) -> Result<Value, EvalError> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            crate::stack::MAX_SYNTAX_DEPTH,
+            Self::parse_primary_inner,
+        )
+        .unwrap_or_else(|| {
+            Err("syntax error: expression is nested too deeply"
+                .to_string()
+                .into())
+        })
+    }
+
+    fn parse_primary_inner(&mut self) -> Result<Value, EvalError> {
         match self.peek() {
             Some("(") => {
                 self.advance();
@@ -473,6 +491,7 @@ mod tests {
             tokens: &owned,
             pos: 0,
             meter: NoopMeter,
+            depth: 0,
         };
         parser.parse_expr().map_err(|e| match e {
             EvalError::Message(m) => m,

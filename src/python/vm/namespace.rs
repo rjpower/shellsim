@@ -258,13 +258,11 @@ impl Vm<'_> {
             );
         };
         match self.state.heap.get(id)?.clone() {
-            Object::Class {
-                instance_type,
-                exception_base: Some(_),
-                ..
-            } => {
+            Object::Class(class_object) if class_object.exception_base.is_some() => {
                 let actual_type = self.type_id(&actual.value)?;
-                self.state.types.is_subclass(actual_type, instance_type)
+                self.state
+                    .types
+                    .is_subclass(actual_type, class_object.instance_type)
             }
             Object::Tuple(types) => {
                 for expected in types {
@@ -288,15 +286,12 @@ impl Vm<'_> {
         let Object::Instance { class, .. } = self.state.heap.get(id)? else {
             return Ok(None);
         };
-        let Object::Class {
-            name,
-            exception_base,
-            ..
-        } = self.state.heap.get(*class)?
-        else {
+        let Object::Class(class_object) = self.state.heap.get(*class)? else {
             return Ok(None);
         };
-        Ok(exception_base.map(|_| name.clone()))
+        Ok(class_object
+            .exception_base
+            .map(|_| class_object.name.clone()))
     }
 
     /// The modeled exception class a user exception instance derives from, if `value` is one.
@@ -310,10 +305,10 @@ impl Vm<'_> {
         let Object::Instance { class, .. } = self.state.heap.get(id)? else {
             return Ok(None);
         };
-        let Object::Class { exception_base, .. } = self.state.heap.get(*class)? else {
+        let Object::Class(class_object) = self.state.heap.get(*class)? else {
             return Ok(None);
         };
-        Ok(*exception_base)
+        Ok(class_object.exception_base)
     }
 
     #[inline(always)]
@@ -419,7 +414,7 @@ impl Vm<'_> {
         target: NamespaceTarget,
     ) -> Result<Value, String> {
         let items = self.namespace_items(target)?;
-        self.allocate_object(Object::Dict(items.into()))
+        self.allocate_dict(items)
     }
 
     /// `target`'s bindings as `(key, value)` pairs with freshly allocated string keys, in the
@@ -445,10 +440,11 @@ impl Vm<'_> {
     ) -> Result<Vec<(Value, Value)>, String> {
         let mut entries: Vec<(String, Value)> = match target {
             ProxyTarget::Class(class) => {
-                let Object::Class { attributes, .. } = self.state.heap.get(class)? else {
+                let Object::Class(class_object) = self.state.heap.get(class)? else {
                     return Err("mappingproxy target is not a class".into());
                 };
-                attributes
+                class_object
+                    .attributes
                     .iter()
                     .map(|(name, value)| (name.clone(), *value))
                     .collect()

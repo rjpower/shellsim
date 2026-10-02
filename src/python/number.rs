@@ -415,8 +415,8 @@ fn float_as_integer_ratio(runtime: &mut dyn PyRuntime, value: PyValue, args: Cal
     if value.is_sign_negative() {
         numerator = -numerator;
     }
-    let numerator = runtime.new_integer(&numerator.to_string())?;
-    let denominator = runtime.new_integer(&denominator.to_string())?;
+    let numerator = runtime.new_bigint(numerator)?;
+    let denominator = runtime.new_bigint(denominator)?;
     runtime.new_tuple(vec![numerator, denominator])
 }
 
@@ -800,7 +800,30 @@ pub(super) fn create_complex(
 ///
 /// The result remains decimal text so allocation and immediate-versus-bigint selection continue
 /// through [`PyRuntime::new_integer`]. Bases use Python's `0` autodetection or the range 2..=36.
-pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<String> {
+/// CPython's default `sys.int_max_str_digits`. Converting a larger `int` to or from decimal text
+/// raises `ValueError`, which bounds the superlinear host cost of the conversion. Bases that are
+/// powers of two convert in linear time and are not limited.
+pub(super) const INT_MAX_STR_DIGITS: usize = 4300;
+
+pub(super) fn int_str_digits_error() -> PyError {
+    PyError::value_error(format!(
+        "Exceeds the limit ({INT_MAX_STR_DIGITS} digits) for integer string conversion; use \
+         sys.set_int_max_str_digits() to increase the limit"
+    ))
+}
+
+/// Whether `value` has more than [`INT_MAX_STR_DIGITS`] decimal digits.
+pub(super) fn exceeds_str_digits(value: &BigInt) -> bool {
+    // Below 2^14284 < 10^4300 a value has at most 4300 digits; from 2^14290 > 10^4301 it has
+    // more. Only the narrow band between needs an exact, and cheap, count.
+    match value.bits() {
+        0..=14_284 => false,
+        14_285..=14_290 => value.magnitude().to_string().len() > INT_MAX_STR_DIGITS,
+        _ => true,
+    }
+}
+
+pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<BigInt> {
     if requested_base != 0 && !(2..=36).contains(&requested_base) {
         return Err(PyError::value_error(
             "int() base must be >= 2 and <= 36, or 0",
@@ -852,17 +875,20 @@ pub(super) fn parse_integer_text(text: &str, requested_base: i64) -> PyResult<St
     if digits.is_empty() || !digits.chars().all(|character| character.is_digit(base)) {
         return Err(invalid());
     }
+    if !base.is_power_of_two() && digits.len() > INT_MAX_STR_DIGITS {
+        return Err(int_str_digits_error());
+    }
     let mut value = BigInt::parse_bytes(digits.as_bytes(), base).ok_or_else(invalid)?;
     if negative {
         value = -value;
     }
-    Ok(value.to_string())
+    Ok(value)
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum PyNumber {
     Int(i64),
-    BigInt(String),
+    BigInt(BigInt),
     Float(f64),
 }
 
@@ -886,8 +912,8 @@ impl PyNumber {
             Self::Int(value) => Ok(value as f64),
             Self::BigInt(value) => {
                 let value = value
-                    .parse::<f64>()
-                    .map_err(|_| PyError::overflow_error("int too large to convert to float"))?;
+                    .to_f64()
+                    .ok_or_else(|| PyError::overflow_error("int too large to convert to float"))?;
                 if value.is_finite() {
                     Ok(value)
                 } else {
@@ -1276,9 +1302,7 @@ fn binary_numbers(
         return Ok(Some(PyValue::Float(left / right)));
     }
     if matches!(operation, BinaryOperator::Power) {
-        let exponent = integer_decimal(right)
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        let exponent = integer_value(right);
         if exponent.is_negative() {
             let left = left.into_f64()?;
             let right = exponent
@@ -1292,51 +1316,43 @@ fn binary_numbers(
         let exponent = exponent
             .to_u32()
             .ok_or_else(|| PyError::resource_error("power exponent is too large"))?;
-        let left = integer_decimal(left);
-        let result_bound = left
-            .len()
-            .checked_mul(exponent as usize)
-            .and_then(|bytes| bytes.checked_add(2))
-            .ok_or_else(|| PyError::resource_error("power result is too large"))?;
-        runtime.charge_cpu(u64::try_from(result_bound.max(1)).unwrap_or(u64::MAX))?;
-        runtime.reserve_memory(result_bound)?;
-        let left = left
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
-        return runtime
-            .new_integer(&left.pow(exponent).to_string())
-            .map(Some);
+        let left = integer_value(left);
+        let result_words = left
+            .bits()
+            .checked_mul(u64::from(exponent))
+            .ok_or_else(|| PyError::resource_error("power result is too large"))?
+            .div_ceil(64)
+            .max(1);
+        // Repeated squaring is dominated by its last, full-size multiplication.
+        runtime.charge_cpu(multiply_work(result_words, result_words))?;
+        runtime.reserve_memory(word_bytes(result_words)?)?;
+        return runtime.new_bigint(left.pow(exponent)).map(Some);
     }
     if matches!(
         operation,
         BinaryOperator::LeftShift | BinaryOperator::RightShift
     ) {
-        let shift = integer_decimal(right)
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        let shift = integer_value(right);
         if shift.is_negative() {
             return Err(PyError::value_error("negative shift count"));
         }
         let shift = shift
             .to_usize()
             .ok_or_else(|| PyError::resource_error("shift count is too large"))?;
-        let left = integer_decimal(left);
-        let result_bound = left
-            .len()
-            .checked_add(shift.saturating_add(2) / 3)
-            .and_then(|bytes| bytes.checked_add(2))
-            .ok_or_else(|| PyError::resource_error("shift result is too large"))?;
-        runtime.charge_cpu(u64::try_from(result_bound.max(1)).unwrap_or(u64::MAX))?;
-        runtime.reserve_memory(result_bound)?;
-        let left = left
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+        let left = integer_value(left);
+        let result_words = if matches!(operation, BinaryOperator::LeftShift) {
+            words(&left).saturating_add(u64::try_from(shift / 64).unwrap_or(u64::MAX))
+        } else {
+            words(&left)
+        };
+        runtime.charge_cpu(result_words)?;
+        runtime.reserve_memory(word_bytes(result_words)?)?;
         let result = if matches!(operation, BinaryOperator::LeftShift) {
             left << shift
         } else {
             left >> shift
         };
-        return runtime.new_integer(&result.to_string()).map(Some);
+        return runtime.new_bigint(result).map(Some);
     }
     if let (PyNumber::Int(left), PyNumber::Int(right)) = (&left, &right) {
         if let Some(result) = immediate_integer_binary(operation, *left, *right) {
@@ -1344,37 +1360,23 @@ fn binary_numbers(
         }
     }
 
-    let left = integer_decimal(left);
-    let right = integer_decimal(right);
-    let work = left
-        .len()
-        .checked_add(right.len())
-        .ok_or_else(|| PyError::resource_error("integer operation is too large"))?;
-    runtime.charge_cpu(u64::try_from(work).unwrap_or(u64::MAX))?;
-    let result_bound = match operation {
-        BinaryOperator::Add
-        | BinaryOperator::Subtract
-        | BinaryOperator::BitwiseAnd
-        | BinaryOperator::BitwiseXor
-        | BinaryOperator::BitwiseOr => left.len().max(right.len()).saturating_add(2),
-        BinaryOperator::Multiply => work.saturating_add(1),
-        BinaryOperator::Power => unreachable!("power returned above"),
-        BinaryOperator::LeftShift | BinaryOperator::RightShift => {
-            unreachable!("shifts returned above")
-        }
+    let left = integer_value(left);
+    let right = integer_value(right);
+    let (left_words, right_words) = (words(&left), words(&right));
+    let linear = left_words.saturating_add(right_words);
+    let work = match operation {
+        BinaryOperator::Multiply => multiply_work(left_words, right_words).saturating_add(linear),
         BinaryOperator::FloorDivide | BinaryOperator::Remainder => {
-            left.len().max(right.len()).saturating_add(2)
+            divide_work(left_words, right_words).saturating_add(linear)
         }
-        BinaryOperator::Divide => unreachable!("division returned above"),
-        BinaryOperator::MatrixMultiply => return Ok(None),
+        _ => linear,
     };
-    runtime.reserve_memory(result_bound)?;
-    let left = left
-        .parse::<BigInt>()
-        .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
-    let right = right
-        .parse::<BigInt>()
-        .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+    runtime.charge_cpu(work)?;
+    // The result is no larger than the operands' combined size, and those are already charged
+    // as live objects, so the allocation of the result is the only charge needed.
+    if matches!(operation, BinaryOperator::MatrixMultiply) {
+        return Ok(None);
+    }
     if right.is_zero()
         && matches!(
             operation,
@@ -1402,7 +1404,7 @@ fn binary_numbers(
         BinaryOperator::BitwiseOr => left | right,
         BinaryOperator::MatrixMultiply => unreachable!("matrix multiplication returned above"),
     };
-    runtime.new_integer(&result.to_string()).map(Some)
+    runtime.new_bigint(result).map(Some)
 }
 
 #[inline]
@@ -1510,21 +1512,17 @@ fn slot_unary(
                     unreachable!("these immediate operations cannot overflow")
                 }
             };
-            runtime.new_integer(&result.to_string()).map(Some)
+            runtime.new_bigint(result).map(Some)
         }
         PyNumber::BigInt(value) => {
-            runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-            runtime.reserve_memory(value.len().saturating_add(2))?;
-            let value = value
-                .parse::<BigInt>()
-                .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+            runtime.charge_cpu(words(&value))?;
             let result = match operation {
                 UnaryNumericOperation::Positive => value,
                 UnaryNumericOperation::Negative => -value,
                 UnaryNumericOperation::Invert => !value,
                 UnaryNumericOperation::Absolute => value.abs(),
             };
-            runtime.new_integer(&result.to_string()).map(Some)
+            runtime.new_bigint(result).map(Some)
         }
     }
 }
@@ -1553,19 +1551,54 @@ fn real_number(number: NumberRef<'_>) -> Option<PyNumber> {
     match number {
         NumberRef::Int(value) => Some(PyNumber::Int(value)),
         NumberRef::Float(value) => Some(PyNumber::Float(value)),
-        NumberRef::BigInt(_) | NumberRef::UInt(_) => number
-            .to_bigint()
-            .map(|value| PyNumber::BigInt(value.to_string())),
+        NumberRef::BigInt(_) | NumberRef::UInt(_) => number.to_bigint().map(PyNumber::BigInt),
         NumberRef::Complex(..) => None,
     }
 }
 
-fn integer_decimal(value: PyNumber) -> String {
+fn integer_value(value: PyNumber) -> BigInt {
     match value {
-        PyNumber::Int(value) => value.to_string(),
+        PyNumber::Int(value) => BigInt::from(value),
         PyNumber::BigInt(value) => value,
         PyNumber::Float(_) => unreachable!("float arithmetic returned above"),
     }
+}
+
+/// 64-bit words in the magnitude of `value`, at least one. Big-integer work is metered in
+/// words, roughly one CPU unit per word visited.
+pub(super) fn words(value: &BigInt) -> u64 {
+    value.bits().div_ceil(64).max(1)
+}
+
+/// Metered work to divide a `left`-word magnitude by a `right`-word one. num-bigint divides by
+/// long division: one pass over the divisor per quotient word.
+pub(super) fn divide_work(left: u64, right: u64) -> u64 {
+    left.saturating_sub(right)
+        .saturating_add(1)
+        .saturating_mul(right)
+}
+
+/// Metered work to multiply magnitudes of `left` and `right` words. num-bigint's Toom-3
+/// multiplication grows about as n^1.47, which `n * sqrt(m)` bounds from above.
+fn multiply_work(left: u64, right: u64) -> u64 {
+    let (small, large) = (left.min(right), left.max(right));
+    large.saturating_mul(small.isqrt().max(1))
+}
+
+fn word_bytes(words: u64) -> PyResult<usize> {
+    words
+        .checked_mul(8)
+        .and_then(|bytes| usize::try_from(bytes).ok())
+        .ok_or_else(|| PyError::resource_error("integer result is too large"))
+}
+
+/// An upper estimate of the decimal digits in `value`, the unit big-integer work is metered in.
+pub(super) fn decimal_digits(value: &BigInt) -> usize {
+    usize::try_from(value.bits())
+        .unwrap_or(usize::MAX)
+        .saturating_mul(30_103)
+        / 100_000
+        + 1
 }
 
 /// Resolve the Python integer protocol to a bounded repetition count at the erased ABI boundary.
@@ -1578,13 +1611,10 @@ pub(super) fn runtime_repeat_count(
             .map(Some)
             .map_err(|_| PyError::overflow_error("sequence repeat is too large"));
     }
-    let Some(value) = runtime.integer_text(value)? else {
+    let Some(value) = runtime.integer_bigint(value)? else {
         return Ok(None);
     };
-    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-    let value = value
-        .parse::<BigInt>()
-        .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
+    runtime.charge_cpu(words(&value))?;
     if value.is_negative() {
         Ok(Some(0))
     } else {
@@ -1601,9 +1631,9 @@ mod tests {
 
     #[test]
     fn integer_text_parsing_handles_bases_signs_and_separators() {
-        assert_eq!(parse_integer_text("ff", 16).unwrap(), "255");
-        assert_eq!(parse_integer_text(" -0b1_010 ", 0).unwrap(), "-10");
-        assert_eq!(parse_integer_text("0x_ff", 16).unwrap(), "255");
+        assert_eq!(parse_integer_text("ff", 16).unwrap(), 255.into());
+        assert_eq!(parse_integer_text(" -0b1_010 ", 0).unwrap(), (-10).into());
+        assert_eq!(parse_integer_text("0x_ff", 16).unwrap(), 255.into());
         assert!(parse_integer_text("10", 1).is_err());
         assert!(parse_integer_text("_10", 10).is_err());
         assert!(parse_integer_text("1__0", 10).is_err());

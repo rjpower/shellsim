@@ -1128,3 +1128,71 @@ def test_slice_indices_normalizes_bounds_for_a_length():
     assert raised(lambda: slice(None, None, 0).indices(3)) == (ValueError, "slice step cannot be zero")
     assert raised(lambda: slice(1).indices(-1)) == (ValueError, "length should not be negative")
     assert raised(lambda: slice(1).indices(1.5)) == (TypeError, "'float' object cannot be interpreted as an integer")
+
+
+def test_dict_and_set_deletion_keep_order_and_lookup():
+    mapping = {key: key * 2 for key in range(1000)}
+    for key in range(0, 1000, 3):
+        del mapping[key]
+    assert len(mapping) == 666 and list(mapping)[:3] == [1, 2, 4]
+    mapping[3] = "back"
+    assert list(mapping)[-1] == 3 and 0 not in mapping and mapping[4] == 8
+    assert mapping.popitem() == (3, "back") and mapping.pop(4) == 8
+
+    members = set(range(100))
+    for value in range(0, 100, 2):
+        members.discard(value)
+    members.remove(99)
+    assert len(members) == 49 and 97 in members and 98 not in members
+    while len(members) > 1:
+        members.pop()
+    assert len(members) == 1
+
+    large = {key: key for key in range(100_000)}
+    for key in range(99_999):
+        del large[key]
+    assert large == {99_999: 99_999}
+
+
+def test_set_algebra_keeps_builtin_membership_and_kind():
+    class AlwaysContains(set):
+        def __contains__(self, value):
+            return True
+
+    assert {1, 2} & AlwaysContains({2, 3}) == {2}
+    assert type(frozenset({1}) | {2}) is frozenset and type({2} | frozenset({1})) is set
+    left, right = set(range(50_000)), set(range(25_000, 75_000))
+    assert len(left | right) == 75_000 and len(left & right) == 25_000
+    assert len(left - right) == 25_000 and len(left ^ right) == 50_000
+    assert left.issubset(left | right) and len(left.union(right, [-1])) == 75_001
+
+
+def test_int_decimal_conversion_is_limited_to_4300_digits():
+    largest = 10**4300 - 1
+    assert len(str(largest)) == 4300 and int("9" * 4300) == largest
+    too_long = 10**4300
+    for convert in (str, repr, "{}".format, "{:,}".format, "%d".__mod__, lambda value: str([value])):
+        assert raised(lambda convert=convert: convert(too_long))[0] is ValueError
+    assert raised(lambda: int("1" * 4301))[0] is ValueError
+    assert hex(too_long).startswith("0x1") and int("f" * 5000, 16) > too_long
+    assert (too_long * too_long) // too_long == too_long
+
+
+def test_unhashable_dict_keys_and_set_members_raise_type_error():
+    def assign():
+        d = {}
+        d[[1]] = 2
+
+    unhashable = []
+    for build in (
+        lambda: {unhashable: 1},
+        lambda: {unhashable},
+        lambda: dict(zip([unhashable], [1])),
+        lambda: set(iter([{}])),
+        assign,
+    ):
+        assert raised(build)[0] is TypeError
+    # Equal keys of different types share one entry: the first key stays, the last value wins.
+    keys = [1, 1.0, True]
+    merged = dict(zip(keys, "abc"))
+    assert merged == {1: "c"} and type(next(iter(merged))) is int

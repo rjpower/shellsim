@@ -22,8 +22,8 @@ fn alias_item_repr(
         return Ok(builtin.name().into());
     }
     if let Some(id) = value.object_id() {
-        if let Object::Class { name, .. } = heap.get(id)? {
-            return Ok(name.clone());
+        if let Object::Class(class_object) = heap.get(id)? {
+            return Ok(class_object.name.clone());
         }
     }
     render(heap, value, active)
@@ -222,10 +222,10 @@ fn user_exception_parts(heap: &Heap, value: &Value) -> Result<Option<UserExcepti
     let Object::Instance { class, .. } = heap.get(id)? else {
         return Ok(None);
     };
-    let Object::Class { exception_base, .. } = heap.get(*class)? else {
+    let Object::Class(class_object) = heap.get(*class)? else {
         return Ok(None);
     };
-    let Some(base) = *exception_base else {
+    let Some(base) = class_object.exception_base else {
         return Ok(None);
     };
     let args = if let Some(symbol) = heap.symbol_id("args") {
@@ -250,7 +250,18 @@ fn bigint_value<'a>(heap: &'a Heap, value: &Value) -> Option<&'a BigInt> {
     }
 }
 
+/// Nesting bound for heap-only rendering, matching the VM's call-depth limit.
+const MAX_RENDER_DEPTH: usize = 256;
+
 fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result<String, String> {
+    crate::stack::grow(|| render_inner(heap, value, active))
+}
+
+fn render_inner(
+    heap: &Heap,
+    value: &Value,
+    active: &mut BTreeSet<ObjectId>,
+) -> Result<String, String> {
     if let Some(value) = string_value(heap, value)? {
         return Ok(quote_string(&value));
     }
@@ -270,6 +281,12 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
         return Ok(value.repr());
     }
     if let Some(id) = value.object_id() {
+        // `active` holds the objects on the current path, so its size is the nesting depth.
+        if !active.contains(&id) && active.len() >= MAX_RENDER_DEPTH {
+            return Err(
+                "maximum recursion depth exceeded while getting the repr of an object".into(),
+            );
+        }
         if !active.insert(id) {
             return Ok(match heap.get(id)? {
                 Object::Bare => "<object ...>",
@@ -356,12 +373,15 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             }
             Object::Set(values) if values.is_empty() => "set()".into(),
             Object::Set(values) => {
-                format!("{{{}}}", render_values(heap, values, active)?.join(", "))
+                format!(
+                    "{{{}}}",
+                    render_values(heap, &values.to_vec(), active)?.join(", ")
+                )
             }
             Object::FrozenSet(values) if values.is_empty() => "frozenset()".into(),
             Object::FrozenSet(values) => format!(
                 "frozenset({{{}}})",
-                render_values(heap, values, active)?.join(", ")
+                render_values(heap, &values.to_vec(), active)?.join(", ")
             ),
             Object::Range { start, stop, step } => {
                 if *step == 1 && *start == 0 {
@@ -372,29 +392,26 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                     format!("range({start}, {stop}, {step})")
                 }
             }
-            Object::Function { name, .. } => format!("<function {name}>"),
-            Object::Class {
-                name, attributes, ..
-            } => match attributes.get("__module__") {
+            Object::Function(function) => format!("<function {}>", function.name),
+            Object::Class(class_object) => match class_object.attributes.get("__module__") {
                 Some(module) => match string_value(heap, module)? {
-                    Some(module) if module != "builtins" => format!("<class '{module}.{name}'>"),
-                    _ => format!("<class '{name}'>"),
+                    Some(module) if module != "builtins" => {
+                        format!("<class '{module}.{}'>", class_object.name)
+                    }
+                    _ => format!("<class '{}'>", class_object.name),
                 },
-                None => format!("<class '{name}'>"),
+                None => format!("<class '{}'>", class_object.name),
             },
             Object::Instance { class, payload, .. } => match payload {
                 InstancePayload::Builtin(value) => render(heap, value, active)?,
                 InstancePayload::Object => match heap.get(*class)? {
-                    Object::Class {
-                        name,
-                        exception_base: Some(_),
-                        ..
-                    } => {
+                    Object::Class(class_object) if class_object.exception_base.is_some() => {
                         let UserException { args, .. } = user_exception_parts(heap, value)?
                             .ok_or("exception instance lost its native base")?;
-                        format!("{name}({})", render_values(heap, &args, active)?.join(", "))
+                        let args = render_values(heap, &args, active)?.join(", ");
+                        format!("{}({args})", class_object.name)
                     }
-                    Object::Class { name, .. } => format!("<{name} object>"),
+                    Object::Class(class_object) => format!("<{} object>", class_object.name),
                     _ => return Err("instance has an invalid class".into()),
                 },
             },
@@ -458,13 +475,11 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
             Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
-            Object::Match {
-                text, start, end, ..
-            } => format!(
+            Object::Match(found) => format!(
                 "<re.Match object; span=({}, {}), match={}>",
-                start,
-                end,
-                quote_string(text)
+                found.start,
+                found.end,
+                quote_string(&found.text)
             ),
             Object::ArgumentParser { .. } => "<argparse.ArgumentParser>".into(),
             Object::Namespace { values } => {
@@ -479,12 +494,10 @@ fn render(heap: &Heap, value: &Value, active: &mut BTreeSet<ObjectId>) -> Result
                 name,
                 value,
             } => {
-                let Object::Class {
-                    name: class_name, ..
-                } = heap.get(*class)?
-                else {
+                let Object::Class(class_object) = heap.get(*class)? else {
                     return Err("enum member has an invalid class".into());
                 };
+                let class_name = &class_object.name;
                 format!("<{class_name}.{name}: {}>", render(heap, value, active)?)
             }
             Object::EnumMember { name, .. } => format!("<enum member {name}>"),
@@ -543,10 +556,8 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
         Object::Exception { .. } => true,
-        Object::List(values)
-        | Object::Tuple(values)
-        | Object::Set(values)
-        | Object::FrozenSet(values) => !values.is_empty(),
+        Object::List(values) | Object::Tuple(values) => !values.is_empty(),
+        Object::Set(values) | Object::FrozenSet(values) => !values.is_empty(),
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
@@ -706,10 +717,15 @@ fn equals_inner(
                     if left.len() != right.len() {
                         false
                     } else {
+                        // Equal keys have equal hashes, so each key is compared only with the
+                        // keys in its bucket.
                         let mut all = true;
-                        for (left_key, left_value) in left {
+                        for (hash, (left_key, left_value)) in left.iter_hashed() {
                             let mut found = false;
-                            for (right_key, right_value) in right {
+                            for &position in right.candidate_positions(hash) {
+                                let Some((right_key, right_value)) = right.get(position) else {
+                                    continue;
+                                };
                                 if identical(left_key, right_key)
                                     || equals_inner(heap, left_key, right_key, active)?
                                 {
@@ -734,9 +750,12 @@ fn equals_inner(
                         false
                     } else {
                         let mut all = true;
-                        for left_value in left {
+                        for (hash, left_value) in left.iter_hashed() {
                             let mut found = false;
-                            for right_value in right {
+                            for &position in right.candidate_positions(hash) {
+                                let Some(right_value) = right.get(position) else {
+                                    continue;
+                                };
                                 if identical(left_value, right_value)
                                     || equals_inner(heap, left_value, right_value, active)?
                                 {
@@ -1024,10 +1043,15 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
                     .ok_or("bytes containment requires an integer in range(0, 256)")?;
                 Ok(value.contains(&needle))
             }
-            Object::List(values)
-            | Object::Tuple(values)
-            | Object::Set(values)
-            | Object::FrozenSet(values) => {
+            Object::List(values) | Object::Tuple(values) => {
+                for value in values {
+                    if identical(value, needle) || equals(heap, value, needle)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Object::Set(values) | Object::FrozenSet(values) => {
                 for value in values {
                     if identical(value, needle) || equals(heap, value, needle)? {
                         return Ok(true);
@@ -1180,31 +1204,20 @@ mod tests {
     fn dict_and_set_equality_are_order_independent() {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
-        let first = heap
-            .allocate(
-                Object::Dict(
-                    vec![
-                        (Value::inline_string("a").unwrap(), Value::Int(1)),
-                        (Value::inline_string("b").unwrap(), Value::Int(2)),
-                    ]
-                    .into(),
-                ),
-                &mut resources,
-            )
-            .unwrap();
-        let second = heap
-            .allocate(
-                Object::Dict(
-                    vec![
-                        (Value::inline_string("b").unwrap(), Value::Int(2)),
-                        (Value::inline_string("a").unwrap(), Value::Int(1)),
-                    ]
-                    .into(),
-                ),
-                &mut resources,
-            )
-            .unwrap();
+        let dict = |entries: [(&str, i64); 2]| {
+            let mut map = super::super::mapping::OrderedMap::default();
+            for (key, value) in entries {
+                let entry = (Value::inline_string(key).unwrap(), Value::Int(value));
+                map.push(super::super::hash::string(key), entry);
+            }
+            Object::Dict(map)
+        };
+        let mut allocate = |object| heap.allocate(object, &mut resources).unwrap();
+        let first = allocate(dict([("a", 1), ("b", 2)]));
+        let second = allocate(dict([("b", 2), ("a", 1)]));
+        let swapped = allocate(dict([("a", 2), ("b", 1)]));
         assert!(equals(&heap, &first, &second).unwrap());
+        assert!(!equals(&heap, &first, &swapped).unwrap());
     }
 
     #[test]

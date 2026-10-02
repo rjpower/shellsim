@@ -76,15 +76,15 @@ static FUNCTIONS: &[FunctionDef] = &[
 // ---------------------------------------------------------------------------------------------
 
 fn parse_u128(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<u128> {
-    let text = runtime
-        .integer_text(value)?
+    let integer = runtime
+        .integer_bigint(value)?
         .ok_or_else(|| PyError::type_error("expected an integer"))?;
-    text.parse::<u128>()
-        .map_err(|_| PyError::value_error("integer out of range for a bit generator state"))
+    num_traits::ToPrimitive::to_u128(&integer)
+        .ok_or_else(|| PyError::value_error("integer out of range for a bit generator state"))
 }
 
 fn u128_to_value(runtime: &mut dyn PyRuntime, value: u128) -> PyResult<PyValue> {
-    runtime.new_integer(&value.to_string())
+    runtime.new_bigint(value.into())
 }
 
 fn bitgen_from_state(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Pcg64> {

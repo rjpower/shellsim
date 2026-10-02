@@ -15,6 +15,8 @@
 //! suffixes), and `--real-time`, which boots the machine on the physical-time clock. They may
 //! precede the command; commands without script arguments also accept them afterwards.
 
+#![forbid(unsafe_code)]
+
 use std::process::exit;
 
 use shellsim::{realtime::ClockMode, Environment, Limits, RunOutcome};
@@ -123,7 +125,7 @@ fn corpus(args: &[String]) -> ! {
 
 fn fresh_environment(machine: MachineOptions, positional: &[String]) -> Environment {
     let mut env = Environment::with_limits_and_clock(machine.limits, machine.clock);
-    env.positional = positional.to_vec();
+    env.positional = positional.to_vec().into();
     if env.vfs.put_dir("/work", 0o755).is_ok() {
         env.cwd = "/work".to_string();
         env.set_var("PWD", "/work");

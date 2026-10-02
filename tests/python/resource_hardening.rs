@@ -176,10 +176,12 @@ fn combinatorial_iterators_reserve_before_materializing_results() {
 
 #[test]
 fn direct_list_growth_does_not_require_a_full_container_snapshot() {
+    // The list's 720 KB of values fits beside the interpreter's startup heap and collector
+    // slack, but a second copy of the list would not.
     let (status, stdout, stderr, usage) = run_with_limits(
-        "items = []\nfor value in range(3000):\n    items.append(value)\nprint(len(items))",
+        "items = []\nfor value in range(30000):\n    items.append(value)\nprint(len(items))",
         Limits {
-            memory: 256 * 1024,
+            memory: 1024 * 1024,
             ..Limits::unlimited()
         },
     );
@@ -189,8 +191,8 @@ fn direct_list_growth_does_not_require_a_full_container_snapshot() {
         "stderr={} usage={usage:?}",
         String::from_utf8_lossy(&stderr)
     );
-    assert_eq!(stdout, b"3000\n");
-    assert!(usage.memory_peak <= 256 * 1024);
+    assert_eq!(stdout, b"30000\n");
+    assert!(usage.memory_peak <= 1024 * 1024);
 }
 
 #[test]
@@ -379,6 +381,9 @@ fn completed_python_processes_release_owned_memory() {
         memory: 256 * 1024,
         ..Limits::unlimited()
     });
+    // The first actions create shell variables such as `PIPESTATUS`, which stay charged as
+    // retained shell state; each Python process must release everything it owned.
+    let mut retained = Vec::new();
     for _ in 0..20 {
         let (outcome, stdout, stderr) =
             environment.run_script_capture("python3.14 -c 'print(\"x\" * 4096)' >/dev/null");
@@ -389,8 +394,13 @@ fn completed_python_processes_release_owned_memory() {
             String::from_utf8_lossy(&stderr)
         );
         assert!(stdout.is_empty());
-        assert_eq!(outcome.usage.memory_current, 0);
+        retained.push(outcome.usage.memory_current);
     }
+    assert!(retained[0] < 1024, "{retained:?}");
+    assert!(
+        retained[2..].iter().all(|bytes| *bytes == retained[2]),
+        "{retained:?}"
+    );
 }
 
 #[test]
@@ -648,15 +658,13 @@ fn numpy_byte_copies_reserve_memory_before_copying() {
 
 #[test]
 fn set_algebra_consumes_cpu_per_membership_test() {
-    // Building the 200-member set costs about half this budget. Each operation below compares
-    // all 200 members with 200 operand items and must stop at the limit.
+    // Membership uses the hash index, so 200 members against 200 operand items fit the
+    // budget, while 200,000 operand items are each charged and stop at the limit.
     let limits = Limits {
-        cpu: 40_000,
+        cpu: 200_000,
         ..Limits::unlimited()
     };
     let setup = "members = set(range(200))\n";
-    let (status, stdout, _, _) = run_with_limits(&format!("{setup}print('built')"), limits);
-    assert_eq!((status, stdout), (0, b"built\n".to_vec()));
     for operation in [
         "members.intersection(range(200, 400))",
         "members.difference(range(200, 400))",
@@ -664,12 +672,21 @@ fn set_algebra_consumes_cpu_per_membership_test() {
         "members.difference_update(range(200, 400))",
         "members.isdisjoint(range(200, 400))",
     ] {
-        let (status, stdout, stderr, usage) =
+        let (status, stdout, stderr, _) =
             run_with_limits(&format!("{setup}{operation}\nprint('done')"), limits);
-        assert_eq!(status, 137, "{operation}");
-        assert_eq!(usage.cpu_used, 40_000, "{operation}");
-        assert!(stdout.is_empty(), "{operation}");
-        assert!(stderr.is_empty(), "{operation}");
+        assert_eq!(
+            (status, stdout),
+            (0, b"done\n".to_vec()),
+            "{operation}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let large = operation.replace("range(200, 400)", "range(200, 200_200)");
+        let (status, stdout, stderr, usage) =
+            run_with_limits(&format!("{setup}{large}\nprint('done')"), limits);
+        assert_eq!(status, 137, "{large}");
+        assert_eq!(usage.cpu_used, 200_000, "{large}");
+        assert!(stdout.is_empty(), "{large}");
+        assert!(stderr.is_empty(), "{large}");
     }
 }
 
@@ -749,4 +766,104 @@ fn rejection_sampling_uses_modeled_cpu_fuel() {
     assert_eq!(usage.cpu_used, 100_000);
     assert_eq!(stdout, b"ready\n");
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn big_integer_work_is_charged_by_operand_words() {
+    // `1 << 4_000_000` has 62,501 words; squaring it is charged about n * sqrt(n), and long
+    // division by a half-size divisor about the product of the word counts.
+    let limits = Limits {
+        cpu: 50_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "x = 1 << 4_000_000\ny = x * x\nprint(y.bit_length())",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"8000001\n");
+    assert!(usage.cpu_used > 15_000_000, "{usage:?}");
+
+    let (status, stdout, _, usage) = run_with_limits(
+        "x = 1 << 4_000_000\ny = x // ((1 << 2_000_000) + 1)\nprint('done')",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 50_000_000);
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn dict_and_set_deletion_cost_is_constant_per_member() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "d = dict.fromkeys(range(100_000))\nfor key in range(100_000):\n    del d[key]\ns = set(range(100_000))\nwhile s:\n    s.pop()\nprint(len(d), len(s))",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"0 0\n");
+}
+
+#[test]
+fn heap_keys_are_indexed_by_hash() {
+    // Long strings, tuples and user objects live on the heap; each lookup must compare only the
+    // keys that share its hash rather than every key in the dict.
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "class K:\n    pass\nd = {}\nfor i in range(50_000):\n    d['key-' * 10 + str(i)] = i\n    d[(i, str(i))] = i\n    d[K()] = i\nprint(len(d), d['key-' * 10 + '7'], d[(9, '9')])",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"150000 7 9\n");
+}
+
+#[test]
+fn adversarial_substring_search_is_linear() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "s = 'a' * 1_000_000\nneedle = 'a' * 100_000 + 'b'\nfor i in range(20):\n    assert s.find(needle) == -1 and s.count(needle) == 0\nprint(s.rfind('a' * 3), s.count('aa'))",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"999997 500000\n");
+}
+
+#[test]
+fn sorting_a_large_list_uses_n_log_n_comparisons() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "values = [(i * 7919) % 100_003 for i in range(100_000)]\nprint(sorted(values, key=lambda v: -v)[0], sorted(values)[-1])\nvalues.sort(reverse=True)\nprint(values[0])",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"100002 100002\n100002\n");
+}
+
+#[test]
+fn quadratic_copies_are_charged_by_bytes_moved() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    for program in [
+        "l = []\nfor i in range(1_000_000):\n    l.insert(0, i)",
+        "s = ''\nfor i in range(1_000_000):\n    s += 'abcdefgh'",
+        "import math\nprint(math.gcd(7 ** 1_000_000, 3 ** 1_000_000))",
+    ] {
+        let (status, _, _, usage) = run_with_limits(program, limits);
+        assert_eq!(status, 137, "{program}");
+        assert_eq!(usage.cpu_used, limits.cpu, "{program}");
+    }
 }

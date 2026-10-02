@@ -664,8 +664,8 @@ pub(super) trait PyRuntime {
     ) -> PyResult<super::protocol::Comparison>;
     /// Allocate a builtin `complex` in the metered object arena.
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<PyValue>;
-    /// Return an exact decimal rendering for any Python integer representation.
-    fn integer_text(&self, value: &PyValue) -> PyResult<Option<String>>;
+    /// The exact value of a builtin integer, or `None` for any other value.
+    fn integer_bigint(&self, value: &PyValue) -> PyResult<Option<num_bigint::BigInt>>;
     /// Write only to an interpreter-owned simulated stream marker.
     fn write_stream(&mut self, stream: &PyValue, text: &str) -> PyResult<usize>;
     /// Read from the invocation's modeled standard-input stream, incrementally through the
@@ -745,6 +745,8 @@ pub(super) trait PyRuntime {
     fn dict_get(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
     fn dict_insert(&mut self, dict: PyDict, key: PyValue, value: PyValue) -> PyResult<()>;
     fn dict_remove(&mut self, dict: PyDict, key: &PyValue) -> PyResult<Option<PyValue>>;
+    /// The most recently inserted key of `dict`, or `None` when it is empty.
+    fn dict_last_key(&mut self, dict: PyDict) -> PyResult<Option<PyValue>>;
     fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(PyValue, PyValue)>) -> PyResult<()>;
     /// A shallow copy of `dict` of the same kind: a `defaultdict` copy keeps its factory.
     fn dict_copy(&mut self, dict: PyDict) -> PyResult<PyValue>;
@@ -767,6 +769,8 @@ pub(super) trait PyRuntime {
     fn set_is_frozen(&self, set: PySet) -> PyResult<bool>;
     fn set_insert(&mut self, set: PySet, value: PyValue) -> PyResult<bool>;
     fn set_remove(&mut self, set: PySet, value: &PyValue) -> PyResult<bool>;
+    /// The earliest inserted member of `set`, or `None` when it is empty.
+    fn set_first(&mut self, set: PySet) -> PyResult<Option<PyValue>>;
     /// Replace a mutable set's members with already-deduplicated `items`, metering the change
     /// in retained size. Frozen sets are rejected.
     fn replace_set_items(&mut self, set: PySet, items: Vec<PyValue>) -> PyResult<()>;
@@ -885,6 +889,8 @@ pub(super) trait PyRuntime {
     ) -> PyResult<PyValue>;
     /// Parse and allocate a Python integer without imposing an immediate-width limit.
     fn new_integer(&mut self, decimal: &str) -> PyResult<PyValue>;
+    /// An `int` holding `value`, immediate when it fits in `i64`.
+    fn new_bigint(&mut self, value: num_bigint::BigInt) -> PyResult<PyValue>;
     fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<PyValue>;
     fn new_match(
         &mut self,

@@ -53,3 +53,18 @@ fn formatting_commands_finish_after_pipe_input_spans_multiple_quanta() {
     assert_eq!(direct.0, 0, "{}", direct.2);
     assert_eq!(piped, direct);
 }
+
+#[test]
+fn printf_reads_star_width_and_precision_from_arguments() {
+    // Expected output is from the GNU Bash 5.3 printf builtin.
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "printf '[%*d][%-*s][%.*f][%*s][%.*s]\\n' 5 42 4 ab 2 3.14159 -4 x -1 abc; printf '[%05d][%+d][% d][%-6.2f][%x][%o]\\n' 42 7 7 1.5 255 8",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        b"[   42][ab  ][3.14][x   ][abc]\n[00042][+7][ 7][1.50  ][ff][10]\n"
+    );
+}

@@ -77,24 +77,14 @@ impl Vm<'_> {
                     values.next().expect("dictionary value stack contract"),
                 )]
             };
-            for (key, value) in additions {
-                let mut replaced = false;
-                for entry in &mut entries {
-                    if self.values_equal(&entry.0, &key)? {
-                        entry.1 = value;
-                        replaced = true;
-                        break;
-                    }
-                }
-                if !replaced {
-                    entries.push((key, value));
-                }
-            }
+            entries.extend(additions);
         }
+        // A repeated key keeps its first position and takes the last value.
+        let entries = self.ordered_map(entries)?;
         let value = self
             .state
             .heap
-            .allocate(Object::Dict(entries.into()), &mut self.interp.resources)?;
+            .allocate(Object::Dict(entries), &mut self.interp.resources)?;
         self.stack.push(value);
         Ok(())
     }
@@ -138,17 +128,11 @@ impl Vm<'_> {
     /// Push a set of the distinct `candidates`, metering each membership comparison as the `set`
     /// constructor does.
     fn push_set(&mut self, candidates: Vec<Value>) -> Result<(), String> {
-        let mut values = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            self.charge_cpu(1)?;
-            if self.find_value(&values, &candidate)?.is_none() {
-                values.push(candidate);
-            }
-        }
+        let members = self.distinct_members(candidates)?;
         let value = self
             .state
             .heap
-            .allocate(Object::Set(values), &mut self.interp.resources)?;
+            .allocate(Object::Set(members), &mut self.interp.resources)?;
         self.stack.push(value);
         Ok(())
     }

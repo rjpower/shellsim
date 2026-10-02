@@ -17,13 +17,15 @@ use num_traits::ToPrimitive;
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
 use super::cpython_names;
+use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
     ClassLayout, InstanceAttributeSlot, InstanceAttributes, InstancePayload, NamespaceTarget,
     Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_VALUE_BYTES,
+    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
 };
+use super::mapping::{KeyHash, OrderedMap, OrderedSet};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
@@ -85,6 +87,12 @@ pub(super) enum NativeValue {
     NotImplemented,
 }
 
+static MODULES: DefinitionTable<ModuleDef> = DefinitionTable::new();
+static FUNCTIONS: DefinitionTable<FunctionDef> = DefinitionTable::new();
+static METHODS: DefinitionTable<super::native::MethodDef> = DefinitionTable::new();
+static GETTERS: DefinitionTable<super::native::GetterDef> = DefinitionTable::new();
+static VALUE_KINDS: DefinitionTable<super::native::ValueKindDef> = DefinitionTable::new();
+
 impl NativeValue {
     const MODULE: u8 = 0;
     const FUNCTION: u8 = 1;
@@ -104,33 +112,22 @@ impl NativeValue {
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
-            Self::Module(value) => (value as *const ModuleDef as usize as u64, Self::MODULE),
-            Self::Function(value) => (value as u64, Self::FUNCTION),
+            Self::Module(value) => (u64::from(MODULES.intern(value)), Self::MODULE),
+            Self::Function(value) => (value.index() as u64, Self::FUNCTION),
             Self::BuiltinType(value) => (value as u64, Self::BUILTIN_TYPE),
-            Self::NativeFunction(value) => (
-                value as *const FunctionDef as usize as u64,
-                Self::NATIVE_FUNCTION,
-            ),
-            Self::NativeMethod(value) => (
-                value as *const super::native::MethodDef as usize as u64,
-                Self::NATIVE_METHOD,
-            ),
-            Self::NativeClassMethod(value) => (
-                value as *const super::native::MethodDef as usize as u64,
-                Self::NATIVE_CLASS_METHOD,
-            ),
+            Self::NativeFunction(value) => {
+                (u64::from(FUNCTIONS.intern(value)), Self::NATIVE_FUNCTION)
+            }
+            Self::NativeMethod(value) => (u64::from(METHODS.intern(value)), Self::NATIVE_METHOD),
+            Self::NativeClassMethod(value) => {
+                (u64::from(METHODS.intern(value)), Self::NATIVE_CLASS_METHOD)
+            }
             Self::SlotWrapper { owner, slot } => (
                 (u64::from(owner.raw()) << 8) | slot as u64,
                 Self::SLOT_WRAPPER,
             ),
-            Self::NativeGetter(value) => (
-                value as *const super::native::GetterDef as usize as u64,
-                Self::NATIVE_GETTER,
-            ),
-            Self::ValueKind(value) => (
-                value as *const super::native::ValueKindDef as usize as u64,
-                Self::VALUE_KIND,
-            ),
+            Self::NativeGetter(value) => (u64::from(GETTERS.intern(value)), Self::NATIVE_GETTER),
+            Self::ValueKind(value) => (u64::from(VALUE_KINDS.intern(value)), Self::VALUE_KIND),
             Self::Stream(value) => (value as u64, Self::STREAM),
             Self::Environment => (0, Self::ENVIRONMENT),
             Self::ExceptionType(value) => (exception_type_code(value.0), Self::EXCEPTION_TYPE),
@@ -140,49 +137,31 @@ impl NativeValue {
         }
     }
 
-    /// Decode a handle produced by [`Self::encode`]. Static definition pointers are safe to
-    /// recover because the private constructor accepts only `'static` references and values never
-    /// cross interpreter processes or serialization boundaries.
+    /// Decode a handle produced by [`Self::encode`]. Definitions are recovered from the
+    /// process-wide tables in [`super::definitions`], so a payload can only name a definition
+    /// that was interned.
     pub(super) fn decode(payload: u64, kind: u8) -> Self {
+        const INTERNED: &str = "native handle names an interned definition";
         match kind {
-            Self::MODULE => {
-                // SAFETY: `encode` stores a non-null pointer to a static `ModuleDef`.
-                Self::Module(unsafe { &*(payload as usize as *const ModuleDef) })
-            }
-            Self::FUNCTION => {
-                // SAFETY: the payload originates from the fieldless `Builtin` enum below.
-                Self::Function(unsafe { std::mem::transmute::<u8, Builtin>(payload as u8) })
-            }
+            Self::MODULE => Self::Module(MODULES.get(payload).expect(INTERNED)),
+            Self::FUNCTION => Self::Function(Builtin::from_index(payload)),
             Self::BUILTIN_TYPE => Self::BuiltinType(
-                // SAFETY: the payload originates from the `repr(u32)` `BuiltinType` enum.
-                unsafe { std::mem::transmute::<u32, BuiltinType>(payload as u32) },
+                usize::try_from(payload)
+                    .ok()
+                    .and_then(|index| BuiltinType::ALL.get(index))
+                    .copied()
+                    .expect("builtin type handle is in range"),
             ),
-            Self::NATIVE_FUNCTION => {
-                // SAFETY: `encode` stores a non-null pointer to a static `FunctionDef`.
-                Self::NativeFunction(unsafe { &*(payload as usize as *const FunctionDef) })
-            }
-            Self::NATIVE_METHOD => {
-                // SAFETY: `encode` stores a non-null pointer to a static `MethodDef`.
-                Self::NativeMethod(unsafe {
-                    &*(payload as usize as *const super::native::MethodDef)
-                })
-            }
+            Self::NATIVE_FUNCTION => Self::NativeFunction(FUNCTIONS.get(payload).expect(INTERNED)),
+            Self::NATIVE_METHOD => Self::NativeMethod(METHODS.get(payload).expect(INTERNED)),
             Self::NATIVE_CLASS_METHOD => {
-                // SAFETY: `encode` stores a non-null pointer to a static `MethodDef`.
-                Self::NativeClassMethod(unsafe {
-                    &*(payload as usize as *const super::native::MethodDef)
-                })
+                Self::NativeClassMethod(METHODS.get(payload).expect(INTERNED))
             }
             Self::SLOT_WRAPPER => Self::SlotWrapper {
                 owner: TypeId::from_raw((payload >> 8) as u32),
                 slot: Slot::from_index(payload as u8),
             },
-            Self::NATIVE_GETTER => {
-                // SAFETY: `encode` stores a non-null pointer to a static `GetterDef`.
-                Self::NativeGetter(unsafe {
-                    &*(payload as usize as *const super::native::GetterDef)
-                })
-            }
+            Self::NATIVE_GETTER => Self::NativeGetter(GETTERS.get(payload).expect(INTERNED)),
             Self::STREAM => Self::Stream(match payload {
                 0 => Stream::Stdin,
                 1 => Stream::Stdout,
@@ -196,12 +175,7 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ELLIPSIS => Self::Ellipsis,
             Self::NOT_IMPLEMENTED => Self::NotImplemented,
-            Self::VALUE_KIND => {
-                // SAFETY: `encode` stores a non-null pointer to a static `ValueKindDef`.
-                Self::ValueKind(unsafe {
-                    &*(payload as usize as *const super::native::ValueKindDef)
-                })
-            }
+            Self::VALUE_KIND => Self::ValueKind(VALUE_KINDS.get(payload).expect(INTERNED)),
             _ => unreachable!("invalid private native-value tag"),
         }
     }
@@ -390,6 +364,22 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
 ];
 
 impl Builtin {
+    /// Position of the builtin's first entry in [`BUILTIN_FUNCTIONS`], its handle payload.
+    fn index(self) -> usize {
+        BUILTIN_FUNCTIONS
+            .iter()
+            .position(|(_, builtin)| *builtin == self)
+            .expect("every builtin function has a name")
+    }
+
+    fn from_index(payload: u64) -> Self {
+        usize::try_from(payload)
+            .ok()
+            .and_then(|index| BUILTIN_FUNCTIONS.get(index))
+            .map(|(_, builtin)| *builtin)
+            .expect("builtin function handle is in range")
+    }
+
     /// The builtin's Python name, as `__name__` and `repr` report it.
     pub(super) fn name(self) -> &'static str {
         BUILTIN_FUNCTIONS
@@ -1129,10 +1119,12 @@ impl<'a> Vm<'a> {
             }
         } else if let Some(id) = value.object_id() {
             match self.state.heap.get(id)?.clone() {
-                Object::List(values)
-                | Object::Tuple(values)
-                | Object::Set(values)
-                | Object::FrozenSet(values) => {
+                Object::List(values) | Object::Tuple(values) => {
+                    for value in values {
+                        self.push_materialized(&mut result, value)?;
+                    }
+                }
+                Object::Set(values) | Object::FrozenSet(values) => {
                     for value in values {
                         self.push_materialized(&mut result, value)?;
                     }
@@ -1191,8 +1183,8 @@ impl<'a> Vm<'a> {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
-                Object::Class { enum_members, .. } if !enum_members.is_empty() => {
-                    for value in enum_members {
+                Object::Class(class_object) if !class_object.enum_members.is_empty() => {
+                    for value in class_object.enum_members {
                         self.push_materialized(&mut result, value)?;
                     }
                 }
@@ -1272,26 +1264,86 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn find_value(&mut self, values: &[Value], needle: &Value) -> Result<Option<usize>, String> {
-        for (position, value) in values.iter().enumerate() {
-            self.charge_cpu(1)?;
-            if self.values_equal(value, needle)? {
-                return Ok(Some(position));
+    /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
+    /// keep them. Each candidate is hashed once and compared only with members of equal hash.
+    fn distinct_members(&mut self, candidates: Vec<Value>) -> Result<OrderedSet, String> {
+        let mut members = OrderedSet::default();
+        for candidate in candidates {
+            let hash = self.hash_value(&candidate)?;
+            let mut present = false;
+            // `members` is local, so a guest `__eq__` cannot change the candidate positions.
+            for index in 0..members.candidate_positions(hash).len() {
+                let position = members.candidate_positions(hash)[index];
+                let member = *members
+                    .get(position)
+                    .ok_or("set member position out of range")?;
+                self.charge_cpu(1)?;
+                if self.values_equal(&member, &candidate)? {
+                    present = true;
+                    break;
+                }
+            }
+            if !present {
+                members.push(hash, candidate);
             }
         }
-        Ok(None)
+        Ok(members)
     }
 
-    /// The position of the entry whose key equals `needle`. A user `__eq__` may mutate the dict,
-    /// so each candidate key is read again before it is compared.
+    /// Dict storage for `entries` in order. A repeated key keeps its first position and takes
+    /// the last value, as a dict display does.
+    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> Result<OrderedMap, String> {
+        let mut map = OrderedMap::default();
+        for (key, value) in entries {
+            let hash = self.hash_value(&key)?;
+            let mut existing = None;
+            for index in 0..map.candidate_positions(hash).len() {
+                let position = map.candidate_positions(hash)[index];
+                let member = map
+                    .get(position)
+                    .ok_or("dict entry position out of range")?
+                    .0;
+                self.charge_cpu(1)?;
+                if self.values_equal(&member, &key)? {
+                    existing = Some(position);
+                    break;
+                }
+            }
+            match existing {
+                Some(position) => map.set_value(position, value),
+                None => map.push(hash, (key, value)),
+            }
+        }
+        Ok(map)
+    }
+
+    /// Allocate a dict holding `entries`, deduplicated as [`Self::ordered_map`] does.
+    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, String> {
+        let entries = self.ordered_map(entries)?;
+        self.allocate_object(Object::Dict(entries))
+    }
+
+    /// The position of the entry whose key equals `needle`.
     fn find_mapping_entry(
         &mut self,
         id: ObjectId,
         needle: &Value,
     ) -> Result<Option<usize>, String> {
+        Ok(self.lookup_mapping_entry(id, needle)?.1)
+    }
+
+    /// `needle`'s hash and the position of the entry whose key equals it. Hashing and a user
+    /// `__eq__` may run guest code that mutates the dict, so each candidate key is read again
+    /// before it is compared.
+    fn lookup_mapping_entry(
+        &mut self,
+        id: ObjectId,
+        needle: &Value,
+    ) -> Result<(KeyHash, Option<usize>), String> {
+        let hash = self.hash_value(needle)?;
         let candidates = match self.state.heap.get(id)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                entries.candidate_positions(needle).collect::<Vec<_>>()
+                entries.candidate_positions(hash).to_vec()
             }
             _ => return Err("dict handle changed object kind".into()),
         };
@@ -1307,28 +1359,45 @@ impl<'a> Vm<'a> {
                 continue;
             };
             if self.values_equal(&candidate, needle)? {
-                return Ok(Some(position));
+                return Ok((hash, Some(position)));
             }
         }
-        Ok(None)
+        Ok((hash, None))
     }
 
+    /// The position of the member equal to `needle`.
     fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
-        let length = match self.state.heap.get(id)? {
-            Object::Set(values) | Object::FrozenSet(values) => values.len(),
+        Ok(self.lookup_set_entry(id, needle)?.1)
+    }
+
+    /// `needle`'s hash and the position of the member equal to it, rereading each candidate
+    /// because guest code may mutate the set during the comparison.
+    fn lookup_set_entry(
+        &mut self,
+        id: ObjectId,
+        needle: &Value,
+    ) -> Result<(KeyHash, Option<usize>), String> {
+        let hash = self.hash_value(needle)?;
+        let candidates = match self.state.heap.get(id)? {
+            Object::Set(values) | Object::FrozenSet(values) => {
+                values.candidate_positions(hash).to_vec()
+            }
             _ => return Err("set handle changed object kind".into()),
         };
-        for position in 0..length {
+        for position in candidates {
             let candidate = match self.state.heap.get(id)? {
-                Object::Set(values) | Object::FrozenSet(values) => values[position],
+                Object::Set(values) | Object::FrozenSet(values) => match values.get(position) {
+                    Some(value) => *value,
+                    None => continue,
+                },
                 _ => return Err("set handle changed object kind".into()),
             };
             self.charge_cpu(1)?;
             if self.values_equal(&candidate, needle)? {
-                return Ok(Some(position));
+                return Ok((hash, Some(position)));
             }
         }
-        Ok(None)
+        Ok((hash, None))
     }
 
     fn pop(&mut self) -> Result<Value, String> {
@@ -1392,6 +1461,7 @@ impl<'a> Vm<'a> {
 
     fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
+        super::heap::charge_construction(bytes, &mut self.interp.resources)?;
         let next = self
             .transient_memory
             .checked_add(bytes)
@@ -1535,5 +1605,47 @@ fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(
             "expected {minimum}..={maximum} arguments, got {}",
             arguments.len()
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn native_handles_round_trip_without_pointers() {
+        for builtin in BuiltinType::ALL {
+            let (payload, kind) = NativeValue::BuiltinType(builtin).encode();
+            assert_eq!(
+                NativeValue::decode(payload, kind),
+                NativeValue::BuiltinType(builtin)
+            );
+        }
+        for (_, builtin) in BUILTIN_FUNCTIONS {
+            let (payload, kind) = NativeValue::Function(*builtin).encode();
+            assert_eq!(
+                NativeValue::decode(payload, kind),
+                NativeValue::Function(*builtin)
+            );
+        }
+        let module = super::super::stdlib::native_module("math").expect("math is native");
+        let (payload, kind) = NativeValue::Module(module).encode();
+        assert!(
+            payload < 1 << 32,
+            "a module handle is a table index, not an address"
+        );
+        assert_eq!(
+            NativeValue::decode(payload, kind),
+            NativeValue::Module(module)
+        );
+        let function = &module.functions[0];
+        let (payload, kind) = NativeValue::NativeFunction(function).encode();
+        assert!(std::ptr::eq(
+            match NativeValue::decode(payload, kind) {
+                NativeValue::NativeFunction(decoded) => decoded,
+                other => panic!("decoded {other:?}"),
+            },
+            function
+        ));
     }
 }

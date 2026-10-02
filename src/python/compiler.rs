@@ -239,7 +239,7 @@ impl Compiler {
             return;
         }
         self.structural_depth += 1;
-        self.statement_inner(statement);
+        crate::stack::grow(|| self.statement_inner(statement));
         self.structural_depth -= 1;
     }
 
@@ -868,7 +868,12 @@ impl Compiler {
         }
     }
 
+    /// The parser bounds the tree's depth; growth keeps that depth safe on small host stacks.
     fn store_target(&mut self, target: AssignmentTarget, span: Span) {
+        crate::stack::grow(|| self.store_target_inner(target, span))
+    }
+
+    fn store_target_inner(&mut self, target: AssignmentTarget, span: Span) {
         match target {
             AssignmentTarget::Name(name) => {
                 self.store_name(name, span);
@@ -911,7 +916,12 @@ impl Compiler {
     }
 
     /// Delete `target`; a sequence such as `del a, [b, c]` deletes its targets left to right.
+    /// The parser bounds the tree's depth; growth keeps that depth safe on small host stacks.
     fn delete(&mut self, target: AssignmentTarget, span: Span) {
+        crate::stack::grow(|| self.delete_inner(target, span))
+    }
+
+    fn delete_inner(&mut self, target: AssignmentTarget, span: Span) {
         match target {
             AssignmentTarget::Name(name) => {
                 if self.globals.contains(&name) {
@@ -1006,7 +1016,12 @@ impl Compiler {
         }
     }
 
+    /// The parser bounds the tree's depth; growth keeps that depth safe on small host stacks.
     fn expression(&mut self, expression: Expression) {
+        crate::stack::grow(|| self.expression_inner(expression))
+    }
+
+    fn expression_inner(&mut self, expression: Expression) {
         let span = expression.span;
         match expression.kind {
             ExpressionKind::Constant(value) => {

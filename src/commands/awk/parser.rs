@@ -5,12 +5,22 @@ use super::lexer::{lex, Token};
 
 pub(super) fn parse(source: &str) -> Result<Program, String> {
     let tokens = lex(source)?;
-    Parser { tokens, cursor: 0 }.program()
+    Parser {
+        tokens,
+        cursor: 0,
+        depth: 0,
+    }
+    .program()
 }
+
+const TOO_DEEP: &str = "program is nested too deeply";
 
 struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
+    /// Depth of the syntax tree under construction, bounded by
+    /// [`crate::stack::MAX_SYNTAX_DEPTH`].
+    depth: usize,
 }
 
 impl Parser {
@@ -46,6 +56,16 @@ impl Parser {
     }
 
     fn statement(&mut self) -> Result<Stmt, String> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            crate::stack::MAX_SYNTAX_DEPTH,
+            Self::statement_inner,
+        )
+        .unwrap_or_else(|| Err(TOO_DEEP.to_string()))
+    }
+
+    fn statement_inner(&mut self) -> Result<Stmt, String> {
         self.separators();
         if self.take(&Token::LBrace) {
             let mut statements = Vec::new();
@@ -218,6 +238,16 @@ impl Parser {
     }
 
     fn assignment(&mut self) -> Result<Expr, String> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            crate::stack::MAX_SYNTAX_DEPTH,
+            Self::assignment_inner,
+        )
+        .unwrap_or_else(|| Err(TOO_DEEP.to_string()))
+    }
+
+    fn assignment_inner(&mut self) -> Result<Expr, String> {
         let left = self.logical_or()?;
         let op = if self.take(&Token::Assign) {
             Some(AssignOp::Set)
@@ -271,16 +301,13 @@ impl Parser {
     }
 
     fn concat(&mut self) -> Result<Expr, String> {
-        let mut left = self.additive()?;
-        while self.starts_expression() {
-            let right = self.additive()?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op: BinaryOp::Concat,
-                right: Box::new(right),
-            };
-        }
-        Ok(left)
+        let left = self.additive()?;
+        self.chain(left, |parser| {
+            if !parser.starts_expression() {
+                return Ok(None);
+            }
+            Ok(Some((BinaryOp::Concat, parser.additive()?)))
+        })
     }
 
     fn additive(&mut self) -> Result<Expr, String> {
@@ -309,21 +336,56 @@ impl Parser {
         operand: fn(&mut Self) -> Result<Expr, String>,
         operators: &[(Token, BinaryOp)],
     ) -> Result<Expr, String> {
-        let mut left = operand(self)?;
-        while let Some((_, op)) = operators.iter().find(|(token, _)| self.at(token)) {
-            let op = *op;
-            self.cursor += 1;
-            let right = operand(self)?;
-            left = Expr::Binary {
-                left: Box::new(left),
-                op,
-                right: Box::new(right),
+        let left = operand(self)?;
+        self.chain(left, |parser| {
+            let Some((_, op)) = operators.iter().find(|(token, _)| parser.at(token)) else {
+                return Ok(None);
             };
-        }
-        Ok(left)
+            parser.cursor += 1;
+            Ok(Some((*op, operand(parser)?)))
+        })
+    }
+
+    /// Fold a left-associative chain. `next` parses the next operator and operand, or returns
+    /// `None` at the end. Each link deepens the tree, so links count toward the nesting limit.
+    fn chain(
+        &mut self,
+        mut left: Expr,
+        mut next: impl FnMut(&mut Self) -> Result<Option<(BinaryOp, Expr)>, String>,
+    ) -> Result<Expr, String> {
+        let entry = self.depth;
+        let result = loop {
+            if self.depth >= crate::stack::MAX_SYNTAX_DEPTH {
+                break Err(TOO_DEEP.to_string());
+            }
+            self.depth += 1;
+            match next(self) {
+                Ok(Some((op, right))) => {
+                    left = Expr::Binary {
+                        left: Box::new(left),
+                        op,
+                        right: Box::new(right),
+                    }
+                }
+                Ok(None) => break Ok(left),
+                Err(error) => break Err(error),
+            }
+        };
+        self.depth = entry;
+        result
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        crate::stack::descend(
+            self,
+            |parser| &mut parser.depth,
+            crate::stack::MAX_SYNTAX_DEPTH,
+            Self::unary_inner,
+        )
+        .unwrap_or_else(|| Err(TOO_DEEP.to_string()))
+    }
+
+    fn unary_inner(&mut self) -> Result<Expr, String> {
         if self.take(&Token::Not) {
             return Ok(Expr::Unary {
                 op: UnaryOp::Not,

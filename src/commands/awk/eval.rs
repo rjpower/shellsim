@@ -95,6 +95,11 @@ pub(super) fn validate(program: &Program) -> Result<(), String> {
 }
 
 fn validate_stmt(statement: &Stmt) -> Result<(), String> {
+    // The parser bounds tree depth; growth keeps that depth safe on small host stacks.
+    crate::stack::grow(|| validate_stmt_inner(statement))
+}
+
+fn validate_stmt_inner(statement: &Stmt) -> Result<(), String> {
     match statement {
         Stmt::Block(statements) => {
             for statement in statements {
@@ -167,6 +172,11 @@ fn validate_lvalue(target: &LValue) -> Result<(), String> {
 }
 
 fn validate_expr(expression: &Expr) -> Result<(), String> {
+    // The parser bounds tree depth; growth keeps that depth safe on small host stacks.
+    crate::stack::grow(|| validate_expr_inner(expression))
+}
+
+fn validate_expr_inner(expression: &Expr) -> Result<(), String> {
     match expression {
         Expr::Regex(pattern) => regex::Regex::new(pattern)
             .map(|_| ())
@@ -230,6 +240,8 @@ pub(super) fn execute(
         io,
         state,
         literal_regexes: HashMap::new(),
+        state_reserved: 0,
+        fields_reserved: 0,
     };
 
     let mut requested_exit = match runtime.phase(program, Phase::Begin) {
@@ -273,9 +285,62 @@ struct Runtime<'a, 'io> {
     io: &'a mut Io<'io>,
     state: State,
     literal_regexes: HashMap<String, regex::Regex>,
+    /// Machine memory reserved for variables and array elements assigned by the program.
+    state_reserved: u64,
+    /// The part of `state_reserved` held by the current record's fields.
+    fields_reserved: u64,
+}
+
+impl Drop for Runtime<'_, '_> {
+    fn drop(&mut self) {
+        self.system.release_memory(self.state_reserved);
+    }
+}
+
+/// Modeled bookkeeping cost of one stored variable or array element beyond its text.
+const SLOT_OVERHEAD: u64 = 64;
+/// Modeled bytes of one split field beyond its text.
+const FIELD_OVERHEAD: u64 = 32;
+
+/// Modeled bytes of one variable or array element stored under `key`.
+fn slot_bytes(key: &str, value: &Scalar) -> u64 {
+    (key.len() as u64)
+        .saturating_add(value.text.len() as u64)
+        .saturating_add(SLOT_OVERHEAD)
 }
 
 impl Runtime<'_, '_> {
+    /// Reserve growth, or release shrinkage, of program state before the change is stored.
+    fn resize_state(&mut self, old: u64, new: u64) -> Result<(), Flow> {
+        if new > old {
+            if !self.system.reserve_memory(new - old) {
+                return Err(Flow::Exhausted);
+            }
+            self.state_reserved = self.state_reserved.saturating_add(new - old);
+        } else {
+            self.system.release_memory(old - new);
+            self.state_reserved = self.state_reserved.saturating_sub(old - new);
+        }
+        Ok(())
+    }
+
+    /// Store one array element, charging its size first.
+    fn store_element(&mut self, name: &str, key: String, value: Scalar) -> Result<(), Flow> {
+        let old = self
+            .state
+            .arrays
+            .get(name)
+            .and_then(|array| array.get(&key))
+            .map_or(0, |old| slot_bytes(&key, old));
+        self.resize_state(old, slot_bytes(&key, &value))?;
+        self.state
+            .arrays
+            .entry(name.to_string())
+            .or_default()
+            .insert(key, value);
+        Ok(())
+    }
+
     fn phase(&mut self, program: &Program, phase: Phase) -> Flow {
         for rule in &program.rules {
             let selected = match (&rule.pattern, phase) {
@@ -309,6 +374,10 @@ impl Runtime<'_, '_> {
     }
 
     fn statement(&mut self, statement: &Stmt) -> Flow {
+        crate::stack::grow(|| self.statement_inner(statement))
+    }
+
+    fn statement_inner(&mut self, statement: &Stmt) -> Flow {
         if !self.system.charge_cpu(1) {
             return Flow::Exhausted;
         }
@@ -392,8 +461,13 @@ impl Runtime<'_, '_> {
             Stmt::Continue => Flow::Continue,
             Stmt::Delete(target) => match self.array_target(target) {
                 Ok((name, key)) => {
-                    if let Some(array) = self.state.arrays.get_mut(&name) {
-                        array.remove(&key);
+                    let removed = self
+                        .state
+                        .arrays
+                        .get_mut(&name)
+                        .and_then(|array| array.remove(&key));
+                    if let Some(removed) = removed {
+                        let _ = self.resize_state(slot_bytes(&key, &removed), 0);
                     }
                     Flow::Normal
                 }
@@ -457,6 +531,10 @@ impl Runtime<'_, '_> {
     }
 
     fn expr(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
+        crate::stack::grow(|| self.expr_inner(expression))
+    }
+
+    fn expr_inner(&mut self, expression: &Expr) -> Result<Scalar, Flow> {
         if !self.system.charge_cpu(1) {
             return Err(Flow::Exhausted);
         }
@@ -740,13 +818,27 @@ impl Runtime<'_, '_> {
         } else {
             self.state.fs.clone()
         };
-        let values = split_fields(&input, &separator)?;
-        let array = self.state.arrays.entry(array_name.clone()).or_default();
-        array.clear();
-        for (index, value) in values.iter().enumerate() {
-            array.insert((index + 1).to_string(), Scalar::string(value.clone()));
-        }
-        Ok(Scalar::number(values.len() as f64))
+        let released = self
+            .state
+            .arrays
+            .remove(array_name.as_str())
+            .map_or(0, |array| {
+                array.iter().fold(0_u64, |total, (key, value)| {
+                    total.saturating_add(slot_bytes(key, value))
+                })
+            });
+        self.resize_state(released, 0)?;
+        self.state.arrays.insert(array_name.clone(), HashMap::new());
+        let mut count = 0_usize;
+        for_each_field(&input, &separator, |field| {
+            count += 1;
+            self.store_element(
+                array_name,
+                count.to_string(),
+                Scalar::string(field.to_string()),
+            )
+        })?;
+        Ok(Scalar::number(count as f64))
     }
 
     fn substitute(&mut self, args: &[Expr], global: bool) -> Result<Scalar, Flow> {
@@ -851,6 +943,12 @@ impl Runtime<'_, '_> {
                 )))
             }
             _ => {
+                let old = self
+                    .state
+                    .vars
+                    .get(name)
+                    .map_or(0, |old| slot_bytes(name, old));
+                self.resize_state(old, slot_bytes(name, &value))?;
                 self.state.vars.insert(name.to_string(), value);
             }
         }
@@ -870,8 +968,21 @@ impl Runtime<'_, '_> {
         }
     }
 
+    /// Replace `$0` and its fields, charging each field before it is stored.
     fn set_record(&mut self, record: String) -> Result<(), Flow> {
-        self.state.fields = split_fields(&record, &self.state.fs)?;
+        self.state.fields.clear();
+        self.resize_state(self.fields_reserved, 0)?;
+        self.fields_reserved = 0;
+        let separator = self.state.fs.clone();
+        let mut fields = Vec::new();
+        for_each_field(&record, &separator, |field| {
+            let bytes = FIELD_OVERHEAD.saturating_add(field.len() as u64);
+            self.resize_state(0, bytes)?;
+            self.fields_reserved = self.fields_reserved.saturating_add(bytes);
+            fields.push(field.to_string());
+            Ok(())
+        })?;
+        self.state.fields = fields;
         self.state.record = record;
         Ok(())
     }
@@ -936,11 +1047,7 @@ impl Runtime<'_, '_> {
             }
             LValue::Array { name, indices } => {
                 let key = self.array_key(indices)?;
-                self.state
-                    .arrays
-                    .entry(name.clone())
-                    .or_default()
-                    .insert(key, value);
+                self.store_element(name, key, value)?;
             }
         }
         Ok(())
@@ -991,12 +1098,27 @@ pub(super) fn assignment_is_unsupported(name: &str) -> bool {
 }
 
 fn split_fields(record: &str, separator: &str) -> Result<Vec<String>, Flow> {
+    let mut fields = Vec::new();
+    for_each_field(record, separator, |field| {
+        fields.push(field.to_string());
+        Ok(())
+    })?;
+    Ok(fields)
+}
+
+/// Visit the fields of `record` in order, so callers can charge each one before storing it.
+fn for_each_field(
+    record: &str,
+    separator: &str,
+    mut visit: impl FnMut(&str) -> Result<(), Flow>,
+) -> Result<(), Flow> {
     if separator == " " || separator.is_empty() {
-        return Ok(record.split_whitespace().map(str::to_string).collect());
+        return record.split_whitespace().try_for_each(visit);
     }
-    regex::Regex::new(separator)
-        .map(|regex| regex.split(record).map(str::to_string).collect())
-        .map_err(|error| Flow::Error(format!("invalid field separator: {error}")))
+    let regex = regex::Regex::new(separator)
+        .map_err(|error| Flow::Error(format!("invalid field separator: {error}")))?;
+    let result = regex.split(record).try_for_each(&mut visit);
+    result
 }
 
 /// Check an initial field separator before input is read or output is produced.
@@ -1168,6 +1290,11 @@ fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<S
 }
 
 fn number_text(value: f64) -> String {
+    // Integer formatting is much cheaper than exact float formatting, and `-0` keeps its sign
+    // through the float path.
+    if value.fract() == 0.0 && value.abs() < 1e18 && !(value == 0.0 && value.is_sign_negative()) {
+        return (value as i64).to_string();
+    }
     if value.fract() == 0.0 && value.is_finite() {
         format!("{value:.0}")
     } else {

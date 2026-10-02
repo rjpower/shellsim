@@ -48,12 +48,16 @@ pub(in crate::python) fn leaf(runtime: &dyn PyRuntime, value: &PyValue) -> PyRes
         PyKind::Int => match runtime.int_value(value) {
             Some(value) => Leaf::Int(WideInt::from(value)),
             None => {
-                let text = runtime
-                    .integer_text(value)?
+                let integer = runtime
+                    .integer_bigint(value)?
                     .ok_or_else(|| PyError::runtime_error("integer lost its value"))?;
-                text.parse::<WideInt>()
-                    .map(Leaf::Int)
-                    .unwrap_or(Leaf::BigInt(text))
+                match num_traits::ToPrimitive::to_i128(&integer) {
+                    Some(value) => Leaf::Int(value),
+                    None if super::super::super::number::exceeds_str_digits(&integer) => {
+                        return Err(super::super::super::number::int_str_digits_error());
+                    }
+                    None => Leaf::BigInt(integer.to_string()),
+                }
             }
         },
         PyKind::Float => Leaf::Float(value.float_value().unwrap_or(f64::NAN)),

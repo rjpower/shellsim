@@ -272,9 +272,13 @@ fn dump_value(
         PyKind::None => return Ok("null".into()),
         PyKind::Bool => return Ok(runtime.truth(&value)?.to_string()),
         PyKind::Int => {
-            return runtime
-                .integer_text(&value)?
-                .ok_or_else(|| PyError::type_error("invalid integer representation"));
+            let integer = runtime
+                .integer_bigint(&value)?
+                .ok_or_else(|| PyError::type_error("invalid integer representation"))?;
+            if super::super::number::exceeds_str_digits(&integer) {
+                return Err(super::super::number::int_str_digits_error());
+            }
+            return Ok(integer.to_string());
         }
         PyKind::Float => {
             let PyNumber::Float(number) = value.cast::<PyNumber>(runtime)? else {
@@ -429,10 +433,10 @@ fn size_bound(
         PyKind::None => return scalar(4),
         PyKind::Bool => return scalar(if runtime.truth(&value)? { 4 } else { 5 }),
         PyKind::Int => {
-            let text = runtime
-                .integer_text(&value)?
+            let integer = runtime
+                .integer_bigint(&value)?
                 .ok_or_else(|| PyError::type_error("invalid integer representation"))?;
-            return scalar(text.len().max(32));
+            return scalar(super::super::number::decimal_digits(&integer).max(32));
         }
         PyKind::Float => {
             let PyNumber::Float(number) = value.cast::<PyNumber>(runtime)? else {

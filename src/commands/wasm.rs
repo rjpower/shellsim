@@ -18,7 +18,6 @@ use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicPtr, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
@@ -143,17 +142,17 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
 /// Access to the virtual machine for host calls.
 ///
 /// A guest's Wasmtime store lives across many scheduler turns, so it cannot hold a borrow of
-/// the machine. The poller publishes the machine for exactly the duration of one poll of the
-/// guest's future ([`MachineAccess::enter`]). Host calls run synchronously inside that poll and
-/// reach the machine only through `&mut Host`, so at most one `&mut Interp` derived from the
-/// published pointer exists at a time, and none outlives the poll. The poller does not touch
-/// the machine while the guest runs.
+/// the machine. For exactly the duration of one poll of the guest's future
+/// ([`MachineAccess::enter`]), the poller moves the machine into this shared slot and leaves a
+/// spare in its place, then moves it back. Host calls run synchronously inside that poll and
+/// borrow the machine from the slot; a second simultaneous borrow is a bug and panics rather
+/// than deadlocking.
 #[derive(Clone, Default)]
 pub(crate) struct MachineAccess(Arc<MachineShared>);
 
 #[derive(Default)]
 struct MachineShared {
-    machine: AtomicPtr<Interp>,
+    machine: Mutex<Option<Interp>>,
     signals: Mutex<Signals>,
 }
 
@@ -175,36 +174,89 @@ enum Suspension {
     Yielded,
 }
 
-impl MachineAccess {
-    /// Run `poll` with the machine published to host calls.
-    fn enter<R>(&self, interp: &mut Interp, poll: impl FnOnce() -> R) -> R {
-        struct Withdraw<'a>(&'a AtomicPtr<Interp>);
-        impl Drop for Withdraw<'_> {
-            fn drop(&mut self) {
-                self.0.store(std::ptr::null_mut(), Ordering::Release);
-            }
+thread_local! {
+    /// A machine value to leave behind while the real one is lent to a guest. Building one is
+    /// comparatively slow, so each thread keeps one for reuse; it is never observed.
+    static SPARE_MACHINE: std::cell::RefCell<Option<Interp>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The machine borrowed by one host call.
+pub(crate) struct MachineGuard<'a>(std::sync::MutexGuard<'a, Option<Interp>>);
+
+impl std::ops::Deref for MachineGuard<'_> {
+    type Target = Interp;
+
+    fn deref(&self) -> &Interp {
+        self.0
+            .as_ref()
+            .expect("wasm host call outside a guest poll")
+    }
+}
+
+impl std::ops::DerefMut for MachineGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Interp {
+        self.0
+            .as_mut()
+            .expect("wasm host call outside a guest poll")
+    }
+}
+
+/// Return a lent machine to the poller's borrow, even if the guest poll panics.
+struct Restore<'a> {
+    slot: &'a Mutex<Option<Interp>>,
+    interp: &'a mut Interp,
+}
+
+impl Drop for Restore<'_> {
+    fn drop(&mut self) {
+        let lent = self
+            .slot
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(machine) = lent {
+            let spare = std::mem::replace(self.interp, machine);
+            SPARE_MACHINE.with(|cell| *cell.borrow_mut() = Some(spare));
         }
-        let previous = self.0.machine.swap(interp, Ordering::AcqRel);
-        assert!(previous.is_null(), "a wasm guest is already being polled");
-        let _withdraw = Withdraw(&self.0.machine);
+    }
+}
+
+impl MachineAccess {
+    /// Run `poll` with the machine lent to host calls.
+    fn enter<R>(&self, interp: &mut Interp, poll: impl FnOnce() -> R) -> R {
+        let spare = SPARE_MACHINE
+            .with(|cell| cell.borrow_mut().take())
+            .unwrap_or_default();
+        let machine = std::mem::replace(interp, spare);
+        {
+            let mut slot = self.slot();
+            assert!(slot.is_none(), "a wasm guest is already being polled");
+            *slot = Some(machine);
+        }
+        let _restore = Restore {
+            slot: &self.0.machine,
+            interp,
+        };
         poll()
     }
 
-    fn get(&mut self) -> &mut Interp {
-        let machine = self.0.machine.load(Ordering::Acquire);
-        assert!(!machine.is_null(), "wasm host call outside a guest poll");
-        // SAFETY: the pointer comes from the exclusive borrow held by `enter` for the duration
-        // of this poll, which the poller does not use meanwhile. The returned borrow is tied to
-        // `&mut self`, and every `MachineAccess` reached by host calls is the one inside the
-        // exclusively borrowed `Host`, so no second `&mut Interp` can coexist with it.
-        unsafe { &mut *machine }
+    fn slot(&self) -> std::sync::MutexGuard<'_, Option<Interp>> {
+        match self.0.machine.try_lock() {
+            Ok(guard) => guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                panic!("the wasm machine is already borrowed by this host call")
+            }
+        }
     }
 
-    fn get_ref(&self) -> &Interp {
-        let machine = self.0.machine.load(Ordering::Acquire);
-        assert!(!machine.is_null(), "wasm host call outside a guest poll");
-        // SAFETY: as for `get`; a shared borrow of `Host` excludes the mutable path.
-        unsafe { &*machine }
+    fn get(&self) -> MachineGuard<'_> {
+        MachineGuard(self.slot())
+    }
+
+    fn get_ref(&self) -> MachineGuard<'_> {
+        MachineGuard(self.slot())
     }
 
     fn signals(&self) -> std::sync::MutexGuard<'_, Signals> {
@@ -336,7 +388,7 @@ fn guest_file(
     if !caller.data().open_files.contains(&fd) {
         return Err(ERRNO_BADF);
     }
-    ActiveSystem::new(caller.data_mut().machine.get())
+    ActiveSystem::new(&mut caller.data_mut().machine.get())
         .file_state(fd)
         .map_err(|error| syscall_errno(&error))
 }
@@ -485,13 +537,14 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         truncate: request.oflags & 8 != 0,
         append: request.fdflags & 1 != 0,
     };
-    let fd =
-        match ActiveSystem::new(caller.data_mut().machine.get()).open_file(&cwd, &path, options) {
-            Ok(fd) => fd,
-            Err(error) => return syscall_errno(&error),
-        };
+    let fd = match ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .open_file(&cwd, &path, options)
+    {
+        Ok(fd) => fd,
+        Err(error) => return syscall_errno(&error),
+    };
     if !write_u32(&mut caller, request.result, fd as u32) {
-        let _ = ActiveSystem::new(caller.data_mut().machine.get()).close(fd);
+        let _ = ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd);
         return ERRNO_FAULT;
     }
     let host = caller.data_mut();
@@ -510,7 +563,7 @@ fn path_chmod(mut caller: Caller<'_, Host>, pointer: u32, length: u32, mode: u32
         Err(error) => return error,
     };
     let cwd = caller.data().cwd.clone();
-    match ActiveSystem::new(caller.data_mut().machine.get()).chmod(&cwd, &path, mode) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).chmod(&cwd, &path, mode) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -519,7 +572,9 @@ fn path_chmod(mut caller: Caller<'_, Host>, pointer: u32, length: u32, mode: u32
 // These calls copy pixels and key events through guest memory. No guest pointer or host device
 // escapes the active virtual process.
 fn display_open(mut caller: Caller<'_, Host>, width: u32, height: u32, format: u32) -> i32 {
-    match ActiveSystem::new(caller.data_mut().machine.get()).display_open(width, height, format) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .display_open(width, height, format)
+    {
         Ok(handle) => handle as i32,
         Err(error) => -display_errno(error),
     }
@@ -532,10 +587,17 @@ fn display_present(
     length: u32,
     stride: u32,
 ) -> i32 {
-    let Some(frame) = caller.data().machine.get_ref().display.frame() else {
+    let Some(frame_length) = caller
+        .data()
+        .machine
+        .get_ref()
+        .display
+        .frame()
+        .map(|frame| frame.pixels.len())
+    else {
         return ERRNO_BADF;
     };
-    if usize::try_from(length).ok() != Some(frame.pixels.len()) {
+    if usize::try_from(length).ok() != Some(frame_length) {
         return ERRNO_INVAL;
     }
     let Some(memory) = memory(&mut caller) else {
@@ -553,7 +615,7 @@ fn display_present(
     let mut pixels = vec![0; length as usize];
     let read = memory.read(&caller, pointer as usize, &mut pixels);
     let result = if read.is_ok() {
-        ActiveSystem::new(caller.data_mut().machine.get())
+        ActiveSystem::new(&mut caller.data_mut().machine.get())
             .display_present(handle, &pixels, stride)
             .map_or_else(display_errno, |_| ERRNO_SUCCESS)
     } else {
@@ -595,7 +657,8 @@ fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32
             }
         }
     }
-    match ActiveSystem::new(caller.data_mut().machine.get()).input_poll_key(handle) {
+    let polled = ActiveSystem::new(&mut caller.data_mut().machine.get()).input_poll_key(handle);
+    match polled {
         Ok(Some(event)) => {
             slot[..4].copy_from_slice(&event.code.to_le_bytes());
             slot[4..].copy_from_slice(&u32::from(event.pressed).to_le_bytes());
@@ -611,7 +674,7 @@ fn input_poll_key(mut caller: Caller<'_, Host>, handle: u32, result: u32) -> i32
 }
 
 fn display_close(mut caller: Caller<'_, Host>, handle: u32) -> i32 {
-    ActiveSystem::new(caller.data_mut().machine.get())
+    ActiveSystem::new(&mut caller.data_mut().machine.get())
         .display_close(handle)
         .map_or_else(display_errno, |_| ERRNO_SUCCESS)
 }
@@ -697,7 +760,7 @@ fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
         }
         // Closing a real standard descriptor lets a pipe reader see EOF before the guest exits.
         if matches!(host.stdio, Stdio::Descriptors) {
-            let _ = ActiveSystem::new(host.machine.get()).close(fd);
+            let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
         }
         return ERRNO_SUCCESS;
     }
@@ -705,7 +768,7 @@ fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
         return ERRNO_BADF;
     }
     caller.data_mut().append_files.remove(&fd);
-    match ActiveSystem::new(caller.data_mut().machine.get()).close(fd) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -715,11 +778,12 @@ fn fd_seek(mut caller: Caller<'_, Host>, fd: u32, delta: i64, whence: u32, resul
     if let Err(error) = guest_file(&mut caller, fd as i32) {
         return error;
     }
-    let position =
-        match ActiveSystem::new(caller.data_mut().machine.get()).seek(fd as i32, delta, whence) {
-            Ok(position) => position,
-            Err(error) => return syscall_errno(&error),
-        };
+    let position = match ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .seek(fd as i32, delta, whence)
+    {
+        Ok(position) => position,
+        Err(error) => return syscall_errno(&error),
+    };
     if !write_u64(&mut caller, result, position) {
         return ERRNO_FAULT;
     }
@@ -762,12 +826,15 @@ fn filestat(info: &FileInfo) -> [u8; 64] {
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
     let cwd = caller.data().cwd.clone();
-    let system = &mut ActiveSystem::new(caller.data_mut().machine.get());
-    let info = match fd {
-        3 => system.metadata("/", &cwd, true),
-        4 => system.metadata("/", "/", true),
-        5.. => system.metadata_fd(fd as i32),
-        _ => return ERRNO_BADF,
+    let info = {
+        let mut machine = caller.data_mut().machine.get();
+        let system = &mut ActiveSystem::new(&mut machine);
+        match fd {
+            3 => system.metadata("/", &cwd, true),
+            4 => system.metadata("/", "/", true),
+            5.. => system.metadata_fd(fd as i32),
+            _ => return ERRNO_BADF,
+        }
     };
     let info = match info {
         Ok(info) => info,
@@ -802,7 +869,7 @@ fn path_filestat_get(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let info = match ActiveSystem::new(caller.data_mut().machine.get()).metadata(
+    let info = match ActiveSystem::new(&mut caller.data_mut().machine.get()).metadata(
         &cwd,
         &path,
         flags & 1 != 0,
@@ -832,7 +899,7 @@ fn path_unlink_file(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, length:
         Ok(path) => path,
         Err(error) => return error,
     };
-    match ActiveSystem::new(caller.data_mut().machine.get()).unlink(&cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).unlink(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -847,7 +914,7 @@ fn path_create_directory(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, le
         Ok(path) => path,
         Err(error) => return error,
     };
-    match ActiveSystem::new(caller.data_mut().machine.get()).mkdir(&cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).mkdir(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -862,7 +929,7 @@ fn path_remove_directory(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, le
         Ok(path) => path,
         Err(error) => return error,
     };
-    match ActiveSystem::new(caller.data_mut().machine.get()).rmdir(&cwd, &path) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).rmdir(&cwd, &path) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -892,7 +959,8 @@ fn path_rename(
     };
     let old_path = resolve_against(&old_base, &old_path);
     let new_path = resolve_against(&new_base, &new_path);
-    match ActiveSystem::new(caller.data_mut().machine.get()).rename("/", &old_path, &new_path) {
+    match ActiveSystem::new(&mut caller.data_mut().machine.get()).rename("/", &old_path, &new_path)
+    {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
     }
@@ -912,12 +980,13 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
         return ERRNO_FAULT;
     }
     let reservation = u64::from(length);
-    if !ActiveSystem::new(caller.data_mut().machine.get()).reserve_memory(reservation) {
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get()).reserve_memory(reservation) {
         return ERRNO_INVAL;
     }
     let mut bytes = vec![0; length as usize];
-    if let Err(error) = ActiveSystem::new(caller.data_mut().machine.get()).random_fill(&mut bytes) {
-        ActiveSystem::new(caller.data_mut().machine.get()).release_memory(reservation);
+    let filled = ActiveSystem::new(&mut caller.data_mut().machine.get()).random_fill(&mut bytes);
+    if let Err(error) = filled {
+        ActiveSystem::new(&mut caller.data_mut().machine.get()).release_memory(reservation);
         return syscall_errno(&error);
     }
     let result = if memory.write(&mut caller, pointer as usize, &bytes).is_ok() {
@@ -925,7 +994,7 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
     } else {
         ERRNO_FAULT
     };
-    ActiveSystem::new(caller.data_mut().machine.get()).release_memory(reservation);
+    ActiveSystem::new(&mut caller.data_mut().machine.get()).release_memory(reservation);
     result
 }
 
@@ -1006,14 +1075,14 @@ fn fd_write(
     }
     let host = caller.data_mut();
     if standard {
-        let remaining = ActiveSystem::new(host.machine.get()).output_remaining();
+        let remaining = ActiveSystem::new(&mut host.machine.get()).output_remaining();
         if remaining == 0 && !bytes.is_empty() {
-            let _ = ActiveSystem::new(host.machine.get()).charge_output(1);
+            let _ = ActiveSystem::new(&mut host.machine.get()).charge_output(1);
             return Err(exhausted());
         }
         bytes.truncate(remaining.min(bytes.len() as u64) as usize);
     } else if host.append_files.contains(&fd) {
-        if let Err(error) = ActiveSystem::new(host.machine.get()).seek(fd, 0, 2) {
+        if let Err(error) = ActiveSystem::new(&mut host.machine.get()).seek(fd, 0, 2) {
             return Ok(StreamCall::Done(syscall_errno(&error)));
         }
     }
@@ -1023,7 +1092,7 @@ fn fd_write(
             destination.extend_from_slice(&bytes);
             bytes.len()
         }
-        _ => match ActiveSystem::new(host.machine.get()).write(fd, &bytes) {
+        _ => match ActiveSystem::new(&mut host.machine.get()).write(fd, &bytes) {
             Ok(IoPoll::Ready(count)) => count,
             Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
             // WASI has no signals. Writing to a pipe without readers ends the guest as the
@@ -1034,8 +1103,12 @@ fn fd_write(
             Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
         },
     };
-    let mut system = ActiveSystem::new(host.machine.get());
-    if !system.charge_cpu(count as u64) || (standard && !system.charge_output(count as u64)) {
+    let charged = {
+        let mut machine = host.machine.get();
+        let mut system = ActiveSystem::new(&mut machine);
+        system.charge_cpu(count as u64) && (!standard || system.charge_output(count as u64))
+    };
+    if !charged {
         return Err(exhausted());
     }
     Ok(StreamCall::Done(
@@ -1080,13 +1153,13 @@ fn fd_read(
             *offset = end;
             bytes
         }
-        _ => match ActiveSystem::new(host.machine.get()).read(fd, total) {
+        _ => match ActiveSystem::new(&mut host.machine.get()).read(fd, total) {
             Ok(IoPoll::Ready(bytes)) => bytes,
             Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
             Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
         },
     };
-    if !ActiveSystem::new(host.machine.get()).charge_cpu(input.len() as u64) {
+    if !ActiveSystem::new(&mut host.machine.get()).charge_cpu(input.len() as u64) {
         return Err(exhausted());
     }
     let mut copied = 0usize;
@@ -1133,7 +1206,8 @@ fn clock_waits(
     memory
         .read(&*caller, input as usize, &mut bytes)
         .map_err(|_| ERRNO_FAULT)?;
-    let system = ActiveSystem::new(caller.data_mut().machine.get());
+    let mut machine = caller.data_mut().machine.get();
+    let system = ActiveSystem::new(&mut machine);
     let now = system
         .clock_time_ns(ClockId::Monotonic)
         .map_err(|error| syscall_errno(&error))?;
@@ -1171,6 +1245,13 @@ fn clock_waits(
         .collect()
 }
 
+/// One check of a clock wait against the virtual clock.
+enum ClockStep {
+    Reached(u64),
+    Advanced,
+    Wait,
+}
+
 /// Sleep until the earliest clock subscription expires, then report every expired one.
 ///
 /// A scheduled process blocks on a virtual timer like native `sleep`, so other processes run and
@@ -1193,25 +1274,36 @@ async fn poll_oneoff(
     let now = loop {
         let host = caller.data_mut();
         let buffered = matches!(host.stdio, Stdio::Buffered { .. });
-        let interp = host.machine.get();
-        let now = interp.clock.monotonic_ns();
-        if now >= deadline {
-            break now;
-        }
-        if buffered {
-            // A virtual session is the only process on its clock, so it jumps to the deadline.
-            // A real-time session waits for physical time, which the session poll syncs.
-            if interp.real_time.is_none() {
+        // The guard is confined to this block: the poller takes the machine back while the
+        // guest is suspended below.
+        let step = {
+            let mut interp = host.machine.get();
+            let now = interp.clock.monotonic_ns();
+            if now >= deadline {
+                ClockStep::Reached(now)
+            } else if buffered && interp.real_time.is_none() {
+                // A virtual session is the only process on its clock, so it jumps to the
+                // deadline. A real-time session waits for physical time, which the session poll
+                // syncs.
                 if interp.clock.advance_to(deadline).is_err() {
                     return Ok(ERRNO_INVAL);
                 }
-                continue;
+                ClockStep::Advanced
+            } else {
+                if !buffered && !scheduled {
+                    if let Err(error) = ActiveSystem::new(&mut interp).schedule_wake(deadline - now)
+                    {
+                        return Ok(syscall_errno(&error));
+                    }
+                    scheduled = true;
+                }
+                ClockStep::Wait
             }
-        } else if !scheduled {
-            if let Err(error) = ActiveSystem::new(interp).schedule_wake(deadline - now) {
-                return Ok(syscall_errno(&error));
-            }
-            scheduled = true;
+        };
+        match step {
+            ClockStep::Reached(now) => break now,
+            ClockStep::Advanced => continue,
+            ClockStep::Wait => {}
         }
         let machine = host.machine.clone();
         machine
@@ -1454,7 +1546,9 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
                     1 => ClockId::Monotonic,
                     _ => return ERRNO_INVAL,
                 };
-                match ActiveSystem::new(caller.data_mut().machine.get()).clock_time_ns(clock) {
+                let time =
+                    ActiveSystem::new(&mut caller.data_mut().machine.get()).clock_time_ns(clock);
+                match time {
                     Ok(value) if write_u64(&mut caller, address, value) => ERRNO_SUCCESS,
                     Ok(_) => ERRNO_FAULT,
                     Err(error) => syscall_errno(&error),
@@ -1710,7 +1804,7 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
     let out_of_fuel = store.get_fuel().unwrap_or(0) == 0;
     let host = store.data_mut();
     for fd in std::mem::take(&mut host.open_files) {
-        let _ = ActiveSystem::new(host.machine.get()).close(fd);
+        let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
     }
     let status = match result {
         Ok(()) => 0,

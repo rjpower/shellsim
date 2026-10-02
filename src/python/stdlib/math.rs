@@ -16,7 +16,7 @@ use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyKind, PyOperator, PyResult, PyRuntime,
     PyValueCast, ValueDef,
 };
-use super::super::number::PyNumber;
+use super::super::number::{self, PyNumber};
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "math",
@@ -401,7 +401,7 @@ fn native_comb(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
         result = result * (&n - &selected + index) / index;
     }
-    runtime.new_integer(&result.to_string())
+    runtime.new_bigint(result)
 }
 
 /// Compute exact permutations `n! / (n - k)!` (`n!` when `k` is omitted or `None`), bounding work
@@ -440,7 +440,7 @@ fn native_perm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
         result *= &n - index;
     }
-    runtime.new_integer(&result.to_string())
+    runtime.new_bigint(result)
 }
 
 fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -481,10 +481,11 @@ fn native_factorial(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     runtime.reserve_memory(result_bound)?;
     let mut result = BigInt::from(1_u8);
     for factor in 2..=value {
-        runtime.charge_cpu(1)?;
+        // Each step multiplies the whole running product.
+        runtime.charge_cpu(result.bits().div_ceil(64).saturating_add(1))?;
         result *= factor;
     }
-    runtime.new_integer(&result.to_string())
+    runtime.new_bigint(result)
 }
 
 fn native_floor(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -502,8 +503,8 @@ fn native_round_direction(runtime: &mut dyn PyRuntime, args: CallArgs, floor: bo
     if let Some(result) = rounding_method(runtime, &args, method)? {
         return Ok(result);
     }
-    if let Some(integer) = runtime.integer_text(&args.positional()[0])? {
-        return runtime.new_integer(&integer);
+    if let Some(integer) = runtime.integer_bigint(&args.positional()[0])? {
+        return runtime.new_bigint(integer);
     }
     let value = real_argument(runtime, args.positional()[0])?;
     if value.is_nan() {
@@ -551,15 +552,13 @@ fn integer_fold(runtime: &mut dyn PyRuntime, args: CallArgs, lcm: bool) -> PyRes
             result = bigint_gcd(runtime, result, value)?;
         }
     }
-    runtime.new_integer(&result.to_string())
+    runtime.new_bigint(result)
 }
 
 fn integer_argument(runtime: &dyn PyRuntime, value: &Value, name: &str) -> PyResult<BigInt> {
     runtime
-        .integer_text(value)?
-        .ok_or_else(|| PyError::type_error(format!("{name}() only accepts integral values")))?
-        .parse::<BigInt>()
-        .map_err(|_| PyError::runtime_error("invalid internal integer representation"))
+        .integer_bigint(value)?
+        .ok_or_else(|| PyError::type_error(format!("{name}() only accepts integral values")))
 }
 
 fn bigint_gcd(
@@ -568,8 +567,11 @@ fn bigint_gcd(
     mut right: BigInt,
 ) -> PyResult<BigInt> {
     runtime.reserve_memory(bigint_bytes(&left)?.max(bigint_bytes(&right)?))?;
+    // Each Euclid step is one long division, and a step can shrink the operands by as little as
+    // one bit, so the total is charged step by step rather than estimated up front.
     while !right.is_zero() {
-        runtime.charge_cpu(1)?;
+        let (left_words, right_words) = (number::words(&left), number::words(&right));
+        runtime.charge_cpu(number::divide_work(left_words, right_words))?;
         let remainder = left % &right;
         left = right;
         right = remainder;

@@ -10,14 +10,33 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bytecode::CodeRef;
-use super::mapping::OrderedMap;
+use super::mapping::{OrderedMap, OrderedSet};
 use super::native::{PyArgumentSpec, PyArrayBuffer, PyArrayView};
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 use super::Value;
 
 pub(super) const MODELED_VALUE_BYTES: u64 = 24;
-pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 = MODELED_VALUE_BYTES * 3;
+/// A dict entry holds its key, value, and hash in a slot plus one hash-index entry.
+const MAPPING_ENTRY_VALUES: usize = 4;
+pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 =
+    MODELED_VALUE_BYTES * MAPPING_ENTRY_VALUES as u64;
+/// A set member holds its value and hash in a slot plus one hash-index entry.
+const SET_MEMBER_VALUES: usize = 3;
+pub(super) const MODELED_SET_MEMBER_BYTES: u64 = MODELED_VALUE_BYTES * SET_MEMBER_VALUES as u64;
+/// Building an object writes every byte it stores, so creating or replacing a payload also
+/// charges one CPU unit per this many modeled bytes. Copies such as `s += t` then cost in
+/// proportion to the bytes they move.
+pub(super) const BYTES_PER_CPU_UNIT: u64 = 64;
+
+/// Charge the CPU cost of writing `bytes` of new object storage.
+pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Result<(), String> {
+    if resources.charge_cpu(bytes / BYTES_PER_CPU_UNIT) {
+        Ok(())
+    } else {
+        Err("resource limit exceeded while executing Python".into())
+    }
+}
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
@@ -73,8 +92,15 @@ pub struct InstanceAttributeSlot {
 /// Attribute storage for one user-defined instance.
 #[derive(Clone, Debug)]
 pub enum InstanceAttributes {
-    Shaped { shape: ShapeId, values: Vec<Value> },
-    Dictionary(HashMap<SymbolId, Value>),
+    Shaped {
+        shape: ShapeId,
+        values: Vec<Value>,
+    },
+    /// Boxed so the common shaped representation sets the size of an instance. The map's
+    /// 48-byte header would otherwise widen every heap slot, which is the cost the
+    /// `box_collection` lint does not see.
+    #[allow(clippy::box_collection)]
+    Dictionary(Box<HashMap<SymbolId, Value>>),
 }
 
 impl Default for InstanceAttributes {
@@ -147,6 +173,77 @@ pub enum ProxyTarget {
     NativeModule(&'static super::native::ModuleDef),
 }
 
+/// A user-defined class. Boxed inside [`Object::Class`] because it is much larger than the
+/// common objects that share the arena slot size.
+#[derive(Clone, Debug)]
+pub struct ClassObject {
+    /// Semantic type identity used by instances of this class.
+    pub instance_type: TypeId,
+    pub name: String,
+    /// Every direct base in source order, native bases included: `__bases__`.
+    pub bases: Vec<Value>,
+    /// C3-linearized user-defined ancestors, excluding this class.
+    pub mro: Vec<ObjectId>,
+    /// The callable type object responsible for this class.
+    pub metaclass: Value,
+    pub layout: ClassLayout,
+    /// Closest native exception ancestor, when instances may be raised.
+    pub exception_base: Option<&'static str>,
+    pub attributes: HashMap<String, Value>,
+    pub is_dataclass: bool,
+    pub dataclass_fields: Vec<(String, Option<Value>)>,
+    pub enum_members: Vec<Value>,
+}
+
+/// A Python function. Boxed inside [`Object::Function`] to keep arena slots small.
+#[derive(Clone, Debug)]
+pub struct FunctionObject {
+    pub name: String,
+    pub code: CodeRef,
+    pub closure: Option<ScopeId>,
+    pub defaults: Vec<Value>,
+    /// Class captured when this function is installed by a class body.
+    pub defining_class: Option<ObjectId>,
+    /// Names assigned on the function object, its `__dict__`.
+    pub attributes: HashMap<String, Value>,
+}
+
+/// A suspended generator frame. Boxed inside [`Object::Generator`] to keep arena slots small.
+#[derive(Clone, Debug)]
+pub struct GeneratorObject {
+    pub name: String,
+    pub code: CodeRef,
+    pub scope: ScopeId,
+    pub instruction_pointer: usize,
+    pub handlers: Vec<(usize, usize)>,
+    pub exceptions: Vec<(String, Value)>,
+    pub stack: Vec<Value>,
+    pub exhausted: bool,
+    pub running: bool,
+    pub return_value: Value,
+}
+
+/// A regular-expression match. Boxed inside [`Object::Match`] to keep arena slots small.
+#[derive(Clone, Debug)]
+pub struct MatchObject {
+    pub text: String,
+    pub groups: Vec<Option<String>>,
+    pub group_names: Vec<Option<String>>,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// An `argparse.ArgumentParser`. Boxed inside [`Object::ArgumentParser`] to keep arena slots small.
+#[derive(Clone, Debug)]
+pub struct ArgumentParserObject {
+    pub prog: String,
+    pub description: Option<String>,
+    pub add_help: bool,
+    pub is_subcommand: bool,
+    pub arguments: Vec<PyArgumentSpec>,
+    pub subparsers: Option<super::native::PySubparsersSpec>,
+}
+
 #[derive(Clone, Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -173,8 +270,8 @@ pub enum Object {
         factory: Value,
         entries: OrderedMap,
     },
-    Set(Vec<Value>),
-    FrozenSet(Vec<Value>),
+    Set(OrderedSet),
+    FrozenSet(OrderedSet),
     BigInt(BigInt),
     /// Immutable builtin `complex`. Two doubles exceed the inline value payload, so complex
     /// numbers are arena objects like arbitrary-precision integers.
@@ -188,34 +285,8 @@ pub enum Object {
         stop: i64,
         step: i64,
     },
-    Function {
-        name: String,
-        code: CodeRef,
-        closure: Option<ScopeId>,
-        defaults: Vec<Value>,
-        /// Class captured when this function is installed by a class body.
-        defining_class: Option<ObjectId>,
-        /// Names assigned on the function object, its `__dict__`.
-        attributes: HashMap<String, Value>,
-    },
-    Class {
-        /// Semantic type identity used by instances of this class.
-        instance_type: TypeId,
-        name: String,
-        /// Every direct base in source order, native bases included: `__bases__`.
-        bases: Vec<Value>,
-        /// C3-linearized user-defined ancestors, excluding this class.
-        mro: Vec<ObjectId>,
-        /// The callable type object responsible for this class.
-        metaclass: Value,
-        layout: ClassLayout,
-        /// Closest native exception ancestor, when instances may be raised.
-        exception_base: Option<&'static str>,
-        attributes: HashMap<String, Value>,
-        is_dataclass: bool,
-        dataclass_fields: Vec<(String, Option<Value>)>,
-        enum_members: Vec<Value>,
-    },
+    Function(Box<FunctionObject>),
+    Class(Box<ClassObject>),
     Instance {
         class: ObjectId,
         payload: InstancePayload,
@@ -278,18 +349,7 @@ pub enum Object {
     },
     /// A suspended Python generator frame. The bytecode is immutable; the instruction pointer,
     /// exception state, and lexical scope are the complete resumable state.
-    Generator {
-        name: String,
-        code: CodeRef,
-        scope: ScopeId,
-        instruction_pointer: usize,
-        handlers: Vec<(usize, usize)>,
-        exceptions: Vec<(String, Value)>,
-        stack: Vec<Value>,
-        exhausted: bool,
-        running: bool,
-        return_value: Value,
-    },
+    Generator(Box<GeneratorObject>),
     Module {
         name: String,
         scope: ScopeId,
@@ -312,7 +372,7 @@ pub enum Object {
     /// An ndarray view. Byte strides and offset map indices into `ArrayStorage`.
     Array {
         storage: ObjectId,
-        view: PyArrayView,
+        view: Box<PyArrayView>,
         /// The array that owns the storage, for `ndarray.base`; `None` for owners.
         base: Option<ObjectId>,
     },
@@ -331,21 +391,8 @@ pub enum Object {
     },
     /// A bounded regular-expression match result.  Captures are stored as owned text rather than
     /// references into a host regex object, which keeps the arena self-contained.
-    Match {
-        text: String,
-        groups: Vec<Option<String>>,
-        group_names: Vec<Option<String>>,
-        start: usize,
-        end: usize,
-    },
-    ArgumentParser {
-        prog: String,
-        description: Option<String>,
-        add_help: bool,
-        is_subcommand: bool,
-        arguments: Vec<PyArgumentSpec>,
-        subparsers: Option<super::native::PySubparsersSpec>,
-    },
+    Match(Box<MatchObject>),
+    ArgumentParser(Box<ArgumentParserObject>),
     Namespace {
         values: Vec<(String, Value)>,
     },
@@ -456,6 +503,7 @@ impl Heap {
             modeled_size(&current.payload)?
         };
         let next_type = self.infer_type_id(&payload)?;
+        charge_construction(next_bytes, resources)?;
         if next_bytes > current_bytes {
             self.reserve_object_growth(id, next_bytes - current_bytes, resources)?;
         }
@@ -915,7 +963,7 @@ impl Heap {
         else {
             unreachable!("instance was validated before dictionary conversion")
         };
-        *attributes = InstanceAttributes::Dictionary(values);
+        *attributes = InstanceAttributes::Dictionary(Box::new(values));
         Ok(true)
     }
 
@@ -942,13 +990,20 @@ impl Heap {
     }
 
     /// Return whether enough allocation has occurred to justify tracing the arena.
+    ///
+    /// Collection is best effort. A program whose live heap fills the memory limit must run out
+    /// of memory rather than make the host trace that heap after every quantum, so collections
+    /// near the limit wait for new allocation proportional to the live heap. That keeps total
+    /// tracing work within a constant factor of guest allocation.
     pub fn should_collect(&self, memory_limit: u64, memory_remaining: u64) -> bool {
         // Scan at most about sixteen times while approaching a limit. Small test environments
         // still collect promptly, while ordinary 64-256 MiB runs avoid scanning the live graph
         // for every megabyte of temporary allocation.
         let allocation_interval = (memory_limit / 16).clamp(64 * 1024, 16 * 1024 * 1024);
+        let pressure_interval = (self.modeled_bytes / 8).max(64 * 1024);
         self.bytes_since_collection >= allocation_interval
-            || (self.bytes_since_collection != 0 && memory_remaining < allocation_interval)
+            || (memory_remaining < allocation_interval
+                && self.bytes_since_collection >= pressure_interval)
     }
 
     /// Transfer all live heap accounting to the caller when an interpreter is discarded.
@@ -994,7 +1049,7 @@ impl Heap {
         }
         let slots = u64::try_from(locals.len()).map_err(|_| "modeled scope size overflow")?;
         let dynamic = u64::try_from(values.len()).map_err(|_| "modeled scope size overflow")?;
-        let bytes = 32u64
+        let bytes = SCOPE_HEADER
             .checked_add(slots.checked_mul(16).ok_or("modeled scope size overflow")?)
             .and_then(|bytes| bytes.checked_add(dynamic.checked_mul(48)?))
             .ok_or("modeled scope size overflow")?;
@@ -1231,6 +1286,7 @@ impl Heap {
 
     pub fn allocate(&mut self, object: Object, resources: &mut Resources) -> Result<Value, String> {
         let bytes = modeled_size(&object)?;
+        charge_construction(bytes, resources)?;
         if !resources.reserve_memory(bytes) {
             return Err("memory limit exceeded".into());
         }
@@ -1275,18 +1331,19 @@ impl Heap {
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
                 BuiltinType::Function.id()
             }
-            Object::Class { metaclass, .. } => match metaclass.native_value() {
+            Object::Class(class_object) => match class_object.metaclass.native_value() {
                 Some(super::vm::NativeValue::BuiltinType(builtin)) => builtin.id(),
-                _ if metaclass.object_id().is_some() => {
-                    match self.get(metaclass.object_id().expect("checked above"))? {
-                        Object::Class { instance_type, .. } => *instance_type,
+                _ if class_object.metaclass.object_id().is_some() => {
+                    let metaclass = class_object.metaclass.object_id().expect("checked above");
+                    match self.get(metaclass)? {
+                        Object::Class(metaclass) => metaclass.instance_type,
                         _ => return Err("class metaclass is not a class".into()),
                     }
                 }
                 _ => return Err("class has an invalid metaclass".into()),
             },
             Object::Instance { class, .. } => match self.get(*class)? {
-                Object::Class { instance_type, .. } => *instance_type,
+                Object::Class(class_object) => class_object.instance_type,
                 _ => return Err("instance class is not a class".into()),
             },
             Object::Iterator { .. }
@@ -1430,6 +1487,12 @@ impl Heap {
         scope_roots: &[ScopeId],
         resources: &mut Resources,
     ) -> Result<u64, String> {
+        // Tracing and sweeping visit every arena slot, so charge that work like guest
+        // execution. A program that exhausts its CPU budget skips the collection.
+        let slots = self.objects.len().saturating_add(self.scopes.len());
+        if !resources.charge_cpu(u64::try_from(slots).unwrap_or(u64::MAX)) {
+            return Ok(0);
+        }
         let mut marked_objects = vec![false; self.objects.len()];
         let mut marked_scopes = vec![false; self.scopes.len()];
         let mut object_work = Vec::new();
@@ -1530,9 +1593,10 @@ fn trace_object(
     match &object.payload {
         Object::List(items)
         | Object::Tuple(items)
-        | Object::Set(items)
-        | Object::FrozenSet(items)
         | Object::ArrayStorage(PyArrayBuffer::Values(items)) => {
+            trace_values(items.iter().copied(), object_work)
+        }
+        Object::Set(items) | Object::FrozenSet(items) => {
             trace_values(items.iter().copied(), object_work)
         }
         Object::Dict(entries) => {
@@ -1546,27 +1610,29 @@ fn trace_object(
                 trace_values([*key, *value], object_work);
             }
         }
-        Object::Function {
-            closure,
-            defaults,
-            defining_class,
-            attributes,
-            ..
-        } => {
+        Object::Function(function_object) => {
+            let FunctionObject {
+                closure,
+                defaults,
+                defining_class,
+                attributes,
+                ..
+            } = &**function_object;
             trace_values(defaults.iter().copied(), object_work);
             scope_work.extend(*closure);
             object_work.extend(*defining_class);
             trace_values(attributes.values().copied(), object_work);
         }
-        Object::Class {
-            bases,
-            mro,
-            metaclass,
-            attributes,
-            dataclass_fields,
-            enum_members,
-            ..
-        } => {
+        Object::Class(class_object) => {
+            let ClassObject {
+                bases,
+                mro,
+                metaclass,
+                attributes,
+                dataclass_fields,
+                enum_members,
+                ..
+            } = &**class_object;
             trace_values(bases.iter().copied(), object_work);
             object_work.extend(mro.iter().copied());
             trace_value(*metaclass, object_work);
@@ -1622,13 +1688,14 @@ fn trace_object(
             trace_value(*callable, object_work);
             trace_value(*sentinel, object_work);
         }
-        Object::Generator {
-            scope,
-            exceptions,
-            stack,
-            return_value,
-            ..
-        } => {
+        Object::Generator(generator) => {
+            let GeneratorObject {
+                scope,
+                exceptions,
+                stack,
+                return_value,
+                ..
+            } = &**generator;
             scope_work.push(*scope);
             trace_values(exceptions.iter().map(|(_, value)| *value), object_work);
             trace_values(stack.iter().copied(), object_work);
@@ -1647,11 +1714,12 @@ fn trace_object(
             object_work.push(*storage);
             object_work.extend(*base);
         }
-        Object::ArgumentParser {
-            arguments,
-            subparsers,
-            ..
-        } => {
+        Object::ArgumentParser(parser_object) => {
+            let ArgumentParserObject {
+                arguments,
+                subparsers,
+                ..
+            } = &**parser_object;
             for argument in arguments {
                 trace_value(argument.default, object_work);
                 trace_values(argument.choices.iter().copied(), object_work);
@@ -1702,15 +1770,21 @@ fn trace_object(
     }
 }
 
+/// Fixed charge for one arena slot: the host size of the slot itself, so that many small objects
+/// cost the guest what they cost the host.
+const OBJECT_HEADER: u64 = std::mem::size_of::<Option<HeapObject>>() as u64;
+
+/// Fixed charge for one scope slot, before its locals and dynamic names.
+const SCOPE_HEADER: u64 = std::mem::size_of::<Option<Scope>>() as u64;
+
 fn modeled_size(object: &Object) -> Result<u64, String> {
-    const HEADER: u64 = 32;
-    const VALUE: u64 = 24;
-    // Text, bytes, and packed array elements are charged at their byte length rather than per
-    // value slot.
+    const VALUE: u64 = MODELED_VALUE_BYTES;
+    // Text, bytes, big-integer magnitudes, and packed array elements are charged at their byte
+    // length rather than per value slot.
     let packed = |length: usize| {
         u64::try_from(length)
             .ok()
-            .and_then(|bytes| bytes.checked_add(HEADER))
+            .and_then(|bytes| bytes.checked_add(OBJECT_HEADER))
             .ok_or_else(|| String::from("modeled object size overflow"))
     };
     let slots = match object {
@@ -1720,61 +1794,70 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .len()
             .checked_add(args.len())
             .ok_or("modeled object size overflow")?,
-        Object::List(values)
-        | Object::Tuple(values)
-        | Object::Set(values)
-        | Object::FrozenSet(values) => values.len(),
+        Object::List(values) | Object::Tuple(values) => values.len(),
+        Object::Set(values) | Object::FrozenSet(values) => values
+            .len()
+            .checked_mul(SET_MEMBER_VALUES)
+            .ok_or("modeled object size overflow")?,
         Object::Bare => 0,
         Object::Slice { .. } => 3,
-        Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
-            .map_err(|_| "modeled big integer size overflow")?,
+        Object::BigInt(value) => {
+            return packed(
+                usize::try_from(value.bits().div_ceil(8))
+                    .map_err(|_| "modeled big integer size overflow")?,
+            )
+        }
         // Sixteen bytes of payload rounded up to one modeled value slot.
         Object::Complex { .. } | Object::WideValue { .. } => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
-            .checked_mul(3)
+            .checked_mul(MAPPING_ENTRY_VALUES)
             .ok_or("modeled object size overflow")?,
         Object::DefaultDict { entries, .. } => entries
             .len()
-            .checked_mul(3)
+            .checked_mul(MAPPING_ENTRY_VALUES)
             .and_then(|slots| slots.checked_add(1))
             .ok_or("modeled object size overflow")?,
-        Object::Function {
-            name,
-            code,
-            defaults,
-            attributes,
-            ..
-        } => name
-            .len()
-            .checked_add(code.instructions.len())
-            .and_then(|size| size.checked_add(defaults.len()))
-            .and_then(|size| size.checked_add(attributes.len()))
-            .ok_or("modeled object size overflow")?,
-        Object::Class {
-            instance_type: _,
-            name,
-            bases,
-            mro,
-            metaclass: _,
-            layout: _,
-            exception_base,
-            attributes,
-            is_dataclass,
-            dataclass_fields,
-            enum_members,
-        } => name
-            .len()
-            .checked_add(bases.len())
-            .and_then(|size| size.checked_add(mro.len()))
-            .and_then(|size| size.checked_add(1))
-            .and_then(|size| size.checked_add(usize::from(exception_base.is_some())))
-            .and_then(|size| size.checked_add(attributes.len()))
-            .and_then(|size| size.checked_add(usize::from(*is_dataclass)))
-            .and_then(|size| size.checked_add(dataclass_fields.len()))
-            .and_then(|size| size.checked_add(enum_members.len()))
-            .ok_or("modeled object size overflow")?,
+        Object::Function(function_object) => {
+            let FunctionObject {
+                name,
+                code,
+                defaults,
+                attributes,
+                ..
+            } = &**function_object;
+            name.len()
+                .checked_add(code.instructions.len())
+                .and_then(|size| size.checked_add(defaults.len()))
+                .and_then(|size| size.checked_add(attributes.len()))
+                .ok_or("modeled object size overflow")?
+        }
+        Object::Class(class_object) => {
+            let ClassObject {
+                instance_type: _,
+                name,
+                bases,
+                mro,
+                metaclass: _,
+                layout: _,
+                exception_base,
+                attributes,
+                is_dataclass,
+                dataclass_fields,
+                enum_members,
+            } = &**class_object;
+            name.len()
+                .checked_add(bases.len())
+                .and_then(|size| size.checked_add(mro.len()))
+                .and_then(|size| size.checked_add(1))
+                .and_then(|size| size.checked_add(usize::from(exception_base.is_some())))
+                .and_then(|size| size.checked_add(attributes.len()))
+                .and_then(|size| size.checked_add(usize::from(*is_dataclass)))
+                .and_then(|size| size.checked_add(dataclass_fields.len()))
+                .and_then(|size| size.checked_add(enum_members.len()))
+                .ok_or("modeled object size overflow")?
+        }
         Object::Instance { .. } => 0,
         Object::EnumMember { name, .. } => name
             .len()
@@ -1789,20 +1872,22 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::CountIterator { .. } => 2,
         Object::CallableIterator { .. } => 3,
         Object::StreamIterator { .. } => 1,
-        Object::Generator {
-            name,
-            code,
-            handlers,
-            exceptions,
-            stack,
-            ..
-        } => name
-            .len()
-            .checked_add(code.instructions.len())
-            .and_then(|size| size.checked_add(handlers.len()))
-            .and_then(|size| size.checked_add(exceptions.len()))
-            .and_then(|size| size.checked_add(stack.len()))
-            .ok_or("modeled object size overflow")?,
+        Object::Generator(generator_object) => {
+            let GeneratorObject {
+                name,
+                code,
+                handlers,
+                exceptions,
+                stack,
+                ..
+            } = &**generator_object;
+            name.len()
+                .checked_add(code.instructions.len())
+                .and_then(|size| size.checked_add(handlers.len()))
+                .and_then(|size| size.checked_add(exceptions.len()))
+                .and_then(|size| size.checked_add(stack.len()))
+                .ok_or("modeled object size overflow")?
+        }
         Object::Module { name, .. } => name.len(),
         // The namespace it views is charged where that namespace actually lives (the scope or
         // the REPL/script global table), so the view itself is a fixed, minimal handle.
@@ -1816,46 +1901,50 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .and_then(|size| size.checked_add(3))
             .ok_or("modeled object size overflow")?,
         Object::Regex { pattern, .. } => pattern.len(),
-        Object::Match {
-            text,
-            groups,
-            group_names,
-            ..
-        } => text
-            .len()
-            .checked_add(
-                groups
-                    .iter()
-                    .map(|group| group.as_ref().map_or(0, String::len))
-                    .sum(),
-            )
-            .and_then(|size| {
-                size.checked_add(
-                    group_names
+        Object::Match(match_object) => {
+            let MatchObject {
+                text,
+                groups,
+                group_names,
+                ..
+            } = &**match_object;
+            text.len()
+                .checked_add(
+                    groups
                         .iter()
-                        .map(|name| name.as_ref().map_or(0, String::len))
+                        .map(|group| group.as_ref().map_or(0, String::len))
                         .sum(),
                 )
-            })
-            .ok_or("modeled object size overflow")?,
-        Object::ArgumentParser {
-            prog,
-            description,
-            arguments,
-            subparsers,
-            ..
-        } => prog
-            .len()
-            .checked_add(description.as_ref().map_or(0, String::len))
-            .and_then(|size| size.checked_add(arguments.len()))
-            .and_then(|size| {
-                size.checked_add(
-                    subparsers
-                        .as_ref()
-                        .map_or(0, |subparsers| subparsers.commands.len()),
-                )
-            })
-            .ok_or("modeled object size overflow")?,
+                .and_then(|size| {
+                    size.checked_add(
+                        group_names
+                            .iter()
+                            .map(|name| name.as_ref().map_or(0, String::len))
+                            .sum(),
+                    )
+                })
+                .ok_or("modeled object size overflow")?
+        }
+        Object::ArgumentParser(parser_object) => {
+            let ArgumentParserObject {
+                prog,
+                description,
+                arguments,
+                subparsers,
+                ..
+            } = &**parser_object;
+            prog.len()
+                .checked_add(description.as_ref().map_or(0, String::len))
+                .and_then(|size| size.checked_add(arguments.len()))
+                .and_then(|size| {
+                    size.checked_add(
+                        subparsers
+                            .as_ref()
+                            .map_or(0, |subparsers| subparsers.commands.len()),
+                    )
+                })
+                .ok_or("modeled object size overflow")?
+        }
         Object::Namespace { values } => values.len(),
         Object::RaisesContext { expected } => expected.len(),
         Object::Property { setter, .. } => 1 + usize::from(setter.is_some()),
@@ -1863,7 +1952,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::Super { .. } => 2,
     };
     let slots = u64::try_from(slots).map_err(|_| "modeled object size overflow")?;
-    HEADER
+    OBJECT_HEADER
         .checked_add(
             slots
                 .checked_mul(VALUE)
@@ -1883,7 +1972,7 @@ mod tests {
     fn allocate_instance(heap: &mut Heap, resources: &mut Resources) -> Value {
         let class = heap
             .allocate(
-                Object::Class {
+                Object::Class(Box::new(ClassObject {
                     instance_type: BuiltinType::Object.id(),
                     name: "Example".into(),
                     bases: Vec::new(),
@@ -1895,7 +1984,7 @@ mod tests {
                     is_dataclass: false,
                     dataclass_fields: Vec::new(),
                     enum_members: Vec::new(),
-                },
+                })),
                 resources,
             )
             .unwrap();
@@ -1922,10 +2011,22 @@ mod tests {
 
     #[test]
     fn text_and_byte_payloads_are_charged_per_byte() {
-        assert_eq!(modeled_size(&Object::Bytes(vec![0; 1000])), Ok(1032));
-        assert_eq!(modeled_size(&Object::ByteArray(vec![0; 10])), Ok(42));
-        assert_eq!(modeled_size(&Object::String("é".repeat(5).into())), Ok(42));
-        assert_eq!(modeled_size(&Object::List(vec![Value::None; 10])), Ok(272));
+        assert_eq!(
+            modeled_size(&Object::Bytes(vec![0; 1000])),
+            Ok(OBJECT_HEADER + 1000)
+        );
+        assert_eq!(
+            modeled_size(&Object::ByteArray(vec![0; 10])),
+            Ok(OBJECT_HEADER + 10)
+        );
+        assert_eq!(
+            modeled_size(&Object::String("é".repeat(5).into())),
+            Ok(OBJECT_HEADER + 10)
+        );
+        assert_eq!(
+            modeled_size(&Object::List(vec![Value::None; 10])),
+            Ok(OBJECT_HEADER + 10 * MODELED_VALUE_BYTES)
+        );
     }
 
     #[test]
@@ -1952,6 +2053,49 @@ mod tests {
         assert!(released > 0);
         assert!(heap.get(first_id).is_err());
         assert_eq!(resources.outcome(0, 0, 0).usage.memory_current, 0);
+    }
+
+    #[test]
+    fn collection_near_the_limit_waits_for_allocation_proportional_to_the_live_heap() {
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        let heap = Heap {
+            modeled_bytes: 60 * 1024 * 1024,
+            bytes_since_collection: 1024 * 1024,
+            ..Heap::default()
+        };
+        // Close to the limit, a megabyte of new allocation does not justify tracing 60 MiB.
+        assert!(!heap.should_collect(LIMIT, 1024 * 1024));
+        let heap = Heap {
+            bytes_since_collection: 8 * 1024 * 1024,
+            ..heap
+        };
+        assert!(heap.should_collect(LIMIT, 1024 * 1024));
+        // A small heap under pressure still collects promptly.
+        let heap = Heap {
+            modeled_bytes: 256 * 1024,
+            bytes_since_collection: 64 * 1024,
+            ..Heap::default()
+        };
+        assert!(heap.should_collect(LIMIT, 1024 * 1024));
+    }
+
+    #[test]
+    fn collection_charges_cpu_for_every_arena_slot() {
+        let mut heap = Heap::default();
+        let mut allocation = Resources::new(Limits::unlimited());
+        for _ in 0..3 {
+            heap.allocate(Object::Bare, &mut allocation).unwrap();
+        }
+        let mut resources = Resources::new(Limits {
+            cpu: 2,
+            ..Limits::unlimited()
+        });
+        assert_eq!(heap.collect(&[], &[], &mut resources).unwrap(), 0);
+        assert_eq!(
+            resources.stop_reason(),
+            Some(crate::resources::StopReason::CpuExhausted)
+        );
+        assert!(heap.objects.iter().all(Option::is_some));
     }
 
     #[test]
@@ -2141,5 +2285,14 @@ mod tests {
                 ..
             } if values.is_empty()
         ));
+    }
+
+    /// Every heap slot is as large as the largest `Object` variant and every object is charged
+    /// `OBJECT_HEADER` for it, so variants with big inline payloads are boxed to keep small
+    /// objects cheap for guests.
+    #[test]
+    fn heap_slots_stay_small() {
+        assert!(std::mem::size_of::<Object>() <= 64);
+        assert!(std::mem::size_of::<HeapObject>() <= 80);
     }
 }

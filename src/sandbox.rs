@@ -98,6 +98,9 @@ mod imp {
         Ok(())
     }
 
+    // `pre_exec` is unsafe by definition. This host-side child is the Git used to import a
+    // `--root` repository; no simulated program can reach it.
+    #[allow(unsafe_code)]
     pub fn constrain_child_to_read_only(
         command: &mut Command,
     ) -> Result<(), Box<dyn std::error::Error>> {

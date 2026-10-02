@@ -205,6 +205,10 @@ fn cmd_uniq(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         let text = String::from_utf8_lossy(line);
         let mut offset = 0;
         for _ in 0..skip_fields {
+            // A line has at most one field per byte, so a larger count is all of it.
+            if offset == text.len() {
+                break;
+            }
             let rest = &text[offset..];
             let blanks = rest.len() - rest.trim_start_matches(char::is_whitespace).len();
             offset += blanks;

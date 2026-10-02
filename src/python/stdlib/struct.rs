@@ -253,8 +253,8 @@ fn integer_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<i128> {
         return Ok(i128::from(value));
     }
     runtime
-        .integer_text(&value)?
-        .and_then(|value| value.parse::<i128>().ok())
+        .integer_bigint(&value)?
+        .and_then(|value| num_traits::ToPrimitive::to_i128(&value))
         .ok_or_else(|| PyError::type_error("required argument is not an integer"))
 }
 
@@ -345,7 +345,7 @@ fn unpack_value(
                 Endian::Little => u64::from_le_bytes(bytes),
                 Endian::Big => u64::from_be_bytes(bytes),
             };
-            return runtime.new_integer(&value.to_string());
+            return runtime.new_bigint(value.into());
         }
         b'f' => {
             let bytes: [u8; 4] = input.try_into().expect("format size selected input width");

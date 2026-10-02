@@ -14,16 +14,57 @@ fn run(context: &mut crate::program::ProcessContext<'_>, io: &mut Io) -> i32 {
     if args.is_empty() {
         return 0;
     }
-    w(io.out, &format_args(&args[0], &args[1..]));
-    0
+    let mut reserved = 0_u64;
+    let system = &mut *context.system;
+    let formatted = format_args(&args[0], &args[1..], &mut |bytes| {
+        if system.reserve_memory(bytes) {
+            reserved = reserved.saturating_add(bytes);
+            true
+        } else {
+            false
+        }
+    });
+    let status = match formatted {
+        Some(text) => {
+            w(io.out, &text);
+            0
+        }
+        None => context.system.stop_status(),
+    };
+    context.system.release_memory(reserved);
+    status
 }
 
-fn format_args(format: &str, args: &[String]) -> String {
+/// A parsed `%` conversion: flags, field width, precision, and conversion character.
+struct Spec {
+    left: bool,
+    zero: bool,
+    positive_sign: &'static str,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conversion: char,
+}
+
+/// Format `args` through `format`, reusing the format until the arguments run out.
+///
+/// `reserve` is asked for each conversion's output size before that output is built, since a
+/// width or precision can make one conversion far larger than its inputs. Returns `None` when a
+/// reservation fails.
+fn format_args(
+    format: &str,
+    args: &[String],
+    reserve: &mut dyn FnMut(u64) -> bool,
+) -> Option<String> {
     let format = unescape(format);
     let mut out = String::new();
     let mut argument = 0;
     let chars: Vec<char> = format.chars().collect();
     let mut i = 0;
+    let next_argument = |argument: &mut usize| {
+        let value = args.get(*argument).cloned().unwrap_or_default();
+        *argument += 1;
+        value
+    };
     'formats: loop {
         let argument_at_start = argument;
         while i < chars.len() {
@@ -37,26 +78,57 @@ fn format_args(format: &str, args: &[String]) -> String {
                 i += 2;
                 continue;
             }
-            let spec_start = i;
             i += 1;
+            let mut spec = Spec {
+                left: false,
+                zero: false,
+                positive_sign: "",
+                width: None,
+                precision: None,
+                conversion: 's',
+            };
             while i < chars.len() && "-+ 0#".contains(chars[i]) {
-                i += 1;
-            }
-            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '*') {
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == '.' {
-                i += 1;
-                while i < chars.len() && chars[i].is_ascii_digit() {
-                    i += 1;
+                match chars[i] {
+                    '-' => spec.left = true,
+                    '0' => spec.zero = true,
+                    '+' => spec.positive_sign = "+",
+                    ' ' if spec.positive_sign.is_empty() => spec.positive_sign = " ",
+                    _ => {}
                 }
+                i += 1;
             }
-            let conv = chars.get(i).copied().unwrap_or('s');
-            let spec: String = chars[spec_start..=i.min(chars.len() - 1)].iter().collect();
+            // `*` takes the width from the next argument; a negative width left-justifies.
+            if chars.get(i) == Some(&'*') {
+                i += 1;
+                let width = next_argument(&mut argument)
+                    .trim()
+                    .parse::<i64>()
+                    .unwrap_or(0);
+                spec.left |= width < 0;
+                spec.width = Some(width.unsigned_abs() as usize);
+            } else {
+                spec.width = digits(&chars, &mut i);
+            }
+            if chars.get(i) == Some(&'.') {
+                i += 1;
+                spec.precision = if chars.get(i) == Some(&'*') {
+                    i += 1;
+                    // A negative `*` precision is treated as omitted.
+                    usize::try_from(
+                        next_argument(&mut argument)
+                            .trim()
+                            .parse::<i64>()
+                            .unwrap_or(0),
+                    )
+                    .ok()
+                } else {
+                    Some(digits(&chars, &mut i).unwrap_or(0))
+                };
+            }
+            spec.conversion = chars.get(i).copied().unwrap_or('s');
             i += 1;
-            let arg = args.get(argument).cloned().unwrap_or_default();
-            argument += 1;
-            let (rendered, stop) = apply_conversion(&spec, conv, &arg);
+            let arg = next_argument(&mut argument);
+            let (rendered, stop) = apply_conversion(&spec, &arg, reserve)?;
             out.push_str(&rendered);
             if stop {
                 break 'formats;
@@ -67,33 +139,34 @@ fn format_args(format: &str, args: &[String]) -> String {
         }
         i = 0;
     }
-    out
+    Some(out)
 }
 
-fn apply_conversion(spec: &str, conversion: char, arg: &str) -> (String, bool) {
-    let options = spec.trim_start_matches('%');
-    let width = options
-        .trim_start_matches(['-', '+', ' ', '0', '#'])
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse::<usize>()
-        .ok();
-    let left = spec.contains('-');
-    let zero = spec.starts_with("%0") || spec.starts_with("%-0");
-    let positive_sign = if spec.contains('+') {
-        "+"
-    } else if spec.contains(' ') {
-        " "
-    } else {
-        ""
-    };
+/// Parse a run of decimal digits at `chars[*i]`, saturating rather than overflowing.
+fn digits(chars: &[char], i: &mut usize) -> Option<usize> {
+    let start = *i;
+    let mut value = 0_usize;
+    while let Some(digit) = chars.get(*i).and_then(|c| c.to_digit(10)) {
+        value = value.saturating_mul(10).saturating_add(digit as usize);
+        *i += 1;
+    }
+    (*i > start).then_some(value)
+}
+
+/// Upper bound on the digits before the point of a formatted `f64`.
+const MAX_F64_INTEGER_DIGITS: u64 = 310;
+
+fn apply_conversion(
+    spec: &Spec,
+    arg: &str,
+    reserve: &mut dyn FnMut(u64) -> bool,
+) -> Option<(String, bool)> {
     let mut stop = false;
-    let body = match conversion {
+    let body = match spec.conversion {
         'd' | 'i' => {
             let value = arg.trim().parse::<i64>().unwrap_or(0);
             if value >= 0 {
-                format!("{positive_sign}{value}")
+                format!("{}{value}", spec.positive_sign)
             } else {
                 value.to_string()
             }
@@ -102,10 +175,14 @@ fn apply_conversion(spec: &str, conversion: char, arg: &str) -> (String, bool) {
         'X' => format!("{:X}", arg.trim().parse::<i64>().unwrap_or(0)),
         'o' => format!("{:o}", arg.trim().parse::<i64>().unwrap_or(0)),
         'f' | 'F' => {
-            let precision = precision(spec).unwrap_or(6);
+            let precision = spec.precision.unwrap_or(6);
+            if !reserve((precision as u64).saturating_add(MAX_F64_INTEGER_DIGITS)) {
+                return None;
+            }
             format!("{:.*}", precision, arg.trim().parse::<f64>().unwrap_or(0.0))
         }
-        's' => precision(spec)
+        's' => spec
+            .precision
             .map(|n| arg.chars().take(n).collect())
             .unwrap_or_else(|| arg.to_string()),
         'c' => arg
@@ -120,10 +197,14 @@ fn apply_conversion(spec: &str, conversion: char, arg: &str) -> (String, bool) {
         }
         _ => arg.to_string(),
     };
-    let rendered = match width.filter(|width| body.len() < *width) {
+    let rendered = match spec.width.filter(|width| body.len() < *width) {
         Some(width) => {
-            let pad = if zero && !left { "0" } else { " " }.repeat(width - body.len());
-            if left {
+            if !reserve(width as u64) {
+                return None;
+            }
+            let zero = spec.zero && !spec.left;
+            let pad = if zero { "0" } else { " " }.repeat(width - body.len());
+            if spec.left {
                 format!("{body}{pad}")
             } else if zero
                 && (body.starts_with('-') || body.starts_with('+') || body.starts_with(' '))
@@ -135,7 +216,7 @@ fn apply_conversion(spec: &str, conversion: char, arg: &str) -> (String, bool) {
         }
         None => body,
     };
-    (rendered, stop)
+    Some((rendered, stop))
 }
 
 fn unescape_argument(argument: &str) -> (String, bool) {
@@ -143,10 +224,4 @@ fn unescape_argument(argument: &str) -> (String, bool) {
         return (unescape(argument), false);
     };
     (unescape(&argument[..index]), true)
-}
-
-fn precision(spec: &str) -> Option<usize> {
-    spec.split('.')
-        .nth(1)
-        .and_then(|p| p.trim_end_matches(|c: char| c.is_alphabetic()).parse().ok())
 }
