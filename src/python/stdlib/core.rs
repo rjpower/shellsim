@@ -7,7 +7,7 @@
 use std::cmp::Ordering;
 
 use num_bigint::{BigInt, Sign};
-use num_traits::{Signed, Zero};
+use num_traits::{Signed, ToPrimitive, Zero};
 
 use super::super::heap::DictViewKind;
 use super::super::native::PyValue as Value;
@@ -2073,6 +2073,9 @@ fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
         bytes = bytes
             .checked_add(value.len())
             .ok_or_else(|| PyError::resource_error("joined string is too large"))?;
+        // Each part is a host copy that lives until the join finishes, so repeating one large
+        // item must exhaust the budget as the copies accumulate.
+        runtime.reserve_memory(value.len())?;
         parts.push(value);
     }
     bytes = bytes
@@ -2457,10 +2460,13 @@ fn percent_integer(
     value: &PyValue,
     conversion: char,
 ) -> PyResult<BigInt> {
-    if let Some(text) = runtime.integer_text(value)? {
-        return text
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer"));
+    if let Some(integer) = runtime.integer_bigint(value)? {
+        if matches!(conversion, 'd' | 'i' | 'u')
+            && super::super::number::exceeds_str_digits(&integer)
+        {
+            return Err(super::super::number::int_str_digits_error());
+        }
+        return Ok(integer);
     }
     let actual = runtime.type_name(value)?;
     if !matches!(conversion, 'd' | 'i' | 'u') {
@@ -2485,10 +2491,9 @@ fn percent_integer(
 
 /// The character `%c` formats: an int code point or a one-character string.
 fn percent_character(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<String> {
-    if let Some(text) = runtime.integer_text(value)? {
-        return text
-            .parse::<u32>()
-            .ok()
+    if let Some(integer) = runtime.integer_bigint(value)? {
+        return integer
+            .to_u32()
             .and_then(char::from_u32)
             .map(String::from)
             .ok_or_else(|| PyError::overflow_error("%c arg not in range(0x110000)"));
@@ -3131,14 +3136,13 @@ fn dict_popitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     args.expect_positional("dict.popitem", 0, 0)?;
     args.reject_keywords("dict.popitem")?;
     let dict = receiver.cast::<PyDict>(runtime)?;
-    let mut entries = dict.items(runtime)?;
-    let Some((key, value)) = entries.pop() else {
+    let Some(key) = runtime.dict_last_key(dict)? else {
         let message = runtime.new_string("popitem(): dictionary is empty".into())?;
         return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
-    // Committing the shorter snapshot rebuilds the key index in time linear in the size.
-    runtime.charge_cpu(u64::try_from(entries.len()).unwrap_or(u64::MAX))?;
-    runtime.replace_dict_items(dict, entries)?;
+    let Some(value) = runtime.dict_remove(dict, &key)? else {
+        return Err(runtime.exception_with_args("KeyError", vec![key]));
+    };
     runtime.new_tuple(vec![key, value])
 }
 
@@ -3409,13 +3413,10 @@ fn set_pop(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> Py
     args.expect_positional("set.pop", 0, 0)?;
     args.reject_keywords("set.pop")?;
     let set = mutable_set(runtime, receiver, "pop")?;
-    let members = set.items(runtime)?;
-    let Some(&value) = members.first() else {
+    let Some(value) = runtime.set_first(set)? else {
         let message = runtime.new_string("pop from an empty set".into())?;
         return Err(runtime.exception_with_args("KeyError", vec![message]));
     };
-    // Removing the first member shifts the rest of the member vector.
-    runtime.charge_cpu(u64::try_from(members.len()).unwrap_or(u64::MAX))?;
     runtime.set_remove(set, &value)?;
     Ok(value)
 }
@@ -3505,8 +3506,9 @@ fn set_issubset(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     args.reject_keywords("set.issubset")?;
     let members = receiver.cast::<PySet>(runtime)?.items(runtime)?;
     let operand = collect_values(runtime, args.positional()[0])?;
+    let operand = runtime.new_frozen_set(operand)?;
     for member in &members {
-        if !set_contains(runtime, &operand, member)? {
+        if !indexed_contains(runtime, operand, member)? {
             return Ok(Value::Bool(false));
         }
     }
@@ -3535,11 +3537,10 @@ fn set_all_items(
 ) -> PyResult {
     args.expect_positional(name, 1, 1)?;
     args.reject_keywords(name)?;
-    let members = receiver.cast::<PySet>(runtime)?.items(runtime)?;
+    let members = Value::Object(receiver.cast::<PySet>(runtime)?.object_id());
     let iterator = runtime.iterator(args.positional()[0])?;
     while let Some(item) = runtime.iterator_next(iterator)? {
-        runtime.charge_cpu(1)?;
-        if set_contains(runtime, &members, &item)? != expected {
+        if indexed_contains(runtime, members, &item)? != expected {
             return Ok(Value::Bool(false));
         }
     }
@@ -3559,9 +3560,10 @@ fn filter_set_members(
 ) -> PyResult<Vec<PyValue>> {
     for operand in operands {
         let operand = collect_values(runtime, *operand)?;
+        let operand = runtime.new_frozen_set(operand)?;
         let mut kept = Vec::new();
         for member in members {
-            if set_contains(runtime, &operand, &member)? == keep_present {
+            if indexed_contains(runtime, operand, &member)? == keep_present {
                 runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
                 kept.push(member);
             }
@@ -3579,17 +3581,19 @@ fn symmetric_difference_members(
     operand: PyValue,
 ) -> PyResult<Vec<PyValue>> {
     let operand = collect_values(runtime, operand)?;
+    let operand_index = runtime.new_frozen_set(operand.clone())?;
+    let member_index = runtime.new_frozen_set(members.clone())?;
+    // Operand items already added, so a repeated operand item is kept once.
+    let added = runtime.new_set(Vec::new())?.cast::<PySet>(runtime)?;
     let mut result = Vec::new();
     for member in &members {
-        if !set_contains(runtime, &operand, member)? {
+        if !indexed_contains(runtime, operand_index, member)? {
             runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
             result.push(*member);
         }
     }
     for item in operand {
-        // Receiver-only members never equal an operand item, so searching `result` only finds
-        // an earlier duplicate within the operand.
-        if !set_contains(runtime, &members, &item)? && !set_contains(runtime, &result, &item)? {
+        if !indexed_contains(runtime, member_index, &item)? && runtime.set_insert(added, item)? {
             runtime.reserve_memory(std::mem::size_of::<PyValue>())?;
             result.push(item);
         }
@@ -3610,28 +3614,21 @@ fn set_union(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
     args.reject_keywords("set.union")?;
     let receiver = receiver.cast::<PySet>(runtime)?;
     let frozen = runtime.set_is_frozen(receiver)?;
-    let mut values = receiver.items(runtime)?;
+    let members = receiver.items(runtime)?;
+    let union = runtime.new_set(members)?;
+    let union_set = union.cast::<PySet>(runtime)?;
     for source in args.positional() {
         let iterator = runtime.iterator(*source)?;
         while let Some(value) = runtime.iterator_next(iterator)? {
-            let mut present = false;
-            for candidate in &values {
-                runtime.charge_cpu(1)?;
-                if runtime.equals(candidate, &value)? {
-                    present = true;
-                    break;
-                }
-            }
-            if !present {
-                runtime.reserve_memory(64)?;
-                values.push(value);
-            }
+            runtime.charge_cpu(1)?;
+            runtime.set_insert(union_set, value)?;
         }
     }
     if frozen {
-        runtime.new_frozen_set(values)
+        let members = union_set.items(runtime)?;
+        runtime.new_frozen_set(members)
     } else {
-        runtime.new_set(values)
+        Ok(union)
     }
 }
 
@@ -3771,16 +3768,18 @@ fn set_binary(
     right: PyValue,
     operation: SetBinaryOperation,
 ) -> PyResult<Option<PyValue>> {
-    let left = left.cast::<PySet>(runtime)?;
-    let frozen = runtime.set_is_frozen(left)?;
-    let left = left.items(runtime)?;
-    let Ok(right) = right.cast::<PySet>(runtime) else {
+    let left_set = left.cast::<PySet>(runtime)?;
+    let frozen = runtime.set_is_frozen(left_set)?;
+    let left_members = left_set.items(runtime)?;
+    let Ok(right_set) = right.cast::<PySet>(runtime) else {
         return Ok(None);
     };
-    let right = right.items(runtime)?;
+    let right_members = right_set.items(runtime)?;
+    let left = Value::Object(left_set.object_id());
+    let right = Value::Object(right_set.object_id());
     let mut result = Vec::new();
-    for value in &left {
-        let present = set_contains(runtime, &right, value)?;
+    for value in &left_members {
+        let present = indexed_contains(runtime, right, value)?;
         if matches!(operation, SetBinaryOperation::Union)
             || present == matches!(operation, SetBinaryOperation::Intersection)
         {
@@ -3792,8 +3791,8 @@ fn set_binary(
         operation,
         SetBinaryOperation::Union | SetBinaryOperation::SymmetricDifference
     ) {
-        for value in &right {
-            if !set_contains(runtime, &left, value)? {
+        for value in &right_members {
+            if !indexed_contains(runtime, left, value)? {
                 runtime.reserve_memory(64)?;
                 result.push(*value);
             }
@@ -3806,18 +3805,11 @@ fn set_binary(
     }
 }
 
-fn set_contains(
-    runtime: &mut dyn PyRuntime,
-    values: &[PyValue],
-    expected: &PyValue,
-) -> PyResult<bool> {
-    for candidate in values {
-        runtime.charge_cpu(1)?;
-        if runtime.equals(expected, candidate)? {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+/// Membership of `value` in the builtin set or frozenset `set`, through its hash index rather
+/// than any `__contains__` override.
+fn indexed_contains(runtime: &mut dyn PyRuntime, set: PyValue, value: &PyValue) -> PyResult<bool> {
+    runtime.charge_cpu(1)?;
+    runtime.builtin_contains(set, *value)
 }
 
 fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
@@ -4007,12 +3999,7 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     }
     match value.cast::<PyNumber>(runtime)? {
         PyNumber::Int(value) => round_integer(runtime, BigInt::from(value), digits),
-        PyNumber::BigInt(value) => {
-            let value = value
-                .parse::<BigInt>()
-                .expect("PyNumber bigint originates from a decimal integer");
-            round_integer(runtime, value, digits)
-        }
+        PyNumber::BigInt(value) => round_integer(runtime, value, digits),
         PyNumber::Float(value) => round_float(runtime, value, digits),
     }
 }
@@ -4029,13 +4016,13 @@ fn integer_argument(
     value: &PyValue,
     message: &str,
 ) -> PyResult<IntegerArgument> {
-    let text = runtime
-        .integer_text(value)?
+    let integer = runtime
+        .integer_bigint(value)?
         .ok_or_else(|| PyError::type_error(message))?;
-    Ok(match text.parse::<i64>() {
-        Ok(value) => IntegerArgument::Finite(value),
-        Err(_) if text.starts_with('-') => IntegerArgument::TooNegative,
-        Err(_) => IntegerArgument::TooPositive,
+    Ok(match integer.to_i64() {
+        Some(value) => IntegerArgument::Finite(value),
+        None if integer.is_negative() => IntegerArgument::TooNegative,
+        None => IntegerArgument::TooPositive,
     })
 }
 
@@ -4051,7 +4038,9 @@ fn round_integer(
         Some(IntegerArgument::TooNegative) => return runtime.new_integer("0"),
         Some(IntegerArgument::Finite(value)) => value.unsigned_abs(),
     };
-    let decimal_digits = value.abs().to_string().len() as u64;
+    // Rounding at or beyond the leading digit is still exact below, so an upper estimate of the
+    // digit count only skips work.
+    let decimal_digits = super::super::number::decimal_digits(&value) as u64;
     if negative_digits > decimal_digits {
         return runtime.new_integer("0");
     }
@@ -4067,7 +4056,7 @@ fn round_integer(
     {
         quotient += if value.sign() == Sign::Minus { -1 } else { 1 };
     }
-    runtime.new_integer(&(quotient * divisor).to_string())
+    runtime.new_bigint(quotient * divisor)
 }
 
 fn round_float(
@@ -4878,19 +4867,9 @@ pub(crate) fn slot_dict_delete_item(
     key: PyValue,
 ) -> PyResult<Option<PyValue>> {
     let dict = owner.cast::<PyDict>(runtime)?;
-    let mut items = runtime.dict_items(dict)?;
-    let mut found = None;
-    for (index, (candidate, _)) in items.iter().enumerate() {
-        if runtime.equals(candidate, &key)? {
-            found = Some(index);
-            break;
-        }
-    }
-    let Some(index) = found else {
+    if runtime.dict_remove(dict, &key)?.is_none() {
         return Err(runtime.exception_with_args("KeyError", vec![key]));
-    };
-    items.remove(index);
-    runtime.replace_dict_items(dict, items)?;
+    }
     Ok(Some(PyValue::None))
 }
 

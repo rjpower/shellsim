@@ -379,6 +379,9 @@ fn completed_python_processes_release_owned_memory() {
         memory: 256 * 1024,
         ..Limits::unlimited()
     });
+    // The first actions create shell variables such as `PIPESTATUS`, which stay charged as
+    // retained shell state; each Python process must release everything it owned.
+    let mut retained = Vec::new();
     for _ in 0..20 {
         let (outcome, stdout, stderr) =
             environment.run_script_capture("python3.14 -c 'print(\"x\" * 4096)' >/dev/null");
@@ -389,8 +392,13 @@ fn completed_python_processes_release_owned_memory() {
             String::from_utf8_lossy(&stderr)
         );
         assert!(stdout.is_empty());
-        assert_eq!(outcome.usage.memory_current, 0);
+        retained.push(outcome.usage.memory_current);
     }
+    assert!(retained[0] < 1024, "{retained:?}");
+    assert!(
+        retained[2..].iter().all(|bytes| *bytes == retained[2]),
+        "{retained:?}"
+    );
 }
 
 #[test]
@@ -648,15 +656,13 @@ fn numpy_byte_copies_reserve_memory_before_copying() {
 
 #[test]
 fn set_algebra_consumes_cpu_per_membership_test() {
-    // Building the 200-member set costs about half this budget. Each operation below compares
-    // all 200 members with 200 operand items and must stop at the limit.
+    // Membership uses the hash index, so 200 members against 200 operand items fit the
+    // budget, while 200,000 operand items are each charged and stop at the limit.
     let limits = Limits {
-        cpu: 40_000,
+        cpu: 200_000,
         ..Limits::unlimited()
     };
     let setup = "members = set(range(200))\n";
-    let (status, stdout, _, _) = run_with_limits(&format!("{setup}print('built')"), limits);
-    assert_eq!((status, stdout), (0, b"built\n".to_vec()));
     for operation in [
         "members.intersection(range(200, 400))",
         "members.difference(range(200, 400))",
@@ -664,12 +670,21 @@ fn set_algebra_consumes_cpu_per_membership_test() {
         "members.difference_update(range(200, 400))",
         "members.isdisjoint(range(200, 400))",
     ] {
-        let (status, stdout, stderr, usage) =
+        let (status, stdout, stderr, _) =
             run_with_limits(&format!("{setup}{operation}\nprint('done')"), limits);
-        assert_eq!(status, 137, "{operation}");
-        assert_eq!(usage.cpu_used, 40_000, "{operation}");
-        assert!(stdout.is_empty(), "{operation}");
-        assert!(stderr.is_empty(), "{operation}");
+        assert_eq!(
+            (status, stdout),
+            (0, b"done\n".to_vec()),
+            "{operation}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let large = operation.replace("range(200, 400)", "range(200, 200_200)");
+        let (status, stdout, stderr, usage) =
+            run_with_limits(&format!("{setup}{large}\nprint('done')"), limits);
+        assert_eq!(status, 137, "{large}");
+        assert_eq!(usage.cpu_used, 200_000, "{large}");
+        assert!(stdout.is_empty(), "{large}");
+        assert!(stderr.is_empty(), "{large}");
     }
 }
 
@@ -749,4 +764,43 @@ fn rejection_sampling_uses_modeled_cpu_fuel() {
     assert_eq!(usage.cpu_used, 100_000);
     assert_eq!(stdout, b"ready\n");
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn big_integer_work_is_charged_by_operand_words() {
+    // `1 << 4_000_000` has 62,501 words; squaring it is charged about n * sqrt(n), and long
+    // division by a half-size divisor about the product of the word counts.
+    let limits = Limits {
+        cpu: 50_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "x = 1 << 4_000_000\ny = x * x\nprint(y.bit_length())",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"8000001\n");
+    assert!(usage.cpu_used > 15_000_000, "{usage:?}");
+
+    let (status, stdout, _, usage) = run_with_limits(
+        "x = 1 << 4_000_000\ny = x // ((1 << 2_000_000) + 1)\nprint('done')",
+        limits,
+    );
+    assert_eq!(status, 137);
+    assert_eq!(usage.cpu_used, 50_000_000);
+    assert!(stdout.is_empty());
+}
+
+#[test]
+fn dict_and_set_deletion_cost_is_constant_per_member() {
+    let limits = Limits {
+        cpu: 5_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "d = dict.fromkeys(range(100_000))\nfor key in range(100_000):\n    del d[key]\ns = set(range(100_000))\nwhile s:\n    s.pop()\nprint(len(d), len(s))",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"0 0\n");
 }

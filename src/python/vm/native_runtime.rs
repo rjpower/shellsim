@@ -593,11 +593,11 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::resource_error)
     }
 
-    fn integer_text(&self, value: &Value) -> PyResult<Option<String>> {
+    fn integer_bigint(&self, value: &Value) -> PyResult<Option<BigInt>> {
         Ok(match super::number::view(&self.state.heap, value) {
-            Some(super::number::NumberRef::Int(value)) => Some(value.to_string()),
-            Some(super::number::NumberRef::BigInt(value)) => Some(value.to_string()),
-            Some(super::number::NumberRef::UInt(value)) => Some(value.to_string()),
+            Some(super::number::NumberRef::Int(value)) => Some(value.into()),
+            Some(super::number::NumberRef::BigInt(value)) => Some(value.clone()),
+            Some(super::number::NumberRef::UInt(value)) => Some(value.into()),
             Some(super::number::NumberRef::Float(_) | super::number::NumberRef::Complex(..))
             | None => None,
         })
@@ -1033,6 +1033,22 @@ impl PyRuntime for Vm<'_> {
         }
     }
 
+    fn dict_last_key(&mut self, dict: PyDict) -> PyResult<Option<Value>> {
+        let id = dict.object_id();
+        if let Some(target) = self.namespace_view(id)? {
+            let items = self
+                .namespace_items(target)
+                .map_err(|message| self.raised_or_runtime_error(message))?;
+            return Ok(items.last().map(|(key, _)| *key));
+        }
+        match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::Dict(items) | Object::DefaultDict { entries: items, .. } => {
+                Ok(items.iter().next_back().map(|(key, _)| *key))
+            }
+            _ => Err(PyError::runtime_error("dict handle changed object kind")),
+        }
+    }
+
     fn dict_get(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
         let id = dict.object_id();
         if let Some(target) = self.namespace_view(id)? {
@@ -1052,7 +1068,8 @@ impl PyRuntime for Vm<'_> {
         };
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                Ok(Some(entries[position].1))
+                // A key's `__eq__` may have removed the entry after the lookup found it.
+                Ok(entries.get(position).map(|entry| entry.1))
             }
             _ => Err(PyError::runtime_error("dict handle changed object kind")),
         }
@@ -1124,7 +1141,11 @@ impl PyRuntime for Vm<'_> {
             .map_err(PyError::runtime_error)?
         {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                entries.remove(position).1
+                // A key's `__eq__` may already have removed the entry the lookup found.
+                match entries.remove(position) {
+                    Some(entry) => entry.1,
+                    None => return Ok(None),
+                }
             }
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
@@ -1261,7 +1282,7 @@ impl PyRuntime for Vm<'_> {
             .get(set.object_id())
             .map_err(PyError::runtime_error)?
         {
-            Object::Set(items) | Object::FrozenSet(items) => Ok(items.clone()),
+            Object::Set(items) | Object::FrozenSet(items) => Ok(items.to_vec()),
             _ => Err(PyError::runtime_error("set handle changed object kind")),
         }
     }
@@ -1304,6 +1325,18 @@ impl PyRuntime for Vm<'_> {
         Ok(true)
     }
 
+    fn set_first(&mut self, set: PySet) -> PyResult<Option<Value>> {
+        match self
+            .state
+            .heap
+            .get(set.object_id())
+            .map_err(PyError::runtime_error)?
+        {
+            Object::Set(items) | Object::FrozenSet(items) => Ok(items.iter().next().copied()),
+            _ => Err(PyError::runtime_error("set handle changed object kind")),
+        }
+    }
+
     fn set_remove(&mut self, set: PySet, value: &Value) -> PyResult<bool> {
         let id = set.object_id();
         let Some(position) = self
@@ -1320,7 +1353,9 @@ impl PyRuntime for Vm<'_> {
         else {
             return Err(PyError::runtime_error("set handle changed object kind"));
         };
-        items.remove(position);
+        if items.remove(position).is_none() {
+            return Ok(false);
+        }
         self.state
             .heap
             .release_object_shrink(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
@@ -1339,7 +1374,7 @@ impl PyRuntime for Vm<'_> {
         }
         self.state
             .heap
-            .replace_payload(id, Object::Set(items), &mut self.interp.resources)
+            .replace_payload(id, Object::Set(items.into()), &mut self.interp.resources)
             .map_err(PyError::resource_error)
     }
 
@@ -1616,28 +1651,54 @@ impl PyRuntime for Vm<'_> {
 
     fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<Value>> {
         let id = iterator.object_id();
-        match self
+        // Step a materialized iterator in place: cloning its payload would copy every remaining
+        // value on each step.
+        if let Object::Iterator { values, position } = self
             .state
             .heap
-            .get(id)
+            .get_mut(id)
             .map_err(PyError::runtime_error)?
-            .clone()
         {
-            Object::Iterator { values, position } => {
-                let value = values.get(position).cloned();
-                if value.is_some() {
-                    let Object::Iterator { position, .. } = self
-                        .state
-                        .heap
-                        .get_mut(id)
-                        .map_err(PyError::runtime_error)?
-                    else {
-                        return Err(PyError::runtime_error("iterator changed object kind"));
-                    };
-                    *position += 1;
-                }
-                Ok(value)
+            let value = values.get(*position).copied();
+            if value.is_some() {
+                *position += 1;
             }
+            return Ok(value);
+        }
+        // Copy out only the fields a step needs; cloning a payload such as an instance or a
+        // generator frame on every step would make iteration quadratic.
+        let object = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
+            Object::CountIterator { current, step } => Object::CountIterator {
+                current: *current,
+                step: *step,
+            },
+            Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => Object::CallableIterator {
+                callable: *callable,
+                sentinel: *sentinel,
+                exhausted: *exhausted,
+            },
+            Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => {
+                return self
+                    .next_stored_iterator(id)
+                    .map_err(|error| self.raised_or_runtime_error(error));
+            }
+            Object::Generator { .. } => {
+                return self.resume_generator(id).map_err(PyError::runtime_error);
+            }
+            _ => {
+                return self
+                    .next_until_stop(&Value::Object(id))
+                    .map_err(|error| self.raised_or_runtime_error(error));
+            }
+        };
+        match object {
             Object::SequenceIterator { .. }
             | Object::ReverseIterator { .. }
             | Object::RangeIterator { .. }
@@ -1867,11 +1928,14 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
-        Vm::allocate_object(self, Object::Set(items)).map_err(PyError::resource_error)
+        // Indexing hashes each member once.
+        PyRuntime::charge_cpu(self, u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+        Vm::allocate_object(self, Object::Set(items.into())).map_err(PyError::resource_error)
     }
 
     fn new_frozen_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
-        Vm::allocate_object(self, Object::FrozenSet(items)).map_err(PyError::resource_error)
+        PyRuntime::charge_cpu(self, u64::try_from(items.len()).unwrap_or(u64::MAX))?;
+        Vm::allocate_object(self, Object::FrozenSet(items.into())).map_err(PyError::resource_error)
     }
 
     fn new_value_kind(
@@ -2169,11 +2233,16 @@ impl PyRuntime for Vm<'_> {
         let value = decimal
             .parse::<BigInt>()
             .map_err(|_| PyError::value_error("invalid integer"))?;
+        self.new_bigint(value)
+    }
+
+    fn new_bigint(&mut self, value: BigInt) -> PyResult<Value> {
         if let Some(value) = value.to_i64() {
-            Ok(Value::Int(value))
-        } else {
-            Vm::allocate_object(self, Object::BigInt(value)).map_err(PyError::resource_error)
+            return Ok(Value::Int(value));
         }
+        self.charge_cpu(super::super::number::words(&value))
+            .map_err(PyError::resource_error)?;
+        Vm::allocate_object(self, Object::BigInt(value)).map_err(PyError::resource_error)
     }
 
     fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<Value> {

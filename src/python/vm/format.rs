@@ -329,6 +329,13 @@ pub(super) fn format_integer(
     }
     let negative = value.sign() == BigSign::Minus;
     let magnitude = if negative { -value } else { value };
+    if radix == 10 && super::super::number::exceeds_str_digits(&magnitude) {
+        return Err(value_error(format!(
+            "Exceeds the limit ({} digits) for integer string conversion; use \
+             sys.set_int_max_str_digits() to increase the limit",
+            super::super::number::INT_MAX_STR_DIGITS
+        )));
+    }
     let mut digits = magnitude.to_str_radix(radix);
     if uppercase {
         digits.make_ascii_uppercase();

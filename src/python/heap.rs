@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::bytecode::CodeRef;
-use super::mapping::OrderedMap;
+use super::mapping::{OrderedMap, OrderedSet};
 use super::native::{PyArgumentSpec, PyArrayBuffer, PyArrayView};
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
@@ -173,8 +173,8 @@ pub enum Object {
         factory: Value,
         entries: OrderedMap,
     },
-    Set(Vec<Value>),
-    FrozenSet(Vec<Value>),
+    Set(OrderedSet),
+    FrozenSet(OrderedSet),
     BigInt(BigInt),
     /// Immutable builtin `complex`. Two doubles exceed the inline value payload, so complex
     /// numbers are arena objects like arbitrary-precision integers.
@@ -942,13 +942,20 @@ impl Heap {
     }
 
     /// Return whether enough allocation has occurred to justify tracing the arena.
+    ///
+    /// Collection is best effort. A program whose live heap fills the memory limit must run out
+    /// of memory rather than make the host trace that heap after every quantum, so collections
+    /// near the limit wait for new allocation proportional to the live heap. That keeps total
+    /// tracing work within a constant factor of guest allocation.
     pub fn should_collect(&self, memory_limit: u64, memory_remaining: u64) -> bool {
         // Scan at most about sixteen times while approaching a limit. Small test environments
         // still collect promptly, while ordinary 64-256 MiB runs avoid scanning the live graph
         // for every megabyte of temporary allocation.
         let allocation_interval = (memory_limit / 16).clamp(64 * 1024, 16 * 1024 * 1024);
+        let pressure_interval = (self.modeled_bytes / 8).max(64 * 1024);
         self.bytes_since_collection >= allocation_interval
-            || (self.bytes_since_collection != 0 && memory_remaining < allocation_interval)
+            || (memory_remaining < allocation_interval
+                && self.bytes_since_collection >= pressure_interval)
     }
 
     /// Transfer all live heap accounting to the caller when an interpreter is discarded.
@@ -1430,6 +1437,12 @@ impl Heap {
         scope_roots: &[ScopeId],
         resources: &mut Resources,
     ) -> Result<u64, String> {
+        // Tracing and sweeping visit every arena slot, so charge that work like guest
+        // execution. A program that exhausts its CPU budget skips the collection.
+        let slots = self.objects.len().saturating_add(self.scopes.len());
+        if !resources.charge_cpu(u64::try_from(slots).unwrap_or(u64::MAX)) {
+            return Ok(0);
+        }
         let mut marked_objects = vec![false; self.objects.len()];
         let mut marked_scopes = vec![false; self.scopes.len()];
         let mut object_work = Vec::new();
@@ -1530,9 +1543,10 @@ fn trace_object(
     match &object.payload {
         Object::List(items)
         | Object::Tuple(items)
-        | Object::Set(items)
-        | Object::FrozenSet(items)
         | Object::ArrayStorage(PyArrayBuffer::Values(items)) => {
+            trace_values(items.iter().copied(), object_work)
+        }
+        Object::Set(items) | Object::FrozenSet(items) => {
             trace_values(items.iter().copied(), object_work)
         }
         Object::Dict(entries) => {
@@ -1705,8 +1719,8 @@ fn trace_object(
 fn modeled_size(object: &Object) -> Result<u64, String> {
     const HEADER: u64 = 32;
     const VALUE: u64 = 24;
-    // Text, bytes, and packed array elements are charged at their byte length rather than per
-    // value slot.
+    // Text, bytes, big-integer magnitudes, and packed array elements are charged at their byte
+    // length rather than per value slot.
     let packed = |length: usize| {
         u64::try_from(length)
             .ok()
@@ -1720,14 +1734,16 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .len()
             .checked_add(args.len())
             .ok_or("modeled object size overflow")?,
-        Object::List(values)
-        | Object::Tuple(values)
-        | Object::Set(values)
-        | Object::FrozenSet(values) => values.len(),
+        Object::List(values) | Object::Tuple(values) => values.len(),
+        Object::Set(values) | Object::FrozenSet(values) => values.len(),
         Object::Bare => 0,
         Object::Slice { .. } => 3,
-        Object::BigInt(value) => usize::try_from(value.bits().saturating_add(7) / 8)
-            .map_err(|_| "modeled big integer size overflow")?,
+        Object::BigInt(value) => {
+            return packed(
+                usize::try_from(value.bits().div_ceil(8))
+                    .map_err(|_| "modeled big integer size overflow")?,
+            )
+        }
         // Sixteen bytes of payload rounded up to one modeled value slot.
         Object::Complex { .. } | Object::WideValue { .. } => 1,
         Object::Range { .. } => 3,
@@ -1952,6 +1968,48 @@ mod tests {
         assert!(released > 0);
         assert!(heap.get(first_id).is_err());
         assert_eq!(resources.outcome(0, 0, 0).usage.memory_current, 0);
+    }
+
+    #[test]
+    fn collection_near_the_limit_waits_for_allocation_proportional_to_the_live_heap() {
+        const LIMIT: u64 = 64 * 1024 * 1024;
+        let heap = Heap {
+            modeled_bytes: 60 * 1024 * 1024,
+            bytes_since_collection: 1024 * 1024,
+            ..Heap::default()
+        };
+        // Close to the limit, a megabyte of new allocation does not justify tracing 60 MiB.
+        assert!(!heap.should_collect(LIMIT, 1024 * 1024));
+        let heap = Heap {
+            bytes_since_collection: 8 * 1024 * 1024,
+            ..heap
+        };
+        assert!(heap.should_collect(LIMIT, 1024 * 1024));
+        // A small heap under pressure still collects promptly.
+        let heap = Heap {
+            modeled_bytes: 256 * 1024,
+            bytes_since_collection: 64 * 1024,
+            ..Heap::default()
+        };
+        assert!(heap.should_collect(LIMIT, 1024 * 1024));
+    }
+
+    #[test]
+    fn collection_charges_cpu_for_every_arena_slot() {
+        let mut resources = Resources::new(Limits {
+            cpu: 2,
+            ..Limits::unlimited()
+        });
+        let mut heap = Heap::default();
+        for _ in 0..3 {
+            heap.allocate(Object::Bare, &mut resources).unwrap();
+        }
+        assert_eq!(heap.collect(&[], &[], &mut resources).unwrap(), 0);
+        assert_eq!(
+            resources.stop_reason(),
+            Some(crate::resources::StopReason::CpuExhausted)
+        );
+        assert!(heap.objects.iter().all(Option::is_some));
     }
 
     #[test]

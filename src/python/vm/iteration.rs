@@ -189,17 +189,14 @@ impl Vm<'_> {
                 self.push_materialized(&mut values, Value::Int(i64::from(byte)))?;
             }
         } else if let Some(id) = iterable.object_id() {
-            let length = match self.state.heap.get(id)? {
-                Object::Set(items) | Object::FrozenSet(items) => items.len(),
-                Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries.len(),
+            let members = match self.state.heap.get(id)? {
+                Object::Set(items) | Object::FrozenSet(items) => items.to_vec(),
+                Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
+                    entries.iter().map(|entry| entry.0).collect()
+                }
                 _ => return Ok(None),
             };
-            for index in 0..length {
-                let item = match self.state.heap.get(id)? {
-                    Object::Set(items) | Object::FrozenSet(items) => items[index],
-                    Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries[index].0,
-                    _ => return Err("builtin iterator source changed object kind".into()),
-                };
+            for item in members {
                 self.push_materialized(&mut values, item)?;
             }
         } else {

@@ -1410,7 +1410,10 @@ impl Vm<'_> {
                     if let Some(position) = self.find_mapping_entry(id, &index)? {
                         match self.state.heap.get(id)? {
                             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                                entries[position].1
+                                entries
+                                    .get(position)
+                                    .ok_or("dictionary changed size during lookup")?
+                                    .1
                             }
                             _ => unreachable!("mapping kind was classified before lookup"),
                         }
@@ -1665,9 +1668,8 @@ impl Vm<'_> {
         let float = match number {
             Some(NumberRef::Float(float)) => float,
             Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_))) => {
-                let text = number.to_bigint().expect("integer view").to_string();
                 return self
-                    .new_integer(&text)
+                    .new_bigint(number.to_bigint().expect("integer view"))
                     .map_err(|error| self.record_native_error(error));
             }
             Some(NumberRef::Complex(..)) => {
@@ -1694,8 +1696,9 @@ impl Vm<'_> {
                 self.raise_exception("OverflowError", "cannot convert float infinity to integer")
             );
         }
-        let text = format!("{:.0}", float.trunc());
-        self.new_integer(&text)
+        let integer = <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(float.trunc())
+            .ok_or("float is not finite")?;
+        self.new_bigint(integer)
             .map_err(|error| self.record_native_error(error))
     }
 
@@ -3273,6 +3276,7 @@ impl Vm<'_> {
             }
         }
         let Some((id, container)) = self.container_items(value)? else {
+            self.check_int_str_digits(value)?;
             return protocol::repr(&self.state.heap, value);
         };
         if active.contains(&id) {
@@ -3436,8 +3440,8 @@ impl Vm<'_> {
         let items = match self.state.heap.get(id)? {
             Object::List(items) => ContainerItems::List(items.clone()),
             Object::Tuple(items) => ContainerItems::Tuple(items.clone()),
-            Object::Set(items) => ContainerItems::Set(items.clone()),
-            Object::FrozenSet(items) => ContainerItems::FrozenSet(items.clone()),
+            Object::Set(items) => ContainerItems::Set(items.to_vec()),
+            Object::FrozenSet(items) => ContainerItems::FrozenSet(items.to_vec()),
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 ContainerItems::Dict(entries.iter().copied().collect())
             }
@@ -3501,7 +3505,21 @@ impl Vm<'_> {
         {
             return self.repr_value(value);
         }
+        self.check_int_str_digits(value)?;
         protocol::display(&self.state.heap, value)
+    }
+
+    /// Raise `ValueError` before rendering an int with more decimal digits than CPython's
+    /// default `sys.int_max_str_digits` allows.
+    fn check_int_str_digits(&mut self, value: &Value) -> Result<(), String> {
+        if let Some(super::number::NumberRef::BigInt(integer)) =
+            super::number::view(&self.state.heap, value)
+        {
+            if super::number::exceeds_str_digits(integer) {
+                return Err(self.record_native_error(super::number::int_str_digits_error()));
+            }
+        }
+        Ok(())
     }
 
     /// Order two values by Python's rich comparisons, including user `__eq__` and `__lt__`.
@@ -3888,9 +3906,9 @@ impl Vm<'_> {
                             ))
                         })?;
                     self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-                    let decimal = super::number::parse_integer_text(&text, base)
+                    let integer = super::number::parse_integer_text(&text, base)
                         .map_err(|error| self.record_native_error(error))?;
-                    self.new_integer(&decimal)
+                    self.new_bigint(integer)
                         .map_err(|error| self.record_native_error(error))?
                 } else {
                     match arguments.first() {
@@ -3902,9 +3920,9 @@ impl Vm<'_> {
                             let text =
                                 protocol::string_value(&self.state.heap, value)?.expect("guarded");
                             self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-                            let decimal = super::number::parse_integer_text(&text, 10)
+                            let integer = super::number::parse_integer_text(&text, 10)
                                 .map_err(|error| self.record_native_error(error))?;
-                            self.new_integer(&decimal)
+                            self.new_bigint(integer)
                                 .map_err(|error| self.record_native_error(error))?
                         }
                         Some(value) => {
@@ -4063,14 +4081,8 @@ impl Vm<'_> {
                     BuiltinType::List => Object::List(values),
                     BuiltinType::Tuple => Object::Tuple(values),
                     BuiltinType::Set | BuiltinType::FrozenSet => {
-                        let mut unique = Vec::new();
-                        for value in values {
-                            self.charge_cpu(1)?;
-                            if self.find_value(&unique, &value)?.is_none() {
-                                self.reserve_result(64)?;
-                                unique.push(value);
-                            }
-                        }
+                        let unique = self.distinct_members(values)?;
+                        self.reserve_result(unique.len().saturating_mul(64))?;
                         if builtin_type == BuiltinType::Set {
                             Object::Set(unique)
                         } else {

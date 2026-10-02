@@ -70,7 +70,7 @@ impl Vm<'_> {
                 items.extend(arguments.iter().copied());
                 (items, hash::tuple)
             }
-            Object::FrozenSet(items) => (items.clone(), hash::frozenset),
+            Object::FrozenSet(items) => (items.to_vec(), hash::frozenset),
             Object::Range { start, stop, step } => {
                 let (start, stop, step) = (*start, *stop, *step);
                 return range_hash(start, stop, step);

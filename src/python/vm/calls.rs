@@ -22,10 +22,8 @@ impl Vm<'_> {
             return Ok(None);
         };
         Ok(match self.state.heap.get(id)? {
-            Object::List(values)
-            | Object::Tuple(values)
-            | Object::Set(values)
-            | Object::FrozenSet(values) => Some(values.len()),
+            Object::List(values) | Object::Tuple(values) => Some(values.len()),
+            Object::Set(values) | Object::FrozenSet(values) => Some(values.len()),
             Object::Range { start, stop, step } => Some(range_length(*start, *stop, *step)?),
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => Some(entries.len()),
             _ => None,
@@ -82,13 +80,11 @@ impl Vm<'_> {
     }
 
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
-        let decimal = <Self as PyRuntime>::integer_text(self, value)?.ok_or_else(|| {
+        let integer = <Self as PyRuntime>::integer_bigint(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
         })?;
-        let integer = decimal
-            .parse::<BigInt>()
-            .map_err(|_| PyError::runtime_error("invalid internal integer representation"))?;
-        Ok((integer, decimal.len()))
+        let digits = super::super::number::decimal_digits(&integer);
+        Ok((integer, digits))
     }
 
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
@@ -660,15 +656,12 @@ impl Vm<'_> {
             }
             Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
                 expect_arity(&arguments, 1, 1)?;
-                let decimal = <Self as PyRuntime>::integer_text(self, &arguments[0])
+                let integer = <Self as PyRuntime>::integer_bigint(self, &arguments[0])
                     .map_err(|error| error.to_string())?
                     .ok_or("integer argument expected")?;
-                let integer = decimal
-                    .parse::<BigInt>()
-                    .map_err(|_| "invalid internal integer representation")?;
-                let output_bound = decimal
-                    .len()
-                    .checked_mul(4)
+                // Binary needs one digit per bit, the widest of the three spellings.
+                let output_bound = usize::try_from(integer.bits())
+                    .ok()
                     .and_then(|length| length.checked_add(3))
                     .ok_or("integer representation is too large")?;
                 <Self as PyRuntime>::reserve_memory(self, output_bound)
@@ -996,7 +989,7 @@ impl Vm<'_> {
                     if modulus.is_negative() && !result.is_zero() {
                         result += modulus;
                     }
-                    let result = <Self as PyRuntime>::new_integer(self, &result.to_string())
+                    let result = <Self as PyRuntime>::new_bigint(self, result)
                         .map_err(|error| error.to_string())?;
                     return Ok(CallResult::Value(result));
                 }
@@ -2008,8 +2001,44 @@ impl Vm<'_> {
         let Some(id) = iterator.object_id() else {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
         };
-        Ok(match self.state.heap.get(id)?.clone() {
+        // Copy out only the fields a step needs. Cloning a materialized iterator, generator or
+        // instance payload on every step would make iteration quadratic in host time.
+        enum Step {
+            Callable {
+                callable: Value,
+                sentinel: Value,
+                exhausted: bool,
+            },
+            Count {
+                current: i64,
+                step: i64,
+            },
+            Protocol,
+        }
+        let step = match self.state.heap.get(id)? {
             Object::CallableIterator {
+                callable,
+                sentinel,
+                exhausted,
+            } => Step::Callable {
+                callable: *callable,
+                sentinel: *sentinel,
+                exhausted: *exhausted,
+            },
+            Object::CountIterator { current, step } => Step::Count {
+                current: *current,
+                step: *step,
+            },
+            Object::Generator { .. } => return self.resume_generator(id),
+            Object::Iterator { .. }
+            | Object::SequenceIterator { .. }
+            | Object::ReverseIterator { .. }
+            | Object::RangeIterator { .. }
+            | Object::StreamIterator { .. } => return self.next_stored_iterator(id),
+            _ => Step::Protocol,
+        };
+        Ok(match step {
+            Step::Callable {
                 callable,
                 sentinel,
                 exhausted,
@@ -2036,7 +2065,7 @@ impl Vm<'_> {
                     }
                 }
             }
-            Object::CountIterator { current, step } => {
+            Step::Count { current, step } => {
                 let next = super::super::stdlib::itertools::count_next(current, step)
                     .map_err(str::to_string)?;
                 if let Object::CountIterator { current, .. } = self.state.heap.get_mut(id)? {
@@ -2044,16 +2073,14 @@ impl Vm<'_> {
                 }
                 Some(Value::Int(current))
             }
-            Object::Generator { .. } => self.resume_generator(id)?,
-            Object::Iterator { .. }
-            | Object::SequenceIterator { .. }
-            | Object::ReverseIterator { .. }
-            | Object::RangeIterator { .. }
-            | Object::StreamIterator { .. } => self.next_stored_iterator(id)?,
-            _ => match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
-                Some(value) => Some(value),
-                None => return Err(self.raise_object_type_error(iterator, "is not an iterator")),
-            },
+            Step::Protocol => {
+                match self.invoke_slot(iterator, Slot::Next, "__next__", Vec::new())? {
+                    Some(value) => Some(value),
+                    None => {
+                        return Err(self.raise_object_type_error(iterator, "is not an iterator"))
+                    }
+                }
+            }
         })
     }
 

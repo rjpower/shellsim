@@ -138,17 +138,11 @@ impl Vm<'_> {
     /// Push a set of the distinct `candidates`, metering each membership comparison as the `set`
     /// constructor does.
     fn push_set(&mut self, candidates: Vec<Value>) -> Result<(), String> {
-        let mut values = Vec::with_capacity(candidates.len());
-        for candidate in candidates {
-            self.charge_cpu(1)?;
-            if self.find_value(&values, &candidate)?.is_none() {
-                values.push(candidate);
-            }
-        }
+        let members = self.distinct_members(candidates)?;
         let value = self
             .state
             .heap
-            .allocate(Object::Set(values), &mut self.interp.resources)?;
+            .allocate(Object::Set(members), &mut self.interp.resources)?;
         self.stack.push(value);
         Ok(())
     }

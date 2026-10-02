@@ -373,12 +373,15 @@ fn render_inner(
             }
             Object::Set(values) if values.is_empty() => "set()".into(),
             Object::Set(values) => {
-                format!("{{{}}}", render_values(heap, values, active)?.join(", "))
+                format!(
+                    "{{{}}}",
+                    render_values(heap, &values.to_vec(), active)?.join(", ")
+                )
             }
             Object::FrozenSet(values) if values.is_empty() => "frozenset()".into(),
             Object::FrozenSet(values) => format!(
                 "frozenset({{{}}})",
-                render_values(heap, values, active)?.join(", ")
+                render_values(heap, &values.to_vec(), active)?.join(", ")
             ),
             Object::Range { start, stop, step } => {
                 if *step == 1 && *start == 0 {
@@ -560,10 +563,8 @@ pub fn truth(heap: &Heap, value: &Value) -> Result<bool, String> {
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
         Object::Exception { .. } => true,
-        Object::List(values)
-        | Object::Tuple(values)
-        | Object::Set(values)
-        | Object::FrozenSet(values) => !values.is_empty(),
+        Object::List(values) | Object::Tuple(values) => !values.is_empty(),
+        Object::Set(values) | Object::FrozenSet(values) => !values.is_empty(),
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
@@ -1041,10 +1042,15 @@ pub fn contains(heap: &Heap, container: &Value, needle: &Value) -> Result<bool, 
                     .ok_or("bytes containment requires an integer in range(0, 256)")?;
                 Ok(value.contains(&needle))
             }
-            Object::List(values)
-            | Object::Tuple(values)
-            | Object::Set(values)
-            | Object::FrozenSet(values) => {
+            Object::List(values) | Object::Tuple(values) => {
+                for value in values {
+                    if identical(value, needle) || equals(heap, value, needle)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Object::Set(values) | Object::FrozenSet(values) => {
                 for value in values {
                     if identical(value, needle) || equals(heap, value, needle)? {
                         return Ok(true);

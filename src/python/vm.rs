@@ -24,6 +24,7 @@ use super::heap::{
     Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
     MODELED_VALUE_BYTES,
 };
+use super::mapping::OrderedSet;
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
@@ -1129,10 +1130,12 @@ impl<'a> Vm<'a> {
             }
         } else if let Some(id) = value.object_id() {
             match self.state.heap.get(id)?.clone() {
-                Object::List(values)
-                | Object::Tuple(values)
-                | Object::Set(values)
-                | Object::FrozenSet(values) => {
+                Object::List(values) | Object::Tuple(values) => {
+                    for value in values {
+                        self.push_materialized(&mut result, value)?;
+                    }
+                }
+                Object::Set(values) | Object::FrozenSet(values) => {
                     for value in values {
                         self.push_materialized(&mut result, value)?;
                     }
@@ -1272,14 +1275,29 @@ impl<'a> Vm<'a> {
         Ok(())
     }
 
-    fn find_value(&mut self, values: &[Value], needle: &Value) -> Result<Option<usize>, String> {
-        for (position, value) in values.iter().enumerate() {
+    /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
+    /// keep them. Each candidate is compared only with indexed members that may equal it.
+    fn distinct_members(&mut self, candidates: Vec<Value>) -> Result<OrderedSet, String> {
+        let mut members = OrderedSet::default();
+        for candidate in candidates {
             self.charge_cpu(1)?;
-            if self.values_equal(value, needle)? {
-                return Ok(Some(position));
+            let positions = members.candidate_positions(&candidate).collect::<Vec<_>>();
+            let mut present = false;
+            for position in positions {
+                let member = *members
+                    .get(position)
+                    .ok_or("set member position out of range")?;
+                self.charge_cpu(1)?;
+                if self.values_equal(&member, &candidate)? {
+                    present = true;
+                    break;
+                }
+            }
+            if !present {
+                members.push(candidate);
             }
         }
-        Ok(None)
+        Ok(members)
     }
 
     /// The position of the entry whose key equals `needle`. A user `__eq__` may mutate the dict,
@@ -1313,14 +1331,21 @@ impl<'a> Vm<'a> {
         Ok(None)
     }
 
+    /// The position of the member equal to `needle`. A user `__eq__` may mutate the set, so
+    /// each candidate is read again before it is compared.
     fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
-        let length = match self.state.heap.get(id)? {
-            Object::Set(values) | Object::FrozenSet(values) => values.len(),
+        let candidates = match self.state.heap.get(id)? {
+            Object::Set(values) | Object::FrozenSet(values) => {
+                values.candidate_positions(needle).collect::<Vec<_>>()
+            }
             _ => return Err("set handle changed object kind".into()),
         };
-        for position in 0..length {
+        for position in candidates {
             let candidate = match self.state.heap.get(id)? {
-                Object::Set(values) | Object::FrozenSet(values) => values[position],
+                Object::Set(values) | Object::FrozenSet(values) => match values.get(position) {
+                    Some(value) => *value,
+                    None => continue,
+                },
                 _ => return Err("set handle changed object kind".into()),
             };
             self.charge_cpu(1)?;
