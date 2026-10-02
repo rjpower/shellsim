@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-pub const COST_MODEL_VERSION: u32 = 1;
+pub const COST_MODEL_VERSION: u32 = 2;
 /// Stable conversion used by Python's process clocks.  CPU remains deterministic fuel; assigning
 /// one microsecond per unit merely gives that separate domain a conventional time representation.
 pub const CPU_UNIT_NANOS: u64 = 1_000;
@@ -75,6 +75,7 @@ pub struct Usage {
     pub output_bytes: u64,
 }
 
+/// Cumulative usage of every invocation of one command during a run, in first-use order.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandUsage {
     pub command: String,
@@ -235,10 +236,23 @@ impl Resources {
         disk_before: u64,
         disk_after: u64,
     ) {
+        let cpu = self.cpu_used.saturating_sub(cpu_before);
+        let disk_delta = (disk_after as i128).saturating_sub(disk_before as i128) as i64;
+        // One cumulative entry per command name keeps the trace bounded by the command registry
+        // rather than by how many times a guest loop runs a command.
+        if let Some(usage) = self
+            .command_usage
+            .iter_mut()
+            .find(|usage| usage.command == command)
+        {
+            usage.cpu = usage.cpu.saturating_add(cpu);
+            usage.disk_delta = usage.disk_delta.saturating_add(disk_delta);
+            return;
+        }
         self.command_usage.push(CommandUsage {
             command: command.to_string(),
-            cpu: self.cpu_used.saturating_sub(cpu_before),
-            disk_delta: (disk_after as i128).saturating_sub(disk_before as i128) as i64,
+            cpu,
+            disk_delta,
         });
     }
 

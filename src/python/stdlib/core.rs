@@ -1753,6 +1753,35 @@ fn string_rindex(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
     string_find_impl(runtime, receiver, args, true, true)
 }
 
+/// Characters a substring search examines per CPU unit. Rust's substring search is linear in
+/// the haystack and needle, so `str.find` and `str.count` cost the same for adversarial
+/// inputs, such as `'a' * n` searched for `'a' * m + 'b'`, as for ordinary text.
+const SEARCH_CHARS_PER_CPU_UNIT: usize = 16;
+
+/// The slice of `text` holding characters `start..end`, or `None` when `start` is past the end
+/// or after `end`.
+fn char_range(text: &str, start: usize, end: usize) -> Option<&str> {
+    if start > end {
+        return None;
+    }
+    let mut offsets = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(text.len()));
+    let first = offsets.nth(start)?;
+    let last = if end == start {
+        first
+    } else {
+        offsets.nth(end - start - 1).unwrap_or(text.len())
+    };
+    Some(&text[first..last])
+}
+
+fn charge_search(runtime: &mut dyn PyRuntime, haystack: &str, needle: &str) -> PyResult<()> {
+    let examined = haystack.len().saturating_add(needle.len());
+    runtime.charge_cpu(u64::try_from(examined / SEARCH_CHARS_PER_CPU_UNIT + 1).unwrap_or(u64::MAX))
+}
+
 fn string_find_impl(
     runtime: &mut dyn PyRuntime,
     receiver: PyValue,
@@ -1764,23 +1793,20 @@ fn string_find_impl(
     args.reject_keywords("str search")?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
     let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
-    let characters = value.chars().collect::<Vec<_>>();
-    let needle = needle.chars().collect::<Vec<_>>();
-    runtime.charge_cpu(u64::try_from(characters.len()).unwrap_or(u64::MAX))?;
-    let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
+    charge_search(runtime, &value, &needle)?;
+    let length = value.chars().count();
+    let (start, end) = string_bounds(runtime, args.positional(), length)?;
     let found = if needle.is_empty() {
         (start <= end).then_some(if reverse { end } else { start })
-    } else if needle.len() > end.saturating_sub(start) {
-        None
     } else {
-        let mut candidates = start..=end - needle.len();
-        if reverse {
-            candidates
-                .rev()
-                .find(|index| characters[*index..].starts_with(&needle))
-        } else {
-            candidates.find(|index| characters[*index..].starts_with(&needle))
-        }
+        char_range(&value, start, end).and_then(|haystack| {
+            let offset = if reverse {
+                haystack.rfind(needle.as_str())
+            } else {
+                haystack.find(needle.as_str())
+            }?;
+            Some(start + haystack[..offset].chars().count())
+        })
     };
     match found {
         Some(index) => i64::try_from(index)
@@ -1796,9 +1822,9 @@ fn string_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
     args.reject_keywords("str.count")?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
     let OwnedPyString(needle) = args.positional()[0].cast(runtime)?;
-    let characters = value.chars().collect::<Vec<_>>();
-    let needle = needle.chars().collect::<Vec<_>>();
-    let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
+    charge_search(runtime, &value, &needle)?;
+    let length = value.chars().count();
+    let (start, end) = string_bounds(runtime, args.positional(), length)?;
     let count = if needle.is_empty() {
         if start <= end {
             end - start + 1
@@ -1806,18 +1832,9 @@ fn string_count(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
             0
         }
     } else {
-        let mut count = 0usize;
-        let mut index = start;
-        while index + needle.len() <= end {
-            runtime.charge_cpu(1)?;
-            if characters[index..].starts_with(&needle) {
-                count = count.saturating_add(1);
-                index += needle.len();
-            } else {
-                index += 1;
-            }
-        }
-        count
+        // `matches` yields non-overlapping occurrences from the left, as `str.count` counts.
+        char_range(&value, start, end)
+            .map_or(0, |haystack| haystack.matches(needle.as_str()).count())
     };
     i64::try_from(count)
         .map(Value::Int)
@@ -2946,24 +2963,15 @@ fn list_sort(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> 
         runtime.reserve_memory(64)?;
         keyed.push((sort_key, value));
     }
-    for index in 1..keyed.len() {
-        let mut current = index;
-        while current > 0 {
-            runtime.charge_cpu(1)?;
-            let order = runtime.compare(&keyed[current].0, &keyed[current - 1].0)?;
-            if order
-                != if reverse {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            {
-                break;
-            }
-            keyed.swap(current, current - 1);
-            current -= 1;
-        }
-    }
+    let ahead = if reverse {
+        Ordering::Greater
+    } else {
+        Ordering::Less
+    };
+    super::super::sort::merge_sort(&mut keyed, |right, left| {
+        runtime.charge_cpu(1)?;
+        Ok(runtime.compare(&right.0, &left.0)? == ahead)
+    })?;
     runtime.replace_list_items(list, keyed.into_iter().map(|(_, value)| value).collect())?;
     Ok(Value::None)
 }

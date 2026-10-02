@@ -105,6 +105,13 @@ fn stdin_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::Wait
 }
 
 impl Vm<'_> {
+    /// Charge for moving `count` list slots, as inserting or removing before the end does.
+    fn charge_shift(&mut self, count: usize) -> PyResult<()> {
+        let bytes = (count as u64).saturating_mul(MODELED_VALUE_BYTES);
+        super::super::heap::charge_construction(bytes, &mut self.interp.resources)
+            .map_err(PyError::resource_error)
+    }
+
     /// A VM failure as a native error: the Python exception it raised, if any, or else an
     /// internal runtime error.
     fn raised_or_runtime_error(&self, message: String) -> PyError {
@@ -832,6 +839,7 @@ impl PyRuntime for Vm<'_> {
         let id = list.object_id();
         let length = self.list_len(list)?;
         let index = index.min(length);
+        self.charge_shift(length - index)?;
         self.state
             .heap
             .reserve_object_growth(id, MODELED_VALUE_BYTES, &mut self.interp.resources)
@@ -874,6 +882,8 @@ impl PyRuntime for Vm<'_> {
 
     fn list_pop(&mut self, list: PyList, index: usize) -> PyResult<Value> {
         let id = list.object_id();
+        let length = self.list_len(list)?;
+        self.charge_shift(length.saturating_sub(index))?;
         let value = match self
             .state
             .heap
@@ -1062,7 +1072,7 @@ impl PyRuntime for Vm<'_> {
         }
         let Some(position) = self
             .find_mapping_entry(id, key)
-            .map_err(PyError::runtime_error)?
+            .map_err(|message| self.raised_or_runtime_error(message))?
         else {
             return Ok(None);
         };
@@ -1083,10 +1093,10 @@ impl PyRuntime for Vm<'_> {
                 .namespace_store(target, name, value)
                 .map_err(PyError::resource_error);
         }
-        if let Some(position) = self
-            .find_mapping_entry(id, &key)
-            .map_err(PyError::runtime_error)?
-        {
+        let (hash, position) = self
+            .lookup_mapping_entry(id, &key)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        if let Some(position) = position {
             let entries = match self
                 .state
                 .heap
@@ -1112,7 +1122,7 @@ impl PyRuntime for Vm<'_> {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
             _ => unreachable!("dict kind was checked during lookup"),
         };
-        entries.push((key, value));
+        entries.push(hash, (key, value));
         Ok(())
     }
 
@@ -1130,7 +1140,7 @@ impl PyRuntime for Vm<'_> {
         }
         let Some(position) = self
             .find_mapping_entry(id, key)
-            .map_err(PyError::runtime_error)?
+            .map_err(|message| self.raised_or_runtime_error(message))?
         else {
             return Ok(None);
         };
@@ -1188,11 +1198,14 @@ impl PyRuntime for Vm<'_> {
             }
             return Ok(());
         }
+        let entries = self
+            .ordered_map(items)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
         let replacement = match self.state.heap.get(id).map_err(PyError::runtime_error)? {
-            Object::Dict(_) => Object::Dict(items.into()),
+            Object::Dict(_) => Object::Dict(entries),
             Object::DefaultDict { factory, .. } => Object::DefaultDict {
                 factory: *factory,
-                entries: items.into(),
+                entries,
             },
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
@@ -1302,11 +1315,10 @@ impl PyRuntime for Vm<'_> {
 
     fn set_insert(&mut self, set: PySet, value: Value) -> PyResult<bool> {
         let id = set.object_id();
-        if self
-            .find_set_entry(id, &value)
-            .map_err(PyError::runtime_error)?
-            .is_some()
-        {
+        let (hash, position) = self
+            .lookup_set_entry(id, &value)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        if position.is_some() {
             return Ok(false);
         }
         self.state
@@ -1321,7 +1333,7 @@ impl PyRuntime for Vm<'_> {
         else {
             unreachable!("set kind was checked during lookup")
         };
-        items.push(value);
+        items.push(hash, value);
         Ok(true)
     }
 
@@ -1341,7 +1353,7 @@ impl PyRuntime for Vm<'_> {
         let id = set.object_id();
         let Some(position) = self
             .find_set_entry(id, value)
-            .map_err(PyError::runtime_error)?
+            .map_err(|message| self.raised_or_runtime_error(message))?
         else {
             return Ok(false);
         };
@@ -1372,9 +1384,12 @@ impl PyRuntime for Vm<'_> {
             }
             _ => return Err(PyError::runtime_error("set handle changed object kind")),
         }
+        let members = self
+            .distinct_members(items)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
         self.state
             .heap
-            .replace_payload(id, Object::Set(items.into()), &mut self.interp.resources)
+            .replace_payload(id, Object::Set(members), &mut self.interp.resources)
             .map_err(PyError::resource_error)
     }
 
@@ -1924,18 +1939,24 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn new_dict(&mut self, items: Vec<(Value, Value)>) -> PyResult<Value> {
-        Vm::allocate_object(self, Object::Dict(items.into())).map_err(PyError::resource_error)
+        let entries = self
+            .ordered_map(items)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        Vm::allocate_object(self, Object::Dict(entries)).map_err(PyError::resource_error)
     }
 
     fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
-        // Indexing hashes each member once.
-        PyRuntime::charge_cpu(self, u64::try_from(items.len()).unwrap_or(u64::MAX))?;
-        Vm::allocate_object(self, Object::Set(items.into())).map_err(PyError::resource_error)
+        let members = self
+            .distinct_members(items)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        Vm::allocate_object(self, Object::Set(members)).map_err(PyError::resource_error)
     }
 
     fn new_frozen_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
-        PyRuntime::charge_cpu(self, u64::try_from(items.len()).unwrap_or(u64::MAX))?;
-        Vm::allocate_object(self, Object::FrozenSet(items.into())).map_err(PyError::resource_error)
+        let members = self
+            .distinct_members(items)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        Vm::allocate_object(self, Object::FrozenSet(members)).map_err(PyError::resource_error)
     }
 
     fn new_value_kind(

@@ -241,6 +241,7 @@ pub(super) fn execute(
         state,
         literal_regexes: HashMap::new(),
         state_reserved: 0,
+        fields_reserved: 0,
     };
 
     let mut requested_exit = match runtime.phase(program, Phase::Begin) {
@@ -286,6 +287,8 @@ struct Runtime<'a, 'io> {
     literal_regexes: HashMap<String, regex::Regex>,
     /// Machine memory reserved for variables and array elements assigned by the program.
     state_reserved: u64,
+    /// The part of `state_reserved` held by the current record's fields.
+    fields_reserved: u64,
 }
 
 impl Drop for Runtime<'_, '_> {
@@ -296,6 +299,8 @@ impl Drop for Runtime<'_, '_> {
 
 /// Modeled bookkeeping cost of one stored variable or array element beyond its text.
 const SLOT_OVERHEAD: u64 = 64;
+/// Modeled bytes of one split field beyond its text.
+const FIELD_OVERHEAD: u64 = 32;
 
 /// Modeled bytes of one variable or array element stored under `key`.
 fn slot_bytes(key: &str, value: &Scalar) -> u64 {
@@ -813,7 +818,6 @@ impl Runtime<'_, '_> {
         } else {
             self.state.fs.clone()
         };
-        let values = split_fields(&input, &separator)?;
         let released = self
             .state
             .arrays
@@ -825,10 +829,15 @@ impl Runtime<'_, '_> {
             });
         self.resize_state(released, 0)?;
         self.state.arrays.insert(array_name.clone(), HashMap::new());
-        let count = values.len();
-        for (index, value) in values.into_iter().enumerate() {
-            self.store_element(array_name, (index + 1).to_string(), Scalar::string(value))?;
-        }
+        let mut count = 0_usize;
+        for_each_field(&input, &separator, |field| {
+            count += 1;
+            self.store_element(
+                array_name,
+                count.to_string(),
+                Scalar::string(field.to_string()),
+            )
+        })?;
         Ok(Scalar::number(count as f64))
     }
 
@@ -959,8 +968,21 @@ impl Runtime<'_, '_> {
         }
     }
 
+    /// Replace `$0` and its fields, charging each field before it is stored.
     fn set_record(&mut self, record: String) -> Result<(), Flow> {
-        self.state.fields = split_fields(&record, &self.state.fs)?;
+        self.state.fields.clear();
+        self.resize_state(self.fields_reserved, 0)?;
+        self.fields_reserved = 0;
+        let separator = self.state.fs.clone();
+        let mut fields = Vec::new();
+        for_each_field(&record, &separator, |field| {
+            let bytes = FIELD_OVERHEAD.saturating_add(field.len() as u64);
+            self.resize_state(0, bytes)?;
+            self.fields_reserved = self.fields_reserved.saturating_add(bytes);
+            fields.push(field.to_string());
+            Ok(())
+        })?;
+        self.state.fields = fields;
         self.state.record = record;
         Ok(())
     }
@@ -1076,12 +1098,27 @@ pub(super) fn assignment_is_unsupported(name: &str) -> bool {
 }
 
 fn split_fields(record: &str, separator: &str) -> Result<Vec<String>, Flow> {
+    let mut fields = Vec::new();
+    for_each_field(record, separator, |field| {
+        fields.push(field.to_string());
+        Ok(())
+    })?;
+    Ok(fields)
+}
+
+/// Visit the fields of `record` in order, so callers can charge each one before storing it.
+fn for_each_field(
+    record: &str,
+    separator: &str,
+    mut visit: impl FnMut(&str) -> Result<(), Flow>,
+) -> Result<(), Flow> {
     if separator == " " || separator.is_empty() {
-        return Ok(record.split_whitespace().map(str::to_string).collect());
+        return record.split_whitespace().try_for_each(visit);
     }
-    regex::Regex::new(separator)
-        .map(|regex| regex.split(record).map(str::to_string).collect())
-        .map_err(|error| Flow::Error(format!("invalid field separator: {error}")))
+    let regex = regex::Regex::new(separator)
+        .map_err(|error| Flow::Error(format!("invalid field separator: {error}")))?;
+    let result = regex.split(record).try_for_each(&mut visit);
+    result
 }
 
 /// Check an initial field separator before input is read or output is produced.
@@ -1253,6 +1290,11 @@ fn take_digits(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<S
 }
 
 fn number_text(value: f64) -> String {
+    // Integer formatting is much cheaper than exact float formatting, and `-0` keeps its sign
+    // through the float path.
+    if value.fract() == 0.0 && value.abs() < 1e18 && !(value == 0.0 && value.is_sign_negative()) {
+        return (value as i64).to_string();
+    }
     if value.fract() == 0.0 && value.is_finite() {
         format!("{value:.0}")
     } else {

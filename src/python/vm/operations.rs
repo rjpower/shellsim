@@ -77,24 +77,14 @@ impl Vm<'_> {
                     values.next().expect("dictionary value stack contract"),
                 )]
             };
-            for (key, value) in additions {
-                let mut replaced = false;
-                for entry in &mut entries {
-                    if self.values_equal(&entry.0, &key)? {
-                        entry.1 = value;
-                        replaced = true;
-                        break;
-                    }
-                }
-                if !replaced {
-                    entries.push((key, value));
-                }
-            }
+            entries.extend(additions);
         }
+        // A repeated key keeps its first position and takes the last value.
+        let entries = self.ordered_map(entries)?;
         let value = self
             .state
             .heap
-            .allocate(Object::Dict(entries.into()), &mut self.interp.resources)?;
+            .allocate(Object::Dict(entries), &mut self.interp.resources)?;
         self.stack.push(value);
         Ok(())
     }

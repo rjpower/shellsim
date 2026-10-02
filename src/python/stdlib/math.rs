@@ -16,7 +16,7 @@ use super::super::native::{
     CallArgs, FunctionDef, ModuleDef, PyConstant, PyError, PyKind, PyOperator, PyResult, PyRuntime,
     PyValueCast, ValueDef,
 };
-use super::super::number::PyNumber;
+use super::super::number::{self, PyNumber};
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "math",
@@ -567,8 +567,11 @@ fn bigint_gcd(
     mut right: BigInt,
 ) -> PyResult<BigInt> {
     runtime.reserve_memory(bigint_bytes(&left)?.max(bigint_bytes(&right)?))?;
+    // Each Euclid step is one long division, and a step can shrink the operands by as little as
+    // one bit, so the total is charged step by step rather than estimated up front.
     while !right.is_zero() {
-        runtime.charge_cpu(1)?;
+        let (left_words, right_words) = (number::words(&left), number::words(&right));
+        runtime.charge_cpu(number::divide_work(left_words, right_words))?;
         let remainder = left % &right;
         left = right;
         right = remainder;

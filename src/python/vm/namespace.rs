@@ -419,7 +419,7 @@ impl Vm<'_> {
         target: NamespaceTarget,
     ) -> Result<Value, String> {
         let items = self.namespace_items(target)?;
-        self.allocate_object(Object::Dict(items.into()))
+        self.allocate_dict(items)
     }
 
     /// `target`'s bindings as `(key, value)` pairs with freshly allocated string keys, in the

@@ -1245,9 +1245,22 @@ pub fn eval_arith(interp: &mut Interp, expr: &str) -> i64 {
     }
 }
 
-fn glob_vfs(interp: &Interp, pattern: &str) -> Vec<String> {
+/// Whether a path component is a pattern. A `[` without a later `]` is an ordinary character,
+/// so a lone `[`, as in `[ "$a" = b ]`, never lists a directory.
+fn is_glob_component(component: &str) -> bool {
+    component.contains('*')
+        || component.contains('?')
+        || component
+            .find('[')
+            .is_some_and(|open| component[open + 1..].contains(']'))
+}
+
+fn glob_vfs(interp: &mut Interp, pattern: &str) -> Vec<String> {
     // Only glob the basename components that contain metacharacters, against the VFS.
     // Split pattern into directory part and a per-component glob walk.
+    if !pattern.split('/').any(is_glob_component) {
+        return Vec::new();
+    }
     let absolute = pattern.starts_with('/');
     let base = if absolute {
         "/".to_string()
@@ -1258,10 +1271,15 @@ fn glob_vfs(interp: &Interp, pattern: &str) -> Vec<String> {
     let mut current = vec![base];
     for comp in &comps {
         let mut next = Vec::new();
-        let has_meta = comp.contains('*') || comp.contains('?') || comp.contains('[');
+        let has_meta = is_glob_component(comp);
         for dir in &current {
             if has_meta {
                 if let Ok(entries) = interp.vfs.list_dir("/", dir) {
+                    // Listing and matching cost one unit per entry, plus the pattern compile.
+                    let work = entries.len().saturating_add(comp.len());
+                    if !interp.resources.charge_cpu(work as u64) {
+                        return Vec::new();
+                    }
                     let re = regex::Regex::new(&glob_to_regex(comp)).ok();
                     for e in entries {
                         // skip hidden unless pattern starts with .

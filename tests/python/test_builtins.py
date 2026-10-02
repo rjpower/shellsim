@@ -1176,3 +1176,23 @@ def test_int_decimal_conversion_is_limited_to_4300_digits():
     assert raised(lambda: int("1" * 4301))[0] is ValueError
     assert hex(too_long).startswith("0x1") and int("f" * 5000, 16) > too_long
     assert (too_long * too_long) // too_long == too_long
+
+
+def test_unhashable_dict_keys_and_set_members_raise_type_error():
+    def assign():
+        d = {}
+        d[[1]] = 2
+
+    unhashable = []
+    for build in (
+        lambda: {unhashable: 1},
+        lambda: {unhashable},
+        lambda: dict(zip([unhashable], [1])),
+        lambda: set(iter([{}])),
+        assign,
+    ):
+        assert raised(build)[0] is TypeError
+    # Equal keys of different types share one entry: the first key stays, the last value wins.
+    keys = [1, 1.0, True]
+    merged = dict(zip(keys, "abc"))
+    assert merged == {1: "c"} and type(next(iter(merged))) is int

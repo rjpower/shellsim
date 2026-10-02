@@ -24,6 +24,7 @@ mod parser;
 mod process;
 mod protocol;
 mod slice;
+mod sort;
 mod source;
 mod stdlib;
 mod string;

@@ -1,176 +1,31 @@
 //! Insertion-ordered storage shared by Python mapping objects.
 //!
-//! Python dictionaries preserve insertion order, while key equality belongs to the runtime's
-//! object protocol. This type owns ordering and mutation; callers supply protocol-aware lookup.
+//! Python dictionaries preserve insertion order, while hashing and key equality belong to the
+//! runtime's object protocol. These types own ordering, mutation and a hash index; callers
+//! supply each key's hash and test the candidates that share it for equality.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 
-use super::native::KindNumber;
-use super::{Value, ValueTag};
+use super::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum IndexedKey {
-    Integer(i64),
-    Float(u64),
-    InlineString(Value),
-    None,
-    Native(Value),
-    Registered(Value),
+/// A key's result under the runtime's `hash()` protocol. Callers compute it before every
+/// insertion or lookup, so storage never needs the heap or guest code to place a key.
+pub(super) type KeyHash = i64;
+
+/// Positions of the live members that share one hash. Almost every bucket holds one member.
+#[derive(Clone, Debug)]
+enum Bucket {
+    One(usize),
+    Many(Vec<usize>),
 }
 
-impl IndexedKey {
-    fn from_value(value: &Value) -> Option<Self> {
-        if let Some(value) = value.immediate_int() {
-            return Some(Self::Integer(value));
+impl Bucket {
+    fn positions(&self) -> &[usize] {
+        match self {
+            Self::One(position) => std::slice::from_ref(position),
+            Self::Many(positions) => positions,
         }
-        if let Some(value) = value.float_value() {
-            return Some(Self::float(value));
-        }
-        if value.inline_string_len().is_some() {
-            return Some(Self::InlineString(*value));
-        }
-        match value.tag() {
-            ValueTag::None => Some(Self::None),
-            ValueTag::Native => Some(Self::Native(*value)),
-            ValueTag::Registered => Self::registered(*value),
-            ValueTag::Object
-            | ValueTag::Int
-            | ValueTag::Float
-            | ValueTag::Bool
-            | ValueTag::SmallString0
-            | ValueTag::SmallString1
-            | ValueTag::SmallString2
-            | ValueTag::SmallString3
-            | ValueTag::SmallString4
-            | ValueTag::SmallString5
-            | ValueTag::SmallString6
-            | ValueTag::SmallString7
-            | ValueTag::SmallString8
-            | ValueTag::SmallString9
-            | ValueTag::SmallString10
-            | ValueTag::SmallString11
-            | ValueTag::SmallString12
-            | ValueTag::SmallString13
-            | ValueTag::SmallString14
-            | ValueTag::SmallString15 => None,
-        }
-    }
-
-    /// Integral floats share the bucket of the equal integer, as `hash(2.0) == hash(2)`.
-    fn float(value: f64) -> Self {
-        let integer = value as i64;
-        if value.is_finite() && value.fract() == 0.0 && integer as f64 == value {
-            return Self::Integer(integer);
-        }
-        Self::Float(value.to_bits())
-    }
-
-    /// A registered number, such as a NumPy scalar, shares the bucket of the Python number it
-    /// equals. Complex numbers with an imaginary part and integers beyond `i64` stay unindexed,
-    /// like their builtin counterparts.
-    fn registered(value: Value) -> Option<Self> {
-        let (index, payload) = value.registered_parts()?;
-        let Some(kind) = super::stdlib::value_kind(index) else {
-            return Some(Self::Registered(value));
-        };
-        let Some(number) = kind.numeric.and_then(|numeric| numeric(kind, [payload, 0])) else {
-            return Some(Self::Registered(value));
-        };
-        match number {
-            KindNumber::Bool(value) => Some(Self::Integer(i64::from(value))),
-            KindNumber::Int(value) => Some(Self::Integer(value)),
-            KindNumber::UInt(value) => i64::try_from(value).ok().map(Self::Integer),
-            KindNumber::Float(value) => Some(Self::float(value)),
-            KindNumber::Complex(real, imag) => (imag == 0.0).then(|| Self::float(real)),
-        }
-    }
-}
-/// Hash index from scalar keys to slot positions, shared by ordered maps and sets.
-///
-/// Most scalar keys own one slot, so the common case stores a single position. Distinct members
-/// whose keys share a bucket, such as two NaN objects, spill into `overflow`. Object kinds
-/// without a stable hash model stay unindexed and are compared by every lookup.
-#[derive(Clone, Debug, Default)]
-struct PositionIndex {
-    index: HashMap<IndexedKey, usize>,
-    overflow: HashMap<IndexedKey, Vec<usize>>,
-    /// Ascending positions of unindexed members.
-    unindexed: Vec<usize>,
-}
-
-impl PositionIndex {
-    fn add(&mut self, key: &Value, position: usize) {
-        let Some(key) = IndexedKey::from_value(key) else {
-            self.unindexed.push(position);
-            return;
-        };
-        match self.index.entry(key) {
-            Entry::Vacant(slot) => {
-                slot.insert(position);
-            }
-            Entry::Occupied(_) => self.overflow.entry(key).or_default().push(position),
-        }
-    }
-
-    fn remove(&mut self, key: &Value, position: usize) {
-        let Some(key) = IndexedKey::from_value(key) else {
-            if let Ok(found) = self.unindexed.binary_search(&position) {
-                self.unindexed.remove(found);
-            }
-            return;
-        };
-        if self.index.get(&key) == Some(&position) {
-            match self.overflow.get_mut(&key) {
-                Some(spilled) => {
-                    let next = spilled.remove(0);
-                    if spilled.is_empty() {
-                        self.overflow.remove(&key);
-                    }
-                    self.index.insert(key, next);
-                }
-                None => {
-                    self.index.remove(&key);
-                }
-            }
-        } else if let Some(spilled) = self.overflow.get_mut(&key) {
-            spilled.retain(|&spilled| spilled != position);
-            if spilled.is_empty() {
-                self.overflow.remove(&key);
-            }
-        }
-    }
-
-    /// Positions that can hold a member equal to `key`. Unindexable keys fall back to every
-    /// position below `length`, including tombstones, which callers skip.
-    fn candidates(&self, key: &Value, length: usize) -> impl Iterator<Item = usize> + '_ {
-        let indexed = IndexedKey::from_value(key);
-        let first = indexed
-            .as_ref()
-            .and_then(|key| self.index.get(key))
-            .copied();
-        let spilled = indexed
-            .as_ref()
-            .and_then(|key| self.overflow.get(key))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        let unindexed = if indexed.is_some() {
-            self.unindexed.as_slice()
-        } else {
-            &[]
-        };
-        let fallback = indexed.is_none().then_some(0..length).into_iter().flatten();
-        first
-            .into_iter()
-            .chain(spilled.iter().copied())
-            .chain(unindexed.iter().copied())
-            .chain(fallback)
-    }
-
-    fn clear(&mut self) {
-        self.index.clear();
-        self.overflow.clear();
-        self.unindexed.clear();
     }
 }
 
@@ -178,14 +33,18 @@ impl PositionIndex {
 /// time. Slots are compacted once tombstones outnumber live members, which keeps removal
 /// amortized constant and storage within twice the live size. Positions stay valid until the
 /// next removal.
+///
+/// Each slot keeps its member's hash, so the index can be rebuilt and two containers can be
+/// compared without hashing again. Distinct members with equal hashes share a bucket and are
+/// told apart by the caller's equality test, as in CPython.
 #[derive(Clone, Debug)]
 struct Slots<T> {
-    slots: Vec<Option<T>>,
+    slots: Vec<Option<(KeyHash, T)>>,
     /// No live member precedes this position, so taking the first member, as `set.pop` does,
     /// does not rescan leading tombstones. Trailing tombstones are popped eagerly.
     first: usize,
     live: usize,
-    index: PositionIndex,
+    index: HashMap<KeyHash, Bucket>,
 }
 
 impl<T> Default for Slots<T> {
@@ -194,23 +53,55 @@ impl<T> Default for Slots<T> {
             slots: Vec::new(),
             first: 0,
             live: 0,
-            index: PositionIndex::default(),
+            index: HashMap::new(),
+        }
+    }
+}
+
+fn index_add(index: &mut HashMap<KeyHash, Bucket>, hash: KeyHash, position: usize) {
+    match index.entry(hash) {
+        Entry::Vacant(slot) => {
+            slot.insert(Bucket::One(position));
+        }
+        Entry::Occupied(mut slot) => match slot.get_mut() {
+            Bucket::One(first) => {
+                let first = *first;
+                slot.insert(Bucket::Many(vec![first, position]));
+            }
+            Bucket::Many(positions) => positions.push(position),
+        },
+    }
+}
+
+fn index_remove(index: &mut HashMap<KeyHash, Bucket>, hash: KeyHash, position: usize) {
+    let Entry::Occupied(mut slot) = index.entry(hash) else {
+        return;
+    };
+    match slot.get_mut() {
+        Bucket::One(_) => {
+            slot.remove();
+        }
+        Bucket::Many(positions) => {
+            positions.retain(|&candidate| candidate != position);
+            if let [remaining] = positions[..] {
+                slot.insert(Bucket::One(remaining));
+            }
         }
     }
 }
 
 impl<T> Slots<T> {
-    fn push(&mut self, key: &Value, member: T) {
-        self.index.add(key, self.slots.len());
-        self.slots.push(Some(member));
+    fn push(&mut self, hash: KeyHash, member: T) {
+        index_add(&mut self.index, hash, self.slots.len());
+        self.slots.push(Some((hash, member)));
         self.live += 1;
     }
 
     /// Remove the live member at `position`, or return `None` when a guest `__eq__` already
     /// removed it after the lookup.
-    fn take(&mut self, position: usize, key_of: impl Fn(&T) -> &Value) -> Option<T> {
-        let member = self.slots.get_mut(position)?.take()?;
-        self.index.remove(key_of(&member), position);
+    fn take(&mut self, position: usize) -> Option<T> {
+        let (hash, member) = self.slots.get_mut(position)?.take()?;
+        index_remove(&mut self.index, hash, position);
         self.live -= 1;
         while self.slots.last().is_some_and(Option::is_none) {
             self.slots.pop();
@@ -224,25 +115,41 @@ impl<T> Slots<T> {
             self.slots.retain(Option::is_some);
             self.index.clear();
             for (position, slot) in self.slots.iter().enumerate() {
-                let member = slot.as_ref().expect("compacted slots are live");
-                self.index.add(key_of(member), position);
+                let (hash, _) = slot.as_ref().expect("compacted slots are live");
+                index_add(&mut self.index, *hash, position);
             }
         }
         Some(member)
     }
 
     fn get(&self, position: usize) -> Option<&T> {
-        self.slots.get(position).and_then(Option::as_ref)
+        self.slots
+            .get(position)
+            .and_then(Option::as_ref)
+            .map(|(_, member)| member)
+    }
+
+    fn get_mut(&mut self, position: usize) -> Option<&mut T> {
+        self.slots
+            .get_mut(position)
+            .and_then(Option::as_mut)
+            .map(|(_, member)| member)
     }
 
     fn iter(&self) -> impl DoubleEndedIterator<Item = &T> + Clone {
-        self.slots[self.first..].iter().filter_map(Option::as_ref)
+        self.iter_hashed().map(|(_, member)| member)
     }
 
-    fn candidates(&self, key: &Value) -> impl Iterator<Item = usize> + '_ {
-        self.index
-            .candidates(key, self.slots.len())
-            .filter(|&position| self.slots[position].is_some())
+    fn iter_hashed(&self) -> impl DoubleEndedIterator<Item = (KeyHash, &T)> + Clone {
+        self.slots[self.first..]
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(|(hash, member)| (*hash, member))
+    }
+
+    /// Positions of live members whose hash is `hash`.
+    fn candidates(&self, hash: KeyHash) -> &[usize] {
+        self.index.get(&hash).map_or(&[], Bucket::positions)
     }
 }
 
@@ -253,22 +160,23 @@ pub(super) struct OrderedMap {
 }
 
 impl OrderedMap {
-    pub(super) fn push(&mut self, entry: (Value, Value)) {
-        self.entries.push(&entry.0, entry);
+    /// Append an entry whose key is not already present; `hash` is the key's hash.
+    pub(super) fn push(&mut self, hash: KeyHash, entry: (Value, Value)) {
+        self.entries.push(hash, entry);
     }
 
     /// Remove the live entry at `position`, invalidating previously returned positions.
     pub(super) fn remove(&mut self, position: usize) -> Option<(Value, Value)> {
-        self.entries.take(position, |entry| &entry.0)
+        self.entries.take(position)
     }
 
     pub(super) fn set_value(&mut self, position: usize, value: Value) {
-        if let Some(Some(entry)) = self.entries.slots.get_mut(position) {
+        if let Some(entry) = self.entries.get_mut(position) {
             entry.1 = value;
         }
     }
 
-    /// The live entry at a position from [`Self::candidate_positions`] or [`Self::positions`].
+    /// The live entry at a position from [`Self::candidate_positions`].
     pub(super) fn get(&self, position: usize) -> Option<&(Value, Value)> {
         self.entries.get(position)
     }
@@ -285,14 +193,20 @@ impl OrderedMap {
         self.entries.iter()
     }
 
+    /// Entries with their key hashes, for copying into another mapping without rehashing.
+    pub(super) fn iter_hashed(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (KeyHash, &(Value, Value))> + Clone {
+        self.entries.iter_hashed()
+    }
+
     pub(super) fn to_vec(&self) -> Vec<(Value, Value)> {
         self.iter().copied().collect()
     }
 
-    /// Yield only live positions that can compare equal under the runtime's scalar protocol.
-    /// Unindexed object kinds remain a correctness fallback until they have a stable hash model.
-    pub(super) fn candidate_positions(&self, key: &Value) -> impl Iterator<Item = usize> + '_ {
-        self.entries.candidates(key)
+    /// Live positions whose key has hash `hash`; the caller tests each key for equality.
+    pub(super) fn candidate_positions(&self, hash: KeyHash) -> &[usize] {
+        self.entries.candidates(hash)
     }
 }
 
@@ -303,13 +217,14 @@ pub(super) struct OrderedSet {
 }
 
 impl OrderedSet {
-    pub(super) fn push(&mut self, value: Value) {
-        self.values.push(&value, value);
+    /// Append a member that is not already present; `hash` is the member's hash.
+    pub(super) fn push(&mut self, hash: KeyHash, value: Value) {
+        self.values.push(hash, value);
     }
 
     /// Remove the live member at `position`, invalidating previously returned positions.
     pub(super) fn remove(&mut self, position: usize) -> Option<Value> {
-        self.values.take(position, |value| value)
+        self.values.take(position)
     }
 
     pub(super) fn get(&self, position: usize) -> Option<&Value> {
@@ -328,89 +243,71 @@ impl OrderedSet {
         self.values.iter()
     }
 
+    /// Members with their hashes, for copying into another set without rehashing.
+    pub(super) fn iter_hashed(&self) -> impl DoubleEndedIterator<Item = (KeyHash, &Value)> + Clone {
+        self.values.iter_hashed()
+    }
+
     pub(super) fn to_vec(&self) -> Vec<Value> {
         self.iter().copied().collect()
     }
 
-    /// Live positions of members that can compare equal to `value`.
-    pub(super) fn candidate_positions(&self, value: &Value) -> impl Iterator<Item = usize> + '_ {
-        self.values.candidates(value)
+    /// Live positions of members with hash `hash`; the caller tests each for equality.
+    pub(super) fn candidate_positions(&self, hash: KeyHash) -> &[usize] {
+        self.values.candidates(hash)
     }
 }
 
-impl From<Vec<Value>> for OrderedSet {
-    fn from(values: Vec<Value>) -> Self {
-        values.into_iter().collect()
-    }
+type Owned<T> = std::iter::Map<
+    std::iter::Flatten<std::vec::IntoIter<Option<(KeyHash, T)>>>,
+    fn((KeyHash, T)) -> T,
+>;
+type Borrowed<'a, T> = std::iter::Map<
+    std::iter::Flatten<std::slice::Iter<'a, Option<(KeyHash, T)>>>,
+    fn(&'a (KeyHash, T)) -> &'a T,
+>;
+
+fn member<T>((_, member): (KeyHash, T)) -> T {
+    member
 }
 
-impl FromIterator<Value> for OrderedSet {
-    fn from_iter<T: IntoIterator<Item = Value>>(iter: T) -> Self {
-        let mut set = Self::default();
-        for value in iter {
-            set.push(value);
-        }
-        set
-    }
+fn member_ref<T>((_, member): &(KeyHash, T)) -> &T {
+    member
 }
 
 impl IntoIterator for OrderedSet {
     type Item = Value;
-    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Option<Value>>>;
+    type IntoIter = Owned<Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.values.slots.into_iter().flatten()
-    }
-}
-
-impl From<Vec<(Value, Value)>> for OrderedMap {
-    fn from(entries: Vec<(Value, Value)>) -> Self {
-        let mut mapping = Self::default();
-        mapping.extend(entries);
-        mapping
-    }
-}
-
-impl FromIterator<(Value, Value)> for OrderedMap {
-    fn from_iter<T: IntoIterator<Item = (Value, Value)>>(iter: T) -> Self {
-        let mut mapping = Self::default();
-        mapping.extend(iter);
-        mapping
-    }
-}
-
-impl Extend<(Value, Value)> for OrderedMap {
-    fn extend<T: IntoIterator<Item = (Value, Value)>>(&mut self, iter: T) {
-        for entry in iter {
-            self.push(entry);
-        }
+        self.values.slots.into_iter().flatten().map(member)
     }
 }
 
 impl IntoIterator for OrderedMap {
     type Item = (Value, Value);
-    type IntoIter = std::iter::Flatten<std::vec::IntoIter<Option<(Value, Value)>>>;
+    type IntoIter = Owned<(Value, Value)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.slots.into_iter().flatten()
+        self.entries.slots.into_iter().flatten().map(member)
     }
 }
 
 impl<'a> IntoIterator for &'a OrderedMap {
     type Item = &'a (Value, Value);
-    type IntoIter = std::iter::Flatten<std::slice::Iter<'a, Option<(Value, Value)>>>;
+    type IntoIter = Borrowed<'a, (Value, Value)>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.entries.slots.iter().flatten()
+        self.entries.slots.iter().flatten().map(member_ref)
     }
 }
 
 impl<'a> IntoIterator for &'a OrderedSet {
     type Item = &'a Value;
-    type IntoIter = std::iter::Flatten<std::slice::Iter<'a, Option<Value>>>;
+    type IntoIter = Borrowed<'a, Value>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.values.slots.iter().flatten()
+        self.values.slots.iter().flatten().map(member_ref)
     }
 }
 
@@ -418,14 +315,25 @@ impl<'a> IntoIterator for &'a OrderedSet {
 mod tests {
     use super::*;
 
+    // Integer members use their own value as the hash, as `hash(n) == n` for small `n`.
+    fn set_of(values: impl IntoIterator<Item = i64>) -> OrderedSet {
+        let mut set = OrderedSet::default();
+        for value in values {
+            set.push(value, Value::Int(value));
+        }
+        set
+    }
+
     fn position(set: &OrderedSet, value: i64) -> Option<usize> {
-        set.candidate_positions(&Value::Int(value))
+        set.candidate_positions(value)
+            .iter()
+            .copied()
             .find(|&position| set.get(position) == Some(&Value::Int(value)))
     }
 
     #[test]
     fn removal_keeps_order_and_compaction_keeps_lookup() {
-        let mut set: OrderedSet = (0..20).map(Value::Int).collect();
+        let mut set = set_of(0..20);
         for value in (0..20).step_by(2) {
             let found = position(&set, value).expect("member is indexed");
             assert_eq!(set.remove(found), Some(Value::Int(value)));
@@ -437,22 +345,39 @@ mod tests {
         assert_eq!(set.values.slots.len(), set.len());
         let odd = (3..20).step_by(2).map(Value::Int).collect::<Vec<_>>();
         assert_eq!(set.to_vec(), odd);
-        assert!(odd
-            .iter()
-            .all(|value| set.candidate_positions(value).count() == 1));
+        assert!((3..20)
+            .step_by(2)
+            .all(|value| set.candidate_positions(value).len() == 1));
         assert_eq!(position(&set, 2), None);
     }
 
     #[test]
+    fn members_with_equal_hashes_share_a_bucket() {
+        let mut set = OrderedSet::default();
+        for value in 0..3 {
+            set.push(7, Value::Int(value));
+        }
+        assert_eq!(set.candidate_positions(7), [0, 1, 2]);
+        set.remove(1);
+        assert_eq!(set.candidate_positions(7), [0, 2]);
+        set.remove(0);
+        assert_eq!(set.candidate_positions(7), [2]);
+        assert!(set.candidate_positions(8).is_empty());
+    }
+
+    #[test]
     fn popping_the_first_member_skips_leading_tombstones_once() {
-        let mut map: OrderedMap = (0..6).map(|key| (Value::Int(key), Value::None)).collect();
+        let mut map = OrderedMap::default();
+        for key in 0..6 {
+            map.push(key, (Value::Int(key), Value::None));
+        }
         map.remove(0);
         map.remove(1);
         assert_eq!(map.entries.first, 2);
         assert_eq!(map.iter().next().map(|entry| entry.0), Some(Value::Int(2)));
         map.remove(5);
         assert_eq!(map.entries.slots.len(), 5, "trailing tombstones are popped");
-        map.push((Value::Int(9), Value::None));
+        map.push(9, (Value::Int(9), Value::None));
         let keys = map.iter().map(|entry| entry.0).collect::<Vec<_>>();
         assert_eq!(keys, [2, 3, 4, 9].map(Value::Int));
     }

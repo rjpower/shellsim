@@ -199,6 +199,7 @@ fn shell_state_and_expansions_are_charged_before_they_are_retained() {
         "printf '%*d' 2000000000 1",
         "printf '%.*f' 2000000000 1",
         "awk 'BEGIN { for (i = 0; ; i++) a[i] = i }'",
+        "awk 'BEGIN { s = sprintf(\"%200000s\", \"\"); gsub(/ /, \"a \", s); split(s, a) }'",
     ] {
         assert_stops_on_memory(source);
     }
@@ -215,4 +216,36 @@ fn sparse_indexed_arrays_store_only_assigned_elements() {
     );
     assert_eq!(outcome.exit_status, 0);
     assert_eq!(stdout, b"3 3 9999999999 10000000000 1 y\n");
+}
+
+#[test]
+fn command_usage_has_one_entry_per_command() {
+    let mut env = Environment::new();
+    let (outcome, _, _) =
+        env.run_script_capture("for i in 1 2 3 4 5; do printf x; :; done | sort >/dev/null");
+    let commands = outcome
+        .command_usage
+        .iter()
+        .map(|usage| usage.command.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(commands.iter().filter(|name| **name == "printf").count(), 1);
+    assert!(commands.len() <= 3, "{commands:?}");
+}
+
+#[test]
+fn a_lone_bracket_does_not_list_the_directory() {
+    // `[` without a closing `]` is not a glob pattern, so a test loop does no directory work.
+    let mut env = Environment::new();
+    let script = "mkdir d; cd d; for i in $(seq 2000); do : > f$i; done";
+    let (outcome, _, _) = env.run_script_capture(script);
+    assert_eq!(outcome.exit_status, 0);
+    let (lone, _, _) = env.run_script_capture("i=0; while [ $i -lt 200 ]; do i=$((i+1)); done");
+    let (glob, _, _) = env.run_script_capture("for i in $(seq 200); do echo f1* >/dev/null; done");
+    assert_eq!(lone.exit_status, 0);
+    assert!(
+        glob.usage.cpu_used > lone.usage.cpu_used + 200 * 2000,
+        "glob {} lone {}",
+        glob.usage.cpu_used,
+        lone.usage.cpu_used
+    );
 }

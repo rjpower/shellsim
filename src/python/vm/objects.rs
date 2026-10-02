@@ -1407,7 +1407,8 @@ impl Vm<'_> {
             match target {
                 BuiltinSubscript::Value(value) => value,
                 BuiltinSubscript::Mapping { factory } => {
-                    if let Some(position) = self.find_mapping_entry(id, &index)? {
+                    let (hash, position) = self.lookup_mapping_entry(id, &index)?;
+                    if let Some(position) = position {
                         match self.state.heap.get(id)? {
                             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                                 entries
@@ -1440,7 +1441,7 @@ impl Vm<'_> {
                         else {
                             unreachable!("defaultdict kind was classified before insertion")
                         };
-                        entries.push((index, value));
+                        entries.push(hash, (index, value));
                         value
                     } else if let Some(value) = self.missing_key(&subject, index)? {
                         value
@@ -2198,7 +2199,7 @@ impl Vm<'_> {
                 for (attribute_name, value) in &descriptor_candidates {
                     namespace_entries.push((self.allocate_string(attribute_name.clone())?, *value));
                 }
-                let namespace = self.allocate_object(Object::Dict(namespace_entries.into()))?;
+                let namespace = self.allocate_dict(namespace_entries)?;
                 self.invoke_value(constructor, vec![class_name, bases_value, namespace])?
             } else {
                 self.allocate_class(ClassDefinition {
@@ -2267,7 +2268,7 @@ impl Vm<'_> {
                 for (name, value) in descriptor_candidates {
                     entries.push((self.allocate_string(name)?, value));
                 }
-                let namespace = self.allocate_object(Object::Dict(entries.into()))?;
+                let namespace = self.allocate_dict(entries)?;
                 let class_name = self.allocate_string(name.clone())?;
                 let result = self.invoke_value(initializer, vec![class_name, bases, namespace])?;
                 if !result.is_none() {
@@ -2318,7 +2319,7 @@ impl Vm<'_> {
         }
         let class_name = self.allocate_string(name.to_string())?;
         let field_names = self.allocate_object(Object::Tuple(field_names))?;
-        let namespace = self.allocate_object(Object::Dict(entries.into()))?;
+        let namespace = self.allocate_dict(entries)?;
         let collections = PyRuntime::import_module(self, "collections")
             .map_err(|error| self.record_native_error(error))?;
         let build = PyRuntime::get_attribute(self, collections, "_namedtuple_from_class")
@@ -3665,7 +3666,8 @@ impl Vm<'_> {
     /// metered through the normal iterator and allocation paths.
     /// `d[key] = value` for the dict `id`: replace the value of an equal key, or append the pair.
     fn dict_set_entry(&mut self, id: ObjectId, key: Value, value: Value) -> Result<(), String> {
-        if let Some(position) = self.find_mapping_entry(id, &key)? {
+        let (hash, position) = self.lookup_mapping_entry(id, &key)?;
+        if let Some(position) = position {
             let entries = match self.state.heap.get_mut(id)? {
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
                 _ => unreachable!("dict kind was checked during lookup"),
@@ -3682,7 +3684,7 @@ impl Vm<'_> {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => entries,
             _ => unreachable!("dict kind was checked during lookup"),
         };
-        entries.push((key, value));
+        entries.push(hash, (key, value));
         Ok(())
     }
 
@@ -3697,7 +3699,7 @@ impl Vm<'_> {
             let message = format!("dict expected at most 1 argument, got {}", arguments.len());
             return Err(self.raise_exception("TypeError", message));
         }
-        let dict = self.allocate_object(Object::Dict(Vec::new().into()))?;
+        let dict = self.allocate_object(Object::Dict(Default::default()))?;
         let id = dict.object_id().expect("dicts are arena objects");
         if let Some(source) = arguments.first() {
             for (key, value) in self.dict_source_entries(source)? {

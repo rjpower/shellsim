@@ -841,24 +841,17 @@ impl Vm<'_> {
                     self.reserve_result(64)?;
                     keyed.push((key, value));
                 }
-                // Stable insertion sort keeps comparison dispatch and failure order obvious. Like
-                // CPython's sort it only asks `<`, and a reversed sort keeps equal items in order.
-                for index in 1..keyed.len() {
-                    let mut current = index;
-                    while current > 0 {
-                        self.charge_cpu(1)?;
-                        let (left, right) = if reverse {
-                            (keyed[current - 1].0, keyed[current].0)
-                        } else {
-                            (keyed[current].0, keyed[current - 1].0)
-                        };
-                        if !self.compare_truth(ComparisonOperator::Less, &left, &right)? {
-                            break;
-                        }
-                        keyed.swap(current, current - 1);
-                        current -= 1;
-                    }
-                }
+                // Like CPython's sort this only asks `<`, and a reversed sort keeps equal items
+                // in their original order.
+                super::super::sort::merge_sort(&mut keyed, |right, left| {
+                    self.charge_cpu(1)?;
+                    let (lesser, greater) = if reverse {
+                        (left.0, right.0)
+                    } else {
+                        (right.0, left.0)
+                    };
+                    self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
+                })?;
                 let values = keyed.into_iter().map(|(_, value)| value).collect();
                 Ok(CallResult::Value(
                     self.allocate_object(Object::List(values))?,
@@ -1707,7 +1700,7 @@ impl Vm<'_> {
             }
         }
         if let Some(slot) = signature.keyword_variadic_slot {
-            locals[slot] = Some(self.allocate_object(Object::Dict(extra_keywords.into()))?);
+            locals[slot] = Some(self.allocate_dict(extra_keywords)?);
         }
         if defaults.len() != signature.default_slots.len() {
             return Err(format!("{name}() has invalid default argument metadata"));

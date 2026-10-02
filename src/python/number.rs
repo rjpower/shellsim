@@ -1366,12 +1366,9 @@ fn binary_numbers(
     let linear = left_words.saturating_add(right_words);
     let work = match operation {
         BinaryOperator::Multiply => multiply_work(left_words, right_words).saturating_add(linear),
-        // num-bigint divides by long division: one pass over the divisor per quotient word.
-        BinaryOperator::FloorDivide | BinaryOperator::Remainder => left_words
-            .saturating_sub(right_words)
-            .saturating_add(1)
-            .saturating_mul(right_words)
-            .saturating_add(linear),
+        BinaryOperator::FloorDivide | BinaryOperator::Remainder => {
+            divide_work(left_words, right_words).saturating_add(linear)
+        }
         _ => linear,
     };
     runtime.charge_cpu(work)?;
@@ -1571,6 +1568,14 @@ fn integer_value(value: PyNumber) -> BigInt {
 /// words, roughly one CPU unit per word visited.
 pub(super) fn words(value: &BigInt) -> u64 {
     value.bits().div_ceil(64).max(1)
+}
+
+/// Metered work to divide a `left`-word magnitude by a `right`-word one. num-bigint divides by
+/// long division: one pass over the divisor per quotient word.
+pub(super) fn divide_work(left: u64, right: u64) -> u64 {
+    left.saturating_sub(right)
+        .saturating_add(1)
+        .saturating_mul(right)
 }
 
 /// Metered work to multiply magnitudes of `left` and `right` words. num-bigint's Toom-3

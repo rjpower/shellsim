@@ -804,3 +804,64 @@ fn dict_and_set_deletion_cost_is_constant_per_member() {
     assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
     assert_eq!(stdout, b"0 0\n");
 }
+
+#[test]
+fn heap_keys_are_indexed_by_hash() {
+    // Long strings, tuples and user objects live on the heap; each lookup must compare only the
+    // keys that share its hash rather than every key in the dict.
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "class K:\n    pass\nd = {}\nfor i in range(50_000):\n    d['key-' * 10 + str(i)] = i\n    d[(i, str(i))] = i\n    d[K()] = i\nprint(len(d), d['key-' * 10 + '7'], d[(9, '9')])",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"150000 7 9\n");
+}
+
+#[test]
+fn adversarial_substring_search_is_linear() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "s = 'a' * 1_000_000\nneedle = 'a' * 100_000 + 'b'\nfor i in range(20):\n    assert s.find(needle) == -1 and s.count(needle) == 0\nprint(s.rfind('a' * 3), s.count('aa'))",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"999997 500000\n");
+}
+
+#[test]
+fn sorting_a_large_list_uses_n_log_n_comparisons() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    let (status, stdout, stderr, _) = run_with_limits(
+        "values = [(i * 7919) % 100_003 for i in range(100_000)]\nprint(sorted(values, key=lambda v: -v)[0], sorted(values)[-1])\nvalues.sort(reverse=True)\nprint(values[0])",
+        limits,
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"100002 100002\n100002\n");
+}
+
+#[test]
+fn quadratic_copies_are_charged_by_bytes_moved() {
+    let limits = Limits {
+        cpu: 20_000_000,
+        ..Limits::unlimited()
+    };
+    for program in [
+        "l = []\nfor i in range(1_000_000):\n    l.insert(0, i)",
+        "s = ''\nfor i in range(1_000_000):\n    s += 'abcdefgh'",
+        "import math\nprint(math.gcd(7 ** 1_000_000, 3 ** 1_000_000))",
+    ] {
+        let (status, _, _, usage) = run_with_limits(program, limits);
+        assert_eq!(status, 137, "{program}");
+        assert_eq!(usage.cpu_used, limits.cpu, "{program}");
+    }
+}

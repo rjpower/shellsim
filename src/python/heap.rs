@@ -18,6 +18,19 @@ use super::Value;
 
 pub(super) const MODELED_VALUE_BYTES: u64 = 24;
 pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 = MODELED_VALUE_BYTES * 3;
+/// Building an object writes every byte it stores, so creating or replacing a payload also
+/// charges one CPU unit per this many modeled bytes. Copies such as `s += t` then cost in
+/// proportion to the bytes they move.
+pub(super) const BYTES_PER_CPU_UNIT: u64 = 64;
+
+/// Charge the CPU cost of writing `bytes` of new object storage.
+pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Result<(), String> {
+    if resources.charge_cpu(bytes / BYTES_PER_CPU_UNIT) {
+        Ok(())
+    } else {
+        Err("resource limit exceeded while executing Python".into())
+    }
+}
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
@@ -456,6 +469,7 @@ impl Heap {
             modeled_size(&current.payload)?
         };
         let next_type = self.infer_type_id(&payload)?;
+        charge_construction(next_bytes, resources)?;
         if next_bytes > current_bytes {
             self.reserve_object_growth(id, next_bytes - current_bytes, resources)?;
         }
@@ -1238,6 +1252,7 @@ impl Heap {
 
     pub fn allocate(&mut self, object: Object, resources: &mut Resources) -> Result<Value, String> {
         let bytes = modeled_size(&object)?;
+        charge_construction(bytes, resources)?;
         if !resources.reserve_memory(bytes) {
             return Err("memory limit exceeded".into());
         }

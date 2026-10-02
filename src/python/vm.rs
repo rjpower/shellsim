@@ -24,7 +24,7 @@ use super::heap::{
     Object, ObjectId, ProxyTarget, ScopeId, SymbolId, MODELED_MAPPING_ENTRY_BYTES,
     MODELED_VALUE_BYTES,
 };
-use super::mapping::OrderedSet;
+use super::mapping::{KeyHash, OrderedMap, OrderedSet};
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayRef,
@@ -1276,14 +1276,15 @@ impl<'a> Vm<'a> {
     }
 
     /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
-    /// keep them. Each candidate is compared only with indexed members that may equal it.
+    /// keep them. Each candidate is hashed once and compared only with members of equal hash.
     fn distinct_members(&mut self, candidates: Vec<Value>) -> Result<OrderedSet, String> {
         let mut members = OrderedSet::default();
         for candidate in candidates {
-            self.charge_cpu(1)?;
-            let positions = members.candidate_positions(&candidate).collect::<Vec<_>>();
+            let hash = self.hash_value(&candidate)?;
             let mut present = false;
-            for position in positions {
+            // `members` is local, so a guest `__eq__` cannot change the candidate positions.
+            for index in 0..members.candidate_positions(hash).len() {
+                let position = members.candidate_positions(hash)[index];
                 let member = *members
                     .get(position)
                     .ok_or("set member position out of range")?;
@@ -1294,22 +1295,66 @@ impl<'a> Vm<'a> {
                 }
             }
             if !present {
-                members.push(candidate);
+                members.push(hash, candidate);
             }
         }
         Ok(members)
     }
 
-    /// The position of the entry whose key equals `needle`. A user `__eq__` may mutate the dict,
-    /// so each candidate key is read again before it is compared.
+    /// Dict storage for `entries` in order. A repeated key keeps its first position and takes
+    /// the last value, as a dict display does.
+    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> Result<OrderedMap, String> {
+        let mut map = OrderedMap::default();
+        for (key, value) in entries {
+            let hash = self.hash_value(&key)?;
+            let mut existing = None;
+            for index in 0..map.candidate_positions(hash).len() {
+                let position = map.candidate_positions(hash)[index];
+                let member = map
+                    .get(position)
+                    .ok_or("dict entry position out of range")?
+                    .0;
+                self.charge_cpu(1)?;
+                if self.values_equal(&member, &key)? {
+                    existing = Some(position);
+                    break;
+                }
+            }
+            match existing {
+                Some(position) => map.set_value(position, value),
+                None => map.push(hash, (key, value)),
+            }
+        }
+        Ok(map)
+    }
+
+    /// Allocate a dict holding `entries`, deduplicated as [`Self::ordered_map`] does.
+    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, String> {
+        let entries = self.ordered_map(entries)?;
+        self.allocate_object(Object::Dict(entries))
+    }
+
+    /// The position of the entry whose key equals `needle`.
     fn find_mapping_entry(
         &mut self,
         id: ObjectId,
         needle: &Value,
     ) -> Result<Option<usize>, String> {
+        Ok(self.lookup_mapping_entry(id, needle)?.1)
+    }
+
+    /// `needle`'s hash and the position of the entry whose key equals it. Hashing and a user
+    /// `__eq__` may run guest code that mutates the dict, so each candidate key is read again
+    /// before it is compared.
+    fn lookup_mapping_entry(
+        &mut self,
+        id: ObjectId,
+        needle: &Value,
+    ) -> Result<(KeyHash, Option<usize>), String> {
+        let hash = self.hash_value(needle)?;
         let candidates = match self.state.heap.get(id)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                entries.candidate_positions(needle).collect::<Vec<_>>()
+                entries.candidate_positions(hash).to_vec()
             }
             _ => return Err("dict handle changed object kind".into()),
         };
@@ -1325,18 +1370,28 @@ impl<'a> Vm<'a> {
                 continue;
             };
             if self.values_equal(&candidate, needle)? {
-                return Ok(Some(position));
+                return Ok((hash, Some(position)));
             }
         }
-        Ok(None)
+        Ok((hash, None))
     }
 
-    /// The position of the member equal to `needle`. A user `__eq__` may mutate the set, so
-    /// each candidate is read again before it is compared.
+    /// The position of the member equal to `needle`.
     fn find_set_entry(&mut self, id: ObjectId, needle: &Value) -> Result<Option<usize>, String> {
+        Ok(self.lookup_set_entry(id, needle)?.1)
+    }
+
+    /// `needle`'s hash and the position of the member equal to it, rereading each candidate
+    /// because guest code may mutate the set during the comparison.
+    fn lookup_set_entry(
+        &mut self,
+        id: ObjectId,
+        needle: &Value,
+    ) -> Result<(KeyHash, Option<usize>), String> {
+        let hash = self.hash_value(needle)?;
         let candidates = match self.state.heap.get(id)? {
             Object::Set(values) | Object::FrozenSet(values) => {
-                values.candidate_positions(needle).collect::<Vec<_>>()
+                values.candidate_positions(hash).to_vec()
             }
             _ => return Err("set handle changed object kind".into()),
         };
@@ -1350,10 +1405,10 @@ impl<'a> Vm<'a> {
             };
             self.charge_cpu(1)?;
             if self.values_equal(&candidate, needle)? {
-                return Ok(Some(position));
+                return Ok((hash, Some(position)));
             }
         }
-        Ok(None)
+        Ok((hash, None))
     }
 
     fn pop(&mut self) -> Result<Value, String> {
@@ -1417,6 +1472,7 @@ impl<'a> Vm<'a> {
 
     fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
+        super::heap::charge_construction(bytes, &mut self.interp.resources)?;
         let next = self
             .transient_memory
             .checked_add(bytes)

@@ -125,7 +125,7 @@ impl Vm<'_> {
             Object::MappingProxy(target) => self.proxy_items(target)?,
             _ => return Ok(None),
         };
-        self.allocate_object(Object::Dict(entries.into())).map(Some)
+        self.allocate_dict(entries).map(Some)
     }
 
     fn equality_kind(&self, value: &Value) -> Result<EqualityKind, String> {

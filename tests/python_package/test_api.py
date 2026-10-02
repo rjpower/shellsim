@@ -19,7 +19,7 @@ def test_fresh_run_returns_bytes_and_structured_usage() -> None:
     assert result.stderr == b""
     assert result.stdout_text == "hello\n"
     assert result.usage.cpu_used > 0
-    assert result.cost_model_version == 1
+    assert result.cost_model_version == 2
 
 
 def test_direct_python_source_avoids_shell_quoting_and_preserves_argv_stdin() -> None:

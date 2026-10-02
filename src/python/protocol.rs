@@ -724,10 +724,15 @@ fn equals_inner(
                     if left.len() != right.len() {
                         false
                     } else {
+                        // Equal keys have equal hashes, so each key is compared only with the
+                        // keys in its bucket.
                         let mut all = true;
-                        for (left_key, left_value) in left {
+                        for (hash, (left_key, left_value)) in left.iter_hashed() {
                             let mut found = false;
-                            for (right_key, right_value) in right {
+                            for &position in right.candidate_positions(hash) {
+                                let Some((right_key, right_value)) = right.get(position) else {
+                                    continue;
+                                };
                                 if identical(left_key, right_key)
                                     || equals_inner(heap, left_key, right_key, active)?
                                 {
@@ -752,9 +757,12 @@ fn equals_inner(
                         false
                     } else {
                         let mut all = true;
-                        for left_value in left {
+                        for (hash, left_value) in left.iter_hashed() {
                             let mut found = false;
-                            for right_value in right {
+                            for &position in right.candidate_positions(hash) {
+                                let Some(right_value) = right.get(position) else {
+                                    continue;
+                                };
                                 if identical(left_value, right_value)
                                     || equals_inner(heap, left_value, right_value, active)?
                                 {
@@ -1203,31 +1211,20 @@ mod tests {
     fn dict_and_set_equality_are_order_independent() {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
-        let first = heap
-            .allocate(
-                Object::Dict(
-                    vec![
-                        (Value::inline_string("a").unwrap(), Value::Int(1)),
-                        (Value::inline_string("b").unwrap(), Value::Int(2)),
-                    ]
-                    .into(),
-                ),
-                &mut resources,
-            )
-            .unwrap();
-        let second = heap
-            .allocate(
-                Object::Dict(
-                    vec![
-                        (Value::inline_string("b").unwrap(), Value::Int(2)),
-                        (Value::inline_string("a").unwrap(), Value::Int(1)),
-                    ]
-                    .into(),
-                ),
-                &mut resources,
-            )
-            .unwrap();
+        let dict = |entries: [(&str, i64); 2]| {
+            let mut map = super::super::mapping::OrderedMap::default();
+            for (key, value) in entries {
+                let entry = (Value::inline_string(key).unwrap(), Value::Int(value));
+                map.push(super::super::hash::string(key), entry);
+            }
+            Object::Dict(map)
+        };
+        let mut allocate = |object| heap.allocate(object, &mut resources).unwrap();
+        let first = allocate(dict([("a", 1), ("b", 2)]));
+        let second = allocate(dict([("b", 2), ("a", 1)]));
+        let swapped = allocate(dict([("a", 2), ("b", 1)]));
         assert!(equals(&heap, &first, &second).unwrap());
+        assert!(!equals(&heap, &first, &swapped).unwrap());
     }
 
     #[test]
