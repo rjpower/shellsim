@@ -26,9 +26,10 @@ fn map_vfs_error(error: VfsError) -> PyError {
         VfsError::Exists(_) => PyError::exception("FileExistsError", message),
         VfsError::ReadOnly(_) => PyError::exception("PermissionError", message),
         VfsError::NoSpace | VfsError::TooLarge { .. } => PyError::resource_error(message),
-        VfsError::NotEmpty(_) | VfsError::Loop(_) | VfsError::Invalid(_) => {
-            PyError::exception("OSError", message)
-        }
+        VfsError::NotEmpty(_)
+        | VfsError::Loop(_)
+        | VfsError::Invalid(_)
+        | VfsError::NameTooLong(_) => PyError::exception("OSError", message),
     }
 }
 
