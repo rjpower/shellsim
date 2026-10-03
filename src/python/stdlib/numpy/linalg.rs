@@ -470,6 +470,15 @@ fn qr<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
         return runtime.new_tuple(vec![h_array.value(), tau_array.value()]);
     }
     let full = mode == "complete";
+    // A complete `q` is `rows * rows` whatever the column count; reserve it before building it.
+    let q_width = if full { rows } else { k };
+    let q_bytes = rows
+        .checked_mul(q_width)
+        .and_then(|q| q.checked_add(rows.saturating_mul(cols)))
+        .and_then(|elements| elements.checked_mul(count))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| PyError::resource_error("qr result is too large"))?;
+    runtime.reserve_memory(q_bytes)?;
     let mut rs = Vec::with_capacity(mats.len());
     let mut qs = Vec::with_capacity(mats.len());
     for mat in &mats {
@@ -488,7 +497,6 @@ fn qr<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     if mode == "r" {
         return runtime.new_tuple(vec![r_array.value()]);
     }
-    let q_width = if full { rows } else { k };
     let q_array = array_from_batches(runtime, &batch_shape, rows, q_width, &qs, precision)?;
     runtime.new_tuple(vec![q_array.value(), r_array.value()])
 }
@@ -568,6 +576,17 @@ fn svd<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> 
     let precision = check_dtype(&a, "svd")?;
     let (batch_shape, rows, cols) = rect_shape(&a)?;
     let k = rows.min(cols);
+    // Full matrices hold `rows * rows` and `cols * cols` elements however small the input is, so
+    // reserve the factors before the kernel builds them in host memory.
+    let (u_width, vt_height) = if full_matrices { (rows, cols) } else { (k, k) };
+    let factor_bytes = rows
+        .checked_mul(u_width)
+        .and_then(|u| cols.checked_mul(vt_height).and_then(|vt| u.checked_add(vt)))
+        .and_then(|elements| elements.checked_add(rows.saturating_mul(cols)))
+        .and_then(|elements| elements.checked_mul(batch_count(&batch_shape)))
+        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f64>()))
+        .ok_or_else(|| PyError::resource_error("svd result is too large"))?;
+    runtime.reserve_memory(factor_bytes)?;
     let flat = as_f64(runtime, &a)?;
     let mats = chunks(&flat, rows, cols);
     let mut singular = Vec::with_capacity(mats.len());
@@ -589,8 +608,6 @@ fn svd<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> 
     if !compute_uv {
         return scalar_or_array(runtime, &s_array);
     }
-    let u_width = if full_matrices { rows } else { k };
-    let vt_height = if full_matrices { cols } else { k };
     let u_array = array_from_batches(runtime, &batch_shape, rows, u_width, &us, precision)?;
     let vt_array = array_from_batches(runtime, &batch_shape, vt_height, cols, &vts, precision)?;
     runtime.new_tuple(vec![u_array.value(), s_array.value(), vt_array.value()])
