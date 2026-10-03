@@ -130,8 +130,13 @@ pub enum VfsError {
     Exists(String),
     Loop(String),
     Invalid(String),
+    /// A path component longer than [`NAME_MAX`] or a path longer than [`PATH_MAX`].
+    NameTooLong(String),
     NoSpace,
-    TooLarge { path: String, limit: usize },
+    TooLarge {
+        path: String,
+        limit: usize,
+    },
     ReadOnly(String),
 }
 
@@ -147,6 +152,7 @@ impl VfsError {
             VfsError::Exists(_) => "File exists",
             VfsError::Loop(_) => "Too many levels of symbolic links",
             VfsError::Invalid(_) => "Invalid argument",
+            VfsError::NameTooLong(_) => "File name too long",
             VfsError::NoSpace => "No space left on device",
             VfsError::TooLarge { .. } => "File too large",
             VfsError::ReadOnly(_) => "Read-only filesystem",
@@ -164,6 +170,7 @@ impl std::fmt::Display for VfsError {
             VfsError::Exists(p) => write!(f, "File exists: {p}"),
             VfsError::Loop(p) => write!(f, "Too many levels of symbolic links: {p}"),
             VfsError::Invalid(p) => write!(f, "Invalid argument: {p}"),
+            VfsError::NameTooLong(p) => write!(f, "File name too long: {p}"),
             VfsError::NoSpace => write!(f, "No space left on device"),
             VfsError::TooLarge { path, limit } => {
                 write!(f, "file too large: {path} (limit {limit} bytes)")
@@ -219,6 +226,20 @@ pub fn normalize(path: &str) -> String {
     } else {
         format!("/{}", out.join("/"))
     }
+}
+
+/// Longest path a mutation may create, as Linux's `PATH_MAX` bounds it. Node keys are full
+/// paths, so without this bound a deep directory chain costs the sum of all its prefixes.
+pub const PATH_MAX: usize = 4096;
+/// Longest single path component, as Linux's `NAME_MAX` bounds it.
+pub const NAME_MAX: usize = 255;
+
+/// Reject a path to be created when it or one of its components exceeds the Linux limits.
+fn check_path_limits(abs: &str) -> Result<()> {
+    if abs.len() >= PATH_MAX || abs.split('/').any(|component| component.len() > NAME_MAX) {
+        return Err(VfsError::NameTooLong(abs.to_string()));
+    }
+    Ok(())
 }
 
 fn reject_pseudo_mutation(path: &str) -> Result<()> {
@@ -322,16 +343,25 @@ impl Vfs {
         self.disk_peak = self.disk_peak.max(self.disk_used);
     }
 
-    fn finish_mutation(&mut self, before: BTreeMap<String, Node>) -> Result<()> {
-        let used = self.measured_usage();
+    /// The usage after adding `added` bytes, or `NoSpace` when it would exceed the limit.
+    /// Mutations check this before changing any node, so no rollback is needed.
+    fn usage_after_adding(&self, added: u64) -> Result<u64> {
+        let used = self.disk_used.saturating_add(added);
         if used > self.disk_limit {
-            self.nodes = before;
-            self.disk_used = self.measured_usage();
             Err(VfsError::NoSpace)
         } else {
-            self.disk_used = used;
-            self.disk_peak = self.disk_peak.max(used);
-            Ok(())
+            Ok(used)
+        }
+    }
+
+    /// The usage after a change of `delta` bytes, which may be negative.
+    fn usage_after_delta(&self, delta: i128) -> Result<u64> {
+        let used = i128::from(self.disk_used).saturating_add(delta);
+        let used = u64::try_from(used.max(0)).unwrap_or(u64::MAX);
+        if used > self.disk_limit {
+            Err(VfsError::NoSpace)
+        } else {
+            Ok(used)
         }
     }
 
@@ -784,6 +814,7 @@ impl Vfs {
     fn write_target(&self, cwd: &str, path: &str) -> Result<String> {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
+        check_path_limits(&abs)?;
         let parent = parent_of(&abs).unwrap_or_else(|| "/".to_string());
         let real_parent = self.realpath(&parent, true)?;
         let name = basename(&abs);
@@ -830,8 +861,23 @@ impl Vfs {
 
     pub fn append(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        let before = self.nodes.clone();
         self.require_parent_dir(&target)?;
+        let added = match self.nodes.get(&target) {
+            Some(Node {
+                kind: NodeKind::File(_),
+                ..
+            }) => data.len() as u64,
+            Some(Node {
+                kind: NodeKind::Dir,
+                ..
+            }) => return Err(VfsError::IsADir(path.to_string())),
+            Some(existing) => {
+                let replacement = NODE_OVERHEAD.saturating_add(data.len() as u64);
+                replacement.saturating_sub(self.node_usage(&target, existing))
+            }
+            None => NODE_OVERHEAD.saturating_add(data.len() as u64),
+        };
+        let used = self.usage_after_adding(added)?;
         match self.nodes.get_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
@@ -841,10 +887,6 @@ impl Vfs {
                 d.extend_from_slice(data);
                 *mtime = self.mutation_time_ms;
             }
-            Some(Node {
-                kind: NodeKind::Dir,
-                ..
-            }) => return Err(VfsError::IsADir(path.to_string())),
             _ => {
                 self.nodes.insert(
                     target,
@@ -852,7 +894,8 @@ impl Vfs {
                 );
             }
         }
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     /// Write bytes at a file offset, extending the file with zeroes when needed.
@@ -884,11 +927,7 @@ impl Vfs {
             None => return Err(VfsError::NotFound(path.to_string())),
         };
         let growth = end.saturating_sub(existing_len) as u64;
-        if self.disk_used.saturating_add(growth) > self.disk_limit {
-            return Err(VfsError::NoSpace);
-        }
-
-        let before = self.nodes.clone();
+        let used = self.usage_after_adding(growth)?;
         let node = self.nodes.get_mut(&target).expect("file was checked above");
         let NodeKind::File(bytes) = &mut node.kind else {
             unreachable!("file was checked above")
@@ -898,24 +937,27 @@ impl Vfs {
         }
         bytes[offset..end].copy_from_slice(data);
         node.mtime = self.mutation_time_ms;
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        let before = self.nodes.clone();
         if self.nodes.contains_key(&target) {
             return Err(VfsError::Exists(path.to_string()));
         }
         self.require_parent_dir(&target)?;
-        self.nodes
-            .insert(target, Node::dir(0o755, self.mutation_time_ms));
-        self.finish_mutation(before)
+        let node = Node::dir(0o755, self.mutation_time_ms);
+        let used = self.usage_after_adding(self.node_usage(&target, &node))?;
+        self.nodes.insert(target, node);
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn mkdir_all(&mut self, cwd: &str, path: &str) -> Result<()> {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
+        check_path_limits(&abs)?;
         let additions = self.missing_directories(&abs)?;
         let added_usage = self.directory_addition_usage(&additions);
         let used = self.disk_used.saturating_add(added_usage);
@@ -1024,8 +1066,19 @@ impl Vfs {
 
     /// Reclaim unlinked storage once no file description names its orphan identity.
     pub(crate) fn retain_orphans(&mut self, live: &BTreeSet<u64>) {
-        self.orphaned.retain(|id, _| live.contains(id));
-        self.refresh_usage();
+        // Every process exit and descriptor close reaches here, so the usage is adjusted by the
+        // orphans dropped instead of recounting the whole tree.
+        let mut freed = 0_u64;
+        self.orphaned.retain(|id, node| {
+            if live.contains(id) {
+                return true;
+            }
+            freed = freed.saturating_add(NODE_OVERHEAD.saturating_add(node_payload_len(node)));
+            false
+        });
+        if freed > 0 {
+            self.record_usage(self.disk_used.saturating_sub(freed));
+        }
     }
 
     pub fn remove_all(&mut self, cwd: &str, path: &str) -> Result<()> {
@@ -1071,7 +1124,6 @@ impl Vfs {
             return Err(VfsError::NotFound(from.to_string()));
         }
         let mut to_target = self.write_target(cwd, to)?;
-        let before = self.nodes.clone();
         // moving into an existing directory
         if matches!(
             self.nodes.get(&to_target),
@@ -1088,13 +1140,30 @@ impl Vfs {
             };
         }
         let subtree = self.walk(&from_real);
+        // Baseline directories stop being free when renamed away and a replaced target stops
+        // counting, so the usage change is the per-node difference.
+        let mut delta: i128 = 0;
+        for k in &subtree {
+            let node = &self.nodes[k];
+            let newk = format!("{to_target}{}", &k[from_real.len()..]);
+            check_path_limits(&newk)?;
+            delta += i128::from(self.node_usage(&newk, node));
+            delta -= i128::from(self.node_usage(k, node));
+            if let Some(replaced) = self.nodes.get(&newk) {
+                if !subtree.contains(&newk) {
+                    delta -= i128::from(self.node_usage(&newk, replaced));
+                }
+            }
+        }
+        let used = self.usage_after_delta(delta)?;
         for k in subtree {
             let node = self.nodes.remove(&k).unwrap();
             let suffix = &k[from_real.len()..];
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
         }
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn copy_file(&mut self, cwd: &str, from: &str, to: &str) -> Result<()> {
@@ -1103,18 +1172,18 @@ impl Vfs {
         if let NodeKind::NativeExecutable(program) = source.kind {
             let target = self.write_target(cwd, to)?;
             self.require_parent_dir(&target)?;
-            let before = self.nodes.clone();
-            self.nodes.insert(
-                target,
-                Node {
-                    kind: NodeKind::NativeExecutable(program),
-                    mode: source.mode,
-                    uid: source.uid,
-                    gid: source.gid,
-                    mtime: self.mutation_time_ms,
-                },
-            );
-            return self.finish_mutation(before);
+            let node = Node {
+                kind: NodeKind::NativeExecutable(program),
+                mode: source.mode,
+                uid: source.uid,
+                gid: source.gid,
+                mtime: self.mutation_time_ms,
+            };
+            let used =
+                self.projected_usage_after_replacement(&target, self.node_usage(&target, &node))?;
+            self.nodes.insert(target, node);
+            self.record_usage(used);
+            return Ok(());
         }
         let data = self.read(cwd, from)?;
         self.write(cwd, to, &data, source.mode)
@@ -1142,7 +1211,6 @@ impl Vfs {
             return Ok(());
         }
         let mut to_target = self.write_target(cwd, to)?;
-        let before = self.nodes.clone();
         if matches!(
             self.nodes.get(&to_target),
             Some(Node {
@@ -1157,7 +1225,19 @@ impl Vfs {
                 format!("{to_target}/{name}")
             };
         }
-        for k in self.walk(&from_real) {
+        let subtree = self.walk(&from_real);
+        let mut delta: i128 = 0;
+        for k in &subtree {
+            let node = &self.nodes[k];
+            let newk = format!("{to_target}{}", &k[from_real.len()..]);
+            check_path_limits(&newk)?;
+            delta += i128::from(self.node_usage(&newk, node));
+            if let Some(replaced) = self.nodes.get(&newk) {
+                delta -= i128::from(self.node_usage(&newk, replaced));
+            }
+        }
+        let used = self.usage_after_delta(delta)?;
+        for k in subtree {
             let mut node = self.nodes.get(&k).unwrap().clone();
             if !preserve {
                 node.mtime = self.mutation_time_ms;
@@ -1166,42 +1246,41 @@ impl Vfs {
             let newk = format!("{to_target}{suffix}");
             self.nodes.insert(newk, node);
         }
-        self.finish_mutation(before)
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn symlink(&mut self, cwd: &str, target: &str, linkpath: &str) -> Result<()> {
         let link_target = self.write_target(cwd, linkpath)?;
-        let before = self.nodes.clone();
         if self.nodes.contains_key(&link_target) {
             return Err(VfsError::Exists(linkpath.to_string()));
         }
         self.require_parent_dir(&link_target)?;
-        self.nodes.insert(
-            link_target,
-            Node {
-                kind: NodeKind::Symlink(target.to_string()),
-                mode: 0o777,
-                uid: 0,
-                gid: 0,
-                mtime: self.mutation_time_ms,
-            },
-        );
-        self.finish_mutation(before)
+        let node = Node {
+            kind: NodeKind::Symlink(target.to_string()),
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            mtime: self.mutation_time_ms,
+        };
+        let used = self.usage_after_adding(self.node_usage(&link_target, &node))?;
+        self.nodes.insert(link_target, node);
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn touch(&mut self, cwd: &str, path: &str, mtime: u64) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        let before = self.nodes.clone();
-        match self.nodes.get_mut(&target) {
-            Some(n) => n.mtime = mtime,
-            None => {
-                self.require_parent_dir(&target)?;
-                let mut n = Node::file(Vec::new(), 0o644, mtime);
-                n.mtime = mtime;
-                self.nodes.insert(target, n);
-            }
+        if let Some(node) = self.nodes.get_mut(&target) {
+            node.mtime = mtime;
+            return Ok(());
         }
-        self.finish_mutation(before)
+        self.require_parent_dir(&target)?;
+        let node = Node::file(Vec::new(), 0o644, mtime);
+        let used = self.usage_after_adding(self.node_usage(&target, &node))?;
+        self.nodes.insert(target, node);
+        self.record_usage(used);
+        Ok(())
     }
 
     pub fn chmod(&mut self, cwd: &str, path: &str, mode: Mode) -> Result<()> {
@@ -1249,6 +1328,7 @@ impl Vfs {
     pub fn put_file(&mut self, abs: &str, data: Vec<u8>, mode: Mode) -> Result<()> {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
+        check_path_limits(&norm)?;
         if matches!(
             self.nodes.get(&norm).map(|node| &node.kind),
             Some(NodeKind::Dir)
@@ -1411,6 +1491,49 @@ mod tests {
         v.remove_file("/", "/a").unwrap();
         assert_eq!(v.disk_used(), 0);
         v.write("/", "/b", b"123", 0o644).unwrap();
+    }
+
+    #[test]
+    fn rename_and_copy_adjust_usage_without_recounting() {
+        let mut v = Vfs::with_disk_limit(NODE_OVERHEAD * 2 + 7);
+        v.write("/", "/a", b"12345", 0o644).unwrap();
+        v.rename("/", "/a", "/b").unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD + 5);
+
+        v.write("/", "/c", b"12", 0o644).unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD * 2 + 7);
+        // Renaming over `/b` releases the replaced node.
+        v.rename("/", "/c", "/b").unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD + 2);
+
+        v.copy_file("/", "/b", "/d").unwrap();
+        assert_eq!(v.disk_used(), NODE_OVERHEAD * 2 + 4);
+        assert!(matches!(
+            v.copy_file("/", "/b", "/e"),
+            Err(VfsError::NoSpace)
+        ));
+        assert!(!v.exists("/", "/e"));
+        assert_eq!(v.disk_used(), NODE_OVERHEAD * 2 + 4);
+    }
+
+    #[test]
+    fn over_long_names_and_paths_are_rejected() {
+        let mut v = Vfs::new();
+        let name = "n".repeat(NAME_MAX + 1);
+        assert!(matches!(
+            v.write("/", &format!("/{name}"), b"", 0o644),
+            Err(VfsError::NameTooLong(_))
+        ));
+        let deep = "/d".repeat(PATH_MAX / 2 + 1);
+        assert!(matches!(
+            v.mkdir_all("/", &deep),
+            Err(VfsError::NameTooLong(_))
+        ));
+        assert!(!v.exists("/", "/d"));
+        assert_eq!(v.disk_used(), 0);
+
+        let just_fits = "n".repeat(NAME_MAX);
+        v.write("/", &format!("/{just_fits}"), b"", 0o644).unwrap();
     }
 
     #[test]

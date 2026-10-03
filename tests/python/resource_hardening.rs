@@ -441,10 +441,10 @@ fn complex_values_are_metered_heap_allocations() {
 
 #[test]
 fn complex_arrays_reserve_element_storage_before_allocation() {
-    // `import numpy` loads the Python half of the package, which needs about 2 MiB; the
-    // million-element array needs 16 MB.
+    // `import numpy` loads the Python half of the package, which peaks near 5 MiB while the
+    // largest module is parsed; the million-element array needs 16 MB.
     let limits = Limits {
-        memory: 4 * 1024 * 1024,
+        memory: 8 * 1024 * 1024,
         ..Limits::unlimited()
     };
     let (status, stdout, _, _) = run_with_limits(
@@ -457,7 +457,7 @@ fn complex_arrays_reserve_element_storage_before_allocation() {
         limits,
     );
     assert_eq!(status, 137);
-    assert!(usage.memory_peak <= 4 * 1024 * 1024);
+    assert!(usage.memory_peak <= 8 * 1024 * 1024);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
 }
@@ -915,4 +915,205 @@ fn native_scratch_survives_nested_python_frames() {
     assert!(usage.memory_peak <= 4 * 1024 * 1024);
     assert!(stdout.is_empty());
     assert!(stderr.is_empty());
+}
+
+#[test]
+fn deeply_nested_sequence_ordering_raises_recursion_error() {
+    // Comparing 100k-deep tuples used to recurse on the host stack; the bound surfaces as the
+    // same exception CPython raises.
+    let (status, stdout, stderr, _) = run_with_limits(
+        "x = ()\ny = ()\nfor i in range(100000):\n    x = (x,)\n    y = (y,)\n\
+         try:\n    x < y\nexcept RecursionError:\n    print('bounded')\n\
+         print((1, 2) < (1, 3), [[1]] < [[2]], sorted([(2, 1), (1, 2)]))",
+        Limits::unlimited(),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout, b"bounded\nTrue True [(1, 2), (2, 1)]\n");
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn rendering_a_self_referential_exception_raises_recursion_error() {
+    let (status, stdout, stderr, _) = run_with_limits(
+        "e = ValueError(1)\ne.args = (e,)\n\
+         try:\n    str(e)\nexcept RecursionError:\n    print('str bounded')\n\
+         class E(Exception):\n    pass\nf = E()\nf.args = (f,)\n\
+         try:\n    str(f)\nexcept RecursionError:\n    print('user bounded')\n\
+         print(str(ValueError(ValueError(1))), repr(KeyError(KeyError('k'))))",
+        Limits::unlimited(),
+    );
+    assert_eq!(status, 0);
+    assert_eq!(
+        stdout,
+        b"str bounded\nuser bounded\n1 KeyError(KeyError('k'))\n"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
+fn int_from_bytes_is_linear_in_the_input() {
+    // A megabyte of input used to round-trip through a decimal string, which is quadratic.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "print(int.from_bytes(b'\\xff' * 1_000_000, 'big').bit_length())\n\
+         print(int.from_bytes(b'\\x01\\x00', 'little'), int.from_bytes(b'\\xff', 'big', signed=True))",
+        Limits {
+            cpu: 20_000_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0);
+    assert_eq!(stdout, b"8000000\n1 -1\n");
+    assert!(stderr.is_empty());
+    assert!(usage.cpu_used < 20_000_000);
+}
+
+#[test]
+fn full_svd_and_complete_qr_reserve_their_square_factors() {
+    // A 4000 x 200 input has a 4000 x 4000 `U` or `Q` of 128 MB, which must be reserved before
+    // it is built instead of appearing as host memory the model never saw.
+    for source in [
+        "import numpy as np\nnp.linalg.svd(np.zeros((4000, 200)))",
+        "import numpy as np\nnp.linalg.qr(np.zeros((4000, 200)), mode='complete')",
+    ] {
+        let (status, stdout, stderr, usage) = run_with_limits(
+            source,
+            Limits {
+                memory: 64 * 1024 * 1024,
+                ..Limits::unlimited()
+            },
+        );
+        assert_eq!(status, 137, "{source}");
+        assert!(usage.memory_peak <= 64 * 1024 * 1024, "{source}");
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+    // The thin factorizations the solvers use stay small and correct.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import numpy as np\na = np.arange(12.0).reshape(4, 3)\n\
+         u, s, vt = np.linalg.svd(a, full_matrices=False)\n\
+         print(np.allclose(u @ np.diag(s) @ vt, a), u.shape, vt.shape)\n\
+         x, *_ = np.linalg.lstsq(a, np.arange(4.0), rcond=None)\nprint(np.allclose(a @ x, np.arange(4.0)))",
+        Limits {
+            memory: 16 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"True (4, 3) (3, 3)\nTrue\n");
+    assert!(usage.memory_peak <= 16 * 1024 * 1024);
+}
+
+#[test]
+fn over_long_paths_are_rejected_before_any_node_is_created() {
+    // A 20k-component path used to cost a gigabyte of host memory for the parent directories.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "import os\ntry:\n    os.makedirs('/' + '/'.join(['d'] * 3000))\nexcept OSError:\n    print('OSError')\n\
+         try:\n    open('/' + 'n' * 300, 'w')\nexcept OSError:\n    print('OSError')\n\
+         os.makedirs('/ok/' + '/'.join(['d'] * 100))\nprint(os.path.isdir('/ok/d/d'))",
+        Limits {
+            memory: 16 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"OSError\nOSError\nTrue\n");
+    assert!(usage.memory_peak <= 16 * 1024 * 1024);
+}
+
+#[test]
+fn leaving_an_except_handler_releases_the_handled_exception() {
+    // `continue`, `break` and `return` out of a handler used to leave the exception on the VM's
+    // stack, so a long loop grew without bound and every collection walked the whole stack.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "def f():\n    try:\n        raise KeyError(1)\n    except KeyError:\n        return 1\n\
+         total = 0\nfor i in range(20000):\n    try:\n        raise ValueError(i)\n    except ValueError:\n        total += f()\n        continue\n\
+         print(total)",
+        Limits {
+            memory: 4 * 1024 * 1024,
+            cpu: 50_000_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"20000\n");
+    assert!(usage.memory_peak <= 2 * 1024 * 1024);
+}
+
+#[test]
+fn repeated_eval_does_not_retain_code_caches() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "total = 0\nfor i in range(20000):\n    total += eval('1 + 1')\nprint(total)",
+        Limits {
+            memory: 4 * 1024 * 1024,
+            cpu: 50_000_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"40000\n");
+    assert!(usage.memory_peak <= 1024 * 1024);
+}
+
+#[test]
+fn string_scans_charge_cpu_proportional_to_their_length() {
+    // Substring search, equality, ordering, strip and affix tests over a 10 MB string each scan
+    // the whole value; a loop of them must run out of CPU rather than host time.
+    for operation in [
+        "'q' in s",
+        "s == t",
+        "s < t",
+        "s.strip()",
+        "s.startswith('q')",
+    ] {
+        let (status, stdout, _, usage) = run_with_limits(
+            &format!("s = 'x' * 10_000_000\nt = 'x' * 10_000_000\nfor _ in range(100000):\n    {operation}"),
+            Limits {
+                cpu: 20_000_000,
+                memory: 256 * 1024 * 1024,
+                ..Limits::unlimited()
+            },
+        );
+        assert_eq!(status, 137, "{operation}");
+        assert_eq!(usage.cpu_used, 20_000_000, "{operation}");
+        assert!(stdout.is_empty());
+    }
+}
+
+#[test]
+fn set_subset_tests_are_linear_in_the_smaller_set() {
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "a = set(range(20000))\nb = set(range(40000))\nfor _ in range(50):\n    assert a <= b and not b <= a and a < b\nprint('ok')",
+        Limits {
+            cpu: 50_000_000,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"ok\n");
+    assert!(usage.cpu_used < 50_000_000);
+}
+
+#[test]
+fn front_end_memory_is_reserved_before_a_large_source_is_parsed() {
+    // A megabyte of statements expands to hundreds of megabytes of tokens and syntax tree. The
+    // reservation happens before lexing so the limit stops the program instead of the host.
+    let (status, stdout, stderr, usage) = run_with_limits(
+        "exec('x = 1\\n' * 200000)\nprint(x)",
+        Limits {
+            memory: 32 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137, "{}", String::from_utf8_lossy(&stderr));
+    assert!(usage.memory_peak <= 32 * 1024 * 1024);
+    assert!(stdout.is_empty());
+    let (status, stdout, stderr, _) = run_with_limits(
+        "exec('x = 1\\n' * 2000)\nprint(x)",
+        Limits {
+            memory: 32 * 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"1\n");
 }

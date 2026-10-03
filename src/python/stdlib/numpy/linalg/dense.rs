@@ -544,6 +544,14 @@ pub(in crate::python) fn qr_explicit_q(qr: &QrFactorization, full: bool) -> Mat 
     } else {
         rows.min(qr.factored.cols)
     };
+    qr_explicit_q_columns(qr, width)
+}
+
+/// The first `width` columns of the explicit `Q`, for `width` between the factored column count
+/// and the row count. Building only the needed columns keeps a basis extension of a tall matrix
+/// at `rows * width` instead of `rows * rows`.
+fn qr_explicit_q_columns(qr: &QrFactorization, width: usize) -> Mat {
+    let rows = qr.factored.rows;
     let mut q = Mat::zeros(rows, width);
     for i in 0..width {
         q.set(i, i, 1.0);
@@ -879,7 +887,7 @@ fn extend_orthonormal(basis: &Mat, width: usize) -> Mat {
         return basis.clone();
     }
     let qr = householder_qr(basis);
-    let q = qr_explicit_q(&qr, true);
+    let q = qr_explicit_q_columns(&qr, width);
     let mut result = Mat::zeros(basis.rows, width);
     for col in 0..basis.cols {
         for row in 0..basis.rows {

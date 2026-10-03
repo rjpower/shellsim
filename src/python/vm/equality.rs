@@ -39,6 +39,39 @@ enum EqualityKind {
 }
 
 impl<'s> Vm<'s> {
+    /// Charge the scan a structural comparison of two strings, byte strings or big integers
+    /// performs. Their equality and ordering run at memory speed over the shorter operand, which
+    /// is unbounded work the comparison itself does not otherwise account for.
+    pub(super) fn charge_scan_pair(
+        &mut self,
+        left: &Value<'s>,
+        right: &Value<'s>,
+    ) -> Result<(), String> {
+        let heap = self.heap();
+        let scanned = match (
+            protocol::string_ref(heap, *left)?,
+            protocol::string_ref(heap, *right)?,
+        ) {
+            (Some(left), Some(right)) => left.byte_len().min(right.byte_len()),
+            _ => match (
+                protocol::bytes_ref(heap, *left)?,
+                protocol::bytes_ref(heap, *right)?,
+            ) {
+                (Some(left), Some(right)) => left.len().min(right.len()),
+                _ => match (
+                    protocol::bigint_value(heap, *left),
+                    protocol::bigint_value(heap, *right),
+                ) {
+                    (Some(left), Some(right)) => {
+                        usize::try_from(left.bits().min(right.bits()) / 8).unwrap_or(usize::MAX)
+                    }
+                    _ => return Ok(()),
+                },
+            },
+        };
+        self.charge_cpu(super::objects::scan_cost(scanned))
+    }
+
     /// `left is right or left == right`, as containers compare elements.
     pub(super) fn values_equal(
         &mut self,
@@ -87,6 +120,7 @@ impl<'s> Vm<'s> {
         if !left.is_object() || !right.is_object() {
             return protocol::equals(self.heap(), *left, *right);
         }
+        self.charge_scan_pair(left, right)?;
         // A namespace view or mapping proxy compares as the dict of its current entries, so
         // `globals() == globals()`, `vars(a) == {"x": 1}` and `A.__dict__ == A.__dict__` hold
         // as they do in CPython.

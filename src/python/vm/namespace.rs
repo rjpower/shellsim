@@ -672,6 +672,55 @@ impl<'s> Vm<'s> {
         Ok((module, scope))
     }
 
+    /// Lex, parse and compile a module's source. The front end's working memory (tokens, syntax
+    /// tree, pending instructions) is reserved from the source length and token count before it
+    /// is allocated and released once the code exists, so a large module counts against the
+    /// limit while it is compiled but not for the life of the program. The compiled code is
+    /// accounted separately when its caches are materialized.
+    pub(super) fn compile_module_source(
+        &mut self,
+        source: &str,
+        path: &str,
+    ) -> Result<super::super::bytecode::CodeRef, String> {
+        let parse_memory = super::super::source::front_end_memory(source.len())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or("module source is too large")?;
+        if !self.interp.resources.reserve_memory(parse_memory)
+            || !self.interp.resources.charge_cpu(source.len() as u64)
+        {
+            return Err("resource limit exceeded while importing module".into());
+        }
+        let result = self.compile_module_tokens(source, path);
+        self.interp.resources.release_memory(parse_memory);
+        result
+    }
+
+    fn compile_module_tokens(
+        &mut self,
+        source: &str,
+        path: &str,
+    ) -> Result<super::super::bytecode::CodeRef, String> {
+        let located = |message: &str, span: &super::super::source::Span| {
+            format!(
+                "{message} in {path} at line {}, column {}",
+                span.line, span.column
+            )
+        };
+        let tokens = super::super::lexer::lex(source)
+            .map_err(|error| located(&error.message, &error.span))?;
+        let token_memory = super::super::source::token_memory(tokens.len())
+            .and_then(|bytes| u64::try_from(bytes).ok())
+            .ok_or("module source is too large")?;
+        if !self.interp.resources.reserve_memory(token_memory) {
+            return Err("resource limit exceeded while importing module".into());
+        }
+        let result = super::super::parser::parse(tokens)
+            .map_err(|error| located(&error.message, &error.span))
+            .map(super::super::compiler::compile);
+        self.interp.resources.release_memory(token_memory);
+        result
+    }
+
     pub(super) fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
         let name = self.resolve_import_name(name)?;
         if let Some(module) = super::super::stdlib::native_module(&name) {
@@ -717,28 +766,7 @@ impl<'s> Vm<'s> {
                 self.raise_exception("ModuleNotFoundError", format!("No module named '{name}'"))
             );
         };
-        let parse_memory = u64::try_from(source.len())
-            .ok()
-            .and_then(|bytes| bytes.checked_mul(4))
-            .ok_or("module source is too large")?;
-        if !self.interp.resources.reserve_memory(parse_memory)
-            || !self.interp.resources.charge_cpu(source.len() as u64)
-        {
-            return Err("resource limit exceeded while importing module".into());
-        }
-        let tokens = super::super::lexer::lex(&source).map_err(|error| {
-            format!(
-                "{} in {path} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            )
-        })?;
-        let program = super::super::parser::parse(tokens).map_err(|error| {
-            format!(
-                "{} in {path} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            )
-        })?;
-        let code = super::super::compiler::compile(program);
+        let code = self.compile_module_source(&source, &path)?;
         // A frozen module's path is a synthetic `<frozen name>` marker, so its package-ness comes
         // from the bundled file name instead.
         let is_package = path.ends_with("/__init__.py") || frozen.is_some_and(|f| f.is_package());

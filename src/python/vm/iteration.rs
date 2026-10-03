@@ -1038,8 +1038,9 @@ impl<'s> Vm<'s> {
                 }
                 instruction_pointer
             }
-            (GeneratorResume::Throw(exception), Some((target, depth))) => {
+            (GeneratorResume::Throw(exception), Some((target, depth, exception_depth))) => {
                 self.execution.stack.truncate(depth);
+                self.exception_stack.truncate(exception_depth);
                 self.push(exception.value);
                 let value = self.store(exception.value);
                 self.exception_stack.push(RaisedException {

@@ -739,11 +739,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn display(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
-        self.display_value(value).map_err(PyError::runtime_error)
+        self.display_value(value)
+            .map_err(|error| self.raised_or_runtime_error(error))
     }
 
     fn repr(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
-        self.repr_value(value).map_err(PyError::runtime_error)
+        self.repr_value(value)
+            .map_err(|error| self.raised_or_runtime_error(error))
     }
 
     fn default_object_repr(&self, value: &Value<'s>) -> PyResult<'s, String> {
@@ -1966,8 +1968,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
         // The exception is stored into a `RaisedException` only at the call, so no stored
         // reference is held across the allocation below.
-        let (kind, value) = if let Some((kind, _)) =
-            protocol::exception_parts(self.state, exception).map_err(PyError::runtime_error)?
+        let (kind, value) = if let Some(kind) =
+            protocol::exception_kind(self.state, exception).map_err(PyError::runtime_error)?
         {
             (kind, exception)
         } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
@@ -2772,30 +2774,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn exec_module(&mut self, module: PyModule<'s>, path: &str) -> PyResult<'s, ()> {
         let source = self.interp.read_text(path)?;
-        let parse_memory = u64::try_from(source.len())
-            .ok()
-            .and_then(|bytes| bytes.checked_mul(4))
-            .ok_or_else(|| PyError::resource_error("module source is too large"))?;
-        if !self.interp.resources.reserve_memory(parse_memory)
-            || !self.interp.resources.charge_cpu(source.len() as u64)
-        {
-            return Err(PyError::resource_error(
-                "resource limit exceeded while loading module",
-            ));
-        }
-        let tokens = super::super::lexer::lex(&source).map_err(|error| {
-            PyError::runtime_error(format!(
-                "{} in {path} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            ))
+        let code = self.compile_module_source(&source, path).map_err(|error| {
+            if error.starts_with("resource limit exceeded") || error.ends_with("too large") {
+                PyError::resource_error(error)
+            } else {
+                PyError::runtime_error(error)
+            }
         })?;
-        let program = super::super::parser::parse(tokens).map_err(|error| {
-            PyError::runtime_error(format!(
-                "{} in {path} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            ))
-        })?;
-        let code = super::super::compiler::compile(program);
         let Object::Module { scope, .. } =
             self.get(module.value()).map_err(PyError::runtime_error)?
         else {

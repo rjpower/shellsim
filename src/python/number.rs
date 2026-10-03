@@ -760,7 +760,8 @@ fn int_from_bytes<'s>(
     } else {
         BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes)
     };
-    let value = runtime.new_integer(&value.to_string())?;
+    // Build the integer directly: a decimal round trip is quadratic in the byte count.
+    let value = runtime.new_bigint(value)?;
     runtime.call_value(class, CallArgs::new(vec![value], Vec::new()))
 }
 

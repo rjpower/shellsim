@@ -262,13 +262,17 @@ impl<'s> Vm<'s> {
         needle: &Value<'s>,
     ) -> Result<bool, String> {
         if protocol::string_ref(self.heap(), *container)?.is_some() {
-            if protocol::string_ref(self.heap(), *needle)?.is_none() {
+            let Some(needle_text) = protocol::string_ref(self.heap(), *needle)? else {
                 let message = format!(
                     "'in <string>' requires string as left operand, not {}",
                     self.type_name_of(needle)?
                 );
                 return Err(self.raise_exception("TypeError", message));
-            }
+            };
+            let scanned = protocol::string_ref(self.heap(), *container)?
+                .map_or(0, |text| text.byte_len())
+                .saturating_add(needle_text.byte_len());
+            self.charge_cpu(super::objects::scan_cost(scanned))?;
             return protocol::contains(self.heap(), *container, *needle);
         }
         if !container.is_object() {

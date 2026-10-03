@@ -278,15 +278,16 @@ fn exec_plus_packs_matches_like_gnu_find() {
 
 #[test]
 fn exec_batches_flush_early_once_the_argument_byte_cap_is_reached() {
-    // 300 names of just over 500 bytes each add up to comfortably more than the 128 KiB batch
-    // cap, so this must flush more than one child; confirm the `+` form still runs every match
-    // exactly once across those children. Files are seeded directly through the VFS so the test
-    // does not need a single enormous shell command line to create them.
+    // 800 names of just over 200 bytes each (inside the 255-byte name limit) add up to
+    // comfortably more than the 128 KiB batch cap, so this must flush more than one child;
+    // confirm the `+` form still runs every match exactly once across those children. Files are
+    // seeded directly through the VFS so the test does not need a single enormous shell command
+    // line to create them.
     let mut environment = Environment::new();
     environment.vfs.mkdir_all("/", "/many").unwrap();
     let mut expected_names = Vec::new();
-    for i in 0..300 {
-        let name = format!("f_{i}_{}", "x".repeat(500));
+    for i in 0..800 {
+        let name = format!("f_{i}_{}", "x".repeat(200));
         environment
             .vfs
             .write("/", &format!("/many/{name}"), b"", 0o644)

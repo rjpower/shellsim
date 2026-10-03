@@ -74,9 +74,7 @@ impl<'s> Vm<'s> {
         if self.bytecode_frames.len() >= 256 {
             return Err(format!("maximum {builtin} depth exceeded"));
         }
-        let parse_memory = source
-            .len()
-            .checked_mul(4)
+        let parse_memory = super::super::source::front_end_memory(source.len())
             .ok_or_else(|| format!("{builtin} source is too large"))?;
         self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
         self.reserve_result(parse_memory)?;
@@ -86,6 +84,9 @@ impl<'s> Vm<'s> {
                 error.message, error.span.line, error.span.column
             )
         })?;
+        let token_memory = super::super::source::token_memory(tokens.len())
+            .ok_or_else(|| format!("{builtin} source is too large"))?;
+        self.reserve_result(token_memory)?;
         super::super::parser::parse(tokens).map_err(|error| {
             format!(
                 "{} at line {}, column {}",
@@ -1579,11 +1580,13 @@ impl<'s> Vm<'s> {
         self.call_depth += 1;
         if let CallMode::Deferred(call_span) = mode {
             let stack_base = self.stack.len();
+            let exception_base = self.exception_stack.len();
             self.bytecode_frames.push(BytecodeFrame {
                 code: code.clone(),
                 instruction_pointer: 0,
                 stack_base,
                 handlers: Vec::new(),
+                exception_base,
                 function_return: Some(FunctionReturn {
                     name: name.to_string(),
                     call_span,

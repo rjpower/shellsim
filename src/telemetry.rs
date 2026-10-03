@@ -5,7 +5,7 @@
 //! suspension. Storage is bounded by both event count and modeled bytes so simulated input cannot
 //! cause unbounded host allocation. Oldest events are discarded deterministically.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use serde::Serialize;
 
@@ -119,6 +119,10 @@ struct RetainedInvocation {
 #[derive(Clone, Debug, Default)]
 pub struct InvocationLog {
     events: VecDeque<RetainedInvocation>,
+    /// Sequence numbers of the retained invocations each process has not finished, innermost
+    /// last. Completing an invocation looks it up here instead of scanning the window, which
+    /// keeps a long-running shell loop from paying for every earlier command it ran.
+    open: HashMap<ProcessId, Vec<u64>>,
     modeled_bytes: u64,
     next_sequence: u64,
     dropped: u64,
@@ -163,8 +167,12 @@ impl InvocationLog {
             };
             self.modeled_bytes = self.modeled_bytes.saturating_sub(event.modeled_bytes);
             self.dropped = self.dropped.saturating_add(1);
+            if event.event.status.is_none() {
+                self.forget_open(event.event.pid, event.event.sequence);
+            }
         }
         self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_bytes);
+        self.open.entry(pid).or_default().push(current_sequence);
         self.events.push_back(RetainedInvocation {
             event: InvocationEvent {
                 sequence: current_sequence,
@@ -184,10 +192,35 @@ impl InvocationLog {
 
     /// Complete the innermost active invocation for `pid`.
     pub fn finish_latest(&mut self, pid: ProcessId, status: i32, cpu_after: u64, disk_after: u64) {
-        let Some(invocation) =
-            self.events.iter_mut().rev().find(|invocation| {
-                invocation.event.pid == pid && invocation.event.status.is_none()
-            })
+        let Some(sequence) = self.open.get_mut(&pid).and_then(Vec::pop) else {
+            return;
+        };
+        if self.open.get(&pid).is_some_and(Vec::is_empty) {
+            self.open.remove(&pid);
+        }
+        self.finish_sequence(sequence, status, cpu_after, disk_after);
+    }
+
+    /// Complete every open invocation of `pid`. A native process that exec'd another image
+    /// leaves one open record per image, and they all end with the process.
+    pub fn finish_process(&mut self, pid: ProcessId, status: i32, cpu_after: u64, disk_after: u64) {
+        for sequence in self.open.remove(&pid).unwrap_or_default() {
+            self.finish_sequence(sequence, status, cpu_after, disk_after);
+        }
+    }
+
+    /// Record the completion of the retained invocation numbered `sequence`, if it is still in
+    /// the window. Sequences are consecutive, so the position follows from the first retained
+    /// one.
+    fn finish_sequence(&mut self, sequence: u64, status: i32, cpu_after: u64, disk_after: u64) {
+        let Some(first) = self.events.front().map(|event| event.event.sequence) else {
+            return;
+        };
+        let Some(invocation) = sequence
+            .checked_sub(first)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| self.events.get_mut(offset))
+            .filter(|invocation| invocation.event.sequence == sequence)
         else {
             return;
         };
@@ -196,17 +229,12 @@ impl InvocationLog {
         invocation.event.disk_delta = Some(signed_delta(disk_after, invocation.disk_before));
     }
 
-    /// Complete every open invocation of `pid`. A native process that exec'd another image
-    /// leaves one open record per image, and they all end with the process.
-    pub fn finish_process(&mut self, pid: ProcessId, status: i32, cpu_after: u64, disk_after: u64) {
-        for invocation in self
-            .events
-            .iter_mut()
-            .filter(|invocation| invocation.event.pid == pid && invocation.event.status.is_none())
-        {
-            invocation.event.status = Some(status);
-            invocation.event.cpu = Some(cpu_after.saturating_sub(invocation.cpu_before));
-            invocation.event.disk_delta = Some(signed_delta(disk_after, invocation.disk_before));
+    fn forget_open(&mut self, pid: ProcessId, sequence: u64) {
+        if let Some(open) = self.open.get_mut(&pid) {
+            open.retain(|candidate| *candidate != sequence);
+            if open.is_empty() {
+                self.open.remove(&pid);
+            }
         }
     }
 
@@ -263,6 +291,34 @@ mod tests {
         assert_eq!(events[0].cpu, Some(8));
         assert_eq!(events[0].disk_delta, Some(-1));
         assert_eq!(events[1].status, Some(0));
+    }
+
+    #[test]
+    fn completion_finds_open_invocations_after_older_ones_were_dropped() {
+        let mut log = InvocationLog::default();
+        for index in 0..MAX_INVOCATION_EVENTS + 100 {
+            log.begin(
+                1,
+                &["image".into()],
+                CommandTrust::Real,
+                None,
+                index as u64,
+                0,
+            );
+        }
+        log.begin(2, &["other".into()], CommandTrust::Real, None, 0, 0);
+        log.finish_process(1, 3, 10_000, 0);
+        let events = log.events();
+        assert_eq!(events.len(), MAX_INVOCATION_EVENTS);
+        assert!(events
+            .iter()
+            .filter(|event| event.pid == 1)
+            .all(|event| event.status == Some(3)));
+        assert_eq!(events.last().unwrap().status, None);
+        // A second completion for the same process finds nothing open.
+        log.finish_latest(1, 0, 0, 0);
+        log.finish_latest(2, 0, 5, 0);
+        assert_eq!(log.events().last().unwrap().status, Some(0));
     }
 
     #[test]

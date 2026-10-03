@@ -12,7 +12,7 @@ impl<'s> Vm<'s> {
         &mut self,
         code: &CodeRef,
     ) -> Result<Execution, (String, super::super::source::Span)> {
-        let mut handlers: Vec<(usize, usize)> = Vec::new();
+        let mut handlers: Vec<(usize, usize, usize)> = Vec::new();
         let stack_base = self.stack.len();
         self.execute_code_from(code, 0, &mut handlers, stack_base)
     }
@@ -21,14 +21,16 @@ impl<'s> Vm<'s> {
         &mut self,
         code: &CodeRef,
         instruction_pointer: usize,
-        handlers: &mut Vec<(usize, usize)>,
+        handlers: &mut Vec<(usize, usize, usize)>,
         stack_base: usize,
     ) -> Result<Execution, (String, super::super::source::Span)> {
+        let exception_base = self.exception_stack.len();
         self.bytecode_frames.push(BytecodeFrame {
             code: code.clone(),
             instruction_pointer,
             stack_base,
             handlers: std::mem::take(handlers),
+            exception_base,
             function_return: None,
             pending_native_call: None,
         });
@@ -46,6 +48,7 @@ impl<'s> Vm<'s> {
             .expect("active bytecode frame must remain installed");
         if !matches!(result, Ok(Execution::Yield(_, _))) {
             self.stack.truncate(frame.stack_base);
+            self.exception_stack.truncate(frame.exception_base);
         }
         *handlers = frame.handlers;
         result
@@ -312,7 +315,10 @@ impl<'s> Vm<'s> {
                 Opcode::Assert => vm.dispatch_assert(),
                 Opcode::TryBegin(target) => {
                     let depth = vm.stack.len();
-                    vm.active_frame_mut().handlers.push((target, depth));
+                    let exception_depth = vm.exception_stack.len();
+                    vm.active_frame_mut()
+                        .handlers
+                        .push((target, depth, exception_depth));
                     Ok(DispatchControl::Next)
                 }
                 Opcode::TryEnd => {
@@ -479,7 +485,7 @@ impl<'s> Vm<'s> {
             self.push(value);
             return Ok(DispatchControl::Next);
         }
-        let kind = if let Some((kind, _)) = protocol::exception_parts(self.state, value)? {
+        let kind = if let Some(kind) = protocol::exception_kind(self.state, value)? {
             kind
         } else if let Some(kind) = self.user_exception_kind(&value)? {
             kind
@@ -498,7 +504,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
         let exception = if has_value {
             let value = self.pop()?;
-            if let Some((kind, _)) = protocol::exception_parts(self.state, value)? {
+            if let Some(kind) = protocol::exception_kind(self.state, value)? {
                 RaisedException {
                     kind,
                     value: self.store(value),
@@ -557,7 +563,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
         let cause = self.pop()?;
         let valid = cause.is_none()
-            || protocol::exception_parts(self.state, cause)?.is_some()
+            || protocol::exception_kind(self.state, cause)?.is_some()
             || self.user_exception_kind(&cause)?.is_some()
             || self.exception_class_base(&cause)?.is_some();
         if !valid {
@@ -688,7 +694,7 @@ impl<'s> Vm<'s> {
     }
 
     fn exception_class(&self, kind: &str, value: &Value<'s>) -> Result<Value<'s>, String> {
-        if protocol::exception_parts(self.state, *value)?.is_some() {
+        if protocol::exception_kind(self.state, *value)?.is_some() {
             let name = super::known_exception_type(kind)
                 .ok_or_else(|| format!("exception type metadata is not modeled for {kind:?}"))?;
             Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
@@ -889,6 +895,7 @@ impl<'s> Vm<'s> {
                 .expect("deferred method frame must remain installed");
         }
         self.stack.truncate(frame.stack_base);
+        self.exception_stack.truncate(frame.exception_base);
         Some(function_return)
     }
 
@@ -896,11 +903,14 @@ impl<'s> Vm<'s> {
         let Some(exception) = self.pending_exception.take() else {
             return false;
         };
-        let Some((target, depth)) = self.active_frame_mut().handlers.pop() else {
+        let Some((target, depth, exception_depth)) = self.active_frame_mut().handlers.pop() else {
             self.pending_exception = Some(exception);
             return false;
         };
         self.stack.truncate(depth);
+        // Exceptions handled inside the `try` body, including one a handler was processing when
+        // this exception escaped it, end with the body.
+        self.exception_stack.truncate(exception_depth);
         self.execution.stack.push_ref(&exception.value);
         self.exception_stack.push(exception);
         self.active_frame_mut().instruction_pointer = target;

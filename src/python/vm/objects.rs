@@ -30,6 +30,19 @@ const CLASS_ATTRIBUTE_BYTES: u64 = 48;
 
 /// Container nesting bound for `repr()`, matching the VM's call-depth limit.
 const MAX_REPR_DEPTH: usize = 256;
+
+/// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
+const MAX_COMPARE_DEPTH: usize = 256;
+
+/// Bytes a linear scan over text or bytes covers per CPU unit. Searches, comparisons and code
+/// point walks run at memory speed, so one unit per word keeps the charge proportional without
+/// making ordinary string handling expensive.
+const SCAN_BYTES_PER_CPU_UNIT: usize = 16;
+
+/// CPU units for scanning `bytes` bytes of text or binary data.
+pub(super) fn scan_cost(bytes: usize) -> u64 {
+    u64::try_from(bytes / SCAN_BYTES_PER_CPU_UNIT).unwrap_or(u64::MAX) + 1
+}
 impl ContainerItems<'_> {
     fn len(&self) -> usize {
         match self {
@@ -203,13 +216,8 @@ impl<'s> Vm<'s> {
     }
 
     pub(super) fn ensure_code_cache(&mut self, code: &CodeRef) -> Result<usize, String> {
-        if let Some(index) = self
-            .execution
-            .code_caches
-            .iter()
-            .position(|cache| Arc::ptr_eq(&cache.code, code))
-        {
-            return Ok(index);
+        if let Some(slot) = self.execution.code_caches.slot_of(code) {
+            return Ok(slot);
         }
         let bytes = code
             .name_count()
@@ -217,13 +225,20 @@ impl<'s> Vm<'s> {
             .and_then(|names| names.checked_add(std::mem::size_of::<CodeCaches>()))
             .ok_or("code cache size overflow")?;
         self.reserve_retained_memory(bytes)?;
-        let index = self.execution.code_caches.len();
-        self.execution.code_caches.push(CodeCaches {
+        let caches = CodeCaches {
             code: code.clone(),
             names: vec![None; code.name_count()],
             attributes: None,
-        });
-        Ok(index)
+        };
+        let mut released = 0usize;
+        let slot = self
+            .execution
+            .code_caches
+            .insert(caches, |bytes| released = released.saturating_add(bytes));
+        if released > 0 {
+            self.release_retained_memory_bytes(released);
+        }
+        Ok(slot)
     }
 
     fn cacheable_instance_attribute(
@@ -1186,7 +1201,7 @@ impl<'s> Vm<'s> {
                 .types
                 .replace_slots(type_id, &class_object.attributes)?;
         }
-        for cache in &mut self.execution.code_caches {
+        for cache in self.execution.code_caches.iter_mut() {
             cache.attributes = None;
         }
         Ok(())
@@ -1521,6 +1536,13 @@ impl<'s> Vm<'s> {
         owner: &Value<'s>,
         index: &Value<'s>,
     ) -> Result<Option<char>, String> {
+        // A non-ASCII string is indexed by code point, which scans the UTF-8 up to the index.
+        let non_ascii_bytes = protocol::string_ref(&self.state.heap, *owner)?
+            .filter(|text| !text.is_ascii())
+            .map(|text| text.byte_len());
+        if let Some(bytes) = non_ascii_bytes {
+            self.charge_cpu(scan_cost(bytes))?;
+        }
         match protocol::string_index(&self.state.heap, *owner, *index)? {
             protocol::StringIndex::NotString => Ok(None),
             protocol::StringIndex::Character(character) => Ok(Some(character)),
@@ -1544,6 +1566,14 @@ impl<'s> Vm<'s> {
         stop: Option<i64>,
         step: Option<i64>,
     ) -> Result<Value<'s>, String> {
+        let non_ascii_bytes = protocol::string_ref(&self.state.heap, owner)?
+            .filter(|text| !text.is_ascii())
+            .map(|text| text.byte_len());
+        if let Some(bytes) = non_ascii_bytes {
+            // Slicing by code point materializes the characters first.
+            self.charge_cpu(scan_cost(bytes))?;
+            self.reserve_result(bytes.saturating_mul(std::mem::size_of::<char>()))?;
+        }
         let string_slice = protocol::string_ref(&self.state.heap, owner)?
             .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
             .transpose()?;
@@ -3362,7 +3392,7 @@ impl<'s> Vm<'s> {
         }
         let Some((id, container)) = self.container_items(value)? else {
             self.check_int_str_digits(value)?;
-            return protocol::repr(self.state, *value);
+            return protocol::repr(self.state, *value).map_err(|error| self.render_error(error));
         };
         if active.contains(&id) {
             return Ok(container.placeholder().into());
@@ -3566,7 +3596,7 @@ impl<'s> Vm<'s> {
             .types
             .is_subclass(self.type_id(value)?, BuiltinType::Exception.id())?
         {
-            return protocol::display(self.state, *value);
+            return protocol::display(self.state, *value).map_err(|error| self.render_error(error));
         }
         let plain_instance = match value.is_object() {
             true => match self.get(*value)? {
@@ -3594,7 +3624,17 @@ impl<'s> Vm<'s> {
             return self.repr_value(value);
         }
         self.check_int_str_digits(value)?;
-        protocol::display(self.state, *value)
+        protocol::display(self.state, *value).map_err(|error| self.render_error(error))
+    }
+
+    /// Turn a rendering failure into the Python exception CPython raises for it: nesting past
+    /// the render bound is `RecursionError`; anything else stays an internal error.
+    fn render_error(&mut self, error: String) -> String {
+        if error.starts_with("maximum recursion depth exceeded") {
+            self.raise_exception("RecursionError", error)
+        } else {
+            error
+        }
     }
 
     /// Raise `ValueError` before rendering an int with more decimal digits than CPython's
@@ -3616,6 +3656,18 @@ impl<'s> Vm<'s> {
         left: &Value<'s>,
         right: &Value<'s>,
     ) -> Result<protocol::Comparison, String> {
+        self.compare_values_at(left, right, 0)
+    }
+
+    /// [`Self::compare_values`] at nesting `depth`: sequences compare element by element, and
+    /// nesting past [`MAX_COMPARE_DEPTH`] raises `RecursionError` instead of exhausting the host
+    /// stack on deeply nested tuples or lists.
+    fn compare_values_at(
+        &mut self,
+        left: &Value<'s>,
+        right: &Value<'s>,
+        depth: usize,
+    ) -> Result<protocol::Comparison, String> {
         if left.is_object() && right.is_object() {
             let sequences = match (self.get(*left)?, self.get(*right)?) {
                 (Object::List(left), Object::List(right))
@@ -3625,12 +3677,18 @@ impl<'s> Vm<'s> {
                 _ => None,
             };
             if let Some((left, right)) = sequences {
+                if depth >= MAX_COMPARE_DEPTH {
+                    return Err(self.raise_exception(
+                        "RecursionError",
+                        "maximum recursion depth exceeded in comparison",
+                    ));
+                }
                 for (left, right) in left.iter().zip(&right) {
                     self.charge_cpu(1)?;
                     if self.identical(*left, *right) {
                         continue;
                     }
-                    let comparison = self.compare_values(left, right)?;
+                    let comparison = self.compare_values_at(left, right, depth + 1)?;
                     if comparison != protocol::Comparison::Ordered(Ordering::Equal) {
                         return Ok(comparison);
                     }
@@ -3659,8 +3717,9 @@ impl<'s> Vm<'s> {
         }
         let (builtin_left, builtin_right) = (self.builtin_view(*left)?, self.builtin_view(*right)?);
         if !self.identical(builtin_left, *left) || !self.identical(builtin_right, *right) {
-            return self.compare_values(&builtin_left, &builtin_right);
+            return self.compare_values_at(&builtin_left, &builtin_right, depth);
         }
+        self.charge_scan_pair(left, right)?;
         protocol::compare(&self.state.heap, *left, *right)
     }
 
@@ -4243,7 +4302,7 @@ impl<'s> Vm<'s> {
         if value.inline_string_len().is_some() {
             return Ok(BuiltinType::String.id());
         }
-        if let Some((kind, _)) = protocol::exception_parts(self.state, *value)? {
+        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
             if let Some(id) = self.state.types.exception_type_id(&kind) {
                 return Ok(id);
             }
