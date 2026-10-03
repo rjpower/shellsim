@@ -1489,6 +1489,37 @@ fn exact_integer(value: PyValue<'_>) -> Option<i64> {
     value.immediate_int()
 }
 
+/// Compare a builtin float with a builtin float or immediate int without the rich-comparison
+/// protocol. Ints beyond 2^53 are left to the general path, where the comparison is exact.
+pub(super) fn exact_float_comparison<'s>(
+    operation: ComparisonOperator,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+) -> Option<bool> {
+    if left.float_value().is_none() && right.float_value().is_none() {
+        return None;
+    }
+    let left = exact_scalar_f64(left)?;
+    let right = exact_scalar_f64(right)?;
+    Some(match operation {
+        ComparisonOperator::Equal => left == right,
+        ComparisonOperator::NotEqual => left != right,
+        ComparisonOperator::Less => left < right,
+        ComparisonOperator::LessEqual => left <= right,
+        ComparisonOperator::Greater => left > right,
+        ComparisonOperator::GreaterEqual => left >= right,
+        _ => return None,
+    })
+}
+
+fn exact_scalar_f64(value: PyValue<'_>) -> Option<f64> {
+    if let Some(float) = value.float_value() {
+        return Some(float);
+    }
+    let integer = value.immediate_int()?;
+    (integer.unsigned_abs() <= 1 << 53).then_some(integer as f64)
+}
+
 #[inline]
 fn immediate_integer_binary(operation: BinaryOperator, left: i64, right: i64) -> Option<i64> {
     match operation {

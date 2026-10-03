@@ -753,6 +753,9 @@ pub(super) trait PyRuntime<'s> {
     ) -> PyResult<'s, PyValue<'s>>;
     fn equals(&mut self, left: &PyValue<'s>, right: &PyValue<'s>) -> PyResult<'s, bool>;
     fn compare(&mut self, left: &PyValue<'s>, right: &PyValue<'s>) -> PyResult<'s, Ordering>;
+    /// `left < right` through the rich-comparison protocol. Sorting asks only this, as CPython
+    /// does, so a user `__lt__` runs once per comparison instead of twice.
+    fn less_than(&mut self, left: &PyValue<'s>, right: &PyValue<'s>) -> PyResult<'s, bool>;
     /// Resolve an attribute through the runtime's descriptor and MRO protocol.
     fn get_attribute(
         &mut self,

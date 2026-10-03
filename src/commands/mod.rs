@@ -319,7 +319,7 @@ fn runs_native_process(image: crate::vfs::NativeProgram) -> bool {
 
 /// Register `f` under every name in `names` with trust `t`.
 fn reg(map: &mut HashMap<&'static str, CommandSpec>, names: &[&'static str], t: Trust, f: CmdFn) {
-    reg_costed(map, names, t, 100, 10 * 1024, f);
+    reg_costed(map, names, t, 1000, 10 * 1024, f);
 }
 
 /// Register command names that are intentionally unavailable in the simulated environment.
@@ -456,7 +456,7 @@ fn reg_resumable(
             CommandSpec {
                 body: CommandBody::Resumable(resume),
                 trust,
-                base_cpu: 100,
+                base_cpu: 1000,
                 base_memory: 10 * 1024,
             },
         );

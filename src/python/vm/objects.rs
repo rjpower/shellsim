@@ -3288,6 +3288,15 @@ impl<'s> Vm<'s> {
     }
 
     pub(super) fn truth_value(&mut self, value: &Value<'s>) -> Result<bool, String> {
+        // Immediate bools, ints, floats and None have no slots to consult; every comparison
+        // result passes through here, so the slot lookups would dominate a sort.
+        if value.bool_value().is_some()
+            || value.immediate_int().is_some()
+            || value.float_value().is_some()
+            || value.is_none()
+        {
+            return protocol::truth(&self.state.heap, *value);
+        }
         if let Some(result) = self.invoke_slot(value, Slot::Bool, "__bool__", Vec::new())? {
             return result
                 .bool_value()

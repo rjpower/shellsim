@@ -1,6 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
-use super::super::heap::{Builder, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
+use super::super::heap::{Builder, Heap, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
 use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
@@ -148,10 +148,55 @@ impl<'s> Vm<'s> {
         self.truth_value(&result)
     }
 
+    /// Compare two builtin strings directly. Code point order is UTF-8 byte order, so the
+    /// comparison is a byte scan, charged like the other string scans.
+    fn exact_string_comparison(
+        &mut self,
+        operator: ComparisonOperator,
+        left: Value<'s>,
+        right: Value<'s>,
+    ) -> Result<Option<bool>, String> {
+        // Only exact `str` values qualify: a `str` subclass may define its own comparison.
+        let is_plain = |heap: &Heap, value: Value<'s>| -> Result<bool, String> {
+            Ok(value.inline_string_ref().is_some()
+                || (value.is_object() && matches!(heap.get(value)?, Object::String(_))))
+        };
+        let ordering = {
+            let heap = &self.state.heap;
+            if !is_plain(heap, left)? || !is_plain(heap, right)? {
+                return Ok(None);
+            }
+            let (Some(left), Some(right)) = (
+                protocol::string_ref(heap, left)?,
+                protocol::string_ref(heap, right)?,
+            ) else {
+                return Ok(None);
+            };
+            left.as_str().cmp(right.as_str())
+        };
+        let result = match operator {
+            ComparisonOperator::Equal => ordering.is_eq(),
+            ComparisonOperator::NotEqual => ordering.is_ne(),
+            ComparisonOperator::Less => ordering.is_lt(),
+            ComparisonOperator::LessEqual => ordering.is_le(),
+            ComparisonOperator::Greater => ordering.is_gt(),
+            ComparisonOperator::GreaterEqual => ordering.is_ge(),
+            _ => return Ok(None),
+        };
+        self.charge_scan_pair(&left, &right)?;
+        Ok(Some(result))
+    }
+
     pub(super) fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
-        if let Some(result) = number::exact_integer_comparison(operator, left, right) {
+        if let Some(result) = number::exact_integer_comparison(operator, left, right)
+            .or_else(|| number::exact_float_comparison(operator, left, right))
+        {
+            self.push(Value::Bool(result));
+            return Ok(());
+        }
+        if let Some(result) = self.exact_string_comparison(operator, left, right)? {
             self.push(Value::Bool(result));
             return Ok(());
         }

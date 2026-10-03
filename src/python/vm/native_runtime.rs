@@ -816,6 +816,17 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
+    fn less_than(&mut self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, bool> {
+        self.compare_truth(super::super::ast::ComparisonOperator::Less, left, right)
+            .map_err(|message| {
+                if self.pending_exception.is_some() {
+                    PyError::new(PyErrorKind::Raised, message)
+                } else {
+                    PyError::type_error(message)
+                }
+            })
+    }
+
     fn get_attribute(&mut self, value: Value<'s>, name: &str) -> PyResult<'s, Option<Value<'s>>> {
         self.resolve_optional_attribute(value, name)
             .map_err(|message| {
@@ -2775,7 +2786,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     fn exec_module(&mut self, module: PyModule<'s>, path: &str) -> PyResult<'s, ()> {
         let source = self.interp.read_text(path)?;
         let code = self.compile_module_source(&source, path).map_err(|error| {
-            if error.starts_with("resource limit exceeded") || error.ends_with("too large") {
+            // A stopped resource meter is the only resource failure the front end reports.
+            if self.interp.resources.stop_reason().is_some() {
                 PyError::resource_error(error)
             } else {
                 PyError::runtime_error(error)

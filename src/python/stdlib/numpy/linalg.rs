@@ -442,6 +442,19 @@ fn qr<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     let k = rows.min(cols);
     let count = batch_count(&batch_shape);
     runtime.charge_cpu(dense::factor_cost(rows as u64, cols as u64) * count as u64)?;
+    let full = mode == "complete";
+    // A complete `q` is `rows * rows` whatever the column count; reserve it, the `r` factor and
+    // the working copy before the factorization starts so the limit stops the work up front.
+    let q_width = if full { rows } else { k };
+    if mode != "raw" {
+        let q_bytes = rows
+            .checked_mul(q_width)
+            .and_then(|q| q.checked_add(rows.saturating_mul(cols)))
+            .and_then(|elements| elements.checked_mul(count))
+            .and_then(|elements| elements.checked_mul(std::mem::size_of::<f64>()))
+            .ok_or_else(|| PyError::resource_error("qr result is too large"))?;
+        runtime.reserve_memory(q_bytes)?;
+    }
     let flat = as_f64(runtime, &a)?;
     let mats = chunks(&flat, rows, cols);
     if mode == "raw" {
@@ -469,16 +482,6 @@ fn qr<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
         let tau_array = array_from_vectors(runtime, &batch_shape, k, &tau_values, precision)?;
         return runtime.new_tuple(vec![h_array.value(), tau_array.value()]);
     }
-    let full = mode == "complete";
-    // A complete `q` is `rows * rows` whatever the column count; reserve it before building it.
-    let q_width = if full { rows } else { k };
-    let q_bytes = rows
-        .checked_mul(q_width)
-        .and_then(|q| q.checked_add(rows.saturating_mul(cols)))
-        .and_then(|elements| elements.checked_mul(count))
-        .and_then(|elements| elements.checked_mul(std::mem::size_of::<f64>()))
-        .ok_or_else(|| PyError::resource_error("qr result is too large"))?;
-    runtime.reserve_memory(q_bytes)?;
     let mut rs = Vec::with_capacity(mats.len());
     let mut qs = Vec::with_capacity(mats.len());
     for mat in &mats {
