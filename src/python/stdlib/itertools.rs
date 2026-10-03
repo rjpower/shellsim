@@ -9,7 +9,7 @@ use super::super::native::{
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "itertools",
+    name: "_itertools",
     functions: &[
         FunctionDef {
             module: "itertools",

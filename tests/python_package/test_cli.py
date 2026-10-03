@@ -123,7 +123,8 @@ def test_root_rejects_host_symlinks(tmp_path: Path) -> None:
 
 
 def test_limit_suffixes_match_the_rust_cli() -> None:
-    completed = run_cli("--cpu", "1k", "--memory", "1m", "-c", "printf bounded")
+    # The CLI runs `cd /work` before the command, and each command charges 1000 CPU units.
+    completed = run_cli("--cpu", "10k", "--memory", "1m", "-c", "printf bounded")
 
     assert completed.returncode == 0
     assert completed.stdout == b"bounded"

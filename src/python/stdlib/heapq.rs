@@ -12,7 +12,7 @@ use super::super::native::{
 };
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "heapq",
+    name: "_heapq",
     functions: &[
         FunctionDef {
             module: "heapq",

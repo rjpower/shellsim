@@ -1093,6 +1093,9 @@ impl Parser {
                     | TokenKind::Newline
                     | TokenKind::Dedent
                     | TokenKind::Eof
+                    | TokenKind::RightParen
+                    | TokenKind::RightBracket
+                    | TokenKind::RightBrace
             )
         }) {
             values.push(self.expression_item()?);
@@ -1790,7 +1793,8 @@ impl Parser {
                 }) {
                     None
                 } else {
-                    Some(Box::new(self.expression()?))
+                    // `yield a, b` yields one tuple, like `return a, b`.
+                    Some(Box::new(self.tuple_expression()?))
                 };
                 return Ok(Expression {
                     kind: ExpressionKind::Yield(value),

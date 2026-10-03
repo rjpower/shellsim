@@ -310,6 +310,11 @@ impl Vfs {
         self.disk_used
     }
 
+    /// The quota file contents count against; `u64::MAX` when no limit was configured.
+    pub fn disk_limit(&self) -> u64 {
+        self.disk_limit
+    }
+
     pub fn disk_peak(&self) -> u64 {
         self.disk_peak
     }

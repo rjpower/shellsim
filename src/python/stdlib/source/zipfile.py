@@ -6,6 +6,7 @@ four-byte checksum, which is the raw DEFLATE stream a ZIP member holds.
 """
 
 import _shellsim_vfs
+import posixpath
 import io
 import struct
 import subprocess
@@ -167,7 +168,14 @@ class ZipFile:
         self._check_writable(compress_type)
         filename = str(filename)
         if arcname is None:
-            arcname = filename.rstrip("/").split("/")[-1]
+            arcname = filename
+        # As CPython's ZipInfo.from_file: normalize the name and drop leading separators.
+        arcname = posixpath.normpath(arcname.replace("\\", "/")).lstrip("/")
+        if _shellsim_vfs.is_dir(filename):
+            if arcname != ".":
+                arcname = _safe_name(arcname) + "/"
+                self._entries.append((arcname, b"", ZIP_STORED))
+            return
         arcname = _safe_name(arcname)
         data = _shellsim_vfs.read_bytes(filename)
         self._entries.append((arcname, data, self._member_compression(compress_type)))

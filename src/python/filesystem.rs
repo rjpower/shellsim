@@ -9,7 +9,7 @@ use std::path::Path;
 use crate::interp::Interp;
 use crate::vfs::{resolve_against, VfsError};
 
-use super::native::{PyError, PyFileMetadata, PyFilesystem, PyResult};
+use super::native::{PyError, PyFileKind, PyFileMetadata, PyFilesystem, PyResult};
 
 const MAX_TEXT_FILE: usize = 4 * 1024 * 1024;
 const MODELED_GLOB_RESULT_BYTES: usize = 64;
@@ -18,19 +18,34 @@ const MODELED_DIRECTORY_ENTRY_BYTES: usize = 64;
 /// Preserve ordinary Python filesystem exception boundaries while keeping resource exhaustion
 /// distinct for the shellsim harness.
 fn map_vfs_error(error: VfsError) -> PyError {
-    let message = error.to_string();
-    match error {
-        VfsError::NotFound(_) => PyError::exception("FileNotFoundError", message),
-        VfsError::NotADir(_) => PyError::exception("NotADirectoryError", message),
-        VfsError::IsADir(_) => PyError::exception("IsADirectoryError", message),
-        VfsError::Exists(_) => PyError::exception("FileExistsError", message),
-        VfsError::ReadOnly(_) => PyError::exception("PermissionError", message),
-        VfsError::NoSpace | VfsError::TooLarge { .. } => PyError::resource_error(message),
-        VfsError::NotEmpty(_)
-        | VfsError::Loop(_)
-        | VfsError::Invalid(_)
-        | VfsError::NameTooLong(_) => PyError::exception("OSError", message),
-    }
+    let reason = error.reason();
+    let errno = match &error {
+        VfsError::NotFound(_) => 2,
+        VfsError::NotADir(_) => 20,
+        VfsError::IsADir(_) => 21,
+        VfsError::Exists(_) => 17,
+        VfsError::ReadOnly(_) => 30,
+        VfsError::NotEmpty(_) => 39,
+        VfsError::Loop(_) => 40,
+        VfsError::Invalid(_) => 22,
+        VfsError::NameTooLong(_) => 36,
+        VfsError::NoSpace | VfsError::TooLarge { .. } => {
+            return PyError::resource_error(error.to_string())
+        }
+    };
+    let path = match error {
+        VfsError::NotFound(path)
+        | VfsError::NotADir(path)
+        | VfsError::IsADir(path)
+        | VfsError::Exists(path)
+        | VfsError::ReadOnly(path)
+        | VfsError::NotEmpty(path)
+        | VfsError::Loop(path)
+        | VfsError::Invalid(path)
+        | VfsError::NameTooLong(path) => path,
+        VfsError::NoSpace | VfsError::TooLarge { .. } => unreachable!("returned above"),
+    };
+    PyError::os_error(errno, reason, Some(path))
 }
 
 /// Capability used by the VM to discover Python source without learning VFS layout policy.
@@ -63,6 +78,10 @@ fn reserve_memory(interp: &mut Interp, bytes: usize) -> PyResult<'static, ()> {
 impl PyFilesystem for Interp {
     fn current_dir(&self) -> String {
         self.cwd.clone()
+    }
+
+    fn disk_usage(&self) -> (u64, u64) {
+        (self.vfs.disk_used(), self.vfs.disk_limit())
     }
 
     fn change_dir(&mut self, path: &str) -> PyResult<'static, ()> {
@@ -183,24 +202,61 @@ impl PyFilesystem for Interp {
         Ok(entries)
     }
 
-    fn metadata(&self, path: &str) -> PyResult<'static, PyFileMetadata> {
+    fn metadata(&self, path: &str, follow: bool) -> PyResult<'static, PyFileMetadata> {
         let node = self
-            .fs_metadata(&self.cwd, path, true)
+            .fs_metadata(&self.cwd, path, follow)
             .map_err(map_vfs_error)?;
-        let size = match &node.kind {
-            crate::vfs::NodeKind::File(data) => data.len(),
-            crate::vfs::NodeKind::Symlink(target) => target.len(),
-            crate::vfs::NodeKind::Dir | crate::vfs::NodeKind::NativeExecutable(_) => 0,
+        let (size, kind) = match &node.kind {
+            crate::vfs::NodeKind::File(data) => (data.len(), PyFileKind::File),
+            crate::vfs::NodeKind::Symlink(target) => (target.len(), PyFileKind::Symlink),
+            crate::vfs::NodeKind::Dir => (0, PyFileKind::Dir),
+            crate::vfs::NodeKind::NativeExecutable(_) => (0, PyFileKind::Other),
         };
         Ok(PyFileMetadata {
             mode: node.mode,
             size,
+            mtime_ms: node.mtime,
+            kind,
         })
+    }
+
+    fn rmdir(&mut self, path: &str) -> PyResult<'static, ()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs.rmdir(&cwd, path).map_err(map_vfs_error)
+    }
+
+    fn chmod(&mut self, path: &str, mode: u32) -> PyResult<'static, ()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs.chmod(&cwd, path, mode).map_err(map_vfs_error)
+    }
+
+    fn symlink(&mut self, target: &str, link_path: &str) -> PyResult<'static, ()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        self.vfs
+            .symlink(&cwd, target, link_path)
+            .map_err(map_vfs_error)
+    }
+
+    fn read_link(&self, path: &str) -> PyResult<'static, String> {
+        self.vfs.read_link(&self.cwd, path).map_err(map_vfs_error)
+    }
+
+    fn touch(&mut self, path: &str) -> PyResult<'static, ()> {
+        self.sync_vfs_time();
+        let cwd = self.cwd.clone();
+        let now = self.vfs.mutation_time();
+        self.vfs.touch(&cwd, path, now).map_err(map_vfs_error)
     }
 
     fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<'static, ()> {
         if exist_ok && self.vfs.is_dir(&self.cwd, path) {
             return Ok(());
+        }
+        if parents && self.vfs.exists(&self.cwd, path) {
+            return Err(map_vfs_error(VfsError::Exists(path.to_string())));
         }
         self.sync_vfs_time();
         let cwd = self.cwd.clone();

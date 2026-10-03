@@ -238,13 +238,20 @@ pub struct GeneratorObject {
 }
 
 /// A regular-expression match. Boxed inside [`Object::Match`] to keep heap slots small.
-#[derive(Clone, Debug)]
+///
+/// The subject string and the `re.Pattern` are held by reference so a match costs its own
+/// group text, not a copy of the string it was found in. `spans` are character offsets into
+/// the subject per group, `None` for a group that did not participate.
+#[derive(Debug)]
 pub struct MatchObject {
+    pub subject: Ref,
+    pub regex: Ref,
     pub text: String,
     pub groups: Vec<Option<String>>,
     pub group_names: Vec<Option<String>>,
-    pub start: usize,
-    pub end: usize,
+    pub spans: Vec<Option<(usize, usize)>>,
+    pub pos: usize,
+    pub endpos: usize,
 }
 
 /// One declared `argparse` argument, with its default and choices stored as references.
@@ -1142,9 +1149,9 @@ impl Heap {
             Object::RaisesContext { .. } => BuiltinType::RaisesContext.id(),
             Object::EnumMember { .. } | Object::Namespace { .. } => BuiltinType::Native.id(),
             Object::Property { .. } => BuiltinType::Property.id(),
-            Object::StaticMethod { .. } | Object::ClassMethod { .. } | Object::Super { .. } => {
-                BuiltinType::Native.id()
-            }
+            Object::StaticMethod { .. } => BuiltinType::StaticMethod.id(),
+            Object::ClassMethod { .. } => BuiltinType::ClassMethod.id(),
+            Object::Super { .. } => BuiltinType::Native.id(),
         })
     }
 }
@@ -1283,15 +1290,19 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                 text,
                 groups,
                 group_names,
+                spans,
                 ..
             } = &**match_object;
             text.len()
-                .checked_add(
-                    groups
-                        .iter()
-                        .map(|group| group.as_ref().map_or(0, String::len))
-                        .sum(),
-                )
+                .checked_add(spans.len().saturating_mul(16))
+                .and_then(|size| {
+                    size.checked_add(
+                        groups
+                            .iter()
+                            .map(|group| group.as_ref().map_or(0, String::len))
+                            .sum(),
+                    )
+                })
                 .and_then(|size| {
                     size.checked_add(
                         group_names

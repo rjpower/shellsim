@@ -756,7 +756,9 @@ fn fraction_growth_stops_at_the_memory_limit() {
 #[test]
 fn rejection_sampling_uses_modeled_cpu_fuel() {
     let (status, stdout, stderr, usage) = run_with_limits(
-        "import random\nclass NeverAccept(random.Random):\n    def random(self):\n        self._toggle = not getattr(self, '_toggle', False)\n        return 0.5 if self._toggle else 0.9999999999999999\nprint('ready')\nNeverAccept(1).gammavariate(2.0, 1.0)",
+        // The gamma sampler discards a first draw outside (1e-7, 0.9999999), so a source that
+        // always returns 0.99999999 never leaves its rejection loop.
+        "import random\nclass NeverAccept(random.Random):\n    def random(self):\n        return 0.99999999\nprint('ready')\nNeverAccept(1).gammavariate(2.0, 1.0)",
         Limits {
             cpu: 100_000,
             ..Limits::unlimited()

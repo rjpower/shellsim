@@ -386,7 +386,7 @@ print(path.relative_to(root), path.stat().st_size, path.stat().st_mode)
         run(source),
         (
             0,
-            "/tmp/sample.txt /tmp sample.txt sample .txt\nFalse 5 True hello\nhello!\nsample.txt 6 420\n".into(),
+            "/tmp/sample.txt /tmp sample.txt sample .txt\nFalse 5 True hello\nhello!\nsample.txt 6 33188\n".into(),
             String::new(),
         )
     );
@@ -443,15 +443,27 @@ import logging
 class Example(ABC):
     @abstractmethod
     def value(self):
+        raise NotImplementedError
+
+class Concrete(Example):
+    def value(self):
         return 42
 
 logging.basicConfig(level=logging.INFO)
 logging.getLogger(__name__).info("loaded")
-print(Example().value(), Any, Optional)
+try:
+    Example()
+except TypeError:
+    print("abstract")
+print(Concrete().value(), Any, Optional)
 "#;
     assert_eq!(
         run(source),
-        (0, "42 typing.Any typing.Optional\n".into(), String::new())
+        (
+            0,
+            "abstract\n42 typing.Any typing.Optional\n".into(),
+            String::new()
+        )
     );
 }
 
@@ -500,7 +512,7 @@ except ValueError:
         run(source),
         (
             0,
-            "7 0.299265 b\n[3, 2, 1, 4] [1, 3]\nTrue 10\nempty\n".into(),
+            "9 0.302139 c\n[4, 1, 2, 3] [1, 2]\nTrue 18\nempty\n".into(),
             String::new(),
         )
     );
@@ -555,14 +567,24 @@ print(random.weibullvariate(1.0, 2.0))
 }
 
 #[test]
-fn frozen_random_unsupported_distribution_fails_at_attribute_lookup() {
+fn frozen_random_covers_every_distribution_and_rejects_unknown_names() {
     let source = r#"import random
+random.seed(3)
+print(random.paretovariate(2.0) >= 1.0, 0.0 <= random.vonmisesvariate(0.0, 1.0) <= 2 * 3.141592653589793)
+print(random.lognormvariate(0.0, 1.0) > 0.0, random.binomialvariate(10, 0.5) in range(11))
 try:
-    random.paretovariate(2.0)
+    random.not_a_distribution(2.0)
 except AttributeError:
     print('unsupported')
 "#;
-    assert_eq!(run(source), (0, "unsupported\n".into(), String::new()));
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "True True\nTrue True\nunsupported\n".into(),
+            String::new()
+        )
+    );
 }
 
 #[test]

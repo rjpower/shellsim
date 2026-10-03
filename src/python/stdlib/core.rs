@@ -117,6 +117,7 @@ pub(crate) static BYTES_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytes", "lstrip", bytes_lstrip),
         method("bytes", "rstrip", bytes_rstrip),
         method("bytes", "split", bytes_split),
+        method("bytes", "splitlines", bytes_splitlines),
         method("bytes", "upper", bytes_upper),
         method("bytes", "lower", bytes_lower),
         method("bytes", "replace", bytes_replace),
@@ -150,6 +151,7 @@ pub(crate) static BYTEARRAY_TYPE: NativeTypeDef = NativeTypeDef {
         method("bytearray", "lstrip", bytes_lstrip),
         method("bytearray", "rstrip", bytes_rstrip),
         method("bytearray", "split", bytes_split),
+        method("bytearray", "splitlines", bytes_splitlines),
         method("bytearray", "upper", bytes_upper),
         method("bytearray", "lower", bytes_lower),
         method("bytearray", "replace", bytes_replace),
@@ -220,6 +222,10 @@ pub(crate) static DICT_TYPE: NativeTypeDef = NativeTypeDef {
 
 /// `dict` methods bound to the type, so `dict.fromkeys(...)` and `{}.fromkeys(...)` agree.
 pub(crate) static DICT_CLASS_METHODS: &[MethodDef] = &[method("dict", "fromkeys", dict_fromkeys)];
+/// `bytes.fromhex` and `bytearray.fromhex`, bound to their types.
+pub(crate) static BYTES_CLASS_METHODS: &[MethodDef] = &[method("bytes", "fromhex", bytes_fromhex)];
+pub(crate) static BYTEARRAY_CLASS_METHODS: &[MethodDef] =
+    &[method("bytearray", "fromhex", bytearray_fromhex)];
 
 pub(crate) static SET_TYPE: NativeTypeDef = NativeTypeDef {
     name: "set",
@@ -272,8 +278,55 @@ pub(crate) static FROZENSET_TYPE: NativeTypeDef = NativeTypeDef {
 pub(crate) static PROPERTY_TYPE: NativeTypeDef = NativeTypeDef {
     name: "property",
     methods: &[method("property", "setter", property_setter)],
-    getters: &[],
+    getters: &[
+        GetterDef {
+            owner: "property",
+            name: "fget",
+            get: property_fget,
+        },
+        GetterDef {
+            owner: "property",
+            name: "fset",
+            get: property_fset,
+        },
+        GetterDef {
+            owner: "property",
+            name: "__isabstractmethod__",
+            get: property_is_abstract,
+        },
+    ],
 };
+
+/// `property.fget`: the getter function.
+fn property_fget<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    runtime.property_getter(receiver.cast::<PyProperty<'s>>(runtime)?)
+}
+
+/// `property.fset`: the setter function, or `None` for a read-only property.
+fn property_fset<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    Ok(runtime
+        .property_setter(receiver.cast::<PyProperty<'s>>(runtime)?)?
+        .unwrap_or(Value::None))
+}
+
+/// `property.__isabstractmethod__`: whether the getter or setter is marked abstract, so
+/// `abc.ABCMeta` sees an `@property` over an `@abstractmethod`.
+fn property_is_abstract<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+) -> PyResult<'s> {
+    let property = receiver.cast::<PyProperty<'s>>(runtime)?;
+    let mut functions = vec![runtime.property_getter(property)?];
+    functions.extend(runtime.property_setter(property)?);
+    for function in functions {
+        if let Some(flag) = runtime.get_attribute(function, "__isabstractmethod__")? {
+            if runtime.truth(&flag)? {
+                return Ok(Value::Bool(true));
+            }
+        }
+    }
+    Ok(Value::Bool(false))
+}
 
 pub(crate) static OBJECT_TYPE: NativeTypeDef = NativeTypeDef {
     name: "object",
@@ -374,8 +427,84 @@ pub(crate) static EXCEPTION_TYPE: NativeTypeDef = NativeTypeDef {
     ],
 };
 
-/// `exception.args`: the constructor arguments of a builtin exception.
+/// Attributes `OSError` derives from its constructor arguments: `errno`, `strerror`,
+/// `filename` and `filename2`, each `None` unless the exception was built with an errno and a
+/// message, as in CPython.
+pub(crate) static OS_ERROR_TYPE: NativeTypeDef = NativeTypeDef {
+    name: "OSError",
+    methods: &[],
+    getters: &[
+        GetterDef {
+            owner: "OSError",
+            name: "errno",
+            get: os_error_errno,
+        },
+        GetterDef {
+            owner: "OSError",
+            name: "strerror",
+            get: os_error_strerror,
+        },
+        GetterDef {
+            owner: "OSError",
+            name: "filename",
+            get: os_error_filename,
+        },
+        GetterDef {
+            owner: "OSError",
+            name: "filename2",
+            get: os_error_filename2,
+        },
+    ],
+};
+
+/// The errno-form arguments `(errno, strerror[, filename[, winerror[, filename2]]])` of an
+/// `OSError`, or `None` when it was built with a plain message.
+fn os_error_parts<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: &PyValue<'s>,
+) -> PyResult<'s, Option<Vec<PyValue<'s>>>> {
+    let Some((kind, args)) = runtime.exception_args(receiver)? else {
+        return Ok(None);
+    };
+    let errno_form = (2..=5).contains(&args.len())
+        && super::super::exception_types::exception_is_subclass(&kind, "OSError");
+    Ok(errno_form.then_some(args))
+}
+
+fn os_error_field<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    index: usize,
+) -> PyResult<'s> {
+    Ok(os_error_parts(runtime, &receiver)?
+        .and_then(|args| args.get(index).copied())
+        .unwrap_or(Value::None))
+}
+
+fn os_error_errno<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    os_error_field(runtime, receiver, 0)
+}
+
+fn os_error_strerror<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    os_error_field(runtime, receiver, 1)
+}
+
+fn os_error_filename<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    os_error_field(runtime, receiver, 2)
+}
+
+fn os_error_filename2<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    os_error_field(runtime, receiver, 4)
+}
+
+/// `exception.args`: the constructor arguments of a builtin exception. An `OSError` built with a
+/// filename keeps only `(errno, strerror)` in `args`, as CPython does.
 fn exception_args<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+    if let Some(args) = os_error_parts(runtime, &receiver)? {
+        if args.len() > 2 {
+            return runtime.new_tuple(args[..2].to_vec());
+        }
+    }
     let (_, args) = runtime
         .exception_args(&receiver)?
         .ok_or_else(|| PyError::type_error("descriptor 'args' requires an exception"))?;
@@ -422,6 +551,11 @@ pub(crate) static TYPE_TYPE: NativeTypeDef = NativeTypeDef {
         GetterDef {
             owner: "type",
             name: "__name__",
+            get: type_name,
+        },
+        GetterDef {
+            owner: "type",
+            name: "__qualname__",
             get: type_name,
         },
         GetterDef {
@@ -543,11 +677,82 @@ fn string_encode<'s>(
     args: CallArgs<'s>,
 ) -> PyResult<'s> {
     args.expect_positional("str.encode", 0, 2)?;
-    args.reject_keywords("str.encode")?;
+    args.reject_unknown_keywords("str.encode", &["encoding", "errors"])?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
+    let (encoding, errors) = codec_args(runtime, &args, "str.encode")?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    // The widest code point the encoding can represent; characters above it go through the
+    // error handler.
+    let limit = match encoding.as_str() {
+        "utf-8" | "utf8" => {
+            return runtime.new_bytes(value.into_bytes());
+        }
+        "ascii" | "us-ascii" => 0x7f,
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => 0xff,
+        _ => return Err(PyError::value_error("unknown text encoding")),
+    };
+    let mut encoded = Vec::with_capacity(value.len());
+    for character in value.chars() {
+        let code = u32::from(character);
+        if code <= limit {
+            encoded.push(code as u8);
+            continue;
+        }
+        match errors {
+            CodecErrors::Strict => {
+                return Err(PyError::exception(
+                    "UnicodeEncodeError",
+                    format!("'{encoding}' codec can't encode character {character:?}"),
+                ))
+            }
+            CodecErrors::Ignore => {}
+            CodecErrors::Replace => encoded.push(b'?'),
+            CodecErrors::BackslashReplace => {
+                encoded.extend_from_slice(backslash_escape(character).as_bytes())
+            }
+            CodecErrors::XmlCharRefReplace => {
+                encoded.extend_from_slice(format!("&#{code};").as_bytes())
+            }
+        }
+    }
+    runtime.new_bytes(encoded)
+}
+
+/// How a codec treats characters or bytes it cannot convert.
+#[derive(Clone, Copy)]
+enum CodecErrors {
+    Strict,
+    Ignore,
+    Replace,
+    /// `\xNN`, `\uNNNN` or `\UNNNNNNNN` escapes for what the codec cannot represent.
+    BackslashReplace,
+    /// `&#NNN;` references; encoding only.
+    XmlCharRefReplace,
+}
+
+/// The escape `backslashreplace` substitutes for one unencodable character.
+fn backslash_escape(character: char) -> String {
+    let code = u32::from(character);
+    if code <= 0xff {
+        format!("\\x{code:02x}")
+    } else if code <= 0xffff {
+        format!("\\u{code:04x}")
+    } else {
+        format!("\\U{code:08x}")
+    }
+}
+
+/// The `encoding` and `errors` arguments of `str.encode` and `bytes.decode`, positional or by
+/// keyword, with the encoding name normalized to lowercase hyphenated form.
+fn codec_args<'s>(
+    runtime: &dyn PyRuntime<'s>,
+    args: &CallArgs<'s>,
+    name: &str,
+) -> PyResult<'s, (String, CodecErrors)> {
     let encoding = args
         .positional()
         .first()
+        .or(args.keyword(name, "encoding")?)
         .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "utf-8".into())
@@ -556,40 +761,24 @@ fn string_encode<'s>(
     let errors = args
         .positional()
         .get(1)
+        .or(args.keyword(name, "errors")?)
         .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or_else(|| "strict".into());
-    if errors != "strict" {
-        return Err(PyError::value_error(
-            "only strict encoding errors are supported",
-        ));
-    }
-    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-    let encoded = match encoding.as_str() {
-        "utf-8" | "utf8" => value.into_bytes(),
-        "ascii" => {
-            if !value.is_ascii() {
-                return Err(PyError::exception(
-                    "UnicodeEncodeError",
-                    "character is outside the ASCII range",
-                ));
-            }
-            value.into_bytes()
+    let errors = match errors.as_str() {
+        "strict" => CodecErrors::Strict,
+        "ignore" => CodecErrors::Ignore,
+        "replace" => CodecErrors::Replace,
+        "backslashreplace" => CodecErrors::BackslashReplace,
+        "xmlcharrefreplace" if name == "str.encode" => CodecErrors::XmlCharRefReplace,
+        _ => {
+            return Err(PyError::exception(
+                "LookupError",
+                format!("unknown error handler name '{errors}'"),
+            ))
         }
-        "latin-1" | "latin1" | "iso-8859-1" => value
-            .chars()
-            .map(|character| {
-                u8::try_from(u32::from(character)).map_err(|_| {
-                    PyError::exception(
-                        "UnicodeEncodeError",
-                        "character is outside the Latin-1 range",
-                    )
-                })
-            })
-            .collect::<PyResult<'s, Vec<_>>>()?,
-        _ => return Err(PyError::value_error("unknown text encoding")),
     };
-    runtime.new_bytes(encoded)
+    Ok((encoding, errors))
 }
 
 fn string_lower<'s>(
@@ -826,40 +1015,55 @@ fn bytes_decode<'s>(
     args: CallArgs<'s>,
 ) -> PyResult<'s> {
     args.expect_positional("bytes.decode", 0, 2)?;
-    args.reject_keywords("bytes.decode")?;
-    let encoding = args
-        .positional()
-        .first()
-        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
-        .transpose()?
-        .unwrap_or_else(|| "utf-8".into());
-    let errors = args
-        .positional()
-        .get(1)
-        .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
-        .transpose()?
-        .unwrap_or_else(|| "strict".into());
-    if errors != "strict" {
-        return Err(PyError::value_error(
-            "only strict decoding errors are supported",
-        ));
-    }
+    args.reject_unknown_keywords("bytes.decode", &["encoding", "errors"])?;
+    let (encoding, errors) = codec_args(runtime, &args, "bytes.decode")?;
     let PyBytes(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-    let normalized = encoding.to_ascii_lowercase().replace('_', "-");
-    let decoded = match normalized.as_str() {
-        "utf-8" | "utf8" => String::from_utf8(value)
-            .map_err(|_| PyError::exception("UnicodeDecodeError", "invalid UTF-8 byte sequence"))?,
-        "ascii" => {
-            if !value.is_ascii() {
-                return Err(PyError::exception(
-                    "UnicodeDecodeError",
-                    "byte is outside the ASCII range",
-                ));
+    let decoded = match encoding.as_str() {
+        "utf-8" | "utf8" => match errors {
+            CodecErrors::Strict => String::from_utf8(value).map_err(|_| {
+                PyError::exception("UnicodeDecodeError", "invalid UTF-8 byte sequence")
+            })?,
+            CodecErrors::Replace => String::from_utf8_lossy(&value).into_owned(),
+            CodecErrors::Ignore
+            | CodecErrors::BackslashReplace
+            | CodecErrors::XmlCharRefReplace => {
+                let mut decoded = String::with_capacity(value.len());
+                for chunk in value.utf8_chunks() {
+                    decoded.push_str(chunk.valid());
+                    if matches!(errors, CodecErrors::BackslashReplace) {
+                        for byte in chunk.invalid() {
+                            decoded.push_str(&format!("\\x{byte:02x}"));
+                        }
+                    }
+                }
+                decoded
             }
-            String::from_utf8(value).expect("ASCII is valid UTF-8")
+        },
+        "ascii" | "us-ascii" => {
+            let mut decoded = String::with_capacity(value.len());
+            for byte in value {
+                if byte.is_ascii() {
+                    decoded.push(char::from(byte));
+                    continue;
+                }
+                match errors {
+                    CodecErrors::Strict => {
+                        return Err(PyError::exception(
+                            "UnicodeDecodeError",
+                            format!("'ascii' codec can't decode byte {byte:#04x}"),
+                        ))
+                    }
+                    CodecErrors::Ignore | CodecErrors::XmlCharRefReplace => {}
+                    CodecErrors::Replace => decoded.push('\u{fffd}'),
+                    CodecErrors::BackslashReplace => decoded.push_str(&format!("\\x{byte:02x}")),
+                }
+            }
+            decoded
         }
-        "latin-1" | "latin1" | "iso-8859-1" => value.into_iter().map(char::from).collect(),
+        "latin-1" | "latin1" | "iso-8859-1" | "iso8859-1" => {
+            value.into_iter().map(char::from).collect()
+        }
         _ => return Err(PyError::value_error("unknown text encoding")),
     };
     runtime.new_string(decoded)
@@ -1300,6 +1504,56 @@ fn bytes_split<'s>(
         parts.push(new_bytes_like(runtime, kind, part.to_vec())?);
         Ok(())
     })?;
+    runtime.new_list(parts)
+}
+
+/// `bytes.splitlines(keepends=False)`: split at `\n`, `\r` and `\r\n` only, unlike `str`.
+fn bytes_splitlines<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    receiver: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
+    args.expect_positional("bytes.splitlines", 0, 1)?;
+    args.reject_unknown_keywords("bytes.splitlines", &["keepends"])?;
+    let keepends = match args
+        .positional()
+        .first()
+        .or(args.keyword("bytes.splitlines", "keepends")?)
+    {
+        Some(value) => runtime.truth(value)?,
+        None => false,
+    };
+    let kind = runtime.kind(&receiver)?;
+    let PyBytes(value) = receiver.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < value.len() {
+        let byte = value[index];
+        if byte != b'\n' && byte != b'\r' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        if byte == b'\r' && value.get(end) == Some(&b'\n') {
+            end += 1;
+        }
+        let part = if keepends {
+            &value[start..end]
+        } else {
+            &value[start..index]
+        };
+        runtime.reserve_memory(std::mem::size_of::<PyValue<'s>>().saturating_add(part.len()))?;
+        parts.push(new_bytes_like(runtime, kind, part.to_vec())?);
+        start = end;
+        index = end;
+    }
+    if start < value.len() {
+        let part = &value[start..];
+        runtime.reserve_memory(std::mem::size_of::<PyValue<'s>>().saturating_add(part.len()))?;
+        parts.push(new_bytes_like(runtime, kind, part.to_vec())?);
+    }
     runtime.new_list(parts)
 }
 
@@ -2360,13 +2614,15 @@ fn string_splitlines<'s>(
     args: CallArgs<'s>,
 ) -> PyResult<'s> {
     args.expect_positional("str.splitlines", 0, 1)?;
-    args.reject_keywords("str.splitlines")?;
-    let keepends = args
+    args.reject_unknown_keywords("str.splitlines", &["keepends"])?;
+    let keepends = match args
         .positional()
         .first()
-        .map(|value| runtime.truth(value))
-        .transpose()?
-        .unwrap_or(false);
+        .or(args.keyword("str.splitlines", "keepends")?)
+    {
+        Some(value) => runtime.truth(value)?,
+        None => false,
+    };
     let OwnedPyString(value) = receiver.cast(runtime)?;
     runtime.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
     let mut lines = Vec::new();
@@ -3449,10 +3705,14 @@ fn dict_getitem<'s>(
     args.reject_keywords("dict.__getitem__")?;
     let dict = receiver.cast::<PyDict<'s>>(runtime)?;
     let key = args.positional()[0];
-    match runtime.dict_get(dict, &key)? {
-        Some(value) => Ok(value),
-        None => Err(runtime.exception_with_args("KeyError", vec![key])),
+    if let Some(value) = runtime.dict_get(dict, &key)? {
+        return Ok(value);
     }
+    // A dict subclass supplies absent keys through `__missing__`, as `d[key]` does in CPython.
+    if let Some(missing) = runtime.get_attribute_default(receiver, "__missing__")? {
+        return runtime.call_value(missing, CallArgs::new(vec![key], Vec::new()));
+    }
+    Err(runtime.exception_with_args("KeyError", vec![key]))
 }
 
 fn dict_setitem<'s>(
@@ -3705,6 +3965,60 @@ fn dict_fromkeys<'s>(
         runtime.dict_insert(dict, key, value)?;
     }
     Ok(result)
+}
+
+/// Decode pairs of hex digits, ignoring ASCII whitespace between pairs as CPython does.
+fn parse_hex_bytes<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    text: PyValue<'s>,
+) -> PyResult<'s, Vec<u8>> {
+    let OwnedPyString(text) = text.cast(runtime)?;
+    runtime.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        let digit = |position: usize| -> PyResult<'s, u8> {
+            bytes
+                .get(position)
+                .and_then(|byte| char::from(*byte).to_digit(16))
+                .map(|value| value as u8)
+                .ok_or_else(|| {
+                    PyError::value_error(format!(
+                        "non-hexadecimal number found in fromhex() arg at position {position}"
+                    ))
+                })
+        };
+        out.push(digit(index)? * 16 + digit(index + 1)?);
+        index += 2;
+    }
+    Ok(out)
+}
+
+fn bytes_fromhex<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    _class: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
+    args.expect_positional("bytes.fromhex", 1, 1)?;
+    args.reject_keywords("bytes.fromhex")?;
+    let value = parse_hex_bytes(runtime, args.positional()[0])?;
+    runtime.new_bytes(value)
+}
+
+fn bytearray_fromhex<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    _class: PyValue<'s>,
+    args: CallArgs<'s>,
+) -> PyResult<'s> {
+    args.expect_positional("bytearray.fromhex", 1, 1)?;
+    args.reject_keywords("bytearray.fromhex")?;
+    let value = parse_hex_bytes(runtime, args.positional()[0])?;
+    runtime.new_bytearray(value)
 }
 
 fn dict_copy<'s>(

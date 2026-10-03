@@ -144,12 +144,17 @@ impl<'s> Vm<'s> {
                 .collect());
         }
         if !value.is_object() {
-            return Ok(Vec::new());
+            return self.type_attribute_names(value);
         }
         match self.get(*value)? {
-            Object::Module { scope, .. } => Ok(scopes::values(self.heap(), self.handle(scope))?
-                .into_keys()
-                .collect()),
+            Object::Module { scope, .. } => {
+                let namespace = self.module_namespace(self.handle(scope))?;
+                Ok(self
+                    .namespace_entries(namespace)?
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .collect())
+            }
             Object::Class(class_object) => {
                 let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
                 for ancestor in &class_object.mro {
@@ -171,8 +176,20 @@ impl<'s> Vm<'s> {
                 }
                 Ok(names)
             }
-            _ => Ok(Vec::new()),
+            _ => self.type_attribute_names(value),
         }
+    }
+
+    /// The names a builtin value's registered type and its ancestors publish, for `dir()`.
+    fn type_attribute_names(&self, value: &Value<'s>) -> Result<Vec<String>, String> {
+        let type_id = self.type_id(value)?;
+        let ty = self.state.types.get(type_id)?;
+        let mut names = ty.attributes.keys().cloned().collect::<Vec<_>>();
+        let ancestors = ty.mro.clone();
+        for ancestor in ancestors {
+            names.extend(self.state.types.get(ancestor)?.attributes.keys().cloned());
+        }
+        Ok(names)
     }
 
     pub(super) fn call(
@@ -418,9 +435,17 @@ impl<'s> Vm<'s> {
                 let message = format!("{}() takes no keyword arguments", exception_type.0);
                 return Err(self.raise_exception("TypeError", message));
             }
+            // `OSError(errno, strerror, ...)` constructs the errno's subclass, as CPython does.
+            let kind = match arguments.first().and_then(|value| value.immediate_int()) {
+                Some(errno) if exception_type.0 == "OSError" && arguments.len() >= 2 => {
+                    i32::try_from(errno)
+                        .map_or("OSError", super::super::exception_types::os_error_subclass)
+                }
+                _ => exception_type.0,
+            };
             return Ok(CallResult::Value(self.alloc_with(|builder| {
                 Object::Exception {
-                    kind: exception_type.0.to_string(),
+                    kind: kind.to_string(),
                     args: builder.refs(arguments),
                 }
             })?));
@@ -500,7 +525,11 @@ impl<'s> Vm<'s> {
             Builtin::Print => {
                 let mut separator = " ".to_string();
                 let mut ending = "\n".to_string();
-                let mut stream = Stream::Stdout;
+                // `file` is a modeled stream or, as with `io.StringIO`, any object whose
+                // `write` method takes the text. Without `file`, a `sys.stdout` the program
+                // rebound is used, so `contextlib.redirect_stdout` captures output.
+                let mut target = None;
+                let mut flush = false;
                 for (name, value) in &keyword_arguments {
                     match name.as_str() {
                         "sep" => {
@@ -517,12 +546,9 @@ impl<'s> Vm<'s> {
                             ending = protocol::string_value(&self.state.heap, *value)?
                                 .ok_or("end must be None or a string")?;
                         }
-                        "file" => match value.native_value() {
-                            Some(NativeValue::Stream(selected)) => stream = selected,
-                            _ if value.is_none() => {}
-                            _ => return Err("print file must be a modeled text stream".into()),
-                        },
-                        "flush" => {}
+                        "file" if !value.is_none() => target = Some(*value),
+                        "file" => {}
+                        "flush" => flush = self.truth_value(value)?,
                         _ => {
                             return Err(format!(
                                 "print() got an unexpected keyword argument {name:?}"
@@ -530,13 +556,34 @@ impl<'s> Vm<'s> {
                         }
                     }
                 }
+                if target.is_none() {
+                    if let Some(sys) = self.loaded_module("sys") {
+                        target = self.resolve_attribute(sys, "stdout")?;
+                    }
+                }
                 let mut rendered = Vec::with_capacity(arguments.len());
                 for value in &arguments {
                     rendered.push(self.display_value(value)?);
                 }
                 let text = rendered.join(&separator);
-                self.write_output(stream, text.as_bytes());
-                self.write_output(stream, ending.as_bytes());
+                let target = target.unwrap_or(Value::Native(NativeValue::Stream(Stream::Stdout)));
+                if let Some(NativeValue::Stream(stream)) = target.native_value() {
+                    self.write_output(stream, text.as_bytes());
+                    self.write_output(stream, ending.as_bytes());
+                    return Ok(CallResult::Value(Value::None));
+                }
+                let write = self
+                    .resolve_attribute(target, "write")?
+                    .ok_or_else(|| self.raise_object_type_error(&target, "has no write method"))?;
+                for piece in [text, ending] {
+                    let piece = self.allocate_string(piece)?;
+                    self.invoke_value(write, vec![piece])?;
+                }
+                if flush {
+                    if let Some(flush) = self.resolve_attribute(target, "flush")? {
+                        self.invoke_value(flush, Vec::new())?;
+                    }
+                }
                 Ok(CallResult::Value(Value::None))
             }
             Builtin::Input => {
@@ -803,11 +850,16 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 1, 1)?;
                 let values = self.iterable_values(&arguments[0])?;
                 let mut key_function = None;
+                let mut saw_key = false;
                 let mut reverse = false;
                 let mut saw_reverse = false;
                 for (name, value) in keyword_arguments {
                     match name.as_str() {
-                        "key" if key_function.is_none() => key_function = Some(value),
+                        // `key=None` means no key function, as in CPython.
+                        "key" if key_function.is_none() && !saw_key => {
+                            key_function = (!value.is_none()).then_some(value);
+                            saw_key = true;
+                        }
                         "reverse" if !saw_reverse => {
                             reverse = self.truth_value(&value)?;
                             saw_reverse = true;
@@ -1135,31 +1187,6 @@ impl<'s> Vm<'s> {
                 }
                 Ok(CallResult::Value(Value::Bool(result)))
             }
-            Builtin::Property => {
-                expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::Property {
-                        getter: builder.store(arguments[0]),
-                        setter: None,
-                    }
-                })?))
-            }
-            Builtin::StaticMethod => {
-                expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::StaticMethod {
-                        callable: builder.store(arguments[0]),
-                    }
-                })?))
-            }
-            Builtin::ClassMethod => {
-                expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::ClassMethod {
-                        callable: builder.store(arguments[0]),
-                    }
-                })?))
-            }
             Builtin::Super => {
                 expect_arity(&arguments, 0, 2)?;
                 let (start_class, receiver) = match arguments.as_slice() {
@@ -1297,6 +1324,55 @@ impl<'s> Vm<'s> {
 
     /// Apply the default class constructor after any metaclass `__call__` override has had
     /// its turn. Direct `type.__call__` enters here with metaclass dispatch disabled.
+    /// `TypeError` when `class` carries a non-empty `__abstractmethods__`, which `abc.ABCMeta`
+    /// sets on every class it creates. Only the class's own attribute is consulted, so ordinary
+    /// instantiation costs one hash lookup.
+    fn reject_abstract_instantiation(
+        &mut self,
+        class: Value<'s>,
+        name: &str,
+    ) -> Result<(), String> {
+        let Object::Class(class_object) = self.get(class)? else {
+            return Ok(());
+        };
+        let Some(abstract_methods) = class_object.attributes.get("__abstractmethods__") else {
+            return Ok(());
+        };
+        let abstract_methods = self.handle(abstract_methods);
+        if !abstract_methods.is_object() {
+            return Ok(());
+        }
+        let names = match self.get(abstract_methods)? {
+            Object::Set(members) | Object::FrozenSet(members) => self.handles(members),
+            _ => return Ok(()),
+        };
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut names = names
+            .iter()
+            .filter_map(|value| {
+                protocol::string_value(&self.state.heap, *value)
+                    .ok()
+                    .flatten()
+            })
+            .map(|name| format!("'{name}'"))
+            .collect::<Vec<_>>();
+        names.sort();
+        let plural = if names.len() == 1 {
+            "method"
+        } else {
+            "methods"
+        };
+        Err(self.raise_exception(
+            "TypeError",
+            format!(
+                "Can't instantiate abstract class {name} without an implementation for abstract {plural} {}",
+                names.join(", ")
+            ),
+        ))
+    }
+
     fn call_user_class(
         &mut self,
         class: Value<'s>,
@@ -1324,6 +1400,7 @@ impl<'s> Vm<'s> {
                 return self.invoke_call(callable, arguments, keyword_arguments);
             }
         }
+        self.reject_abstract_instantiation(class, &name)?;
         if !enum_members.is_empty() {
             if !keyword_arguments.is_empty() || arguments.len() != 1 {
                 return Err(format!("{name}() expects one value"));
@@ -2140,6 +2217,19 @@ impl<'s> Vm<'s> {
             PyErrorKind::Overflow => Some("OverflowError"),
             PyErrorKind::Runtime => Some("RuntimeError"),
             PyErrorKind::Exception(kind) => Some(kind),
+            PyErrorKind::OsError { errno, filename } => {
+                let kind = super::super::exception_types::os_error_subclass(errno);
+                let mut args = vec![Value::Int(i64::from(errno))];
+                let strerror = self.allocate_string(error.message.clone());
+                let filename = filename.map(|filename| self.allocate_string(filename));
+                if let (Ok(strerror), Ok(filename)) = (strerror, filename.transpose()) {
+                    args.push(strerror);
+                    args.extend(filename);
+                    let message = self.raise_exception_args(kind, args);
+                    return message;
+                }
+                return error.message;
+            }
             PyErrorKind::Resource
             | PyErrorKind::Unsupported
             | PyErrorKind::Raised

@@ -16,6 +16,9 @@ use super::{
     SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
+/// Positional and keyword arguments of one call, as the call machinery passes them.
+type CallArguments<'s> = (Vec<Value<'s>>, Vec<(String, Value<'s>)>);
+
 /// Items of a builtin container whose `repr` the VM renders item by item.
 enum ContainerItems<'s> {
     List(Vec<Value<'s>>),
@@ -98,10 +101,26 @@ impl<'s> Vm<'s> {
     /// raise CPython's `AttributeError`, so `try`/`except` fallbacks for a missing module member
     /// work. On a builtin value a missing name is almost always a method shellsim does not model,
     /// so it stays an unsupported-feature error that user code cannot catch and misread as
-    /// absence; `hasattr` and `getattr` defaults still observe the absence without raising.
+    /// absence; `hasattr` and `getattr` defaults still observe the absence without raising. A
+    /// missing special method (`__exit__`, `__bytes__`, ...) is the exception: programs probe
+    /// those with `try`/`except AttributeError` to pick a protocol, and the set of special names
+    /// a builtin type supports is a modeled decision rather than a gap.
     pub(super) fn missing_attribute(&mut self, owner: &Value<'s>, name: &str) -> String {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
             let message = format!("module '{}' has no attribute '{name}'", module.name);
+            return self.raise_exception("AttributeError", message);
+        }
+        let is_special = name.len() > 4 && name.starts_with("__") && name.ends_with("__");
+        if is_special && !owner.is_object() {
+            let message = match owner.native_value() {
+                Some(NativeValue::BuiltinType(builtin)) => {
+                    format!("type object '{}' has no attribute '{name}'", builtin.name())
+                }
+                _ => match self.type_name_of(owner) {
+                    Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
+                    Err(error) => return error,
+                },
+            };
             return self.raise_exception("AttributeError", message);
         }
         let message = match owner.is_object().then(|| self.get(*owner)) {
@@ -112,10 +131,12 @@ impl<'s> Vm<'s> {
                 let class_name = &class_object.name;
                 format!("type object '{class_name}' has no attribute '{name}'")
             }
-            Some(Ok(Object::Instance { .. } | Object::Bare)) => match self.type_name_of(owner) {
-                Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
-                Err(error) => return error,
-            },
+            Some(Ok(Object::Instance { .. } | Object::Bare | Object::Exception { .. })) => {
+                match self.type_name_of(owner) {
+                    Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
+                    Err(error) => return error,
+                }
+            }
             Some(Err(error)) => return error,
             _ => return format!("attribute {name:?} is not implemented"),
         };
@@ -499,14 +520,14 @@ impl<'s> Vm<'s> {
         if owner.is_object() {
             match self.get(owner)? {
                 Object::Module { scope, .. } => {
-                    let scope = self.handle(scope);
-                    if let Some(value) = self.scope_get(scope, name)? {
+                    let namespace = self.module_namespace(self.handle(scope))?;
+                    if let Some(value) = self.namespace_lookup(namespace, name)? {
                         return Ok(Some(value));
                     }
                     // PEP 562: a module-level `__getattr__` supplies names the module does not
                     // define, which is how packages import submodules lazily. It runs after
                     // the type's attributes, of which modules model only `__class__`.
-                    let hook = self.scope_get(scope, "__getattr__")?;
+                    let hook = self.namespace_lookup(namespace, "__getattr__")?;
                     let Some(hook) = hook.filter(|_| name != "__class__") else {
                         return Ok(None);
                     };
@@ -526,6 +547,12 @@ impl<'s> Vm<'s> {
                     }
                     if let Some(value) = attributes.get(name) {
                         return Ok(Some(self.handle(value)));
+                    }
+                    if name == "__doc__" {
+                        let Some(docstring) = function_object.code.docstring.clone() else {
+                            return Ok(Some(Value::None));
+                        };
+                        return Ok(Some(self.allocate_string(docstring.to_string())?));
                     }
                     if name == "__module__" {
                         let closure = self.handle_optional(closure.as_ref());
@@ -603,6 +630,19 @@ impl<'s> Vm<'s> {
                         .ok_or("instance has no registered class")?;
                     let class_entry = self.type_lookup(class_type, name)?;
                     if let Some((defining_type, descriptor)) = class_entry {
+                        // A native getter on a user exception instance models a C struct slot
+                        // such as `OSError.filename`: an assigned value replaces the derived one.
+                        let overridable_getter = matches!(
+                            descriptor.native_value(),
+                            Some(NativeValue::NativeGetter(_))
+                        ) && self.user_exception_base(&owner)?.is_some();
+                        let instance_value = match (overridable_getter, symbol) {
+                            (true, Some(symbol)) => self.attribute_by_symbol(owner, symbol)?,
+                            _ => None,
+                        };
+                        if let Some(value) = instance_value {
+                            return Ok(Some(value));
+                        }
                         if self.is_data_descriptor(&descriptor)? {
                             return self.bind_type_attribute(
                                 descriptor,
@@ -675,6 +715,19 @@ impl<'s> Vm<'s> {
                         .map(|(_, value)| self.handle(value));
                     return Ok(value);
                 }
+                // `classmethod` and `staticmethod` expose the wrapped callable and forward the
+                // metadata attributes `functools.wraps` and `abc` read from it.
+                Object::StaticMethod { callable } | Object::ClassMethod { callable } => {
+                    let callable = self.handle(callable);
+                    if name == "__func__" || name == "__wrapped__" {
+                        return Ok(Some(callable));
+                    }
+                    let forwarded = self.lookup_attribute(callable, None, name)?;
+                    if name == "__isabstractmethod__" {
+                        return Ok(Some(forwarded.unwrap_or(Value::Bool(false))));
+                    }
+                    return Ok(forwarded);
+                }
                 Object::Slice { start, stop, step } => {
                     let component = match name {
                         "start" => start,
@@ -744,11 +797,9 @@ impl<'s> Vm<'s> {
                         })
                         .map(Some),
                     Object::Module { scope, .. } => {
-                        let scope = self.handle(scope);
-                        self.alloc_with(|b| {
-                            Object::NamespaceDict(NamespaceTarget::Scope(b.store(scope)))
-                        })
-                        .map(Some)
+                        let namespace = self.module_namespace(self.handle(scope))?;
+                        self.alloc_with(|b| Object::NamespaceDict(namespace.store(b)))
+                            .map(Some)
                     }
                     _ => Ok(None),
                 };
@@ -850,6 +901,10 @@ impl<'s> Vm<'s> {
                     Object::Function { .. } => {
                         return self.set_function_attribute(owner, name, Some(value))
                     }
+                    Object::Module { scope, .. } => {
+                        let namespace = self.module_namespace(self.handle(scope))?;
+                        return self.namespace_store(namespace, name.to_string(), value);
+                    }
                     // `BaseException.args` is writable and stores any iterable as a tuple.
                     Object::Exception { args, .. } if name == "args" => {
                         let current = args.len();
@@ -919,7 +974,10 @@ impl<'s> Vm<'s> {
             if matches!(
                 descriptor.native_value(),
                 Some(NativeValue::NativeGetter(_))
-            ) && !(name == "args" && self.user_exception_base(&owner)?.is_some())
+            ) && !(matches!(
+                name,
+                "args" | "errno" | "strerror" | "filename" | "filename2"
+            ) && self.user_exception_base(&owner)?.is_some())
             {
                 let type_name = self.type_name_of(&owner)?;
                 return Err(self.raise_exception(
@@ -1021,8 +1079,8 @@ impl<'s> Vm<'s> {
             Object::Class { .. } => return self.set_class_attribute(owner, name, None),
             Object::Function { .. } => return self.set_function_attribute(owner, name, None),
             Object::Module { scope, .. } => {
-                let scope = self.handle(scope);
-                if scopes::remove(&mut self.state.heap, scope, name)?.is_none() {
+                let namespace = self.module_namespace(self.handle(scope))?;
+                if self.namespace_delete(namespace, name)?.is_none() {
                     return Err(self.missing_attribute(&owner, name));
                 }
                 return Ok(());
@@ -1338,10 +1396,10 @@ impl<'s> Vm<'s> {
                 .ok_or("environment key must be a string")?
                 .as_str()
                 .to_string();
-            let value = self
-                .interp
-                .get_var(&name)
-                .ok_or_else(|| format!("environment key not found: {name}"))?;
+            let Some(value) = self.interp.get_var(&name) else {
+                let key = self.allocate_string(name)?;
+                return Err(self.raise_exception_args("KeyError", vec![key]));
+            };
             self.allocate_string(value)?
         } else if let Some(character) = self.string_subscript(&owner, &index)? {
             self.allocate_string(character.to_string())?
@@ -1496,7 +1554,23 @@ impl<'s> Vm<'s> {
                         return Err(self.raise_exception_args("KeyError", vec![index]));
                     }
                 }
-                BuiltinSubscript::Set | BuiltinSubscript::Unsupported => {
+                BuiltinSubscript::Unsupported => {
+                    // A native type such as `re.Match` is subscriptable through the
+                    // `__getitem__` method it publishes; the method sees the object itself.
+                    let type_id = self.type_id(&owner)?;
+                    let native_method =
+                        self.type_lookup(type_id, "__getitem__")?
+                            .and_then(|(_, descriptor)| match descriptor.native_value() {
+                                Some(NativeValue::NativeMethod(method)) => Some(method),
+                                _ => None,
+                            });
+                    let Some(method) = native_method else {
+                        return Err(self.raise_object_type_error(&owner, "is not subscriptable"));
+                    };
+                    (method.call)(self, owner, CallArgs::new(vec![index], Vec::new()))
+                        .map_err(|error| self.record_native_error(error))?
+                }
+                BuiltinSubscript::Set => {
                     return Err(self.raise_object_type_error(&owner, "is not subscriptable"))
                 }
             }
@@ -2201,6 +2275,14 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        // The class body starts with `__module__` bound to the defining module's `__name__`, as
+        // CPython's compiler arranges, so a metaclass `__new__` running in another module does
+        // not relabel the class.
+        if !prepared_namespace.contains_key("__module__") {
+            if let Some(module) = self.current_module_name()? {
+                prepared_namespace.insert("__module__".into(), module);
+            }
+        }
         let parent = self.handle_optional(self.local_scopes.last());
         let uses_repl_globals = parent
             .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
@@ -2237,6 +2319,13 @@ impl<'s> Vm<'s> {
             }
         }
         let mut attributes = scopes::values(self.heap(), scope)?;
+        if !attributes.contains_key("__doc__") {
+            let docstring = match code.docstring.clone() {
+                Some(text) => self.allocate_string(text.to_string())?,
+                None => Value::None,
+            };
+            attributes.insert("__doc__".into(), docstring);
+        }
         if is_named_tuple {
             let class = self.named_tuple_class(&name, fields, &bindings, attributes)?;
             self.push(class);
@@ -2534,6 +2623,19 @@ impl<'s> Vm<'s> {
     }
 
     /// The `__name__` global of the module whose code is running.
+    /// The namespace a module object's attributes live in. The `__main__` module's scope defers
+    /// to the script's global table, so its attributes are the script's globals.
+    pub(super) fn module_namespace(
+        &self,
+        scope: Value<'s>,
+    ) -> Result<super::namespace::NamespaceHandle<'s>, String> {
+        if scopes::uses_repl_globals(self.heap(), scope)? {
+            Ok(super::namespace::NamespaceHandle::Repl)
+        } else {
+            Ok(super::namespace::NamespaceHandle::Scope(scope))
+        }
+    }
+
     fn current_module_name(&mut self) -> Result<Option<Value<'s>>, String> {
         let scope = self.handle_optional(self.local_scopes.last());
         self.module_name_of(scope)
@@ -3934,6 +4036,26 @@ impl<'s> Vm<'s> {
         Ok(entries)
     }
 
+    /// `int(text, base=n)`: move the `base` keyword into the positional slot `int()` parses.
+    fn int_base_keyword(
+        &mut self,
+        mut arguments: Vec<Value<'s>>,
+        mut keyword_arguments: Vec<(String, Value<'s>)>,
+    ) -> Result<CallArguments<'s>, String> {
+        let Some(position) = keyword_arguments
+            .iter()
+            .position(|(name, _)| name == "base")
+        else {
+            return Ok((arguments, keyword_arguments));
+        };
+        if arguments.len() != 1 {
+            let message = "int() missing string argument";
+            return Err(self.raise_exception("TypeError", message));
+        }
+        arguments.push(keyword_arguments.remove(position).1);
+        Ok((arguments, keyword_arguments))
+    }
+
     pub(super) fn call_builtin_type(
         &mut self,
         builtin_type: BuiltinType,
@@ -3963,6 +4085,11 @@ impl<'s> Vm<'s> {
             });
             return Err(self.record_native_error(error));
         }
+        let (arguments, keyword_arguments) = if builtin_type == BuiltinType::Int {
+            self.int_base_keyword(arguments, keyword_arguments)?
+        } else {
+            (arguments, keyword_arguments)
+        };
         if !keyword_arguments.is_empty() {
             return Err(format!(
                 "{}() does not accept keyword arguments in this slice",
@@ -4192,6 +4319,24 @@ impl<'s> Vm<'s> {
                         self.reserve_result(length)?;
                         vec![0; length]
                     }
+                    [value]
+                        if builtin_type == BuiltinType::Bytes
+                            && self.special_method(value, "__bytes__")?.is_some() =>
+                    {
+                        let converted = self
+                            .conversion_method(value, "__bytes__")?
+                            .expect("special method found above");
+                        match protocol::bytes_value(&self.state.heap, converted)? {
+                            Some(bytes) => bytes,
+                            None => {
+                                let message = format!(
+                                    "__bytes__ returned non-bytes (type {})",
+                                    self.type_name_of(&converted)?
+                                );
+                                return Err(self.raise_exception("TypeError", message));
+                            }
+                        }
+                    }
                     [value] => {
                         let items = self.iterable_values(value)?;
                         let mut bytes = Vec::with_capacity(items.len());
@@ -4262,6 +4407,27 @@ impl<'s> Vm<'s> {
                 }
             }
             BuiltinType::Dict => unreachable!("dict construction returned above"),
+            BuiltinType::Property => {
+                expect_arity(&arguments, 0, 2)?;
+                let getter = arguments.first().copied().unwrap_or(Value::None);
+                let setter = arguments.get(1).copied().filter(|value| !value.is_none());
+                self.alloc_with(|builder| Object::Property {
+                    getter: builder.store(getter),
+                    setter: setter.map(|value| builder.store(value)),
+                })?
+            }
+            BuiltinType::StaticMethod => {
+                expect_arity(&arguments, 1, 1)?;
+                self.alloc_with(|builder| Object::StaticMethod {
+                    callable: builder.store(arguments[0]),
+                })?
+            }
+            BuiltinType::ClassMethod => {
+                expect_arity(&arguments, 1, 1)?;
+                self.alloc_with(|builder| Object::ClassMethod {
+                    callable: builder.store(arguments[0]),
+                })?
+            }
             BuiltinType::Function
             | BuiltinType::Module
             | BuiltinType::Iterator
@@ -4277,7 +4443,6 @@ impl<'s> Vm<'s> {
             | BuiltinType::MappingProxy
             | BuiltinType::ArgumentParser
             | BuiltinType::RaisesContext
-            | BuiltinType::Property
             | BuiltinType::Regex
             | BuiltinType::Match
             | BuiltinType::Array
@@ -4391,10 +4556,40 @@ impl<'s> Vm<'s> {
                 return Ok(false);
             }
         }
+        if let Some(answer) = self.metaclass_check(class, "__instancecheck__", value)? {
+            return Ok(answer);
+        }
         let class = self
             .class_type_id(class)?
             .ok_or("isinstance() requires a class argument")?;
         self.state.types.is_subclass(self.type_id(value)?, class)
+    }
+
+    /// Ask a user metaclass's `__instancecheck__` or `__subclasscheck__` about `subject`, when
+    /// `class` is a class whose metaclass defines the hook. `None` leaves the decision to the
+    /// ordinary type hierarchy, as for classes created by `type` itself.
+    fn metaclass_check(
+        &mut self,
+        class: &Value<'s>,
+        hook: &str,
+        subject: &Value<'s>,
+    ) -> Result<Option<bool>, String> {
+        if !class.is_object() {
+            return Ok(None);
+        }
+        let Object::Class(class_object) = self.get(*class)? else {
+            return Ok(None);
+        };
+        let metaclass = self.handle(&class_object.metaclass);
+        if !metaclass.is_object() || !matches!(self.get(metaclass)?, Object::Class(_)) {
+            return Ok(None);
+        }
+        let Some((owner, descriptor)) = self.class_attribute_entry(metaclass, hook)? else {
+            return Ok(None);
+        };
+        let method = self.bind_descriptor(descriptor, Some(*class), metaclass, owner)?;
+        let answer = self.invoke_value(method, vec![*subject])?;
+        self.truth_value(&answer).map(Some)
     }
 
     pub(super) fn is_subclass(
@@ -4413,6 +4608,9 @@ impl<'s> Vm<'s> {
                 }
                 return Ok(false);
             }
+        }
+        if let Some(answer) = self.metaclass_check(base, "__subclasscheck__", class)? {
+            return Ok(answer);
         }
         let class = self
             .class_type_id(class)?

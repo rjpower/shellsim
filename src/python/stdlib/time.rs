@@ -5,7 +5,7 @@ use super::super::number::PyNumber;
 use super::super::{native::PyValueCast, Value};
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "time",
+    name: "_time",
     functions: &[
         FunctionDef {
             module: "time",

@@ -384,3 +384,6 @@ def _namedtuple_from_class(typename, fields, namespace, module):
         if key not in _NAMED_TUPLE_SPECIAL and key not in fields:
             setattr(result, key, value)
     return result
+
+
+import collections.abc as abc

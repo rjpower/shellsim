@@ -49,6 +49,8 @@ pub struct Code {
     pub parameters: Box<[Parameter]>,
     /// Call-shape facts derived once by the compiler and shared by every invocation.
     pub call_signature: CallSignature,
+    /// The leading string literal of the body, exposed as `__doc__`.
+    pub docstring: Option<Arc<str>>,
     /// Stable slot names for locals owned by this code object.
     pub local_names: Arc<[String]>,
     names: Box<[Arc<str>]>,
@@ -576,6 +578,7 @@ impl CodeBuilder {
         parameters: Vec<Parameter>,
         local_names: Vec<String>,
         is_coroutine: bool,
+        docstring: Option<Arc<str>>,
     ) -> CodeRef {
         let positional_count = parameters
             .iter()
@@ -610,6 +613,7 @@ impl CodeBuilder {
             spans: spans.into_boxed_slice(),
             parameters: parameters.into_boxed_slice(),
             call_signature,
+            docstring,
             local_names: local_names.into(),
             names: self.names.into_boxed_slice(),
             constants: self.constants.into_boxed_slice(),
