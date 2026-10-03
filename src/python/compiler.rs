@@ -10,7 +10,7 @@ use super::bytecode::{
     ParameterKind as BytecodeParameterKind,
 };
 use super::source::Span;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 /// The parameter holding a comprehension's outermost iterator. CPython names it `.0` too; the
 /// name cannot collide with an identifier.
@@ -129,6 +129,9 @@ struct LoopContext {
 enum Cleanup {
     Finally(Vec<Statement>),
     WithExit,
+    /// An `except` body or a `finally` body entered through an exception: leaving it by
+    /// `return`, `break` or `continue` releases the exception it was handling.
+    ExceptHandler,
 }
 
 fn compile_parameter_kind(kind: AstParameterKind) -> BytecodeParameterKind {
@@ -170,29 +173,37 @@ impl Compiler {
             .map(|parameter| parameter.name.clone())
             .collect::<Vec<_>>();
         if resolution == NameResolution::Local {
+            // Index the slots by name so resolution stays linear in the instruction count.
+            let mut slots: HashMap<String, usize> = local_names
+                .iter()
+                .enumerate()
+                .map(|(slot, name)| (name.clone(), slot))
+                .collect();
             for instruction in &instructions {
                 if let Operation::StoreName(name) = &instruction.operation {
                     if !self.globals.contains(name)
                         && !self.nonlocals.contains(name)
-                        && !local_names.contains(name)
+                        && !slots.contains_key(name)
                     {
-                        local_names.push(name.clone());
+                        slots.insert(name.clone(), slots.len());
                     }
                 }
             }
+            let mut resolved = vec![String::new(); slots.len()];
+            for (name, slot) in &slots {
+                resolved[*slot] = name.clone();
+            }
             for instruction in &mut instructions {
                 let replacement = match &instruction.operation {
-                    Operation::LoadName(name) => local_names
-                        .iter()
-                        .position(|local| local == name)
-                        .map(Operation::LoadLocal),
-                    Operation::StoreName(name) => local_names
-                        .iter()
-                        .position(|local| local == name)
-                        .map(Operation::StoreLocal),
-                    Operation::DeleteName(name) => local_names
-                        .iter()
-                        .position(|local| local == name)
+                    Operation::LoadName(name) => {
+                        slots.get(name.as_str()).copied().map(Operation::LoadLocal)
+                    }
+                    Operation::StoreName(name) => {
+                        slots.get(name.as_str()).copied().map(Operation::StoreLocal)
+                    }
+                    Operation::DeleteName(name) => slots
+                        .get(name.as_str())
+                        .copied()
                         .map(Operation::DeleteLocal),
                     _ => None,
                 };
@@ -200,6 +211,7 @@ impl Compiler {
                     instruction.operation = operation;
                 }
             }
+            local_names = resolved;
         } else if resolution == NameResolution::Global {
             for instruction in &mut instructions {
                 instruction.operation =
@@ -708,8 +720,10 @@ impl Compiler {
                         Some(self.emit(Operation::TryBegin(usize::MAX), span))
                     };
                     self.protected_regions.push("try/except/finally");
+                    self.finalizers.push(Cleanup::ExceptHandler);
                     self.finalizers.push(Cleanup::Finally(finalbody.clone()));
                     self.statements(handler.body);
+                    self.finalizers.pop();
                     self.finalizers.pop();
                     self.protected_regions.pop();
                     if let Some(handler_body_try) = handler_body_try {
@@ -732,7 +746,9 @@ impl Compiler {
                     self.patch_jump(previous, self.instructions.len());
                 }
                 self.emit(Operation::PopTop, span);
+                self.finalizers.push(Cleanup::ExceptHandler);
                 self.statements(finalbody.clone());
+                self.finalizers.pop();
                 self.emit(Operation::Reraise, span);
                 let normal_start = self.instructions.len();
                 self.patch_jump(normal, normal_start);
@@ -855,6 +871,9 @@ impl Compiler {
                     // is not mistaken for an exception from the body.
                     self.emit(Operation::TryEnd, span);
                     self.emit(Operation::WithExit, span);
+                }
+                Cleanup::ExceptHandler => {
+                    self.emit(Operation::ClearException, span);
                 }
             }
         }
@@ -1712,6 +1731,35 @@ mod tests {
         };
         assert_eq!(code.name(name), "x");
         assert_eq!(code.instructions.last().unwrap().opcode, Opcode::Halt);
+    }
+
+    #[test]
+    fn leaving_a_handler_early_clears_the_handled_exception() {
+        // The handler body is wrapped in a function so `return` is legal; its code object is the
+        // one whose instructions are counted.
+        let clears = |body: &str| {
+            let source = format!(
+                "def h():\n    for x in y:\n        try:\n            f()\n        except E:\n            {body}\n"
+            );
+            let module = compile(parse(lex(&source).unwrap()).unwrap());
+            let Opcode::MakeFunction(function) = module.instructions[0].opcode else {
+                panic!("function definition must create a code object")
+            };
+            module
+                .function(function)
+                .code
+                .instructions
+                .iter()
+                .filter(|instruction| matches!(instruction.opcode, Opcode::ClearException))
+                .count()
+        };
+        let fallthrough = clears("g()");
+        for exit in ["continue", "break", "return 1"] {
+            assert!(
+                clears(exit) > fallthrough,
+                "{exit} must clear the exception before leaving the handler"
+            );
+        }
     }
 
     #[test]

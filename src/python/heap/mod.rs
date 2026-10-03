@@ -228,7 +228,8 @@ pub struct GeneratorObject {
     pub code: CodeRef,
     pub scope: Ref,
     pub instruction_pointer: usize,
-    pub handlers: Vec<(usize, usize)>,
+    /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
+    pub handlers: Vec<(usize, usize, usize)>,
     pub exceptions: Vec<(String, Ref)>,
     pub stack: Vec<Ref>,
     pub exhausted: bool,
@@ -567,7 +568,13 @@ impl Builder<'_> {
     }
 
     pub fn refs<'s>(&self, values: impl IntoIterator<Item = Value<'s>>) -> Vec<Ref> {
-        values.into_iter().map(|value| self.store(value)).collect()
+        // Collecting straight from a `Vec<Value>` would reuse its allocation in place, so a
+        // list cut down to a few items could keep the capacity of the snapshot it came from.
+        // The modeled size counts items, so build exactly the storage the items need.
+        let values = values.into_iter();
+        let mut refs = Vec::with_capacity(values.size_hint().0);
+        refs.extend(values.map(|value| self.store(value)));
+        refs
     }
 
     pub fn named<'s>(

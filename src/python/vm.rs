@@ -525,6 +525,7 @@ impl VmProgram {
                 instruction_pointer: 0,
                 stack_base: 0,
                 handlers: Vec::new(),
+                exception_base: 0,
                 function_return: None,
                 pending_native_call: None,
             });
@@ -602,7 +603,7 @@ struct VmState {
     with_contexts: Vec<Ref>,
     /// (class, receiver) pairs for frames executing a method, for zero-argument `super()`.
     method_frames: Vec<(Ref, Ref)>,
-    code_caches: Vec<CodeCaches>,
+    code_caches: CodeCacheTable,
     stdin_position: usize,
     stdin_text: Option<String>,
     /// Bytes read from fd 0 but not yet consumed by a completed `read`/`readline`, kept across
@@ -677,7 +678,7 @@ impl Roots for VmState {
             visitor(class);
             visitor(receiver);
         }
-        for caches in &mut self.code_caches {
+        for caches in self.code_caches.iter_mut() {
             if let Some(attributes) = &mut caches.attributes {
                 for cache in attributes.iter_mut().flatten() {
                     visitor(&mut cache.class);
@@ -707,6 +708,103 @@ struct CodeCaches {
     code: CodeRef,
     names: Vec<Option<SymbolId>>,
     attributes: Option<Vec<Option<LoadAttributeCache>>>,
+}
+
+/// Per-code inline caches in stable slots.
+///
+/// A slot index stays valid while its code object is alive, which lets the dispatch cursor
+/// hold one for a whole quantum. Code that only the table still references, such as a
+/// finished `eval` or `exec` expression, is dropped when the table is pruned, so a program that
+/// compiles source in a loop does not accumulate caches without bound or pay a linear lookup
+/// for each one.
+#[derive(Clone, Default)]
+struct CodeCacheTable {
+    slots: Vec<Option<CodeCaches>>,
+    /// Slot of each live code object, keyed by the `Arc` address.
+    by_code: HashMap<usize, usize>,
+    free: Vec<usize>,
+    /// Live slot count at which the next prune runs; doubles with the surviving set.
+    prune_at: usize,
+}
+
+/// Fewest live caches kept before pruning is considered.
+const CODE_CACHE_PRUNE_FLOOR: usize = 64;
+
+impl CodeCacheTable {
+    fn slot_of(&self, code: &CodeRef) -> Option<usize> {
+        self.by_code.get(&(Arc::as_ptr(code) as usize)).copied()
+    }
+
+    fn get(&self, slot: usize) -> Option<&CodeCaches> {
+        self.slots.get(slot)?.as_ref()
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut CodeCaches> {
+        self.slots.iter_mut().flatten()
+    }
+
+    /// Install caches for `code` and return their slot. Before growing past the prune
+    /// threshold, release every cache whose code nothing else references; `release` receives
+    /// the modeled bytes each one held.
+    fn insert(&mut self, caches: CodeCaches, mut release: impl FnMut(usize)) -> usize {
+        if self.by_code.len() >= self.prune_at.max(CODE_CACHE_PRUNE_FLOOR) {
+            for (slot, entry) in self.slots.iter_mut().enumerate() {
+                let stale = entry
+                    .as_ref()
+                    .is_some_and(|caches| Arc::strong_count(&caches.code) == 1);
+                if stale {
+                    let caches = entry.take().expect("stale slot holds caches");
+                    self.by_code.remove(&(Arc::as_ptr(&caches.code) as usize));
+                    self.free.push(slot);
+                    release(code_cache_bytes(&caches));
+                }
+            }
+            self.prune_at = self.by_code.len().saturating_mul(2);
+        }
+        let key = Arc::as_ptr(&caches.code) as usize;
+        let slot = match self.free.pop() {
+            Some(slot) => {
+                self.slots[slot] = Some(caches);
+                slot
+            }
+            None => {
+                self.slots.push(Some(caches));
+                self.slots.len() - 1
+            }
+        };
+        self.by_code.insert(key, slot);
+        slot
+    }
+}
+
+impl std::ops::Index<usize> for CodeCacheTable {
+    type Output = CodeCaches;
+
+    fn index(&self, slot: usize) -> &CodeCaches {
+        self.slots[slot].as_ref().expect("code cache slot is live")
+    }
+}
+
+impl std::ops::IndexMut<usize> for CodeCacheTable {
+    fn index_mut(&mut self, slot: usize) -> &mut CodeCaches {
+        self.slots[slot].as_mut().expect("code cache slot is live")
+    }
+}
+
+/// Modeled bytes retained by one code object's caches.
+fn code_cache_bytes(caches: &CodeCaches) -> usize {
+    let names = caches
+        .names
+        .len()
+        .saturating_mul(std::mem::size_of::<Option<SymbolId>>());
+    let attributes = caches.attributes.as_ref().map_or(0, |attributes| {
+        attributes
+            .len()
+            .saturating_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
+    });
+    names
+        .saturating_add(attributes)
+        .saturating_add(std::mem::size_of::<CodeCaches>())
 }
 
 impl Clone for CodeCaches {
@@ -743,7 +841,12 @@ struct BytecodeFrame {
     instruction_pointer: usize,
     /// First operand owned by this frame in the VM's shared value stack.
     stack_base: usize,
-    handlers: Vec<(usize, usize)>,
+    /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
+    handlers: Vec<(usize, usize, usize)>,
+    /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
+    /// route truncates the exception stack here, so a `return` inside an `except` body or an
+    /// exception escaping a handler cannot leave its handled exception behind.
+    exception_base: usize,
     function_return: Option<FunctionReturn>,
     pending_native_call: Option<PendingNativeCall>,
 }
@@ -1073,6 +1176,15 @@ impl<'s> Vm<'s> {
         self.interp.resources.release_memory(bytes);
     }
 
+    /// Give back part of the retained reservation, for caches dropped before the run ends.
+    fn release_retained_memory_bytes(&mut self, bytes: usize) {
+        let bytes = u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .min(self.retained_memory);
+        self.retained_memory -= bytes;
+        self.interp.resources.release_memory(bytes);
+    }
+
     fn reserve_retained_memory(&mut self, bytes: usize) -> Result<(), String> {
         let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
         let next = self
@@ -1260,7 +1372,7 @@ impl<'s> Vm<'s> {
 
     /// The type name CPython prints in error messages, such as `int` or a user class name.
     fn type_name_of(&self, value: &Value<'s>) -> Result<String, String> {
-        if let Some((kind, _)) = protocol::exception_parts(self.state, *value)? {
+        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
             return Ok(kind);
         }
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())

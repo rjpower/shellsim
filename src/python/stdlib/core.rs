@@ -1691,6 +1691,12 @@ fn strip<'s>(
         Some(value) if runtime.kind(value)? == super::super::native::PyKind::None => None,
         Some(value) => Some((*value).cast::<OwnedPyString>(runtime)?.0),
     };
+    // Each stripped character is tested against the whole set, and the result is a copy.
+    let tests = value
+        .len()
+        .saturating_mul(characters.as_ref().map_or(1, |chars| chars.len().max(1)));
+    runtime.charge_cpu(u64::try_from(tests / SEARCH_CHARS_PER_CPU_UNIT + 1).unwrap_or(u64::MAX))?;
+    runtime.reserve_memory(value.len())?;
     let result = match (kind, characters.as_deref()) {
         (StripKind::Both, None) => value.trim().to_string(),
         (StripKind::Left, None) => value.trim_start().to_string(),
@@ -1782,6 +1788,11 @@ fn string_affix<'s>(
             )));
         }
     };
+    // The window is addressed by code point, so the text is decoded once up front.
+    runtime.charge_cpu(
+        u64::try_from(value.len() / SEARCH_CHARS_PER_CPU_UNIT + 1).unwrap_or(u64::MAX),
+    )?;
+    runtime.reserve_memory(value.len().saturating_mul(std::mem::size_of::<char>()))?;
     let characters = value.chars().collect::<Vec<_>>();
     let (start, end) = string_bounds(runtime, args.positional(), characters.len())?;
     let window = characters.get(start..end).unwrap_or_default();
@@ -4260,28 +4271,22 @@ fn set_is_subset<'s>(
     left: PyValue<'s>,
     right: PyValue<'s>,
 ) -> PyResult<'s, Option<(bool, bool)>> {
-    let left = left.cast::<PySet<'s>>(runtime)?;
-    let left = left.items(runtime)?;
-    let Ok(right) = right.cast::<PySet<'s>>(runtime) else {
+    let left_set = left.cast::<PySet<'s>>(runtime)?;
+    let left = left_set.items(runtime)?;
+    let Ok(right_set) = right.cast::<PySet<'s>>(runtime) else {
         return Ok(None);
     };
-    let right = right.items(runtime)?;
+    let right_len = right_set.items(runtime)?.len();
     let mut subset = true;
+    // Each member is probed by hash, so the test is linear in the smaller set.
     for value in &left {
-        let mut present = false;
-        for candidate in &right {
-            runtime.charge_cpu(1)?;
-            if runtime.equals(value, candidate)? {
-                present = true;
-                break;
-            }
-        }
-        if !present {
+        runtime.charge_cpu(1)?;
+        if !runtime.builtin_contains(right, *value)? {
             subset = false;
             break;
         }
     }
-    Ok(Some((subset, left.len() < right.len())))
+    Ok(Some((subset, left.len() < right_len)))
 }
 
 pub(crate) fn slot_set_less<'s>(

@@ -43,18 +43,43 @@ fn alias_item_repr(
 /// the heap alone because a user exception's message comes from its `args` instance attribute,
 /// which the shape and symbol tables resolve.
 pub fn display(state: &ReplState, value: Value<'_>) -> Result<String, String> {
+    display_inner(state, value, &mut BTreeSet::new())
+}
+
+/// [`display`] with the exceptions whose message is being rendered on the current path. An
+/// exception whose `args` reach itself, directly or through another exception, would otherwise
+/// recurse without bound; CPython raises `RecursionError` there too.
+fn display_inner(
+    state: &ReplState,
+    value: Value<'_>,
+    active: &mut BTreeSet<u32>,
+) -> Result<String, String> {
     let heap = &state.heap;
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
     }
-    if let Some((_, message)) = exception_parts(state, value)? {
-        return Ok(message);
+    let user_exception = |state: &ReplState| {
+        user_exception_parts(state, value)
+            .map(|parts| parts.map(|exception| (exception.base.to_string(), exception.args)))
+    };
+    let Some((base, args)) = exception_args(heap, value)?.or(user_exception(state)?) else {
+        return render(state, value, active);
+    };
+    let id = heap
+        .identity(value)?
+        .ok_or("exception is not a heap object")?;
+    if !active.insert(id) || active.len() >= MAX_RENDER_DEPTH {
+        return Err(RECURSION_IN_STR.into());
     }
-    if let Some(exception) = user_exception_parts(state, value)? {
-        return exception_message(state, exception.base, &exception.args);
-    }
-    repr(state, value)
+    let message = exception_message(state, &base, &args, active);
+    active.remove(&id);
+    message
 }
+
+/// The error for a `str()` whose `args` nest deeper than [`MAX_RENDER_DEPTH`] or reach the
+/// exception itself.
+const RECURSION_IN_STR: &str =
+    "maximum recursion depth exceeded while getting the str of an object";
 
 /// The stand-in for a CPython object address in default reprs such as
 /// `<object object at 0x7f0000000010>`: derived from the object's stable identity, so it is
@@ -171,8 +196,18 @@ pub fn exception_parts(
     let Some((kind, args)) = exception_args(&state.heap, value)? else {
         return Ok(None);
     };
-    let message = exception_message(state, &kind, &args)?;
+    let mut active = BTreeSet::new();
+    if let Some(id) = state.heap.identity(value)? {
+        active.insert(id);
+    }
+    let message = exception_message(state, &kind, &args, &mut active)?;
     Ok(Some((kind, message)))
+}
+
+/// The class name of a builtin exception instance, without rendering its message. Rendering can
+/// fail on self-referential arguments, so callers that only classify the value use this.
+pub fn exception_kind(state: &ReplState, value: Value<'_>) -> Result<Option<String>, String> {
+    Ok(exception_args(&state.heap, value)?.map(|(kind, _)| kind))
 }
 
 /// The class name and constructor arguments of a builtin exception instance.
@@ -189,17 +224,25 @@ pub fn exception_args<'s>(
 /// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
 /// `args`: empty without arguments, the `str()` of a single argument, whose `repr()` a
 /// `KeyError` shows because the argument is a key, and otherwise the `repr()` of the tuple.
-fn exception_message(state: &ReplState, kind: &str, args: &[Value<'_>]) -> Result<String, String> {
+///
+/// `active` holds the exceptions on the current rendering path, so a self-referential `args`
+/// stops instead of recursing without bound.
+fn exception_message(
+    state: &ReplState,
+    kind: &str,
+    args: &[Value<'_>],
+    active: &mut BTreeSet<u32>,
+) -> Result<String, String> {
     match args {
         [] => Ok(String::new()),
         [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
-            repr(state, *only)
+            render(state, *only, active)
         }
-        [only] => display(state, *only),
+        [only] => display_inner(state, *only, active),
         _ => {
             let values = args
                 .iter()
-                .map(|value| repr(state, *value))
+                .map(|value| render(state, *value, active))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", values.join(", ")))
         }
@@ -262,7 +305,7 @@ fn user_exception_parts<'s>(
     Ok(Some(UserException { base, args }))
 }
 
-fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
+pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
     match object(heap, value).ok()?? {
         Object::BigInt(value) => Some(value),
         _ => None,
@@ -974,6 +1017,18 @@ impl Comparison {
 }
 
 pub fn compare(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Comparison, String> {
+    compare_at(heap, left, right, 0)
+}
+
+/// Nesting bound for sequence ordering outside the VM, matching [`MAX_RENDER_DEPTH`].
+const MAX_COMPARE_DEPTH: usize = 256;
+
+fn compare_at(
+    heap: &Heap,
+    left: Value<'_>,
+    right: Value<'_>,
+    depth: usize,
+) -> Result<Comparison, String> {
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
             return Ok(Comparison::Ordered(left.cmp(right)));
@@ -1018,7 +1073,10 @@ pub fn compare(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Compari
     match (object(heap, left)?, object(heap, right)?) {
         (Some(Object::List(left)), Some(Object::List(right)))
         | (Some(Object::Tuple(left)), Some(Object::Tuple(right))) => {
-            sequence_compare(heap, left, right)
+            if depth >= MAX_COMPARE_DEPTH {
+                return Err("maximum recursion depth exceeded in comparison".into());
+            }
+            sequence_compare(heap, left, right, depth + 1)
         }
         _ => Ok(Comparison::Unsupported),
     }
@@ -1046,13 +1104,18 @@ fn compare_bigint_float(integer: &BigInt, float: f64) -> Result<Comparison, Stri
     }))
 }
 
-fn sequence_compare(heap: &Heap, left: &[Ref], right: &[Ref]) -> Result<Comparison, String> {
+fn sequence_compare(
+    heap: &Heap,
+    left: &[Ref],
+    right: &[Ref],
+    depth: usize,
+) -> Result<Comparison, String> {
     for (left, right) in left.iter().zip(right) {
         let (left, right) = (heap.handle(left), heap.handle(right));
         if heap.identical(left, right) || equals(heap, left, right)? {
             continue;
         }
-        return compare(heap, left, right);
+        return compare_at(heap, left, right, depth);
     }
     Ok(Comparison::Ordered(left.len().cmp(&right.len())))
 }
