@@ -1,8 +1,8 @@
 //! Private VFS primitives for frozen pure-Python stdlib facades.
 
 use super::super::native::{
-    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyError, PyResult, PyRuntime,
-    PyValueCast,
+    CallArgs, FunctionDef, ModuleDef, OwnedPyString, PyBytes, PyError, PyFileKind, PyResult,
+    PyRuntime, PyValueCast,
 };
 use super::super::Value;
 
@@ -46,6 +46,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
         },
         FunctionDef {
             module: "_shellsim_vfs",
+            name: "disk_usage",
+            call: disk_usage,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
             name: "is_file",
             call: is_file,
         },
@@ -73,6 +78,31 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             module: "_shellsim_vfs",
             name: "mkdir",
             call: mkdir,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "rmdir",
+            call: rmdir,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "chmod",
+            call: chmod,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "symlink",
+            call: symlink,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "readlink",
+            call: readlink,
+        },
+        FunctionDef {
+            module: "_shellsim_vfs",
+            name: "utime",
+            call: utime,
         },
         FunctionDef {
             module: "_shellsim_vfs",
@@ -158,6 +188,17 @@ fn append_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
         .map_err(|_| PyError::overflow_error("file position exceeds Python int range"))
 }
 
+/// `(used, limit)` bytes of the simulated disk. An unlimited disk reports `i64::MAX` as its
+/// limit so callers can still compute a finite free space.
+fn disk_usage<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.disk_usage", 0, 0)?;
+    args.reject_keywords("_shellsim_vfs.disk_usage")?;
+    let (used, limit) = runtime.filesystem().disk_usage();
+    let used = Value::Int(i64::try_from(used).unwrap_or(i64::MAX));
+    let limit = Value::Int(i64::try_from(limit).unwrap_or(i64::MAX));
+    runtime.new_tuple(vec![used, limit])
+}
+
 fn exists<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     args.expect_positional("_shellsim_vfs.exists", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.exists")?;
@@ -198,16 +239,73 @@ fn list_dir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult
     runtime.new_list(values)
 }
 
+/// `stat(path, follow)`: `(mode, size, mtime_ms, kind)` where kind is 0 for a regular file,
+/// 1 for a directory, 2 for a symlink and 3 for anything else.
 fn stat<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
-    args.expect_positional("_shellsim_vfs.stat", 1, 1)?;
+    args.expect_positional("_shellsim_vfs.stat", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.stat")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
-    let metadata = runtime.filesystem().metadata(&path)?;
+    let follow = runtime.truth(&args.positional()[1])?;
+    let metadata = runtime.filesystem().metadata(&path, follow)?;
     let mode = Value::Int(i64::from(metadata.mode));
     let size = i64::try_from(metadata.size)
         .map(Value::Int)
         .map_err(|_| PyError::overflow_error("file size exceeds Python int range"))?;
-    runtime.new_tuple(vec![mode, size])
+    let mtime = i64::try_from(metadata.mtime_ms)
+        .map(Value::Int)
+        .map_err(|_| PyError::overflow_error("file time exceeds Python int range"))?;
+    let kind = Value::Int(match metadata.kind {
+        PyFileKind::File => 0,
+        PyFileKind::Dir => 1,
+        PyFileKind::Symlink => 2,
+        PyFileKind::Other => 3,
+    });
+    runtime.new_tuple(vec![mode, size, mtime, kind])
+}
+
+fn rmdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.rmdir", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.rmdir")?;
+    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
+    runtime.filesystem().rmdir(&path)?;
+    Ok(Value::None)
+}
+
+fn chmod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.chmod", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.chmod")?;
+    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
+    let mode = runtime
+        .int_value(&args.positional()[1])
+        .and_then(|mode| u32::try_from(mode).ok())
+        .ok_or_else(|| PyError::value_error("mode must be a non-negative integer"))?;
+    runtime.filesystem().chmod(&path, mode & 0o7777)?;
+    Ok(Value::None)
+}
+
+fn symlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.symlink", 2, 2)?;
+    args.reject_keywords("_shellsim_vfs.symlink")?;
+    let OwnedPyString(target) = args.positional()[0].cast(runtime)?;
+    let OwnedPyString(link_path) = args.positional()[1].cast(runtime)?;
+    runtime.filesystem().symlink(&target, &link_path)?;
+    Ok(Value::None)
+}
+
+fn readlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.readlink", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.readlink")?;
+    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
+    let target = runtime.filesystem().read_link(&path)?;
+    runtime.new_string(target)
+}
+
+fn utime<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("_shellsim_vfs.utime", 1, 1)?;
+    args.reject_keywords("_shellsim_vfs.utime")?;
+    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
+    runtime.filesystem().touch(&path)?;
+    Ok(Value::None)
 }
 
 fn mkdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {

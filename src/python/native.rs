@@ -193,6 +193,13 @@ pub(super) enum PyErrorKind {
     /// the program stops with the minimal-shim diagnostic, as for an unmodeled builtin.
     Unsupported,
     Exception(&'static str),
+    /// An `OSError` carrying an errno and an optional operand path. The VM picks the subclass
+    /// from the errno as CPython does and stores `(errno, strerror, filename)` as the args; the
+    /// message holds the `strerror` text.
+    OsError {
+        errno: i32,
+        filename: Option<String>,
+    },
     /// A nested VM operation already stored the concrete Python exception.
     Raised,
     Exit(i32),
@@ -252,6 +259,12 @@ impl PyError {
 
     pub fn exception(kind: &'static str, message: impl Into<String>) -> Self {
         Self::new(PyErrorKind::Exception(kind), message)
+    }
+
+    /// An `OSError` for `errno` with CPython's `[Errno N] strerror: 'filename'` form; the VM
+    /// raises the errno's subclass, such as `FileNotFoundError` for `ENOENT`.
+    pub fn os_error(errno: i32, strerror: impl Into<String>, filename: Option<String>) -> Self {
+        Self::new(PyErrorKind::OsError { errno, filename }, strerror)
     }
 
     pub fn exit(status: i32) -> Self {
@@ -625,8 +638,17 @@ pub(super) trait PyFilesystem {
     fn is_dir(&self, path: &str) -> bool;
     fn is_symlink(&self, path: &str) -> bool;
     fn list_dir(&mut self, path: &str) -> PyResult<'static, Vec<String>>;
-    fn metadata(&self, path: &str) -> PyResult<'static, PyFileMetadata>;
+    /// Metadata of `path`; `follow` resolves a final symlink as `stat` does, else as `lstat`.
+    fn metadata(&self, path: &str, follow: bool) -> PyResult<'static, PyFileMetadata>;
     fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<'static, ()>;
+    fn rmdir(&mut self, path: &str) -> PyResult<'static, ()>;
+    fn chmod(&mut self, path: &str, mode: u32) -> PyResult<'static, ()>;
+    fn symlink(&mut self, target: &str, link_path: &str) -> PyResult<'static, ()>;
+    fn read_link(&self, path: &str) -> PyResult<'static, String>;
+    /// Set the modification time to the virtual clock, creating an empty file if needed.
+    fn touch(&mut self, path: &str) -> PyResult<'static, ()>;
+    /// `(used, limit)` bytes of the simulated disk, for `os.statvfs` and `shutil.disk_usage`.
+    fn disk_usage(&self) -> (u64, u64);
     fn glob(&mut self, pattern: &str) -> PyResult<'static, Vec<String>>;
 }
 
@@ -634,6 +656,18 @@ pub(super) trait PyFilesystem {
 pub(super) struct PyFileMetadata {
     pub mode: u32,
     pub size: usize,
+    /// Modification time on the virtual clock, in milliseconds since the epoch.
+    pub mtime_ms: u64,
+    pub kind: PyFileKind,
+}
+
+/// The node kinds the modeled VFS distinguishes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum PyFileKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
 }
 
 /// Read-only metadata supplied by the `type` data descriptors.
@@ -1003,6 +1037,8 @@ pub(super) trait PyRuntime<'s> {
     fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<'s, PyValue<'s>>;
     fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<'s, PyValue<'s>>;
     fn property_getter(&self, property: PyProperty<'s>) -> PyResult<'s, PyValue<'s>>;
+    /// The setter of a property, or `None` for a read-only one.
+    fn property_setter(&self, property: PyProperty<'s>) -> PyResult<'s, Option<PyValue<'s>>>;
     fn new_property(
         &mut self,
         getter: PyValue<'s>,
@@ -1038,16 +1074,9 @@ pub(super) trait PyRuntime<'s> {
     /// An `int` holding `value`, immediate when it fits in `i64`.
     fn new_bigint(&mut self, value: num_bigint::BigInt) -> PyResult<'s, PyValue<'s>>;
     fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<'s, PyValue<'s>>;
-    fn new_match(
-        &mut self,
-        text: String,
-        groups: Vec<Option<String>>,
-        group_names: Vec<Option<String>>,
-        start: usize,
-        end: usize,
-    ) -> PyResult<'s, PyValue<'s>>;
+    fn new_match(&mut self, data: PyMatchData<'s>) -> PyResult<'s, PyValue<'s>>;
     fn regex_parts(&mut self, regex: PyRegex<'s>) -> PyResult<'s, (String, u32)>;
-    fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData>;
+    fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData<'s>>;
     fn marker(&self, marker: PyMarker) -> PyValue<'s>;
     fn mark_dataclass(&mut self, class: PyClass<'s>) -> PyResult<'s, ()>;
     fn argv0(&self) -> String;
@@ -1118,6 +1147,8 @@ pub(super) trait PyRuntime<'s> {
         &self,
         value: &PyValue<'s>,
     ) -> PyResult<'s, Option<Vec<PyParameter<'s>>>>;
+    /// `(is_generator, is_coroutine)` for a Python function or bound method; `None` otherwise.
+    fn function_flags(&self, value: &PyValue<'s>) -> PyResult<'s, Option<(bool, bool)>>;
     /// PID of the logical process running this Python interpreter.
     fn current_pid(&self) -> u32;
     /// PID of the logical parent of the process running this Python interpreter.
@@ -1128,6 +1159,17 @@ pub(super) trait PyRuntime<'s> {
     /// The name CPython prints for a value's type in error messages, such as `int`,
     /// `float32` or a user class name.
     fn type_name(&self, value: &PyValue<'s>) -> PyResult<'s, String>;
+    /// The exception being handled by the innermost active `except` block, for
+    /// `sys.exc_info()` and `sys.exception()`.
+    fn active_exception(&self) -> Option<PyValue<'s>>;
+    /// A dict of the modules loaded so far, keyed by name, for `sys.modules`.
+    fn loaded_modules(&mut self) -> PyResult<'s, PyValue<'s>>;
+    /// Register `module` under `name` so later imports of `name` return it, as assigning to
+    /// `sys.modules` does; `module` must be a module object.
+    fn register_module(&mut self, name: &str, module: PyValue<'s>) -> PyResult<'s, ()>;
+    /// Forget the module registered under `name`, as `del sys.modules[name]` does. Returns
+    /// whether a registration existed.
+    fn unregister_module(&mut self, name: &str) -> bool;
 }
 
 /// Checked handle to an interpreter-owned array view.
@@ -1285,12 +1327,19 @@ impl<'s> FromPyValue<'s> for PyMatch<'s> {
     }
 }
 
-/// Owned, metered snapshot of a match payload.
-pub(super) struct PyMatchData {
+/// Owned, metered copy of a match payload, also the parts a new match is built from.
+///
+/// `spans` holds character offsets into the subject per group, `None` for a group that did not
+/// participate; `spans[0]` is the whole match. `pos` and `endpos` are the searched window.
+pub(super) struct PyMatchData<'s> {
+    pub subject: PyValue<'s>,
+    pub regex: PyValue<'s>,
+    pub text: String,
     pub groups: Vec<Option<String>>,
     pub group_names: Vec<Option<String>>,
-    pub start: usize,
-    pub end: usize,
+    pub spans: Vec<Option<(usize, usize)>>,
+    pub pos: usize,
+    pub endpos: usize,
 }
 
 /// Owned definition of one bounded ``argparse`` argument.

@@ -11,6 +11,7 @@ use super::bytecode::{
 };
 use super::source::Span;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 /// The parameter holding a comprehension's outermost iterator. CPython names it `.0` too; the
 /// name cannot collide with an identifier.
@@ -29,7 +30,9 @@ pub fn compile(program: Program) -> CodeRef {
         named_expression: NamedExpressionContext::local(),
         is_class_scope: false,
         structural_depth: 0,
+        docstring: None,
     };
+    compiler.docstring = docstring_of(&program.statements);
     compiler.statements(program.statements);
     compiler.emit(Operation::Halt, Span::default());
     compiler.finish(Vec::new())
@@ -49,6 +52,7 @@ pub fn compile_expression(expression: Expression) -> CodeRef {
         named_expression: NamedExpressionContext::local(),
         is_class_scope: false,
         structural_depth: 0,
+        docstring: None,
     };
     let span = expression.span;
     compiler.expression(expression);
@@ -86,6 +90,8 @@ struct Compiler {
     nonlocals: HashSet<String>,
     named_expression: NamedExpressionContext,
     is_class_scope: bool,
+    /// The body's leading string literal, recorded on the code object as `__doc__`.
+    docstring: Option<Arc<str>>,
     structural_depth: usize,
 }
 
@@ -151,6 +157,17 @@ fn contains_star(target: &AssignmentTarget) -> bool {
         AssignmentTarget::Name(_)
         | AssignmentTarget::Attribute { .. }
         | AssignmentTarget::Subscript { .. } => false,
+    }
+}
+
+/// The docstring of a body: its first statement when that is a bare string literal.
+fn docstring_of(body: &[Statement]) -> Option<Arc<str>> {
+    match &body.first()?.kind {
+        StatementKind::Expression(Expression {
+            kind: ExpressionKind::Constant(Constant::String(text)),
+            ..
+        }) => Some(Arc::from(text.as_str())),
+        _ => None,
     }
 }
 
@@ -232,7 +249,14 @@ impl Compiler {
             });
             spans.push(instruction.span);
         }
-        builder.finish(bytecode, spans, parameters, local_names, self.is_coroutine)
+        builder.finish(
+            bytecode,
+            spans,
+            parameters,
+            local_names,
+            self.is_coroutine,
+            self.docstring,
+        )
     }
 
     fn statements(&mut self, statements: Vec<Statement>) {
@@ -468,7 +492,9 @@ impl Compiler {
                     named_expression: NamedExpressionContext::local(),
                     is_class_scope: false,
                     structural_depth: self.structural_depth,
+                    docstring: None,
                 };
+                nested.docstring = docstring_of(&body);
                 nested.statements(body);
                 nested.emit(Operation::LoadConstant(Constant::None), span);
                 nested.emit(Operation::Return, span);
@@ -521,7 +547,9 @@ impl Compiler {
                     named_expression: NamedExpressionContext::local(),
                     is_class_scope: true,
                     structural_depth: self.structural_depth,
+                    docstring: None,
                 };
+                nested.docstring = docstring_of(&body);
                 nested.statements(body);
                 nested.emit(Operation::Halt, span);
                 for base in bases {
@@ -1289,6 +1317,7 @@ impl Compiler {
                     named_expression: NamedExpressionContext::local(),
                     is_class_scope: false,
                     structural_depth: self.structural_depth,
+                    docstring: None,
                 };
                 nested.expression(*body);
                 nested.emit(Operation::Return, span);
@@ -1466,6 +1495,7 @@ impl Compiler {
             named_expression,
             is_class_scope: false,
             structural_depth: self.structural_depth,
+            docstring: None,
         };
         let result_name = "$__shellsim_comprehension_result".to_string();
         nested.emit(
@@ -1548,6 +1578,7 @@ impl Compiler {
             named_expression,
             is_class_scope: false,
             structural_depth: self.structural_depth,
+            docstring: None,
         };
         nested.emit_generator_comprehension_body(&clauses, 0, &element, span);
         nested.emit(Operation::LoadConstant(Constant::None), span);
@@ -1575,6 +1606,7 @@ impl Compiler {
             named_expression,
             is_class_scope: false,
             structural_depth: self.structural_depth,
+            docstring: None,
         };
         let result_name = "$__shellsim_comprehension_result".to_string();
         nested.emit(Operation::BuildDict(Vec::new()), span);

@@ -1525,6 +1525,15 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
+    fn property_setter(&self, property: PyProperty<'s>) -> PyResult<'s, Option<Value<'s>>> {
+        match self.get(property.value()).map_err(PyError::runtime_error)? {
+            Object::Property { setter, .. } => Ok(self.handle_optional(setter.as_ref())),
+            _ => Err(PyError::runtime_error(
+                "property handle changed object kind",
+            )),
+        }
+    }
+
     fn new_property(
         &mut self,
         getter: Value<'s>,
@@ -2411,24 +2420,29 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Vm::allocate_object(self, Object::Regex { pattern, flags }).map_err(PyError::resource_error)
     }
 
-    fn new_match(
-        &mut self,
-        text: String,
-        groups: Vec<Option<String>>,
-        group_names: Vec<Option<String>>,
-        start: usize,
-        end: usize,
-    ) -> PyResult<'s, Value<'s>> {
-        Vm::allocate_object(
-            self,
+    fn new_match(&mut self, data: PyMatchData<'s>) -> PyResult<'s, Value<'s>> {
+        let PyMatchData {
+            subject,
+            regex,
+            text,
+            groups,
+            group_names,
+            spans,
+            pos,
+            endpos,
+        } = data;
+        self.alloc_with(|builder| {
             Object::Match(Box::new(MatchObject {
+                subject: builder.store(subject),
+                regex: builder.store(regex),
                 text,
                 groups,
                 group_names,
-                start,
-                end,
-            })),
-        )
+                spans,
+                pos,
+                endpos,
+            }))
+        })
         .map_err(PyError::resource_error)
     }
 
@@ -2447,7 +2461,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok((pattern, flags))
     }
 
-    fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData> {
+    fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData<'s>> {
         let Object::Match(match_object) = self
             .state
             .heap
@@ -2456,31 +2470,27 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         else {
             return Err(PyError::runtime_error("match handle changed object kind"));
         };
-        let MatchObject {
-            groups,
-            group_names,
-            start,
-            end,
-            ..
-        } = &**match_object;
-        let bytes = groups
+        let bytes = match_object
+            .groups
             .iter()
-            .chain(group_names)
-            .try_fold(0usize, |total, value| {
+            .chain(&match_object.group_names)
+            .try_fold(match_object.text.len(), |total, value| {
                 total.checked_add(value.as_ref().map_or(0, String::len))
-            });
+            })
+            .and_then(|total| total.checked_add(match_object.spans.len().saturating_mul(16)));
         let bytes = bytes.ok_or_else(|| PyError::resource_error("match snapshot is too large"))?;
-        let groups = groups.clone();
-        let group_names = group_names.clone();
-        let start = *start;
-        let end = *end;
+        let data = PyMatchData {
+            subject: self.handle(&match_object.subject),
+            regex: self.handle(&match_object.regex),
+            text: match_object.text.clone(),
+            groups: match_object.groups.clone(),
+            group_names: match_object.group_names.clone(),
+            spans: match_object.spans.clone(),
+            pos: match_object.pos,
+            endpos: match_object.endpos,
+        };
         self.reserve_memory(bytes)?;
-        Ok(PyMatchData {
-            groups,
-            group_names,
-            start,
-            end,
-        })
+        Ok(data)
     }
 
     fn marker(&self, marker: PyMarker) -> Value<'s> {
@@ -2985,6 +2995,31 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.module_name_of(scope).map_err(PyError::runtime_error)
     }
 
+    fn function_flags(&self, value: &Value<'s>) -> PyResult<'s, Option<(bool, bool)>> {
+        if !value.is_object() {
+            return Ok(None);
+        }
+        let function = match self.get(*value).map_err(PyError::runtime_error)? {
+            Object::Function { .. } => *value,
+            Object::DescriptorBoundMethod { descriptor, .. } if descriptor.is_object() => {
+                self.handle(descriptor)
+            }
+            // A suspended generator or coroutine reports the flags of the code it runs.
+            Object::Generator(generator) => {
+                let signature = &generator.code.call_signature;
+                return Ok(Some((signature.is_generator, signature.is_coroutine)));
+            }
+            _ => return Ok(None),
+        };
+        let Object::Function(function_object) =
+            self.get(function).map_err(PyError::runtime_error)?
+        else {
+            return Ok(None);
+        };
+        let signature = &function_object.code.call_signature;
+        Ok(Some((signature.is_generator, signature.is_coroutine)))
+    }
+
     fn function_parameters(&self, value: &Value<'s>) -> PyResult<'s, Option<Vec<PyParameter<'s>>>> {
         if !value.is_object() {
             return Ok(None);
@@ -3036,6 +3071,42 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(Some(parameters))
     }
 
+    fn active_exception(&self) -> Option<Value<'s>> {
+        self.exception_stack
+            .last()
+            .map(|exception| self.handle(&exception.value))
+    }
+
+    fn loaded_modules(&mut self) -> PyResult<'s, Value<'s>> {
+        let mut names: Vec<String> = self.state.modules.keys().cloned().collect();
+        names.sort();
+        let mut items = Vec::with_capacity(names.len());
+        for name in names {
+            let module = self.handle(&self.state.modules[&name]);
+            items.push((self.new_string(name)?, module));
+        }
+        self.new_dict(items)
+    }
+
+    fn register_module(&mut self, name: &str, module: Value<'s>) -> PyResult<'s, ()> {
+        let is_module = matches!(module.native_value(), Some(NativeValue::Module(_)))
+            || (module.is_object()
+                && matches!(
+                    self.get(module).map_err(PyError::runtime_error)?,
+                    Object::Module { .. }
+                ));
+        if !is_module {
+            return Err(PyError::type_error("sys.modules values must be modules"));
+        }
+        let stored = self.store(module);
+        self.state.modules.insert(name.to_string(), stored);
+        Ok(())
+    }
+
+    fn unregister_module(&mut self, name: &str) -> bool {
+        self.state.modules.remove(name).is_some()
+    }
+
     fn current_pid(&self) -> u32 {
         self.interp.process.pid
     }
@@ -3047,7 +3118,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<'s, ()> {
         self.interp.send_signal(pid, signal).map_err(|error| {
             if error.contains("does not exist") {
-                PyError::exception("ProcessLookupError", format!("[Errno 3] {error}"))
+                PyError::os_error(3, "No such process", None)
             } else {
                 PyError::runtime_error(error)
             }

@@ -163,6 +163,9 @@ impl<'s> Vm<'s> {
                 "frozenset" => Some(BuiltinType::FrozenSet),
                 "slice" => Some(BuiltinType::Slice),
                 "range" => Some(BuiltinType::Range),
+                "property" => Some(BuiltinType::Property),
+                "staticmethod" => Some(BuiltinType::StaticMethod),
+                "classmethod" => Some(BuiltinType::ClassMethod),
                 _ => None,
             };
             if let Some(builtin_type) = builtin_type {
@@ -779,12 +782,17 @@ impl<'s> Vm<'s> {
         let module_name = self.allocate_string(name.clone())?;
         let module_package = self.allocate_string(package_name)?;
         let module_file = self.allocate_string(path.clone())?;
+        let module_doc = match code.docstring.clone() {
+            Some(text) => self.allocate_string(text.to_string())?,
+            None => Value::None,
+        };
         let (module, scope) = self.allocate_module(
             name.clone(),
             HashMap::from([
                 ("__name__".into(), module_name),
                 ("__package__".into(), module_package),
                 ("__file__".into(), module_file),
+                ("__doc__".into(), module_doc),
             ]),
         )?;
         let stored = self.store(module);

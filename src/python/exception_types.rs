@@ -162,6 +162,28 @@ pub(super) fn exception_is_subclass(kind: &str, base: &str) -> bool {
     exception_is_subclass("Exception", base)
 }
 
+/// The `OSError` subclass CPython raises for `errno`, or `OSError` itself when the errno has no
+/// dedicated subclass. Linux errno values.
+pub(super) fn os_error_subclass(errno: i32) -> &'static str {
+    match errno {
+        1 | 13 => "PermissionError",
+        2 => "FileNotFoundError",
+        3 => "ProcessLookupError",
+        4 => "InterruptedError",
+        10 => "ChildProcessError",
+        11 | 114 | 115 => "BlockingIOError",
+        17 => "FileExistsError",
+        20 => "NotADirectoryError",
+        21 => "IsADirectoryError",
+        32 | 108 => "BrokenPipeError",
+        103 => "ConnectionAbortedError",
+        104 => "ConnectionResetError",
+        110 => "TimeoutError",
+        111 => "ConnectionRefusedError",
+        _ => "OSError",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

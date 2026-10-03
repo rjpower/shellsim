@@ -141,7 +141,7 @@ fn pack<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s>
     let format = parse_format(&format_text)?;
     let values = &args.positional()[1..];
     if values.len() != format.values {
-        return Err(PyError::type_error(format!(
+        return Err(PyError::value_error(format!(
             "pack expected {} items for packing (got {})",
             format.values,
             values.len()
@@ -199,7 +199,7 @@ fn pack_value<'s>(
         ($type:ty) => {{
             let value = integer_value(runtime, value)?;
             let value = <$type>::try_from(value)
-                .map_err(|_| PyError::exception("StructError", "integer out of range"))?;
+                .map_err(|_| PyError::value_error("integer out of range"))?;
             let bytes = match endian {
                 Endian::Little => value.to_le_bytes(),
                 Endian::Big => value.to_be_bytes(),
@@ -211,8 +211,7 @@ fn pack_value<'s>(
         b'c' => {
             let PyBytes(bytes) = value.cast(runtime)?;
             if bytes.len() != 1 {
-                return Err(PyError::exception(
-                    "StructError",
+                return Err(PyError::value_error(
                     "char format requires a bytes object of length 1",
                 ));
             }
@@ -255,7 +254,7 @@ fn integer_value<'s>(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResul
     runtime
         .integer_bigint(&value)?
         .and_then(|value| num_traits::ToPrimitive::to_i128(&value))
-        .ok_or_else(|| PyError::type_error("required argument is not an integer"))
+        .ok_or_else(|| PyError::value_error("required argument is not an integer"))
 }
 
 fn unpack<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
@@ -265,10 +264,10 @@ fn unpack<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'
     let PyBytes(input) = args.positional()[1].cast(runtime)?;
     let format = parse_format(&format_text)?;
     if input.len() != format.size {
-        return Err(PyError::exception(
-            "StructError",
-            format!("unpack requires a buffer of {} bytes", format.size),
-        ));
+        return Err(PyError::value_error(format!(
+            "unpack requires a buffer of {} bytes",
+            format.size
+        )));
     }
     runtime.reserve_memory(
         format

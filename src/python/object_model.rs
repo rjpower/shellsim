@@ -85,10 +85,12 @@ pub(super) enum BuiltinType {
     GenericAlias,
     Enum,
     TestCase,
+    StaticMethod,
+    ClassMethod,
 }
 
 impl BuiltinType {
-    pub(super) const ALL: [Self; 41] = [
+    pub(super) const ALL: [Self; 43] = [
         Self::Object,
         Self::Type,
         Self::None,
@@ -130,6 +132,8 @@ impl BuiltinType {
         Self::GenericAlias,
         Self::Enum,
         Self::TestCase,
+        Self::StaticMethod,
+        Self::ClassMethod,
     ];
 
     pub(super) const fn id(self) -> TypeId {
@@ -173,6 +177,8 @@ impl BuiltinType {
             Self::ArgumentParser => "argparse.ArgumentParser",
             Self::RaisesContext => "pytest.raises",
             Self::Property => "property",
+            Self::StaticMethod => "staticmethod",
+            Self::ClassMethod => "classmethod",
             Self::Array => "numpy.ndarray",
             Self::Complex => "complex",
             Self::Slice => "slice",
@@ -877,6 +883,14 @@ impl Default for TypeRegistry {
             &mut types[BuiltinType::ByteArray as usize],
             &super::stdlib::core::BYTEARRAY_TYPE,
         );
+        install_native_class_methods(
+            &mut types[BuiltinType::Bytes as usize],
+            super::stdlib::core::BYTES_CLASS_METHODS,
+        );
+        install_native_class_methods(
+            &mut types[BuiltinType::ByteArray as usize],
+            super::stdlib::core::BYTEARRAY_CLASS_METHODS,
+        );
         install_native_attributes(
             &mut types[BuiltinType::List as usize],
             &super::stdlib::core::LIST_TYPE,
@@ -993,6 +1007,18 @@ impl Default for TypeRegistry {
         types[BuiltinType::Bool as usize].local_slots = bool_local;
         resolve_builtin_slots(&mut types);
         install_slot_wrappers(&mut types);
+        // Mutable containers publish `__hash__ = None`, which is how `collections.abc.Hashable`
+        // and user code detect that they are unhashable.
+        for builtin in [
+            BuiltinType::List,
+            BuiltinType::Dict,
+            BuiltinType::Set,
+            BuiltinType::ByteArray,
+        ] {
+            types[builtin as usize]
+                .attributes
+                .insert("__hash__".into(), Ref::from_immediate(Value::None));
+        }
         let builtin_bytes = types
             .iter()
             .map(modeled_type_bytes)
@@ -1035,7 +1061,7 @@ impl TypeRegistry {
             let value = Ref::from_immediate(Value::Native(NativeValue::ExceptionType(
                 ExceptionType(definition.name),
             )));
-            let ty = PyType {
+            let mut ty = PyType {
                 name: definition.name.into(),
                 bases,
                 mro: mro.clone(),
@@ -1044,6 +1070,9 @@ impl TypeRegistry {
                 slots: self.inherit_slots(TypeSlots::default(), &mro),
                 value: Some(value),
             };
+            if definition.name == super::stdlib::core::OS_ERROR_TYPE.name {
+                install_native_attributes(&mut ty, &super::stdlib::core::OS_ERROR_TYPE);
+            }
             let id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
             self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
             self.types.push(ty);

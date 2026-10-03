@@ -239,6 +239,25 @@ fn exception_message(
             render(state, *only, active)
         }
         [only] => display_inner(state, *only, active),
+        [errno, strerror, rest @ ..]
+            if rest.len() <= 3
+                && super::exception_types::exception_is_subclass(kind, "OSError") =>
+        {
+            let mut message = format!(
+                "[Errno {}] {}",
+                display_inner(state, *errno, active)?,
+                display_inner(state, *strerror, active)?
+            );
+            if let Some(filename) = rest.first().filter(|value| !value.is_none()) {
+                message.push_str(": ");
+                message.push_str(&render(state, *filename, active)?);
+                if let Some(filename2) = rest.get(2).filter(|value| !value.is_none()) {
+                    message.push_str(" -> ");
+                    message.push_str(&render(state, *filename2, active)?);
+                }
+            }
+            Ok(message)
+        }
         _ => {
             let values = args
                 .iter()
@@ -544,13 +563,21 @@ fn render_inner(
             Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
-            Object::Regex { pattern, .. } => format!("re.compile({})", quote_string(pattern)),
-            Object::Match(found) => format!(
-                "<re.Match object; span=({}, {}), match={}>",
-                found.start,
-                found.end,
-                quote_string(&found.text)
-            ),
+            Object::Regex { pattern, flags } => {
+                let flags = super::stdlib::re::flag_repr(*flags);
+                if flags.is_empty() {
+                    format!("re.compile({})", quote_string(pattern))
+                } else {
+                    format!("re.compile({}, {flags})", quote_string(pattern))
+                }
+            }
+            Object::Match(found) => {
+                let (start, end) = found.spans.first().copied().flatten().unwrap_or((0, 0));
+                format!(
+                    "<re.Match object; span=({start}, {end}), match={}>",
+                    quote_string(&found.text)
+                )
+            }
             Object::ArgumentParser { .. } => "<argparse.ArgumentParser>".into(),
             Object::Namespace { values } => {
                 let rendered = values

@@ -318,9 +318,6 @@ pub(super) enum Builtin {
     All,
     Iter,
     Next,
-    Property,
-    StaticMethod,
-    ClassMethod,
     Super,
     SetAttribute,
     DeleteAttribute,
@@ -363,9 +360,6 @@ pub(super) const BUILTIN_FUNCTIONS: &[(&str, Builtin)] = &[
     ("all", Builtin::All),
     ("iter", Builtin::Iter),
     ("next", Builtin::Next),
-    ("property", Builtin::Property),
-    ("staticmethod", Builtin::StaticMethod),
-    ("classmethod", Builtin::ClassMethod),
     ("super", Builtin::Super),
     ("setattr", Builtin::SetAttribute),
     ("delattr", Builtin::DeleteAttribute),
@@ -529,6 +523,44 @@ impl VmProgram {
                 function_return: None,
                 pending_native_call: None,
             });
+            if let Some(docstring) = self.code.docstring.clone() {
+                // The script's leading string literal is `__doc__` in the main module, unless an
+                // interactive session already bound the name.
+                let Ok(symbol) = vm.state.symbols.intern("__doc__", &mut vm.interp.resources)
+                else {
+                    return VmPoll::Ready(ExecResult::Exit(137));
+                };
+                if vm.state.globals.get(&vm.state.heap, symbol).is_none() {
+                    let Ok(value) = vm.allocate_string(docstring.to_string()) else {
+                        return VmPoll::Ready(ExecResult::Exit(137));
+                    };
+                    if vm
+                        .state
+                        .globals
+                        .insert(&vm.state.heap, symbol, value, &mut vm.interp.resources)
+                        .is_err()
+                    {
+                        return VmPoll::Ready(ExecResult::Exit(137));
+                    }
+                }
+            }
+            if !vm.state.modules.contains_key("__main__") {
+                // `sys.modules["__main__"]` is a module object whose attributes are the
+                // script's globals, so `inspect.getmodule` and friends see the main script.
+                let Ok(scope) =
+                    vm.alloc_scope(None, true, Arc::from([]), Vec::new(), HashMap::new())
+                else {
+                    return VmPoll::Ready(ExecResult::Exit(137));
+                };
+                let Ok(module) = vm.alloc_with(|builder| Object::Module {
+                    name: "__main__".to_string(),
+                    scope: builder.store(scope),
+                }) else {
+                    return VmPoll::Ready(ExecResult::Exit(137));
+                };
+                let stored = vm.store(module);
+                vm.state.modules.insert("__main__".to_string(), stored);
+            }
             self.started = true;
         }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);

@@ -143,6 +143,10 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
             optional(class, f);
             f(&mut value.0);
         }
+        Object::Match(matched) => {
+            f(&mut matched.subject.0);
+            f(&mut matched.regex.0);
+        }
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,
@@ -255,7 +259,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         | Object::CountIterator { .. }
         | Object::StreamIterator { .. }
         | Object::Regex { .. }
-        | Object::Match(_)
         | Object::RaisesContext { .. } => {}
     }
 }

@@ -6,8 +6,8 @@
 
 use super::{
     ArgumentParserObject, ArgumentSpec, ArrayStorage, ClassObject, FunctionObject, GeneratorObject,
-    InstanceAttributes, InstancePayload, NamespaceTarget, Object, ProxyTarget, Ref, ScopeObject,
-    SubcommandSpec, SubparsersSpec,
+    InstanceAttributes, InstancePayload, MatchObject, NamespaceTarget, Object, ProxyTarget, Ref,
+    ScopeObject, SubcommandSpec, SubparsersSpec,
 };
 
 fn slots(slots: &[Ref]) -> Vec<Ref> {
@@ -229,7 +229,16 @@ pub(super) fn dup_object(object: &Object) -> Object {
             pattern: pattern.clone(),
             flags: *flags,
         },
-        Object::Match(matched) => Object::Match(matched.clone()),
+        Object::Match(matched) => Object::Match(Box::new(MatchObject {
+            subject: matched.subject.dup(),
+            regex: matched.regex.dup(),
+            text: matched.text.clone(),
+            groups: matched.groups.clone(),
+            group_names: matched.group_names.clone(),
+            spans: matched.spans.clone(),
+            pos: matched.pos,
+            endpos: matched.endpos,
+        })),
         Object::ArgumentParser(parser) => Object::ArgumentParser(Box::new(ArgumentParserObject {
             prog: parser.prog.clone(),
             description: parser.description.clone(),

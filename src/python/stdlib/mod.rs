@@ -6,7 +6,6 @@
 pub mod argparse;
 mod asyncio;
 mod base64;
-pub mod bisect;
 pub mod collections;
 pub mod core;
 pub mod dataclasses;
@@ -68,6 +67,10 @@ pub(super) fn frozen_module(name: &str) -> Option<FrozenModule> {
 pub(super) fn frozen_builtin(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "open" => Some(("_io", "open")),
+        "aiter" => Some(("_iteration", "aiter")),
+        "BaseExceptionGroup" => Some(("_exceptions", "BaseExceptionGroup")),
+        "ExceptionGroup" => Some(("_exceptions", "ExceptionGroup")),
+        "anext" => Some(("_iteration", "anext")),
         _ => None,
     }
 }
@@ -79,11 +82,10 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "argparse" => Some(&argparse::MODULE),
         "_base64" => Some(&base64::MODULE),
         "_json" => Some(&json::MODULE),
-        "bisect" => Some(&bisect::MODULE),
         "_collections" => Some(&collections::MODULE),
         "dataclasses" => Some(&dataclasses::MODULE),
         "enum" => Some(&r#enum::MODULE),
-        "heapq" => Some(&heapq::MODULE),
+        "_heapq" => Some(&heapq::MODULE),
         "_hashlib" => Some(&hashlib::MODULE),
         "_shellsim_http" => Some(&http::MODULE),
         "_importlib" => Some(&importlib::MODULE),
@@ -91,17 +93,17 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_shellsim_vfs" => Some(&vfs::MODULE),
         "_zlib" => Some(&zlib::MODULE),
         "_functools" => Some(&functools::MODULE),
-        "itertools" => Some(&itertools::MODULE),
+        "_itertools" => Some(&itertools::MODULE),
         "math" => Some(&math::MODULE),
         "_operator" => Some(&operator::MODULE),
         "_os" => Some(&os::MODULE),
         "_pytest" => Some(&pytest::MODULE),
-        "re" => Some(&re::MODULE),
-        "string" => Some(&string::MODULE),
+        "_re" => Some(&re::MODULE),
+        "_string" => Some(&string::MODULE),
         "_struct" => Some(&r#struct::MODULE),
-        "sys" => Some(&sys::MODULE),
+        "_sys" => Some(&sys::MODULE),
         "_shellsim_subprocess" => Some(&subprocess::MODULE),
-        "time" => Some(&time::MODULE),
+        "_time" => Some(&time::MODULE),
         "typing" => Some(&typing::MODULE),
         "unittest" => Some(&unittest::MODULE),
         "_shellsim_warnings" => Some(&warnings::MODULE),

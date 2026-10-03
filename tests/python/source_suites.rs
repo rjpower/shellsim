@@ -22,6 +22,8 @@ const OBJECT_MODEL: &[u8] = include_bytes!("test_object_model.py");
 const TYPE_PROTOCOL: &[u8] = include_bytes!("test_type_protocol.py");
 const OPERATOR: &[u8] = include_bytes!("test_operator.py");
 const RANDOM: &[u8] = include_bytes!("test_random.py");
+const STDLIB_SURFACE: &[u8] = include_bytes!("test_stdlib_surface.py");
+const STDLIB_IO_PATHS: &[u8] = include_bytes!("test_stdlib_io_paths.py");
 const WARNINGS: &[u8] = include_bytes!("test_warnings.py");
 const COUNT_10_MILLION: &[u8] = include_bytes!("performance/test_count_10_million.py");
 
@@ -129,6 +131,16 @@ fn operator() {
 #[test]
 fn random() {
     assert_source_suite("test_random.py", RANDOM);
+}
+
+#[test]
+fn stdlib_surface() {
+    assert_source_suite("test_stdlib_surface.py", STDLIB_SURFACE);
+}
+
+#[test]
+fn stdlib_io_paths() {
+    assert_source_suite("test_stdlib_io_paths.py", STDLIB_IO_PATHS);
 }
 
 #[test]

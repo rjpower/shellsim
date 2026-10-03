@@ -7,7 +7,7 @@
 use super::super::native::{ModuleDef, PyConstant, ValueDef};
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
-    name: "string",
+    name: "_string",
     functions: &[],
     values: &[
         ValueDef::Constant {

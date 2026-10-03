@@ -211,6 +211,101 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
             name: "tan",
             call: native_tan,
         },
+        FunctionDef {
+            module: "math",
+            name: "cbrt",
+            call: native_cbrt,
+        },
+        FunctionDef {
+            module: "math",
+            name: "copysign",
+            call: native_copysign,
+        },
+        FunctionDef {
+            module: "math",
+            name: "dist",
+            call: native_dist,
+        },
+        FunctionDef {
+            module: "math",
+            name: "erf",
+            call: native_erf,
+        },
+        FunctionDef {
+            module: "math",
+            name: "erfc",
+            call: native_erfc,
+        },
+        FunctionDef {
+            module: "math",
+            name: "exp2",
+            call: native_exp2,
+        },
+        FunctionDef {
+            module: "math",
+            name: "expm1",
+            call: native_expm1,
+        },
+        FunctionDef {
+            module: "math",
+            name: "fma",
+            call: native_fma,
+        },
+        FunctionDef {
+            module: "math",
+            name: "fmod",
+            call: native_fmod,
+        },
+        FunctionDef {
+            module: "math",
+            name: "frexp",
+            call: native_frexp,
+        },
+        FunctionDef {
+            module: "math",
+            name: "fsum",
+            call: native_fsum,
+        },
+        FunctionDef {
+            module: "math",
+            name: "isqrt",
+            call: native_isqrt,
+        },
+        FunctionDef {
+            module: "math",
+            name: "ldexp",
+            call: native_ldexp,
+        },
+        FunctionDef {
+            module: "math",
+            name: "log1p",
+            call: native_log1p,
+        },
+        FunctionDef {
+            module: "math",
+            name: "modf",
+            call: native_modf,
+        },
+        FunctionDef {
+            module: "math",
+            name: "nextafter",
+            call: native_nextafter,
+        },
+        FunctionDef {
+            module: "math",
+            name: "remainder",
+            call: native_remainder,
+        },
+        FunctionDef {
+            module: "math",
+            name: "sumprod",
+            call: native_sumprod,
+        },
+        FunctionDef {
+            module: "math",
+            name: "ulp",
+            call: native_ulp,
+        },
     ],
     values: &[
         ValueDef::Constant {
@@ -843,6 +938,16 @@ pub fn call(name: &str, args: &[f64]) -> MathResult {
         "sin" => unary("sin", args, sin),
         "sqrt" => unary("sqrt", args, sqrt),
         "tan" => unary("tan", args, tan),
+        "cbrt" => unary("cbrt", args, |value| Ok(MathValue::Float(value.cbrt()))),
+        "copysign" => binary("copysign", args, |x, y| Ok(MathValue::Float(x.copysign(y)))),
+        "erf" => unary("erf", args, |value| Ok(MathValue::Float(erf(value)))),
+        "erfc" => unary("erfc", args, |value| Ok(MathValue::Float(erfc(value)))),
+        "exp2" => unary("exp2", args, |value| range_checked(value, value.exp2())),
+        "expm1" => unary("expm1", args, |value| range_checked(value, value.exp_m1())),
+        "fmod" => binary("fmod", args, fmod),
+        "log1p" => unary("log1p", args, log1p),
+        "remainder" => binary("remainder", args, remainder),
+        "ulp" => unary("ulp", args, |value| Ok(MathValue::Float(ulp(value)))),
         _ => Err(MathError::UnknownFunction(name.to_string())),
     }
 }
@@ -1096,6 +1201,492 @@ pub fn sqrt(value: f64) -> MathResult {
         return Err(MathError::ValueError("expected a nonnegative input"));
     }
     Ok(MathValue::Float(value.sqrt()))
+}
+
+fn native_cbrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "cbrt")
+}
+
+fn native_copysign<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "copysign")
+}
+
+fn native_erf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "erf")
+}
+
+fn native_erfc<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "erfc")
+}
+
+fn native_exp2<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "exp2")
+}
+
+fn native_expm1<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "expm1")
+}
+
+fn native_fmod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "fmod")
+}
+
+fn native_log1p<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "log1p")
+}
+
+fn native_remainder<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "remainder")
+}
+
+fn native_ulp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    native_call(runtime, args, "ulp")
+}
+
+/// A finite input whose result overflowed raises Python's `OverflowError`.
+fn range_checked(input: f64, result: f64) -> MathResult {
+    if result.is_infinite() && input.is_finite() {
+        return Err(MathError::OverflowError("math range error"));
+    }
+    Ok(MathValue::Float(result))
+}
+
+/// The error function. A Taylor series serves |x| below 1.5, where it converges in a few dozen
+/// terms; beyond that the complementary function's continued fraction is evaluated backwards.
+pub fn erf(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x.abs() < ERF_SERIES_CUTOFF {
+        return erf_series(x);
+    }
+    let tail = erfc_continued_fraction(x.abs());
+    if x > 0.0 {
+        1.0 - tail
+    } else {
+        tail - 1.0
+    }
+}
+
+/// The complementary error function `1 - erf(x)`, accurate in the tail where the subtraction
+/// would lose all precision.
+pub fn erfc(x: f64) -> f64 {
+    if x.is_nan() {
+        return x;
+    }
+    if x.abs() < ERF_SERIES_CUTOFF {
+        return 1.0 - erf_series(x);
+    }
+    let tail = erfc_continued_fraction(x.abs());
+    if x > 0.0 {
+        tail
+    } else {
+        2.0 - tail
+    }
+}
+
+const ERF_SERIES_CUTOFF: f64 = 1.5;
+
+fn erf_series(x: f64) -> f64 {
+    // erf(x) = 2/sqrt(pi) * sum (-1)^n x^(2n+1) / (n! (2n+1))
+    let square = x * x;
+    let mut term = x;
+    let mut sum = x;
+    for n in 1..100 {
+        term *= -square / n as f64;
+        let addend = term / (2 * n + 1) as f64;
+        sum += addend;
+        if addend.abs() <= f64::EPSILON * sum.abs() {
+            break;
+        }
+    }
+    sum * std::f64::consts::FRAC_2_SQRT_PI
+}
+
+/// erfc(x) for x >= 1.5 as exp(-x^2)/sqrt(pi) divided by the continued fraction
+/// x + (1/2)/(x + 1/(x + (3/2)/(x + ...))), evaluated from a fixed depth backwards.
+fn erfc_continued_fraction(x: f64) -> f64 {
+    const DEPTH: u32 = 80;
+    let mut fraction = x;
+    for n in (1..=DEPTH).rev() {
+        fraction = x + (f64::from(n) / 2.0) / fraction;
+    }
+    (-x * x).exp() / std::f64::consts::PI.sqrt() / fraction
+}
+
+/// C's `fmod`: the remainder with the sign of `x`, undefined for a zero divisor or infinite
+/// dividend as in CPython.
+fn fmod(x: f64, y: f64) -> MathResult {
+    if y.is_nan() || x.is_nan() {
+        return Ok(MathValue::Float(f64::NAN));
+    }
+    if y == 0.0 || x.is_infinite() {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    if y.is_infinite() {
+        return Ok(MathValue::Float(x));
+    }
+    Ok(MathValue::Float(x % y))
+}
+
+fn log1p(x: f64) -> MathResult {
+    if x.is_nan() {
+        return Ok(MathValue::Float(x));
+    }
+    if x <= -1.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    Ok(MathValue::Float(x.ln_1p()))
+}
+
+/// IEEE 754 `remainder`: `x - n*y` for the integer `n` nearest `x/y`, ties to even, so the
+/// result lies within half of `|y|` of zero.
+fn remainder(x: f64, y: f64) -> MathResult {
+    if x.is_nan() || y.is_nan() {
+        return Ok(MathValue::Float(f64::NAN));
+    }
+    if x.is_infinite() || y == 0.0 {
+        return Err(MathError::ValueError("math domain error"));
+    }
+    if y.is_infinite() {
+        return Ok(MathValue::Float(x));
+    }
+    let magnitude = y.abs();
+    let partial = x % magnitude;
+    let other = partial - magnitude.copysign(partial);
+    let result = if partial.abs() < other.abs() {
+        partial
+    } else if partial.abs() > other.abs() {
+        other
+    } else {
+        // A tie: pick the candidate whose implied quotient is even.
+        let quotient = ((x - partial) / magnitude).round_ties_even();
+        if quotient % 2.0 == 0.0 {
+            partial
+        } else {
+            other
+        }
+    };
+    Ok(MathValue::Float(if result == 0.0 {
+        0.0_f64.copysign(x)
+    } else {
+        result
+    }))
+}
+
+/// The spacing between `x` and the next float of larger magnitude.
+fn ulp(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        return x.abs();
+    }
+    let x = x.abs();
+    if x == f64::MAX {
+        return x - x.next_down();
+    }
+    x.next_up() - x
+}
+
+fn native_frexp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.frexp", 1, 1)?;
+    args.reject_keywords("math.frexp")?;
+    let value = real_argument(runtime, args.positional()[0])?;
+    let (mantissa, exponent) = frexp(value);
+    runtime.new_tuple(vec![
+        Value::Float(mantissa),
+        Value::Int(i64::from(exponent)),
+    ])
+}
+
+/// `x = m * 2**e` with `0.5 <= |m| < 1`; zero, infinities and NaN return themselves with
+/// exponent 0.
+pub fn frexp(x: f64) -> (f64, i32) {
+    if x == 0.0 || !x.is_finite() {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    if biased == 0 {
+        // Subnormal: scale into the normal range first.
+        let (mantissa, exponent) = frexp(x * 2f64.powi(54));
+        return (mantissa, exponent - 54);
+    }
+    let mantissa = f64::from_bits((bits & !(0x7ff_u64 << 52)) | (1022_u64 << 52));
+    (mantissa, biased - 1022)
+}
+
+fn native_modf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.modf", 1, 1)?;
+    args.reject_keywords("math.modf")?;
+    let value = real_argument(runtime, args.positional()[0])?;
+    let (fraction, integer) = if value.is_infinite() {
+        (0.0_f64.copysign(value), value)
+    } else if value.is_nan() {
+        (value, value)
+    } else {
+        let integer = value.trunc();
+        ((value - integer).copysign(value), integer)
+    };
+    runtime.new_tuple(vec![Value::Float(fraction), Value::Float(integer)])
+}
+
+fn native_ldexp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.ldexp", 2, 2)?;
+    args.reject_keywords("math.ldexp")?;
+    let value = real_argument(runtime, args.positional()[0])?;
+    let exponent = integer_argument(runtime, &args.positional()[1], "ldexp")?;
+    if value == 0.0 || !value.is_finite() {
+        return Ok(Value::Float(value));
+    }
+    // Any exponent beyond this range already overflows or underflows a double.
+    let exponent = exponent
+        .to_i32()
+        .unwrap_or(if exponent.is_negative() { -2200 } else { 2200 });
+    let exponent = exponent.clamp(-2200, 2200);
+    let half = exponent / 2;
+    let result = value * 2f64.powi(half) * 2f64.powi(exponent - half);
+    if result.is_infinite() {
+        return Err(PyError::overflow_error("math range error"));
+    }
+    Ok(Value::Float(result))
+}
+
+fn native_fma<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.fma", 3, 3)?;
+    args.reject_keywords("math.fma")?;
+    let x = real_argument(runtime, args.positional()[0])?;
+    let y = real_argument(runtime, args.positional()[1])?;
+    let z = real_argument(runtime, args.positional()[2])?;
+    let result = x.mul_add(y, z);
+    if result.is_nan() && !x.is_nan() && !y.is_nan() && !z.is_nan() {
+        return Err(PyError::value_error("invalid operation in fma"));
+    }
+    if result.is_infinite() && x.is_finite() && y.is_finite() && z.is_finite() {
+        return Err(PyError::overflow_error("overflow in fma"));
+    }
+    Ok(Value::Float(result))
+}
+
+fn native_nextafter<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.nextafter", 2, 2)?;
+    args.reject_unknown_keywords("math.nextafter", &["steps"])?;
+    let x = real_argument(runtime, args.positional()[0])?;
+    let y = real_argument(runtime, args.positional()[1])?;
+    let steps = match args.keyword("math.nextafter", "steps")?.copied() {
+        None => None,
+        Some(value) if value.is_none() => None,
+        Some(value) => {
+            let steps = integer_argument(runtime, &value, "nextafter")?;
+            if steps.is_negative() {
+                return Err(PyError::value_error("steps must be a non-negative integer"));
+            }
+            Some(steps.to_u64().unwrap_or(u64::MAX))
+        }
+    };
+    Ok(Value::Float(nextafter(x, y, steps.unwrap_or(1))))
+}
+
+/// The float `steps` representable values from `x` toward `y`, stopping at `y`. Floats map to
+/// consecutive integers in value order, so any step count is a single addition.
+pub fn nextafter(x: f64, y: f64, steps: u64) -> f64 {
+    if x.is_nan() || y.is_nan() {
+        return f64::NAN;
+    }
+    if x == y || steps == 0 {
+        return if steps == 0 { x } else { y };
+    }
+    let from = float_ordinal(x);
+    let to = float_ordinal(y);
+    let distance = to.abs_diff(from);
+    let steps = i64::try_from(steps.min(distance)).unwrap_or(i64::MAX);
+    float_from_ordinal(if to > from {
+        from + steps
+    } else {
+        from - steps
+    })
+}
+
+/// Floats in increasing value order map to increasing integers; both zeros map to 0.
+fn float_ordinal(x: f64) -> i64 {
+    let bits = x.to_bits() as i64;
+    if bits < 0 {
+        i64::MIN - bits
+    } else {
+        bits
+    }
+}
+
+fn float_from_ordinal(ordinal: i64) -> f64 {
+    if ordinal >= 0 {
+        f64::from_bits(ordinal as u64)
+    } else {
+        f64::from_bits((i64::MIN - ordinal) as u64)
+    }
+}
+
+fn native_isqrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.isqrt", 1, 1)?;
+    args.reject_keywords("math.isqrt")?;
+    let value = integer_argument(runtime, &args.positional()[0], "isqrt")?;
+    if value.is_negative() {
+        return Err(PyError::value_error("isqrt() argument must be nonnegative"));
+    }
+    if value.is_zero() {
+        return Ok(Value::Int(0));
+    }
+    runtime.reserve_memory(bigint_bytes(&value)?)?;
+    // Newton's iteration from a power of two above the root, descending monotonically.
+    let mut estimate = BigInt::from(1_u8) << value.bits().div_ceil(2);
+    loop {
+        runtime.charge_cpu(number::divide_work(
+            number::words(&value),
+            number::words(&estimate),
+        ))?;
+        let next = (&estimate + &value / &estimate) >> 1;
+        if next >= estimate {
+            break;
+        }
+        estimate = next;
+    }
+    runtime.new_bigint(estimate)
+}
+
+/// The float items of an iterable, converted one at a time so no handles are retained.
+fn float_items<'s>(runtime: &mut dyn PyRuntime<'s>, iterable: Value<'s>) -> PyResult<'s, Vec<f64>> {
+    let iterator = runtime.iterator(iterable)?;
+    let mut values = Vec::new();
+    let mut exhausted = false;
+    while !exhausted {
+        runtime.nested(&mut |runtime, _| {
+            let Some(item) = runtime.iterator_next(iterator)? else {
+                exhausted = true;
+                return Ok(());
+            };
+            runtime.charge_cpu(1)?;
+            runtime.reserve_memory(std::mem::size_of::<f64>())?;
+            values.push(real_argument(runtime, item)?);
+            Ok(())
+        })?;
+    }
+    Ok(values)
+}
+
+fn native_fsum<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.fsum", 1, 1)?;
+    args.reject_keywords("math.fsum")?;
+    let values = float_items(runtime, args.positional()[0])?;
+    runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
+    fsum(&values).map(Value::Float)
+}
+
+/// Exactly rounded sum of floats, keeping a list of non-overlapping partial sums so the final
+/// rounding happens once.
+pub fn fsum<'s>(values: &[f64]) -> PyResult<'s, f64> {
+    if values.iter().any(|value| !value.is_finite()) {
+        let total: f64 = values.iter().sum();
+        if total.is_nan() && !values.iter().any(|value| value.is_nan()) {
+            return Err(PyError::value_error("-inf + inf in fsum"));
+        }
+        return Ok(total);
+    }
+    let mut partials: Vec<f64> = Vec::new();
+    for &value in values {
+        let mut x = value;
+        let mut kept = 0;
+        for index in 0..partials.len() {
+            let mut y = partials[index];
+            if x.abs() < y.abs() {
+                std::mem::swap(&mut x, &mut y);
+            }
+            let high = x + y;
+            let low = y - (high - x);
+            if low != 0.0 {
+                partials[kept] = low;
+                kept += 1;
+            }
+            x = high;
+        }
+        partials.truncate(kept);
+        if x.is_infinite() {
+            return Err(PyError::overflow_error("intermediate overflow in fsum"));
+        }
+        partials.push(x);
+    }
+    let Some(mut high) = partials.pop() else {
+        return Ok(0.0);
+    };
+    while let Some(y) = partials.pop() {
+        let x = high;
+        high = x + y;
+        let low = y - (high - x);
+        if low != 0.0 {
+            // Round half to even against the next lower partial.
+            if let Some(&next) = partials.last() {
+                if (low < 0.0 && next < 0.0) || (low > 0.0 && next > 0.0) {
+                    let doubled = low * 2.0;
+                    let candidate = high + doubled;
+                    if doubled == candidate - high {
+                        high = candidate;
+                    }
+                }
+            }
+            break;
+        }
+    }
+    Ok(high)
+}
+
+fn native_dist<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.dist", 2, 2)?;
+    args.reject_keywords("math.dist")?;
+    let p = float_items(runtime, args.positional()[0])?;
+    let q = float_items(runtime, args.positional()[1])?;
+    if p.len() != q.len() {
+        return Err(PyError::value_error(
+            "both points must have the same number of dimensions",
+        ));
+    }
+    runtime.charge_cpu(u64::try_from(p.len()).unwrap_or(u64::MAX))?;
+    let distance = p
+        .iter()
+        .zip(&q)
+        .map(|(a, b)| a - b)
+        .fold(0.0_f64, f64::hypot);
+    Ok(Value::Float(distance))
+}
+
+/// `sumprod(p, q)`: the sum of pairwise products through the `*` and `+` protocols, so integers
+/// stay exact; the inputs must have equal lengths.
+fn native_sumprod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("math.sumprod", 2, 2)?;
+    args.reject_keywords("math.sumprod")?;
+    let left = runtime.iterator(args.positional()[0])?;
+    let right = runtime.iterator(args.positional()[1])?;
+    let multiply = PyOperator::Binary(BinaryOperator::Multiply);
+    let add = PyOperator::Binary(BinaryOperator::Add);
+    let total = runtime
+        .new_list(vec![Value::Int(0)])?
+        .cast::<PyList<'s>>(runtime)?;
+    let mut exhausted = false;
+    while !exhausted {
+        runtime.nested(&mut |runtime, _| {
+            let a = runtime.iterator_next(left)?;
+            let b = runtime.iterator_next(right)?;
+            let (a, b) = match (a, b) {
+                (None, None) => {
+                    exhausted = true;
+                    return Ok(());
+                }
+                (Some(a), Some(b)) => (a, b),
+                _ => return Err(PyError::value_error("Inputs are not the same length")),
+            };
+            runtime.charge_cpu(1)?;
+            let product = runtime.apply_operator(multiply, &[a, b])?;
+            let current = runtime.list_items(total)?[0];
+            let next = runtime.apply_operator(add, &[current, product])?;
+            runtime.replace_list_items(total, vec![next])
+        })?;
+    }
+    Ok(runtime.list_items(total)?[0])
 }
 
 #[cfg(test)]

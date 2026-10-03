@@ -2,7 +2,8 @@
 //!
 //! `parameters(callable)` lists a Python function's parameters in declaration order, as
 //! `(name, kind, has_default, default)` tuples whose `kind` is the name of the matching
-//! `inspect.Parameter` kind. A bound method omits its bound first parameter, as
+//! `inspect.Parameter` kind. `flags(callable)` reports whether a function is a generator or a
+//! coroutine function. A bound method omits its bound first parameter, as
 //! `inspect.signature` does. Any other callable gives `None`. The helper reads only what the
 //! compiler recorded for the function; no frame, local variable or host state crosses this
 //! boundary. The frozen `inspect` module builds `inspect.signature` on it.
@@ -13,11 +14,18 @@ use super::super::Value;
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "_shellsim_introspect",
-    functions: &[FunctionDef {
-        module: "_shellsim_introspect",
-        name: "parameters",
-        call: parameters,
-    }],
+    functions: &[
+        FunctionDef {
+            module: "_shellsim_introspect",
+            name: "parameters",
+            call: parameters,
+        },
+        FunctionDef {
+            module: "_shellsim_introspect",
+            name: "flags",
+            call: flags,
+        },
+    ],
     values: &[],
 };
 
@@ -29,6 +37,16 @@ fn kind_name(kind: ParameterKind) -> &'static str {
         ParameterKind::KeywordOnly => "KEYWORD_ONLY",
         ParameterKind::KeywordVariadic => "VAR_KEYWORD",
     }
+}
+
+/// `flags(callable)`: `(is_generator, is_coroutine)` for a Python function, else `None`.
+fn flags<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    args.expect_positional("flags", 1, 1)?;
+    args.reject_keywords("flags")?;
+    let Some((is_generator, is_coroutine)) = runtime.function_flags(&args.positional()[0])? else {
+        return Ok(Value::None);
+    };
+    runtime.new_tuple(vec![Value::Bool(is_generator), Value::Bool(is_coroutine)])
 }
 
 fn parameters<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
