@@ -25,7 +25,7 @@ classifiers = [
 keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simulation", "testing"]
 
 [project.optional-dependencies]
-c = ["shellsim-c-toolchain==0.1.25"]
+c = ["shellsim-c-toolchain==0.1.26"]
 
 [project.urls]
 Homepage = "https://github.com/rjpower/shellsim"
