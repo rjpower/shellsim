@@ -12,8 +12,17 @@ pub struct LexError {
     pub span: Span,
 }
 
+/// Tokenizes Python source.
+///
+/// Line endings are normalized first, as CPython's universal-newline source decoding does, so a
+/// CRLF file lexes exactly like its LF form: a backslash before `\r\n` continues the line and a
+/// triple-quoted string spanning CRLF lines contains `\n`. Spans refer to the normalized text.
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
-    Lexer::new(source).lex()
+    if !source.contains('\r') {
+        return Lexer::new(source).lex();
+    }
+    let normalized = source.replace("\r\n", "\n").replace('\r', "\n");
+    Lexer::new(&normalized).lex()
 }
 
 struct Lexer<'a> {
@@ -49,7 +58,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             let ch = self.peek().expect("checked above");
-            if matches!(ch, ' ' | '\t' | '\r') {
+            if matches!(ch, ' ' | '\t') {
                 self.bump();
                 continue;
             }
@@ -722,11 +731,6 @@ impl<'a> Lexer<'a> {
                 }
                 _ => break,
             }
-        }
-        // A CRLF blank line must not change indentation. The main token loop already ignores
-        // `\r`; consuming it here keeps the indentation stack untouched before the `\n` token.
-        if self.source[self.offset..].starts_with("\r\n") {
-            self.bump();
         }
         if matches!(self.peek(), None | Some('\n' | '#')) {
             return Ok(());
