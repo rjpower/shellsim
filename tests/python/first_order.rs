@@ -18,9 +18,11 @@ print(documented())
 }
 
 #[test]
-fn crlf_blank_lines_do_not_change_python_indentation() {
-    let source = "class Value:\r\n    def get(self):\r\n        first = 20\r\n\r\n        second = 22\r\n        return first + second\r\n\r\nprint(Value().get())\r\n";
-    assert_eq!(run(source), (0, "42\n".into(), String::new()));
+fn crlf_sources_lex_like_their_lf_form() {
+    // Blank lines keep indentation, a backslash continues the line, and a triple-quoted string
+    // spanning CRLF lines contains LF, matching CPython's universal-newline source decoding.
+    let source = "class Value:\r\n    def get(self):\r\n        first = 20\r\n\r\n        second = \\\r\n            22\r\n        return first + second\r\n\r\ntext = '''a\r\nb'''\r\nprint(Value().get(), repr(text))\r\n";
+    assert_eq!(run(source), (0, "42 'a\\nb'\n".into(), String::new()));
 }
 
 #[test]
