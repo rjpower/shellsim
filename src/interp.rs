@@ -204,6 +204,8 @@ pub struct ProcessState {
     pub(crate) getopts: GetoptsState,
     /// `set -e` / `set -u` / `set -x`
     pub opt_errexit: bool,
+    /// Inherit ERR handlers in functions and forked shell contexts (`set -E`).
+    pub opt_errtrace: bool,
     pub opt_nounset: bool,
     pub opt_xtrace: bool,
     /// Diagnostic and control-flow effect raised while expanding the current shell word.
@@ -247,6 +249,11 @@ pub struct ProcessState {
     pub(crate) signal_dispositions: BTreeMap<Signal, ShellSignalDisposition>,
     /// Process-local pseudo-signal action run once when the current shell script finishes.
     pub(crate) exit_disposition: Option<ShellSignalDisposition>,
+    /// ERR is a shell pseudo-signal, independent of kernel signal delivery.
+    pub(crate) err_disposition: Option<ShellSignalDisposition>,
+    /// A non-inheriting function retains the trap for inspection but does not invoke it.
+    pub(crate) err_trap_active: bool,
+    pub(crate) handling_error: bool,
     /// Prevent ordinary caught signals from recursively interrupting their own handler.
     handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
@@ -272,6 +279,7 @@ struct ShellImage {
     arg0: String,
     positional: Vec<String>,
     errexit: bool,
+    errtrace: bool,
     nounset: bool,
     xtrace: bool,
     pipefail: bool,
@@ -434,6 +442,7 @@ impl ProcessState {
             positional: self.positional.clone(),
             getopts: self.getopts.clone(),
             opt_errexit: self.opt_errexit,
+            opt_errtrace: self.opt_errtrace,
             opt_nounset: self.opt_nounset,
             opt_xtrace: self.opt_xtrace,
             expansion_error: None,
@@ -473,6 +482,9 @@ impl ProcessState {
                 self.exit_disposition.clone()
             },
             handling_signal: false,
+            err_disposition: self.err_disposition.clone(),
+            err_trap_active: self.err_trap_active && self.opt_errtrace,
+            handling_error: self.handling_error,
             fork_allocation_bytes,
             local_saved_bytes: self.local_saved_bytes,
             frame_saved_bytes: 0,
@@ -601,7 +613,11 @@ impl ProcessState {
                 }
             });
         }
-        if let Some(disposition) = &self.exit_disposition {
+        for disposition in self
+            .exit_disposition
+            .iter()
+            .chain(self.err_disposition.iter())
+        {
             bytes = bytes.saturating_add(match disposition {
                 ShellSignalDisposition::Ignore => 16,
                 ShellSignalDisposition::Handler { source, body } => {
@@ -689,7 +705,7 @@ impl Environment {
         }
         let mut vfs = Vfs::with_disk_limit(limits.disk);
         vfs.set_mutation_time(clock.unix_ms());
-        vfs.seed_dirs(["/root", "/tmp", "/work", "/usr", "/usr/bin"]);
+        vfs.seed_dirs(["/root", "/tmp", "/work", "/usr", "/usr/bin", "/bin"]);
         for (name, program) in [
             ("true", crate::vfs::NativeProgram::True),
             ("false", crate::vfs::NativeProgram::False),
@@ -714,6 +730,7 @@ impl Environment {
             ("zsh", crate::vfs::NativeProgram::LegacyRegistered("zsh")),
         ] {
             vfs.seed_native_executable(&format!("/usr/bin/{name}"), program);
+            vfs.seed_native_executable(&format!("/bin/{name}"), program);
         }
         for (path, image) in crate::commands::registered_executables() {
             if matches!(
@@ -724,6 +741,10 @@ impl Environment {
                 continue;
             }
             vfs.seed_native_executable(&path, image);
+            // Absolute entrypoints and PATH=/bin use ordinary VFS lookup, including permissions.
+            if let Some(name) = path.strip_prefix("/usr/bin/") {
+                vfs.seed_native_executable(&format!("/bin/{name}"), image);
+            }
         }
         const ROOT_PID: ProcessId = 1_234;
         let process_environment = exported
@@ -776,6 +797,7 @@ impl Environment {
                     offset: 1,
                 },
                 opt_errexit: false,
+                opt_errtrace: false,
                 opt_nounset: false,
                 opt_xtrace: false,
                 expansion_error: None,
@@ -800,6 +822,9 @@ impl Environment {
                 pending_signals: std::collections::BTreeSet::new(),
                 signal_dispositions: BTreeMap::new(),
                 exit_disposition: None,
+                err_disposition: None,
+                err_trap_active: true,
+                handling_error: false,
                 handling_signal: false,
                 fork_allocation_bytes: 0,
                 local_saved_bytes: 0,
@@ -1017,6 +1042,9 @@ impl Environment {
             .signal_dispositions
             .retain(|_, disposition| matches!(disposition, ShellSignalDisposition::Ignore));
         state.exit_disposition = None;
+        state.err_disposition = None;
+        state.err_trap_active = true;
+        state.handling_error = false;
         state.handling_signal = false;
         Ok(())
     }
@@ -1062,6 +1090,7 @@ impl Environment {
                     'c' => command = true,
                     's' => from_stdin = true,
                     'e' => image.errexit = enable,
+                    'E' => image.errtrace = enable,
                     'u' => image.nounset = enable,
                     'x' => image.xtrace = enable,
                     // Interactive and login shells are not modeled; the flags are accepted.
@@ -1073,6 +1102,7 @@ impl Environment {
                         index += 1;
                         match name.as_str() {
                             "errexit" => image.errexit = enable,
+                            "errtrace" => image.errtrace = enable,
                             "nounset" => image.nounset = enable,
                             "xtrace" => image.xtrace = enable,
                             "pipefail" => image.pipefail = enable,
@@ -1166,6 +1196,7 @@ impl Environment {
         state.arg0 = image.arg0;
         state.positional = image.positional.into();
         state.opt_errexit = image.errexit;
+        state.opt_errtrace = image.errtrace;
         state.opt_nounset = image.nounset;
         state.opt_xtrace = image.xtrace;
         state.opt_pipefail = image.pipefail;

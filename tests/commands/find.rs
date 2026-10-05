@@ -33,6 +33,69 @@ fn grouped_alternatives_implicit_and_and_negation_compose() {
 }
 
 #[test]
+fn case_insensitive_names_match_only_the_basename_and_preserve_print0() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(
+        &mut environment,
+        "mkdir -p root/FileNameParent root/nested; touch root/FileNameA.TXT root/filenameb.txt root/nested/FILENAMEC.TxT root/FileNameParent/other.txt; find root -type f -iname 'fileName*.txt' -print0; find root -type f -name 'fileName*.txt'; find root -type f -iname 'FILENAME[A-B].TXT'",
+    );
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        b"root/FileNameA.TXT\0root/filenameb.txt\0root/nested/FILENAMEC.TxT\0root/FileNameA.TXT\nroot/filenameb.txt\n"
+    );
+}
+
+#[test]
+fn prune_skips_descendants_and_composes_with_boolean_actions() {
+    let setup = "mkdir -p tree/ignored/nested tree/kept; touch tree/ignored/nested/file tree/kept/FileName.TXT; ";
+    for (expression, expected) in [
+        (
+            "-path tree/ignored -prune -o -type f -iname 'filename*.txt' -print0",
+            "tree/kept/FileName.TXT\0",
+        ),
+        ("-name ignored -prune", "tree/ignored\n"),
+        ("-prune", "tree\n"),
+        (
+            "-name absent -prune -o -type f -print",
+            "tree/ignored/nested/file\ntree/kept/FileName.TXT\n",
+        ),
+        (
+            "-depth -name ignored -prune -o -type f -print",
+            "tree/ignored/nested/file\ntree/kept/FileName.TXT\n",
+        ),
+        ("-mindepth 1 -prune", "tree/ignored\ntree/kept\n"),
+    ] {
+        let mut env = Environment::new();
+        let (status, stdout, stderr) = run(&mut env, &format!("{setup}find tree {expression}"));
+        assert_eq!(status, 0, "{expression}: {stderr}");
+        assert_eq!(stdout, expected.as_bytes(), "{expression}");
+    }
+    let mut env = Environment::new();
+    let (status, _, _) = run(&mut env, &format!("{setup}find tree -prune -delete"));
+    assert_ne!(status, 0);
+    assert!(env.vfs.exists("/", "/tree/ignored/nested/file"));
+}
+
+#[test]
+fn prune_does_not_pay_to_visit_skipped_children() {
+    let mut env = Environment::new();
+    env.vfs.mkdir_all("/", "/tree/skipped").unwrap();
+    for index in 0..1000 {
+        env.vfs
+            .write("/", &format!("/tree/skipped/{index}"), b"", 0o644)
+            .unwrap();
+    }
+    env.resources = shellsim::resources::Resources::new(shellsim::Limits {
+        cpu: 10_000,
+        ..Default::default()
+    });
+    let (status, stdout, stderr) = run(&mut env, "find /tree -name skipped -prune -o -print");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"/tree\n");
+}
+
+#[test]
 fn depth_path_and_nul_printing_match_common_find_usage() {
     let mut environment = Environment::new();
     let (status, stdout, stderr) = run(
@@ -64,6 +127,7 @@ fn unsupported_or_invalid_predicates_fail_before_walking() {
         ("find . -printf '%p\\n'", "unsupported predicate"),
         ("find . \\( -name x", "missing ')'"),
         ("find . -maxdepth nope", "invalid argument"),
+        ("find . -iname", "missing argument"),
     ] {
         let (status, stdout, stderr) = run(&mut environment, source);
         assert_eq!(status, 2, "{source}: {stderr}");

@@ -55,6 +55,19 @@ behavior must fail explicitly; they must never invoke a host binary. Native comp
 arbitrary executable formats remain outside the model because running emitted machine code would
 bypass every capability boundary.
 
+The base image exposes its `/usr/bin` programs at `/bin` too, including `/bin/bash` and
+`/bin/sh`. Each path is an independent executable VFS entry with the same native program
+identity, so permissions, replacement, and removal apply through ordinary path lookup.
+The directories are not symlinked. Unregistered paths never fall back to basename dispatch.
+
+`read -d` consumes one record and leaves subsequent bytes on the virtual descriptor; an empty
+delimiter selects NUL. `set -E` and `set -o errtrace` inherit ERR handlers into functions,
+subshells, and command substitutions. ERR handling follows command and pipeline status, preserves
+`$?`, and shares the shell's conditional suppression rules. Handler work remains resource-metered.
+`find -prune` stops descent before listing children and follows expression short-circuiting.
+It has no traversal effect under explicit `-depth`; combining it with `-delete` requires an
+explicit `-depth` because deletion otherwise implies depth-first traversal silently.
+
 Text utilities use a shared option scanner for short clusters, long options, values, and the `--`
 operand boundary. The scanner only recognizes command-local option tables. It has no permissive
 fallback, so an accepted option always has an implementation in that command.
@@ -125,3 +138,7 @@ Run a narrow test while editing. Before handing off a change, run:
 
 Tests must not depend on host elapsed time, locale, network, filesystem contents, or unordered
 collection output.
+
+NUL-delimited restore helpers can combine `sort -z` with `read -d ''`. Input process
+substitution in a compound-command redirection (such as `while ...; done < <(...)`) uses
+the same bounded virtual capture as a simple-command redirection.

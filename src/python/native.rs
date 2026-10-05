@@ -703,6 +703,8 @@ pub(super) type PyArrayReader<'a, 's> =
 pub(super) trait PyRuntime<'s> {
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<'s, ()>;
     fn charge_cpu(&mut self, units: u64) -> PyResult<'s, ()>;
+    /// Arm or clear the runner's per-item virtual-time limit; global resource limits still apply.
+    fn set_test_timeout(&mut self, nanoseconds: Option<u64>);
     fn kind(&self, value: &PyValue<'s>) -> PyResult<'s, PyKind>;
     /// The Python class of a value, including a user class's metaclass.
     fn class_of(&self, value: &PyValue<'s>) -> PyResult<'s, PyValue<'s>>;

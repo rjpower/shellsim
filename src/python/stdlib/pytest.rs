@@ -10,6 +10,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     functions: &[
         FunctionDef {
             module: "_pytest",
+            name: "_set_timeout",
+            call: set_timeout,
+        },
+        FunctionDef {
+            module: "_pytest",
             name: "fail",
             call: fail,
         },
@@ -21,6 +26,22 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
     values: &[],
 };
+
+fn set_timeout<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+    use super::super::native::PyValueCast;
+    use super::super::number::PyNumber;
+    args.expect_positional("_pytest._set_timeout", 1, 1)?;
+    args.reject_keywords("_pytest._set_timeout")?;
+    let seconds = args.positional()[0].cast::<PyNumber>(runtime)?.into_f64()?;
+    let nanos = seconds * 1_000_000_000.0;
+    if !nanos.is_finite() || nanos < 0.0 || nanos >= u64::MAX as f64 {
+        return Err(PyError::value_error(
+            "timeout must be finite and non-negative",
+        ));
+    }
+    runtime.set_test_timeout((nanos > 0.0).then_some((nanos as u64).max(1)));
+    Ok(super::super::Value::None)
+}
 
 fn fail<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
     control_error(runtime, args, "pytest.fail", "Failed")

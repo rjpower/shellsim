@@ -123,6 +123,20 @@ impl<'s> Vm<'s> {
             if !vm.interp.resources.charge_cpu(1) {
                 return Ok(Execution::Exit(137));
             }
+            if vm
+                .execution
+                .test_timeout
+                .is_some_and(|timeout| timeout.remaining(vm.interp) == 0)
+            {
+                vm.execution.test_timeout = None;
+                dispatch.sync(&mut vm);
+                let error =
+                    vm.record_native_error(super::PyError::exception("Failed", "test timed out"));
+                vm.propagate_error(error, dispatch.span())?;
+                let span = dispatch.span();
+                dispatch.refresh(&mut vm).map_err(|error| (error, span))?;
+                continue 'execution;
+            }
             let opcode = instruction.opcode;
             let result: Result<DispatchControl, String> = match opcode {
                 Opcode::LoadConstant(constant) => vm

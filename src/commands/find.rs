@@ -3,22 +3,20 @@
 //! Boolean expressions are parsed before the VFS walk. Supported predicates are deliberately
 //! closed: metadata tests, boolean composition, printing, deletion, and `-exec`/`-execdir`.
 //! Unknown predicates fail rather than being treated as paths or delegated to the host.
+//! `-iname` folds ASCII case without consulting the host locale.
 //!
-//! [`Expr`] and [`Parser`] are shared with [`crate::program::find`], the resumable native process
-//! image seeded at `/usr/bin/find`. This module keeps the original synchronous body (registered
-//! under the bare name `find`) for nested callers that dispatch commands in-process, such as
-//! `xargs` invoking `find` recursively; `-exec` there still runs through synchronous nested
-//! dispatch rather than a real child process. The native image is the one real shell scripts
-//! reach when they run `find` as an external command, and it spawns one virtual child per
-//! `-exec`/`-execdir` invocation.
+//! [`Expr`] and [`Parser`] supply the resumable native image in [`crate::program::find`].
+//! That image owns traversal, `-prune`, output, and virtual children for `-exec`/`-execdir`.
 
 use super::util::glob_eq;
 
 #[derive(Clone, Debug)]
 pub(crate) enum Expr {
     True,
+    Prune,
     Type(char),
     Name(String),
+    Iname(String),
     Path(String),
     Empty,
     Newer(String),
@@ -73,7 +71,7 @@ pub(crate) struct Parsed {
     pub(crate) min_depth: usize,
     pub(crate) max_depth: Option<usize>,
     pub(crate) explicit_action: bool,
-    pub(crate) delete: bool,
+    pub(crate) depth_first: bool,
     pub(crate) exec_batches: usize,
 }
 
@@ -84,7 +82,9 @@ pub(crate) struct Parser<'a> {
     max_depth: Option<usize>,
     explicit_action: bool,
     delete: bool,
+    explicit_depth: bool,
     exec_batches: usize,
+    prune: bool,
     /// Depth of the expression tree under construction, bounded by
     /// [`crate::stack::MAX_SYNTAX_DEPTH`].
     depth: usize,
@@ -112,7 +112,9 @@ impl<'a> Parser<'a> {
             max_depth: None,
             explicit_action: false,
             delete: false,
+            explicit_depth: false,
             exec_batches: 0,
+            prune: false,
             depth: 0,
         };
         let expression = if offset == arguments.len() {
@@ -123,13 +125,19 @@ impl<'a> Parser<'a> {
         if let Some(argument) = parser.peek() {
             return Err(format!("unexpected argument '{argument}'"));
         }
+        if parser.prune && parser.delete && !parser.explicit_depth {
+            return Err(
+                "-delete implies -depth, which makes -prune ineffective; specify -depth explicitly"
+                    .to_string(),
+            );
+        }
         Ok(Parsed {
             paths,
             expression,
             min_depth: parser.min_depth,
             max_depth: parser.max_depth,
             explicit_action: parser.explicit_action,
-            delete: parser.delete,
+            depth_first: parser.delete || parser.explicit_depth,
             exec_batches: parser.exec_batches,
         })
     }
@@ -222,7 +230,16 @@ impl<'a> Parser<'a> {
                 }
             }
             "-name" => Ok(Expr::Name(self.required("-name")?.to_string())),
+            "-iname" => Ok(Expr::Iname(self.required("-iname")?.to_ascii_lowercase())),
             "-path" | "-wholename" => Ok(Expr::Path(self.required(argument)?.to_string())),
+            "-prune" => {
+                self.prune = true;
+                Ok(Expr::Prune)
+            }
+            "-depth" => {
+                self.explicit_depth = true;
+                Ok(Expr::True)
+            }
             "-empty" => Ok(Expr::Empty),
             "-newer" => Ok(Expr::Newer(self.required("-newer")?.to_string())),
             "-size" => Ok(Expr::Size(parse_size(self.required("-size")?)?)),
@@ -389,12 +406,8 @@ fn parse_depth(value: &str, predicate: &str) -> Result<usize, String> {
 /// Evaluate one metadata-only predicate leaf against the typed [`crate::syscalls::System`]
 /// boundary, for the resumable native image in [`crate::program::find`].
 ///
-/// `True`, `Print`, `Exec`, and the boolean combinators are handled by each caller instead: their
-/// side effects (writing bytes, spawning children, short-circuit recursion) differ between the
-/// synchronous [`evaluate`] above and the native image's suspend-capable evaluator, so only the
-/// metadata comparisons that read the same [`crate::syscalls::FileInfo`] shape are shared here.
-/// Semantics are kept bit-for-bit identical to `evaluate`'s handling of the same predicates,
-/// including treating a native executable as a non-empty file for `-empty`.
+/// Traversal actions, printing, child commands, and boolean short-circuiting belong to the
+/// resumable image. Native executable nodes count as non-empty files for `-empty`.
 pub(crate) fn evaluate_metadata_leaf(
     system: &mut dyn crate::syscalls::System,
     expr: &Expr,
@@ -413,6 +426,10 @@ pub(crate) fn evaluate_metadata_leaf(
             ))
         }
         Expr::Name(pattern) => Ok(glob_eq(pattern, crate::vfs::basename(path))),
+        Expr::Iname(pattern) => Ok(glob_eq(
+            pattern,
+            &crate::vfs::basename(path).to_ascii_lowercase(),
+        )),
         Expr::Path(pattern) => Ok(glob_eq(pattern, display)),
         Expr::Empty => {
             let info = system
@@ -486,6 +503,7 @@ pub(crate) fn evaluate_metadata_leaf(
             Ok(true)
         }
         Expr::True
+        | Expr::Prune
         | Expr::Print(_)
         | Expr::Exec { .. }
         | Expr::Not(_)

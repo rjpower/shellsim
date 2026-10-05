@@ -38,14 +38,14 @@ struct Options {
 }
 
 #[derive(Clone)]
-struct Entry {
-    name: String,
-    mode: u32,
-    kind: EntryKind,
+pub(crate) struct Entry {
+    pub(crate) name: String,
+    pub(crate) mode: u32,
+    pub(crate) kind: EntryKind,
 }
 
 #[derive(Clone)]
-enum EntryKind {
+pub(crate) enum EntryKind {
     File(Vec<u8>),
     Directory,
 }
@@ -207,7 +207,7 @@ fn archive_name(base: &str, path: &str) -> Result<String, String> {
     Ok(relative.to_string())
 }
 
-fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u8>, String> {
+pub(crate) fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u8>, String> {
     let estimated = entries.iter().try_fold(BLOCK * 2, |total, entry| {
         let data = match &entry.kind {
             EntryKind::File(data) => data.len(),

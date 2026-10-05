@@ -1479,8 +1479,10 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
     let mut stage = false;
     let mut unmerged = false;
     let mut exclude_standard = false;
+    let mut ignored = false;
+    let mut tags = false;
     let mut paths = Vec::new();
-    for argument in Flags::new(args).clustered("cmdosuz") {
+    for argument in Flags::new(args).clustered("cmdosuziv") {
         let name = match argument {
             Arg::Operand(value) => {
                 paths.push(value);
@@ -1496,11 +1498,19 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
             "-s" | "--stage" => stage = true,
             "-u" | "--unmerged" => unmerged = true,
             "--exclude-standard" => exclude_standard = true,
+            "-i" | "--ignored" => ignored = true,
+            "-v" => tags = true,
             "--error-unmatch" => error_unmatch = true,
             "--full-name" => {}
             "-z" => nul = true,
             _ => return usage(io, &format!("unsupported ls-files option: {name}")),
         }
+    }
+    if ignored && (!exclude_standard || (!others && !cached)) {
+        return usage(
+            io,
+            "--ignored requires --exclude-standard and --others or --cached",
+        );
     }
     if unmerged {
         // The three sides of each conflicted path, in the stage order Git prints.
@@ -1514,6 +1524,9 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
             }
             for (stage, hash) in [(1, &entry.base), (2, &entry.ours), (3, &entry.theirs)] {
                 if let Some(hash) = hash {
+                    if tags {
+                        io.print("M ");
+                    }
                     io.print(&format!("100644 {hash} {stage}\t{path}"));
                     io.out.push(if nul { 0 } else { b'\n' });
                 }
@@ -1534,14 +1547,19 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
     } else {
         Tree::new()
     };
-    let rules = if others && exclude_standard {
+    let rules = if (others || ignored) && exclude_standard {
         ignore::load(system, &root)
     } else {
         ignore::IgnoreRules::default()
     };
     let mut listed: BTreeSet<String> = BTreeSet::new();
     if cached {
-        listed.extend(index.keys().cloned());
+        listed.extend(
+            index
+                .keys()
+                .filter(|path| !ignored || rules.is_ignored(path))
+                .cloned(),
+        );
     }
     if modified {
         listed.extend(
@@ -1563,7 +1581,7 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
         listed.extend(
             work.keys()
                 .filter(|path| !index.contains_key(*path))
-                .filter(|path| !rules.is_ignored(path))
+                .filter(|path| rules.is_ignored(path) == ignored)
                 .cloned(),
         );
     }
@@ -1586,6 +1604,13 @@ pub(crate) fn git_ls_files(system: &mut dyn System, args: &[String], io: &mut Io
             continue;
         }
         matched = true;
+        if tags {
+            io.print(if index.contains_key(&path) {
+                "H "
+            } else {
+                "? "
+            });
+        }
         if stage {
             let recorded = index.get(&path).cloned().unwrap_or_default();
             io.print(&format!("{} {} 0\t", recorded.mode(), recorded.hash));

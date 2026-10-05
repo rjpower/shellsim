@@ -24,6 +24,7 @@ mod object_model;
 mod parser;
 mod process;
 mod protocol;
+mod pytest_options;
 mod scopes;
 mod slice;
 mod sort;
@@ -589,50 +590,40 @@ fn run_module(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
 /// Run the deliberately small, VFS-only pytest compatibility slice.  The collector and wrapper
 /// share this interpreter's parser, compiler, exception machinery, and resource limits.
 pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i32 {
-    let mut paths = Vec::new();
-    let mut ctrf = None;
-    let mut index = 0;
-    while let Some(arg) = args.get(index) {
-        if arg == "--ctrf" {
-            index += 1;
-            let Some(path) = args.get(index) else {
-                err.extend_from_slice(b"pytest: --ctrf requires a path\n");
-                return 2;
-            };
-            ctrf = Some(path.clone());
-        } else if let Some(path) = arg.strip_prefix("--ctrf=") {
-            if path.is_empty() {
-                err.extend_from_slice(b"pytest: --ctrf requires a path\n");
-                return 2;
-            }
-            ctrf = Some(path.to_string());
-        } else if arg.starts_with('-') {
-            if !matches!(
-                arg.as_str(),
-                "-q" | "-v" | "-rA" | "--tb=short" | "--disable-warnings"
-            ) {
-                return unsupported(interp, &format!("pytest option {arg}"), err);
-            }
-        } else {
-            paths.push(arg.clone());
+    let options = match pytest_options::parse(args) {
+        Ok(options) => options,
+        Err(message) => {
+            err.extend_from_slice(format!("pytest: {message}\n").as_bytes());
+            return 2;
         }
-        index += 1;
-    }
+    };
+    let paths = match pytest_options::discover(interp, &options.paths) {
+        Ok(paths) => paths,
+        Err(message) => {
+            err.extend_from_slice(format!("pytest: {message}\n").as_bytes());
+            return if interp.resources.is_stopped() {
+                resource_exit_status(interp)
+            } else {
+                2
+            };
+        }
+    };
     if paths.len() > MAX_RUNNER_FILES {
         return runner_limit(err, "pytest", "file count", MAX_RUNNER_FILES);
     }
     if paths.is_empty() {
-        err.extend_from_slice(b"pytest: an explicit VFS test file is required\n");
-        return 2;
+        err.extend_from_slice(b"pytest: no tests collected\n");
+        return 5;
     }
 
     let mut collected = 0usize;
     let mut source_bytes = 0usize;
     let mut sources = Vec::new();
-    for path in paths {
+    let mut collection_errors = 0usize;
+    for path in &paths {
         let source = match interp
             .vfs
-            .read_string_limited(&interp.cwd, &path, MAX_RUNNER_FILE_BYTES)
+            .read_string_limited(&interp.cwd, path, MAX_RUNNER_FILE_BYTES)
         {
             Ok(source) => source,
             Err(error) => {
@@ -651,6 +642,10 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
             Ok(collection) => collection,
             Err(error) => {
                 err.extend_from_slice(format!("pytest: {path}: {error}\n").as_bytes());
+                if options.continue_collection {
+                    collection_errors += 1;
+                    continue;
+                }
                 return 2;
             }
         };
@@ -659,7 +654,7 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
     }
     if collected == 0 {
         err.extend_from_slice(b"pytest: no tests collected\n");
-        return 5;
+        return if collection_errors > 0 { 1 } else { 5 };
     }
 
     // The wrapper is compiled by the same parser/compiler/VM as ordinary Python.  This keeps
@@ -672,7 +667,16 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
     ) {
         return append_failure(interp, err, "pytest", kind);
     }
+    let setup = format!("from _pytest import _set_timeout as __shellsim_set_timeout\nimport warnings as __shellsim_warnings\n__shellsim_saved_filters = __shellsim_warnings.filters[:]\n__shellsim_pytest_failed = {collection_errors}\n{}", options.warning_filters.concat());
+    if let Err(kind) = append_runner_piece(interp, &mut wrapper, &setup) {
+        return append_failure(interp, err, "pytest", kind);
+    }
     for (path, source, collection) in sources {
+        let source = if options.continue_collection {
+            format!("__shellsim_collection_ok = True\ntry:\n{}\nexcept Exception as error:\n    __shellsim_collection_ok = False\n    __shellsim_pytest_failed += 1\n    print({:?}, 'ERROR', error)\n", source.lines().map(|line| format!("    {line}\n")).collect::<String>(), path)
+        } else {
+            source
+        };
         if let Err(kind) = append_runner_piece(interp, &mut wrapper, &source) {
             return append_failure(interp, err, "pytest", kind);
         }
@@ -682,12 +686,22 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
             }
         }
         for test in &collection.tests {
-            let item = match build_pytest_item(&path, test, &collection.fixtures) {
+            let item = match build_pytest_item(path, test, &collection.fixtures, options.timeout) {
                 Ok(item) => item,
                 Err(error) => {
                     err.extend_from_slice(format!("pytest: {path}: {error}\n").as_bytes());
                     return 2;
                 }
+            };
+            let item = if options.continue_collection {
+                format!(
+                    "if __shellsim_collection_ok:\n{}",
+                    item.lines()
+                        .map(|line| format!("    {line}\n"))
+                        .collect::<String>()
+                )
+            } else {
+                item
             };
             if let Err(kind) = append_runner_piece(interp, &mut wrapper, &item) {
                 return append_failure(interp, err, "pytest", kind);
@@ -695,7 +709,7 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
         }
     }
     let summary =
-        "print('__SHELLSIM_PYTEST_SUMMARY__', __shellsim_pytest_failed, __shellsim_pytest_total)\n";
+        "__shellsim_warnings.filters[:] = __shellsim_saved_filters\nprint('__SHELLSIM_PYTEST_SUMMARY__', __shellsim_pytest_failed, __shellsim_pytest_total)\n";
     if let Err(kind) = append_runner_piece(interp, &mut wrapper, summary) {
         return append_failure(interp, err, "pytest", kind);
     }
@@ -735,7 +749,7 @@ pub fn run_pytest(interp: &mut Interp, args: &[String], out: Out, err: Out) -> i
         err.extend_from_slice(b"pytest: runner produced an invalid summary\n");
         return 2;
     };
-    if let Some(path) = ctrf {
+    if let Some(path) = options.ctrf {
         if let Err(error) = write_ctrf(interp, &path, total, failed) {
             err.extend_from_slice(
                 format!("pytest: cannot write CTRF report: {error}\n").as_bytes(),
@@ -1277,6 +1291,7 @@ fn build_pytest_item(
     path: &str,
     test: &PytestFunction,
     fixtures: &HashMap<String, PytestFixture>,
+    timeout: f64,
 ) -> Result<String, String> {
     let label = if test.parametrized.is_empty() {
         format!("{:?}", format!("{path}::{}", test.name))
@@ -1316,7 +1331,9 @@ fn build_pytest_item(
         arguments.push(format!("{parameter}={value}"));
     }
     arguments.push("**__shellsim_case".into());
-    item.push_str("    try:\n");
+    item.push_str(&format!(
+        "    __shellsim_set_timeout({timeout})\n    try:\n"
+    ));
     for line in setup.lines() {
         item.push_str("        ");
         item.push_str(line);
@@ -1327,13 +1344,15 @@ fn build_pytest_item(
         test.name,
         arguments.join(", ")
     ));
+    item.push_str("    finally:\n        try:\n            pass\n");
     // As in pytest, teardown resumes each yield fixture past its `yield`; a second `yield` is an
     // error rather than a place to stop.
     for generator in teardown.into_iter().rev() {
         item.push_str(&format!(
-            "    for _ in {generator}:\n        raise RuntimeError(\"fixture function has more than one 'yield'\")\n"
+            "            for _ in {generator}:\n                raise RuntimeError(\"fixture function has more than one 'yield'\")\n"
         ));
     }
+    item.push_str(&format!("        except Exception as error:\n            print({label}, 'ERROR', error)\n            __shellsim_pytest_failed += 1\n        finally:\n            __shellsim_set_timeout(0)\n"));
     Ok(item)
 }
 

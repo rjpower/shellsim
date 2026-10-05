@@ -515,6 +515,17 @@ impl<'s> PyRefs<'s> for Vm<'s> {
 }
 
 impl<'s> PyRuntime<'s> for Vm<'s> {
+    fn set_test_timeout(&mut self, nanoseconds: Option<u64>) {
+        self.execution.test_timeout =
+            nanoseconds
+                .filter(|value| *value > 0)
+                .map(|duration| super::TestTimeout {
+                    wall_start: self.interp.clock.monotonic_ns(),
+                    cpu_start: self.interp.resources.process_time_ns(),
+                    duration,
+                });
+    }
+
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<'s, ()> {
         self.reserve_result(bytes).map_err(PyError::resource_error)
     }

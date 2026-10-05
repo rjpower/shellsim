@@ -3023,3 +3023,95 @@ fn a_missing_index_is_nothing_staged_rather_than_an_error() {
     assert_eq!(status.0, 0, "{}", status.2);
     assert_eq!(status.1, "D  f\n?? f\n");
 }
+
+#[test]
+fn ls_files_reports_ignored_untracked_paths_and_index_tags() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q; printf '*.log\\n' > .gitignore; printf tracked > tracked; git add .gitignore tracked; printf ignored > ignored.log; printf other > other").0, 0);
+    assert_eq!(
+        run(
+            &mut env,
+            "git ls-files --others --ignored --exclude-standard -z"
+        )
+        .1,
+        "ignored.log\0"
+    );
+    assert_eq!(
+        run(&mut env, "git ls-files --others --exclude-standard -z").1,
+        "other\0"
+    );
+    assert_eq!(
+        run(&mut env, "git ls-files -v -z").1,
+        "H .gitignore\0H tracked\0"
+    );
+    assert_eq!(
+        run(
+            &mut env,
+            "git ls-files -v --others --ignored --exclude-standard -z"
+        )
+        .1,
+        "? ignored.log\0"
+    );
+    assert_eq!(run(&mut env, "git ls-files --others --ignored").0, 129);
+}
+
+#[test]
+fn archive_exports_committed_selected_content_through_tar_pipe() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q; mkdir src; printf committed > src/script; chmod +x src/script; printf omitted > other; git add src other; git commit -qm base; printf changed > src/script; mkdir export").0, 0);
+    let exported = run(&mut env, "git -c safe.directory= -c core.hooksPath= -c core.fsmonitor=false archive --format=tar HEAD -- src | tar -xf - -C export");
+    assert_eq!(exported.0, 0, "{}", exported.2);
+    assert_eq!(
+        env.vfs.read("/", "/export/src/script").unwrap(),
+        b"committed"
+    );
+    assert!(!env.vfs.exists("/", "/export/other"));
+    assert_eq!(run(&mut env, "test -x export/src/script").0, 0);
+    assert_eq!(
+        run(&mut env, "git cat-file -p HEAD:src/script").1,
+        "committed"
+    );
+    assert_eq!(run(&mut env, "git archive --format=zip HEAD").0, 129);
+    assert_eq!(run(&mut env, "git archive HEAD -- absent").0, 128);
+    assert_eq!(run(&mut env, "git archive absent").0, 128);
+    assert_eq!(
+        run(
+            &mut env,
+            "ln -s src/script link; git add link; git commit -qm link; git archive HEAD"
+        )
+        .0,
+        128
+    );
+}
+
+#[test]
+fn archive_respects_resource_limits_before_emitting_output() {
+    let mut env = Environment::new();
+    assert_eq!(
+        run(
+            &mut env,
+            "git init -q; printf data > file; git add file; git commit -qm base"
+        )
+        .0,
+        0
+    );
+    env.resources = shellsim::resources::Resources::new(shellsim::Limits {
+        cpu: 100,
+        ..shellsim::Limits::unlimited()
+    });
+    let exported = run(&mut env, "git archive HEAD");
+    assert_ne!(exported.0, 0);
+    assert!(exported.1.is_empty());
+}
+
+#[test]
+fn diff_nul_listings_preserve_path_bytes() {
+    let mut env = Environment::new();
+    assert_eq!(run(&mut env, "git init -q; printf original > 'line\nbreak'; git add .; git commit -qm base; printf changed > 'line\nbreak'").0, 0);
+    assert_eq!(run(&mut env, "git diff --name-only -z").1, "line\nbreak\0");
+    assert_eq!(
+        run(&mut env, "git diff --name-status -z").1,
+        "M\0line\nbreak\0"
+    );
+    assert_eq!(run(&mut env, "git diff --numstat -z").0, 129);
+}

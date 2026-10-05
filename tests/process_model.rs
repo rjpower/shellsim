@@ -216,6 +216,8 @@ fn typed_registered_commands_run_in_child_processes() {
         .unwrap();
     assert_eq!(run(&mut env, "/work/list-typed /work").0, 0);
     env.vfs.remove_file("/", "/usr/bin/ls").unwrap();
+    assert_eq!(run(&mut env, "ls /work").0, 0);
+    env.vfs.remove_file("/", "/bin/ls").unwrap();
     assert_eq!(run(&mut env, "ls /work").0, 127);
 }
 
@@ -390,6 +392,7 @@ fn copied_registered_image_keeps_its_original_path_entrypoint() {
     assert_eq!(run(&mut env, "/work/reassigned 42 /work/owned").0, 0);
     let metadata = env.vfs.metadata("/", "/work/owned", false).unwrap();
     assert_eq!((metadata.uid, metadata.gid), (0, 42));
+    env.vfs.remove_file("/", "/bin/chgrp").unwrap();
     assert_eq!(run(&mut env, "chgrp 7 /work/owned").0, 127);
 }
 
@@ -511,6 +514,9 @@ fn registered_native_commands_resolve_only_from_executable_vfs_entries() {
     assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
 
     env.vfs.remove_file("/", "/usr/bin/cat").unwrap();
+    assert_eq!(run(&mut env, "which cat").1, "/bin/cat\n");
+    assert_eq!(run(&mut env, "cat /work/note").1, "visible");
+    env.vfs.remove_file("/", "/bin/cat").unwrap();
     assert_eq!(run(&mut env, "cat /work/note").0, 127);
     assert_eq!(run(&mut env, "which cat").0, 1);
     assert_eq!(run(&mut env, "/work/reader /work/note").1, "visible");
@@ -697,6 +703,8 @@ fn idle_shell_sessions_survive_environment_snapshots() {
 fn native_images_follow_executable_permissions_and_can_be_replaced() {
     let mut env = Environment::new();
     env.vfs.chmod("/", "/usr/bin/pwd", 0o644).unwrap();
+    assert_eq!(run(&mut env, "env pwd").0, 0);
+    env.vfs.chmod("/", "/bin/pwd", 0o644).unwrap();
     let denied = run(&mut env, "env pwd");
     assert_eq!(denied.0, 126);
     assert!(denied.2.contains("permission denied"), "{}", denied.2);
@@ -704,6 +712,7 @@ fn native_images_follow_executable_permissions_and_can_be_replaced() {
     assert_eq!(run(&mut env, "env -i PATH=/missing pwd").0, 127);
 
     env.vfs.remove_file("/", "/usr/bin/pwd").unwrap();
+    env.vfs.remove_file("/", "/bin/pwd").unwrap();
     let missing = run(&mut env, "env pwd");
     assert_eq!(missing.0, 127);
     assert!(missing.2.contains("command not found"), "{}", missing.2);

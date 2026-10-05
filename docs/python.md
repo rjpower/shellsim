@@ -205,11 +205,27 @@ synchronous calls made inside a coroutine retain their usual blocking behavior.
 The bounded `pytest` runner supports ordinary and yield fixtures, fixture dependencies,
 `@pytest.mark.parametrize`, `tmp_path`/`tmpdir`, skip markers, `pytest.raises` with exception
 tuples and `match`, `pytest.warns`, `pytest.approx` (numbers, lists, tuples, dicts and NumPy
-arrays), and explicit test files. Parametrized values are evaluated when the test module
+arrays), explicit test files, and bounded discovery of `test_*.py` and `*_test.py` modules.
+Discovery skips hidden directories, virtual environments, and symlinks. Parametrized values are evaluated when the test module
 runs, so they may be any expression, and stacked decorators vary the topmost fastest, as in
 pytest. Fixture scopes, `pytest.param` and custom `ids` remain outside this small runner. `unittest`
 supports straightforward test classes. Unsupported syntax and runner features produce an error
 rather than a false passing result.
+
+Dataset launcher flags include `--no-header`, `--tb=line`, `--color=no`, `-p no:cacheprovider`,
+and an empty `--override-ini=addopts=`. Output remains the runner's plain per-test report;
+these switches do not install plugins or enable arbitrary pytest configuration. `-W` applies
+warning filters with builtin warning categories. `--continue-on-collection-errors` runs modules
+that collect successfully and still returns failure when any collection failed.
+`--timeout=SECONDS` arms a per-item limit over virtual waiting and modeled CPU time, checked at
+bytecode boundaries; `time.sleep` is capped at that deadline. Timed-out items fail, subsequent
+items can run, and environment resource limits remain authoritative. This does not promise
+host wall-clock timing or preemption in the middle of a native operation.
+
+`uv init --python VERSION --no-progress` records the requested version in `.python-version` and
+`requires-python`; `uv add` and `uv run` also accept `--no-progress`. Selectors 3.11 through 3.14
+use the same embedded interpreter with its modeled Python 3.14 semantics. No interpreter is
+downloaded or executed on the host.
 
 ## Runtime model
 

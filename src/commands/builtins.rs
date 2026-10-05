@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use crate::commands::util::{ewln, split_flags, wln};
+use crate::commands::util::{ewln, wln};
 use crate::commands::{CommandContext, CommandPoll, CommandResume, CommandSpec, Io, Trust};
 use crate::interp::Interp;
 use crate::syscalls::System;
@@ -357,7 +357,7 @@ fn cmd_flock(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     if args.is_empty() {
-        print_traps(interp, &[], true, io);
+        print_traps(interp, &[], true, true, true, io);
         return 0;
     }
     if args[0] == "-l" {
@@ -368,14 +368,21 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         return list_signal(None, io);
     }
     if args[0] == "-p" {
-        let (include_exit, signals) = match parse_trap_targets(&args[1..]) {
+        let (include_exit, include_err, signals) = match parse_trap_targets(&args[1..]) {
             Ok(targets) => targets,
             Err(error) => {
                 ewln(io.err, &format!("trap: {error}"));
                 return 2;
             }
         };
-        print_traps(interp, &signals, include_exit, io);
+        print_traps(
+            interp,
+            &signals,
+            include_exit,
+            include_err,
+            args.len() == 1,
+            io,
+        );
         return 0;
     }
 
@@ -389,7 +396,7 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
         ewln(io.err, "trap: missing signal operand");
         return 2;
     }
-    let (has_exit, signals) = match parse_trap_targets(signal_args) {
+    let (has_exit, has_err, signals) = match parse_trap_targets(signal_args) {
         Ok(targets) => targets,
         Err(error) => {
             ewln(io.err, &format!("trap: {error}"));
@@ -439,6 +446,11 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     if has_exit {
         updated_exit = disposition.clone();
     }
+    let updated_err = if has_err {
+        disposition.clone()
+    } else {
+        interp.err_disposition.clone()
+    };
     let state_bytes = updated
         .values()
         .fold(0_u64, |total, disposition| {
@@ -450,30 +462,45 @@ fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
                     .saturating_add(32),
             })
         })
-        .saturating_add(updated_exit.as_ref().map_or(0, |disposition| {
-            match disposition {
-                crate::interp::ShellSignalDisposition::Ignore => 16,
-                crate::interp::ShellSignalDisposition::Handler { source, body } => (source.len()
-                    as u64)
-                    .saturating_add(body.estimated_bytes())
-                    .saturating_add(32),
-            }
-        }));
+        .saturating_add(updated_exit.iter().chain(updated_err.iter()).fold(
+            0_u64,
+            |total, disposition| {
+                total.saturating_add(match disposition {
+                    crate::interp::ShellSignalDisposition::Ignore => 16,
+                    crate::interp::ShellSignalDisposition::Handler { source, body } => {
+                        (source.len() as u64)
+                            .saturating_add(body.estimated_bytes())
+                            .saturating_add(32)
+                    }
+                })
+            },
+        ));
     if state_bytes > MAX_TRAP_STATE_BYTES {
         ewln(io.err, "trap: signal handler state exceeds the 1 MiB limit");
         return 2;
     }
     interp.signal_dispositions = updated;
     interp.exit_disposition = updated_exit;
+    interp.err_disposition = updated_err;
+    if has_err {
+        interp.err_trap_active = true;
+    }
     0
 }
 
-fn parse_trap_targets(values: &[String]) -> Result<(bool, Vec<crate::process::Signal>), String> {
+fn parse_trap_targets(
+    values: &[String],
+) -> Result<(bool, bool, Vec<crate::process::Signal>), String> {
     let mut has_exit = values.is_empty();
+    let mut has_err = values.is_empty();
     let mut signals = Vec::with_capacity(values.len());
     for value in values {
         if value == "0" || value.eq_ignore_ascii_case("EXIT") {
             has_exit = true;
+            continue;
+        }
+        if value.eq_ignore_ascii_case("ERR") {
+            has_err = true;
             continue;
         }
         let signal = crate::process::Signal::parse(value)
@@ -482,29 +509,34 @@ fn parse_trap_targets(values: &[String]) -> Result<(bool, Vec<crate::process::Si
             signals.push(signal);
         }
     }
-    Ok((has_exit, signals))
+    Ok((has_exit, has_err, signals))
 }
 
 fn print_traps(
     interp: &CommandContext<'_>,
     selected: &[crate::process::Signal],
     include_exit: bool,
+    include_err: bool,
+    all: bool,
     io: &mut Io,
 ) {
-    if include_exit {
-        if let Some(disposition) = &interp.exit_disposition {
+    for (include, name, disposition) in [
+        (include_exit, "EXIT", &interp.exit_disposition),
+        (include_err, "ERR", &interp.err_disposition),
+    ] {
+        if let Some(disposition) = disposition.as_ref().filter(|_| include) {
             let action = match disposition {
                 crate::interp::ShellSignalDisposition::Ignore => String::new(),
                 crate::interp::ShellSignalDisposition::Handler { source, .. } => source.clone(),
             };
             wln(
                 io.out,
-                &format!("trap -- '{}' EXIT", action.replace('\'', "'\\''")),
+                &format!("trap -- '{}' {name}", action.replace('\'', "'\\''")),
             );
         }
     }
     for (signal, disposition) in &interp.signal_dispositions {
-        if !selected.is_empty() && !selected.contains(signal) {
+        if !all && !selected.contains(signal) {
             continue;
         }
         let action = match disposition {
@@ -1091,6 +1123,8 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
         match a.as_str() {
             "-e" => interp.opt_errexit = true,
             "+e" => interp.opt_errexit = false,
+            "-E" => interp.opt_errtrace = true,
+            "+E" => interp.opt_errtrace = false,
             "-u" => interp.opt_nounset = true,
             "+u" => interp.opt_nounset = false,
             "-x" | "+x" => {
@@ -1102,6 +1136,7 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
                     match opt.as_str() {
                         "pipefail" => interp.opt_pipefail = true,
                         "errexit" => interp.opt_errexit = true,
+                        "errtrace" => interp.opt_errtrace = true,
                         "nounset" => interp.opt_nounset = true,
                         _ => {
                             ewln(io.err, &format!("set: unimplemented option '{opt}'"));
@@ -1116,6 +1151,7 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
                     match opt.as_str() {
                         "pipefail" => interp.opt_pipefail = false,
                         "errexit" => interp.opt_errexit = false,
+                        "errtrace" => interp.opt_errtrace = false,
                         "nounset" => interp.opt_nounset = false,
                         _ => {
                             ewln(io.err, &format!("set: unimplemented option '{opt}'"));
@@ -1129,17 +1165,19 @@ fn cmd_set(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32
                 interp.positional = args[i + 1..].to_vec().into();
                 break;
             }
-            s if s.starts_with('-') && s.len() > 1 => {
+            s if (s.starts_with('-') || s.starts_with('+')) && s.len() > 1 => {
+                let enable = s.starts_with('-');
                 for option in s[1..].chars() {
                     match option {
-                        'e' => interp.opt_errexit = true,
-                        'u' => interp.opt_nounset = true,
+                        'e' => interp.opt_errexit = enable,
+                        'E' => interp.opt_errtrace = enable,
+                        'u' => interp.opt_nounset = enable,
                         'x' => {
                             ewln(io.err, "set: xtrace is unimplemented");
                             return 2;
                         }
                         'o' if args.get(i + 1).map(String::as_str) == Some("pipefail") => {
-                            interp.opt_pipefail = true;
+                            interp.opt_pipefail = enable;
                             i += 1;
                         }
                         'o' => {
@@ -1750,42 +1788,129 @@ fn num(s: &str) -> i64 {
     s.trim().parse().unwrap_or(0)
 }
 
-fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
-    let (flags, ops, long) = split_flags(args);
-    if !long.is_empty() || flags.iter().any(|flag| !matches!(flag, 'a' | 'r')) {
-        ewln(io.err, "read: supported options are -a and -r");
-        return 2;
+/// Parsed record framing and assignment options for the shell `read` builtin.
+struct ReadOptions<'a> {
+    raw: bool,
+    delimiter: u8,
+    array: Option<&'a str>,
+    names: Vec<&'a str>,
+}
+
+fn parse_read_options(args: &[String]) -> Result<ReadOptions<'_>, &'static str> {
+    let mut options = ReadOptions {
+        raw: false,
+        delimiter: b'\n',
+        array: None,
+        names: Vec::new(),
+    };
+    let mut index = 0;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            index += 1;
+            break;
+        }
+        if !argument.starts_with('-') || argument == "-" {
+            break;
+        }
+        let bytes = argument.as_bytes();
+        let mut offset = 1;
+        while offset < bytes.len() {
+            match bytes[offset] {
+                b'r' => options.raw = true,
+                option @ (b'a' | b'd') => {
+                    let value = if offset + 1 < bytes.len() {
+                        &argument[offset + 1..]
+                    } else {
+                        index += 1;
+                        args.get(index)
+                            .ok_or("read: option requires a value")?
+                            .as_str()
+                    };
+                    if option == b'a' {
+                        options.array = Some(value);
+                    } else {
+                        options.delimiter = value.as_bytes().first().copied().unwrap_or(0);
+                    }
+                    break;
+                }
+                _ => return Err("read: supported options are -a, -r and -d"),
+            }
+            offset += 1;
+        }
+        index += 1;
     }
-    // `read -a arr`: split the line into an indexed array (the name follows `-a`).
-    if flags.contains(&'a') {
-        let line = read_one_line(interp, io);
-        let Some(line) = line else { return 1 };
-        let line = if flags.contains(&'r') {
-            line
-        } else {
-            decode_read_backslashes(&line)
+    options
+        .names
+        .extend(args[index..].iter().map(String::as_str));
+    if options.names.iter().any(|name| !shell_identifier(name))
+        || options.array.is_some_and(|name| !shell_identifier(name))
+    {
+        return Err("read: expected valid variable names");
+    }
+    Ok(options)
+}
+
+/// Identify a completed buffered record without consuming bytes after its delimiter.
+/// Invalid options are complete immediately so they fail without waiting for input.
+#[derive(Clone, Copy)]
+pub(crate) struct ReadFraming {
+    delimiter: Option<u8>,
+    raw: bool,
+}
+
+impl ReadFraming {
+    pub(crate) fn new(args: &[String]) -> Self {
+        match parse_read_options(args) {
+            Ok(options) => Self {
+                delimiter: Some(options.delimiter),
+                raw: options.raw,
+            },
+            Err(_) => Self {
+                delimiter: None,
+                raw: true,
+            },
+        }
+    }
+
+    pub(crate) fn complete(self, input: &[u8]) -> bool {
+        let Some(delimiter) = self.delimiter else {
+            return true;
         };
-        let arr = ops.first().map(|s| s.as_str()).unwrap_or("REPLY");
+        if input.last().copied() != Some(delimiter) {
+            return false;
+        }
+        self.raw
+            || input[..input.len() - 1]
+                .iter()
+                .rev()
+                .take_while(|byte| **byte == b'\\')
+                .count()
+                % 2
+                == 0
+    }
+}
+
+fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+    let options = match parse_read_options(args) {
+        Ok(options) => options,
+        Err(message) => {
+            ewln(io.err, message);
+            return 2;
+        }
+    };
+    let (line, terminated) = read_one_record(interp, io, options.delimiter, options.raw);
+    let status = i32::from(!terminated);
+    if let Some(array) = options.array {
         let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
-        let elems: Vec<String> = if ifs.is_empty() {
+        let elems = if ifs.is_empty() {
             vec![line]
         } else {
             split_read_fields(&line, &ifs)
         };
-        interp.set_array(arr, elems);
-        return 0;
+        interp.set_array(array, elems);
+        return status;
     }
-    // Obtain a line: from explicit stdin (pipe) if present, else from the persistent input
-    // cursor (set up by a `< file` redirect on an enclosing loop).
-    let Some(line) = read_one_line(interp, io) else {
-        return 1;
-    };
-    let line = if flags.contains(&'r') {
-        line
-    } else {
-        decode_read_backslashes(&line)
-    };
-
+    let ops = options.names;
     let ifs = interp.get_var("IFS").unwrap_or_else(|| " \t\n".to_string());
     if ops.is_empty() {
         interp.set_var("REPLY", line);
@@ -1805,7 +1930,7 @@ fn cmd_read(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
             }
         }
     }
-    0
+    status
 }
 
 /// Split a `read` record according to POSIX IFS classes.
@@ -1838,21 +1963,6 @@ fn split_read_fields(line: &str, ifs: &str) -> Vec<String> {
         fields.push(field);
     }
     fields
-}
-
-fn decode_read_backslashes(line: &str) -> String {
-    let mut decoded = String::with_capacity(line.len());
-    let mut characters = line.chars();
-    while let Some(character) = characters.next() {
-        if character == '\\' {
-            if let Some(escaped) = characters.next() {
-                decoded.push(escaped);
-            }
-        } else {
-            decoded.push(character);
-        }
-    }
-    decoded
 }
 
 const MAX_MAPFILE_RECORDS: usize = 100_000;
@@ -1997,49 +2107,43 @@ fn shell_identifier(value: &str) -> bool {
         && bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
-/// Read one line for `read`: from an explicit stdin pipe if present, else the persistent input
-/// cursor (a `< file` redirect on an enclosing loop). Returns None at EOF.
-fn read_one_line(interp: &mut Interp, io: &Io) -> Option<String> {
-    if !io.stdin.is_empty() {
-        return Some(
-            String::from_utf8_lossy(&io.stdin)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .to_string(),
-        );
-    }
-    if interp.input_pos < interp.input_stream.len() {
-        let rest = &interp.input_stream[interp.input_pos..];
-        let nl = rest.iter().position(|&b| b == b'\n');
-        let (line_bytes, adv) = match nl {
-            Some(i) => (&rest[..i], i + 1),
-            None => (rest, rest.len()),
-        };
-        let l = String::from_utf8_lossy(line_bytes).into_owned();
-        interp.input_pos += adv;
-        return Some(l);
-    }
-    let mut line = Vec::new();
-    let mut consumed = false;
-    while line.len() < crate::descriptors::MAX_CAPTURE_BYTES {
-        match interp.read_fd(0, 1).ok()? {
-            crate::descriptors::IoPoll::Ready(bytes) if bytes.is_empty() => break,
-            crate::descriptors::IoPoll::Ready(bytes) => {
-                consumed = true;
-                if bytes[0] == b'\n' {
-                    break;
-                }
-                line.push(bytes[0]);
+/// Read a bounded record and report whether its delimiter was encountered. Shell variables
+/// discard embedded NUL bytes; an empty `-d` instead uses NUL as the record delimiter.
+fn read_one_record(interp: &mut Interp, io: &Io, delimiter: u8, raw: bool) -> (String, bool) {
+    let mut record = Vec::new();
+    let mut cursor = 0usize;
+    let mut escaped = false;
+    let mut terminated = false;
+    while cursor < crate::descriptors::MAX_CAPTURE_BYTES {
+        let byte = if !io.stdin.is_empty() {
+            io.stdin.get(cursor).copied()
+        } else if interp.input_pos < interp.input_stream.len() {
+            let byte = interp.input_stream[interp.input_pos];
+            interp.input_pos += 1;
+            Some(byte)
+        } else {
+            match interp.read_fd(0, 1) {
+                Ok(crate::descriptors::IoPoll::Ready(bytes)) => bytes.first().copied(),
+                _ => None,
             }
-            crate::descriptors::IoPoll::Blocked(_) => return None,
+        };
+        let Some(byte) = byte else { break };
+        cursor += 1;
+        if escaped {
+            if byte != b'\n' && byte != 0 {
+                record.push(byte);
+            }
+            escaped = false;
+        } else if byte == delimiter {
+            terminated = true;
+            break;
+        } else if !raw && byte == b'\\' {
+            escaped = true;
+        } else if byte != 0 {
+            record.push(byte);
         }
     }
-    if !consumed {
-        None
-    } else {
-        Some(String::from_utf8_lossy(&line).into_owned())
-    }
+    (String::from_utf8_lossy(&record).into_owned(), terminated)
 }
 
 fn cmd_which(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

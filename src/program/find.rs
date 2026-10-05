@@ -1,12 +1,7 @@
 //! Resumable `find` image: walks the VFS in bounded quanta and spawns one real virtual child
-//! process per `-exec`/`-execdir` invocation, instead of running it through synchronous nested
-//! command dispatch the way [`crate::commands::find`]'s legacy body does.
-//!
-//! Parsing (the [`find::Parser`]/[`find::Expr`] types) and metadata-only predicate evaluation
-//! ([`find::evaluate_metadata_leaf`]) are shared with `commands::find` so the native image and the
-//! synchronous body kept for nested callers (such as `xargs` invoking `find` recursively) never
-//! diverge on what `find` accepts. Only `-exec`'s side effects differ: this image never touches
-//! `Interp` and drives everything through [`System`].
+//! process per `-exec`/`-execdir` invocation. Parsing and metadata-only predicate evaluation
+//! live in [`crate::commands::find`]; this image controls traversal and drives side effects
+//! through [`System`].
 //!
 //! ## Walk strategy
 //! The walk keeps an explicit directory stack (mirroring [`crate::interp::Interp::fs_walk`]'s
@@ -64,6 +59,7 @@ pub(crate) struct FindProcess {
     stderr: Vec<u8>,
     stderr_offset: usize,
     done: bool,
+    pruned: bool,
     starts: VecDeque<StartPoint>,
     active: Option<ActiveWalk>,
     exec_batches: Vec<Vec<String>>,
@@ -84,6 +80,8 @@ enum StackItem {
     /// Visit this path; if it is a directory, list and push its children before yielding it (or,
     /// in post-order/`-delete` mode, after).
     Enter(String, usize),
+    /// List children only after the directory expression has finished.
+    Descend(String, usize),
     /// A directory whose children have already been pushed and (in post-order mode) processed;
     /// yield it now.
     Leave(String, usize),
@@ -138,6 +136,7 @@ impl FindProcess {
             stderr: Vec::new(),
             stderr_offset: 0,
             done: false,
+            pruned: false,
             starts: VecDeque::new(),
             active: None,
             exec_batches: Vec::new(),
@@ -320,7 +319,7 @@ impl FindProcess {
                     self.push_stderr(format!("find: '{}': {reason}\n", start.token));
                     continue;
                 }
-                let post_order = self.parsed().delete;
+                let post_order = self.parsed().depth_first;
                 self.active = Some(ActiveWalk {
                     stack: vec![StackItem::Enter(start.absolute.clone(), 0)],
                     post_order,
@@ -347,41 +346,42 @@ impl FindProcess {
             }
             let (abs, depth) = match item {
                 StackItem::Leave(abs, depth) => (abs, depth),
+                StackItem::Descend(abs, depth) => {
+                    if self.pruned {
+                        self.pruned = false;
+                        continue;
+                    }
+                    let mut entries = system
+                        .list_dir("/", &abs)
+                        .map_err(|error| Diagnostic::Operational(format!("{abs}: {error}")))?;
+                    entries.sort();
+                    let walk = self.active.as_mut().expect("active walk present");
+                    for entry in entries.into_iter().rev() {
+                        if !system.charge_cpu(1) {
+                            return Err(Diagnostic::Resource);
+                        }
+                        let child = format!("{}/{entry}", abs.trim_end_matches('/'));
+                        walk.stack
+                            .push(StackItem::Enter(child, depth.saturating_add(1)));
+                    }
+                    continue;
+                }
                 StackItem::Enter(abs, depth) => {
+                    self.pruned = false;
                     let info = system
                         .metadata("/", &abs, false)
                         .map_err(|error| Diagnostic::Operational(format!("{abs}: {error}")))?;
-                    let is_dir = matches!(info.kind, crate::syscalls::FileKind::Directory);
-                    if is_dir {
-                        let max_depth = self.parsed().max_depth;
-                        let within_depth = max_depth.is_none_or(|maximum| depth < maximum);
+                    if matches!(info.kind, crate::syscalls::FileKind::Directory) {
+                        let within_depth = self
+                            .parsed()
+                            .max_depth
+                            .is_none_or(|maximum| depth < maximum);
+                        let walk = self.active.as_mut().expect("active walk present");
+                        if post_order {
+                            walk.stack.push(StackItem::Leave(abs.clone(), depth));
+                        }
                         if within_depth {
-                            let mut entries = system.list_dir("/", &abs).map_err(|error| {
-                                Diagnostic::Operational(format!("{abs}: {error}"))
-                            })?;
-                            entries.sort();
-                            let walk = self.active.as_mut().expect("active walk present");
-                            if post_order {
-                                walk.stack.push(StackItem::Leave(abs.clone(), depth));
-                            }
-                            for entry in entries.into_iter().rev() {
-                                if !system.charge_cpu(1) {
-                                    return Err(Diagnostic::Resource);
-                                }
-                                let child = if abs == "/" {
-                                    format!("/{entry}")
-                                } else {
-                                    format!("{abs}/{entry}")
-                                };
-                                walk.stack
-                                    .push(StackItem::Enter(child, depth.saturating_add(1)));
-                            }
-                        } else if post_order {
-                            self.active
-                                .as_mut()
-                                .expect("active walk present")
-                                .stack
-                                .push(StackItem::Leave(abs.clone(), depth));
+                            walk.stack.push(StackItem::Descend(abs.clone(), depth));
                         }
                         if post_order {
                             continue;
@@ -454,6 +454,10 @@ impl FindProcess {
                         eval.node = Some(*inner);
                     }
                     Expr::True => eval.value = Some(true),
+                    Expr::Prune => {
+                        self.pruned = !self.parsed().depth_first;
+                        eval.value = Some(true);
+                    }
                     Expr::Print(nul) => {
                         self.stdout.extend_from_slice(eval.display.as_bytes());
                         self.stdout.push(if nul { 0 } else { b'\n' });

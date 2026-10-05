@@ -8,7 +8,7 @@ history, branch, and merge without noticing it is not talking to Git.
 ## What is supported
 
 ```text
-init  status  add  rm  mv  restore  reset  clean  ls-files
+init  status  add  rm  mv  restore  reset  clean  ls-files  archive
 commit  log  show  diff  apply  rev-parse  rev-list  branch  tag  switch  checkout  merge
 cherry-pick  revert  rebase  config  remote  stash  grep  cat-file  hash-object  ls-tree
 check-ignore  merge-base  describe  shortlog  show-ref  symbolic-ref  for-each-ref  blame  reflog
@@ -46,6 +46,15 @@ placeholders, and the
 `status`, `add`, `clean`, `ls-files --others --exclude-standard`, and `check-ignore`, including
 negation, anchoring, directory-only patterns, character classes, `**`, and nested pattern files.
 Naming an ignored file outright to `git add` is an error, as it is in Git.
+
+`ls-files --others --ignored --exclude-standard -z` lists ignored, untracked paths. `ls-files -v`
+prefixes tracked entries with `H`, untracked entries with `?`, and unmerged stage entries with
+`M`. Assume-unchanged and skip-worktree index flags are not modeled.
+`git diff --name-only -z` and `--name-status -z` emit NUL-delimited paths, preserving
+embedded newlines. Other statistical formats with `-z` remain unsupported.
+`git archive --format=tar COMMIT -- PATH...` exports committed regular files and executable
+modes to stdout, suitable for piping into `tar -xf - -C DIRECTORY`. Archives are bounded to
+4096 files and 16 MiB. Symbolic links and non-tar formats fail explicitly.
 
 Options are read the way Git reads them, whichever of its four spellings a caller reaches for:
 `-n5`, `-n 5`, `--max-count=5` and `--max-count 5` are one option, short options cluster as `-am`

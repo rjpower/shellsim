@@ -83,3 +83,93 @@ fn head_stops_infinite_input_and_reads_child_files() {
     assert_eq!(status, 0, "{stderr}");
     assert_eq!(stdout, b"==> short <==\none\n\n==> short <==\none\n");
 }
+
+#[test]
+fn stream_operand_boundaries_preserve_dash_prefixed_files_and_stdin() {
+    for command in ["head", "tail"] {
+        let mut environment = Environment::new();
+        for file in ["-n", "-c", "--unknown", "--"] {
+            environment
+                .vfs
+                .write("/", &format!("/work/{file}"), b"one\ntwo\n", 0o644)
+                .unwrap();
+            let (status, stdout, stderr) =
+                run(&mut environment, &format!("cd /work; {command} -- {file}"));
+            assert_eq!(status, 0, "{command} {file}: {stderr}");
+            assert_eq!(stdout, b"one\ntwo\n", "{command} {file}");
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+        for operand in ["", " -"] {
+            let (status, stdout, stderr) = run(
+                &mut environment,
+                &format!("printf 'one\\ntwo\\n' | {command} --{operand}"),
+            );
+            assert_eq!(status, 0, "{command}: {stderr}");
+            assert_eq!(stdout, b"one\ntwo\n");
+            assert!(stderr.is_empty(), "{stderr}");
+        }
+        let (status, stdout, stderr) = run(&mut environment, &format!("{command} --unknown"));
+        assert_ne!(status, 0, "{command}");
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
+fn head_operand_boundary_preserves_early_pipe_termination() {
+    let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(&mut environment, "yes ready | head -n 3 -- -");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(stdout, b"ready\nready\nready\n");
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn stream_counts_reject_overflow_and_unsupported_negative_head_counts() {
+    let overflowing = "99999999999999999999999999999999999999999999999999";
+    for command in ["head", "tail"] {
+        let mut environment = Environment::new();
+        for option in [format!("-{overflowing}"), format!("-n {overflowing}")] {
+            let (status, stdout, stderr) = run(
+                &mut environment,
+                &format!("printf 'one\\ntwo\\n' | {command} {option}"),
+            );
+            assert_ne!(status, 0, "{command} {option}");
+            assert!(stdout.is_empty());
+            assert!(!stderr.is_empty());
+        }
+    }
+    let mut environment = Environment::new();
+    for option in ["-n -1", "-n-1", "-c -1", "-c-1"] {
+        let (status, stdout, stderr) = run(
+            &mut environment,
+            &format!("printf 'one\\ntwo\\n' | head {option}"),
+        );
+        assert_ne!(status, 0, "head {option}");
+        assert!(stdout.is_empty());
+        assert!(!stderr.is_empty());
+    }
+}
+
+#[test]
+fn stream_count_options_select_the_last_mode() {
+    for (command, options, expected) in [
+        ("head", "-c 1 -n 1", b"one\n".as_slice()),
+        ("head", "-n 1 -c 1", b"o".as_slice()),
+        ("head", "-c 1 -n1", b"one\n".as_slice()),
+        ("head", "-c 1 -1", b"one\n".as_slice()),
+        ("tail", "-c 1 -n 1", b"two\n".as_slice()),
+        ("tail", "-n 1 -c 1", b"\n".as_slice()),
+        ("tail", "-c 1 -n1", b"two\n".as_slice()),
+        ("tail", "-c 1 -1", b"two\n".as_slice()),
+    ] {
+        let mut environment = Environment::new();
+        let (status, stdout, stderr) = run(
+            &mut environment,
+            &format!("printf 'one\\ntwo\\n' | {command} {options}"),
+        );
+        assert_eq!(status, 0, "{command} {options}: {stderr}");
+        assert_eq!(stdout, expected, "{command} {options}");
+        assert!(stderr.is_empty(), "{stderr}");
+    }
+}
