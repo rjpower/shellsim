@@ -8,7 +8,8 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{BuiltinType, ClassLayout, Object, Slot, Value, Vm};
+use super::super::object_model::SlotValue;
+use super::{Object, Slot, Value, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -77,23 +78,6 @@ impl<'s> Vm<'s> {
                 return range_hash(start, stop, step);
             }
             Object::Slice { start, stop, step } => (self.handles([start, stop, step]), hash::slice),
-            Object::EnumMember { class, name, value } => {
-                let (class, name, item) = (
-                    self.handle_optional(class.as_ref()),
-                    name.clone(),
-                    self.handle(value),
-                );
-                if let Some(class) = class {
-                    if matches!(
-                        self.get(class)?,
-                        Object::Class(class_object)
-                            if class_object.layout == ClassLayout::Builtin(BuiltinType::String)
-                    ) {
-                        return self.hash_nested(&item, depth + 1);
-                    }
-                }
-                return Ok(hash::string(&name));
-            }
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
             }
@@ -117,7 +101,9 @@ impl<'s> Vm<'s> {
         Ok(combine(&hashes))
     }
 
-    /// CPython's `object.__hash__` resolution for an instance of a user class.
+    /// `hash()` of an instance of a user class, resolved through the class's hash slot. A class
+    /// that defines `__eq__` without `__hash__` carries `__hash__ = None` and is unhashable, as
+    /// is a `@dataclass` with the default `eq=True`.
     fn instance_hash(
         &mut self,
         value: &Value<'s>,
@@ -128,27 +114,17 @@ impl<'s> Vm<'s> {
             return Err("instance has an invalid class".into());
         };
         let is_dataclass = class_object.is_dataclass;
-        let lineage: Vec<_> = std::iter::once(class)
-            .chain(self.handles(&class_object.mro))
-            .collect();
-        for ancestor in lineage {
-            self.charge_cpu(1)?;
-            let Object::Class(ancestor) = self.get(ancestor)? else {
-                return Err("class MRO contains a non-class object".into());
-            };
-            let attributes = &ancestor.attributes;
-            match attributes.get("__hash__") {
-                Some(method) if method.is_none() => return Err(self.unhashable(value)),
-                Some(_) => {
-                    let result = self
-                        .invoke_slot(value, Slot::Hash, "__hash__", Vec::new())?
-                        .ok_or("__hash__ slot disappeared during lookup")?;
-                    return self.hash_result(&result);
-                }
-                // A class that defines `__eq__` without `__hash__` gets `__hash__ = None`.
-                None if attributes.contains_key("__eq__") => return Err(self.unhashable(value)),
-                None => {}
+        match self.state.types.slot(self.type_id(value)?, Slot::Hash)? {
+            Some(SlotValue::Descriptor(descriptor)) if self.handle(&descriptor).is_none() => {
+                return Err(self.unhashable(value));
             }
+            Some(SlotValue::Descriptor(_) | SlotValue::NativeUnary(_)) => {
+                let result = self
+                    .invoke_slot(value, Slot::Hash, "__hash__", Vec::new())?
+                    .ok_or("__hash__ slot disappeared during lookup")?;
+                return self.hash_result(&result);
+            }
+            _ => {}
         }
         // `@dataclass` defaults to `eq=True, frozen=False`, which also sets `__hash__ = None`.
         if is_dataclass {

@@ -368,7 +368,6 @@ fn render_inner(
                 Object::Match { .. } => "<re.Match ...>",
                 Object::ArgumentParser { .. } => "<argparse.ArgumentParser ...>",
                 Object::Namespace { .. } => "<argparse.Namespace ...>",
-                Object::EnumMember { .. } => "<enum member ...>",
                 Object::RaisesContext { .. } => "<pytest.raises ...>",
                 Object::Property { .. } => "<property ...>",
                 Object::StaticMethod { .. } => "<staticmethod ...>",
@@ -541,21 +540,6 @@ fn render_inner(
                     .collect::<Result<Vec<_>, String>>()?;
                 format!("Namespace({})", rendered.join(", "))
             }
-            Object::EnumMember {
-                class: Some(class),
-                name,
-                value,
-            } => {
-                let Object::Class(class_object) = heap.get(heap.handle(class))? else {
-                    return Err("enum member has an invalid class".into());
-                };
-                let class_name = &class_object.name;
-                format!(
-                    "<{class_name}.{name}: {}>",
-                    render(state, heap.handle(value), active)?
-                )
-            }
-            Object::EnumMember { name, .. } => format!("<enum member {name}>"),
             Object::RaisesContext { .. } => "<pytest.raises>".into(),
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),
@@ -645,7 +629,6 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         | Object::DictView { .. }
         | Object::MappingProxy(_) => true,
         Object::GenericAlias { .. } => true,
-        Object::EnumMember { .. } => true,
         Object::RaisesContext { .. } => true,
         Object::Property { .. }
         | Object::StaticMethod { .. }
@@ -819,7 +802,6 @@ fn equals_inner(
                 | (Object::Match { .. }, Object::Match { .. })
                 | (Object::ArgumentParser { .. }, Object::ArgumentParser { .. })
                 | (Object::Namespace { .. }, Object::Namespace { .. }) => false,
-                (Object::EnumMember { .. }, Object::EnumMember { .. }) => false,
                 (Object::Property { .. }, Object::Property { .. })
                 | (Object::StaticMethod { .. }, Object::StaticMethod { .. })
                 | (Object::ClassMethod { .. }, Object::ClassMethod { .. })
@@ -1169,7 +1151,6 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             | Object::DictView { .. }
             | Object::MappingProxy(_) => Err("object is not a container".into()),
             Object::GenericAlias { .. } => Err("object is not a container".into()),
-            Object::EnumMember { .. } => Err("object is not a container".into()),
             Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }
             | Object::StaticMethod { .. }

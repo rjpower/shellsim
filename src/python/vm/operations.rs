@@ -144,7 +144,7 @@ impl<'s> Vm<'s> {
                     match self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])? {
                         Some(value) => self.truth_value(&value)?,
                         None => {
-                            let container = self.builtin_view(right)?;
+                            let container = right;
                             self.contains_value(&container, &left)?
                         }
                     };

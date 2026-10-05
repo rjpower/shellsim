@@ -641,36 +641,6 @@ impl<'s> Vm<'s> {
                     }
                     return Ok(None);
                 }
-                Object::EnumMember {
-                    class,
-                    name: member_name,
-                    value,
-                } => {
-                    match name {
-                        "name" => {
-                            let member_name = member_name.clone();
-                            return self.allocate_string(member_name).map(Some);
-                        }
-                        "value" => return Ok(Some(self.handle(value))),
-                        _ => {}
-                    }
-                    if let Some(class) = self.handle_optional(class.as_ref()) {
-                        let type_id = self
-                            .class_type_id(&class)?
-                            .ok_or("enum member has an invalid class")?;
-                        if let Some((defining_type, descriptor)) =
-                            self.type_lookup(type_id, name)?
-                        {
-                            return self.bind_type_attribute(
-                                descriptor,
-                                Some(owner),
-                                type_id,
-                                defining_type,
-                            );
-                        }
-                    }
-                    return Ok(None);
-                }
                 Object::GenericAlias { origin, arguments } => {
                     return match name {
                         "__origin__" => Ok(Some(self.handle(origin))),
@@ -1312,19 +1282,8 @@ impl<'s> Vm<'s> {
         self.raise_exception("AttributeError", message)
     }
 
-    /// `value`, or the value an enum member stands for. Builtin operations that the member's
-    /// class does not override act on that value.
-    pub(super) fn builtin_view(&self, value: Value<'s>) -> Result<Value<'s>, String> {
-        if value.is_object() {
-            if let Object::EnumMember { value, .. } = self.get(value)? {
-                return Ok(self.handle(value));
-            }
-        }
-        Ok(value)
-    }
-
     /// The class object of `value` when it is an instance of a user class, whatever payload the
-    /// class's layout gave it; `None` for builtin values, class objects and enum members.
+    /// class's layout gave it; `None` for builtin values and class objects.
     pub(super) fn instance_class(&self, value: Value<'s>) -> Result<Option<Value<'s>>, String> {
         self.state.types.instance_class(&self.state.heap, value)
     }
@@ -1411,7 +1370,6 @@ impl<'s> Vm<'s> {
         index: Value<'s>,
     ) -> Result<Value<'s>, String> {
         let subject = owner;
-        let owner = self.builtin_view(owner)?;
         // A slice is an ordinary key to a mapping; only sequences slice with it.
         let mapping = match owner.is_object() {
             true => matches!(
@@ -1543,7 +1501,6 @@ impl<'s> Vm<'s> {
                 | Object::Match { .. }
                 | Object::ArgumentParser { .. }
                 | Object::Namespace { .. }
-                | Object::EnumMember { .. }
                 | Object::RaisesContext { .. }
                 | Object::NamespaceDict(_)
                 | Object::DictView { .. }
@@ -2385,13 +2342,20 @@ impl<'s> Vm<'s> {
                 if value.is_object() && matches!(self.get(value), Ok(Object::Function { .. })) {
                     continue;
                 }
-                let member = self.alloc_with(|b| Object::EnumMember {
-                    class: None,
-                    name: member_name.clone(),
-                    value: b.store(value),
-                })?;
-                attributes.insert(member_name, member);
-                enum_members.push(member);
+                enum_members.push((member_name, value));
+            }
+            // An enum that mixes in a data type keeps Enum's repr and str, which the data type
+            // would otherwise shadow in the MRO. CPython's EnumType.__new__ makes the same
+            // substitution for methods the class body does not define.
+            if matches!(layout, ClassLayout::Builtin(_)) {
+                for (name, slot) in [("__repr__", Slot::Repr), ("__str__", Slot::String)] {
+                    attributes.entry(name.into()).or_insert(Value::Native(
+                        NativeValue::SlotWrapper {
+                            owner: BuiltinType::Enum.id(),
+                            slot,
+                        },
+                    ));
+                }
             }
         }
         let descriptor_candidates = attributes
@@ -2710,11 +2674,6 @@ impl<'s> Vm<'s> {
             dataclass_fields,
             enum_members,
         } = definition;
-        let enum_member_ids = enum_members
-            .iter()
-            .copied()
-            .filter(|member| member.is_object())
-            .collect::<Vec<_>>();
         // A heap class introduces the instance-dictionary descriptor when no heap ancestor
         // already supplies it. Metaclasses inherit type's own descriptor instead.
         if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains_key("__dict__") {
@@ -2777,7 +2736,7 @@ impl<'s> Vm<'s> {
                     .into_iter()
                     .map(|(field, default)| (field, b.optional(default)))
                     .collect(),
-                enum_members: b.refs(enum_members),
+                enum_members: Vec::new(),
             }))
         })?;
         let state = &mut *self.state;
@@ -2794,15 +2753,27 @@ impl<'s> Vm<'s> {
         class_object.instance_type = instance_type;
         let stored = self.store(class);
         self.state.types.finish(instance_type, stored)?;
-        for member in enum_member_ids {
-            self.modify(member, |b, object| {
-                let Object::EnumMember { class: owner, .. } = object else {
-                    return Err("invalid enum member".to_string());
+        // Members are instances of the class, so they exist once the class has its type. Their
+        // name and value are instance attributes, as in CPython; a data mixin also gives the
+        // member the value as its payload so the mixin's methods act on it.
+        for (member_name, value) in enum_members {
+            let payload = match layout {
+                ClassLayout::Builtin(_) => self.state.heap.copy_builtin_payload(value)?,
+                _ => Object::Bare,
+            };
+            let member = self.allocate_typed(instance_type, payload)?;
+            let name_value = self.allocate_string(member_name.clone())?;
+            self.insert_attribute(member, "_name_", name_value)?;
+            self.insert_attribute(member, "_value_", value)?;
+            self.modify(class, |b, object| {
+                let Object::Class(class_object) = object else {
+                    unreachable!("allocated a class");
                 };
-                *owner = Some(b.store(class));
-                Ok(())
-            })??;
-            self.state.heap.set_type_id(member, instance_type)?;
+                class_object
+                    .attributes
+                    .insert(member_name.clone(), b.store(member));
+                class_object.enum_members.push(b.store(member));
+            })?;
         }
         for (_, descriptor) in &descriptors {
             if !descriptor.is_object() {
@@ -3197,8 +3168,7 @@ impl<'s> Vm<'s> {
                 };
                 let operator = ComparisonOperator::from_slot(slot)
                     .ok_or("comparison slot invoked for a non-comparison operator")?;
-                let (receiver, argument) =
-                    (self.builtin_view(*receiver)?, self.builtin_view(*argument)?);
+                let (receiver, argument) = (*receiver, *argument);
                 return call(self, receiver, argument, operator)
                     .map(|result| result.map(Value::Bool))
                     .map_err(|error| self.record_native_error(error));
@@ -3207,15 +3177,9 @@ impl<'s> Vm<'s> {
                 if !arguments.is_empty() {
                     return Err("hash slot received arguments".into());
                 }
-                let receiver = self.builtin_view(*receiver)?;
+                let receiver = *receiver;
                 let hash = self.payload_hash(&receiver, 0)?;
                 return Ok(Some(Value::Int(hash)));
-            }
-            SlotValue::VmEnumString => {
-                if !arguments.is_empty() {
-                    return Err("enum string slot received arguments".into());
-                }
-                return self.enum_member_string(*receiver).map(Some);
             }
             SlotValue::VmRepr => {
                 if !arguments.is_empty() {
@@ -3225,7 +3189,7 @@ impl<'s> Vm<'s> {
                 return self.allocate_string(rendered).map(Some);
             }
             SlotValue::NativeMethod(method) => {
-                let receiver = self.builtin_view(*receiver)?;
+                let receiver = *receiver;
                 return (method.call)(self, receiver, CallArgs::new(arguments, Vec::new()))
                     .map(Some)
                     .map_err(|error| self.record_native_error(error));
@@ -3236,8 +3200,7 @@ impl<'s> Vm<'s> {
                         "binary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                let (receiver, argument) =
-                    (self.builtin_view(*receiver)?, self.builtin_view(*argument)?);
+                let (receiver, argument) = (*receiver, *argument);
                 return call(self, receiver, argument)
                     .map_err(|error| self.record_native_error(error));
             }
@@ -3247,8 +3210,8 @@ impl<'s> Vm<'s> {
                         "ternary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                let receiver = self.builtin_view(*receiver)?;
-                let (first, second) = (self.builtin_view(*first)?, self.builtin_view(*second)?);
+                let receiver = *receiver;
+                let (first, second) = (*first, *second);
                 return call(self, receiver, first, second)
                     .map_err(|error| self.record_native_error(error));
             }
@@ -3256,7 +3219,7 @@ impl<'s> Vm<'s> {
                 if !arguments.is_empty() {
                     return Err("unary protocol slot received arguments".into());
                 }
-                let receiver = self.builtin_view(*receiver)?;
+                let receiver = *receiver;
                 return call(self, receiver).map_err(|error| self.record_native_error(error));
             }
             SlotValue::Descriptor(descriptor) => self.handle(&descriptor),
@@ -3317,30 +3280,20 @@ impl<'s> Vm<'s> {
         // The builtin `__repr__` and `__hash__` act on the receiver's payload: called from a
         // subclass's own `__repr__`, they must not dispatch back into it.
         if matches!(implementation, SlotValue::VmRepr) {
-            let value = if owner == BuiltinType::Enum.id() {
-                receiver
-            } else {
-                self.builtin_view(receiver)?
-            };
-            let rendered = self.repr_payload(&value, &mut BTreeSet::new())?;
+            let rendered = self.repr_payload(&receiver, &mut BTreeSet::new())?;
             return self.allocate_string(rendered);
         }
-        if matches!(implementation, SlotValue::VmEnumString) {
-            return self.enum_member_string(receiver);
-        }
         if matches!(implementation, SlotValue::VmHash) {
-            let receiver = self.builtin_view(receiver)?;
             return self.payload_hash(&receiver, 0).map(Value::Int);
         }
-        let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
-            SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
-            SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
-            SlotValue::VmHash => unreachable!("handled before builtin payload view"),
+            SlotValue::VmRepr | SlotValue::VmHash => {
+                unreachable!("handled before the native slot dispatch")
+            }
             SlotValue::NativeCompare(call) => {
                 let operator = ComparisonOperator::from_slot(slot)
                     .ok_or("comparison slot invoked for a non-comparison operator")?;
-                let argument = self.builtin_view(arguments[0])?;
+                let argument = arguments[0];
                 call(self, receiver, argument, operator).map(|result| result.map(Value::Bool))
             }
             SlotValue::NativeMethod(method) => {
@@ -3349,12 +3302,12 @@ impl<'s> Vm<'s> {
             }
             SlotValue::NativeUnary(call) => call(self, receiver),
             SlotValue::NativeBinary(call) => {
-                let argument = self.builtin_view(arguments[0])?;
+                let argument = arguments[0];
                 call(self, receiver, argument)
             }
             SlotValue::NativeTernary(call) => {
-                let first = self.builtin_view(arguments[0])?;
-                let second = self.builtin_view(arguments[1])?;
+                let first = arguments[0];
+                let second = arguments[1];
                 call(self, receiver, first, second)
             }
             SlotValue::Descriptor(_) => return Err("slot wrapper is not native".into()),
@@ -3523,25 +3476,6 @@ impl<'s> Vm<'s> {
         };
         active.remove(&id);
         Ok(rendered)
-    }
-
-    fn enum_member_string(&mut self, member: Value<'s>) -> Result<Value<'s>, String> {
-        if !member.is_object() {
-            return Err("enum string slot requires a member".into());
-        }
-        let Object::EnumMember {
-            class: Some(class),
-            name,
-            ..
-        } = self.get(member)?
-        else {
-            return Err("enum string slot requires a member".into());
-        };
-        let class_name = match self.get(self.handle(class))? {
-            Object::Class(class_object) => class_object.name.clone(),
-            _ => return Err("enum member has an invalid class".into()),
-        };
-        self.allocate_string(format!("{class_name}.{name}"))
     }
 
     /// Dict-literal text for `entries`: `{key: value, ...}`.
@@ -3848,7 +3782,7 @@ impl<'s> Vm<'s> {
         source: &Value<'s>,
     ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
         // A dict subclass contributes the entries it holds, as CPython's dict merge does.
-        let view = self.builtin_view(*source)?;
+        let view = *source;
         if view.is_object() {
             if let Object::Dict(entries) | Object::DefaultDict { entries, .. } = self.get(view)? {
                 return Ok(entries

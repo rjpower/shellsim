@@ -1983,7 +1983,7 @@ struct ClassDefinition<'s> {
     exception_base: Option<&'static str>,
     attributes: HashMap<String, Value<'s>>,
     dataclass_fields: Vec<(String, Option<Value<'s>>)>,
-    enum_members: Vec<Value<'s>>,
+    enum_members: Vec<(String, Value<'s>)>,
 }
 
 fn select_string_slice(

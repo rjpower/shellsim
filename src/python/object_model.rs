@@ -211,8 +211,6 @@ pub enum SlotValue {
     NativeMethod(&'static MethodDef),
     /// The VM's representation renderer, which shares cycle tracking across nested values.
     VmRepr,
-    /// Enum member text needs its defining class, which is stored in the VM's heap.
-    VmEnumString,
     /// Hash compound values through the VM so their elements use Python's hash protocol.
     VmHash,
     /// A builtin type's six rich comparisons, one function answering for every operator.
@@ -511,7 +509,6 @@ impl Clone for SlotValue {
             Self::Descriptor(value) => Self::Descriptor(value.dup()),
             Self::NativeMethod(method) => Self::NativeMethod(method),
             Self::VmRepr => Self::VmRepr,
-            Self::VmEnumString => Self::VmEnumString,
             Self::VmHash => Self::VmHash,
             Self::NativeCompare(function) => Self::NativeCompare(*function),
             Self::NativeBinary(function) => Self::NativeBinary(*function),
@@ -648,6 +645,10 @@ impl Default for TypeRegistry {
         install_native_attributes(
             &mut types[BuiltinType::Object as usize],
             &super::stdlib::core::OBJECT_TYPE,
+        );
+        install_native_attributes(
+            &mut types[BuiltinType::Enum as usize],
+            &super::stdlib::r#enum::ENUM_TYPE,
         );
         install_native_attributes(
             &mut types[BuiltinType::Type as usize],
@@ -948,10 +949,7 @@ impl TypeRegistry {
         if ty.kind != TypeKind::Class {
             return Ok(None);
         }
-        if matches!(
-            heap.get(value)?,
-            Object::Class(_) | Object::EnumMember { .. }
-        ) {
+        if matches!(heap.get(value)?, Object::Class(_)) {
             return Ok(None);
         }
         let class = ty
@@ -2167,12 +2165,10 @@ fn install_builtin_slots(types: &mut [PyType]) {
     types[BuiltinType::NotImplemented as usize]
         .slots
         .set(Slot::Bool, unary(not_implemented_bool));
-    types[BuiltinType::Enum as usize]
-        .slots
-        .set(Slot::Repr, SlotValue::VmRepr);
-    types[BuiltinType::Enum as usize]
-        .slots
-        .set(Slot::String, SlotValue::VmEnumString);
+    let enum_slots = &mut types[BuiltinType::Enum as usize].slots;
+    enum_slots.set(Slot::Repr, unary(super::stdlib::r#enum::slot_repr));
+    enum_slots.set(Slot::String, unary(super::stdlib::r#enum::slot_str));
+    enum_slots.set(Slot::Hash, unary(super::stdlib::r#enum::slot_hash));
 }
 
 /// Fill resolved builtin slots from the first defining ancestor. Local slots were captured
@@ -2210,7 +2206,6 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                     | SlotValue::NativeTernary(_)
                     | SlotValue::NativeUnary(_)
                     | SlotValue::VmRepr
-                    | SlotValue::VmEnumString
                     | SlotValue::VmHash
                     | SlotValue::NativeCompare(_)
             )

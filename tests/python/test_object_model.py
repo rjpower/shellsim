@@ -1030,3 +1030,48 @@ def test_exception_instances_are_ordinary_instances():
         pass
     else:
         raise AssertionError("int accepted an attribute")
+
+
+def test_enum_members_are_ordinary_instances():
+    import enum
+
+    class Color(enum.Enum):
+        RED = 1
+        GREEN = 2
+
+        def describe(self):
+            return self.name.lower() + "=" + str(self.value)
+
+    class Mode(str, enum.Enum):
+        FAST = "fast"
+        SLOW = "slow"
+
+    class Level(int, enum.Enum):
+        LOW = 1
+        HIGH = 10
+
+    # A member is an instance of its class whose name and value are instance attributes.
+    assert type(Color.RED) is Color and isinstance(Color.RED, enum.Enum)
+    assert (Color.RED.name, Color.RED.value, Color.RED.describe()) == ("RED", 1, "red=1")
+    assert vars(Color.RED)["_name_"] == "RED" and vars(Color.RED)["_value_"] == 1
+    assert (repr(Color.RED), str(Color.RED)) == ("<Color.RED: 1>", "Color.RED")
+    assert Color(2) is Color.GREEN and Color.RED != 1
+    assert hash(Color.RED) == hash("RED") and len({Color.RED, Color.RED, Color.GREEN}) == 2
+    assert [member.name for member in Color] == ["RED", "GREEN"]
+    try:
+        Color(7)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Color(7) did not raise")
+    # A data mixin gives the member the value as its payload and keeps Enum's repr and str.
+    assert Mode.FAST == "fast" and Mode.FAST.upper() == "FAST" and Mode.FAST + "!" == "fast!"
+    assert (repr(Mode.FAST), str(Mode.FAST), f"{Mode.FAST}") == (
+        "<Mode.FAST: 'fast'>",
+        "Mode.FAST",
+        "Mode.FAST",
+    )
+    assert hash(Mode.FAST) == hash("fast") and str.__repr__(Mode.FAST) == "'fast'"
+    assert Mode("slow") is Mode.SLOW and isinstance(Mode.FAST, str)
+    assert Level.HIGH + 1 == 11 and Level.HIGH > Level.LOW and int(Level.HIGH) == 10
+    assert sorted([Level.HIGH, Level.LOW]) == [Level.LOW, Level.HIGH]

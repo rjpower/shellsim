@@ -95,11 +95,6 @@ pub(super) fn dup_object(object: &Object) -> Object {
                 .collect(),
             enum_members: slots(&class.enum_members),
         })),
-        Object::EnumMember { class, name, value } => Object::EnumMember {
-            class: optional(class),
-            name: name.clone(),
-            value: value.dup(),
-        },
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,

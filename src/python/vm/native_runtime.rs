@@ -574,7 +574,6 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::Range { .. } => PyKind::Native,
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
             Object::Class { .. } => PyKind::Class,
-            Object::EnumMember { .. } => PyKind::Instance,
             Object::GenericAlias { .. } => PyKind::Native,
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }

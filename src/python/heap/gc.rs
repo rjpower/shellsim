@@ -136,10 +136,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
             }
             slots(enum_members, f);
         }
-        Object::EnumMember { class, value, .. } => {
-            optional(class, f);
-            f(&mut value.0);
-        }
         Object::Match(matched) => {
             f(&mut matched.subject.0);
             f(&mut matched.regex.0);

@@ -385,11 +385,6 @@ pub enum Object {
     Float(f64),
     Function(Box<FunctionObject>),
     Class(Box<ClassObject>),
-    EnumMember {
-        class: Option<Ref>,
-        name: String,
-        value: Ref,
-    },
     DescriptorBoundMethod {
         receiver: Ref,
         descriptor: Ref,
@@ -876,14 +871,6 @@ impl Heap {
         Ok(self.object(self.object_id(value)?)?.type_id)
     }
 
-    /// Re-type an object whose Python class is known only after allocation: a builtin exception
-    /// instance's registered class, or an enum member's class once its class statement completes.
-    pub fn set_type_id(&mut self, value: Value<'_>, type_id: TypeId) -> Result<(), String> {
-        let id = self.object_id(value)?;
-        self.object_mut(id)?.type_id = type_id;
-        Ok(())
-    }
-
     /// A stable identity for `id()` and identity hashing, assigned on first use and unchanged
     /// when the object moves. Immediates have none.
     pub fn identity(&self, value: Value<'_>) -> Result<Option<u32>, String> {
@@ -1237,7 +1224,7 @@ impl Heap {
             Object::Match { .. } => BuiltinType::Match.id(),
             Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
             Object::RaisesContext { .. } => BuiltinType::RaisesContext.id(),
-            Object::EnumMember { .. } | Object::Namespace { .. } => BuiltinType::Native.id(),
+            Object::Namespace { .. } => BuiltinType::Native.id(),
             Object::Property { .. } => BuiltinType::Property.id(),
             Object::StaticMethod { .. } => BuiltinType::StaticMethod.id(),
             Object::ClassMethod { .. } => BuiltinType::ClassMethod.id(),
@@ -1327,10 +1314,6 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                 .and_then(|size| size.checked_add(enum_members.len()))
                 .ok_or("modeled object size overflow")?
         }
-        Object::EnumMember { name, .. } => name
-            .len()
-            .checked_add(1)
-            .ok_or("modeled object size overflow")?,
         Object::DescriptorBoundMethod { .. } => 3,
         Object::GenericAlias { arguments, .. } => arguments.len().saturating_add(1),
         Object::Iterator { values, .. } => values.len(),

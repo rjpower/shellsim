@@ -25,7 +25,7 @@ impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
     pub(super) fn physical_length(&self, value: Value<'s>) -> Result<Option<usize>, String> {
-        let subject = self.builtin_view(value)?;
+        let subject = value;
         if let Some(length) = protocol::string_length(&self.state.heap, subject)? {
             return Ok(Some(length));
         }
@@ -382,17 +382,10 @@ impl<'s> Vm<'s> {
                     } else if let Some(NativeValue::NativeMethod(method)) =
                         descriptor.native_value()
                     {
-                        let native_receiver = if receiver.is_object()
-                            && matches!(self.get(receiver), Ok(Object::EnumMember { .. }))
-                        {
-                            self.builtin_view(receiver)?
-                        } else {
-                            receiver
-                        };
                         self.call_native_method(
                             method,
                             receiver,
-                            native_receiver,
+                            receiver,
                             CallArgs::new(arguments, keyword_arguments),
                             mode,
                         )
@@ -1397,19 +1390,19 @@ impl<'s> Vm<'s> {
             if !keyword_arguments.is_empty() || arguments.len() != 1 {
                 return Err(format!("{name}() expects one value"));
             }
+            let value_symbol = self.intern_symbol("_value_")?;
             for member in enum_members {
-                if !member.is_object() {
-                    return Err("invalid enum member".into());
-                }
-                let Object::EnumMember { value, .. } = self.get(member)? else {
-                    return Err("invalid enum member".into());
-                };
-                let value = self.handle(value);
+                let value = self
+                    .attribute_by_symbol(member, value_symbol)?
+                    .ok_or("enum member has no value")?;
                 if self.values_equal(&value, &arguments[0])? {
                     return Ok(CallResult::Value(member));
                 }
             }
-            return Err(format!("value is not a valid {name}"));
+            let rendered = self.repr_value(&arguments[0])?;
+            return Err(
+                self.raise_exception("ValueError", format!("{rendered} is not a valid {name}"))
+            );
         }
         if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
             let class_type = self

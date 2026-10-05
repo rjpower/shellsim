@@ -67,7 +67,7 @@ impl<'s> Vm<'s> {
         {
             return Ok(iterator);
         }
-        let subject = self.builtin_view(value)?;
+        let subject = value;
         let physical_sequence = if subject.is_object() {
             matches!(
                 self.get(subject)?,
@@ -114,7 +114,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: Value<'s>,
     ) -> Result<Value<'s>, String> {
-        let subject = self.builtin_view(value)?;
+        let subject = value;
         let length = self
             .physical_length(subject)?
             .ok_or("native reverse slot requires a sequence")?;
