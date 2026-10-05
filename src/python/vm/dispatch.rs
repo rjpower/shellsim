@@ -48,6 +48,7 @@ impl<'s> Vm<'s> {
             .map_err(|error| (error, super::super::source::Span::default()))?;
         self.handlers.append(&mut resume.handlers);
         self.with_contexts.append(&mut resume.contexts);
+        let depth = self.bytecode_frames.len();
         self.bytecode_frames.push(frame);
         self.synchronous_frames += 1;
         let result = loop {
@@ -57,6 +58,9 @@ impl<'s> Vm<'s> {
             }
         };
         self.synchronous_frames -= 1;
+        // A process exit leaves the frames this execution called installed above its own;
+        // they end with it.
+        self.bytecode_frames.truncate(depth + 1);
         let frame = self
             .bytecode_frames
             .pop()
@@ -131,13 +135,54 @@ impl<'s> Vm<'s> {
         if let Some(flow) = vm.resume_suspension()? {
             return Ok(flow);
         }
+        // CPU is metered per quantum: the loop counts instructions and charges them in one
+        // call when it leaves or when a call hands control to Rust code, so natives see an
+        // exact meter. The quantum never exceeds what the limit has left, so the count of
+        // instructions executed before exhaustion is the same as charging each one.
+        let remaining = vm.interp.resources.cpu_remaining();
+        if remaining == 0 || vm.interp.resources.is_stopped() {
+            // The failed charge records the stop reason, as charging the instruction would.
+            vm.interp.resources.charge_cpu(1);
+            return Ok(Flow::Exit(137));
+        }
+        let quantum = usize::try_from(remaining).map_or(budget, |remaining| budget.min(remaining));
         let mut dispatch = DispatchCursor::for_active(&mut vm)
             .map_err(|error| (error, super::super::source::Span::default()))?;
-        'execution: for _ in 0..budget.max(1) {
+        let mut executed = 0;
+        let result = vm.run_quantum(&mut dispatch, quantum.max(1), &mut executed);
+        vm.flush_cpu(&mut executed);
+        result
+    }
+
+    /// Charge the instructions counted since the last flush.
+    #[inline(always)]
+    fn flush_cpu(&mut self, executed: &mut u64) {
+        if *executed != 0 {
+            // A failed charge records the stop; the next quantum ends the process.
+            self.interp.resources.charge_cpu(*executed);
+            *executed = 0;
+        }
+    }
+
+    /// Run up to `quantum` instructions of the active frame, counting them in `executed`.
+    fn run_quantum(
+        &mut self,
+        dispatch: &mut DispatchCursor,
+        quantum: usize,
+        executed: &mut u64,
+    ) -> Result<Flow, (String, super::super::source::Span)> {
+        'execution: for _ in 0..quantum {
+            // A resource limit a native or a nested execution hit stops the process before the
+            // next instruction, as the per-instruction charge did; the quantum itself cannot
+            // exceed the CPU limit.
+            if self.interp.resources.is_stopped() {
+                return Ok(Flow::Exit(137));
+            }
+            *executed += 1;
             // Handles and native scratch live for one semantic instruction. Releasing the
             // previous instruction's here avoids double-counting a materialized result after it
             // has moved into a heap object.
-            vm.reset_scope_if_used();
+            self.reset_scope_if_used();
             let instruction_pointer = dispatch.op_index;
             let code = &dispatch.code;
             let code_cache = dispatch.code_cache;
@@ -147,118 +192,117 @@ impl<'s> Vm<'s> {
                     super::super::source::Span::default(),
                 ));
             };
-            if !vm.interp.resources.charge_cpu(1) {
-                return Ok(Flow::Exit(137));
-            }
-            if vm
+            if self
                 .execution
                 .test_timeout
-                .is_some_and(|timeout| timeout.remaining(vm.interp) == 0)
+                .is_some_and(|timeout| timeout.remaining(self.interp) == 0)
             {
-                vm.execution.test_timeout = None;
-                dispatch.sync(&mut vm);
+                self.execution.test_timeout = None;
+                dispatch.sync(self);
                 let error =
-                    vm.record_native_error(super::PyError::exception("Failed", "test timed out"));
-                vm.propagate_error(error, dispatch.span())?;
+                    self.record_native_error(super::PyError::exception("Failed", "test timed out"));
+                self.propagate_error(error, dispatch.span())?;
                 let span = dispatch.span();
-                dispatch.refresh(&mut vm).map_err(|error| (error, span))?;
+                dispatch.refresh(self).map_err(|error| (error, span))?;
                 continue 'execution;
             }
             let opcode = instruction.opcode;
             let result: Result<Flow, String> = match opcode {
-                Opcode::LoadConstant(constant) => vm
+                Opcode::LoadConstant(constant) => self
                     .value_from_constant(code.constant(constant))
                     .map(|value| {
-                        vm.push(value);
+                        self.push(value);
                     })
                     .map(|()| Flow::Next),
                 Opcode::LoadName(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.load_name(symbol, code.name(name)))
+                    dispatch_next(self.load_name(symbol, code.name(name)))
                 }
                 Opcode::LoadGlobal(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.load_global(symbol, code, name))
+                    dispatch_next(self.load_global(symbol, code, name))
                 }
                 Opcode::StoreName(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.store_name(symbol, code.name(name)))
+                    dispatch_next(self.store_name(symbol, code.name(name)))
                 }
-                Opcode::LoadLocal(slot) => dispatch_next(vm.load_fast(dispatch.locals, slot)),
-                Opcode::StoreLocal(slot) => dispatch_next(vm.store_fast(dispatch.locals, slot)),
+                Opcode::LoadLocal(slot) => dispatch_next(self.load_fast(dispatch.locals, slot)),
+                Opcode::StoreLocal(slot) => dispatch_next(self.store_fast(dispatch.locals, slot)),
                 Opcode::StoreEnclosing { name, scope_hops } => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.store_enclosing(symbol, code.name(name), scope_hops))
+                    dispatch_next(self.store_enclosing(symbol, code.name(name), scope_hops))
                 }
-                Opcode::StoreNonlocal(name) => dispatch_next(vm.store_nonlocal(code.name(name))),
+                Opcode::StoreNonlocal(name) => dispatch_next(self.store_nonlocal(code.name(name))),
                 Opcode::StoreGlobal(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.store_global(symbol, code, name, value))
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_global(symbol, code, name, value))
                 }
                 Opcode::StoreAttribute(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    let owner = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.store_attribute_by_symbol(
+                    let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.store_attribute_by_symbol(
                         owner,
                         symbol,
                         code.name(name),
                         value,
                     ))
                 }
-                Opcode::StoreSubscript => dispatch_next(vm.store_subscript()),
+                Opcode::StoreSubscript => dispatch_next(self.store_subscript()),
                 Opcode::DeleteAttribute(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    let owner = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.delete_attribute_by_symbol(owner, symbol, code.name(name)))
+                    let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(self.delete_attribute_by_symbol(owner, symbol, code.name(name)))
                 }
                 Opcode::DeleteName(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
                     let name = code.name(name);
-                    let scope = vm.active_scope();
+                    let scope = self.active_scope();
                     let result = if let Some(scope) = scope {
-                        scopes::remove(&mut vm.state.heap, scope, name).map(|_| ())
+                        scopes::remove(&mut self.state.heap, scope, name).map(|_| ())
                     } else {
-                        vm.state.globals.remove(&vm.state.heap, symbol);
+                        self.state.globals.remove(&self.state.heap, symbol);
                         Ok(())
                     };
                     dispatch_next(result)
                 }
-                Opcode::DeleteLocal(slot) => dispatch_next(vm.delete_local(dispatch.locals, slot)),
+                Opcode::DeleteLocal(slot) => {
+                    dispatch_next(self.delete_local(dispatch.locals, slot))
+                }
                 Opcode::DeleteGlobal(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.delete_global(symbol, code, name))
+                    dispatch_next(self.delete_global(symbol, code, name))
                 }
-                Opcode::DeleteSubscript => dispatch_next(vm.delete_subscript()),
+                Opcode::DeleteSubscript => dispatch_next(self.delete_subscript()),
                 Opcode::Import { name, bind_root } => {
-                    dispatch_next(vm.import(code.name(name), bind_root))
+                    dispatch_next(self.import(code.name(name), bind_root))
                 }
-                Opcode::ImportFrom(name) => dispatch_next(vm.import_from(code.name(name))),
-                Opcode::ImportStar => dispatch_next(vm.import_star()),
+                Opcode::ImportFrom(name) => dispatch_next(self.import_from(code.name(name))),
+                Opcode::ImportStar => dispatch_next(self.import_star()),
                 Opcode::LoadAttribute(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.load_attribute_at(
+                    dispatch_next(self.load_attribute_at(
                         code,
                         code_cache,
                         instruction_pointer,
@@ -266,29 +310,29 @@ impl<'s> Vm<'s> {
                         code.name(name),
                     ))
                 }
-                Opcode::LoadSubscript => dispatch_next(vm.load_subscript()),
+                Opcode::LoadSubscript => dispatch_next(self.load_subscript()),
                 Opcode::BuildSlice {
                     has_start,
                     has_stop,
                     has_step,
-                } => dispatch_next(vm.build_slice(has_start, has_stop, has_step)),
+                } => dispatch_next(self.build_slice(has_start, has_stop, has_step)),
                 Opcode::BuildList(count) => {
-                    dispatch_next(vm.build_sequence(count, SequenceKind::List))
+                    dispatch_next(self.build_sequence(count, SequenceKind::List))
                 }
                 Opcode::BuildTuple(count) => {
-                    dispatch_next(vm.build_sequence(count, SequenceKind::Tuple))
+                    dispatch_next(self.build_sequence(count, SequenceKind::Tuple))
                 }
-                Opcode::BuildDict(dict) => dispatch_next(vm.build_dict(code.unpack_flags(dict))),
-                Opcode::BuildSet(count) => dispatch_next(vm.build_set(count)),
+                Opcode::BuildDict(dict) => dispatch_next(self.build_dict(code.unpack_flags(dict))),
+                Opcode::BuildSet(count) => dispatch_next(self.build_set(count)),
                 Opcode::BuildUnpacked { kind, starred } => {
-                    dispatch_next(vm.build_unpacked(kind, code.unpack_flags(starred)))
+                    dispatch_next(self.build_unpacked(kind, code.unpack_flags(starred)))
                 }
                 Opcode::UnpackSequence { count, star_index } => {
-                    dispatch_next(vm.unpack_sequence(count, star_index))
+                    dispatch_next(self.unpack_sequence(count, star_index))
                 }
                 Opcode::MakeFunction(function) => {
                     let function = code.function(function);
-                    dispatch_next(vm.make_function(
+                    dispatch_next(self.make_function(
                         code.name(function.name).to_owned(),
                         function.code.clone(),
                         function.defaults,
@@ -296,7 +340,7 @@ impl<'s> Vm<'s> {
                 }
                 Opcode::MakeClass(class) => {
                     let class = code.class(class);
-                    dispatch_next(vm.make_class(
+                    dispatch_next(self.make_class(
                         code.name(class.name).to_owned(),
                         &class.code,
                         class.bases,
@@ -304,35 +348,36 @@ impl<'s> Vm<'s> {
                         &class.fields,
                     ))
                 }
-                Opcode::GetIterator => dispatch_next(vm.get_iterator()),
-                Opcode::ForIterator(target) => match vm.for_iterator() {
+                Opcode::GetIterator => dispatch_next(self.get_iterator()),
+                Opcode::ForIterator(target) => match self.for_iterator() {
                     Ok(ForIterOutcome::Yielded) => Ok(Flow::Next),
                     Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
                     Ok(ForIterOutcome::Blocked(reason)) => {
                         // The iterator is still on the stack, unconsumed; leaving the frame's
                         // instruction pointer at this same opcode makes the next quantum retry
                         // the identical advance instead of skipping or repeating a yielded value.
-                        vm.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(vm.suspend(reason, None))
+                        self.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(self.suspend(reason, None))
                     }
                     Err(error) => Err(error),
                 },
-                Opcode::Unary(operator) => dispatch_next(vm.unary(operator)),
-                Opcode::Binary(operator) => dispatch_next(vm.binary(operator)),
-                Opcode::InPlaceBinary(operator) => dispatch_next(vm.inplace_binary(operator)),
+                Opcode::Unary(operator) => dispatch_next(self.unary(operator)),
+                Opcode::Binary(operator) => dispatch_next(self.binary(operator)),
+                Opcode::InPlaceBinary(operator) => dispatch_next(self.inplace_binary(operator)),
                 Opcode::FormatValue(format) => {
                     let format = code.format(format);
-                    dispatch_next(vm.format_value(format.conversion, &format.format_spec))
+                    dispatch_next(self.format_value(format.conversion, &format.format_spec))
                 }
-                Opcode::Compare(operator) => dispatch_next(vm.compare(operator)),
+                Opcode::Compare(operator) => dispatch_next(self.compare(operator)),
                 Opcode::Call(call) => {
-                    vm.dispatch_call(&dispatch.code, call, instruction_pointer, dispatch.span())
+                    self.flush_cpu(executed);
+                    self.dispatch_call(&dispatch.code, call, instruction_pointer, dispatch.span())
                 }
                 Opcode::LoadMethod(name) => {
-                    let symbol = vm
+                    let symbol = self
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(vm.load_method_at(
+                    dispatch_next(self.load_method_at(
                         code,
                         code_cache,
                         instruction_pointer,
@@ -340,29 +385,32 @@ impl<'s> Vm<'s> {
                         code.name(name),
                     ))
                 }
-                Opcode::CallMethod(call) => vm.dispatch_call_method(
-                    &dispatch.code,
-                    call,
-                    instruction_pointer,
-                    dispatch.span(),
-                ),
-                Opcode::Copy(depth) => dispatch_next(vm.copy(depth)),
-                Opcode::Swap(depth) => dispatch_next(vm.swap(depth)),
-                Opcode::PopTop => vm.pop_ref().map(|_| Flow::Next),
+                Opcode::CallMethod(call) => {
+                    self.flush_cpu(executed);
+                    self.dispatch_call_method(
+                        &dispatch.code,
+                        call,
+                        instruction_pointer,
+                        dispatch.span(),
+                    )
+                }
+                Opcode::Copy(depth) => dispatch_next(self.copy(depth)),
+                Opcode::Swap(depth) => dispatch_next(self.swap(depth)),
+                Opcode::PopTop => self.pop_ref().map(|_| Flow::Next),
                 Opcode::Jump(target) => Ok(Flow::Jump(target)),
-                Opcode::JumpIfFalseOrPop(target) => match vm.jump_if_or_pop(false) {
+                Opcode::JumpIfFalseOrPop(target) => match self.jump_if_or_pop(false) {
                     Ok(true) => Ok(Flow::Jump(target)),
                     Ok(false) => Ok(Flow::Next),
                     Err(error) => Err(error),
                 },
-                Opcode::JumpIfTrueOrPop(target) => match vm.jump_if_or_pop(true) {
+                Opcode::JumpIfTrueOrPop(target) => match self.jump_if_or_pop(true) {
                     Ok(true) => Ok(Flow::Jump(target)),
                     Ok(false) => Ok(Flow::Next),
                     Err(error) => Err(error),
                 },
                 Opcode::PopJumpIfFalse(target) => {
-                    let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    if !vm
+                    let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                    if !self
                         .truth_value(&value)
                         .map_err(|error| (error, dispatch.span()))?
                     {
@@ -372,89 +420,89 @@ impl<'s> Vm<'s> {
                     }
                 }
                 Opcode::Return => {
-                    let value = vm.pop_ref().map_err(|error| (error, dispatch.span()))?;
-                    match vm.finish_called_frame(value) {
+                    let value = self.pop_ref().map_err(|error| (error, dispatch.span()))?;
+                    match self.finish_called_frame(value) {
                         Ok(()) => Ok(Flow::Refresh),
                         Err(value) => Ok(Flow::Return(value)),
                     }
                 }
                 Opcode::Yield => {
-                    let value = vm.pop_ref().map_err(|error| (error, dispatch.span()))?;
-                    vm.active_frame_mut().instruction_pointer = instruction_pointer + 1;
+                    let value = self.pop_ref().map_err(|error| (error, dispatch.span()))?;
+                    self.active_frame_mut().instruction_pointer = instruction_pointer + 1;
                     Ok(Flow::Yield(value))
                 }
-                Opcode::YieldFromSend(target) => match vm.yield_from_send() {
+                Opcode::YieldFromSend(target) => match self.yield_from_send() {
                     Ok(ForIterOutcome::Yielded) => {
                         // Suspend at this instruction so the next `send` repeats the step.
-                        let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                        vm.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(Flow::Yield(vm.store(value)))
+                        let value = self.pop().map_err(|error| (error, dispatch.span()))?;
+                        self.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(Flow::Yield(self.store(value)))
                     }
                     Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
                     Ok(ForIterOutcome::Blocked(reason)) => {
-                        vm.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(vm.suspend(reason, None))
+                        self.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(self.suspend(reason, None))
                     }
                     Err(error) => Err(error),
                 },
-                Opcode::AwaitResult => vm.dispatch_await_result(),
+                Opcode::AwaitResult => self.dispatch_await_result(),
                 Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
-                Opcode::Assert => vm.dispatch_assert(),
+                Opcode::Assert => self.dispatch_assert(),
                 Opcode::TryBegin(target) => {
-                    let depth = vm.stack.len();
-                    let exception_depth = vm.exception_stack.len();
-                    vm.handlers.push((target, depth, exception_depth));
+                    let depth = self.stack.len();
+                    let exception_depth = self.exception_stack.len();
+                    self.handlers.push((target, depth, exception_depth));
                     Ok(Flow::Next)
                 }
                 Opcode::TryEnd => {
-                    vm.pop_handler()
+                    self.pop_handler()
                         .ok_or("invalid bytecode exception handler")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
                     Ok(Flow::Next)
                 }
                 Opcode::MatchException { typed } => {
-                    let actual = vm
+                    let actual = self
                         .exception_stack
                         .last()
                         .ok_or("no active exception")
                         .map_err(|e| (e.to_string(), dispatch.span()))?
                         .clone();
                     let matches = if typed {
-                        let expected = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                        vm.exception_type_matches(expected, &actual)
+                        let expected = self.pop().map_err(|error| (error, dispatch.span()))?;
+                        self.exception_type_matches(expected, &actual)
                             .map_err(|error| (error, dispatch.span()))?
                     } else {
                         true
                     };
-                    vm.push(Value::Bool(matches));
+                    self.push(Value::Bool(matches));
                     Ok(Flow::Next)
                 }
                 Opcode::ClearException => {
-                    vm.exception_stack
+                    self.exception_stack
                         .pop()
                         .ok_or("no active exception")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
                     Ok(Flow::Next)
                 }
                 Opcode::Reraise => {
-                    let exception = vm
+                    let exception = self
                         .exception_stack
                         .last()
                         .cloned()
                         .ok_or("no active exception")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
-                    vm.pending_exception = Some(exception);
+                    self.pending_exception = Some(exception);
                     Err("exception raised".into())
                 }
-                Opcode::Raise(has_value) => vm.dispatch_raise(has_value),
-                Opcode::RaiseFrom => vm.dispatch_raise_from(),
-                Opcode::WithEnter => vm.dispatch_with_enter(),
-                Opcode::WithExit => vm.dispatch_with_exit(),
-                Opcode::WithExitException => vm.dispatch_with_exit_exception(),
-                Opcode::AsyncWithExitException => vm.dispatch_async_with_exit_exception(),
-                Opcode::AsyncWithFinishException => vm.dispatch_async_with_finish_exception(),
-                Opcode::PopExpression => vm.dispatch_pop_expression(),
-                Opcode::Halt => match vm.finish_called_frame(Ref::from_immediate(Value::None)) {
+                Opcode::Raise(has_value) => self.dispatch_raise(has_value),
+                Opcode::RaiseFrom => self.dispatch_raise_from(),
+                Opcode::WithEnter => self.dispatch_with_enter(),
+                Opcode::WithExit => self.dispatch_with_exit(),
+                Opcode::WithExitException => self.dispatch_with_exit_exception(),
+                Opcode::AsyncWithExitException => self.dispatch_async_with_exit_exception(),
+                Opcode::AsyncWithFinishException => self.dispatch_async_with_finish_exception(),
+                Opcode::PopExpression => self.dispatch_pop_expression(),
+                Opcode::Halt => match self.finish_called_frame(Ref::from_immediate(Value::None)) {
                     Ok(()) => Ok(Flow::Refresh),
                     Err(_) => Ok(Flow::Halt),
                 },
@@ -464,21 +512,21 @@ impl<'s> Vm<'s> {
                 Ok(Flow::Jump(target)) => dispatch.op_index = target,
                 Ok(Flow::Refresh) => {
                     let span = dispatch.span();
-                    dispatch.refresh(&mut vm).map_err(|error| (error, span))?;
+                    dispatch.refresh(self).map_err(|error| (error, span))?;
                 }
                 Ok(flow) => return Ok(flow),
                 Err(error) => {
-                    dispatch.sync(&mut vm);
-                    if vm.propagate_error(error, dispatch.span())? {
+                    dispatch.sync(self);
+                    if self.propagate_error(error, dispatch.span())? {
                         let span = dispatch.span();
-                        dispatch.refresh(&mut vm).map_err(|error| (error, span))?;
+                        dispatch.refresh(self).map_err(|error| (error, span))?;
                         continue 'execution;
                     }
                     unreachable!("propagate_error either enters a handler or returns an error")
                 }
             }
         }
-        dispatch.sync(&mut vm);
+        dispatch.sync(self);
         Ok(Flow::Pending)
     }
 

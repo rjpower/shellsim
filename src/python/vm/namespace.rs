@@ -72,6 +72,7 @@ impl<'s> Vm<'s> {
 
     /// The scope the active frame resolves free names through: its own scope, else the
     /// closure of the function it runs. `None` means the main program's global table.
+    #[inline(always)]
     pub(super) fn lookup_scope(&self) -> Option<Value<'s>> {
         self.handle_optional(
             self.bytecode_frames

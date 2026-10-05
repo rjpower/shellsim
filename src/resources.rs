@@ -125,6 +125,7 @@ impl Resources {
         self.stop_reason
     }
 
+    #[inline(always)]
     pub fn is_stopped(&self) -> bool {
         self.stop_reason.is_some()
     }

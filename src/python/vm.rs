@@ -844,6 +844,7 @@ impl CodeCacheTable {
 impl std::ops::Index<usize> for CodeCacheTable {
     type Output = CodeCaches;
 
+    #[inline(always)]
     fn index(&self, slot: usize) -> &CodeCaches {
         self.slots[slot].as_ref().expect("code cache slot is live")
     }
@@ -1246,7 +1247,25 @@ impl DispatchCursor {
             .bytecode_frames
             .last_mut()
             .expect("bytecode execution requires an active frame");
-        debug_assert!(Arc::ptr_eq(&self.code, &frame.code));
+        if !Arc::ptr_eq(&self.code, &frame.code) {
+            let frames = vm
+                .bytecode_frames
+                .iter()
+                .map(|f| {
+                    format!(
+                        "(code={:p} called={} ip={})",
+                        Arc::as_ptr(&f.code),
+                        f.called,
+                        f.instruction_pointer
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "SYNC MISMATCH op_index={} cursor_code={:p} frames={frames:?}",
+                self.op_index,
+                Arc::as_ptr(&self.code)
+            );
+        }
         frame.instruction_pointer = self.op_index;
     }
 }
@@ -2051,11 +2070,10 @@ impl<'s> Vm<'s> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
-        Ok(self
-            .execution
+        self.execution
             .stack
             .pop(&self.state.heap)
-            .expect("non-empty frame stack was checked"))
+            .ok_or_else(|| "invalid bytecode stack effect".into())
     }
 
     fn take(&mut self, count: usize) -> Result<Vec<Value<'s>>, String> {
