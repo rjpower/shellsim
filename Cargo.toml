@@ -65,6 +65,6 @@ wat = "1"
 opt-level = 1
 
 [profile.release]
-opt-level = "z"
+opt-level = "s"
 lto = "fat"
 codegen-units = 1
