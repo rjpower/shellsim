@@ -3,6 +3,7 @@
 use std::collections::BTreeSet;
 
 use super::super::attributes;
+use super::super::heap::InstanceAttributes;
 use super::super::heap::{ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget};
 use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
@@ -10,7 +11,7 @@ use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, ClassDefinition, ClassField,
     ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
-    LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
+    NameId, NativeValue, Object, PyError, PyRuntime, RaisedException, Resolved, SiteCache,
     SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
@@ -80,6 +81,16 @@ pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
             | BuiltinType::Float
             | BuiltinType::Complex
     )
+}
+
+/// A site cache hit: the attribute's value, or a method of the receiver's type, which
+/// `LoadMethod` pushes unbound and `LoadAttribute` binds to the receiver.
+enum SiteHit<'s> {
+    Value(Value<'s>),
+    Method {
+        descriptor: Value<'s>,
+        defining: Value<'s>,
+    },
 }
 
 impl<'s> Vm<'s> {
@@ -156,21 +167,30 @@ impl<'s> Vm<'s> {
         name: &str,
     ) -> Result<(), String> {
         let owner = self.pop()?;
-        if owner.is_object() {
-            if let Some(cache) = self.attribute_cache(code_cache, site) {
-                if let Some(value) =
-                    attributes::cached_attribute(self.heap(), owner, cache.type_id, cache.location)?
-                {
-                    self.push(value);
-                    return Ok(());
-                }
+        match self.site_hit(code_cache, site, owner)? {
+            Some(SiteHit::Value(value)) => {
+                self.push(value);
+                return Ok(());
             }
+            Some(SiteHit::Method {
+                descriptor,
+                defining,
+            }) => {
+                let bound = self.alloc_with(|b| Object::DescriptorBoundMethod {
+                    receiver: b.store(owner),
+                    descriptor: b.store(descriptor),
+                    owner: Some(b.store(defining)),
+                })?;
+                self.push(bound);
+                return Ok(());
+            }
+            None => {}
         }
         let Some(value) = self.resolve_attribute_by_symbol(owner, symbol, name)? else {
             return Err(self.missing_attribute(&owner, name));
         };
-        if let Some(cache) = self.cacheable_instance_attribute(owner, symbol, name)? {
-            self.remember_attribute_cache(code, code_cache, site, cache)?;
+        if let Some(cache) = self.cacheable_site(owner, symbol, name, Some(value))? {
+            self.remember_site(code, code_cache, site, cache)?;
         }
         self.push(value);
         Ok(())
@@ -190,46 +210,132 @@ impl<'s> Vm<'s> {
         name: &str,
     ) -> Result<(), String> {
         let owner = self.peek(0)?;
-        if let Some(method) = self.unbound_method(owner, symbol, name)? {
-            self.execution
-                .stack
-                .set(&self.state.heap, self.stack.len() - 1, method);
-            self.push(owner);
-            return Ok(());
+        let top = self.stack.len() - 1;
+        match self.site_hit(code_cache, site, owner)? {
+            Some(SiteHit::Method { descriptor, .. }) => {
+                self.execution.stack.set(&self.state.heap, top, descriptor);
+                self.push(owner);
+                return Ok(());
+            }
+            Some(SiteHit::Value(value)) => {
+                self.execution.stack.set(&self.state.heap, top, value);
+                self.push(Value::Native(NativeValue::NoReceiver));
+                return Ok(());
+            }
+            None => {}
+        }
+        if let Some(cache) = self.cacheable_site(owner, symbol, name, None)? {
+            if let Resolved::Method { descriptor, .. } = &cache.resolved {
+                let method = self.handle(descriptor);
+                self.remember_site(code, code_cache, site, cache)?;
+                self.execution.stack.set(&self.state.heap, top, method);
+                self.push(owner);
+                return Ok(());
+            }
         }
         self.load_attribute_at(code, code_cache, site, symbol, name)?;
         self.push(Value::Native(NativeValue::NoReceiver));
         Ok(())
     }
 
-    fn unbound_method(
+    /// What a site's cache gives for `owner`, when the cache is filled and the owner has the
+    /// type and shape it was filled for. One heap lookup checks the key and reads a slot.
+    fn site_hit(
+        &self,
+        code_cache: usize,
+        site: usize,
+        owner: Value<'s>,
+    ) -> Result<Option<SiteHit<'s>>, String> {
+        let Some(cache) = self.site(code_cache, site) else {
+            return Ok(None);
+        };
+        let heap = &self.state.heap;
+        let (type_id, attributes) = if owner.is_object() {
+            heap.typed_attributes(owner)?
+        } else {
+            (self.type_id(&owner)?, None)
+        };
+        let shape = match attributes {
+            None => None,
+            Some(InstanceAttributes::Shaped { shape, .. }) => Some(*shape),
+            Some(InstanceAttributes::Dictionary(_)) => return Ok(None),
+        };
+        if (type_id, shape) != (cache.type_id, cache.shape) {
+            return Ok(None);
+        }
+        Ok(match &cache.resolved {
+            Resolved::InstanceSlot(slot) => {
+                let Some(InstanceAttributes::Shaped { values, .. }) = attributes else {
+                    return Ok(None);
+                };
+                heap.handle_optional(values.get(*slot)).map(SiteHit::Value)
+            }
+            Resolved::ClassValue(value) => Some(SiteHit::Value(heap.handle(value))),
+            Resolved::Method { descriptor, owner } => Some(SiteHit::Method {
+                descriptor: heap.handle(descriptor),
+                defining: heap.handle(owner),
+            }),
+        })
+    }
+
+    /// How a lookup of `owner.name` would resolve at every later execution of the site, or
+    /// `None` when the lookup depends on more than the owner's type and shape. `value`, when
+    /// given, is what the full lookup just produced; a class attribute is cached only when
+    /// binding left it unchanged.
+    fn cacheable_site(
         &mut self,
         owner: Value<'s>,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<Option<Value<'s>>, String> {
+        value: Option<Value<'s>>,
+    ) -> Result<Option<SiteCache>, String> {
         // Only owners whose lookup is a plain walk of their type's MRO qualify: user instances
         // without an attribute hook, and builtin values. Classes, `super` proxies and native
         // module or type values resolve names their own way in `lookup_attribute`.
         if owner.native_value().is_some() || self.class_type_id(&owner)?.is_some() {
             return Ok(None);
         }
-        let type_id = self.type_id(&owner)?;
-        if owner.is_object() {
+        let (type_id, shape) = if owner.is_object() {
             if matches!(self.get(owner)?, Object::Class(_) | Object::Super { .. }) {
                 return Ok(None);
             }
-            if self.instance_class(owner)?.is_some()
-                && self
-                    .state
-                    .types
-                    .slot(type_id, Slot::GetAttribute)?
-                    .is_some()
-            {
+            let Some(key) = attributes::site_key(self.heap(), owner)? else {
                 return Ok(None);
-            }
+            };
+            key
+        } else {
+            (self.type_id(&owner)?, None)
+        };
+        let is_instance = owner.is_object() && self.instance_class(owner)?.is_some();
+        if is_instance
+            && self
+                .state
+                .types
+                .slot(type_id, Slot::GetAttribute)?
+                .is_some()
+        {
+            return Ok(None);
         }
-        let Some((_, descriptor)) = self.type_lookup(type_id, name)? else {
+        let type_entry = self.type_lookup(type_id, name)?;
+        if is_instance {
+            if let Some(location) = self.instance_attribute_slot_by_symbol(owner, symbol)? {
+                let shadowed = match &type_entry {
+                    Some((_, descriptor)) => self.is_data_descriptor(descriptor)?,
+                    None => false,
+                };
+                if shadowed {
+                    return Ok(None);
+                }
+                return Ok(Some(SiteCache {
+                    type_id,
+                    shape,
+                    resolved: Resolved::InstanceSlot(location.slot()),
+                }));
+            }
+        } else if owner.is_object() && self.attribute_by_symbol(owner, symbol)?.is_some() {
+            return Ok(None);
+        }
+        let Some((defining, descriptor)) = type_entry else {
             return Ok(None);
         };
         let is_method = match descriptor.native_value() {
@@ -237,51 +343,69 @@ impl<'s> Vm<'s> {
             Some(_) => false,
             None => descriptor.is_object() && matches!(self.get(descriptor)?, Object::Function(_)),
         };
-        if !is_method {
+        if is_method {
+            let owner_class = self.type_value(defining)?;
+            return Ok(Some(SiteCache {
+                type_id,
+                shape,
+                resolved: Resolved::Method {
+                    descriptor: self.store(descriptor),
+                    owner: self.store(owner_class),
+                },
+            }));
+        }
+        // A plain class attribute: binding returned the descriptor itself, and the descriptor
+        // is not a user instance, whose `__get__` could return itself by design.
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        if !self.identical(value, descriptor)
+            || (descriptor.is_object() && self.instance_class(descriptor)?.is_some())
+        {
             return Ok(None);
         }
-        // An instance attribute of the same name shadows a non-data descriptor.
-        if owner.is_object() && self.attribute_by_symbol(owner, symbol)?.is_some() {
-            return Ok(None);
-        }
-        Ok(Some(descriptor))
+        Ok(Some(SiteCache {
+            type_id,
+            shape,
+            resolved: Resolved::ClassValue(self.store(value)),
+        }))
     }
 
-    fn attribute_cache(&self, code_cache: usize, site: usize) -> Option<&LoadAttributeCache> {
+    fn site(&self, code_cache: usize, site: usize) -> Option<&SiteCache> {
         self.execution
             .code_caches
             .get(code_cache)?
-            .attributes
+            .sites
             .as_ref()?
             .get(site)?
             .as_ref()
     }
 
-    fn remember_attribute_cache(
+    fn remember_site(
         &mut self,
         code: &CodeRef,
         code_cache: usize,
         site: usize,
-        cache: LoadAttributeCache,
+        cache: SiteCache,
     ) -> Result<(), String> {
-        if let Some(attributes) = &mut self.execution.code_caches[code_cache].attributes {
-            attributes[site] = Some(cache);
+        if let Some(sites) = &mut self.execution.code_caches[code_cache].sites {
+            sites[site] = Some(cache);
             return Ok(());
         }
         let bytes = code
             .instructions
             .len()
-            .checked_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
-            .ok_or("attribute cache size overflow")?;
+            .checked_mul(std::mem::size_of::<Option<SiteCache>>())
+            .ok_or("site cache size overflow")?;
         if u64::try_from(bytes).unwrap_or(u64::MAX) > self.interp.resources.memory_remaining() {
             return Ok(());
         }
         self.reserve_retained_memory(bytes)?;
-        let mut attributes: Vec<Option<LoadAttributeCache>> = std::iter::repeat_with(|| None)
+        let mut sites: Vec<Option<SiteCache>> = std::iter::repeat_with(|| None)
             .take(code.instructions.len())
             .collect();
-        attributes[site] = Some(cache);
-        self.execution.code_caches[code_cache].attributes = Some(attributes);
+        sites[site] = Some(cache);
+        self.execution.code_caches[code_cache].sites = Some(sites);
         Ok(())
     }
 
@@ -324,7 +448,7 @@ impl<'s> Vm<'s> {
         let caches = CodeCaches {
             code: code.clone(),
             names: vec![None; code.name_count()],
-            attributes: None,
+            sites: None,
         };
         let mut released = 0usize;
         let slot = self
@@ -335,29 +459,6 @@ impl<'s> Vm<'s> {
             self.release_retained_memory_bytes(released);
         }
         Ok(slot)
-    }
-
-    fn cacheable_instance_attribute(
-        &mut self,
-        owner: Value<'s>,
-        symbol: SymbolId,
-        name: &str,
-    ) -> Result<Option<LoadAttributeCache>, String> {
-        if self.instance_class(owner)?.is_none() {
-            return Ok(None);
-        }
-        let class_type = self.type_id(&owner)?;
-        if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
-            if self.is_data_descriptor(&descriptor)? {
-                return Ok(None);
-            }
-        }
-        Ok(self
-            .instance_attribute_slot_by_symbol(owner, symbol)?
-            .map(|location| LoadAttributeCache {
-                type_id: class_type,
-                location,
-            }))
     }
 
     /// Resolve one attribute without involving the operand stack.
@@ -1304,7 +1405,7 @@ impl<'s> Vm<'s> {
                 .replace_slots(type_id, &class_object.attributes)?;
         }
         for cache in self.execution.code_caches.iter_mut() {
-            cache.attributes = None;
+            cache.sites = None;
         }
         Ok(())
     }
@@ -3163,12 +3264,16 @@ impl<'s> Vm<'s> {
             keyword_names.push(Some(std::sync::Arc::from(name)));
             self.push(value);
         }
-        self.call(
-            positional,
-            &keyword_names,
-            &vec![false; total],
-            CallMode::Immediate,
-        )
+        // Nothing here is starred; short calls borrow a constant flag slice.
+        const PLAIN: [bool; 8] = [false; 8];
+        let starred;
+        let plain: &[bool] = if total <= PLAIN.len() {
+            &PLAIN[..total]
+        } else {
+            starred = vec![false; total];
+            &starred
+        };
+        self.call(positional, &keyword_names, plain, CallMode::Immediate)
     }
 
     pub(super) fn invoke_slot(

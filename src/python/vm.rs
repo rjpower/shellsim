@@ -15,7 +15,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::attributes::InstanceAttributeSlot;
+use super::attributes::ShapeId;
 use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
 use super::cpython_names;
 use super::definitions::DefinitionTable;
@@ -749,6 +749,9 @@ impl Roots for VmState {
                 visitor(slot);
             }
         }
+        for caches in self.code_caches.iter_mut() {
+            caches.visit_refs(visitor);
+        }
         if let Some(suspension) = &mut self.suspension {
             match &mut suspension.retry {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
@@ -771,7 +774,23 @@ impl Roots for VmState {
 struct CodeCaches {
     code: CodeRef,
     names: Vec<Option<SymbolId>>,
-    attributes: Option<Vec<Option<LoadAttributeCache>>>,
+    /// One entry per instruction, filled for `LoadAttribute` and `LoadMethod` sites.
+    sites: Option<Vec<Option<SiteCache>>>,
+}
+
+impl CodeCaches {
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        for site in self.sites.iter_mut().flatten().flatten() {
+            match &mut site.resolved {
+                Resolved::InstanceSlot(_) => {}
+                Resolved::ClassValue(value) => visitor(value),
+                Resolved::Method { descriptor, owner } => {
+                    visitor(descriptor);
+                    visitor(owner);
+                }
+            }
+        }
+    }
 }
 
 /// Per-code inline caches in stable slots.
@@ -862,13 +881,13 @@ fn code_cache_bytes(caches: &CodeCaches) -> usize {
         .names
         .len()
         .saturating_mul(std::mem::size_of::<Option<SymbolId>>());
-    let attributes = caches.attributes.as_ref().map_or(0, |attributes| {
-        attributes
+    let sites = caches.sites.as_ref().map_or(0, |sites| {
+        sites
             .len()
-            .saturating_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
+            .saturating_mul(std::mem::size_of::<Option<SiteCache>>())
     });
     names
-        .saturating_add(attributes)
+        .saturating_add(sites)
         .saturating_add(std::mem::size_of::<CodeCaches>())
 }
 
@@ -877,13 +896,21 @@ impl Clone for CodeCaches {
         Self {
             code: self.code.clone(),
             names: self.names.clone(),
-            attributes: self.attributes.as_ref().map(|caches| {
-                caches
+            sites: self.sites.as_ref().map(|sites| {
+                sites
                     .iter()
-                    .map(|cache| {
-                        cache.as_ref().map(|cache| LoadAttributeCache {
-                            type_id: cache.type_id,
-                            location: cache.location,
+                    .map(|site| {
+                        site.as_ref().map(|site| SiteCache {
+                            type_id: site.type_id,
+                            shape: site.shape,
+                            resolved: match &site.resolved {
+                                Resolved::InstanceSlot(slot) => Resolved::InstanceSlot(*slot),
+                                Resolved::ClassValue(value) => Resolved::ClassValue(value.dup()),
+                                Resolved::Method { descriptor, owner } => Resolved::Method {
+                                    descriptor: descriptor.dup(),
+                                    owner: owner.dup(),
+                                },
+                            },
                         })
                     })
                     .collect()
@@ -892,11 +919,27 @@ impl Clone for CodeCaches {
     }
 }
 
-/// One `LoadAttribute` site's last shaped lookup: valid while the receiver has this class and
-/// shape.
-struct LoadAttributeCache {
+/// One name-keyed site's last lookup, valid while the receiver has the same type and the same
+/// instance-attribute shape, which is what decides every plain attribute lookup: a shaped
+/// slot, a class attribute no instance attribute shadows, or a method of the type. Every
+/// class attribute store clears the sites of every code object, so a hit needs no version
+/// check.
+struct SiteCache {
     type_id: TypeId,
-    location: InstanceAttributeSlot,
+    /// The receiver's instance-attribute shape; `None` for a value without instance attributes.
+    shape: Option<ShapeId>,
+    resolved: Resolved,
+}
+
+/// What a site resolved to.
+enum Resolved {
+    /// The attribute lives in this shaped slot of the receiver.
+    InstanceSlot(usize),
+    /// A class attribute that binding leaves as it is, such as a constant or a nested class.
+    ClassValue(Ref),
+    /// A plain function or native method of the receiver's type: `LoadMethod` pushes it with
+    /// the receiver, `LoadAttribute` binds it to the receiver with `owner`, the defining class.
+    Method { descriptor: Ref, owner: Ref },
 }
 
 /// An executing code object's activation record: everything the frame owns is either in

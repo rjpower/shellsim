@@ -250,26 +250,25 @@ impl Shapes {
     }
 }
 
-/// Read a shaped attribute through an inline cache: the value when `instance` still has type
-/// `type_id` and shape `location.shape`, otherwise `None` so the caller falls back to a full
-/// lookup.
-pub fn cached_attribute<'s>(
+impl InstanceAttributeSlot {
+    pub fn slot(self) -> usize {
+        self.slot
+    }
+}
+
+/// What an inline cache keys a heap object's attribute lookups on: its type and the shape of
+/// its instance attributes, `None` when it has none. An object whose attributes live in a
+/// dictionary has no key, so no site caches it.
+pub fn site_key(
     heap: &Heap,
     instance: Value<'_>,
-    type_id: TypeId,
-    location: InstanceAttributeSlot,
-) -> Result<Option<Value<'s>>, String> {
-    let (actual_type, attributes) = heap.typed_attributes(instance)?;
-    if actual_type != type_id {
-        return Ok(None);
-    }
-    let Some(InstanceAttributes::Shaped { shape, values }) = attributes else {
-        return Ok(None);
-    };
-    if *shape != location.shape {
-        return Ok(None);
-    }
-    Ok(heap.handle_optional(values.get(location.slot)))
+) -> Result<Option<(TypeId, Option<ShapeId>)>, String> {
+    let (type_id, attributes) = heap.typed_attributes(instance)?;
+    Ok(match attributes {
+        None => Some((type_id, None)),
+        Some(InstanceAttributes::Shaped { shape, .. }) => Some((type_id, Some(*shape))),
+        Some(InstanceAttributes::Dictionary(_)) => None,
+    })
 }
 
 /// Everything an attribute write needs: the heap and its roots for growth, the shape tables,
