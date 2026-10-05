@@ -207,7 +207,12 @@ impl Default for TypeSlots {
 /// A cached Python descriptor or a native implementation attached directly to a builtin type.
 #[derive(Debug)]
 pub enum SlotValue {
-    Descriptor(Ref),
+    /// A descriptor from a user class's namespace, with the type that defines it so a
+    /// dispatch can bind it without searching the MRO again.
+    Descriptor {
+        value: Ref,
+        owner: TypeId,
+    },
     NativeMethod(&'static MethodDef),
     /// The VM's representation renderer, which shares cycle tracking across nested values.
     VmRepr,
@@ -462,13 +467,19 @@ pub(super) const SLOT_DEFS: [(Slot, &str, u8); SLOT_COUNT] = [
 ];
 
 impl TypeSlots {
-    fn from_attributes(attributes: &HashMap<String, Ref>) -> Self {
+    fn from_attributes(owner: TypeId, attributes: &HashMap<String, Ref>) -> Self {
         let mut slots = Self::default();
         for (slot, name, _) in SLOT_DEFS {
             if let Some(value) = attributes.get(name) {
                 // The slot table lives in the registry root alongside the attributes, so the
                 // duplicate reference is traced and rewritten with them.
-                slots.set(slot, SlotValue::Descriptor(value.dup()));
+                slots.set(
+                    slot,
+                    SlotValue::Descriptor {
+                        value: value.dup(),
+                        owner,
+                    },
+                );
             }
         }
         slots
@@ -489,7 +500,7 @@ impl TypeSlots {
     /// Every cached descriptor reference, for the registry's root set.
     fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
         for entry in &mut self.0 {
-            if let Some(SlotValue::Descriptor(value)) = entry {
+            if let Some(SlotValue::Descriptor { value, .. }) = entry {
                 visitor(value);
             }
         }
@@ -506,7 +517,10 @@ impl Clone for TypeSlots {
 impl Clone for SlotValue {
     fn clone(&self) -> Self {
         match self {
-            Self::Descriptor(value) => Self::Descriptor(value.dup()),
+            Self::Descriptor { value, owner } => Self::Descriptor {
+                value: value.dup(),
+                owner: *owner,
+            },
             Self::NativeMethod(method) => Self::NativeMethod(method),
             Self::VmRepr => Self::VmRepr,
             Self::VmHash => Self::VmHash,
@@ -967,7 +981,7 @@ impl TypeRegistry {
         attributes: &HashMap<String, Ref>,
     ) -> Result<TypeId, String> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
-        let local_slots = TypeSlots::from_attributes(attributes);
+        let local_slots = TypeSlots::from_attributes(TypeId(index), attributes);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
         let ty = PyType {
             name,
@@ -1024,7 +1038,7 @@ impl TypeRegistry {
         attributes: &HashMap<String, Ref>,
     ) -> Result<(), String> {
         let mro = self.get(id)?.mro.clone();
-        let local_slots = TypeSlots::from_attributes(attributes);
+        let local_slots = TypeSlots::from_attributes(id, attributes);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
         let ty = self
             .types

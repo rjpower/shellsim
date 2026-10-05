@@ -267,7 +267,7 @@ impl<'s> Vm<'s> {
         }
         Ok(matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Next)?,
-            Some(slot) if !matches!(&slot, SlotValue::Descriptor(descriptor) if descriptor.is_none())
+            Some(slot) if !matches!(&slot, SlotValue::Descriptor { value, .. } if value.is_none())
         ))
     }
 
@@ -284,7 +284,9 @@ impl<'s> Vm<'s> {
     ) -> Result<Option<Value<'s>>, String> {
         match self.state.types.slot(self.type_id(iterable)?, Slot::Iter)? {
             None => return Ok(None),
-            Some(SlotValue::Descriptor(descriptor)) if descriptor.is_none() => {
+            Some(SlotValue::Descriptor {
+                value: descriptor, ..
+            }) if descriptor.is_none() => {
                 return Err(self.raise_object_type_error(iterable, "is not iterable"));
             }
             Some(_) => {}

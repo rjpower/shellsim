@@ -1662,7 +1662,7 @@ impl<'s> Vm<'s> {
         if self.instance_class(*value)?.is_some() {
             return Ok(matches!(
                 self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-                Some(SlotValue::Descriptor(descriptor)) if !descriptor.is_none()
+                Some(SlotValue::Descriptor { value: descriptor, .. }) if !descriptor.is_none()
             ));
         }
         if matches!(
@@ -1688,7 +1688,7 @@ impl<'s> Vm<'s> {
         }
         Ok(matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-            Some(slot) if !matches!(&slot, SlotValue::Descriptor(descriptor) if descriptor.is_none())
+            Some(slot) if !matches!(&slot, SlotValue::Descriptor { value, .. } if value.is_none())
         ))
     }
 

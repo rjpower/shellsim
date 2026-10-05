@@ -3198,10 +3198,28 @@ impl<'s> Vm<'s> {
                 let receiver = *receiver;
                 return call(self, receiver).map_err(|error| self.record_native_error(error));
             }
-            SlotValue::Descriptor(descriptor) => self.handle(&descriptor),
+            SlotValue::Descriptor { value, owner } => (self.handle(&value), owner),
         };
         if !receiver.is_object() {
             return Ok(None);
+        }
+        let (descriptor, owner) = slot_descriptor;
+        // A plain function is called with the receiver prepended, which is what binding it
+        // and calling the bound method would do, without the bound method.
+        if descriptor.is_object() && matches!(self.get(descriptor)?, Object::Function(_)) {
+            let positional = arguments.len().saturating_add(1);
+            self.push(descriptor);
+            self.push(*receiver);
+            for argument in arguments {
+                self.push(argument);
+            }
+            let result = self.call(
+                positional,
+                &[],
+                &vec![false; positional],
+                CallMode::Immediate,
+            );
+            return self.immediate_call_value(result, method_name).map(Some);
         }
         let class = match (self.instance_class(*receiver)?, self.get(*receiver)?) {
             (Some(class), _) => class,
@@ -3210,12 +3228,25 @@ impl<'s> Vm<'s> {
             }
             _ => return Ok(None),
         };
-        let (defining_class, _) = self
-            .class_attribute_entry(class, method_name)?
-            .ok_or("cached type slot has no descriptor")?;
-        let callable =
-            self.bind_descriptor(slot_descriptor, Some(*receiver), class, defining_class)?;
+        let defining_class = self.type_value(owner)?;
+        let callable = self.bind_descriptor(descriptor, Some(*receiver), class, defining_class)?;
         self.invoke_value(callable, arguments).map(Some)
+    }
+
+    /// The value of an immediate call, which cannot suspend or leave a frame behind.
+    fn immediate_call_value(
+        &mut self,
+        result: Result<CallResult<'s>, String>,
+        what: &str,
+    ) -> Result<Value<'s>, String> {
+        match result? {
+            CallResult::Value(value) => Ok(value),
+            CallResult::Exit(status) => Err(format!("{what} exited with status {status}")),
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
     }
 
     /// Execute the defining type's native slot for an explicit dunder call. The receiver check
@@ -3286,7 +3317,7 @@ impl<'s> Vm<'s> {
                 let second = arguments[1];
                 call(self, receiver, first, second)
             }
-            SlotValue::Descriptor(_) => return Err("slot wrapper is not native".into()),
+            SlotValue::Descriptor { .. } => return Err("slot wrapper is not native".into()),
         };
         result
             .map(|result| result.unwrap_or(Value::Native(NativeValue::NotImplemented)))
