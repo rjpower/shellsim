@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 
-use super::heap::{self, Ref};
+use super::heap::{self, Heap, Object, Ref};
 use super::native::{
     BinarySlotFn, CompareSlotFn, MethodDef, PyError, PyResult, PyRuntime, TernarySlotFn,
     UnarySlotFn,
@@ -533,6 +533,7 @@ fn dup_attributes(attributes: &HashMap<String, Ref>) -> HashMap<String, Ref> {
 #[derive(Debug)]
 pub struct PyType {
     pub name: String,
+    pub kind: TypeKind,
     pub bases: Vec<TypeId>,
     pub mro: Vec<TypeId>,
     pub attributes: HashMap<String, Ref>,
@@ -546,6 +547,7 @@ impl Clone for PyType {
     fn clone(&self) -> Self {
         Self {
             name: self.name.clone(),
+            kind: self.kind,
             bases: self.bases.clone(),
             mro: self.mro.clone(),
             attributes: dup_attributes(&self.attributes),
@@ -554,6 +556,20 @@ impl Clone for PyType {
             value: self.value.as_ref().map(Ref::dup),
         }
     }
+}
+
+/// How a type came to be registered, which decides what its instances are made of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TypeKind {
+    /// A builtin type or builtin exception type, whose instances are payloads with no attribute
+    /// storage.
+    Builtin,
+    /// A native value kind, whose instances are immediates or wide values.
+    ValueKind,
+    /// A class created by a class statement or `type()`. Its instances are heap objects whose
+    /// header names the class and may carry attributes; their payload is the layout the class
+    /// inherits, [`Object::Bare`](super::heap::Object::Bare) for a plain class.
+    Class,
 }
 
 /// Per-runtime registry containing all semantic Python types.
@@ -615,6 +631,7 @@ impl Default for TypeRegistry {
             let (bases, mro) = builtin_metadata(builtin);
             types.push(PyType {
                 name: builtin.name().into(),
+                kind: TypeKind::Builtin,
                 bases,
                 mro,
                 attributes: HashMap::new(),
@@ -837,6 +854,7 @@ impl TypeRegistry {
             )));
             let mut ty = PyType {
                 name: definition.name.into(),
+                kind: TypeKind::Builtin,
                 bases,
                 mro: mro.clone(),
                 attributes: HashMap::new(),
@@ -877,6 +895,34 @@ impl TypeRegistry {
             .ok_or_else(|| "type construction is incomplete".into())
     }
 
+    /// The class object of `value` when `value` is an instance of a user class, whatever payload
+    /// the class's layout gave it. Class objects and enum members resolve through their own
+    /// paths and return `None` here, as do builtin values.
+    pub fn instance_class<'s>(
+        &self,
+        heap: &Heap,
+        value: Value<'_>,
+    ) -> Result<Option<Value<'s>>, String> {
+        if !value.is_object() {
+            return Ok(None);
+        }
+        let ty = self.get(heap.type_id(value)?)?;
+        if ty.kind != TypeKind::Class {
+            return Ok(None);
+        }
+        if matches!(
+            heap.get(value)?,
+            Object::Class(_) | Object::EnumMember { .. }
+        ) {
+            return Ok(None);
+        }
+        let class = ty
+            .value
+            .as_ref()
+            .ok_or("instance of a class whose construction is incomplete")?;
+        Ok(Some(heap.handle(class)))
+    }
+
     pub fn register(
         &mut self,
         name: String,
@@ -889,6 +935,7 @@ impl TypeRegistry {
         let slots = self.inherit_slots(local_slots.clone(), &mro);
         let ty = PyType {
             name,
+            kind: TypeKind::Class,
             bases,
             mro,
             attributes: HashMap::new(),
@@ -1056,6 +1103,7 @@ impl TypeRegistry {
         }
         let mut ty = PyType {
             name: kind.name.into(),
+            kind: TypeKind::ValueKind,
             bases,
             mro,
             attributes: HashMap::new(),

@@ -20,8 +20,8 @@ use crate::resources::Resources;
 use super::value::Raw;
 use super::{
     ArgumentParserObject, ArrayStorage, ClassObject, FunctionObject, GeneratorObject, Heap,
-    HeapObject, InstanceAttributes, InstancePayload, NamespaceTarget, Object, ObjectId,
-    ProxyTarget, Ref, ScopeObject,
+    HeapObject, InstanceAttributes, NamespaceTarget, Object, ObjectId, ProxyTarget, Ref,
+    ScopeObject,
 };
 
 /// Stored references held outside the heap, which the collector must trace and may rewrite.
@@ -66,7 +66,22 @@ pub(super) fn major_floor(memory_limit: u64) -> u64 {
     (memory_limit / 8).clamp(1024 * 1024, 32 * 1024 * 1024)
 }
 
-/// Visit every reference stored in `object`.
+/// Visit every reference stored in `object`: its instance attributes, then its payload.
+pub(super) fn for_each_object_ref(object: &mut HeapObject, f: &mut dyn FnMut(&mut Raw)) {
+    if let Some(attributes) = &mut object.attributes {
+        match &mut **attributes {
+            InstanceAttributes::Shaped { values, .. } => slots(values, f),
+            InstanceAttributes::Dictionary(values) => {
+                for slot in values.values_mut() {
+                    f(&mut slot.0);
+                }
+            }
+        }
+    }
+    for_each_ref(&mut object.payload, f);
+}
+
+/// Visit every reference stored in a payload.
 pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
     match object {
         Object::List(items)
@@ -120,24 +135,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
                 optional(slot, f);
             }
             slots(enum_members, f);
-        }
-        Object::Instance {
-            class,
-            payload,
-            attributes,
-        } => {
-            f(&mut class.0);
-            if let InstancePayload::Builtin(value) = payload {
-                f(&mut value.0);
-            }
-            match attributes {
-                InstanceAttributes::Shaped { values, .. } => slots(values, f),
-                InstanceAttributes::Dictionary(values) => {
-                    for slot in values.values_mut() {
-                        f(&mut slot.0);
-                    }
-                }
-            }
         }
         Object::EnumMember { class, value, .. } => {
             optional(class, f);
@@ -253,6 +250,7 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         | Object::ArrayStorage(ArrayStorage::Bytes(_))
         | Object::WideValue { .. }
         | Object::BigInt(_)
+        | Object::Float(_)
         | Object::Complex { .. }
         | Object::Range { .. }
         | Object::RangeIterator { .. }
@@ -394,7 +392,7 @@ impl Heap {
         if clear_dirty {
             object.set_dirty(false);
         }
-        for_each_ref(&mut object.payload, &mut |raw| self.forward(raw, promotion));
+        for_each_object_ref(&mut object, &mut |raw| self.forward(raw, promotion));
         self.old[index] = Some(object);
     }
 
@@ -433,7 +431,7 @@ impl Heap {
             let Some(mut object) = self.old.get_mut(index).and_then(Option::take) else {
                 return Err("invalid object reference during collection".into());
             };
-            for_each_ref(&mut object.payload, &mut |raw| push(raw, &mut work));
+            for_each_object_ref(&mut object, &mut |raw| push(raw, &mut work));
             self.old[index] = Some(object);
         }
 
@@ -476,6 +474,10 @@ impl HeapObject {
             type_id: self.type_id,
             flags: self.flags.clone(),
             payload: super::snapshot::dup_object(&self.payload),
+            attributes: self
+                .attributes
+                .as_deref()
+                .map(|attributes| Box::new(super::snapshot::dup_attributes(attributes))),
             modeled_bytes: self.modeled_bytes,
         }
     }

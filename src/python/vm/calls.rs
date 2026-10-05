@@ -1,7 +1,7 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
 use super::super::ast::{Program, Statement, StatementKind};
-use super::super::heap::{GeneratorObject, InstanceAttributes, InstancePayload};
+use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
     expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
@@ -106,13 +106,9 @@ impl<'s> Vm<'s> {
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
     /// sorted, or `None` when the class defines none.
     fn custom_dir(&mut self, value: &Value<'s>) -> Result<Option<Value<'s>>, String> {
-        if !value.is_object() {
-            return Ok(None);
-        }
-        let Object::Instance { class, .. } = self.get(*value)? else {
+        let Some(class) = self.instance_class(*value)? else {
             return Ok(None);
         };
-        let class = self.handle(class);
         if self.class_attribute(class, "__dir__")?.is_none() {
             return Ok(None);
         }
@@ -146,6 +142,18 @@ impl<'s> Vm<'s> {
         if !value.is_object() {
             return self.type_attribute_names(value);
         }
+        if let Some(class) = self.instance_class(*value)? {
+            let mut names = self.instance_attribute_names(*value)?;
+            if let Object::Class(class_object) = self.get(class)? {
+                names.extend(class_object.attributes.keys().cloned());
+                for ancestor in &class_object.mro {
+                    if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
+                        names.extend(ancestor.attributes.keys().cloned());
+                    }
+                }
+            }
+            return Ok(names);
+        }
         match self.get(*value)? {
             Object::Module { scope, .. } => {
                 let namespace = self.module_namespace(self.handle(scope))?;
@@ -160,18 +168,6 @@ impl<'s> Vm<'s> {
                 for ancestor in &class_object.mro {
                     if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
                         names.extend(ancestor.attributes.keys().cloned());
-                    }
-                }
-                Ok(names)
-            }
-            Object::Instance { class, .. } => {
-                let mut names = self.instance_attribute_names(*value)?;
-                if let Object::Class(class_object) = self.get(self.handle(class))? {
-                    names.extend(class_object.attributes.keys().cloned());
-                    for ancestor in &class_object.mro {
-                        if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
-                            names.extend(ancestor.attributes.keys().cloned());
-                        }
                     }
                 }
                 Ok(names)
@@ -302,9 +298,11 @@ impl<'s> Vm<'s> {
                     owner: self.handle_optional(owner.as_ref()),
                 },
                 Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.handle(origin)),
-                Object::Instance { class, .. } => Callee::Instance(self.handle(class)),
                 Object::Class(_) => Callee::Class,
-                _ => Callee::Other,
+                _ => match self.instance_class(function)? {
+                    Some(class) => Callee::Instance(class),
+                    None => Callee::Other,
+                },
             };
             return match callee {
                 Callee::Function => {
@@ -1502,14 +1500,14 @@ impl<'s> Vm<'s> {
                 return Ok(CallResult::Value(created));
             }
         };
-        let instance = self.alloc_with(|builder| Object::Instance {
-            class: builder.store(class),
-            payload: match builtin_payload {
-                Some(value) => InstancePayload::Builtin(builder.store(value)),
-                None => InstancePayload::Object,
-            },
-            attributes: InstanceAttributes::default(),
-        })?;
+        let instance_type = self
+            .class_type_id(&class)?
+            .ok_or("class has no registered type")?;
+        let payload = match builtin_payload {
+            Some(value) => self.state.heap.copy_builtin_payload(value)?,
+            None => Object::Bare,
+        };
+        let instance = self.allocate_typed(instance_type, payload)?;
         if exception_base.is_some() {
             let exception_args =
                 self.alloc_with(|builder| Object::Tuple(builder.refs(arguments.iter().copied())))?;
@@ -2017,11 +2015,11 @@ impl<'s> Vm<'s> {
         let Some(class) = subclass else {
             return Ok(value);
         };
-        self.alloc_with(|builder| Object::Instance {
-            class: builder.store(class),
-            payload: InstancePayload::Builtin(builder.store(value)),
-            attributes: InstanceAttributes::default(),
-        })
+        let instance_type = self
+            .class_type_id(&class)?
+            .ok_or("builtin subclass has no registered type")?;
+        let payload = self.state.heap.copy_builtin_payload(value)?;
+        self.allocate_typed(instance_type, payload)
     }
 
     /// `object.__new__(class)`: a new instance of `class` with no attributes set.
@@ -2092,11 +2090,10 @@ impl<'s> Vm<'s> {
                 );
             }
         }
-        self.alloc_with(|builder| Object::Instance {
-            class: builder.store(class),
-            payload: InstancePayload::Object,
-            attributes: InstanceAttributes::default(),
-        })
+        let instance_type = self
+            .class_type_id(&class)?
+            .ok_or("class has no registered type")?;
+        self.allocate_typed(instance_type, Object::Bare)
     }
 
     pub(super) fn iterator_next(

@@ -132,6 +132,15 @@ impl<'s> Vm<'s> {
         self.with_heap(|heap, roots, resources| heap.alloc(object, roots, resources))
     }
 
+    /// Allocate `object` as an instance of the user class registered as `type_id`.
+    pub(super) fn allocate_typed(
+        &mut self,
+        type_id: TypeId,
+        object: Object,
+    ) -> Result<Value<'s>, String> {
+        self.with_heap(|heap, roots, resources| heap.alloc_typed(type_id, object, roots, resources))
+    }
+
     /// Allocate an object, turning handles into stored references with the builder.
     pub(super) fn alloc_with(
         &mut self,

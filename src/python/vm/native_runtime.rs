@@ -548,8 +548,18 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 PyKind::Native
             });
         }
+        if self
+            .instance_class(*value)
+            .map_err(PyError::runtime_error)?
+            .is_some()
+        {
+            if let Object::Bare = self.get(*value).map_err(PyError::runtime_error)? {
+                return Ok(PyKind::Instance);
+            }
+        }
         Ok(match self.get(*value).map_err(PyError::runtime_error)? {
             Object::Bare => PyKind::Native,
+            Object::Float(_) => PyKind::Float,
             Object::String(_) => PyKind::String,
             Object::Bytes(_) => PyKind::Bytes,
             Object::ByteArray(_) => PyKind::ByteArray,
@@ -564,7 +574,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::Range { .. } => PyKind::Native,
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => PyKind::Function,
             Object::Class { .. } => PyKind::Class,
-            Object::Instance { .. } | Object::EnumMember { .. } => PyKind::Instance,
+            Object::EnumMember { .. } => PyKind::Instance,
             Object::GenericAlias { .. } => PyKind::Native,
             Object::Iterator { .. }
             | Object::SequenceIterator { .. }
@@ -745,6 +755,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn repr(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
         self.repr_value(value)
+            .map_err(|error| self.raised_or_runtime_error(error))
+    }
+
+    fn payload_repr(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
+        self.repr_payload(value, &mut std::collections::BTreeSet::new())
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
@@ -1560,10 +1575,6 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn builtin_payload(&self, value: &Value<'s>) -> PyResult<'s, Option<Value<'s>>> {
-        protocol::builtin_payload(&self.state.heap, *value).map_err(PyError::runtime_error)
-    }
-
     fn new_builtin_instance(
         &mut self,
         builtin: BuiltinType,
@@ -1772,33 +1783,33 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 .is_some_and(|kind| kind.call.is_some())
             {
                 true
-            } else if value.is_object() {
-                match self.get(*value).map_err(PyError::runtime_error)? {
-                    Object::Function { .. }
-                    | Object::Class { .. }
-                    | Object::DescriptorBoundMethod { .. } => true,
-                    // An instance is callable when its class or an ancestor defines `__call__`.
-                    Object::Instance { class, .. } => {
-                        let heap = &self.state.heap;
-                        let defines_call = |class: &heap::Ref| {
-                            matches!(
-                                heap.get(heap.handle(class)),
-                                Ok(Object::Class(class_object))
-                                    if class_object.attributes.contains_key("__call__")
-                            )
-                        };
-                        match heap
-                            .get(heap.handle(class))
-                            .map_err(PyError::runtime_error)?
-                        {
-                            Object::Class(class_object) => {
-                                defines_call(class) || class_object.mro.iter().any(defines_call)
-                            }
-                            _ => false,
-                        }
+            } else if let Some(class) = self
+                .instance_class(*value)
+                .map_err(PyError::runtime_error)?
+            {
+                // An instance is callable when its class or an ancestor defines `__call__`.
+                let heap = &self.state.heap;
+                let defines_call = |class: &heap::Ref| {
+                    matches!(
+                        heap.get(heap.handle(class)),
+                        Ok(Object::Class(class_object))
+                            if class_object.attributes.contains_key("__call__")
+                    )
+                };
+                match heap.get(class).map_err(PyError::runtime_error)? {
+                    Object::Class(class_object) => {
+                        defines_call(&heap.store(class))
+                            || class_object.mro.iter().any(defines_call)
                     }
                     _ => false,
                 }
+            } else if value.is_object() {
+                matches!(
+                    self.get(*value).map_err(PyError::runtime_error)?,
+                    Object::Function { .. }
+                        | Object::Class { .. }
+                        | Object::DescriptorBoundMethod { .. }
+                )
             } else {
                 false
             },
@@ -1811,6 +1822,17 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn is_unbounded_iterator(&self, value: &Value<'s>) -> PyResult<'s, bool> {
         Vm::is_unbounded_iterator(self, value).map_err(PyError::runtime_error)
+    }
+
+    fn payload_iterator(&mut self, value: Value<'s>) -> PyResult<'s, Option<Value<'s>>> {
+        Vm::payload_iterator(self, value).map_err(PyError::runtime_error)
+    }
+
+    fn is_user_instance(&self, value: &Value<'s>) -> PyResult<'s, bool> {
+        Ok(self
+            .instance_class(*value)
+            .map_err(PyError::runtime_error)?
+            .is_some())
     }
 
     fn iterator(&mut self, value: Value<'s>) -> PyResult<'s, PyIterator<'s>> {

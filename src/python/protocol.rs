@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
-use super::heap::{Heap, InstancePayload, NamespaceTarget, Object, Ref};
+use super::heap::{Heap, NamespaceTarget, Object, Ref};
 use super::scopes;
 pub use super::string::{string_ref, string_value};
 use super::{ReplState, Value};
@@ -180,10 +180,6 @@ pub fn bytes_ref<'heap>(
 ) -> Result<Option<&'heap [u8]>, String> {
     Ok(match object(heap, value)? {
         Some(Object::Bytes(value) | Object::ByteArray(value)) => Some(value),
-        Some(Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        }) => return bytes_ref(heap, heap.handle(value)),
         _ => None,
     })
 }
@@ -268,18 +264,6 @@ fn exception_message(
     }
 }
 
-/// The builtin value behind an instance of a subclass of a builtin type such as `int` or
-/// `tuple`, which builtin operations the class does not override act on.
-pub fn builtin_payload<'s>(heap: &Heap, value: Value<'_>) -> Result<Option<Value<'s>>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        }) => Some(heap.handle(value)),
-        _ => None,
-    })
-}
-
 /// The closest builtin exception ancestor and the `args` of an instance of a user exception
 /// class.
 pub fn user_exception_args<'s>(
@@ -300,10 +284,10 @@ fn user_exception_parts<'s>(
     value: Value<'_>,
 ) -> Result<Option<UserException<'s>>, String> {
     let heap = &state.heap;
-    let Some(Object::Instance { class, .. }) = object(heap, value)? else {
+    let Some(class) = state.types.instance_class(heap, value)? else {
         return Ok(None);
     };
-    let Object::Class(class_object) = heap.get(heap.handle(class))? else {
+    let Object::Class(class_object) = heap.get(class)? else {
         return Ok(None);
     };
     let Some(base) = class_object.exception_base else {
@@ -390,7 +374,6 @@ fn render_inner(
                 Object::Range { .. } => "range(...)",
                 Object::Function { .. } => "<function ...>",
                 Object::Class { .. } => "<class ...>",
-                Object::Instance { .. } => "<instance ...>",
                 Object::DescriptorBoundMethod { .. } => "<bound method ...>",
                 Object::GenericAlias { .. } => "<generic alias ...>",
                 Object::Iterator { .. }
@@ -419,12 +402,30 @@ fn render_inner(
                 Object::Super { .. } => "<super ...>",
                 Object::Scope(_) => "<scope ...>",
                 Object::BigInt(_) => "<int ...>",
+                Object::Float(_) => "<float ...>",
                 Object::Complex { .. } => "<complex ...>",
             }
             .into());
         }
         let rendered = match heap.get(value)? {
-            Object::Bare => format!("<object object at {}>", address(id)),
+            Object::Bare => match state.types.instance_class(heap, value)? {
+                None => format!("<object object at {}>", address(id)),
+                Some(class) => match heap.get(class)? {
+                    Object::Class(class_object) if class_object.exception_base.is_some() => {
+                        let UserException { args, .. } = user_exception_parts(state, value)?
+                            .ok_or("exception instance lost its native base")?;
+                        let args = args
+                            .iter()
+                            .map(|argument| render(state, *argument, active))
+                            .collect::<Result<Vec<_>, _>>()?
+                            .join(", ");
+                        format!("{}({args})", class_object.name)
+                    }
+                    Object::Class(class_object) => format!("<{} object>", class_object.name),
+                    _ => return Err("instance has an invalid class".into()),
+                },
+            },
+            Object::Float(value) => super::float_text::repr(*value),
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
@@ -486,23 +487,6 @@ fn render_inner(
                     _ => format!("<class '{}'>", class_object.name),
                 },
                 None => format!("<class '{}'>", class_object.name),
-            },
-            Object::Instance { class, payload, .. } => match payload {
-                InstancePayload::Builtin(inner) => render(state, heap.handle(inner), active)?,
-                InstancePayload::Object => match heap.get(heap.handle(class))? {
-                    Object::Class(class_object) if class_object.exception_base.is_some() => {
-                        let UserException { args, .. } = user_exception_parts(state, value)?
-                            .ok_or("exception instance lost its native base")?;
-                        let args = args
-                            .iter()
-                            .map(|argument| render(state, *argument, active))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .join(", ");
-                        format!("{}({args})", class_object.name)
-                    }
-                    Object::Class(class_object) => format!("<{} object>", class_object.name),
-                    _ => return Err("instance has an invalid class".into()),
-                },
             },
             Object::DescriptorBoundMethod { .. } => "<bound method>".into(),
             Object::GenericAlias { origin, arguments } => {
@@ -668,20 +652,13 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
+        Object::Float(value) => *value != 0.0,
         Object::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
         Object::Range { start, stop, step } => {
             (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
         }
-        Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        } => truth(heap, heap.handle(value))?,
         Object::Function { .. }
         | Object::Class { .. }
-        | Object::Instance {
-            payload: InstancePayload::Object,
-            ..
-        }
         | Object::DescriptorBoundMethod { .. }
         | Object::Iterator { .. }
         | Object::SequenceIterator { .. }
@@ -867,7 +844,6 @@ fn equals_inner(
                 }
                 (Object::Function { .. }, Object::Function { .. })
                 | (Object::Class { .. }, Object::Class { .. })
-                | (Object::Instance { .. }, Object::Instance { .. })
                 | (Object::DescriptorBoundMethod { .. }, Object::DescriptorBoundMethod { .. })
                 | (Object::Iterator { .. }, Object::Iterator { .. })
                 | (Object::CountIterator { .. }, Object::CountIterator { .. })
@@ -1156,9 +1132,11 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
     }
     match object(heap, container)? {
         Some(object) => match object {
-            Object::Bare | Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
-                Err("object is not a container".into())
-            }
+            Object::Bare
+            | Object::Float(_)
+            | Object::String(_)
+            | Object::Exception { .. }
+            | Object::Slice { .. } => Err("object is not a container".into()),
             Object::Bytes(value) | Object::ByteArray(value) => {
                 if let Some(needle) = bytes_ref(heap, needle)? {
                     return Ok(memchr::memmem::find(value, needle).is_some());
@@ -1205,7 +1183,6 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Function { .. }
             | Object::Class { .. }
-            | Object::Instance { .. }
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::SequenceIterator { .. }

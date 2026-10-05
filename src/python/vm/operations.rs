@@ -434,20 +434,14 @@ impl<'s> Vm<'s> {
     /// Whether `|=` on object `value` is `dict.update`: a dict or namespace view, or a dict
     /// subclass instance whose class does not define `__ior__`.
     fn updates_dict_in_place(&mut self, value: Value<'s>) -> Result<bool, String> {
-        let class = match self.get(value)? {
-            Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_) => {
-                return Ok(true)
-            }
-            Object::Instance { class, .. } => self.handle(class),
-            _ => return Ok(false),
-        };
-        let holds_dict = match protocol::builtin_payload(self.heap(), value)? {
-            Some(payload) if payload.is_object() => {
-                matches!(self.get(payload)?, Object::Dict(_))
-            }
-            _ => false,
-        };
-        Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none())
+        if let Some(class) = self.instance_class(value)? {
+            let holds_dict = matches!(self.get(value)?, Object::Dict(_));
+            return Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none());
+        }
+        Ok(matches!(
+            self.get(value)?,
+            Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_)
+        ))
     }
 
     fn inplace_method(

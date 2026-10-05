@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 
 use super::super::ast::ComparisonOperator;
 use super::super::heap::{Heap, Object};
-use super::{number, protocol, Slot, Value, Vm};
+use super::{number, protocol, BuiltinType, Slot, Value, Vm};
 
 /// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
 const MAX_COMPARE_DEPTH: usize = 256;
@@ -159,10 +159,11 @@ impl<'s> Vm<'s> {
         left: Value<'s>,
         right: Value<'s>,
     ) -> Result<Option<bool>, String> {
-        // Only exact `str` values qualify: a `str` subclass may define its own comparison.
+        // Only exact `str` values qualify: a `str` subclass holds the same payload but may define
+        // its own comparison.
         let is_plain = |heap: &Heap, value: Value<'s>| -> Result<bool, String> {
             Ok(value.inline_string_ref().is_some()
-                || (value.is_object() && matches!(heap.get(value)?, Object::String(_))))
+                || (value.is_object() && heap.type_id(value)? == BuiltinType::String.id()))
         };
         let ordering = {
             let heap = &self.state.heap;

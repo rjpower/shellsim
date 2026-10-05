@@ -72,23 +72,19 @@ pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Resu
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassLayout {
     Object,
-    /// A subclass of a builtin value type such as `int` or `tuple`, whose instances carry a
-    /// value of that type in [`InstancePayload::Builtin`].
+    /// A subclass of a builtin value type such as `int` or `tuple`. Its instances carry that
+    /// builtin's payload (an [`Object::BigInt`], [`Object::Tuple`], ...) under the subclass's
+    /// type id, so builtin operations the class does not override act on the payload directly.
     Builtin(BuiltinType),
     Type,
 }
 
-/// Type-erased payload carried by an instance while preserving its user-defined class identity.
-#[derive(Debug)]
-pub enum InstancePayload {
-    Object,
-    /// The builtin value an instance of a builtin subclass stands for, such as the `int` of
-    /// `class Flag(int)` or the `tuple` of a named tuple. Builtin operations that the class does
-    /// not override act on this value.
-    Builtin(Ref),
-}
-
-/// Attribute storage for one user-defined instance.
+/// Attribute storage for one instance of a user-defined class.
+///
+/// It hangs off the object header rather than the payload, like CPython's `__dict__` pointer, so
+/// an instance of a `list` subclass is an [`Object::List`] with attributes and an instance of a
+/// plain class is an [`Object::Bare`] with attributes. The box is allocated on the first
+/// attribute write; most builtin objects never pay for it.
 #[derive(Debug)]
 pub enum InstanceAttributes {
     Shaped {
@@ -386,13 +382,11 @@ pub enum Object {
         stop: i64,
         step: i64,
     },
+    /// A boxed `float`, which only an instance of a `float` subclass needs: an exact float is an
+    /// immediate value.
+    Float(f64),
     Function(Box<FunctionObject>),
     Class(Box<ClassObject>),
-    Instance {
-        class: Ref,
-        payload: InstancePayload,
-        attributes: InstanceAttributes,
-    },
     EnumMember {
         class: Option<Ref>,
         name: String,
@@ -527,6 +521,8 @@ struct HeapObject {
     /// lazily assigned identity, 0 while unassigned. Packed so a header stays within the slot.
     flags: Cell<u32>,
     payload: Object,
+    /// Attributes assigned on an instance of a user class; `None` until the first write.
+    attributes: Option<Box<InstanceAttributes>>,
     modeled_bytes: u64,
 }
 
@@ -818,6 +814,39 @@ impl Heap {
         value: Value<'_>,
         f: impl FnOnce(&Builder<'_>, &mut Object) -> R,
     ) -> Result<R, String> {
+        self.modify_object(value, |builder, object| f(builder, &mut object.payload))
+    }
+
+    /// The attributes stored on `value`, or `None` when none has been assigned (or `value` is
+    /// not an instance of a user class).
+    pub fn attributes(&self, value: Value<'_>) -> Result<Option<&InstanceAttributes>, String> {
+        Ok(self.object(self.object_id(value)?)?.attributes.as_deref())
+    }
+
+    /// `value`'s type together with its attributes, for inline caches that guard on both.
+    pub fn typed_attributes(
+        &self,
+        value: Value<'_>,
+    ) -> Result<(TypeId, Option<&InstanceAttributes>), String> {
+        let object = self.object(self.object_id(value)?)?;
+        Ok((object.type_id, object.attributes.as_deref()))
+    }
+
+    /// Mutate `value`'s attribute storage, creating or replacing it, with a [`Builder`] for
+    /// turning handles into stored references.
+    pub fn modify_attributes<R>(
+        &mut self,
+        value: Value<'_>,
+        f: impl FnOnce(&Builder<'_>, &mut Option<Box<InstanceAttributes>>) -> R,
+    ) -> Result<R, String> {
+        self.modify_object(value, |builder, object| f(builder, &mut object.attributes))
+    }
+
+    fn modify_object<R>(
+        &mut self,
+        value: Value<'_>,
+        f: impl FnOnce(&Builder<'_>, &mut HeapObject) -> R,
+    ) -> Result<R, String> {
         let id = self.object_id(value)?;
         let builder = Builder {
             handles: &self.handles,
@@ -842,7 +871,7 @@ impl Heap {
             }
             object
         };
-        Ok(f(&builder, &mut object.payload))
+        Ok(f(&builder, object))
     }
 
     pub fn type_id(&self, value: Value<'_>) -> Result<TypeId, String> {
@@ -898,9 +927,23 @@ impl Heap {
 
     /// Allocate `object` in the young space, collecting first when the space is full or the
     /// memory limit would be exceeded. `object`'s own references are rewritten if that
-    /// collection moves their targets.
+    /// collection moves their targets. The object's type is the builtin type of its payload.
     pub fn alloc<'s>(
         &mut self,
+        object: Object,
+        roots: &mut dyn Roots,
+        resources: &mut Resources,
+    ) -> Result<Value<'s>, String> {
+        let type_id = self.infer_type_id(&object)?;
+        self.alloc_typed(type_id, object, roots, resources)
+    }
+
+    /// Allocate `object` as an instance of `type_id`, which is how an instance of a user class
+    /// comes to carry a builtin payload: a `list` subclass instance is an [`Object::List`]
+    /// whose type is the subclass.
+    pub fn alloc_typed<'s>(
+        &mut self,
+        type_id: TypeId,
         mut object: Object,
         roots: &mut dyn Roots,
         resources: &mut Resources,
@@ -908,7 +951,6 @@ impl Heap {
         let bytes = modeled_size(&object)?;
         charge_construction(bytes, resources)?;
         self.make_room(bytes, Some(&mut object), roots, resources)?;
-        let type_id = self.infer_type_id(&object)?;
         self.modeled_bytes = self
             .modeled_bytes
             .checked_add(bytes)
@@ -919,6 +961,7 @@ impl Heap {
             type_id,
             flags: Cell::new(0),
             payload: object,
+            attributes: None,
             modeled_bytes: bytes,
         }));
         Ok(self.handle_raw(Raw::object(id)))
@@ -933,6 +976,41 @@ impl Heap {
     ) -> Result<Value<'s>, String> {
         let object = build(&self.builder());
         self.alloc(object, roots, resources)
+    }
+
+    /// A fresh payload holding the same builtin value as `value`, for the instance of a builtin
+    /// subclass that `Class(value)` creates. Immediates are boxed; heap payloads are copied, so
+    /// the instance never aliases the object it was built from.
+    pub fn copy_builtin_payload(&self, value: Value<'_>) -> Result<Object, String> {
+        if let Some(value) = value.inline_string_ref() {
+            return Ok(Object::String(PyString::from(value.as_str())));
+        }
+        if let Some(value) = value.float_value() {
+            return Ok(Object::Float(value));
+        }
+        if let Some(value) = value.bool_value() {
+            return Ok(Object::BigInt(BigInt::from(value)));
+        }
+        if let Some(value) = value.immediate_int() {
+            return Ok(Object::BigInt(BigInt::from(value)));
+        }
+        if !value.is_object() {
+            return Err("value cannot be the payload of a builtin subclass instance".into());
+        }
+        match self.get(value)? {
+            object @ (Object::String(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::List(_)
+            | Object::Tuple(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::BigInt(_)
+            | Object::Float(_)
+            | Object::Complex { .. }) => Ok(snapshot::dup_object(object)),
+            _ => Err("value cannot be the payload of a builtin subclass instance".into()),
+        }
     }
 
     /// Make the young space and the memory limit accommodate `bytes` more, collecting as needed.
@@ -1106,6 +1184,7 @@ impl Heap {
             Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
             Object::Complex { .. } => BuiltinType::Complex.id(),
+            Object::Float(_) => BuiltinType::Float.id(),
             Object::Range { .. } => BuiltinType::Range.id(),
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
                 BuiltinType::Function.id()
@@ -1121,13 +1200,6 @@ impl Heap {
                         },
                         None => return Err("class has an invalid metaclass".into()),
                     },
-                }
-            }
-            Object::Instance { class, .. } => {
-                let class = class.0.object_id().ok_or("instance class is not a class")?;
-                match &self.object(class)?.payload {
-                    Object::Class(class_object) => class_object.instance_type,
-                    _ => return Err("instance class is not a class".into()),
                 }
             }
             Object::Iterator { .. }
@@ -1198,8 +1270,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                     .map_err(|_| "modeled big integer size overflow")?,
             )
         }
-        // Sixteen bytes of payload rounded up to one modeled value slot.
-        Object::Complex { .. } | Object::WideValue { .. } => 1,
+        // Up to sixteen bytes of payload rounded up to one modeled value slot.
+        Object::Complex { .. } | Object::WideValue { .. } | Object::Float(_) => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
@@ -1249,7 +1321,6 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                 .and_then(|size| size.checked_add(enum_members.len()))
                 .ok_or("modeled object size overflow")?
         }
-        Object::Instance { .. } => 0,
         Object::EnumMember { name, .. } => name
             .len()
             .checked_add(1)

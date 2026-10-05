@@ -3548,7 +3548,7 @@ fn tuple_repr<'s>(
     args.expect_positional("tuple.__repr__", 0, 0)?;
     args.reject_keywords("tuple.__repr__")?;
     let tuple = receiver.cast::<PyTuple<'s>>(runtime)?;
-    let text = runtime.repr(&tuple.value())?;
+    let text = runtime.payload_repr(&tuple.value())?;
     runtime.new_string(text)
 }
 
@@ -3771,7 +3771,7 @@ fn dict_repr<'s>(
     args.expect_positional("dict.__repr__", 0, 0)?;
     args.reject_keywords("dict.__repr__")?;
     let dict = receiver.cast::<PyDict<'s>>(runtime)?;
-    let text = runtime.repr(&dict.value())?;
+    let text = runtime.payload_repr(&dict.value())?;
     runtime.new_string(text)
 }
 
@@ -4033,8 +4033,7 @@ pub(crate) fn slot_sequence_iter<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     receiver: PyValue<'s>,
 ) -> PyResult<'s, Option<PyValue<'s>>> {
-    let iterator = runtime.iterator(receiver)?;
-    Ok(Some(iterator.value()))
+    runtime.payload_iterator(receiver)
 }
 
 /// A builtin type's physical length, shared with `len()` after user-slot dispatch.

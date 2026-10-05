@@ -785,6 +785,9 @@ pub(super) trait PyRuntime<'s> {
     fn truth(&mut self, value: &PyValue<'s>) -> PyResult<'s, bool>;
     fn display(&mut self, value: &PyValue<'s>) -> PyResult<'s, String>;
     fn repr(&mut self, value: &PyValue<'s>) -> PyResult<'s, String>;
+    /// The builtin `repr()` of `value`'s payload, ignoring any `__repr__` its class defines: what
+    /// `tuple.__repr__(instance)` renders when a subclass's `__repr__` delegates to it.
+    fn payload_repr(&mut self, value: &PyValue<'s>) -> PyResult<'s, String>;
     /// The base object's identity representation, without dispatching to an override.
     fn default_object_repr(&self, value: &PyValue<'s>) -> PyResult<'s, String>;
     /// The physical builtin length, without invoking a user-defined `__len__` slot.
@@ -964,6 +967,12 @@ pub(super) trait PyRuntime<'s> {
     fn is_unbounded_iterator(&self, value: &PyValue<'s>) -> PyResult<'s, bool>;
     /// `iter(value)`: an iterator is returned as is; any other iterable produces one.
     fn iterator(&mut self, value: PyValue<'s>) -> PyResult<'s, PyIterator<'s>>;
+    /// An iterator over `value`'s builtin payload, ignoring any `__iter__` its class defines, or
+    /// `None` when the payload is not a builtin iterable. The builtin `__iter__` slots use it.
+    fn payload_iterator(&mut self, value: PyValue<'s>) -> PyResult<'s, Option<PyValue<'s>>>;
+    /// Whether `value` is an instance of a user-defined class, whatever payload it carries. A
+    /// named tuple is a tuple to [`PyRuntime::kind`] and a user instance here.
+    fn is_user_instance(&self, value: &PyValue<'s>) -> PyResult<'s, bool>;
     /// The next item of `iterator`, or `None` once it is exhausted.
     fn iterator_next(&mut self, iterator: PyIterator<'s>) -> PyResult<'s, Option<PyValue<'s>>>;
     fn generator_send(
@@ -1068,7 +1077,6 @@ pub(super) trait PyRuntime<'s> {
         setter: Option<PyValue<'s>>,
     ) -> PyResult<'s, PyValue<'s>>;
     /// The builtin value an instance of a subclass of a builtin type such as `tuple` holds.
-    fn builtin_payload(&self, value: &PyValue<'s>) -> PyResult<'s, Option<PyValue<'s>>>;
     /// `builtin.__new__(class, ...)`, such as `tuple.__new__(cls, iterable)`: the builtin value,
     /// held by a new instance of `class` when it is a subclass of `builtin`.
     fn new_builtin_instance(
@@ -1273,7 +1281,7 @@ pub(super) struct PyByteArray<'s>(PyValue<'s>);
 
 impl<'s> FromPyValue<'s> for PyByteArray<'s> {
     fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
-        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let payload = value;
         if !payload.is_object() {
             return Err(PyError::type_error("expected a bytearray"));
         }
@@ -1481,7 +1489,7 @@ pub(super) struct PyList<'s>(PyValue<'s>);
 
 impl<'s> FromPyValue<'s> for PyList<'s> {
     fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
-        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let payload = value;
         if !payload.is_object() {
             let actual = runtime.type_name(&value)?;
             return Err(PyError::type_error(format!("expected list, got {actual}")));
@@ -1513,7 +1521,7 @@ pub(super) struct PyTuple<'s>(PyValue<'s>);
 impl<'s> FromPyValue<'s> for PyTuple<'s> {
     /// Accepts a tuple, or an instance of a `tuple` subclass through the tuple it holds.
     fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
-        let tuple = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let tuple = value;
         match tuple {
             _ if tuple.is_object() && runtime.kind(&tuple)? == PyKind::Tuple => Ok(Self(tuple)),
             _ => {
@@ -1631,7 +1639,7 @@ pub(super) struct PyDict<'s>(PyValue<'s>);
 impl<'s> FromPyValue<'s> for PyDict<'s> {
     /// Accepts a dict, or an instance of a `dict` subclass through the dict it holds.
     fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
-        let dict = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let dict = value;
         match dict {
             _ if dict.is_object() && runtime.kind(&dict)? == PyKind::Dict => Ok(Self(dict)),
             _ => {
@@ -1662,7 +1670,7 @@ pub(super) struct PySet<'s>(PyValue<'s>);
 
 impl<'s> FromPyValue<'s> for PySet<'s> {
     fn from_py_value(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Self> {
-        let payload = runtime.builtin_payload(&value)?.unwrap_or(value);
+        let payload = value;
         if !payload.is_object() {
             return Err(PyError::type_error("expected set"));
         }

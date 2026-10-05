@@ -10,7 +10,7 @@ use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::hash;
-use super::heap::{Heap, InstancePayload, Object};
+use super::heap::{Heap, Object};
 use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
     PyResult, PyRuntime, PyValue, ValueKindDef,
@@ -276,15 +276,15 @@ pub(super) fn view<'s, 'a>(heap: &'a Heap, value: &PyValue<'s>) -> Option<Number
         return None;
     }
     match heap.get(*value).ok()? {
-        Object::BigInt(value) => Some(NumberRef::BigInt(value)),
+        // An `int` subclass instance boxes its value, so a machine-sized one reads as the plain
+        // integer every integer operation already handles.
+        Object::BigInt(value) => Some(
+            value
+                .to_i64()
+                .map_or(NumberRef::BigInt(value), NumberRef::Int),
+        ),
+        Object::Float(value) => Some(NumberRef::Float(*value)),
         Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
-        Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        } => {
-            let value: PyValue<'s> = heap.handle(value);
-            view(heap, &value)
-        }
         _ => None,
     }
 }

@@ -22,9 +22,9 @@ use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    Builder, ClassLayout, InstancePayload, KeyHash, NamespaceTarget, Object, OrderedMap,
-    OrderedSet, ProxyTarget, Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
+    Builder, ClassLayout, KeyHash, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget,
+    Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
@@ -716,13 +716,6 @@ impl Roots for VmState {
             visitor(class);
             visitor(receiver);
         }
-        for caches in self.code_caches.iter_mut() {
-            if let Some(attributes) = &mut caches.attributes {
-                for cache in attributes.iter_mut().flatten() {
-                    visitor(&mut cache.class);
-                }
-            }
-        }
         for frame in &mut self.bytecode_frames {
             match &mut frame.pending_native_call {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
@@ -855,7 +848,7 @@ impl Clone for CodeCaches {
                     .iter()
                     .map(|cache| {
                         cache.as_ref().map(|cache| LoadAttributeCache {
-                            class: cache.class.dup(),
+                            type_id: cache.type_id,
                             location: cache.location,
                         })
                     })
@@ -868,7 +861,7 @@ impl Clone for CodeCaches {
 /// One `LoadAttribute` site's last shaped lookup: valid while the receiver has this class and
 /// shape.
 struct LoadAttributeCache {
-    class: Ref,
+    type_id: TypeId,
     location: InstanceAttributeSlot,
 }
 
@@ -1489,9 +1482,6 @@ impl<'s> Vm<'s> {
         if self.has_python_iter(value)? {
             return self.materialize_through_bytecode(*value);
         }
-        if let Some(value) = protocol::builtin_payload(&self.state.heap, *value)? {
-            return self.iterable_values(&value);
-        }
         let mut result = Vec::new();
         if let Some(value) = protocol::string_value(&self.state.heap, *value)? {
             for character in value.chars() {
@@ -1530,7 +1520,7 @@ impl<'s> Vm<'s> {
                 Object::Class(class_object) if !class_object.enum_members.is_empty() => {
                     MaterializeSource::Values(self.handles(&class_object.enum_members))
                 }
-                Object::Instance { .. } => MaterializeSource::Instance,
+                _ if self.instance_class(*value)?.is_some() => MaterializeSource::Instance,
                 _ => MaterializeSource::NotIterable,
             };
             match source {
@@ -1577,6 +1567,14 @@ impl<'s> Vm<'s> {
     fn has_python_iter(&self, value: &Value<'s>) -> Result<bool, String> {
         if !value.is_object() {
             return Ok(false);
+        }
+        // An instance of a user class iterates through Python code only when the class (or a
+        // user ancestor) defines `__iter__`; an inherited builtin slot reads the payload natively.
+        if self.instance_class(*value)?.is_some() {
+            return Ok(matches!(
+                self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
+                Some(SlotValue::Descriptor(descriptor)) if !descriptor.is_none()
+            ));
         }
         if matches!(
             self.get(*value)?,

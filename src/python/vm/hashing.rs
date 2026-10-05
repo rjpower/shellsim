@@ -8,7 +8,7 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, Vm};
+use super::{BuiltinType, ClassLayout, Object, Slot, Value, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -30,19 +30,24 @@ impl<'s> Vm<'s> {
         if value.is_none() {
             return Ok(hash::NONE);
         }
-        // Instances of `int` subclasses have a numeric view but may define their own `__hash__`.
-        let user_instance = self.is_user_instance(value)?;
-        if !user_instance {
-            if let Some(number) = number::view(self.heap(), value) {
-                return Ok(number::number_hash(number));
-            }
+        // Instances of `int` or `str` subclasses hold a builtin payload but may define their own
+        // `__hash__`, so they take the class path before the payload is consulted.
+        if let Some(class) = self.instance_class(*value)? {
+            return self.instance_hash(value, class, depth);
         }
-        if !user_instance {
-            if let Some(text) = super::super::string::string_ref(self.heap(), *value)? {
-                let text = text.as_str().to_owned();
-                self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
-                return Ok(hash::string(&text));
-            }
+        self.payload_hash(value, depth)
+    }
+
+    /// The hash of a builtin value or payload, ignoring any user class the object belongs to.
+    /// This is what `tuple.__hash__(instance)` and the other builtin hash slots compute.
+    pub(super) fn payload_hash(&mut self, value: &Value<'s>, depth: usize) -> Result<i64, String> {
+        if let Some(number) = number::view(self.heap(), value) {
+            return Ok(number::number_hash(number));
+        }
+        if let Some(text) = super::super::string::string_ref(self.heap(), *value)? {
+            let text = text.as_str().to_owned();
+            self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+            return Ok(hash::string(&text));
         }
         if let Some(native) = value.native_value() {
             let (payload, tag) = native.encode();
@@ -103,10 +108,6 @@ impl<'s> Vm<'s> {
                 kind: DictViewKind::Keys | DictViewKind::Items,
                 ..
             } => return Err(self.unhashable(value)),
-            Object::Instance { class, .. } => {
-                let class = self.handle(class);
-                return self.instance_hash(value, class);
-            }
             _ => return Ok(hash::identity(self.identity_bits(value)?)),
         };
         let mut hashes = Vec::with_capacity(items.len());
@@ -116,15 +117,13 @@ impl<'s> Vm<'s> {
         Ok(combine(&hashes))
     }
 
-    fn is_user_instance(&self, value: &Value<'s>) -> Result<bool, String> {
-        if !value.is_object() {
-            return Ok(false);
-        }
-        Ok(matches!(self.get(*value)?, Object::Instance { .. }))
-    }
-
     /// CPython's `object.__hash__` resolution for an instance of a user class.
-    fn instance_hash(&mut self, value: &Value<'s>, class: Value<'s>) -> Result<i64, String> {
+    fn instance_hash(
+        &mut self,
+        value: &Value<'s>,
+        class: Value<'s>,
+        depth: usize,
+    ) -> Result<i64, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("instance has an invalid class".into());
         };
@@ -155,16 +154,9 @@ impl<'s> Vm<'s> {
         if is_dataclass {
             return Err(self.unhashable(value));
         }
-        // An `int` or `tuple` subclass hashes as the value it holds; a `dict` subclass is
-        // unhashable like `dict`, and the error names the subclass.
-        if let Some(payload) = protocol::builtin_payload(self.heap(), *value)? {
-            let holds_dict = payload.is_object() && matches!(self.get(payload)?, Object::Dict(_));
-            if holds_dict {
-                return Err(self.unhashable(value));
-            }
-            return self.hash_value(&payload);
-        }
-        Ok(hash::identity(self.identity_bits(value)?))
+        // An `int` or `tuple` subclass hashes as the value it holds; a `dict` or `list` subclass
+        // is unhashable like its base, and the error names the subclass.
+        self.payload_hash(value, depth)
     }
 
     /// The stable identity of a heap object, as identity hashing consumes it.

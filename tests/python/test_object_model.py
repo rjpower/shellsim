@@ -939,3 +939,56 @@ def test_vars_requires_an_object_with_a_dict():
         pass
     else:
         raise AssertionError("object() reported having a __dict__")
+
+
+class _Shout(str):
+    def __iter__(self):
+        return iter(["shout"])
+
+    def __repr__(self):
+        return "Shout(" + str.__repr__(self) + ")"
+
+
+class _Tagged(list):
+    pass
+
+
+class _Flag(int):
+    pass
+
+
+def test_builtin_subclass_instances_carry_the_builtin_payload():
+    # A subclass instance is its builtin payload with the subclass as its type: builtin slots
+    # read the payload, the subclass's own slots win, and `Base.__slot__(instance)` delegates to
+    # the builtin behavior without dispatching back into the override.
+    shout = _Shout("hey")
+    assert (type(shout) is _Shout, isinstance(shout, str), str(shout)) == (True, True, "hey")
+    assert (list(shout), list(str.__iter__(shout))) == (["shout"], ["h", "e", "y"])
+    assert repr(shout) == "Shout('hey')" and shout.upper() == "HEY"
+    assert shout == "hey" and hash(shout) == hash("hey") and {shout: 1}["hey"] == 1
+
+    tagged = _Tagged([1, 2])
+    tagged.tag = "pair"
+    tagged.append(3)
+    assert (tagged, tagged.tag, len(tagged), tagged.__dict__) == ([1, 2, 3], "pair", 3, {"tag": "pair"})
+    assert list.__repr__(tagged) == "[1, 2, 3]" and type(tagged + [4]) is list
+
+    # An `int` subclass is a machine integer to every integer consumer, including index protocols.
+    flag = _Flag(2)
+    assert (flag + 1, [10, 20, 30][flag], "ab" * flag, flag.bit_length()) == (3, 30, "abab", 2)
+    assert type(flag + 0) is int and type(flag.conjugate()) is int and type(flag.real) is int
+    assert _Flag(2**70) == 2**70 and type(_Flag(2**70) - 2**70) is int
+
+    # Attributes survive collections in both shaped and dictionary storage.
+    kept = []
+    for index in range(2000):
+        item = _Tagged()
+        item.index = index
+        if index % 2:
+            item.extra = index
+            del item.index
+            item.index = index
+        kept.append(item)
+        _ = [object() for _ in range(20)]
+    assert all(item.index == index for index, item in enumerate(kept))
+    assert kept[1].extra == 1 and kept[3].__dict__ == {"extra": 3, "index": 3}

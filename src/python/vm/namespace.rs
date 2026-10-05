@@ -330,13 +330,10 @@ impl<'s> Vm<'s> {
     }
 
     pub(super) fn user_exception_kind(&self, value: &Value<'_>) -> Result<Option<String>, String> {
-        if !value.is_object() {
-            return Ok(None);
-        }
-        let Object::Instance { class, .. } = self.get(*value)? else {
+        let Some(class) = self.instance_class(*value)? else {
             return Ok(None);
         };
-        let Object::Class(class_object) = self.get(self.handle(class))? else {
+        let Object::Class(class_object) = self.get(class)? else {
             return Ok(None);
         };
         Ok(class_object
@@ -349,13 +346,10 @@ impl<'s> Vm<'s> {
         &self,
         value: &Value<'_>,
     ) -> Result<Option<&'static str>, String> {
-        if !value.is_object() {
-            return Ok(None);
-        }
-        let Object::Instance { class, .. } = self.get(*value)? else {
+        let Some(class) = self.instance_class(*value)? else {
             return Ok(None);
         };
-        let Object::Class(class_object) = self.get(self.handle(class))? else {
+        let Object::Class(class_object) = self.get(class)? else {
             return Ok(None);
         };
         Ok(class_object.exception_base)

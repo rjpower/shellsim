@@ -147,22 +147,49 @@ impl<'s> Vm<'s> {
                 });
             }
         }
+        if self.instance_class(iterable)?.is_none() {
+            if let Some(iterator) = self.payload_iterator(iterable)? {
+                return Ok(iterator);
+            }
+        }
+        if let Some(iterator) = self.class_iterator(&iterable)? {
+            return Ok(iterator);
+        }
+        let values = self.iterable_values(&iterable)?;
+        self.alloc_with(|builder| Object::Iterator {
+            values: builder.refs(values),
+            position: 0,
+        })
+    }
+
+    /// An iterator over a builtin payload, ignoring any `__iter__` the object's class defines:
+    /// what the builtin `__iter__` slots return, so `str.__iter__(instance)` does not dispatch
+    /// back into a subclass's override. Returns `None` when the payload is not a builtin
+    /// iterable.
+    pub(super) fn payload_iterator(
+        &mut self,
+        iterable: Value<'s>,
+    ) -> Result<Option<Value<'s>>, String> {
         if iterable.is_object() {
             match self.get(iterable)? {
                 Object::List(_) | Object::Tuple(_) => {
-                    return self.alloc_with(|builder| Object::SequenceIterator {
-                        owner: builder.store(iterable),
-                        position: 0,
-                    });
+                    return self
+                        .alloc_with(|builder| Object::SequenceIterator {
+                            owner: builder.store(iterable),
+                            position: 0,
+                        })
+                        .map(Some);
                 }
                 Object::Range { start, stop, step } => {
                     let (current, stop, step) = (*start, *stop, *step);
-                    return self.alloc(Object::RangeIterator {
-                        current,
-                        stop,
-                        step,
-                        exhausted: false,
-                    });
+                    return self
+                        .alloc(Object::RangeIterator {
+                            current,
+                            stop,
+                            step,
+                            exhausted: false,
+                        })
+                        .map(Some);
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
@@ -174,25 +201,12 @@ impl<'s> Vm<'s> {
                 | Object::Generator { .. } => {
                     // These iterators remain lazy; materializing either one here would permit an
                     // unbounded host allocation before the caller's loop can meter each item.
-                    return Ok(iterable);
+                    return Ok(Some(iterable));
                 }
                 _ => {}
             }
         }
-        if let Some(iterator) = self.snapshot_builtin_iterator(iterable)? {
-            return Ok(iterator);
-        }
-        if let Some(iterator) = self.class_iterator(&iterable)? {
-            return Ok(iterator);
-        }
-        if let Some(value) = protocol::builtin_payload(&self.state.heap, iterable)? {
-            return self.make_iterator(value);
-        }
-        let values = self.iterable_values(&iterable)?;
-        self.alloc_with(|builder| Object::Iterator {
-            values: builder.refs(values),
-            position: 0,
-        })
+        self.snapshot_builtin_iterator(iterable)
     }
 
     /// Builtin strings, byte strings and hash containers keep their existing snapshot iteration
@@ -202,9 +216,6 @@ impl<'s> Vm<'s> {
         &mut self,
         iterable: Value<'s>,
     ) -> Result<Option<Value<'s>>, String> {
-        if iterable.is_object() && matches!(self.get(iterable), Ok(Object::Instance { .. })) {
-            return Ok(None);
-        }
         let mut values = Vec::new();
         if let Some(text) = protocol::string_value(&self.state.heap, iterable)? {
             for character in text.chars() {

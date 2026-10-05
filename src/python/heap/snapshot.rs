@@ -6,8 +6,8 @@
 
 use super::{
     ArgumentParserObject, ArgumentSpec, ArrayStorage, ClassObject, FunctionObject, GeneratorObject,
-    InstanceAttributes, InstancePayload, MatchObject, NamespaceTarget, Object, ProxyTarget, Ref,
-    ScopeObject, SubcommandSpec, SubparsersSpec,
+    InstanceAttributes, MatchObject, NamespaceTarget, Object, ProxyTarget, Ref, ScopeObject,
+    SubcommandSpec, SubparsersSpec,
 };
 
 fn slots(slots: &[Ref]) -> Vec<Ref> {
@@ -26,9 +26,22 @@ fn named<K: Clone + Eq + std::hash::Hash>(
         .collect()
 }
 
+pub(super) fn dup_attributes(attributes: &InstanceAttributes) -> InstanceAttributes {
+    match attributes {
+        InstanceAttributes::Shaped { shape, values } => InstanceAttributes::Shaped {
+            shape: *shape,
+            values: slots(values),
+        },
+        InstanceAttributes::Dictionary(values) => {
+            InstanceAttributes::Dictionary(Box::new(named(values)))
+        }
+    }
+}
+
 pub(super) fn dup_object(object: &Object) -> Object {
     match object {
         Object::Bare => Object::Bare,
+        Object::Float(value) => Object::Float(*value),
         Object::String(value) => Object::String(value.clone()),
         Object::Bytes(value) => Object::Bytes(value.clone()),
         Object::ByteArray(value) => Object::ByteArray(value.clone()),
@@ -85,26 +98,6 @@ pub(super) fn dup_object(object: &Object) -> Object {
                 .collect(),
             enum_members: slots(&class.enum_members),
         })),
-        Object::Instance {
-            class,
-            payload,
-            attributes,
-        } => Object::Instance {
-            class: class.dup(),
-            payload: match payload {
-                InstancePayload::Object => InstancePayload::Object,
-                InstancePayload::Builtin(value) => InstancePayload::Builtin(value.dup()),
-            },
-            attributes: match attributes {
-                InstanceAttributes::Shaped { shape, values } => InstanceAttributes::Shaped {
-                    shape: *shape,
-                    values: slots(values),
-                },
-                InstanceAttributes::Dictionary(values) => {
-                    InstanceAttributes::Dictionary(Box::new(named(values)))
-                }
-            },
-        },
         Object::EnumMember { class, name, value } => Object::EnumMember {
             class: optional(class),
             name: name.clone(),
