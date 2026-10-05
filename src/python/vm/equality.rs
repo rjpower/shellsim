@@ -238,7 +238,11 @@ impl<'s> Vm<'s> {
         Ok(false)
     }
 
-    fn sequence_item(&self, id: Value<'s>, index: usize) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn sequence_item(
+        &self,
+        id: Value<'s>,
+        index: usize,
+    ) -> Result<Option<Value<'s>>, String> {
         match self.get(id)? {
             Object::List(items) | Object::Tuple(items) => {
                 Ok(self.handle_optional(items.get(index)))
@@ -247,7 +251,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn sequence_len(&self, id: Value<'s>) -> Result<usize, String> {
+    pub(super) fn sequence_len(&self, id: Value<'s>) -> Result<usize, String> {
         match self.get(id)? {
             Object::List(items) | Object::Tuple(items) => Ok(items.len()),
             _ => Err("sequence handle changed object kind".into()),

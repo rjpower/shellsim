@@ -44,6 +44,7 @@ use super::symbols::SymbolId;
 use super::{protocol, ExecResult, Out, ReplState, Value};
 
 mod calls;
+mod compare;
 mod dispatch;
 mod equality;
 mod format;
@@ -621,6 +622,8 @@ struct VmState {
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
+    /// Nesting of builtin sequence ordering in progress, bounded like other recursion.
+    compare_depth: usize,
     /// Frames collected by the most recent [`Vm::propagate_error`] unwind, freshest overwrites
     /// stale. Consumed by `render_execution` when reporting an uncaught exception's traceback.
     traceback_frames: Vec<TracebackFrame>,
@@ -666,6 +669,7 @@ impl Clone for VmState {
             class_bindings: self.class_bindings.clone(),
             call_depth: self.call_depth,
             pending_exception: self.pending_exception.clone(),
+            compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
             async_timer_deadlines: self.async_timer_deadlines.clone(),
@@ -1360,18 +1364,30 @@ impl<'s> Vm<'s> {
         } else {
             vec![self.allocate_string(message)?]
         };
-        self.alloc_with(|builder| Object::Exception {
-            kind,
+        self.allocate_exception_object(&kind, args)
+    }
+
+    /// An instance of the builtin exception class `kind` with the constructor arguments `args`.
+    /// The object header carries the class's type id, so `type()`, `isinstance` and slot
+    /// lookups read it directly.
+    fn allocate_exception_object(
+        &mut self,
+        kind: &str,
+        args: Vec<Value<'s>>,
+    ) -> Result<Value<'s>, String> {
+        let value = self.alloc_with(|builder| Object::Exception {
+            kind: kind.to_string(),
             args: builder.refs(args),
-        })
+        })?;
+        if let Some(type_id) = self.state.types.exception_type_id(kind) {
+            self.state.heap.set_type_id(value, type_id)?;
+        }
+        Ok(value)
     }
 
     /// Raise a builtin exception with the constructor arguments `args`.
     fn raise_exception_args(&mut self, kind: &str, args: Vec<Value<'s>>) -> String {
-        let value = match self.alloc_with(|builder| Object::Exception {
-            kind: kind.to_string(),
-            args: builder.refs(args),
-        }) {
+        let value = match self.allocate_exception_object(kind, args) {
             Ok(value) => value,
             Err(error) => return error,
         };

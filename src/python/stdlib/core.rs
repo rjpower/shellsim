@@ -3659,8 +3659,7 @@ fn list_sort<'s>(
         keyed.push((sort_key, value));
     }
     // Like CPython's sort this asks only `<`, and a reversed sort keeps equal items in their
-    // original order. Each comparison may run a Python `__lt__`; a child scope per call keeps
-    // the handles it makes from accumulating across the n log n comparisons of one sort.
+    // original order.
     super::super::sort::merge_sort(&mut keyed, |right, left| {
         runtime.charge_cpu(1)?;
         let (lesser, greater) = if reverse {
@@ -3668,12 +3667,7 @@ fn list_sort<'s>(
         } else {
             (right.0, left.0)
         };
-        let mut less = false;
-        runtime.nested(&mut |runtime, _| {
-            less = runtime.less_than(&lesser, &greater)?;
-            Ok(())
-        })?;
-        Ok(less)
+        runtime.less_than(&lesser, &greater)
     })?;
     runtime.replace_list_items(list, keyed.into_iter().map(|(_, value)| value).collect())?;
     Ok(Value::None)

@@ -12,8 +12,8 @@ use super::{
     expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
     CallArgs, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
     ComparisonOperator, ExceptionType, Execution, HashMap, InstancePayload, LoadAttributeCache,
-    NameId, NativeValue, Object, Ordering, PyError, PyRuntime, RaisedException, SlicePlan, Slot,
-    SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    NameId, NativeValue, Object, PyError, PyRuntime, RaisedException, SlicePlan, Slot, SlotValue,
+    SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -33,9 +33,6 @@ const CLASS_ATTRIBUTE_BYTES: u64 = 48;
 
 /// Container nesting bound for `repr()`, matching the VM's call-depth limit.
 const MAX_REPR_DEPTH: usize = 256;
-
-/// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
-const MAX_COMPARE_DEPTH: usize = 256;
 
 /// Bytes a linear scan over text or bytes covers per CPU unit. Searches, comparisons and code
 /// point walks run at memory speed, so one unit per word keeps the charge proportional without
@@ -2764,6 +2761,7 @@ impl<'s> Vm<'s> {
                 *owner = Some(b.store(class));
                 Ok(())
             })??;
+            self.state.heap.set_type_id(member, instance_type)?;
         }
         for (_, descriptor) in &descriptors {
             if !descriptor.is_object() {
@@ -3146,51 +3144,6 @@ impl<'s> Vm<'s> {
         )
     }
 
-    fn vm_container_compare(
-        &mut self,
-        receiver: Value<'s>,
-        slot: Slot,
-        argument: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
-        let (left, right) = (self.builtin_view(receiver)?, self.builtin_view(argument)?);
-        let left_type = self.type_id(&left)?;
-        let right_type = self.type_id(&right)?;
-        let compatible = match left_type {
-            id if id == BuiltinType::List.id() => right_type == BuiltinType::List.id(),
-            id if id == BuiltinType::Tuple.id() => right_type == BuiltinType::Tuple.id(),
-            id if id == BuiltinType::Dict.id() || id == BuiltinType::NamespaceDict.id() => {
-                right_type == BuiltinType::Dict.id()
-                    || right_type == BuiltinType::NamespaceDict.id()
-            }
-            id if id == BuiltinType::Set.id() || id == BuiltinType::FrozenSet.id() => {
-                right_type == BuiltinType::Set.id() || right_type == BuiltinType::FrozenSet.id()
-            }
-            _ => false,
-        };
-        if !compatible {
-            return Ok(None);
-        }
-        let result = match slot {
-            Slot::Equal => self.builtin_equality(&left, &right)?,
-            Slot::NotEqual => !self.builtin_equality(&left, &right)?,
-            Slot::LessThan | Slot::LessEqual | Slot::GreaterThan | Slot::GreaterEqual => {
-                let accepted: &[Ordering] = match slot {
-                    Slot::LessThan => &[Ordering::Less],
-                    Slot::LessEqual => &[Ordering::Less, Ordering::Equal],
-                    Slot::GreaterThan => &[Ordering::Greater],
-                    _ => &[Ordering::Greater, Ordering::Equal],
-                };
-                match self.compare_values(&left, &right)? {
-                    protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
-                    protocol::Comparison::Unordered => false,
-                    protocol::Comparison::Unsupported => return Ok(None),
-                }
-            }
-            _ => return Err("invalid container comparison slot".into()),
-        };
-        Ok(Some(Value::Bool(result)))
-    }
-
     pub(super) fn invoke_slot(
         &mut self,
         receiver: &Value<'s>,
@@ -3209,7 +3162,9 @@ impl<'s> Vm<'s> {
                 let [argument] = arguments.as_slice() else {
                     return Err("comparison slot received the wrong number of arguments".into());
                 };
-                return self.vm_container_compare(*receiver, slot, *argument);
+                let operator = ComparisonOperator::from_slot(slot)
+                    .ok_or("comparison slot invoked for a non-comparison operator")?;
+                return self.container_compare(operator, *receiver, *argument);
             }
             SlotValue::VmHash => {
                 if !arguments.is_empty() {
@@ -3343,8 +3298,10 @@ impl<'s> Vm<'s> {
             let [argument] = arguments.as_slice() else {
                 return Err("comparison slot received the wrong number of arguments".into());
             };
+            let operator = ComparisonOperator::from_slot(slot)
+                .ok_or("comparison slot invoked for a non-comparison operator")?;
             return Ok(self
-                .vm_container_compare(receiver, slot, *argument)?
+                .container_compare(operator, receiver, *argument)?
                 .unwrap_or(Value::Native(NativeValue::NotImplemented)));
         }
         let receiver = self.builtin_view(receiver)?;
@@ -3759,112 +3716,6 @@ impl<'s> Vm<'s> {
             }
         }
         Ok(())
-    }
-
-    /// Order two values by Python's rich comparisons, including user `__eq__` and `__lt__`.
-    pub(super) fn compare_values(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<protocol::Comparison, String> {
-        self.compare_values_at(left, right, 0)
-    }
-
-    /// [`Self::compare_values`] at nesting `depth`: sequences compare element by element, and
-    /// nesting past [`MAX_COMPARE_DEPTH`] raises `RecursionError` instead of exhausting the host
-    /// stack on deeply nested tuples or lists.
-    fn compare_values_at(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-        depth: usize,
-    ) -> Result<protocol::Comparison, String> {
-        if left.is_object() && right.is_object() {
-            let sequences = match (self.get(*left)?, self.get(*right)?) {
-                (Object::List(left), Object::List(right))
-                | (Object::Tuple(left), Object::Tuple(right)) => {
-                    Some((self.handles(left), self.handles(right)))
-                }
-                _ => None,
-            };
-            if let Some((left, right)) = sequences {
-                if depth >= MAX_COMPARE_DEPTH {
-                    return Err(self.raise_exception(
-                        "RecursionError",
-                        "maximum recursion depth exceeded in comparison",
-                    ));
-                }
-                for (left, right) in left.iter().zip(&right) {
-                    self.charge_cpu(1)?;
-                    if self.identical(*left, *right) {
-                        continue;
-                    }
-                    let comparison = self.compare_values_at(left, right, depth + 1)?;
-                    if comparison != protocol::Comparison::Ordered(Ordering::Equal) {
-                        return Ok(comparison);
-                    }
-                }
-                return Ok(protocol::Comparison::Ordered(left.len().cmp(&right.len())));
-            }
-        }
-        if let Some(equal) = self.invoke_operator_slot(left, Slot::Equal, "__eq__", vec![*right])? {
-            if self.truth_value(&equal)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Equal));
-            }
-        }
-        if let Some(less) =
-            self.invoke_operator_slot(left, Slot::LessThan, "__lt__", vec![*right])?
-        {
-            if self.truth_value(&less)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Less));
-            }
-        }
-        if let Some(less) =
-            self.invoke_operator_slot(right, Slot::LessThan, "__lt__", vec![*left])?
-        {
-            if self.truth_value(&less)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Greater));
-            }
-        }
-        let (builtin_left, builtin_right) = (self.builtin_view(*left)?, self.builtin_view(*right)?);
-        if !self.identical(builtin_left, *left) || !self.identical(builtin_right, *right) {
-            return self.compare_values_at(&builtin_left, &builtin_right, depth);
-        }
-        self.charge_scan_pair(left, right)?;
-        protocol::compare(&self.state.heap, *left, *right)
-    }
-
-    /// Order two values for native sorting, heap and bisection helpers with the `<` operator
-    /// alone, as CPython's do: `left < right` is `Less`, `right < left` is `Greater`, and
-    /// anything else, such as a NaN, is `Equal`, so the earlier value stays in place.
-    pub(super) fn sort_order(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<Ordering, String> {
-        if self.compare_truth(ComparisonOperator::Less, left, right)? {
-            Ok(Ordering::Less)
-        } else if self.compare_truth(ComparisonOperator::Less, right, left)? {
-            Ok(Ordering::Greater)
-        } else {
-            Ok(Ordering::Equal)
-        }
-    }
-
-    /// Raise CPython's `TypeError` for an ordering comparison between unrelated types.
-    pub(super) fn raise_unorderable(
-        &mut self,
-        symbol: &str,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> String {
-        let message = match (self.type_name_of(left), self.type_name_of(right)) {
-            (Ok(left), Ok(right)) => {
-                format!("'{symbol}' not supported between instances of '{left}' and '{right}'")
-            }
-            (Err(error), _) | (_, Err(error)) => return error,
-        };
-        self.raise_exception("TypeError", message)
     }
 
     fn super_attribute(
@@ -4472,24 +4323,16 @@ impl<'s> Vm<'s> {
     }
 
     /// Return the Python-level type independently of the value's physical storage shape.
+    /// The Python type of a value: a tag switch for an immediate, the object header for a
+    /// heap object. The header is set when the object is allocated and re-typed only by
+    /// [`Heap::set_type_id`](super::super::heap::Heap::set_type_id) for a builtin exception
+    /// instance or an enum member whose class is known only later.
     pub(super) fn type_id(&self, value: &Value<'s>) -> Result<TypeId, String> {
         if value.inline_string_len().is_some() {
             return Ok(BuiltinType::String.id());
         }
-        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
-            if let Some(id) = self.state.types.exception_type_id(&kind) {
-                return Ok(id);
-            }
-        }
         if value.is_object() {
-            if let Object::EnumMember {
-                class: Some(class), ..
-            } = self.get(*value)?
-            {
-                return self
-                    .class_type_id(&self.handle(class))?
-                    .ok_or_else(|| "invalid enum class".to_string());
-            }
+            return self.object_type_id(*value);
         }
         if value.is_none() {
             return Ok(BuiltinType::None.id());
@@ -4509,9 +4352,6 @@ impl<'s> Vm<'s> {
                 .types
                 .value_kind_type_id_by_index(kind)
                 .ok_or("invalid registered value kind")?);
-        }
-        if value.is_object() {
-            return self.object_type_id(*value);
         }
         Ok(
             match value
