@@ -504,7 +504,6 @@ impl<'s> Vm<'s> {
     ) -> Result<Flow, String> {
         let call = code.call(call);
         self.dispatch_call_spec(
-            code,
             call.positional,
             &call.keywords,
             &call.starred,
@@ -536,7 +535,6 @@ impl<'s> Vm<'s> {
                 .remove(receiver_depth)
                 .ok_or("stack underflow")?;
             return self.dispatch_call_spec(
-                code,
                 call.positional - 1,
                 &call.keywords,
                 &call.starred[1..],
@@ -545,7 +543,6 @@ impl<'s> Vm<'s> {
             );
         }
         self.dispatch_call_spec(
-            code,
             call.positional,
             &call.keywords,
             &call.starred,
@@ -556,9 +553,8 @@ impl<'s> Vm<'s> {
 
     fn dispatch_call_spec(
         &mut self,
-        code: &CodeRef,
         positional: usize,
-        keyword_names: &[Option<super::NameId>],
+        keywords: &[super::super::bytecode::KeywordName],
         starred: &[bool],
         op_index: usize,
         span: super::super::source::Span,
@@ -567,11 +563,7 @@ impl<'s> Vm<'s> {
         // suspends, or returns here; recording that first also lets native code attribute
         // work to this line, as `warnings.warn` does for its caller.
         self.active_frame_mut().instruction_pointer = op_index + 1;
-        let keywords = keyword_names
-            .iter()
-            .map(|name| name.map(|name| code.name(name).to_owned()))
-            .collect::<Vec<_>>();
-        self.call(positional, &keywords, starred, CallMode::Deferred(span))
+        self.call(positional, keywords, starred, CallMode::Deferred(span))
     }
 
     /// The value of a call made in [`CallMode::Immediate`], which leaves it on the operand

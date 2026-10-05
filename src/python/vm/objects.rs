@@ -3154,15 +3154,13 @@ impl<'s> Vm<'s> {
         let total = positional
             .checked_add(keyword_arguments.len())
             .ok_or("too many call arguments")?;
-        let keyword_names = keyword_arguments
-            .iter()
-            .map(|(name, _)| Some(name.clone()))
-            .collect::<Vec<_>>();
         self.push(callable);
         for argument in arguments {
             self.push(argument);
         }
-        for (_, value) in keyword_arguments {
+        let mut keyword_names = Vec::with_capacity(keyword_arguments.len());
+        for (name, value) in keyword_arguments {
+            keyword_names.push(Some(std::sync::Arc::from(name)));
             self.push(value);
         }
         self.call(

@@ -64,6 +64,11 @@ pub struct Code {
     errors: Box<[String]>,
 }
 
+/// One keyword operand of a call: the parameter name, or `None` for a `**mapping` whose names
+/// arrive at run time. Names are shared with the code's name table so a call passes them to
+/// the binder without copying.
+pub type KeywordName = Option<Arc<str>>;
+
 /// Immutable argument-binding metadata for one code object.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CallSignature {
@@ -152,7 +157,7 @@ pub struct Instruction {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CallSpec {
     pub positional: usize,
-    pub keywords: Box<[Option<NameId>]>,
+    pub keywords: Box<[KeywordName]>,
     pub starred: Box<[bool]>,
 }
 
@@ -423,6 +428,12 @@ pub struct CodeBuilder {
 }
 
 impl CodeBuilder {
+    /// The interned `Arc<str>` for `name`, shared with the name table.
+    fn shared_name(&mut self, name: String) -> Arc<str> {
+        let id = self.name(name);
+        self.names[id.index()].clone()
+    }
+
     fn name(&mut self, name: String) -> NameId {
         if let Some(id) = self.name_ids.get(name.as_str()) {
             return *id;
@@ -549,7 +560,7 @@ impl CodeBuilder {
             } => {
                 let keywords = keywords
                     .into_iter()
-                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
+                    .map(|keyword| keyword.map(|keyword| self.shared_name(keyword)))
                     .collect();
                 let id = CallId::new(self.calls.len());
                 self.calls.push(CallSpec {
@@ -567,7 +578,7 @@ impl CodeBuilder {
             } => {
                 let keywords = keywords
                     .into_iter()
-                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
+                    .map(|keyword| keyword.map(|keyword| self.shared_name(keyword)))
                     .collect();
                 let id = CallId::new(self.calls.len());
                 self.calls.push(CallSpec {

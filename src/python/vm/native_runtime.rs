@@ -1746,15 +1746,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .checked_add(keywords.len())
             .ok_or_else(|| PyError::resource_error("too many call arguments"))?;
         let unpacked = vec![false; total];
-        let keyword_names = keywords
-            .iter()
-            .map(|(name, _)| Some(name.clone()))
-            .collect::<Vec<_>>();
         self.push(callable);
         for value in positional {
             self.push(value);
         }
-        for (_, value) in keywords {
+        let mut keyword_names = Vec::with_capacity(keywords.len());
+        for (name, value) in keywords {
+            keyword_names.push(Some(std::sync::Arc::from(name)));
             self.push(value);
         }
         let flow = self

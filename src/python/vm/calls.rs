@@ -1,6 +1,9 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
+use std::sync::Arc;
+
 use super::super::ast::{Program, Statement, StatementKind};
+use super::super::bytecode::{KeywordName, ParameterKind};
 use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
@@ -10,14 +13,6 @@ use super::{
     RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
-
-/// The parts of a Python function object a call needs, as handles in the caller's scope.
-struct FunctionParts<'s> {
-    name: String,
-    code: CodeRef,
-    closure: Option<Value<'s>>,
-    defaults: Vec<Value<'s>>,
-}
 
 impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
@@ -186,15 +181,19 @@ impl<'s> Vm<'s> {
         Ok(names)
     }
 
+    /// Call the value below the arguments on the operand stack. `positional` values follow the
+    /// callee, then one value per `keywords` entry; `starred` marks the `*iterable` and
+    /// `**mapping` operands among them. Python functions bind straight from the stack through
+    /// [`Self::call_python`]; every other callee receives owned arguments.
     pub(super) fn call(
         &mut self,
         positional: usize,
-        keyword_names: &[Option<String>],
+        keywords: &[KeywordName],
         starred: &[bool],
         mode: CallMode,
     ) -> Result<Flow, String> {
         let count = positional
-            .checked_add(keyword_names.len())
+            .checked_add(keywords.len())
             .ok_or("too many call arguments")?;
         if starred.len() != count {
             return Err("invalid bytecode call argument metadata".into());
@@ -202,36 +201,51 @@ impl<'s> Vm<'s> {
         if self.frame_stack_len() < count + 1 {
             return Err("invalid bytecode stack effect".into());
         }
-        if keyword_names.is_empty() && !starred.contains(&true) {
-            if let Some(result) = self.call_python_direct(positional, mode)? {
-                return Ok(result);
-            }
+        if starred.contains(&true) {
+            let (positional, keywords) =
+                self.expand_starred_arguments(positional, keywords, starred)?;
+            return self.call_expanded(positional, &keywords, mode);
         }
-        let arguments_start = self.stack.len() - count;
+        self.call_expanded(positional, keywords, mode)
+    }
+
+    /// Replace the call operands on the stack with their expansion: each `*iterable` by its
+    /// items and each `**mapping` by its values, whose names join the returned keyword list.
+    /// Returns the expanded positional count and keyword names.
+    fn expand_starred_arguments(
+        &mut self,
+        positional: usize,
+        keywords: &[KeywordName],
+        starred: &[bool],
+    ) -> Result<(usize, Vec<KeywordName>), String> {
+        let arguments_start = self.stack.len() - positional - keywords.len();
         let mut raw_arguments = self
             .execution
             .stack
             .split_off(&self.state.heap, arguments_start);
         let keyword_values = raw_arguments.split_off(positional);
-        let positional_starred = &starred[..positional];
-        let mut arguments = Vec::new();
-        for (argument, expanded) in raw_arguments.into_iter().zip(positional_starred) {
-            if *expanded {
+        let mut expanded = 0usize;
+        for (argument, starred) in raw_arguments.into_iter().zip(&starred[..positional]) {
+            if *starred {
                 for value in self.iterable_values(&argument)? {
-                    self.push_materialized(&mut arguments, value)?;
+                    self.push_argument(value)?;
+                    expanded += 1;
                 }
             } else {
-                self.push_materialized(&mut arguments, argument)?;
+                self.push_argument(argument)?;
+                expanded += 1;
             }
         }
-        let mut keyword_arguments = Vec::new();
-        for ((name, value), expanded) in keyword_names
+        let mut names = Vec::with_capacity(keywords.len());
+        for ((name, value), starred) in keywords
             .iter()
             .zip(keyword_values)
             .zip(&starred[positional..])
         {
-            let additions = match (name, expanded) {
-                (Some(name), false) => vec![(name.clone(), value)],
+            match (name, starred) {
+                (Some(name), false) => {
+                    self.push_keyword_argument(&mut names, name.clone(), value)?;
+                }
                 (None, true) => {
                     let Some(entries) = self.mapping_items(value)? else {
                         let message = format!(
@@ -240,34 +254,93 @@ impl<'s> Vm<'s> {
                         );
                         return Err(self.raise_exception("TypeError", message));
                     };
-                    self.reserve_result(entries.len().saturating_mul(64))?;
-                    let mut additions = Vec::with_capacity(entries.len());
                     for (key, value) in entries {
                         let Some(name) = string::string_value(&self.state.heap, key)? else {
                             return Err(
                                 self.raise_exception("TypeError", "keywords must be strings")
                             );
                         };
-                        self.reserve_result(64usize.saturating_add(name.len()))?;
-                        self.charge_cpu(1)?;
-                        additions.push((name, value));
+                        self.push_keyword_argument(&mut names, Arc::from(name), value)?;
                     }
-                    additions
                 }
                 _ => return Err("invalid keyword argument metadata".into()),
-            };
-            for (name, value) in additions {
-                if keyword_arguments
-                    .iter()
-                    .any(|(existing, _)| existing == &name)
-                {
-                    let message = format!("got multiple values for keyword argument '{name}'");
-                    return Err(self.raise_exception("TypeError", message));
-                }
-                self.reserve_result(64usize.saturating_add(name.len()))?;
-                self.charge_cpu(1)?;
-                keyword_arguments.push((name, value));
             }
+        }
+        Ok((expanded, names))
+    }
+
+    /// Push one expanded positional argument, metering the stack growth.
+    fn push_argument(&mut self, value: Value<'s>) -> Result<(), String> {
+        self.reserve_result(64)?;
+        self.charge_cpu(1)?;
+        self.push(value);
+        Ok(())
+    }
+
+    /// Push one expanded keyword argument and record its name, rejecting a repeated name.
+    fn push_keyword_argument(
+        &mut self,
+        names: &mut Vec<KeywordName>,
+        name: Arc<str>,
+        value: Value<'s>,
+    ) -> Result<(), String> {
+        if names
+            .iter()
+            .any(|existing| existing.as_deref() == Some(&*name))
+        {
+            let message = format!("got multiple values for keyword argument '{name}'");
+            return Err(self.raise_exception("TypeError", message));
+        }
+        self.reserve_result(64usize.saturating_add(name.len()))?;
+        self.charge_cpu(1)?;
+        self.push(value);
+        names.push(Some(name));
+        Ok(())
+    }
+
+    /// Dispatch a call whose operands hold no starred entries.
+    fn call_expanded(
+        &mut self,
+        positional: usize,
+        keywords: &[KeywordName],
+        mode: CallMode,
+    ) -> Result<Flow, String> {
+        let count = positional + keywords.len();
+        let callee = self.peek(count)?;
+        if callee.is_object() {
+            match self.get(callee)? {
+                Object::Function(_) => {
+                    return self.call_python(callee, None, positional, keywords, mode);
+                }
+                Object::DescriptorBoundMethod {
+                    receiver,
+                    descriptor,
+                    ..
+                } if descriptor.is_object() => {
+                    let (receiver, descriptor) = (self.handle(receiver), self.handle(descriptor));
+                    return self.call_python(
+                        descriptor,
+                        Some(receiver),
+                        positional,
+                        keywords,
+                        mode,
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.reserve_result(count.saturating_mul(64))?;
+        self.charge_cpu(count as u64)?;
+        let arguments_start = self.stack.len() - count;
+        let mut arguments = self
+            .execution
+            .stack
+            .split_off(&self.state.heap, arguments_start);
+        let keyword_values = arguments.split_off(positional);
+        let mut keyword_arguments = Vec::with_capacity(keywords.len());
+        for (name, value) in keywords.iter().zip(keyword_values) {
+            let name = name.as_ref().ok_or("invalid keyword argument metadata")?;
+            keyword_arguments.push((name.to_string(), value));
         }
         let function = self.pop()?;
         if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
@@ -278,7 +351,6 @@ impl<'s> Vm<'s> {
         if function.is_object() {
             /// What a heap callable is, with the handles its call needs.
             enum Callee<'v> {
-                Function,
                 BoundMethod {
                     receiver: Value<'v>,
                     descriptor: Value<'v>,
@@ -289,7 +361,6 @@ impl<'s> Vm<'s> {
                 Other,
             }
             let callee = match self.get(function)? {
-                Object::Function(_) => Callee::Function,
                 Object::DescriptorBoundMethod {
                     receiver,
                     descriptor,
@@ -306,22 +377,11 @@ impl<'s> Vm<'s> {
                 },
             };
             return match callee {
-                Callee::Function => {
-                    self.call_python_general(function, None, arguments, keyword_arguments, mode)
-                }
                 Callee::BoundMethod {
                     receiver,
                     descriptor,
                 } => {
-                    if descriptor.is_object() {
-                        self.call_python_general(
-                            descriptor,
-                            Some(receiver),
-                            arguments,
-                            keyword_arguments,
-                            mode,
-                        )
-                    } else if let Some(NativeValue::SlotWrapper { owner, slot }) =
+                    if let Some(NativeValue::SlotWrapper { owner, slot }) =
                         descriptor.native_value()
                     {
                         self.call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
@@ -1218,21 +1278,6 @@ impl<'s> Vm<'s> {
 
     /// The name, code, closure, defaults and defining class of a Python function object, or
     /// `None` when `function` is some other value.
-    fn function_parts(&self, function: Value<'s>) -> Result<Option<FunctionParts<'s>>, String> {
-        if !function.is_object() {
-            return Ok(None);
-        }
-        let Object::Function(function_object) = self.get(function)? else {
-            return Ok(None);
-        };
-        Ok(Some(FunctionParts {
-            name: function_object.name.clone(),
-            code: function_object.code.clone(),
-            closure: self.handle_optional(function_object.closure.as_ref()),
-            defaults: self.handles(&function_object.defaults),
-        }))
-    }
-
     /// Call a native method. A deferred call that suspends returns a retry that passes
     /// `receiver` and the same arguments again; this call passes `native_receiver`.
     fn call_native_method(
@@ -1512,14 +1557,24 @@ impl<'s> Vm<'s> {
             if !initializer.is_object() {
                 return Err(format!("{name}.__init__ is not callable"));
             }
-            if self.function_parts(initializer)?.is_none() {
+            if !matches!(self.get(initializer)?, Object::Function(_)) {
                 return Err(format!("{name}.__init__ is not a function"));
             }
-            let flow = self.call_python_general(
+            let positional = arguments.len();
+            self.push(initializer);
+            for argument in arguments {
+                self.push(argument);
+            }
+            let mut keywords = Vec::with_capacity(keyword_arguments.len());
+            for (keyword, value) in keyword_arguments {
+                keywords.push(Some(Arc::from(keyword)));
+                self.push(value);
+            }
+            let flow = self.call_python(
                 initializer,
                 Some(instance),
-                arguments,
-                keyword_arguments,
+                positional,
+                &keywords,
                 CallMode::Immediate,
             )?;
             match self.immediate_value(flow)? {
@@ -1540,122 +1595,314 @@ impl<'s> Vm<'s> {
 
     const MAX_CALL_DEPTH: usize = 256;
 
-    /// Bind a plain positional call of a Python function, or of a bound method wrapping one,
-    /// straight from the operand stack into the new frame's local slots, and enter it.
-    ///
-    /// The callee sits below the `positional` arguments on the stack. `None` leaves the call to
-    /// [`Self::call_python_general`]: any other callee, a generator or coroutine, a function
-    /// with heap-resident locals, a signature with variadic or required keyword-only
-    /// parameters, and an arity the signature cannot bind, whose error the general path
-    /// reports. Nothing here allocates, so stored references move between roots directly.
-    fn call_python_direct(
+    /// Call the Python `function` whose arguments sit on top of the operand stack above the
+    /// callee slot: `positional` values, then one value per `keywords` entry. `receiver`
+    /// becomes the first argument. Binding validates the call against the signature first,
+    /// then moves the stored references straight into the new frame's slots on the shared
+    /// locals stack, so a call with no `*args` or `**kwargs` parameter allocates nothing. A
+    /// generator or coroutine, or code whose nested scopes read its locals, then moves the
+    /// bound slots into a heap scope.
+    fn call_python(
         &mut self,
+        function: Value<'s>,
+        receiver: Option<Value<'s>>,
         positional: usize,
+        keywords: &[KeywordName],
         mode: CallMode,
-    ) -> Result<Option<Flow>, String> {
-        let callee = self.peek(positional)?;
-        if !callee.is_object() {
-            return Ok(None);
-        }
-        let (function, receiver) = match self.get(callee)? {
-            Object::Function(_) => (callee, None),
-            Object::DescriptorBoundMethod {
-                receiver,
-                descriptor,
-                ..
-            } if descriptor.is_object() => (self.handle(descriptor), Some(self.handle(receiver))),
-            _ => return Ok(None),
+    ) -> Result<Flow, String> {
+        let Object::Function(function_object) = self.get(function)? else {
+            return Err("bound descriptor is not callable".into());
         };
-        let Object::Function(function_object) = self.state.heap.get(function)? else {
-            return Ok(None);
-        };
-        let signature = &function_object.code.call_signature;
-        let given = positional + usize::from(receiver.is_some());
-        if signature.heap_locals
-            || signature.variadic_slot.is_some()
-            || signature.keyword_variadic_slot.is_some()
-            || signature.keyword_only_required
-            || given < signature.required_positional
-            || given > signature.positional_count
-        {
-            return Ok(None);
-        }
-        if self.call_depth == Self::MAX_CALL_DEPTH {
-            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
-        }
         let code = function_object.code.clone();
         let closure = self.handle_optional(function_object.closure.as_ref());
-        let locals_base = self.execution.locals.len();
-        if let Some(receiver) = receiver {
-            let receiver = self.store(receiver);
-            self.execution.locals.push(Some(receiver));
+        let signature = &code.call_signature;
+        let suspends = signature.is_generator || signature.is_coroutine;
+        if !suspends && self.call_depth == Self::MAX_CALL_DEPTH {
+            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
-        let arguments_start = self.stack.len() - positional;
-        let super::VmState { locals, stack, .. } = &mut *self.execution;
-        locals.extend(stack.drain_refs(arguments_start).map(Some));
-        stack.pop_ref();
-        locals.extend(std::iter::repeat_with(|| None).take(code.local_names.len() - given));
-        let Object::Function(function_object) = self.state.heap.get(function)? else {
-            unreachable!("function was checked above and nothing has allocated");
+        let locals_base = self.execution.locals.len();
+        if let Err(error) =
+            self.bind_arguments(function, &code, receiver, positional, keywords, locals_base)
+        {
+            self.execution.locals.truncate(locals_base);
+            return Err(error);
+        }
+        if suspends || signature.heap_locals {
+            let locals = self.execution.locals[locals_base..]
+                .iter()
+                .map(|slot| self.handle_optional(slot.as_ref()))
+                .collect::<Vec<_>>();
+            self.execution.locals.truncate(locals_base);
+            if suspends {
+                return self.create_generator(function, &code, closure, locals);
+            }
+            let scope = self.function_scope(&code, closure, locals)?;
+            let entry = FrameEntry::function(function, scope);
+            return self.enter_python_function(function, &code, entry, mode);
+        }
+        let entry = FrameEntry::with_locals(function, closure, locals_base);
+        self.enter_python_function(function, &code, entry, mode)
+    }
+
+    /// Bind the call operands on the stack into `code`'s local slots at `locals_base` on the
+    /// locals stack, consuming the operands and the callee slot. Every `TypeError` the
+    /// signature can raise is detected before the stack changes; the caller discards the
+    /// partially extended locals on error.
+    fn bind_arguments(
+        &mut self,
+        function: Value<'s>,
+        code: &CodeRef,
+        receiver: Option<Value<'s>>,
+        positional: usize,
+        keywords: &[KeywordName],
+        locals_base: usize,
+    ) -> Result<(), String> {
+        let signature = &code.call_signature;
+        let receiver_offset = usize::from(receiver.is_some());
+        let given = positional + receiver_offset;
+        let count = positional + keywords.len();
+        let arguments_start = self.stack.len() - count;
+        if given > signature.positional_count && signature.variadic_slot.is_none() {
+            return Err(self.too_many_positional(function, code, given, keywords));
+        }
+        // Slots the positional arguments fill; the rest of them go to `*args`.
+        let filled = given.min(signature.positional_count);
+        // Validate the keywords and the required parameters before touching the stack.
+        let mut extra_keywords = 0usize;
+        for (index, keyword) in keywords.iter().enumerate() {
+            let name = keyword
+                .as_deref()
+                .ok_or("invalid keyword argument metadata")?;
+            let repeated = keywords[..index]
+                .iter()
+                .any(|earlier| earlier.as_deref() == Some(name));
+            match keyword_target(code, name) {
+                KeywordTarget::Slot(slot) if slot < filled || repeated => {
+                    let message = format!(
+                        "{}() got multiple values for argument '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                KeywordTarget::Slot(_) => {}
+                // A name that binds no slot, including a positional-only parameter's, lands in
+                // `**kwargs` when the signature has one.
+                KeywordTarget::Unknown | KeywordTarget::PositionalOnly
+                    if signature.keyword_variadic_slot.is_some() =>
+                {
+                    if repeated {
+                        let message = format!(
+                            "{}() got multiple values for argument '{name}'",
+                            self.function_name(&self.store(function))
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    extra_keywords += 1;
+                }
+                KeywordTarget::Unknown => {
+                    let message = format!(
+                        "{}() got an unexpected keyword argument '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                KeywordTarget::PositionalOnly => {
+                    let message = format!(
+                        "{}() got some positional-only arguments passed as keyword \
+                         arguments: '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+            }
+        }
+        if given < signature.required_positional
+            || signature.keyword_only_required
+            || !keywords.is_empty()
+        {
+            self.check_required_parameters(function, code, filled, keywords)?;
+        }
+        // Allocate the variadic containers from the stack values, which stay rooted meanwhile.
+        let variadic = match signature.variadic_slot {
+            Some(_) if given > signature.positional_count => {
+                let first_extra = signature.positional_count.saturating_sub(receiver_offset);
+                let mut extras = Vec::with_capacity(given - signature.positional_count);
+                if signature.positional_count == 0 {
+                    extras.extend(receiver);
+                }
+                for index in first_extra..positional {
+                    extras.push(self.peek(count - 1 - index)?);
+                }
+                self.reserve_result(extras.len().saturating_mul(64))?;
+                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extras)))?)
+            }
+            Some(_) => Some(self.alloc_with(|builder| Object::Tuple(builder.refs([])))?),
+            None => None,
         };
+        let keyword_variadic = match signature.keyword_variadic_slot {
+            Some(_) => {
+                let mut entries = Vec::with_capacity(extra_keywords);
+                for (index, keyword) in keywords.iter().enumerate() {
+                    let name = keyword.as_deref().expect("keywords were validated above");
+                    if !matches!(keyword_target(code, name), KeywordTarget::Slot(_)) {
+                        let key = self.allocate_string(name.to_string())?;
+                        self.reserve_result(64)?;
+                        entries.push((key, self.peek(keywords.len() - 1 - index)?));
+                    }
+                }
+                Some(self.allocate_dict(entries)?)
+            }
+            None => None,
+        };
+        // Move the operands into the slots.
+        let receiver = receiver.map(|receiver| self.store(receiver));
+        let variadic = variadic.map(|value| self.store(value));
+        let keyword_variadic = keyword_variadic.map(|value| self.store(value));
+        let super::VmState { locals, stack, .. } = &mut *self.execution;
+        locals.extend(std::iter::repeat_with(|| None).take(code.local_names.len()));
+        let slots = &mut locals[locals_base..];
+        if let (Some(receiver), true) = (receiver, signature.positional_count > 0) {
+            slots[0] = Some(receiver);
+        }
+        for (index, value) in stack.drain_refs(arguments_start).enumerate() {
+            if index < positional {
+                let slot = index + receiver_offset;
+                if slot < signature.positional_count {
+                    slots[slot] = Some(value);
+                }
+            } else {
+                let name = keywords[index - positional]
+                    .as_deref()
+                    .expect("keywords were validated above");
+                if let KeywordTarget::Slot(slot) = keyword_target(code, name) {
+                    slots[slot] = Some(value);
+                }
+            }
+        }
+        stack.pop_ref();
+        if let (Some(slot), Some(value)) = (signature.variadic_slot, variadic) {
+            slots[slot] = Some(value);
+        }
+        if let (Some(slot), Some(value)) = (signature.keyword_variadic_slot, keyword_variadic) {
+            slots[slot] = Some(value);
+        }
+        let Object::Function(function_object) = self.state.heap.get(function)? else {
+            unreachable!("function was checked by the caller and remains a function");
+        };
+        if function_object.defaults.len() != signature.default_slots.len() {
+            return Err(format!(
+                "{}() has invalid default argument metadata",
+                function_object.name
+            ));
+        }
         for (&slot, default) in signature
             .default_slots
             .iter()
             .zip(&function_object.defaults)
         {
-            let local = &mut locals[locals_base + slot];
+            let local = &mut self.execution.locals[locals_base + slot];
             if local.is_none() {
                 *local = Some(default.dup());
             }
         }
-        let entry = FrameEntry::with_locals(function, closure, locals_base);
-        self.enter_python_function(function, &code, entry, mode)
-            .map(Some)
+        Ok(())
     }
 
-    /// Call a Python function through full argument binding: keyword and starred arguments,
-    /// variadic parameters, generators, heap-resident locals, and arity errors. `receiver`
-    /// becomes the first argument.
-    fn call_python_general(
+    /// The `TypeError` for a call that passes more positional arguments than the signature
+    /// takes, worded as CPython words it.
+    fn too_many_positional(
         &mut self,
         function: Value<'s>,
-        receiver: Option<Value<'s>>,
-        mut arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-        mode: CallMode,
-    ) -> Result<Flow, String> {
-        let FunctionParts {
-            name,
-            code,
-            closure,
-            defaults,
-        } = self
-            .function_parts(function)?
-            .ok_or("bound descriptor is not callable")?;
-        if let Some(receiver) = receiver {
-            arguments.insert(0, receiver);
-        }
-        let locals =
-            self.bind_function_locals(&name, &code, &defaults, arguments, keyword_arguments)?;
-        if code.call_signature.is_generator || code.call_signature.is_coroutine {
-            return self.create_generator(function, &code, closure, locals);
-        }
-        if self.call_depth == Self::MAX_CALL_DEPTH {
-            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
-        }
-        let entry = if code.call_signature.heap_locals {
-            let scope = self.function_scope(&code, closure, locals)?;
-            FrameEntry::function(function, scope)
+        code: &CodeRef,
+        given: usize,
+        keywords: &[KeywordName],
+    ) -> String {
+        let count = code.call_signature.positional_count;
+        let required = code.parameters[..count]
+            .iter()
+            .filter(|parameter| !parameter.has_default)
+            .count();
+        let takes = if required == count {
+            format!(
+                "{count} positional argument{}",
+                if count == 1 { "" } else { "s" }
+            )
         } else {
-            let locals_base = self.execution.locals.len();
-            let stored = locals
-                .into_iter()
-                .map(|value| value.map(|value| self.store(value)))
-                .collect::<Vec<_>>();
-            self.execution.locals.extend(stored);
-            FrameEntry::with_locals(function, closure, locals_base)
+            format!("from {required} to {count} positional arguments")
         };
-        self.enter_python_function(function, &code, entry, mode)
+        let keyword_only = keywords
+            .iter()
+            .filter(|keyword| {
+                code.parameters.iter().any(|parameter| {
+                    Some(parameter.name.as_str()) == keyword.as_deref()
+                        && parameter.kind == ParameterKind::KeywordOnly
+                })
+            })
+            .count();
+        let keyword_detail = if keyword_only == 0 {
+            String::new()
+        } else {
+            format!(
+                " positional argument{} (and {keyword_only} keyword-only argument{})",
+                if given == 1 { "" } else { "s" },
+                if keyword_only == 1 { "" } else { "s" }
+            )
+        };
+        let verb = if given == 1 && keyword_only == 0 {
+            "was"
+        } else {
+            "were"
+        };
+        let message = format!(
+            "{}() takes {takes} but {given}{keyword_detail} {verb} given",
+            self.function_name(&self.store(function))
+        );
+        self.raise_exception("TypeError", message)
+    }
+
+    /// Raise the `TypeError` for parameters without a default that neither the `filled`
+    /// positional slots nor `keywords` supply.
+    fn check_required_parameters(
+        &mut self,
+        function: Value<'s>,
+        code: &CodeRef,
+        filled: usize,
+        keywords: &[KeywordName],
+    ) -> Result<(), String> {
+        let missing = |keyword_only: bool| {
+            code.parameters
+                .iter()
+                .enumerate()
+                .filter(|(slot, parameter)| {
+                    let kind_matches = match parameter.kind {
+                        ParameterKind::PositionalOnly | ParameterKind::Positional => !keyword_only,
+                        ParameterKind::KeywordOnly => keyword_only,
+                        ParameterKind::Variadic | ParameterKind::KeywordVariadic => false,
+                    };
+                    let supplied = *slot < filled
+                        || keywords
+                            .iter()
+                            .any(|keyword| keyword.as_deref() == Some(parameter.name.as_str()));
+                    kind_matches && !supplied && !parameter.has_default
+                })
+                .map(|(_, parameter)| format!("'{}'", parameter.name))
+                .collect::<Vec<_>>()
+        };
+        for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
+            let names = missing(keyword_only);
+            if names.is_empty() {
+                continue;
+            }
+            let plural = if names.len() == 1 { "" } else { "s" };
+            let message = format!(
+                "{}() missing {} required {description} argument{plural}: {}",
+                self.function_name(&self.store(function)),
+                names.len(),
+                english_list(&names)
+            );
+            return Err(self.raise_exception("TypeError", message));
+        }
+        Ok(())
     }
 
     /// Run `code` for `function` in a frame whose locals are already bound. A deferred call
@@ -1770,149 +2017,6 @@ impl<'s> Vm<'s> {
             locals,
             HashMap::new(),
         )
-    }
-
-    /// Bind one invocation directly into the compiler's local-slot layout.
-    fn bind_function_locals(
-        &mut self,
-        name: &str,
-        code: &CodeRef,
-        defaults: &[Value<'s>],
-        mut arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<Vec<Option<Value<'s>>>, String> {
-        let signature = &code.call_signature;
-        if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
-            let required = code.parameters[..signature.positional_count]
-                .iter()
-                .filter(|parameter| !parameter.has_default)
-                .count();
-            let takes = match (required, signature.positional_count) {
-                (required, count) if required == count => format!(
-                    "{count} positional argument{}",
-                    if count == 1 { "" } else { "s" }
-                ),
-                (required, count) => format!("from {required} to {count} positional arguments"),
-            };
-            let given = arguments.len();
-            let keyword_only = keyword_arguments
-                .iter()
-                .filter(|(keyword, _)| {
-                    code.parameters.iter().any(|parameter| {
-                        parameter.name == *keyword
-                            && parameter.kind == super::super::bytecode::ParameterKind::KeywordOnly
-                    })
-                })
-                .count();
-            let keyword_detail = if keyword_only == 0 {
-                String::new()
-            } else {
-                format!(
-                    " positional argument{} (and {keyword_only} keyword-only argument{})",
-                    if given == 1 { "" } else { "s" },
-                    if keyword_only == 1 { "" } else { "s" }
-                )
-            };
-            let verb = if given == 1 && keyword_only == 0 {
-                "was"
-            } else {
-                "were"
-            };
-            let message =
-                format!("{name}() takes {takes} but {given}{keyword_detail} {verb} given");
-            return Err(self.raise_exception("TypeError", message));
-        }
-        let extra_positional =
-            if signature.variadic_slot.is_some() && arguments.len() > signature.positional_count {
-                arguments.split_off(signature.positional_count)
-            } else {
-                Vec::new()
-            };
-        let mut locals = vec![None; code.local_names.len()];
-        for (slot, value) in arguments.into_iter().enumerate() {
-            locals[slot] = Some(value);
-        }
-        if let Some(slot) = signature.variadic_slot {
-            locals[slot] =
-                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extra_positional)))?);
-        }
-        let mut extra_keywords = Vec::new();
-        for (keyword, value) in keyword_arguments {
-            let slot = code.parameters.iter().position(|parameter| {
-                parameter.name == keyword
-                    && matches!(
-                        parameter.kind,
-                        super::super::bytecode::ParameterKind::Positional
-                            | super::super::bytecode::ParameterKind::KeywordOnly
-                    )
-            });
-            let Some(slot) = slot else {
-                if signature.keyword_variadic_slot.is_some() {
-                    let key = self.allocate_string(keyword)?;
-                    self.reserve_result(64)?;
-                    extra_keywords.push((key, value));
-                    continue;
-                }
-                let positional_only = code.parameters.iter().any(|parameter| {
-                    parameter.name == keyword
-                        && parameter.kind == super::super::bytecode::ParameterKind::PositionalOnly
-                });
-                let message = if positional_only {
-                    format!(
-                        "{name}() got some positional-only arguments passed as keyword \
-                         arguments: '{keyword}'"
-                    )
-                } else {
-                    format!("{name}() got an unexpected keyword argument '{keyword}'")
-                };
-                return Err(self.raise_exception("TypeError", message));
-            };
-            if locals[slot].replace(value).is_some() {
-                let message = format!("{name}() got multiple values for argument '{keyword}'");
-                return Err(self.raise_exception("TypeError", message));
-            }
-        }
-        if let Some(slot) = signature.keyword_variadic_slot {
-            locals[slot] = Some(self.allocate_dict(extra_keywords)?);
-        }
-        if defaults.len() != signature.default_slots.len() {
-            return Err(format!("{name}() has invalid default argument metadata"));
-        }
-        for (&slot, default) in signature.default_slots.iter().zip(defaults) {
-            if locals[slot].is_none() {
-                locals[slot] = Some(*default);
-            }
-        }
-        let missing = |keyword_only: bool| {
-            code.parameters
-                .iter()
-                .enumerate()
-                .filter(|(slot, parameter)| {
-                    let kind_matches = match parameter.kind {
-                        super::super::bytecode::ParameterKind::PositionalOnly
-                        | super::super::bytecode::ParameterKind::Positional => !keyword_only,
-                        super::super::bytecode::ParameterKind::KeywordOnly => keyword_only,
-                        _ => false,
-                    };
-                    kind_matches && locals[*slot].is_none() && !parameter.has_default
-                })
-                .map(|(_, parameter)| format!("'{}'", parameter.name))
-                .collect::<Vec<_>>()
-        };
-        for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
-            let names = missing(keyword_only);
-            if names.is_empty() {
-                continue;
-            }
-            let plural = if names.len() == 1 { "" } else { "s" };
-            let message = format!(
-                "{name}() missing {} required {description} argument{plural}: {}",
-                names.len(),
-                english_list(&names)
-            );
-            return Err(self.raise_exception("TypeError", message));
-        }
-        Ok(locals)
     }
 
     /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
@@ -2408,6 +2512,32 @@ impl<'s> Vm<'s> {
             }
         }
         self.allocate_string(text)
+    }
+}
+
+/// Where a keyword argument lands in a signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeywordTarget {
+    /// The local slot of a parameter the keyword may bind.
+    Slot(usize),
+    /// A positional-only parameter, which a keyword cannot bind.
+    PositionalOnly,
+    /// No parameter of that name; `**kwargs` collects it when the signature has one.
+    Unknown,
+}
+
+fn keyword_target(code: &CodeRef, name: &str) -> KeywordTarget {
+    match code
+        .parameters
+        .iter()
+        .position(|parameter| parameter.name == name)
+    {
+        Some(slot) => match code.parameters[slot].kind {
+            ParameterKind::Positional | ParameterKind::KeywordOnly => KeywordTarget::Slot(slot),
+            ParameterKind::PositionalOnly => KeywordTarget::PositionalOnly,
+            ParameterKind::Variadic | ParameterKind::KeywordVariadic => KeywordTarget::Unknown,
+        },
+        None => KeywordTarget::Unknown,
     }
 }
 
