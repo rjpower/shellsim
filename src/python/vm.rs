@@ -524,18 +524,10 @@ impl VmProgram {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            vm.bytecode_frames.push(BytecodeFrame {
-                code: self.code.clone(),
-                instruction_pointer: 0,
-                stack_base: 0,
-                locals_base: None,
-                scope: None,
-                enclosing: None,
-                handlers: Vec::new(),
-                exception_base: 0,
-                function_return: None,
-                pending_native_call: None,
-            });
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), None) else {
+                return VmPoll::Ready(ExecResult::Exit(137));
+            };
+            vm.bytecode_frames.push(frame);
             if let Some(docstring) = self.code.docstring.clone() {
                 // The script's leading string literal is `__doc__` in the main module, unless an
                 // interactive session already bound the name.
@@ -895,6 +887,8 @@ struct LoadAttributeCache {
 /// main program and `exec`/`eval` code own neither and fall through to the global table.
 struct BytecodeFrame {
     code: CodeRef,
+    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
+    code_cache: usize,
     instruction_pointer: usize,
     /// First operand owned by this frame in the VM's shared value stack.
     stack_base: usize,
@@ -919,6 +913,7 @@ impl Clone for BytecodeFrame {
     fn clone(&self) -> Self {
         Self {
             code: self.code.clone(),
+            code_cache: self.code_cache,
             instruction_pointer: self.instruction_pointer,
             stack_base: self.stack_base,
             locals_base: self.locals_base,
@@ -949,6 +944,16 @@ struct FrameEntry<'v> {
 }
 
 impl FrameEntry<'_> {
+    /// A frame for code that binds no locals of its own and resolves every name globally: the
+    /// main program.
+    fn bare() -> Self {
+        Self {
+            scope: None,
+            enclosing: None,
+            locals_base: None,
+        }
+    }
+
     /// A frame whose names all live in `scope`: module and class bodies, generators, and
     /// functions with heap-resident locals.
     fn scoped(scope: Value<'_>) -> FrameEntry<'_> {
@@ -1081,13 +1086,13 @@ impl DispatchCursor {
             .last()
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
+        let code_cache = frame.code_cache;
         let op_index = frame.instruction_pointer;
         let locals = match (frame.locals_base, &frame.scope) {
             (Some(base), _) => LocalsLocation::Stack(base),
             (None, Some(_)) => LocalsLocation::Heap,
             (None, None) => LocalsLocation::None,
         };
-        let code_cache = vm.ensure_code_cache(&code)?;
         Ok(Self {
             code,
             code_cache,

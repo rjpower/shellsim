@@ -1720,7 +1720,7 @@ impl<'s> Vm<'s> {
                 call_span,
                 pop_method_frame,
             };
-            let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return));
+            let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return))?;
             self.bytecode_frames.push(frame);
             return Ok(CallResult::EnteredFrame);
         }

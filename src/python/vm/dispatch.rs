@@ -31,7 +31,9 @@ impl<'s> Vm<'s> {
         entry: FrameEntry<'_>,
     ) -> Result<Execution, (String, super::super::source::Span)> {
         let exception_base = self.exception_stack.len();
-        let frame = self.enter_frame(code, instruction_pointer, stack_base, entry, None);
+        let frame = self
+            .enter_frame(code, instruction_pointer, stack_base, entry, None)
+            .map_err(|error| (error, super::super::source::Span::default()))?;
         self.bytecode_frames.push(BytecodeFrame {
             handlers: std::mem::take(handlers),
             exception_base,
@@ -70,9 +72,11 @@ impl<'s> Vm<'s> {
         stack_base: usize,
         entry: FrameEntry<'_>,
         function_return: Option<FunctionReturn>,
-    ) -> BytecodeFrame {
-        BytecodeFrame {
+    ) -> Result<BytecodeFrame, String> {
+        let code_cache = self.ensure_code_cache(code)?;
+        Ok(BytecodeFrame {
             code: code.clone(),
+            code_cache,
             instruction_pointer,
             stack_base,
             locals_base: entry.locals_base,
@@ -82,7 +86,7 @@ impl<'s> Vm<'s> {
             exception_base: self.exception_stack.len(),
             function_return,
             pending_native_call: None,
-        }
+        })
     }
 
     pub(super) fn execute_active_frame(
