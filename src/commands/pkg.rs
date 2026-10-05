@@ -141,6 +141,22 @@ pub(crate) fn resolve_install_args(
     interp: &Interp,
     args: &[String],
 ) -> Result<InstallRequest, String> {
+    resolve_install_options(interp, args, false)
+}
+
+/// uv suppresses progress without changing the offline installer or its operand boundary.
+pub(crate) fn resolve_uv_install_args(
+    interp: &Interp,
+    args: &[String],
+) -> Result<InstallRequest, String> {
+    resolve_install_options(interp, args, true)
+}
+
+fn resolve_install_options(
+    interp: &Interp,
+    args: &[String],
+    uv: bool,
+) -> Result<InstallRequest, String> {
     #[derive(Clone, Copy)]
     enum Key {
         Requirement,
@@ -148,6 +164,7 @@ pub(crate) fn resolve_install_args(
         NoDeps,
         NoCacheDir,
         DisableVersionCheck,
+        NoProgress,
     }
     const OPTIONS: &[OptionSpec<Key>] = &[
         OptionSpec::required(Key::Requirement, Some('r'), Some("requirement")),
@@ -159,8 +176,14 @@ pub(crate) fn resolve_install_args(
             None,
             Some("disable-pip-version-check"),
         ),
+        OptionSpec::flag(Key::NoProgress, None, Some("no-progress")),
     ];
-    let parsed = parse_options(args, OPTIONS)?;
+    let specs = if uv {
+        OPTIONS
+    } else {
+        &OPTIONS[..OPTIONS.len() - 1]
+    };
+    let parsed = parse_options(args, specs)?;
     let mut packages = resolve_package_specs(&parsed.operands)?;
     for option in parsed.options {
         match option.key {
@@ -168,7 +191,11 @@ pub(crate) fn resolve_install_args(
                 interp,
                 &option.value.expect("required option value"),
             )?),
-            Key::Quiet | Key::NoDeps | Key::NoCacheDir | Key::DisableVersionCheck => {}
+            Key::Quiet
+            | Key::NoDeps
+            | Key::NoCacheDir
+            | Key::DisableVersionCheck
+            | Key::NoProgress => {}
         }
     }
     if packages.is_empty() {

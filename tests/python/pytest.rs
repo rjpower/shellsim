@@ -39,6 +39,100 @@ fn accepts_common_presentation_only_flags() {
 }
 
 #[test]
+fn accepts_swe_verifier_flags_and_applies_warning_filters() {
+    let source =
+        "import warnings\ndef test_warn():\n    warnings.warn('old', DeprecationWarning)\n";
+    let command = "pytest --no-header -rA --tb=line --color=no -p no:cacheprovider -W ignore::DeprecationWarning --override-ini=addopts= --continue-on-collection-errors /test_sample.py";
+    let (status, stdout, stderr) = run_pytest(source, command);
+    assert_eq!(status, 0, "{}", String::from_utf8_lossy(&stderr));
+    assert_eq!(stdout, b"/test_sample.py::test_warn PASSED\n");
+    assert!(stderr.is_empty());
+    let (status, stdout, _) = run_pytest(
+        source,
+        "pytest -W error::DeprecationWarning /test_sample.py",
+    );
+    assert_eq!(status, 1);
+    assert!(String::from_utf8_lossy(&stdout).contains("FAILED"));
+}
+
+#[test]
+fn timeouts_fail_only_the_slow_item_using_virtual_cpu_and_sleep() {
+    for body in [
+        "while True:\n        pass",
+        "import time\n    time.sleep(1000)",
+    ] {
+        let source = format!("def test_slow():\n    {body}\ndef test_after():\n    assert True\n");
+        let (status, stdout, stderr) = run_pytest(&source, "pytest --timeout=0.01 /test_sample.py");
+        assert_eq!(status, 1, "{}", String::from_utf8_lossy(&stderr));
+        let stdout = String::from_utf8_lossy(&stdout);
+        assert!(stdout.contains("test_slow FAILED"), "{stdout}");
+        assert!(stdout.contains("test_after PASSED"), "{stdout}");
+    }
+    let (status, _, stderr) = run_pytest(
+        "def test_ok():\n    pass\n",
+        "pytest --timeout=120 /test_sample.py",
+    );
+    assert_eq!(status, 0, "{stderr:?}");
+    let source = "import time\ndef test_one():\n    time.sleep(0.008)\ndef test_two():\n    time.sleep(0.008)\n";
+    let (status, _, stderr) = run_pytest(source, "pytest --timeout=0.01 /test_sample.py");
+    assert_eq!(status, 0, "{stderr:?}");
+    let (status, _, stderr) = run_pytest(source, "pytest --timeout=0 /test_sample.py");
+    assert_eq!(status, 0, "{stderr:?}");
+}
+
+#[test]
+fn pytest_timeout_cannot_override_the_environment_resource_limit() {
+    let mut env = Environment::new();
+    env.vfs
+        .write(
+            "/",
+            "/test.py",
+            b"def test_loop():\n    while True:\n        pass\n",
+            0o644,
+        )
+        .unwrap();
+    env.resources = shellsim::resources::Resources::new(shellsim::Limits {
+        cpu: 100_000,
+        ..Default::default()
+    });
+    let (outcome, _, _) = env.run_script_capture("pytest --timeout=120 /test.py");
+    assert_eq!(
+        outcome.stop_reason,
+        Some(shellsim::StopReason::CpuExhausted)
+    );
+}
+
+#[test]
+fn collection_errors_continue_and_discovery_is_virtual() {
+    let mut env = Environment::new();
+    env.vfs.mkdir_all("/", "/work/tests").unwrap();
+    for (name, source) in [
+        ("test_bad.py", "def broken(:\n"),
+        (
+            "test_import.py",
+            "raise ValueError('bad import')\ndef test_no():\n    pass\n",
+        ),
+        ("test_good.py", "def test_ok():\n    assert True\n"),
+    ] {
+        env.vfs
+            .write(
+                "/",
+                &format!("/work/tests/{name}"),
+                source.as_bytes(),
+                0o644,
+            )
+            .unwrap();
+    }
+    let (outcome, stdout, stderr) =
+        env.run_script_capture("cd /work; pytest --continue-on-collection-errors");
+    assert_eq!(outcome.exit_status, 1, "{stderr:?}");
+    let stdout = String::from_utf8_lossy(&stdout);
+    assert!(stdout.contains("test_good.py::test_ok PASSED"), "{stdout}");
+    assert!(stdout.contains("test_import.py ERROR"), "{stdout}");
+    assert!(!stdout.contains("test_no PASSED"));
+}
+
+#[test]
 fn assert_and_pytest_controls_have_expected_statuses() {
     let source = "import pytest\ndef test_assertion():\n    assert 1 == 2, 'nope'\ndef test_skip():\n    pytest.skip('later')\ndef test_raises():\n    with pytest.raises(ValueError):\n        raise ValueError('bad')\n";
     let (status, stdout, stderr) = run_pytest(source, "python3.14 -m pytest /test_sample.py");

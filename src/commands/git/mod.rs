@@ -15,6 +15,7 @@
 //! would need a network is refused and recorded as unsupported.
 
 mod apply;
+mod archive;
 mod commit;
 mod compare;
 mod config;
@@ -49,6 +50,7 @@ usage: git [-C DIRECTORY] [-c NAME=VALUE] COMMAND [ARGUMENTS]
 Supported commands:
    add         stage working-tree contents
    apply       apply a unified diff to the working tree
+   archive     write committed files as a tar archive
    branch      list, create, rename, or delete branches
    cat-file    show an object's type, size, or contents
    check-ignore report which paths .gitignore excludes
@@ -622,6 +624,7 @@ fn dispatch(
         "remote" => config::git_remote(system, globals, args, io),
         "stash" => stash::git_stash(system, args, io),
         "apply" => apply::git_apply(system, args, io),
+        "archive" => archive::git_archive(system, args, io),
         "grep" => plumbing::git_grep(system, args, io),
         "cat-file" => plumbing::git_cat_file(system, args, io),
         "hash-object" => plumbing::git_hash_object(system, args, io),

@@ -29,21 +29,26 @@ pub(crate) fn parse_head_options(args: &[String]) -> Result<HeadOptions, String>
     let mut lines = 10usize;
     let mut bytes = None;
     let mut files = Vec::new();
+    let mut operands_only = false;
     let mut it = args.iter().peekable();
     while let Some(arg) = it.next() {
-        if arg == "-n" {
+        if operands_only {
+            files.push(arg.clone());
+        } else if arg == "--" {
+            operands_only = true;
+        } else if arg == "-n" {
             let value = it
                 .next()
                 .ok_or_else(|| "option requires an argument -- 'n'".to_string())?;
             lines = value
-                .trim_start_matches('-')
                 .parse()
                 .map_err(|_| format!("invalid number of lines: {value}"))?;
+            bytes = None;
         } else if let Some(value) = arg.strip_prefix("-n") {
             lines = value
-                .trim_start_matches('-')
                 .parse()
                 .map_err(|_| format!("invalid number of lines: {value}"))?;
+            bytes = None;
         } else if arg == "-c" {
             let value = it
                 .next()
@@ -63,7 +68,10 @@ pub(crate) fn parse_head_options(args: &[String]) -> Result<HeadOptions, String>
             && arg.len() > 1
             && arg[1..].chars().all(|character| character.is_ascii_digit())
         {
-            lines = arg[1..].parse().unwrap_or(10);
+            lines = arg[1..]
+                .parse()
+                .map_err(|_| format!("invalid number of lines: {arg}"))?;
+            bytes = None;
         } else if !arg.starts_with('-') || arg == "-" {
             files.push(arg.clone());
         } else {
@@ -102,9 +110,15 @@ fn cmd_tail(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     let mut bytes = false;
     let mut from_start = false;
     let mut files = Vec::new();
+    let mut operands_only = false;
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
-        if a == "-n" {
+        if operands_only {
+            files.push(a.clone());
+        } else if a == "--" {
+            operands_only = true;
+        } else if a == "-n" {
+            bytes = false;
             let Some(v) = it.next().cloned() else {
                 ewln(io.err, "tail: option requires an argument -- 'n'");
                 return ShellPoll::Ready(1);
@@ -142,6 +156,7 @@ fn cmd_tail(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
                 }
             };
         } else if let Some(v) = a.strip_prefix('+').filter(|value| !value.is_empty()) {
+            bytes = false;
             from_start = true;
             n = match v.parse() {
                 Ok(value) => value,
@@ -151,6 +166,7 @@ fn cmd_tail(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
                 }
             };
         } else if let Some(v) = a.strip_prefix("-n") {
+            bytes = false;
             from_start = v.starts_with('+');
             n = match v.trim_start_matches('+').trim_start_matches('-').parse() {
                 Ok(value) => value,
@@ -162,7 +178,15 @@ fn cmd_tail(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         } else if let Some(v) = a.strip_prefix('-').filter(|value| {
             !value.is_empty() && value.chars().all(|character| character.is_ascii_digit())
         }) {
-            n = v.parse().expect("validated decimal tail count");
+            bytes = false;
+            from_start = false;
+            n = match v.parse() {
+                Ok(value) => value,
+                Err(_) => {
+                    ewln(io.err, &format!("tail: invalid number of lines: {a}"));
+                    return ShellPoll::Ready(1);
+                }
+            };
         } else if a == "-f" || a == "-F" {
             ewln(io.err, "tail: unimplemented follow mode");
             return ShellPoll::Ready(2);

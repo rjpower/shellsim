@@ -41,6 +41,8 @@ pub(crate) enum RightSide {
 #[derive(Clone, Debug)]
 pub(crate) struct Options {
     pub format: Format,
+    /// Use NUL separators for path listings.
+    pub zero_terminated: bool,
     pub context: usize,
     pub right: RightSide,
     /// Repository-relative path prefixes to restrict the comparison to.
@@ -63,6 +65,7 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             format: Format::Patch,
+            zero_terminated: false,
             context: DEFAULT_CONTEXT,
             right: RightSide::Stored,
             paths: Vec::new(),
@@ -151,18 +154,20 @@ pub(crate) fn emit(
     if changed.is_empty() && renames.is_empty() {
         return false;
     }
+    let end = if options.zero_terminated { "\0" } else { "\n" };
     if options.format == Format::NameOnly {
         for (_, to) in &renames {
-            io.print(&format!("{to}\n"));
+            io.print(&format!("{to}{end}"));
         }
         for path in &changed {
-            io.print(&format!("{path}\n"));
+            io.print(&format!("{path}{end}"));
         }
         return false;
     }
     if options.format == Format::NameStatus {
         for (from, to) in &renames {
-            io.print(&format!("R100\t{from}\t{to}\n"));
+            let field = if options.zero_terminated { "\0" } else { "\t" };
+            io.print(&format!("R100{field}{from}{field}{to}{end}"));
         }
         for path in &changed {
             let status = status_letter(
@@ -170,7 +175,8 @@ pub(crate) fn emit(
                 new.contains_key(path),
                 options.unmerged.contains(path),
             );
-            io.print(&format!("{status}\t{path}\n"));
+            let field = if options.zero_terminated { "\0" } else { "\t" };
+            io.print(&format!("{status}{field}{path}{end}"));
         }
         return false;
     }
@@ -589,6 +595,7 @@ pub(crate) fn git_diff(system: &mut dyn System, args: &[String], io: &mut Io) ->
             Arg::Option { name, attached } => (name, attached),
         };
         match name.as_str() {
+            "-z" => options.zero_terminated = true,
             "--cached" | "--staged" => cached = true,
             "--quiet" => options.quiet = true,
             "--exit-code" => exit_code = true,
@@ -598,6 +605,17 @@ pub(crate) fn git_diff(system: &mut dyn System, args: &[String], io: &mut Io) ->
                 }
             }
         }
+    }
+    if options.zero_terminated
+        && !matches!(
+            options.format,
+            Format::NameOnly | Format::NameStatus | Format::Patch
+        )
+    {
+        return usage(
+            io,
+            "-z is supported with --name-only, --name-status, or patch output",
+        );
     }
     if exit_code && !options.quiet {
         // `--exit-code` still prints the patch; only `--quiet` suppresses it.

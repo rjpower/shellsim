@@ -22,6 +22,7 @@ mod arcmd;
 mod awk;
 mod bc;
 mod builtins;
+pub(crate) use builtins::ReadFraming;
 mod dd;
 mod diff;
 mod echo;

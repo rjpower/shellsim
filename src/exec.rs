@@ -364,6 +364,7 @@ enum ShellFrame {
     FinishFunction {
         positional: crate::variables::Positional,
         variables: Vec<(String, Option<String>)>,
+        err_trap_active: bool,
     },
     FinishInlineCommand {
         variables: Vec<(String, Option<String>)>,
@@ -377,6 +378,12 @@ enum ShellFrame {
     FinishExitTrap {
         previous_status: i32,
     },
+    /// Test the status of a completed command or pipeline before advancing its enclosing list.
+    CheckError,
+    FinishErrorTrap {
+        previous_status: i32,
+        errexit_exempt: bool,
+    },
     ResumeCommand {
         variables: Vec<(String, Option<String>)>,
         continuation: crate::commands::CommandResume,
@@ -386,6 +393,7 @@ enum ShellFrame {
         variables: Vec<(String, Option<String>)>,
         stdin: Vec<u8>,
         reserved: u64,
+        framing: Option<crate::commands::ReadFraming>,
     },
     WriteCommandOutput {
         command: String,
@@ -410,6 +418,7 @@ enum ShellFrame {
 
 #[derive(Clone)]
 struct PreparedCommand {
+    body: Option<Node>,
     assigns: Vec<(String, String)>,
     words: Vec<String>,
     redirects: Vec<Redirect>,
@@ -506,6 +515,8 @@ pub(crate) struct ShellContinuation {
     /// the process image as Bash does, keeping `$!` and pipeline PIDs on the real program.
     exec_tail: bool,
     replaced: bool,
+    /// Pipeline status is handled by its parent; nested commands still run their own ERR traps.
+    pipeline_entry: bool,
 }
 
 impl ShellContinuation {
@@ -520,6 +531,7 @@ impl ShellContinuation {
             exit_trap_started: false,
             exec_tail: false,
             replaced: false,
+            pipeline_entry: false,
         }
     }
 
@@ -567,11 +579,14 @@ impl ShellContinuation {
                 return ShellPoll::Ready(self.status);
             };
             self.step(interp, frame);
-            // Record a finished command's PIPESTATUS in the same step, so bookkeeping does not
-            // change how much work fits in a scheduler quantum.
-            while matches!(self.frames.last(), Some(ShellFrame::RecordPipeStatus)) {
-                self.frames.pop();
-                interp.set_array("PIPESTATUS", vec![self.status.to_string()]);
+            // Status bookkeeping must not consume another scheduler quantum. A triggered ERR
+            // handler pushes actual execution frames and therefore ends this bookkeeping loop.
+            while matches!(
+                self.frames.last(),
+                Some(ShellFrame::RecordPipeStatus | ShellFrame::CheckError)
+            ) {
+                let frame = self.frames.pop().expect("status bookkeeping frame");
+                self.step(interp, frame);
             }
             interp.last_status = self.status;
             if self.replaced {
@@ -641,7 +656,9 @@ impl ShellContinuation {
                 ShellFrame::FinishFunction {
                     positional,
                     variables,
+                    err_trap_active,
                 } => {
+                    interp.err_trap_active = err_trap_active;
                     interp.leave_function_scope();
                     interp.process.frame_saved_bytes = interp
                         .process
@@ -660,6 +677,7 @@ impl ShellContinuation {
                 }
                 ShellFrame::FinishSignalHandler { .. } => interp.finish_signal_handler(),
                 ShellFrame::FinishExitTrap { .. } => {}
+                ShellFrame::FinishErrorTrap { .. } => interp.handling_error = false,
                 ShellFrame::FinishLoop => {
                     interp.loop_depth = interp.loop_depth.saturating_sub(1);
                 }
@@ -917,6 +935,11 @@ impl ShellContinuation {
         }
         if let Some(scope) = redirect_scope {
             self.frames.push(ShellFrame::RestoreRedirect(scope));
+        }
+        if let Some(body) = command.body {
+            restore_command_variables(interp, command.temporary_variables);
+            self.frames.push(ShellFrame::Eval(body));
+            return;
         }
         self.frames.push(ShellFrame::RunCommand {
             assigns: command.assigns,
@@ -1633,7 +1656,9 @@ impl ShellContinuation {
             ShellFrame::FinishFunction {
                 positional,
                 variables,
+                err_trap_active,
             } => {
+                interp.err_trap_active = err_trap_active;
                 interp.leave_function_scope();
                 interp.process.frame_saved_bytes = interp
                     .process
@@ -1669,6 +1694,36 @@ impl ShellContinuation {
             }
             ShellFrame::FinishExitTrap { previous_status } => {
                 self.status = interp.exiting.take().unwrap_or(previous_status);
+            }
+            ShellFrame::CheckError => {
+                if self.status != 0
+                    && interp.cond_depth == 0
+                    && !self.errexit_exempt
+                    && !interp.handling_error
+                    && !should_unwind(interp)
+                    && interp.err_trap_active
+                {
+                    if let Some(crate::interp::ShellSignalDisposition::Handler { body, .. }) =
+                        interp.err_disposition.clone()
+                    {
+                        if self.ensure_capacity(interp, 2) {
+                            interp.handling_error = true;
+                            self.frames.push(ShellFrame::FinishErrorTrap {
+                                previous_status: self.status,
+                                errexit_exempt: self.errexit_exempt,
+                            });
+                            self.frames.push(ShellFrame::Eval(body));
+                        }
+                    }
+                }
+            }
+            ShellFrame::FinishErrorTrap {
+                previous_status,
+                errexit_exempt,
+            } => {
+                interp.handling_error = false;
+                self.status = interp.exiting.unwrap_or(previous_status);
+                self.errexit_exempt = errexit_exempt;
             }
             ShellFrame::ResumeCommand {
                 variables,
@@ -1736,9 +1791,19 @@ impl ShellContinuation {
                 variables,
                 mut stdin,
                 mut reserved,
+                framing,
             } => {
-                if crate::commands::buffers_standard_input(interp, &argv) {
-                    match interp.read_fd(0, crate::descriptors::DEFAULT_PIPE_CAPACITY) {
+                let read_record = framing.is_some();
+                let record_complete = framing.is_some_and(|framing| framing.complete(&stdin));
+                if !record_complete
+                    && (read_record || crate::commands::buffers_standard_input(interp, &argv))
+                {
+                    let capacity = if read_record {
+                        1
+                    } else {
+                        crate::descriptors::DEFAULT_PIPE_CAPACITY
+                    };
+                    match interp.read_fd(0, capacity) {
                         Ok(IoPoll::Ready(bytes)) if !bytes.is_empty() => {
                             let bytes_len = bytes.len() as u64;
                             if !interp.resources.reserve_memory(bytes_len) {
@@ -1754,6 +1819,7 @@ impl ShellContinuation {
                                 variables,
                                 stdin,
                                 reserved,
+                                framing,
                             });
                             return;
                         }
@@ -1763,6 +1829,7 @@ impl ShellContinuation {
                                 variables,
                                 stdin,
                                 reserved,
+                                framing,
                             });
                             self.blocked = Some(io_wait_reason(wait));
                             return;
@@ -1985,6 +2052,20 @@ impl ShellContinuation {
             };
             return;
         }
+        let pipeline_entry = std::mem::take(&mut self.pipeline_entry);
+        if !pipeline_entry
+            && matches!(
+                node,
+                Node::Command { .. }
+                    | Node::ArgvCommand(_)
+                    | Node::Subshell(_)
+                    | Node::Arithmetic(_)
+                    | Node::Pipeline(_)
+            )
+            && !self.push(interp, ShellFrame::CheckError)
+        {
+            return;
+        }
         if matches!(
             node,
             Node::Command { .. } | Node::ArgvCommand(_) | Node::Subshell(_) | Node::Arithmetic(_)
@@ -2003,6 +2084,7 @@ impl ShellContinuation {
                 self.push(
                     interp,
                     ShellFrame::PrepareCommand(PreparedCommand {
+                        body: None,
                         assigns,
                         words,
                         redirects,
@@ -2073,17 +2155,21 @@ impl ShellContinuation {
             Node::Group(inner) => {
                 self.push(interp, ShellFrame::Eval(*inner));
             }
-            Node::Redirected(inner, redirects) => match begin_redirects(interp, &redirects) {
-                Ok(scope) => {
-                    if self.push(interp, ShellFrame::RestoreRedirect(scope)) {
-                        self.push(interp, ShellFrame::Eval(*inner));
-                    }
-                }
-                Err(error) => {
-                    write_diagnostic(interp, &format!("shellsim: redirection: {error}\n"));
-                    self.status = 1;
-                }
-            },
+            Node::Redirected(inner, redirects) => {
+                self.push(
+                    interp,
+                    ShellFrame::PrepareCommand(PreparedCommand {
+                        body: Some(*inner),
+                        assigns: Vec::new(),
+                        words: Vec::new(),
+                        redirects,
+                        temporary_variables: Vec::new(),
+                        substitution_status: None,
+                        output_substitutions: Vec::new(),
+                        process_substitution_files: Vec::new(),
+                    }),
+                );
+            }
             Node::If {
                 cond,
                 then,
@@ -2254,9 +2340,12 @@ impl ShellContinuation {
                 .frame_saved_bytes
                 .saturating_add(saved_call_bytes(&positional, &variables));
             interp.enter_function_scope();
+            let err_trap_active = interp.err_trap_active;
+            interp.err_trap_active &= interp.opt_errtrace;
             self.frames.push(ShellFrame::FinishFunction {
                 positional,
                 variables,
+                err_trap_active,
             });
             self.frames.push(ShellFrame::Eval(body));
         } else {
@@ -2355,10 +2444,13 @@ impl ShellContinuation {
     fn exec_in_place(&mut self, interp: &mut Interp, argv: &[String]) -> bool {
         if !self.exec_tail
             || interp.exit_disposition.is_some()
+            || (interp.err_trap_active && interp.err_disposition.is_some())
             || !self.frames.iter().all(|frame| {
                 matches!(
                     frame,
-                    ShellFrame::RestoreRedirect(_) | ShellFrame::RecordPipeStatus
+                    ShellFrame::RestoreRedirect(_)
+                        | ShellFrame::RecordPipeStatus
+                        | ShellFrame::CheckError
                 )
             })
             || !crate::commands::execs_native_image(interp, &argv[0])
@@ -2458,6 +2550,7 @@ impl ShellContinuation {
             }
         } else {
             self.frames.push(ShellFrame::ReadCommandInput {
+                framing: (argv[0] == "read").then(|| crate::commands::ReadFraming::new(&argv[1..])),
                 argv,
                 variables,
                 stdin: Vec::new(),
@@ -2538,9 +2631,13 @@ impl ShellContinuation {
                         .install_process_description(pid, 1, *writer)
                         .map_err(|error| format!("{error:?}"))?;
                 }
-                interp
-                    .process
-                    .set_continuation(pid, Some(ShellContinuation::subshell(stage)))
+                interp.process.set_continuation(
+                    pid,
+                    Some(ShellContinuation {
+                        pipeline_entry: true,
+                        ..ShellContinuation::subshell(stage)
+                    }),
+                )
             })();
             if let Err(error) = setup {
                 interp.cancel_unstarted_child(pid);

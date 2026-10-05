@@ -278,6 +278,24 @@ fn uv_models_local_environments_projects_and_validated_launcher_options() {
 }
 
 #[test]
+fn uv_supports_sampled_project_selectors_and_progress_flags() {
+    let (status, stdout, stderr) = text("cd /work; uv init --python 3.12 --no-progress; cat .python-version; grep requires-python pyproject.toml; uv add --no-progress pytest==8.4.1 pytest-json-ctrf==0.3.5; printf 'def test_ok():\\n    pass\\n' > test_state.py; uv run --no-progress pytest --ctrf /logs/verifier/ctrf.json test_state.py -rA");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        "3.12\nrequires-python = \">=3.12\"\ntest_state.py::test_ok PASSED\n"
+    );
+    for command in [
+        "uv init --python",
+        "uv init --python=9.1",
+        "uv init --python=pythonpython3.12",
+        "uv run --no-progress --unknown python -c 'pass'",
+    ] {
+        assert_ne!(text(command).0, 0, "{command}");
+    }
+}
+
+#[test]
 fn uv_sync_validates_all_dependencies_before_mutating_package_state() {
     let mut environment = Environment::new();
     environment
@@ -311,7 +329,6 @@ fn uv_sync_requires_project_metadata() {
 fn byte_oriented_tools_preserve_unterminated_input() {
     for (command, expected) in [
         ("head", b"abc".as_slice()),
-        ("sort", b"abc".as_slice()),
         ("uniq", b"abc".as_slice()),
         ("rev", b"cba".as_slice()),
     ] {

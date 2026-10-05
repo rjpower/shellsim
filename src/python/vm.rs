@@ -619,6 +619,7 @@ pub(super) struct ProcessInput<'a> {
 /// the process continuation.
 #[derive(Default)]
 struct VmState {
+    test_timeout: Option<TestTimeout>,
     stack: ValueStack,
     bytecode_frames: Vec<BytecodeFrame>,
     /// Local slots of every frame that keeps its locals in the VM, frames stacked in call
@@ -668,6 +669,7 @@ struct VmState {
 impl Clone for VmState {
     fn clone(&self) -> Self {
         Self {
+            test_timeout: self.test_timeout,
             stack: self.stack.clone(),
             bytecode_frames: self.bytecode_frames.clone(),
             locals: self
@@ -700,6 +702,25 @@ impl Clone for VmState {
             transient_memory: self.transient_memory,
             retained_memory: self.retained_memory,
         }
+    }
+}
+
+/// Test deadlines include virtual waiting and modeled CPU time, never host elapsed time.
+#[derive(Clone, Copy)]
+struct TestTimeout {
+    wall_start: u64,
+    cpu_start: u64,
+    duration: u64,
+}
+
+impl TestTimeout {
+    fn remaining(self, interp: &Interp) -> u64 {
+        let wall = interp.clock.monotonic_ns().saturating_sub(self.wall_start);
+        let cpu = interp
+            .resources
+            .process_time_ns()
+            .saturating_sub(self.cpu_start);
+        self.duration.saturating_sub(wall.max(cpu))
     }
 }
 

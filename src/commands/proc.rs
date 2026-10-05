@@ -237,7 +237,7 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     }
     // ---- package management (takes priority so `uv pip install pytest` installs, not runs) ----
     if first == Some("add") {
-        let request = match crate::commands::pkg::resolve_install_args(interp, &args[1..]) {
+        let request = match crate::commands::pkg::resolve_uv_install_args(interp, &args[1..]) {
             Ok(request) => request,
             Err(error) => return uv_failure(interp, io, &error, &error, 1),
         };
@@ -247,13 +247,51 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
         return 0;
     }
     if first == Some("init") {
-        if args.len() != 1 {
-            return uv_failure(interp, io, "init-options", "unsupported init option", 2);
+        let mut python = None;
+        let mut index = 1;
+        while let Some(arg) = args.get(index) {
+            if arg == "--no-progress" {
+                index += 1;
+                continue;
+            }
+            let value = if arg == "--python" || arg == "-p" {
+                index += 1;
+                args.get(index).map(String::as_str)
+            } else {
+                arg.strip_prefix("--python=")
+            };
+            let Some(value) = value.filter(|value| modeled_python_selector(value)) else {
+                return uv_failure(
+                    interp,
+                    io,
+                    "init-options",
+                    "unsupported init option or Python selector",
+                    2,
+                );
+            };
+            python = Some(value.strip_prefix("python").unwrap_or(value));
+            index += 1;
         }
         let path = crate::vfs::resolve_against(&interp.cwd, "pyproject.toml");
         if !interp.vfs.is_file("/", &path) {
             let source = b"[project]\nname = \"app\"\nversion = \"0.1.0\"\ndependencies = []\n";
-            if let Err(error) = interp.vfs.put_file(&path, source.to_vec(), 0o644) {
+            let mut source = source.to_vec();
+            if let Some(version) = python {
+                source.extend_from_slice(format!("requires-python = \">={version}\"\n").as_bytes());
+                let version_path = crate::vfs::resolve_against(&interp.cwd, ".python-version");
+                if let Err(error) =
+                    interp
+                        .vfs
+                        .put_file(&version_path, format!("{version}\n").into_bytes(), 0o644)
+                {
+                    ewln(
+                        io.err,
+                        &format!("uv: cannot record Python request: {error}"),
+                    );
+                    return 1;
+                }
+            }
+            if let Err(error) = interp.vfs.put_file(&path, source, 0o644) {
                 ewln(
                     io.err,
                     &format!("uv: cannot create pyproject.toml: {error}"),
@@ -354,6 +392,14 @@ fn cmd_uv(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 
     )
 }
 
+/// Selectors express a project request; the embedded runtime retains its modeled 3.14 semantics.
+fn modeled_python_selector(value: &str) -> bool {
+    matches!(
+        value.strip_prefix("python").unwrap_or(value),
+        "3.11" | "3.12" | "3.13" | "3.14"
+    )
+}
+
 fn uv_launcher_args(interp: &mut Interp, args: &[String]) -> Result<Vec<String>, String> {
     let mut index = 0;
     let mut packages = Vec::new();
@@ -363,6 +409,10 @@ fn uv_launcher_args(interp: &mut Interp, args: &[String]) -> Result<Vec<String>,
             .map_or((argument.as_str(), None), |(option, value)| {
                 (option, Some(value))
             });
+        if argument == "--no-progress" {
+            index += 1;
+            continue;
+        }
         let needs_value = matches!(option, "-p" | "--python" | "-w" | "--with");
         if !needs_value {
             if argument == "--" {
@@ -383,17 +433,7 @@ fn uv_launcher_args(interp: &mut Interp, args: &[String]) -> Result<Vec<String>,
                 .ok_or_else(|| format!("option '{option}' requires a value"))?
         };
         if matches!(option, "-p" | "--python") {
-            if !matches!(
-                value,
-                "3.11"
-                    | "3.12"
-                    | "3.13"
-                    | "3.14"
-                    | "python3.11"
-                    | "python3.12"
-                    | "python3.13"
-                    | "python3.14"
-            ) {
+            if !modeled_python_selector(value) {
                 return Err(format!("Python selector '{value}' is not modeled"));
             }
         } else {

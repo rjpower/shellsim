@@ -174,9 +174,12 @@ impl PyClock for Vm<'_> {
     }
 
     fn sleep(&mut self, seconds: f64) -> PyResult<'static, ()> {
-        let nanos = seconds * crate::clock::NANOS_PER_SECOND as f64;
+        let mut nanos = seconds * crate::clock::NANOS_PER_SECOND as f64;
         if nanos > u64::MAX as f64 {
             return Err(PyError::overflow_error("time.sleep() length is too large"));
+        }
+        if let Some(timeout) = self.execution.test_timeout {
+            nanos = nanos.min(timeout.remaining(self.interp) as f64);
         }
         if self.mode.scheduler_owned && self.native_suspend_allowed {
             let event = self

@@ -52,6 +52,57 @@ fn standard_paths_and_environment_utilities() {
 }
 
 #[test]
+fn bin_entrypoints_resolve_native_images_through_the_vfs() {
+    for shell in ["/bin/bash", "/bin/sh", "/usr/bin/bash", "/usr/bin/sh"] {
+        assert_eq!(
+            run(&format!(
+                r#"PATH=/missing {shell} -lc 'printf "%s:%s\n" "$0" "$1"' entry value"#
+            )),
+            (0, "entry:value\n".into(), String::new()),
+            "{shell}"
+        );
+    }
+    assert_eq!(
+        run("PATH=/bin; command -v bash; printf 'one\\ntwo\\n' | /bin/head -n 1 | /bin/cat; /bin/env VALUE=ok /bin/printenv VALUE; /bin/echo done"),
+        (0, "/bin/bash\none\nok\ndone\n".into(), String::new())
+    );
+    assert_eq!(run("PATH=/missing; /bin/bash -c 'exit 7'").0, 7);
+}
+
+#[test]
+fn bin_entrypoints_preserve_permissions_and_exact_path_lookup() {
+    assert_eq!(run("/opt/bash -c 'echo no'").0, 127);
+    assert_eq!(run("chmod -x /bin/bash; /bin/bash -c 'echo no'").0, 126);
+    assert_eq!(run("rm /bin/bash; /bin/bash -c 'echo no'").0, 127);
+    assert_eq!(
+        run("printf 'printf replacement' > /bin/bash; chmod +x /bin/bash; /bin/bash"),
+        (0, "replacement".into(), String::new())
+    );
+}
+
+#[test]
+fn dataset_capture_entrypoint_uses_absolute_bash_and_head_operand_boundary() {
+    assert_eq!(
+        run(
+            r#"cd /work; printf abcdef > ./-capture; /bin/bash -lc 'head -c "$2" -- "$1"' capture -capture 3"#
+        ),
+        (0, "abc".into(), String::new())
+    );
+}
+
+#[test]
+fn bin_images_are_available_without_writable_disk_capacity() {
+    let mut environment = Environment::with_limits(shellsim::Limits {
+        disk: 0,
+        ..Default::default()
+    });
+    let (outcome, stdout, stderr) =
+        environment.run_script_capture("/bin/bash -c '/bin/echo ready'");
+    assert_eq!(outcome.exit_status, 0, "{:?}", stderr);
+    assert_eq!(stdout, b"ready\n");
+}
+
+#[test]
 fn path_resolves_only_executable_vfs_entries() {
     assert_eq!(
         run(
@@ -97,7 +148,7 @@ fn command_v_finds_shell_builtins_without_path_entries() {
     assert_eq!(run("PATH=/missing command -v cat").0, 1);
     assert_eq!(
         run("unset PATH; command -v cat; PATH='' command -v cat"),
-        (1, "/usr/bin/cat\n".into(), String::new())
+        (1, "/bin/cat\n".into(), String::new())
     );
 }
 

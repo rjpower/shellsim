@@ -22,6 +22,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         Numeric,
         Reverse,
         Unique,
+        ZeroTerminated,
         FoldCase,
         Stable,
         Fields,
@@ -32,6 +33,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     const OPTIONS: &[OptionSpec<Key>] = &[
         OptionSpec::flag(Key::Numeric, Some('n'), Some("numeric-sort")),
         OptionSpec::flag(Key::Reverse, Some('r'), Some("reverse")),
+        OptionSpec::flag(Key::ZeroTerminated, Some('z'), Some("zero-terminated")),
         OptionSpec::flag(Key::Unique, Some('u'), Some("unique")),
         OptionSpec::flag(Key::FoldCase, Some('f'), Some("ignore-case")),
         OptionSpec::flag(Key::Stable, Some('s'), Some("stable")),
@@ -46,7 +48,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         OPTIONS,
         (
             Key::Help,
-            "usage: sort [OPTIONS] [FILE...]\nsupported: -n -r -u -f -s -k KEY -t CHAR -o FILE\n",
+            "usage: sort [OPTIONS] [FILE...]\nsupported: -n -r -u -z -f -s -k KEY -t CHAR -o FILE\n",
         ),
         io.out,
         io.err,
@@ -54,6 +56,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
         Ok(parsed) => parsed,
         Err(status) => return ShellPoll::Ready(status),
     };
+    let mut delimiter = b'\n';
     let mut numeric = false;
     let mut reverse = false;
     let mut unique = false;
@@ -66,6 +69,7 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
             Key::Numeric => numeric = true,
             Key::Reverse => reverse = true,
             Key::Unique => unique = true,
+            Key::ZeroTerminated => delimiter = 0,
             Key::FoldCase => fold_case = true,
             Key::Stable => {}
             Key::Fields => {
@@ -109,11 +113,11 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     }
     let line_count = data
         .iter()
-        .filter(|byte| **byte == b'\n')
+        .filter(|byte| **byte == delimiter)
         .count()
         .saturating_add(1) as u64;
     let scratch = (data.len() as u64)
-        .saturating_mul(2)
+        .saturating_mul(3)
         .saturating_add(line_count.saturating_mul(24));
     let comparisons = line_count.saturating_mul(line_count.max(1).ilog2() as u64);
     if !context.system.reserve_memory(scratch) {
@@ -128,13 +132,19 @@ fn run(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
     }
 
     let mut lines = data
-        .split_inclusive(|byte| *byte == b'\n')
-        .map(<[u8]>::to_vec)
+        .split_inclusive(|byte| *byte == delimiter)
+        .map(|record| {
+            let mut record = record.to_vec();
+            if record.last() != Some(&delimiter) {
+                record.push(delimiter);
+            }
+            record
+        })
         .collect::<Vec<_>>();
     let compare = |a: &[u8], b: &[u8]| {
         let text = |line: &[u8]| {
             String::from_utf8_lossy(line)
-                .trim_end_matches('\n')
+                .trim_end_matches(char::from(delimiter))
                 .to_string()
         };
         let field = |line: &[u8]| {
