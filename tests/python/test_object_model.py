@@ -939,3 +939,139 @@ def test_vars_requires_an_object_with_a_dict():
         pass
     else:
         raise AssertionError("object() reported having a __dict__")
+
+
+class _Shout(str):
+    def __iter__(self):
+        return iter(["shout"])
+
+    def __repr__(self):
+        return "Shout(" + str.__repr__(self) + ")"
+
+
+class _Tagged(list):
+    pass
+
+
+class _Flag(int):
+    pass
+
+
+def test_builtin_subclass_instances_carry_the_builtin_payload():
+    # A subclass instance is its builtin payload with the subclass as its type: builtin slots
+    # read the payload, the subclass's own slots win, and `Base.__slot__(instance)` delegates to
+    # the builtin behavior without dispatching back into the override.
+    shout = _Shout("hey")
+    assert (type(shout) is _Shout, isinstance(shout, str), str(shout)) == (True, True, "hey")
+    assert (list(shout), list(str.__iter__(shout))) == (["shout"], ["h", "e", "y"])
+    assert repr(shout) == "Shout('hey')" and shout.upper() == "HEY"
+    assert shout == "hey" and hash(shout) == hash("hey") and {shout: 1}["hey"] == 1
+
+    tagged = _Tagged([1, 2])
+    tagged.tag = "pair"
+    tagged.append(3)
+    assert (tagged, tagged.tag, len(tagged), tagged.__dict__) == ([1, 2, 3], "pair", 3, {"tag": "pair"})
+    assert list.__repr__(tagged) == "[1, 2, 3]" and type(tagged + [4]) is list
+
+    # An `int` subclass is a machine integer to every integer consumer, including index protocols.
+    flag = _Flag(2)
+    assert (flag + 1, [10, 20, 30][flag], "ab" * flag, flag.bit_length()) == (3, 30, "abab", 2)
+    assert type(flag + 0) is int and type(flag.conjugate()) is int and type(flag.real) is int
+    assert _Flag(2**70) == 2**70 and type(_Flag(2**70) - 2**70) is int
+
+    # Attributes survive collections in both shaped and dictionary storage.
+    kept = []
+    for index in range(2000):
+        item = _Tagged()
+        item.index = index
+        if index % 2:
+            item.extra = index
+            del item.index
+            item.index = index
+        kept.append(item)
+        _ = [object() for _ in range(20)]
+    assert all(item.index == index for index, item in enumerate(kept))
+    assert kept[1].extra == 1 and kept[3].__dict__ == {"extra": 3, "index": 3}
+
+
+class _Custom(ValueError):
+    pass
+
+
+def test_exception_instances_are_ordinary_instances():
+    # Builtin and user exception instances share one layout: the registered class as their type
+    # and `args` plus any assigned attribute in an instance dictionary.
+    for error in (KeyError("k"), _Custom("v", 2)):
+        error.extra = 5
+        error.note = "n"
+        del error.note
+        assert error.extra == 5 and vars(error) == {"extra": 5}
+        error.args = [1, 2]
+        assert error.args == (1, 2) and type(error.args) is tuple
+    empty = ValueError()
+    assert (empty.args, repr(empty), str(empty), vars(empty)) == ((), "ValueError()", "", {})
+    custom = _Custom("v", 2)
+    assert (repr(custom), str(custom), custom.args) == ("_Custom('v', 2)", "('v', 2)", ("v", 2))
+    assert isinstance(custom, ValueError) and type(custom) is _Custom
+    try:
+        raise custom
+    except ValueError as caught:
+        assert caught is custom and caught.extra if hasattr(caught, "extra") else True
+    key = KeyError("k")
+    assert (str(key), repr(key), key.args) == ("'k'", "KeyError('k')", ("k",))
+    try:
+        {}["missing"]
+    except KeyError as caught:
+        caught.extra = "seen"
+        assert caught.args == ("missing",) and caught.extra == "seen" and str(caught) == "'missing'"
+    try:
+        (1).extra = 2
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("int accepted an attribute")
+
+
+def test_enum_members_are_ordinary_instances():
+    import enum
+
+    class Color(enum.Enum):
+        RED = 1
+        GREEN = 2
+
+        def describe(self):
+            return self.name.lower() + "=" + str(self.value)
+
+    class Mode(str, enum.Enum):
+        FAST = "fast"
+        SLOW = "slow"
+
+    class Level(int, enum.Enum):
+        LOW = 1
+        HIGH = 10
+
+    # A member is an instance of its class whose name and value are instance attributes.
+    assert type(Color.RED) is Color and isinstance(Color.RED, enum.Enum)
+    assert (Color.RED.name, Color.RED.value, Color.RED.describe()) == ("RED", 1, "red=1")
+    assert vars(Color.RED)["_name_"] == "RED" and vars(Color.RED)["_value_"] == 1
+    assert (repr(Color.RED), str(Color.RED)) == ("<Color.RED: 1>", "Color.RED")
+    assert Color(2) is Color.GREEN and Color.RED != 1
+    assert hash(Color.RED) == hash("RED") and len({Color.RED, Color.RED, Color.GREEN}) == 2
+    assert [member.name for member in Color] == ["RED", "GREEN"]
+    try:
+        Color(7)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("Color(7) did not raise")
+    # A data mixin gives the member the value as its payload and keeps Enum's repr and str.
+    assert Mode.FAST == "fast" and Mode.FAST.upper() == "FAST" and Mode.FAST + "!" == "fast!"
+    assert (repr(Mode.FAST), str(Mode.FAST), f"{Mode.FAST}") == (
+        "<Mode.FAST: 'fast'>",
+        "Mode.FAST",
+        "Mode.FAST",
+    )
+    assert hash(Mode.FAST) == hash("fast") and str.__repr__(Mode.FAST) == "'fast'"
+    assert Mode("slow") is Mode.SLOW and isinstance(Mode.FAST, str)
+    assert Level.HIGH + 1 == 11 and Level.HIGH > Level.LOW and int(Level.HIGH) == 10
+    assert sorted([Level.HIGH, Level.LOW]) == [Level.LOW, Level.HIGH]

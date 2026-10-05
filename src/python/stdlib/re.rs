@@ -14,12 +14,15 @@ use std::cell::RefCell;
 
 use regex::{Captures, Regex, RegexBuilder};
 
+use super::super::heap::{NativeObject, Ref};
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString,
     PyConstant, PyError, PyIndex, PyMatch, PyMatchData, PyRegex, PyResult, PyRuntime, PyValue,
     PyValueCast, ValueDef,
 };
+use super::super::object_model::{BuiltinType, TypeId};
+use super::super::string::quote_string;
 
 pub(super) const IGNORECASE: u32 = 2;
 pub(super) const LOCALE: u32 = 4;
@@ -167,9 +170,109 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
+/// A compiled regular expression as the heap stores it. The pattern is compiled at the operation
+/// boundary so regex execution never gets a host capability; keeping the source and flags here
+/// also makes the object cheap to copy and deterministic to inspect.
+#[derive(Debug)]
+pub(crate) struct RegexObject {
+    pub pattern: String,
+    pub flags: u32,
+}
+
+impl NativeObject for RegexObject {
+    fn python_type(&self) -> TypeId {
+        BuiltinType::Regex.id()
+    }
+
+    fn modeled_bytes(&self) -> Result<u64, String> {
+        u64::try_from(self.pattern.len()).map_err(|_| "modeled object size overflow".into())
+    }
+
+    fn dup(&self) -> Box<dyn NativeObject> {
+        Box::new(Self {
+            pattern: self.pattern.clone(),
+            flags: self.flags,
+        })
+    }
+
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+        let flags = flag_repr(self.flags);
+        let pattern = quote_string(&self.pattern);
+        Ok(if flags.is_empty() {
+            format!("re.compile({pattern})")
+        } else {
+            format!("re.compile({pattern}, {flags})")
+        })
+    }
+}
+
+/// A match result as the heap stores it. The subject string and the `re.Pattern` are held by
+/// reference so a match costs its own group text, not a copy of the string it was found in.
+/// `spans` are character offsets into the subject per group, `None` for a group that did not
+/// participate.
+#[derive(Debug)]
+pub(crate) struct MatchObject {
+    pub subject: Ref,
+    pub regex: Ref,
+    pub text: String,
+    pub groups: Vec<Option<String>>,
+    pub group_names: Vec<Option<String>>,
+    pub spans: Vec<Option<(usize, usize)>>,
+    pub pos: usize,
+    pub endpos: usize,
+}
+
+impl NativeObject for MatchObject {
+    fn python_type(&self) -> TypeId {
+        BuiltinType::Match.id()
+    }
+
+    fn modeled_bytes(&self) -> Result<u64, String> {
+        let text = |values: &[Option<String>]| {
+            values
+                .iter()
+                .map(|value| value.as_ref().map_or(0, String::len))
+                .sum::<usize>()
+        };
+        self.text
+            .len()
+            .checked_add(self.spans.len().saturating_mul(16))
+            .and_then(|size| size.checked_add(text(&self.groups)))
+            .and_then(|size| size.checked_add(text(&self.group_names)))
+            .and_then(|size| u64::try_from(size).ok())
+            .ok_or_else(|| "modeled object size overflow".into())
+    }
+
+    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+        visit(&mut self.subject);
+        visit(&mut self.regex);
+    }
+
+    fn dup(&self) -> Box<dyn NativeObject> {
+        Box::new(Self {
+            subject: self.subject.dup(),
+            regex: self.regex.dup(),
+            text: self.text.clone(),
+            groups: self.groups.clone(),
+            group_names: self.group_names.clone(),
+            spans: self.spans.clone(),
+            pos: self.pos,
+            endpos: self.endpos,
+        })
+    }
+
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+        let (start, end) = self.spans.first().copied().flatten().unwrap_or((0, 0));
+        Ok(format!(
+            "<re.Match object; span=({start}, {end}), match={}>",
+            quote_string(&self.text)
+        ))
+    }
+}
+
 /// `re.compile('...', re.IGNORECASE|re.VERBOSE)`: the flag part of a pattern's repr, empty
 /// when only the implied UNICODE flag is set.
-pub(in crate::python) fn flag_repr(flags: u32) -> String {
+fn flag_repr(flags: u32) -> String {
     const NAMES: [(u32, &str); 6] = [
         (ASCII, "re.ASCII"),
         (IGNORECASE, "re.IGNORECASE"),

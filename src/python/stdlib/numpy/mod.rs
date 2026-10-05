@@ -38,6 +38,7 @@ mod scalar;
 mod select;
 mod shape;
 mod sort;
+pub(in crate::python) mod storage;
 mod ufunc;
 mod underflow;
 

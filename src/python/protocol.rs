@@ -1,7 +1,9 @@
-//! Central Python value protocols for truth, representation, equality, ordering, and containment.
+//! Heap-only Python value protocols: representation, truth, equality, ordering and containment.
 //!
-//! Container algorithms are deliberately linear. Correct behavior and one auditable dispatch
-//! point matter more than asymptotic performance for the bounded evaluator.
+//! These read builtin payloads directly and never run Python code, so the VM uses them as the
+//! fallback once no slot on the value's type claims the operation, and the REPL uses them to
+//! print values. Container algorithms are deliberately linear: correct behavior and one
+//! auditable dispatch point matter more than asymptotic performance for the bounded evaluator.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -9,9 +11,11 @@ use std::collections::BTreeSet;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
-use super::heap::{Heap, InstancePayload, NamespaceTarget, Object, Ref};
+use super::exception_types::{exception_args, exception_type_name};
+use super::heap::{Heap, NamespaceTarget, Object, Ref};
+use super::number::{bigint_value, int_value};
 use super::scopes;
-pub use super::string::{string_ref, string_value};
+use super::string::{bytes_ref, bytes_value, quote_bytes, quote_string, string_value};
 use super::{ReplState, Value};
 
 /// The object behind `value`, or `None` for an immediate.
@@ -58,11 +62,7 @@ fn display_inner(
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
     }
-    let user_exception = |state: &ReplState| {
-        user_exception_parts(state, value)
-            .map(|parts| parts.map(|exception| (exception.base.to_string(), exception.args)))
-    };
-    let Some((base, args)) = exception_args(heap, value)?.or(user_exception(state)?) else {
+    let Some((base, args)) = exception_args(state, value)? else {
         return render(state, value, active);
     };
     let id = heap
@@ -71,7 +71,7 @@ fn display_inner(
     if !active.insert(id) || active.len() >= MAX_RENDER_DEPTH {
         return Err(RECURSION_IN_STR.into());
     }
-    let message = exception_message(state, &base, &args, active);
+    let message = exception_message(state, base, &args, active);
     active.remove(&id);
     message
 }
@@ -97,128 +97,21 @@ pub fn repr(state: &ReplState, value: Value<'_>) -> Result<String, String> {
     render(state, value, &mut BTreeSet::new())
 }
 
-/// Return the integer payload of an immediate integer or an `int` subclass instance.
-pub fn int_value(heap: &Heap, value: Value<'_>) -> Option<i64> {
-    match super::number::index(heap, &value)? {
-        super::number::NumberRef::Int(value) => Some(value),
-        super::number::NumberRef::BigInt(_)
-        | super::number::NumberRef::UInt(_)
-        | super::number::NumberRef::Float(_)
-        | super::number::NumberRef::Complex(..) => None,
-    }
-}
-
-/// The outcome of `owner[index]` when `owner` may be a string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StringIndex {
-    NotString,
-    Character(char),
-    /// CPython raises `TypeError` for a non-integer index.
-    NotInteger,
-    /// CPython raises `IndexError`.
-    OutOfRange,
-}
-
-/// Return one Python string code point without materializing the complete string as characters.
-///
-/// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
-/// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
-pub fn string_index(
-    heap: &Heap,
-    owner: Value<'_>,
-    index: Value<'_>,
-) -> Result<StringIndex, String> {
-    let Some(text) = string_ref(heap, owner)? else {
-        return Ok(StringIndex::NotString);
-    };
-    let Some(index) = int_value(heap, index) else {
-        return Ok(StringIndex::NotInteger);
-    };
-    Ok(indexed_char(text.as_str(), index, text.is_ascii())
-        .map_or(StringIndex::OutOfRange, StringIndex::Character))
-}
-
-/// Return a string's Python length without cloning its arena payload.
-pub fn string_length(heap: &Heap, value: Value<'_>) -> Result<Option<usize>, String> {
-    let Some(text) = string_ref(heap, value)? else {
-        return Ok(None);
-    };
-    Ok(Some(if text.is_ascii() {
-        text.byte_len()
-    } else {
-        text.as_str().chars().count()
-    }))
-}
-
-fn indexed_char(value: &str, index: i64, is_ascii: bool) -> Option<char> {
-    if is_ascii {
-        let index = normalize_index(value.len(), index)?;
-        return value.as_bytes().get(index).copied().map(char::from);
-    }
-
-    let index = normalize_index(value.chars().count(), index)?;
-    value.chars().nth(index)
-}
-
-fn normalize_index(length: usize, index: i64) -> Option<usize> {
-    let index = if index < 0 {
-        length.checked_sub(usize::try_from(index.unsigned_abs()).ok()?)?
-    } else {
-        usize::try_from(index).ok()?
-    };
-    (index < length).then_some(index)
-}
-
-pub fn bytes_value(heap: &Heap, value: Value<'_>) -> Result<Option<Vec<u8>>, String> {
-    Ok(bytes_ref(heap, value)?.map(<[u8]>::to_vec))
-}
-
-/// Borrow the contents of a `bytes` or `bytearray` without copying them.
-pub fn bytes_ref<'heap>(
-    heap: &'heap Heap,
-    value: Value<'_>,
-) -> Result<Option<&'heap [u8]>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Bytes(value) | Object::ByteArray(value)) => Some(value),
-        Some(Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        }) => return bytes_ref(heap, heap.handle(value)),
-        _ => None,
-    })
-}
-
-/// The class name and `str()` of a builtin exception instance.
+/// The class name and `str()` of an exception instance, builtin or user-defined.
 pub fn exception_parts(
     state: &ReplState,
     value: Value<'_>,
 ) -> Result<Option<(String, String)>, String> {
-    let Some((kind, args)) = exception_args(&state.heap, value)? else {
+    let Some(name) = exception_type_name(state, value)? else {
         return Ok(None);
     };
+    let (base, args) = exception_args(state, value)?.ok_or("exception lost its type")?;
     let mut active = BTreeSet::new();
     if let Some(id) = state.heap.identity(value)? {
         active.insert(id);
     }
-    let message = exception_message(state, &kind, &args, &mut active)?;
-    Ok(Some((kind, message)))
-}
-
-/// The class name of a builtin exception instance, without rendering its message. Rendering can
-/// fail on self-referential arguments, so callers that only classify the value use this.
-pub fn exception_kind(state: &ReplState, value: Value<'_>) -> Result<Option<String>, String> {
-    Ok(exception_args(&state.heap, value)?.map(|(kind, _)| kind))
-}
-
-/// The class name and constructor arguments of a builtin exception instance.
-pub fn exception_args<'s>(
-    heap: &Heap,
-    value: Value<'_>,
-) -> Result<Option<(String, Vec<Value<'s>>)>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Exception { kind, args }) => Some((kind.clone(), heap.handles(args))),
-        _ => None,
-    })
+    let message = exception_message(state, base, &args, &mut active)?;
+    Ok(Some((name, message)))
 }
 
 /// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
@@ -265,69 +158,6 @@ fn exception_message(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", values.join(", ")))
         }
-    }
-}
-
-/// The builtin value behind an instance of a subclass of a builtin type such as `int` or
-/// `tuple`, which builtin operations the class does not override act on.
-pub fn builtin_payload<'s>(heap: &Heap, value: Value<'_>) -> Result<Option<Value<'s>>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        }) => Some(heap.handle(value)),
-        _ => None,
-    })
-}
-
-/// The closest builtin exception ancestor and the `args` of an instance of a user exception
-/// class.
-pub fn user_exception_args<'s>(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
-    Ok(user_exception_parts(state, value)?.map(|exception| (exception.base, exception.args)))
-}
-
-/// An instance of a user exception class: its closest builtin exception ancestor and `args`.
-struct UserException<'s> {
-    base: &'static str,
-    args: Vec<Value<'s>>,
-}
-
-fn user_exception_parts<'s>(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<UserException<'s>>, String> {
-    let heap = &state.heap;
-    let Some(Object::Instance { class, .. }) = object(heap, value)? else {
-        return Ok(None);
-    };
-    let Object::Class(class_object) = heap.get(heap.handle(class))? else {
-        return Ok(None);
-    };
-    let Some(base) = class_object.exception_base else {
-        return Ok(None);
-    };
-    let args = if let Some(symbol) = state.symbols.id("args") {
-        state
-            .shapes
-            .attribute_by_symbol(heap, value, symbol)?
-            .and_then(|args| match object(heap, args).ok()?? {
-                Object::Tuple(values) => Some(heap.handles(values)),
-                _ => None,
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    Ok(Some(UserException { base, args }))
-}
-
-pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
-    match object(heap, value).ok()?? {
-        Object::BigInt(value) => Some(value),
-        _ => None,
     }
 }
 
@@ -380,7 +210,7 @@ fn render_inner(
                 Object::String(_) => "<str ...>",
                 Object::Bytes(_) => "<bytes ...>",
                 Object::ByteArray(_) => "<bytearray ...>",
-                Object::Exception { .. } => "<exception ...>",
+                Object::Exception(_) => "<exception ...>",
                 Object::List(_) => "[...]",
                 Object::Tuple(_) => "(...)",
                 Object::Slice { .. } => "slice(...)",
@@ -390,7 +220,6 @@ fn render_inner(
                 Object::Range { .. } => "range(...)",
                 Object::Function { .. } => "<function ...>",
                 Object::Class { .. } => "<class ...>",
-                Object::Instance { .. } => "<instance ...>",
                 Object::DescriptorBoundMethod { .. } => "<bound method ...>",
                 Object::GenericAlias { .. } => "<generic alias ...>",
                 Object::Iterator { .. }
@@ -404,33 +233,35 @@ fn render_inner(
                 Object::NamespaceDict(_) => "{...}",
                 Object::DictView { .. } => "<dict view ...>",
                 Object::MappingProxy(_) => "mappingproxy(...)",
-                Object::ArrayStorage(_) => "<array storage ...>",
                 Object::WideValue { .. } => "<value ...>",
-                Object::Array { .. } => "array(...)",
-                Object::Regex { .. } => "re.compile(...) ",
-                Object::Match { .. } => "<re.Match ...>",
-                Object::ArgumentParser { .. } => "<argparse.ArgumentParser ...>",
-                Object::Namespace { .. } => "<argparse.Namespace ...>",
-                Object::EnumMember { .. } => "<enum member ...>",
-                Object::RaisesContext { .. } => "<pytest.raises ...>",
+                Object::Native(_) => "<native ...>",
                 Object::Property { .. } => "<property ...>",
                 Object::StaticMethod { .. } => "<staticmethod ...>",
                 Object::ClassMethod { .. } => "<classmethod ...>",
                 Object::Super { .. } => "<super ...>",
                 Object::Scope(_) => "<scope ...>",
                 Object::BigInt(_) => "<int ...>",
+                Object::Float(_) => "<float ...>",
                 Object::Complex { .. } => "<complex ...>",
             }
             .into());
         }
         let rendered = match heap.get(value)? {
-            Object::Bare => format!("<object object at {}>", address(id)),
+            Object::Bare => match state.types.instance_class(heap, value)? {
+                None => format!("<object object at {}>", address(id)),
+                Some(class) => match heap.get(class)? {
+                    Object::Class(class_object) => format!("<{} object>", class_object.name),
+                    _ => return Err("instance has an invalid class".into()),
+                },
+            },
+            Object::Exception(args) => {
+                let name = state.types.get(heap.type_id(value)?)?.name.clone();
+                format!("{name}({})", render_values(state, args, active)?.join(", "))
+            }
+            Object::Float(value) => super::float_text::repr(*value),
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
-            Object::Exception { kind, args } => {
-                format!("{kind}({})", render_values(state, args, active)?.join(", "))
-            }
             Object::List(values) => {
                 format!("[{}]", render_values(state, values, active)?.join(", "))
             }
@@ -486,23 +317,6 @@ fn render_inner(
                     _ => format!("<class '{}'>", class_object.name),
                 },
                 None => format!("<class '{}'>", class_object.name),
-            },
-            Object::Instance { class, payload, .. } => match payload {
-                InstancePayload::Builtin(inner) => render(state, heap.handle(inner), active)?,
-                InstancePayload::Object => match heap.get(heap.handle(class))? {
-                    Object::Class(class_object) if class_object.exception_base.is_some() => {
-                        let UserException { args, .. } = user_exception_parts(state, value)?
-                            .ok_or("exception instance lost its native base")?;
-                        let args = args
-                            .iter()
-                            .map(|argument| render(state, *argument, active))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .join(", ");
-                        format!("{}({args})", class_object.name)
-                    }
-                    Object::Class(class_object) => format!("<{} object>", class_object.name),
-                    _ => return Err("instance has an invalid class".into()),
-                },
             },
             Object::DescriptorBoundMethod { .. } => "<bound method>".into(),
             Object::GenericAlias { origin, arguments } => {
@@ -560,54 +374,10 @@ fn render_inner(
             // heap alone cannot read every mapping they may view.
             Object::DictView { .. } => "<dict view>".to_string(),
             Object::MappingProxy(_) => "mappingproxy(...)".to_string(),
-            Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
-            Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
-            Object::Regex { pattern, flags } => {
-                let flags = super::stdlib::re::flag_repr(*flags);
-                if flags.is_empty() {
-                    format!("re.compile({})", quote_string(pattern))
-                } else {
-                    format!("re.compile({}, {flags})", quote_string(pattern))
-                }
+            Object::Native(native) => {
+                native.repr(&mut |slot| render(state, heap.handle(slot), active))?
             }
-            Object::Match(found) => {
-                let (start, end) = found.spans.first().copied().flatten().unwrap_or((0, 0));
-                format!(
-                    "<re.Match object; span=({start}, {end}), match={}>",
-                    quote_string(&found.text)
-                )
-            }
-            Object::ArgumentParser { .. } => "<argparse.ArgumentParser>".into(),
-            Object::Namespace { values } => {
-                let rendered = values
-                    .iter()
-                    .map(|(name, value)| {
-                        Ok(format!(
-                            "{}={}",
-                            name,
-                            render(state, heap.handle(value), active)?
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                format!("Namespace({})", rendered.join(", "))
-            }
-            Object::EnumMember {
-                class: Some(class),
-                name,
-                value,
-            } => {
-                let Object::Class(class_object) = heap.get(heap.handle(class))? else {
-                    return Err("enum member has an invalid class".into());
-                };
-                let class_name = &class_object.name;
-                format!(
-                    "<{class_name}.{name}: {}>",
-                    render(state, heap.handle(value), active)?
-                )
-            }
-            Object::EnumMember { name, .. } => format!("<enum member {name}>"),
-            Object::RaisesContext { .. } => "<pytest.raises>".into(),
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),
             Object::ClassMethod { .. } => "<classmethod>".into(),
@@ -662,26 +432,19 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         Object::String(value) => !value.is_empty(),
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
-        Object::Exception { .. } => true,
+        Object::Exception(_) => true,
         Object::List(values) | Object::Tuple(values) => !values.is_empty(),
         Object::Set(values) | Object::FrozenSet(values) => !values.is_empty(),
         Object::Slice { .. } => true,
         Object::Dict(entries) | Object::DefaultDict { entries, .. } => !entries.is_empty(),
         Object::BigInt(value) => !value.is_zero(),
+        Object::Float(value) => *value != 0.0,
         Object::Complex { real, imag } => *real != 0.0 || *imag != 0.0,
         Object::Range { start, stop, step } => {
             (*step > 0 && *start < *stop) || (*step < 0 && *start > *stop)
         }
-        Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        } => truth(heap, heap.handle(value))?,
         Object::Function { .. }
         | Object::Class { .. }
-        | Object::Instance {
-            payload: InstancePayload::Object,
-            ..
-        }
         | Object::DescriptorBoundMethod { .. }
         | Object::Iterator { .. }
         | Object::SequenceIterator { .. }
@@ -692,19 +455,12 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         | Object::CallableIterator { .. }
         | Object::Generator { .. }
         | Object::Module { .. }
-        | Object::ArrayStorage(_)
-        | Object::Array { .. }
         | Object::WideValue { .. }
-        | Object::Regex { .. }
-        | Object::Match { .. }
-        | Object::ArgumentParser { .. }
-        | Object::Namespace { .. }
+        | Object::Native(_)
         | Object::NamespaceDict(_)
         | Object::DictView { .. }
         | Object::MappingProxy(_) => true,
         Object::GenericAlias { .. } => true,
-        Object::EnumMember { .. } => true,
-        Object::RaisesContext { .. } => true,
         Object::Property { .. }
         | Object::StaticMethod { .. }
         | Object::ClassMethod { .. }
@@ -867,18 +623,13 @@ fn equals_inner(
                 }
                 (Object::Function { .. }, Object::Function { .. })
                 | (Object::Class { .. }, Object::Class { .. })
-                | (Object::Instance { .. }, Object::Instance { .. })
                 | (Object::DescriptorBoundMethod { .. }, Object::DescriptorBoundMethod { .. })
                 | (Object::Iterator { .. }, Object::Iterator { .. })
                 | (Object::CountIterator { .. }, Object::CountIterator { .. })
                 | (Object::CallableIterator { .. }, Object::CallableIterator { .. })
                 | (Object::Generator { .. }, Object::Generator { .. })
                 | (Object::Module { .. }, Object::Module { .. })
-                | (Object::Regex { .. }, Object::Regex { .. })
-                | (Object::Match { .. }, Object::Match { .. })
-                | (Object::ArgumentParser { .. }, Object::ArgumentParser { .. })
-                | (Object::Namespace { .. }, Object::Namespace { .. }) => false,
-                (Object::EnumMember { .. }, Object::EnumMember { .. }) => false,
+                | (Object::Native(_), Object::Native(_)) => false,
                 (Object::Property { .. }, Object::Property { .. })
                 | (Object::StaticMethod { .. }, Object::StaticMethod { .. })
                 | (Object::ClassMethod { .. }, Object::ClassMethod { .. })
@@ -1156,9 +907,11 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
     }
     match object(heap, container)? {
         Some(object) => match object {
-            Object::Bare | Object::String(_) | Object::Exception { .. } | Object::Slice { .. } => {
-                Err("object is not a container".into())
-            }
+            Object::Bare
+            | Object::Float(_)
+            | Object::String(_)
+            | Object::Exception(_)
+            | Object::Slice { .. } => Err("object is not a container".into()),
             Object::Bytes(value) | Object::ByteArray(value) => {
                 if let Some(needle) = bytes_ref(heap, needle)? {
                     return Ok(memchr::memmem::find(value, needle).is_some());
@@ -1205,7 +958,6 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Function { .. }
             | Object::Class { .. }
-            | Object::Instance { .. }
             | Object::DescriptorBoundMethod { .. }
             | Object::Iterator { .. }
             | Object::SequenceIterator { .. }
@@ -1216,19 +968,12 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
-            | Object::ArrayStorage(_)
-            | Object::Array { .. }
             | Object::WideValue { .. }
-            | Object::Regex { .. }
-            | Object::Match { .. }
-            | Object::ArgumentParser { .. }
-            | Object::Namespace { .. }
+            | Object::Native(_)
             | Object::NamespaceDict(_)
             | Object::DictView { .. }
             | Object::MappingProxy(_) => Err("object is not a container".into()),
             Object::GenericAlias { .. } => Err("object is not a container".into()),
-            Object::EnumMember { .. } => Err("object is not a container".into()),
-            Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }
             | Object::StaticMethod { .. }
             | Object::ClassMethod { .. }
@@ -1240,95 +985,10 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
     }
 }
 
-/// CPython's `repr(str)`: single quotes unless the text contains a single quote and no double
-/// quote, with backslash escapes for the quote, backslash, control characters and characters
-/// Python does not consider printable.
-pub(super) fn quote_string(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut rendered = String::with_capacity(value.len() + 2);
-    rendered.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => rendered.push_str("\\\\"),
-            '\n' => rendered.push_str("\\n"),
-            '\r' => rendered.push_str("\\r"),
-            '\t' => rendered.push_str("\\t"),
-            character if character == quote => {
-                rendered.push('\\');
-                rendered.push(character);
-            }
-            character if is_printable(character) => rendered.push(character),
-            character => {
-                let code = u32::from(character);
-                if code <= 0xff {
-                    rendered.push_str(&format!("\\x{code:02x}"));
-                } else if code <= 0xffff {
-                    rendered.push_str(&format!("\\u{code:04x}"));
-                } else {
-                    rendered.push_str(&format!("\\U{code:08x}"));
-                }
-            }
-        }
-    }
-    rendered.push(quote);
-    rendered
-}
-
-/// Python's `str.isprintable` for one character, approximated without Unicode category tables:
-/// controls, separators other than the ASCII space, and the common format characters are not
-/// printable.
-fn is_printable(character: char) -> bool {
-    !(character.is_control()
-        || (character.is_whitespace() && character != ' ')
-        || matches!(
-            character,
-            '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
-        ))
-}
-
-/// CPython's bytes repr: single quotes unless the value contains `'` but no `"`, escaping only
-/// the chosen quote.
-fn quote_bytes(value: &[u8]) -> String {
-    let quote = if value.contains(&b'\'') && !value.contains(&b'"') {
-        b'"'
-    } else {
-        b'\''
-    };
-    let mut rendered = String::from("b");
-    rendered.push(char::from(quote));
-    for byte in value {
-        match byte {
-            b'\\' => rendered.push_str("\\\\"),
-            byte if *byte == quote => {
-                rendered.push('\\');
-                rendered.push(char::from(quote));
-            }
-            b'\n' => rendered.push_str("\\n"),
-            b'\r' => rendered.push_str("\\r"),
-            b'\t' => rendered.push_str("\\t"),
-            0x20..=0x7e => rendered.push(char::from(*byte)),
-            _ => rendered.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    rendered.push(char::from(quote));
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resources::{Limits, Resources};
-
-    #[test]
-    fn bytes_repr_switches_quotes_like_cpython() {
-        assert_eq!(quote_bytes(b"it's"), r#"b"it's""#);
-        assert_eq!(quote_bytes(br#"it's "x""#), r#"b'it\'s "x"'"#);
-        assert_eq!(quote_bytes(b"\"\\\n\x00"), r#"b'"\\\n\x00'"#);
-    }
 
     #[test]
     fn dict_and_set_equality_are_order_independent() {
@@ -1375,60 +1035,5 @@ mod tests {
         assert!(!equals(&heap, nan, nan).unwrap());
         assert!(contains(&heap, first, nan).unwrap());
         assert!(equals(&heap, first, second).unwrap());
-    }
-
-    #[test]
-    fn string_protocols_handle_inline_heap_ascii_and_unicode_values() {
-        let mut heap = Heap::default();
-        let mut resources = Resources::new(Limits::unlimited());
-        let inline = Value::inline_string("café").unwrap();
-        let ascii = heap
-            .alloc(
-                Object::String("a long ASCII string".into()),
-                &mut (),
-                &mut resources,
-            )
-            .unwrap();
-        let unicode = heap
-            .alloc(Object::String("☃ snow".into()), &mut (), &mut resources)
-            .unwrap();
-
-        let inline_ref = string_ref(&heap, inline).unwrap().unwrap();
-        assert_eq!(inline_ref.as_str(), "café");
-        assert!(!inline_ref.is_ascii());
-        let ascii_ref = string_ref(&heap, ascii).unwrap().unwrap();
-        assert_eq!(ascii_ref.as_str(), "a long ASCII string");
-        assert!(ascii_ref.is_ascii());
-        assert_eq!(
-            string_index(&heap, inline, Value::Int(3)).unwrap(),
-            StringIndex::Character('é')
-        );
-        assert_eq!(
-            string_index(&heap, inline, Value::Int(-4)).unwrap(),
-            StringIndex::Character('c')
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::Int(7)).unwrap(),
-            StringIndex::Character('A')
-        );
-        assert_eq!(
-            string_index(&heap, unicode, Value::Int(-6)).unwrap(),
-            StringIndex::Character('☃')
-        );
-        assert_eq!(string_length(&heap, inline).unwrap(), Some(4));
-        assert_eq!(string_length(&heap, ascii).unwrap(), Some(19));
-        assert_eq!(string_length(&heap, unicode).unwrap(), Some(6));
-        assert_eq!(
-            string_index(&heap, Value::Int(1), Value::Int(0)).unwrap(),
-            StringIndex::NotString
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::Int(99)).unwrap(),
-            StringIndex::OutOfRange
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::None).unwrap(),
-            StringIndex::NotInteger
-        );
     }
 }

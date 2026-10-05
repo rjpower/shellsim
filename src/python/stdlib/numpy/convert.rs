@@ -11,7 +11,7 @@ use super::super::super::native::{
     CallArgs, PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyResult,
     PyRuntime, PyValue, PyValueCast,
 };
-use super::super::super::protocol::quote_string;
+use super::super::super::string::quote_string;
 use super::array::{
     buffer_with_capacity, contiguous_buffer, element_count, gather_into, new_array,
     reserve_elements, Array,
@@ -127,33 +127,27 @@ fn sequence_items<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     value: &PyValue<'s>,
 ) -> PyResult<'s, Option<Vec<PyValue<'s>>>> {
+    let user_instance = runtime.is_user_instance(value)?;
     match runtime.kind(value)? {
-        PyKind::List => {
+        PyKind::List if !user_instance => {
             let list = value.cast(runtime)?;
             runtime.list_items(list).map(Some)
         }
-        PyKind::Tuple => {
+        PyKind::Tuple if !user_instance => {
             let tuple = value.cast(runtime)?;
             runtime.tuple_items(tuple).map(Some)
         }
         _ if runtime.type_name(value)? == "range" => iterated_items(runtime, value).map(Some),
-        // NumPy treats tuple subclasses such as named tuples, and any object with `__getitem__`
-        // and `__len__`, as a sequence and takes its items by iterating it.
+        // NumPy treats tuple and list subclasses such as named tuples, and any object with
+        // `__getitem__` and `__len__`, as a sequence and takes its items by iterating it.
+        PyKind::List | PyKind::Tuple => iterated_items(runtime, value).map(Some),
         PyKind::Instance
-            if is_tuple_subclass(runtime, value)?
-                || (runtime.get_attribute(*value, "__getitem__")?.is_some()
-                    && runtime.get_attribute(*value, "__len__")?.is_some()) =>
+            if runtime.get_attribute(*value, "__getitem__")?.is_some()
+                && runtime.get_attribute(*value, "__len__")?.is_some() =>
         {
             iterated_items(runtime, value).map(Some)
         }
         _ => Ok(None),
-    }
-}
-
-fn is_tuple_subclass<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, bool> {
-    match runtime.builtin_payload(value)? {
-        Some(payload) => Ok(runtime.kind(&payload)? == PyKind::Tuple),
-        None => Ok(false),
     }
 }
 
@@ -438,7 +432,6 @@ fn object_number<'s>(
     }
     let sequence = match runtime.kind(value)? {
         PyKind::List | PyKind::Tuple => true,
-        PyKind::Instance if is_tuple_subclass(runtime, value)? => true,
         _ if runtime.native_kind(value)? == Some(PyNativeKind::Array) => {
             !Array::from_value(runtime, *value)?.view.shape.is_empty()
         }

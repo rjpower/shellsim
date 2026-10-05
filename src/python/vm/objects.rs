@@ -3,17 +3,15 @@
 use std::collections::BTreeSet;
 
 use super::super::attributes;
-use super::super::heap::{
-    ArgumentParserObject, ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget,
-};
+use super::super::heap::{ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget};
 use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
-    expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
-    CallArgs, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
-    ComparisonOperator, ExceptionType, Execution, HashMap, InstancePayload, LoadAttributeCache,
-    NameId, NativeValue, Object, Ordering, PyError, PyRuntime, RaisedException, SlicePlan, Slot,
-    SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
+    Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
+    ClassField, ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution,
+    HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
+    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -34,16 +32,13 @@ const CLASS_ATTRIBUTE_BYTES: u64 = 48;
 /// Container nesting bound for `repr()`, matching the VM's call-depth limit.
 const MAX_REPR_DEPTH: usize = 256;
 
-/// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
-const MAX_COMPARE_DEPTH: usize = 256;
-
 /// Bytes a linear scan over text or bytes covers per CPU unit. Searches, comparisons and code
 /// point walks run at memory speed, so one unit per word keeps the charge proportional without
 /// making ordinary string handling expensive.
 const SCAN_BYTES_PER_CPU_UNIT: usize = 16;
 
 /// CPU units for scanning `bytes` bytes of text or binary data.
-pub(super) fn scan_cost(bytes: usize) -> u64 {
+pub(crate) fn scan_cost(bytes: usize) -> u64 {
     u64::try_from(bytes / SCAN_BYTES_PER_CPU_UNIT).unwrap_or(u64::MAX) + 1
 }
 impl ContainerItems<'_> {
@@ -68,8 +63,8 @@ impl ContainerItems<'_> {
     }
 }
 
-/// Whether user classes may derive from `builtin`, holding its values as
-/// [`InstancePayload::Builtin`](super::super::heap::InstancePayload::Builtin).
+/// Whether user classes may derive from `builtin`. Their instances carry the builtin's payload
+/// under the subclass's type id (see [`ClassLayout::Builtin`]).
 pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
     matches!(
         builtin,
@@ -123,6 +118,17 @@ impl<'s> Vm<'s> {
             };
             return self.raise_exception("AttributeError", message);
         }
+        match self.instance_class(*owner) {
+            Ok(Some(_)) => {
+                let message = match self.type_name_of(owner) {
+                    Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
+                    Err(error) => return error,
+                };
+                return self.raise_exception("AttributeError", message);
+            }
+            Ok(None) => {}
+            Err(error) => return error,
+        }
         let message = match owner.is_object().then(|| self.get(*owner)) {
             Some(Ok(Object::Module { name: module, .. })) => {
                 format!("module '{module}' has no attribute '{name}'")
@@ -131,12 +137,10 @@ impl<'s> Vm<'s> {
                 let class_name = &class_object.name;
                 format!("type object '{class_name}' has no attribute '{name}'")
             }
-            Some(Ok(Object::Instance { .. } | Object::Bare | Object::Exception { .. })) => {
-                match self.type_name_of(owner) {
-                    Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
-                    Err(error) => return error,
-                }
-            }
+            Some(Ok(Object::Bare)) => match self.type_name_of(owner) {
+                Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
+                Err(error) => return error,
+            },
             Some(Err(error)) => return error,
             _ => return format!("attribute {name:?} is not implemented"),
         };
@@ -155,7 +159,7 @@ impl<'s> Vm<'s> {
         if owner.is_object() {
             if let Some(cache) = self.attribute_cache(code_cache, site) {
                 if let Some(value) =
-                    attributes::cached_attribute(self.heap(), owner, &cache.class, cache.location)?
+                    attributes::cached_attribute(self.heap(), owner, cache.type_id, cache.location)?
                 {
                     self.push(value);
                     return Ok(());
@@ -268,16 +272,10 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         name: &str,
     ) -> Result<Option<LoadAttributeCache>, String> {
-        if !owner.is_object() {
+        if self.instance_class(owner)?.is_none() {
             return Ok(None);
         }
-        let Object::Instance { class, .. } = self.get(owner)? else {
-            return Ok(None);
-        };
-        let class = self.handle(class);
-        let class_type = self
-            .class_type_id(&class)?
-            .ok_or("instance has no registered class")?;
+        let class_type = self.type_id(&owner)?;
         if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if self.is_data_descriptor(&descriptor)? {
                 return Ok(None);
@@ -286,7 +284,7 @@ impl<'s> Vm<'s> {
         Ok(self
             .instance_attribute_slot_by_symbol(owner, symbol)?
             .map(|location| LoadAttributeCache {
-                class: self.store(class),
+                type_id: class_type,
                 location,
             }))
     }
@@ -345,10 +343,8 @@ impl<'s> Vm<'s> {
         name: &str,
     ) -> Result<Option<Value<'s>>, String> {
         let getattribute: Result<Option<Value<'s>>, String> = if owner.is_object()
-            && matches!(
-                self.get(owner),
-                Ok(Object::Instance { .. } | Object::Class { .. })
-            )
+            && (self.instance_class(owner)?.is_some()
+                || matches!(self.get(owner), Ok(Object::Class { .. })))
             && self
                 .state
                 .types
@@ -389,6 +385,56 @@ impl<'s> Vm<'s> {
             Some(value) => Ok(Some(value)),
             None => self.call_type_getattr_hook(owner, name),
         }
+    }
+
+    /// The default attribute lookup for an instance of user class `class`: a data descriptor on
+    /// the class wins, then the instance's own attributes, then any other class attribute.
+    fn lookup_instance_attribute(
+        &mut self,
+        owner: Value<'s>,
+        class: Value<'s>,
+        symbol: Option<SymbolId>,
+        name: &str,
+    ) -> Result<Option<Value<'s>>, String> {
+        let class_type = self
+            .class_type_id(&class)?
+            .ok_or("instance has no registered class")?;
+        let class_entry = self.type_lookup(class_type, name)?;
+        if let Some((defining_type, descriptor)) = class_entry {
+            // A native getter on a user exception instance models a C struct slot such as
+            // `OSError.filename`: an assigned value replaces the derived one.
+            let overridable_getter = matches!(
+                descriptor.native_value(),
+                Some(NativeValue::NativeGetter(_))
+            ) && exception_types::exception_base(self.state, owner)?
+                .is_some();
+            let instance_value = match (overridable_getter, symbol) {
+                (true, Some(symbol)) => self.attribute_by_symbol(owner, symbol)?,
+                _ => None,
+            };
+            if let Some(value) = instance_value {
+                return Ok(Some(value));
+            }
+            if self.is_data_descriptor(&descriptor)? {
+                return self.bind_type_attribute(
+                    descriptor,
+                    Some(owner),
+                    class_type,
+                    defining_type,
+                );
+            }
+        }
+        let instance_value = match symbol {
+            Some(symbol) => self.attribute_by_symbol(owner, symbol)?,
+            None => None,
+        };
+        if let Some(value) = instance_value {
+            return Ok(Some(value));
+        }
+        let Some((defining_type, descriptor)) = class_entry else {
+            return Ok(None);
+        };
+        self.bind_type_attribute(descriptor, Some(owner), class_type, defining_type)
     }
 
     /// The default object lookup without the outer `__getattr__` fallback. Direct calls to
@@ -488,11 +534,13 @@ impl<'s> Vm<'s> {
         }
         let owner_type = self.type_id(&owner)?;
         // These objects apply their own MRO or proxy lookup in the arms below.
-        let owner_has_custom_lookup = owner.is_object()
-            && matches!(
-                self.get(owner),
-                Ok(Object::Class { .. } | Object::Instance { .. } | Object::Super { .. })
-            );
+        let instance_class = self.instance_class(owner)?;
+        let owner_has_custom_lookup = instance_class.is_some()
+            || (owner.is_object()
+                && matches!(
+                    self.get(owner),
+                    Ok(Object::Class { .. } | Object::Super { .. })
+                ));
         if !owner_has_custom_lookup {
             if let Some((defining_type, descriptor)) = self.type_lookup(owner_type, name)? {
                 match descriptor.native_value() {
@@ -514,6 +562,16 @@ impl<'s> Vm<'s> {
                         return self.call_native_getter(getter, owner);
                     }
                     _ => {}
+                }
+            }
+        }
+        if let Some(class) = instance_class {
+            return self.lookup_instance_attribute(owner, class, symbol, name);
+        }
+        if let Some(symbol) = symbol {
+            if exception_types::exception_base(self.state, owner)?.is_some() {
+                if let Some(value) = self.attribute_by_symbol(owner, symbol)? {
+                    return Ok(Some(value));
                 }
             }
         }
@@ -582,36 +640,6 @@ impl<'s> Vm<'s> {
                     }
                     return Ok(None);
                 }
-                Object::EnumMember {
-                    class,
-                    name: member_name,
-                    value,
-                } => {
-                    match name {
-                        "name" => {
-                            let member_name = member_name.clone();
-                            return self.allocate_string(member_name).map(Some);
-                        }
-                        "value" => return Ok(Some(self.handle(value))),
-                        _ => {}
-                    }
-                    if let Some(class) = self.handle_optional(class.as_ref()) {
-                        let type_id = self
-                            .class_type_id(&class)?
-                            .ok_or("enum member has an invalid class")?;
-                        if let Some((defining_type, descriptor)) =
-                            self.type_lookup(type_id, name)?
-                        {
-                            return self.bind_type_attribute(
-                                descriptor,
-                                Some(owner),
-                                type_id,
-                                defining_type,
-                            );
-                        }
-                    }
-                    return Ok(None);
-                }
                 Object::GenericAlias { origin, arguments } => {
                     return match name {
                         "__origin__" => Ok(Some(self.handle(origin))),
@@ -622,52 +650,6 @@ impl<'s> Vm<'s> {
                         }
                         _ => Ok(None),
                     };
-                }
-                Object::Instance { class, .. } => {
-                    let class = self.handle(class);
-                    let class_type = self
-                        .class_type_id(&class)?
-                        .ok_or("instance has no registered class")?;
-                    let class_entry = self.type_lookup(class_type, name)?;
-                    if let Some((defining_type, descriptor)) = class_entry {
-                        // A native getter on a user exception instance models a C struct slot
-                        // such as `OSError.filename`: an assigned value replaces the derived one.
-                        let overridable_getter = matches!(
-                            descriptor.native_value(),
-                            Some(NativeValue::NativeGetter(_))
-                        ) && self.user_exception_base(&owner)?.is_some();
-                        let instance_value = match (overridable_getter, symbol) {
-                            (true, Some(symbol)) => self.attribute_by_symbol(owner, symbol)?,
-                            _ => None,
-                        };
-                        if let Some(value) = instance_value {
-                            return Ok(Some(value));
-                        }
-                        if self.is_data_descriptor(&descriptor)? {
-                            return self.bind_type_attribute(
-                                descriptor,
-                                Some(owner),
-                                class_type,
-                                defining_type,
-                            );
-                        }
-                    }
-                    let instance_value = match symbol {
-                        Some(symbol) => self.attribute_by_symbol(owner, symbol)?,
-                        None => None,
-                    };
-                    if let Some(value) = instance_value {
-                        return Ok(Some(value));
-                    }
-                    let Some((defining_type, descriptor)) = class_entry else {
-                        return Ok(None);
-                    };
-                    return self.bind_type_attribute(
-                        descriptor,
-                        Some(owner),
-                        class_type,
-                        defining_type,
-                    );
                 }
                 Object::Super {
                     start_class,
@@ -699,21 +681,10 @@ impl<'s> Vm<'s> {
                         _ => self.lookup_attribute(descriptor, None, name),
                     };
                 }
-                Object::Match { .. } => {}
-                Object::ArgumentParser(parser_object) => {
-                    let ArgumentParserObject { prog, .. } = &**parser_object;
-                    if name == "prog" {
-                        let prog = prog.clone();
-                        let prog = self.allocate_string(prog)?;
-                        return Ok(Some(prog));
+                Object::Native(native) => {
+                    if let Some(slot) = native.attribute(name) {
+                        return Ok(Some(self.handle(slot)));
                     }
-                }
-                Object::Namespace { values } => {
-                    let value = values
-                        .iter()
-                        .find(|(key, _)| key == name)
-                        .map(|(_, value)| self.handle(value));
-                    return Ok(value);
                 }
                 // `classmethod` and `staticmethod` expose the wrapped callable and forward the
                 // metadata attributes `functools.wraps` and `abc` read from it.
@@ -786,15 +757,17 @@ impl<'s> Vm<'s> {
                     .ok_or("exception type is not registered")?;
                 Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
             }
+            _ if self.has_instance_dict(owner)? => {
+                return self
+                    .alloc_with(|b| {
+                        Object::NamespaceDict(NamespaceTarget::Instance(b.store(owner)))
+                    })
+                    .map(Some);
+            }
             _ if owner.is_object() => {
                 return match self.get(owner)? {
                     Object::Class { .. } => self
                         .alloc_with(|b| Object::MappingProxy(ProxyTarget::Class(b.store(owner))))
-                        .map(Some),
-                    Object::Instance { .. } => self
-                        .alloc_with(|b| {
-                            Object::NamespaceDict(NamespaceTarget::Instance(b.store(owner)))
-                        })
                         .map(Some),
                     Object::Module { scope, .. } => {
                         let namespace = self.module_namespace(self.handle(scope))?;
@@ -860,10 +833,7 @@ impl<'s> Vm<'s> {
         name: &str,
         value: Value<'s>,
     ) -> Result<(), String> {
-        if let Some(Object::Instance { class, .. }) =
-            owner.is_object().then(|| self.get(owner)).transpose()?
-        {
-            let class = self.handle(class);
+        if let Some(class) = self.instance_class(owner)? {
             if let Some((defining_class, hook)) =
                 self.class_attribute_entry(class, "__setattr__")?
             {
@@ -885,14 +855,25 @@ impl<'s> Vm<'s> {
         name: &str,
         value: Value<'s>,
     ) -> Result<(), String> {
-        let class = match owner.is_object() {
-            true => match self.get(owner)? {
-                Object::Instance { class, .. } => Some(self.handle(class)),
-                _ => None,
-            },
-            false => None,
-        };
-        let Some(class) = class else {
+        // `BaseException.args` is writable and stores any iterable as a tuple.
+        if name == "args" && exception_types::exception_base(self.state, owner)?.is_some() {
+            let current = match self.get(owner)? {
+                Object::Exception(args) => args.len(),
+                _ => return Err("exception instance has a non-exception layout".into()),
+            };
+            let items = self.iterable_values(&value)?;
+            let bytes = u64::try_from(items.len().saturating_sub(current))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(super::MODELED_VALUE_BYTES);
+            self.reserve_object_growth(owner, bytes)?;
+            return self.modify(owner, |b, object| {
+                let Object::Exception(args) = object else {
+                    unreachable!("checked above")
+                };
+                *args = b.refs(items);
+            });
+        }
+        let Some(class) = self.instance_class(owner)? else {
             if owner.is_object() {
                 match self.get(owner)? {
                     Object::Class { .. } => {
@@ -905,23 +886,11 @@ impl<'s> Vm<'s> {
                         let namespace = self.module_namespace(self.handle(scope))?;
                         return self.namespace_store(namespace, name.to_string(), value);
                     }
-                    // `BaseException.args` is writable and stores any iterable as a tuple.
-                    Object::Exception { args, .. } if name == "args" => {
-                        let current = args.len();
-                        let items = self.iterable_values(&value)?;
-                        let bytes = u64::try_from(items.len().saturating_sub(current))
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(super::MODELED_VALUE_BYTES);
-                        self.reserve_object_growth(owner, bytes)?;
-                        self.modify(owner, |b, object| {
-                            let Object::Exception { args, .. } = object else {
-                                unreachable!("checked above")
-                            };
-                            *args = b.refs(items);
-                        })?;
-                        return Ok(());
-                    }
                     _ => {}
+                }
+                // A builtin exception instance has an attribute dictionary like any instance.
+                if exception_types::exception_base(self.state, owner)?.is_some() {
+                    return self.insert_attribute(owner, name, value);
                 }
             }
             return Err(self.reject_builtin_attribute_store(owner, name));
@@ -934,6 +903,7 @@ impl<'s> Vm<'s> {
             .ok_or("instance has no registered class")?;
         if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if descriptor.is_object() {
+                let descriptor_class = self.instance_class(descriptor)?;
                 match self.get(descriptor)? {
                     Object::Property {
                         setter: Some(setter),
@@ -950,11 +920,8 @@ impl<'s> Vm<'s> {
                         );
                         return Err(self.raise_exception("AttributeError", message));
                     }
-                    Object::Instance {
-                        class: descriptor_class,
-                        ..
-                    } => {
-                        let descriptor_class = self.handle(descriptor_class);
+                    _ if descriptor_class.is_some() => {
+                        let descriptor_class = descriptor_class.expect("checked above");
                         if let Some((set_owner, set)) =
                             self.class_attribute_entry(descriptor_class, "__set__")?
                         {
@@ -977,7 +944,7 @@ impl<'s> Vm<'s> {
             ) && !(matches!(
                 name,
                 "args" | "errno" | "strerror" | "filename" | "filename2"
-            ) && self.user_exception_base(&owner)?.is_some())
+            ) && exception_types::exception_base(self.state, owner)?.is_some())
             {
                 let type_name = self.type_name_of(&owner)?;
                 return Err(self.raise_exception(
@@ -1007,7 +974,7 @@ impl<'s> Vm<'s> {
                     .collect();
                 let mut named = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
-                    let Some(name) = protocol::string_value(&self.state.heap, key)? else {
+                    let Some(name) = string::string_value(&self.state.heap, key)? else {
                         let message = format!(
                             "namespace keys must be str, not {}",
                             self.type_name_of(&key)?
@@ -1075,7 +1042,15 @@ impl<'s> Vm<'s> {
             return Err(self.reject_builtin_attribute_store(owner, name));
         }
         let class = match self.get(owner)? {
-            Object::Instance { class, .. } => self.handle(class),
+            _ if self.instance_class(owner)?.is_some() => {
+                self.instance_class(owner)?.expect("checked above")
+            }
+            _ if exception_types::exception_base(self.state, owner)?.is_some() => {
+                if self.remove_attribute_by_symbol(owner, symbol)?.is_none() {
+                    return Err(self.missing_attribute(&owner, name));
+                }
+                return Ok(());
+            }
             Object::Class { .. } => return self.set_class_attribute(owner, name, None),
             Object::Function { .. } => return self.set_function_attribute(owner, name, None),
             Object::Module { scope, .. } => {
@@ -1092,6 +1067,7 @@ impl<'s> Vm<'s> {
             .ok_or("instance has no registered class")?;
         if let Some((_, descriptor)) = self.type_lookup(class_type, name)? {
             if descriptor.is_object() {
+                let descriptor_class = self.instance_class(descriptor)?;
                 match self.get(descriptor)? {
                     Object::Property { .. } => {
                         let message = format!(
@@ -1100,11 +1076,8 @@ impl<'s> Vm<'s> {
                         );
                         return Err(self.raise_exception("AttributeError", message));
                     }
-                    Object::Instance {
-                        class: descriptor_class,
-                        ..
-                    } => {
-                        let descriptor_class = self.handle(descriptor_class);
+                    _ if descriptor_class.is_some() => {
+                        let descriptor_class = descriptor_class.expect("checked above");
                         if let Some((delete_owner, delete)) =
                             self.class_attribute_entry(descriptor_class, "__delete__")?
                         {
@@ -1152,7 +1125,7 @@ impl<'s> Vm<'s> {
     ) -> Result<(), String> {
         if name == "__name__" {
             let Some(text) = value
-                .map(|value| protocol::string_ref(&self.state.heap, value))
+                .map(|value| string::string_ref(&self.state.heap, value))
                 .transpose()?
                 .flatten()
                 .map(|text| text.as_str().to_string())
@@ -1297,15 +1270,32 @@ impl<'s> Vm<'s> {
         self.raise_exception("AttributeError", message)
     }
 
-    /// `value`, or the builtin value it holds when it is an instance of a builtin subclass such
-    /// as a `tuple` subclass. Builtin operations that the class does not override act on it.
-    pub(super) fn builtin_view(&self, value: Value<'s>) -> Result<Value<'s>, String> {
-        if value.is_object() {
-            if let Object::EnumMember { value, .. } = self.get(value)? {
-                return Ok(self.handle(value));
-            }
+    /// The class object of `value` when it is an instance of a user class, whatever payload the
+    /// class's layout gave it; `None` for builtin values and class objects.
+    pub(super) fn instance_class(&self, value: Value<'s>) -> Result<Option<Value<'s>>, String> {
+        self.state.types.instance_class(&self.state.heap, value)
+    }
+
+    /// Whether `value` keeps its own attribute dictionary: an instance of a user class, or an
+    /// exception instance, whose builtin classes also give instances a `__dict__`.
+    pub(super) fn has_instance_dict(&self, value: Value<'s>) -> Result<bool, String> {
+        Ok(self.instance_class(value)?.is_some()
+            || exception_types::exception_base(self.state, value)?.is_some())
+    }
+
+    /// Whether `value` is an instance of a user class with the plain `object` layout and no
+    /// exception base: the objects whose default `repr()` and `str()` are `<Name object at ...>`.
+    fn is_plain_instance(&self, value: &Value<'s>) -> Result<bool, String> {
+        let Some(class) = self.instance_class(*value)? else {
+            return Ok(false);
+        };
+        if !matches!(self.get(*value)?, Object::Bare) {
+            return Ok(false);
         }
-        Ok(protocol::builtin_payload(&self.state.heap, value)?.unwrap_or(value))
+        Ok(matches!(
+            self.get(class)?,
+            Object::Class(class_object) if class_object.exception_base.is_none()
+        ))
     }
 
     pub(super) fn load_subscript(&mut self) -> Result<(), String> {
@@ -1368,7 +1358,6 @@ impl<'s> Vm<'s> {
         index: Value<'s>,
     ) -> Result<Value<'s>, String> {
         let subject = owner;
-        let owner = self.builtin_view(owner)?;
         // A slice is an ordinary key to a mapping; only sequences slice with it.
         let mapping = match owner.is_object() {
             true => matches!(
@@ -1392,7 +1381,7 @@ impl<'s> Vm<'s> {
             };
             self.allocate_string(format!("typing.List[{parameter}]"))?
         } else if matches!(owner.native_value(), Some(NativeValue::Environment)) {
-            let name = protocol::string_ref(&self.state.heap, index)?
+            let name = string::string_ref(&self.state.heap, index)?
                 .ok_or("environment key must be a string")?
                 .as_str()
                 .to_string();
@@ -1411,7 +1400,7 @@ impl<'s> Vm<'s> {
                     } else {
                         "tuple"
                     };
-                    let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                    let Some(index) = number::int_value(&self.state.heap, index) else {
                         let message = format!(
                             "{sequence} indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -1435,7 +1424,7 @@ impl<'s> Vm<'s> {
                 }
                 Object::Range { start, stop, step } => {
                     let length = range_length(*start, *stop, *step)?;
-                    let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                    let Some(index) = number::int_value(&self.state.heap, index) else {
                         let message = format!(
                             "range indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -1475,13 +1464,13 @@ impl<'s> Vm<'s> {
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Slice { .. }
-                | Object::Exception { .. }
+                | Object::Exception(_)
                 | Object::FrozenSet(_)
                 | Object::BigInt(_)
                 | Object::Complex { .. }
                 | Object::Function { .. }
                 | Object::Class { .. }
-                | Object::Instance { .. }
+                | Object::Float(_)
                 | Object::DescriptorBoundMethod { .. }
                 | Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
@@ -1493,15 +1482,8 @@ impl<'s> Vm<'s> {
                 | Object::Generator { .. }
                 | Object::Module { .. }
                 | Object::Scope(_)
-                | Object::ArrayStorage(_)
-                | Object::Array { .. }
                 | Object::WideValue { .. }
-                | Object::Regex { .. }
-                | Object::Match { .. }
-                | Object::ArgumentParser { .. }
-                | Object::Namespace { .. }
-                | Object::EnumMember { .. }
-                | Object::RaisesContext { .. }
+                | Object::Native(_)
                 | Object::NamespaceDict(_)
                 | Object::DictView { .. }
                 | Object::MappingProxy(_) => BuiltinSubscript::Unsupported,
@@ -1587,13 +1569,9 @@ impl<'s> Vm<'s> {
         subject: &Value<'s>,
         key: Value<'s>,
     ) -> Result<Option<Value<'s>>, String> {
-        if !subject.is_object() {
-            return Ok(None);
-        }
-        let Object::Instance { class, .. } = self.get(*subject)? else {
+        let Some(class) = self.instance_class(*subject)? else {
             return Ok(None);
         };
-        let class = self.handle(class);
         if self.class_attribute(class, "__missing__")?.is_none() {
             return Ok(None);
         }
@@ -1611,23 +1589,23 @@ impl<'s> Vm<'s> {
         index: &Value<'s>,
     ) -> Result<Option<char>, String> {
         // A non-ASCII string is indexed by code point, which scans the UTF-8 up to the index.
-        let non_ascii_bytes = protocol::string_ref(&self.state.heap, *owner)?
+        let non_ascii_bytes = string::string_ref(&self.state.heap, *owner)?
             .filter(|text| !text.is_ascii())
             .map(|text| text.byte_len());
         if let Some(bytes) = non_ascii_bytes {
             self.charge_cpu(scan_cost(bytes))?;
         }
-        match protocol::string_index(&self.state.heap, *owner, *index)? {
-            protocol::StringIndex::NotString => Ok(None),
-            protocol::StringIndex::Character(character) => Ok(Some(character)),
-            protocol::StringIndex::NotInteger => {
+        match string::string_index(&self.state.heap, *owner, *index)? {
+            string::StringIndex::NotString => Ok(None),
+            string::StringIndex::Character(character) => Ok(Some(character)),
+            string::StringIndex::NotInteger => {
                 let message = format!(
                     "string indices must be integers, not '{}'",
                     self.type_name_of(index)?
                 );
                 Err(self.raise_exception("TypeError", message))
             }
-            protocol::StringIndex::OutOfRange => {
+            string::StringIndex::OutOfRange => {
                 Err(self.raise_exception("IndexError", "string index out of range"))
             }
         }
@@ -1640,7 +1618,7 @@ impl<'s> Vm<'s> {
         stop: Option<i64>,
         step: Option<i64>,
     ) -> Result<Value<'s>, String> {
-        let non_ascii_bytes = protocol::string_ref(&self.state.heap, owner)?
+        let non_ascii_bytes = string::string_ref(&self.state.heap, owner)?
             .filter(|text| !text.is_ascii())
             .map(|text| text.byte_len());
         if let Some(bytes) = non_ascii_bytes {
@@ -1648,14 +1626,14 @@ impl<'s> Vm<'s> {
             self.charge_cpu(scan_cost(bytes))?;
             self.reserve_result(bytes.saturating_mul(std::mem::size_of::<char>()))?;
         }
-        let string_slice = protocol::string_ref(&self.state.heap, owner)?
+        let string_slice = string::string_ref(&self.state.heap, owner)?
             .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
             .transpose()?;
         if let Some((selected, units)) = string_slice {
             self.charge_cpu(units)?;
             return self.allocate_string(selected);
         }
-        if let Some(bytes) = protocol::bytes_value(&self.state.heap, owner)? {
+        if let Some(bytes) = string::bytes_value(&self.state.heap, owner)? {
             let plan = SlicePlan::new(bytes.len(), start, stop, step)?;
             self.charge_cpu(u64::try_from(plan.len()).unwrap_or(u64::MAX))?;
             let selected = plan.indices().map(|index| bytes[index]).collect();
@@ -1697,13 +1675,13 @@ impl<'s> Vm<'s> {
     /// sequence indices and slice bounds; NumPy integer scalars and 0-d integer arrays qualify.
     /// `None` means `value` is not an integer and its type defines no `__index__`.
     fn index_value(&mut self, value: &Value<'s>) -> Result<Option<i64>, String> {
-        if let Some(index) = protocol::int_value(&self.state.heap, *value) {
+        if let Some(index) = number::int_value(&self.state.heap, *value) {
             return Ok(Some(index));
         }
         let Some(result) = self.int_by_method(value, &["__index__"])? else {
             return Ok(None);
         };
-        match protocol::int_value(&self.state.heap, result) {
+        match number::int_value(&self.state.heap, result) {
             Some(index) => Ok(Some(index)),
             None => {
                 Err(self
@@ -1727,7 +1705,7 @@ impl<'s> Vm<'s> {
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
         );
-        if !sequence || protocol::int_value(&self.state.heap, index).is_some() {
+        if !sequence || number::int_value(&self.state.heap, index).is_some() {
             return Ok(index);
         }
         Ok(match self.index_value(&index)? {
@@ -1760,8 +1738,8 @@ impl<'s> Vm<'s> {
     ) -> Result<Option<Value<'s>>, String> {
         let builtin = self.registered_kind(value).is_none()
             && (super::number::view(&self.state.heap, value).is_some()
-                || protocol::string_value(&self.state.heap, *value)?.is_some()
-                || protocol::bytes_value(&self.state.heap, *value)?.is_some());
+                || string::string_value(&self.state.heap, *value)?.is_some()
+                || string::bytes_value(&self.state.heap, *value)?.is_some());
         if builtin {
             return Ok(None);
         }
@@ -1780,9 +1758,8 @@ impl<'s> Vm<'s> {
         value: &Value<'s>,
         name: &str,
     ) -> Result<Option<Value<'s>>, String> {
-        let class = match value.is_object().then(|| self.get(*value)).transpose()? {
-            Some(Object::Instance { class, .. }) => self.handle(class),
-            _ => return self.resolve_attribute(*value, name),
+        let Some(class) = self.instance_class(*value)? else {
+            return self.resolve_attribute(*value, name);
         };
         let Some((defining_class, descriptor)) = self.class_attribute_entry(class, name)? else {
             return Ok(None);
@@ -1803,9 +1780,7 @@ impl<'s> Vm<'s> {
             let Some(result) = self.conversion_method(value, method)? else {
                 continue;
             };
-            if protocol::int_value(&self.state.heap, result).is_none()
-                && !self.is_bigint(&result)?
-            {
+            if number::int_value(&self.state.heap, result).is_none() && !self.is_bigint(&result)? {
                 let message = format!(
                     "{method} returned non-int (type {})",
                     self.type_name_of(&result)?
@@ -1889,7 +1864,7 @@ impl<'s> Vm<'s> {
             return Ok(None);
         }
         let integer =
-            if protocol::int_value(&self.state.heap, *bound).is_some() || self.is_bigint(bound)? {
+            if number::int_value(&self.state.heap, *bound).is_some() || self.is_bigint(bound)? {
                 *bound
             } else {
                 match self.int_by_method(bound, &["__index__"])? {
@@ -1902,7 +1877,7 @@ impl<'s> Vm<'s> {
                     }
                 }
             };
-        if let Some(index) = protocol::int_value(&self.state.heap, integer) {
+        if let Some(index) = number::int_value(&self.state.heap, integer) {
             return Ok(Some(index));
         }
         let negative = matches!(
@@ -1955,7 +1930,7 @@ impl<'s> Vm<'s> {
         let index = self.sequence_index(&owner, index)?;
         match self.get(owner)? {
             Object::List(values) => {
-                let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                let Some(index) = number::int_value(&self.state.heap, index) else {
                     let message = format!(
                         "list indices must be integers or slices, not {}",
                         self.type_name_of(&index)?
@@ -1982,10 +1957,8 @@ impl<'s> Vm<'s> {
             Object::Dict(_) | Object::DefaultDict { .. } => {
                 self.dict_set_entry(owner, index, value)?
             }
-            // Item assignment on these would be a shellsim gap, not a CPython TypeError.
-            Object::ByteArray(_) | Object::ArrayStorage(_) | Object::Array { .. } => {
-                return Err("object does not support item assignment".into())
-            }
+            // Item assignment on a bytearray would be a shellsim gap, not a CPython TypeError.
+            Object::ByteArray(_) => return Err("object does not support item assignment".into()),
             _ => {
                 return Err(self.raise_object_type_error(&owner, "does not support item assignment"))
             }
@@ -2268,7 +2241,7 @@ impl<'s> Vm<'s> {
                     .map(|(key, value)| (self.handle(key), self.handle(value)))
                     .collect::<Vec<_>>();
                 for (key, value) in entries {
-                    let Some(key) = protocol::string_value(&self.state.heap, key)? else {
+                    let Some(key) = string::string_value(&self.state.heap, key)? else {
                         return Err("metaclass namespace keys must be strings".into());
                     };
                     prepared_namespace.insert(key, value);
@@ -2347,13 +2320,20 @@ impl<'s> Vm<'s> {
                 if value.is_object() && matches!(self.get(value), Ok(Object::Function { .. })) {
                     continue;
                 }
-                let member = self.alloc_with(|b| Object::EnumMember {
-                    class: None,
-                    name: member_name.clone(),
-                    value: b.store(value),
-                })?;
-                attributes.insert(member_name, member);
-                enum_members.push(member);
+                enum_members.push((member_name, value));
+            }
+            // An enum that mixes in a data type keeps Enum's repr and str, which the data type
+            // would otherwise shadow in the MRO. CPython's EnumType.__new__ makes the same
+            // substitution for methods the class body does not define.
+            if matches!(layout, ClassLayout::Builtin(_)) {
+                for (name, slot) in [("__repr__", Slot::Repr), ("__str__", Slot::String)] {
+                    attributes.entry(name.into()).or_insert(Value::Native(
+                        NativeValue::SlotWrapper {
+                            owner: BuiltinType::Enum.id(),
+                            slot,
+                        },
+                    ));
+                }
             }
         }
         let descriptor_candidates = attributes
@@ -2672,11 +2652,6 @@ impl<'s> Vm<'s> {
             dataclass_fields,
             enum_members,
         } = definition;
-        let enum_member_ids = enum_members
-            .iter()
-            .copied()
-            .filter(|member| member.is_object())
-            .collect::<Vec<_>>();
         // A heap class introduces the instance-dictionary descriptor when no heap ancestor
         // already supplies it. Metaclasses inherit type's own descriptor instead.
         if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains_key("__dict__") {
@@ -2739,7 +2714,7 @@ impl<'s> Vm<'s> {
                     .into_iter()
                     .map(|(field, default)| (field, b.optional(default)))
                     .collect(),
-                enum_members: b.refs(enum_members),
+                enum_members: Vec::new(),
             }))
         })?;
         let state = &mut *self.state;
@@ -2756,14 +2731,27 @@ impl<'s> Vm<'s> {
         class_object.instance_type = instance_type;
         let stored = self.store(class);
         self.state.types.finish(instance_type, stored)?;
-        for member in enum_member_ids {
-            self.modify(member, |b, object| {
-                let Object::EnumMember { class: owner, .. } = object else {
-                    return Err("invalid enum member".to_string());
+        // Members are instances of the class, so they exist once the class has its type. Their
+        // name and value are instance attributes, as in CPython; a data mixin also gives the
+        // member the value as its payload so the mixin's methods act on it.
+        for (member_name, value) in enum_members {
+            let payload = match layout {
+                ClassLayout::Builtin(_) => self.state.heap.copy_builtin_payload(value)?,
+                _ => Object::Bare,
+            };
+            let member = self.allocate_typed(instance_type, payload)?;
+            let name_value = self.allocate_string(member_name.clone())?;
+            self.insert_attribute(member, "_name_", name_value)?;
+            self.insert_attribute(member, "_value_", value)?;
+            self.modify(class, |b, object| {
+                let Object::Class(class_object) = object else {
+                    unreachable!("allocated a class");
                 };
-                *owner = Some(b.store(class));
-                Ok(())
-            })??;
+                class_object
+                    .attributes
+                    .insert(member_name.clone(), b.store(member));
+                class_object.enum_members.push(b.store(member));
+            })?;
         }
         for (_, descriptor) in &descriptors {
             if !descriptor.is_object() {
@@ -2780,14 +2768,9 @@ impl<'s> Vm<'s> {
             if !descriptor.is_object() {
                 continue;
             }
-            let Object::Instance {
-                class: descriptor_class,
-                ..
-            } = self.get(descriptor)?
-            else {
+            let Some(descriptor_class) = self.instance_class(descriptor)? else {
                 continue;
             };
-            let descriptor_class = self.handle(descriptor_class);
             let Some((owner, set_name)) =
                 self.class_attribute_entry(descriptor_class, "__set_name__")?
             else {
@@ -3009,15 +2992,11 @@ impl<'s> Vm<'s> {
         if !value.is_object() {
             return Ok(false);
         }
-        Ok(match self.get(*value)? {
-            Object::Property { .. } => true,
-            Object::Instance { class, .. } => {
-                let class = self.handle(class);
-                self.class_attribute(class, "__set__")?.is_some()
-                    || self.class_attribute(class, "__delete__")?.is_some()
-            }
-            _ => false,
-        })
+        if let Some(class) = self.instance_class(*value)? {
+            return Ok(self.class_attribute(class, "__set__")?.is_some()
+                || self.class_attribute(class, "__delete__")?.is_some());
+        }
+        Ok(matches!(self.get(*value)?, Object::Property { .. }))
     }
 
     /// Bind a native class method to `class`, which the method receives in place of an instance.
@@ -3062,6 +3041,7 @@ impl<'s> Vm<'s> {
         if !descriptor.is_object() {
             return Ok(descriptor);
         }
+        let descriptor_class = self.instance_class(descriptor)?;
         match self.get(descriptor)? {
             Object::Function { .. } => match receiver {
                 Some(receiver) => self.alloc_with(|b| Object::DescriptorBoundMethod {
@@ -3090,8 +3070,8 @@ impl<'s> Vm<'s> {
                 }
                 Ok(callable)
             }
-            Object::Instance { class, .. } => {
-                let class = self.handle(class);
+            _ if descriptor_class.is_some() => {
+                let class = descriptor_class.expect("checked above");
                 let Some((get_owner, get)) = self.class_attribute_entry(class, "__get__")? else {
                     return Ok(descriptor);
                 };
@@ -3146,51 +3126,6 @@ impl<'s> Vm<'s> {
         )
     }
 
-    fn vm_container_compare(
-        &mut self,
-        receiver: Value<'s>,
-        slot: Slot,
-        argument: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
-        let (left, right) = (self.builtin_view(receiver)?, self.builtin_view(argument)?);
-        let left_type = self.type_id(&left)?;
-        let right_type = self.type_id(&right)?;
-        let compatible = match left_type {
-            id if id == BuiltinType::List.id() => right_type == BuiltinType::List.id(),
-            id if id == BuiltinType::Tuple.id() => right_type == BuiltinType::Tuple.id(),
-            id if id == BuiltinType::Dict.id() || id == BuiltinType::NamespaceDict.id() => {
-                right_type == BuiltinType::Dict.id()
-                    || right_type == BuiltinType::NamespaceDict.id()
-            }
-            id if id == BuiltinType::Set.id() || id == BuiltinType::FrozenSet.id() => {
-                right_type == BuiltinType::Set.id() || right_type == BuiltinType::FrozenSet.id()
-            }
-            _ => false,
-        };
-        if !compatible {
-            return Ok(None);
-        }
-        let result = match slot {
-            Slot::Equal => self.builtin_equality(&left, &right)?,
-            Slot::NotEqual => !self.builtin_equality(&left, &right)?,
-            Slot::LessThan | Slot::LessEqual | Slot::GreaterThan | Slot::GreaterEqual => {
-                let accepted: &[Ordering] = match slot {
-                    Slot::LessThan => &[Ordering::Less],
-                    Slot::LessEqual => &[Ordering::Less, Ordering::Equal],
-                    Slot::GreaterThan => &[Ordering::Greater],
-                    _ => &[Ordering::Greater, Ordering::Equal],
-                };
-                match self.compare_values(&left, &right)? {
-                    protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
-                    protocol::Comparison::Unordered => false,
-                    protocol::Comparison::Unsupported => return Ok(None),
-                }
-            }
-            _ => return Err("invalid container comparison slot".into()),
-        };
-        Ok(Some(Value::Bool(result)))
-    }
-
     pub(super) fn invoke_slot(
         &mut self,
         receiver: &Value<'s>,
@@ -3205,35 +3140,34 @@ impl<'s> Vm<'s> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
-            SlotValue::VmCompare => {
+            SlotValue::NativeCompare(call) => {
                 let [argument] = arguments.as_slice() else {
                     return Err("comparison slot received the wrong number of arguments".into());
                 };
-                return self.vm_container_compare(*receiver, slot, *argument);
+                let operator = ComparisonOperator::from_slot(slot)
+                    .ok_or("comparison slot invoked for a non-comparison operator")?;
+                let (receiver, argument) = (*receiver, *argument);
+                return call(self, receiver, argument, operator)
+                    .map(|result| result.map(Value::Bool))
+                    .map_err(|error| self.record_native_error(error));
             }
             SlotValue::VmHash => {
                 if !arguments.is_empty() {
                     return Err("hash slot received arguments".into());
                 }
-                let receiver = self.builtin_view(*receiver)?;
-                let hash = self.hash_value(&receiver)?;
+                let receiver = *receiver;
+                let hash = self.payload_hash(&receiver, 0)?;
                 return Ok(Some(Value::Int(hash)));
-            }
-            SlotValue::VmEnumString => {
-                if !arguments.is_empty() {
-                    return Err("enum string slot received arguments".into());
-                }
-                return self.enum_member_string(*receiver).map(Some);
             }
             SlotValue::VmRepr => {
                 if !arguments.is_empty() {
                     return Err("representation slot received arguments".into());
                 }
-                let rendered = self.repr_nested(receiver, &mut BTreeSet::new())?;
+                let rendered = self.repr_payload(receiver, &mut BTreeSet::new())?;
                 return self.allocate_string(rendered).map(Some);
             }
             SlotValue::NativeMethod(method) => {
-                let receiver = self.builtin_view(*receiver)?;
+                let receiver = *receiver;
                 return (method.call)(self, receiver, CallArgs::new(arguments, Vec::new()))
                     .map(Some)
                     .map_err(|error| self.record_native_error(error));
@@ -3244,8 +3178,7 @@ impl<'s> Vm<'s> {
                         "binary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                let (receiver, argument) =
-                    (self.builtin_view(*receiver)?, self.builtin_view(*argument)?);
+                let (receiver, argument) = (*receiver, *argument);
                 return call(self, receiver, argument)
                     .map_err(|error| self.record_native_error(error));
             }
@@ -3255,8 +3188,8 @@ impl<'s> Vm<'s> {
                         "ternary protocol slot received the wrong number of arguments".into(),
                     );
                 };
-                let receiver = self.builtin_view(*receiver)?;
-                let (first, second) = (self.builtin_view(*first)?, self.builtin_view(*second)?);
+                let receiver = *receiver;
+                let (first, second) = (*first, *second);
                 return call(self, receiver, first, second)
                     .map_err(|error| self.record_native_error(error));
             }
@@ -3264,7 +3197,7 @@ impl<'s> Vm<'s> {
                 if !arguments.is_empty() {
                     return Err("unary protocol slot received arguments".into());
                 }
-                let receiver = self.builtin_view(*receiver)?;
+                let receiver = *receiver;
                 return call(self, receiver).map_err(|error| self.record_native_error(error));
             }
             SlotValue::Descriptor(descriptor) => self.handle(&descriptor),
@@ -3272,12 +3205,11 @@ impl<'s> Vm<'s> {
         if !receiver.is_object() {
             return Ok(None);
         }
-        let class = match self.get(*receiver)? {
-            Object::Instance { class, .. } => self.handle(class),
-            Object::Class(class_object) if class_object.metaclass.is_object() => {
+        let class = match (self.instance_class(*receiver)?, self.get(*receiver)?) {
+            (Some(class), _) => class,
+            (None, Object::Class(class_object)) if class_object.metaclass.is_object() => {
                 self.handle(&class_object.metaclass)
             }
-            Object::Class(_) => return Ok(None),
             _ => return Ok(None),
         };
         let (defining_class, _) = self
@@ -3323,48 +3255,37 @@ impl<'s> Vm<'s> {
             .types
             .local_slot(owner, slot)?
             .ok_or("slot wrapper has no local implementation")?;
+        // The builtin `__repr__` and `__hash__` act on the receiver's payload: called from a
+        // subclass's own `__repr__`, they must not dispatch back into it.
         if matches!(implementation, SlotValue::VmRepr) {
-            let value = if owner == BuiltinType::Enum.id() {
-                receiver
-            } else {
-                self.builtin_view(receiver)?
-            };
-            let rendered = self.repr_nested(&value, &mut BTreeSet::new())?;
+            let rendered = self.repr_payload(&receiver, &mut BTreeSet::new())?;
             return self.allocate_string(rendered);
         }
-        if matches!(implementation, SlotValue::VmEnumString) {
-            return self.enum_member_string(receiver);
-        }
         if matches!(implementation, SlotValue::VmHash) {
-            let receiver = self.builtin_view(receiver)?;
-            return self.hash_value(&receiver).map(Value::Int);
+            return self.payload_hash(&receiver, 0).map(Value::Int);
         }
-        if matches!(implementation, SlotValue::VmCompare) {
-            let [argument] = arguments.as_slice() else {
-                return Err("comparison slot received the wrong number of arguments".into());
-            };
-            return Ok(self
-                .vm_container_compare(receiver, slot, *argument)?
-                .unwrap_or(Value::Native(NativeValue::NotImplemented)));
-        }
-        let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
-            SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
-            SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
-            SlotValue::VmHash => unreachable!("handled before builtin payload view"),
-            SlotValue::VmCompare => unreachable!("handled before builtin payload view"),
+            SlotValue::VmRepr | SlotValue::VmHash => {
+                unreachable!("handled before the native slot dispatch")
+            }
+            SlotValue::NativeCompare(call) => {
+                let operator = ComparisonOperator::from_slot(slot)
+                    .ok_or("comparison slot invoked for a non-comparison operator")?;
+                let argument = arguments[0];
+                call(self, receiver, argument, operator).map(|result| result.map(Value::Bool))
+            }
             SlotValue::NativeMethod(method) => {
                 return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
                     .map_err(|error| self.record_native_error(error));
             }
             SlotValue::NativeUnary(call) => call(self, receiver),
             SlotValue::NativeBinary(call) => {
-                let argument = self.builtin_view(arguments[0])?;
+                let argument = arguments[0];
                 call(self, receiver, argument)
             }
             SlotValue::NativeTernary(call) => {
-                let first = self.builtin_view(arguments[0])?;
-                let second = self.builtin_view(arguments[1])?;
+                let first = arguments[0];
+                let second = arguments[1];
                 call(self, receiver, first, second)
             }
             SlotValue::Descriptor(_) => return Err("slot wrapper is not native".into()),
@@ -3405,7 +3326,7 @@ impl<'s> Vm<'s> {
                 .ok_or_else(|| "__bool__ should return bool".into());
         }
         if let Some(result) = self.invoke_slot(value, Slot::Length, "__len__", Vec::new())? {
-            let length = protocol::int_value(&self.state.heap, result)
+            let length = number::int_value(&self.state.heap, result)
                 .ok_or_else(|| "__len__ should return int".to_string())?;
             if length < 0 {
                 return Err("__len__ should return >= 0".into());
@@ -3422,15 +3343,13 @@ impl<'s> Vm<'s> {
     /// Render the base object's identity without consulting the value's `__repr__` slot.
     pub(super) fn default_object_repr(&self, value: &Value<'s>) -> Result<String, String> {
         let mut name = self.type_name_of(value)?;
-        if value.is_object() {
-            if let Object::Instance { class, .. } = self.get(*value)? {
-                if let Object::Class(class_object) = self.get(self.handle(class))? {
-                    if let Some(module) = class_object.attributes.get("__module__") {
-                        let module = self.handle(module);
-                        if let Some(module) = protocol::string_value(&self.state.heap, module)? {
-                            if module != "builtins" {
-                                name = format!("{module}.{name}");
-                            }
+        if let Some(class) = self.instance_class(*value)? {
+            if let Object::Class(class_object) = self.get(class)? {
+                if let Some(module) = class_object.attributes.get("__module__") {
+                    let module = self.handle(module);
+                    if let Some(module) = string::string_value(&self.state.heap, module)? {
+                        if module != "builtins" {
+                            name = format!("{module}.{name}");
                         }
                     }
                 }
@@ -3469,23 +3388,25 @@ impl<'s> Vm<'s> {
             Some(SlotValue::VmRepr)
         ) {
             if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
-                return protocol::string_value(&self.state.heap, result)?
+                return string::string_value(&self.state.heap, result)?
                     .ok_or_else(|| "__repr__ should return str".into());
             }
         }
+        self.repr_payload(value, active)
+    }
+
+    /// The builtin `repr()` of `value`'s payload, ignoring any `__repr__` its class defines.
+    /// Items of a container still render through their own classes.
+    pub(super) fn repr_payload(
+        &mut self,
+        value: &Value<'s>,
+        active: &mut BTreeSet<u32>,
+    ) -> Result<String, String> {
         if let Some(id) = self.identity(*value)? {
+            if self.is_plain_instance(value)? {
+                return self.default_object_repr(value);
+            }
             match self.get(*value)? {
-                Object::Instance {
-                    class,
-                    payload: InstancePayload::Object,
-                    ..
-                } if matches!(
-                    self.get(self.handle(class)),
-                    Ok(Object::Class(class_object)) if class_object.exception_base.is_none()
-                ) =>
-                {
-                    return self.default_object_repr(value)
-                }
                 Object::NamespaceDict(target) => {
                     let target = self.namespace_handle(target);
                     return self.repr_namespace_dict(id, target, active);
@@ -3533,25 +3454,6 @@ impl<'s> Vm<'s> {
         };
         active.remove(&id);
         Ok(rendered)
-    }
-
-    fn enum_member_string(&mut self, member: Value<'s>) -> Result<Value<'s>, String> {
-        if !member.is_object() {
-            return Err("enum string slot requires a member".into());
-        }
-        let Object::EnumMember {
-            class: Some(class),
-            name,
-            ..
-        } = self.get(member)?
-        else {
-            return Err("enum string slot requires a member".into());
-        };
-        let class_name = match self.get(self.handle(class))? {
-            Object::Class(class_object) => class_object.name.clone(),
-            _ => return Err("enum member has an invalid class".into()),
-        };
-        self.allocate_string(format!("{class_name}.{name}"))
     }
 
     /// Dict-literal text for `entries`: `{key: value, ...}`.
@@ -3640,7 +3542,7 @@ impl<'s> Vm<'s> {
         let mut parts = Vec::with_capacity(entries.len());
         for (name, value) in entries {
             let value = self.repr_nested(&value, active)?;
-            parts.push(format!("{}: {value}", protocol::quote_string(&name)));
+            parts.push(format!("{}: {value}", string::quote_string(&name)));
         }
         active.remove(&id);
         Ok(format!("{{{}}}", parts.join(", ")))
@@ -3696,10 +3598,10 @@ impl<'s> Vm<'s> {
 
     pub(super) fn display_value(&mut self, value: &Value<'s>) -> Result<String, String> {
         if let Some(result) = self.invoke_slot(value, Slot::String, "__str__", Vec::new())? {
-            return protocol::string_value(&self.state.heap, result)?
+            return string::string_value(&self.state.heap, result)?
                 .ok_or_else(|| "__str__ should return str".into());
         }
-        if let Some(text) = protocol::string_value(&self.state.heap, *value)? {
+        if let Some(text) = string::string_value(&self.state.heap, *value)? {
             return Ok(text);
         }
         if self
@@ -3709,20 +3611,7 @@ impl<'s> Vm<'s> {
         {
             return protocol::display(self.state, *value).map_err(|error| self.render_error(error));
         }
-        let plain_instance = match value.is_object() {
-            true => match self.get(*value)? {
-                Object::Instance {
-                    class,
-                    payload: InstancePayload::Object,
-                    ..
-                } => matches!(
-                    self.get(self.handle(class))?,
-                    Object::Class(class_object) if class_object.exception_base.is_none()
-                ),
-                _ => false,
-            },
-            false => false,
-        };
+        let plain_instance = self.is_plain_instance(value)?;
         if self
             .state
             .types
@@ -3761,112 +3650,6 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// Order two values by Python's rich comparisons, including user `__eq__` and `__lt__`.
-    pub(super) fn compare_values(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<protocol::Comparison, String> {
-        self.compare_values_at(left, right, 0)
-    }
-
-    /// [`Self::compare_values`] at nesting `depth`: sequences compare element by element, and
-    /// nesting past [`MAX_COMPARE_DEPTH`] raises `RecursionError` instead of exhausting the host
-    /// stack on deeply nested tuples or lists.
-    fn compare_values_at(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-        depth: usize,
-    ) -> Result<protocol::Comparison, String> {
-        if left.is_object() && right.is_object() {
-            let sequences = match (self.get(*left)?, self.get(*right)?) {
-                (Object::List(left), Object::List(right))
-                | (Object::Tuple(left), Object::Tuple(right)) => {
-                    Some((self.handles(left), self.handles(right)))
-                }
-                _ => None,
-            };
-            if let Some((left, right)) = sequences {
-                if depth >= MAX_COMPARE_DEPTH {
-                    return Err(self.raise_exception(
-                        "RecursionError",
-                        "maximum recursion depth exceeded in comparison",
-                    ));
-                }
-                for (left, right) in left.iter().zip(&right) {
-                    self.charge_cpu(1)?;
-                    if self.identical(*left, *right) {
-                        continue;
-                    }
-                    let comparison = self.compare_values_at(left, right, depth + 1)?;
-                    if comparison != protocol::Comparison::Ordered(Ordering::Equal) {
-                        return Ok(comparison);
-                    }
-                }
-                return Ok(protocol::Comparison::Ordered(left.len().cmp(&right.len())));
-            }
-        }
-        if let Some(equal) = self.invoke_operator_slot(left, Slot::Equal, "__eq__", vec![*right])? {
-            if self.truth_value(&equal)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Equal));
-            }
-        }
-        if let Some(less) =
-            self.invoke_operator_slot(left, Slot::LessThan, "__lt__", vec![*right])?
-        {
-            if self.truth_value(&less)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Less));
-            }
-        }
-        if let Some(less) =
-            self.invoke_operator_slot(right, Slot::LessThan, "__lt__", vec![*left])?
-        {
-            if self.truth_value(&less)? {
-                return Ok(protocol::Comparison::Ordered(Ordering::Greater));
-            }
-        }
-        let (builtin_left, builtin_right) = (self.builtin_view(*left)?, self.builtin_view(*right)?);
-        if !self.identical(builtin_left, *left) || !self.identical(builtin_right, *right) {
-            return self.compare_values_at(&builtin_left, &builtin_right, depth);
-        }
-        self.charge_scan_pair(left, right)?;
-        protocol::compare(&self.state.heap, *left, *right)
-    }
-
-    /// Order two values for native sorting, heap and bisection helpers with the `<` operator
-    /// alone, as CPython's do: `left < right` is `Less`, `right < left` is `Greater`, and
-    /// anything else, such as a NaN, is `Equal`, so the earlier value stays in place.
-    pub(super) fn sort_order(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<Ordering, String> {
-        if self.compare_truth(ComparisonOperator::Less, left, right)? {
-            Ok(Ordering::Less)
-        } else if self.compare_truth(ComparisonOperator::Less, right, left)? {
-            Ok(Ordering::Greater)
-        } else {
-            Ok(Ordering::Equal)
-        }
-    }
-
-    /// Raise CPython's `TypeError` for an ordering comparison between unrelated types.
-    pub(super) fn raise_unorderable(
-        &mut self,
-        symbol: &str,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> String {
-        let message = match (self.type_name_of(left), self.type_name_of(right)) {
-            (Ok(left), Ok(right)) => {
-                format!("'{symbol}' not supported between instances of '{left}' and '{right}'")
-            }
-            (Err(error), _) | (_, Err(error)) => return error,
-        };
-        self.raise_exception("TypeError", message)
-    }
-
     fn super_attribute(
         &mut self,
         start_class: Value<'s>,
@@ -3880,9 +3663,7 @@ impl<'s> Vm<'s> {
             return Err("super() receiver is not an instance or class".into());
         }
         let accessed_type = match self.get(*receiver)? {
-            Object::Instance { class, .. } => self
-                .class_type_id(&self.handle(class))?
-                .ok_or("super() receiver has an invalid class")?,
+            _ if self.instance_class(*receiver)?.is_some() => self.type_id(receiver)?,
             Object::Class { .. } => {
                 let class_type = self
                     .class_type_id(receiver)?
@@ -3979,7 +3760,7 @@ impl<'s> Vm<'s> {
         source: &Value<'s>,
     ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
         // A dict subclass contributes the entries it holds, as CPython's dict merge does.
-        let view = self.builtin_view(*source)?;
+        let view = *source;
         if view.is_object() {
             if let Object::Dict(entries) | Object::DefaultDict { entries, .. } = self.get(view)? {
                 return Ok(entries
@@ -4100,7 +3881,7 @@ impl<'s> Vm<'s> {
             BuiltinType::Type => match arguments.as_slice() {
                 [value] => self.type_of(value)?,
                 [name, bases, namespace] => {
-                    let name = protocol::string_value(&self.state.heap, *name)?
+                    let name = string::string_value(&self.state.heap, *name)?
                         .ok_or("type name must be a string")?;
                     self.new_type(
                         Value::Native(NativeValue::BuiltinType(BuiltinType::Type)),
@@ -4186,18 +3967,17 @@ impl<'s> Vm<'s> {
             BuiltinType::Int => {
                 expect_arity(&arguments, 0, 2)?;
                 if let Some(base) = arguments.get(1) {
-                    let base = protocol::int_value(&self.state.heap, *base).ok_or_else(|| {
+                    let base = number::int_value(&self.state.heap, *base).ok_or_else(|| {
                         self.record_native_error(PyError::type_error(
                             "int() base must be an integer",
                         ))
                     })?;
-                    let text = protocol::string_value(&self.state.heap, arguments[0])?.ok_or_else(
-                        || {
+                    let text =
+                        string::string_value(&self.state.heap, arguments[0])?.ok_or_else(|| {
                             self.record_native_error(PyError::type_error(
                                 "int() can't convert non-string with explicit base",
                             ))
-                        },
-                    )?;
+                        })?;
                     self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
                     let integer = super::number::parse_integer_text(&text, base)
                         .map_err(|error| self.record_native_error(error))?;
@@ -4208,10 +3988,10 @@ impl<'s> Vm<'s> {
                         None => Value::Int(0),
                         Some(value) if self.is_bigint(value)? => *value,
                         Some(value)
-                            if protocol::string_value(&self.state.heap, *value)?.is_some() =>
+                            if string::string_value(&self.state.heap, *value)?.is_some() =>
                         {
                             let text =
-                                protocol::string_value(&self.state.heap, *value)?.expect("guarded");
+                                string::string_value(&self.state.heap, *value)?.expect("guarded");
                             self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
                             let integer = super::number::parse_integer_text(&text, 10)
                                 .map_err(|error| self.record_native_error(error))?;
@@ -4262,15 +4042,15 @@ impl<'s> Vm<'s> {
                         };
                         value
                     }
-                    Some(value) if protocol::string_value(&self.state.heap, *value)?.is_some() => {
+                    Some(value) if string::string_value(&self.state.heap, *value)?.is_some() => {
                         let text =
-                            protocol::string_value(&self.state.heap, *value)?.expect("guarded");
+                            string::string_value(&self.state.heap, *value)?.expect("guarded");
                         match text.trim().parse::<f64>() {
                             Ok(parsed) => parsed,
                             Err(_) => {
                                 let message = format!(
                                     "could not convert string to float: {}",
-                                    protocol::quote_string(&text)
+                                    string::quote_string(&text)
                                 );
                                 return Err(self.raise_exception("ValueError", message));
                             }
@@ -4307,12 +4087,12 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 0, 2)?;
                 let value = match arguments.as_slice() {
                     [] => Vec::new(),
-                    [value] if protocol::bytes_value(&self.state.heap, *value)?.is_some() => {
-                        protocol::bytes_value(&self.state.heap, *value)?.expect("guarded")
+                    [value] if string::bytes_value(&self.state.heap, *value)?.is_some() => {
+                        string::bytes_value(&self.state.heap, *value)?.expect("guarded")
                     }
-                    [value] if protocol::int_value(&self.state.heap, *value).is_some() => {
+                    [value] if number::int_value(&self.state.heap, *value).is_some() => {
                         let Ok(length) = usize::try_from(
-                            protocol::int_value(&self.state.heap, *value).expect("guarded"),
+                            number::int_value(&self.state.heap, *value).expect("guarded"),
                         ) else {
                             return Err(self.raise_exception("ValueError", "negative count"));
                         };
@@ -4326,7 +4106,7 @@ impl<'s> Vm<'s> {
                         let converted = self
                             .conversion_method(value, "__bytes__")?
                             .expect("special method found above");
-                        match protocol::bytes_value(&self.state.heap, converted)? {
+                        match string::bytes_value(&self.state.heap, converted)? {
                             Some(bytes) => bytes,
                             None => {
                                 let message = format!(
@@ -4364,9 +4144,9 @@ impl<'s> Vm<'s> {
                         bytes
                     }
                     [value, encoding] => {
-                        let text = protocol::string_value(&self.state.heap, *value)?
+                        let text = string::string_value(&self.state.heap, *value)?
                             .ok_or("encoding without a string argument")?;
-                        let encoding = protocol::string_value(&self.state.heap, *encoding)?
+                        let encoding = string::string_value(&self.state.heap, *encoding)?
                             .ok_or("bytes() encoding must be a string")?;
                         if !matches!(encoding.to_ascii_lowercase().as_str(), "utf-8" | "utf8") {
                             return Err("only UTF-8 encoding is supported".into());
@@ -4472,24 +4252,16 @@ impl<'s> Vm<'s> {
     }
 
     /// Return the Python-level type independently of the value's physical storage shape.
+    /// The Python type of a value: a tag switch for an immediate, the object header for a
+    /// heap object. The header is set when the object is allocated and re-typed only by
+    /// [`Heap::set_type_id`](super::super::heap::Heap::set_type_id) for a builtin exception
+    /// instance or an enum member whose class is known only later.
     pub(super) fn type_id(&self, value: &Value<'s>) -> Result<TypeId, String> {
         if value.inline_string_len().is_some() {
             return Ok(BuiltinType::String.id());
         }
-        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
-            if let Some(id) = self.state.types.exception_type_id(&kind) {
-                return Ok(id);
-            }
-        }
         if value.is_object() {
-            if let Object::EnumMember {
-                class: Some(class), ..
-            } = self.get(*value)?
-            {
-                return self
-                    .class_type_id(&self.handle(class))?
-                    .ok_or_else(|| "invalid enum class".to_string());
-            }
+            return self.object_type_id(*value);
         }
         if value.is_none() {
             return Ok(BuiltinType::None.id());
@@ -4509,9 +4281,6 @@ impl<'s> Vm<'s> {
                 .types
                 .value_kind_type_id_by_index(kind)
                 .ok_or("invalid registered value kind")?);
-        }
-        if value.is_object() {
-            return self.object_type_id(*value);
         }
         Ok(
             match value

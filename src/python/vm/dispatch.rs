@@ -2,9 +2,10 @@
 
 use super::super::scopes;
 use super::{
-    dispatch_next, protocol, BytecodeFrame, CallId, CallMode, CallResult, CodeRef, DispatchControl,
-    DispatchCursor, ExceptionType, Execution, ForIterOutcome, FunctionReturn, NativeValue, Opcode,
-    RaisedException, SequenceKind, TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
+    dispatch_next, exception_types, protocol, string, BytecodeFrame, CallId, CallMode, CallResult,
+    CodeRef, DispatchControl, DispatchCursor, ExceptionType, Execution, ForIterOutcome,
+    FunctionReturn, NativeValue, Opcode, RaisedException, SequenceKind, TracebackFrame, Value, Vm,
+    VM_POLL_QUANTUM,
 };
 
 impl<'s> Vm<'s> {
@@ -485,11 +486,7 @@ impl<'s> Vm<'s> {
             self.push(value);
             return Ok(DispatchControl::Next);
         }
-        let kind = if let Some(kind) = protocol::exception_kind(self.state, value)? {
-            kind
-        } else if let Some(kind) = self.user_exception_kind(&value)? {
-            kind
-        } else {
+        let Some(kind) = exception_types::exception_type_name(self.state, value)? else {
             return Err("coroutine scheduler injected a non-exception".into());
         };
         self.pending_exception = Some(RaisedException {
@@ -504,12 +501,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
         let exception = if has_value {
             let value = self.pop()?;
-            if let Some(kind) = protocol::exception_kind(self.state, value)? {
-                RaisedException {
-                    kind,
-                    value: self.store(value),
-                }
-            } else if let Some(kind) = self.user_exception_kind(&value)? {
+            if let Some(kind) = exception_types::exception_type_name(self.state, value)? {
                 RaisedException {
                     kind,
                     value: self.store(value),
@@ -535,8 +527,7 @@ impl<'s> Vm<'s> {
                         unreachable!("immediate call cannot suspend")
                     }
                 };
-                let kind = self
-                    .user_exception_kind(&instance)?
+                let kind = exception_types::exception_type_name(self.state, instance)?
                     .ok_or("exception class produced a non-exception instance")?;
                 RaisedException {
                     kind,
@@ -563,8 +554,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
         let cause = self.pop()?;
         let valid = cause.is_none()
-            || protocol::exception_kind(self.state, cause)?.is_some()
-            || self.user_exception_kind(&cause)?.is_some()
+            || exception_types::exception_type_name(self.state, cause)?.is_some()
             || self.exception_class_base(&cause)?.is_some();
         if !valid {
             return Err(self.raise_exception(
@@ -694,7 +684,10 @@ impl<'s> Vm<'s> {
     }
 
     fn exception_class(&self, kind: &str, value: &Value<'s>) -> Result<Value<'s>, String> {
-        if protocol::exception_kind(self.state, *value)?.is_some() {
+        // A builtin exception instance has no class object; its class is the registered type.
+        if exception_types::exception_base(self.state, *value)?.is_some()
+            && self.instance_class(*value)?.is_none()
+        {
             let name = super::known_exception_type(kind)
                 .ok_or_else(|| format!("exception type metadata is not modeled for {kind:?}"))?;
             Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
@@ -871,7 +864,7 @@ impl<'s> Vm<'s> {
         let heap = &self.state.heap;
         let root = scopes::root(heap, self.handle(self.local_scopes.last()?)).ok()?;
         let file = scopes::get(heap, root, "__file__").ok()??;
-        protocol::string_value(heap, file).ok().flatten()
+        string::string_value(heap, file).ok().flatten()
     }
 
     fn unwind_deferred_frame(&mut self) -> Option<FunctionReturn> {

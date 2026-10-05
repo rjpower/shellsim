@@ -7,9 +7,9 @@
 
 use super::super::heap::Ref;
 use super::{
-    protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot, SlotValue, Stream, Value,
-    Vm,
+    exception_types, number, string, CallArgs, Execution, ForIterOutcome, IteratorAdvance,
+    NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException,
+    Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// An exception on its way into or out of a generator frame, with its value as a handle so it
@@ -67,7 +67,7 @@ impl<'s> Vm<'s> {
         {
             return Ok(iterator);
         }
-        let subject = self.builtin_view(value)?;
+        let subject = value;
         let physical_sequence = if subject.is_object() {
             matches!(
                 self.get(subject)?,
@@ -79,7 +79,7 @@ impl<'s> Vm<'s> {
                     | Object::ByteArray(_)
             )
         } else {
-            protocol::string_value(&self.state.heap, subject)?.is_some()
+            string::string_value(&self.state.heap, subject)?.is_some()
         };
         let getitem = self
             .state
@@ -94,7 +94,7 @@ impl<'s> Vm<'s> {
         }
         let length = match self.invoke_slot(&value, Slot::Length, "__len__", Vec::new())? {
             Some(length) => {
-                let length = protocol::int_value(&self.state.heap, length).ok_or_else(|| {
+                let length = number::int_value(&self.state.heap, length).ok_or_else(|| {
                     self.raise_exception("TypeError", "__len__() should return an integer")
                 })?;
                 usize::try_from(length).map_err(|_| {
@@ -114,7 +114,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: Value<'s>,
     ) -> Result<Value<'s>, String> {
-        let subject = self.builtin_view(value)?;
+        let subject = value;
         let length = self
             .physical_length(subject)?
             .ok_or("native reverse slot requires a sequence")?;
@@ -147,22 +147,49 @@ impl<'s> Vm<'s> {
                 });
             }
         }
+        if self.instance_class(iterable)?.is_none() {
+            if let Some(iterator) = self.payload_iterator(iterable)? {
+                return Ok(iterator);
+            }
+        }
+        if let Some(iterator) = self.class_iterator(&iterable)? {
+            return Ok(iterator);
+        }
+        let values = self.iterable_values(&iterable)?;
+        self.alloc_with(|builder| Object::Iterator {
+            values: builder.refs(values),
+            position: 0,
+        })
+    }
+
+    /// An iterator over a builtin payload, ignoring any `__iter__` the object's class defines:
+    /// what the builtin `__iter__` slots return, so `str.__iter__(instance)` does not dispatch
+    /// back into a subclass's override. Returns `None` when the payload is not a builtin
+    /// iterable.
+    pub(super) fn payload_iterator(
+        &mut self,
+        iterable: Value<'s>,
+    ) -> Result<Option<Value<'s>>, String> {
         if iterable.is_object() {
             match self.get(iterable)? {
                 Object::List(_) | Object::Tuple(_) => {
-                    return self.alloc_with(|builder| Object::SequenceIterator {
-                        owner: builder.store(iterable),
-                        position: 0,
-                    });
+                    return self
+                        .alloc_with(|builder| Object::SequenceIterator {
+                            owner: builder.store(iterable),
+                            position: 0,
+                        })
+                        .map(Some);
                 }
                 Object::Range { start, stop, step } => {
                     let (current, stop, step) = (*start, *stop, *step);
-                    return self.alloc(Object::RangeIterator {
-                        current,
-                        stop,
-                        step,
-                        exhausted: false,
-                    });
+                    return self
+                        .alloc(Object::RangeIterator {
+                            current,
+                            stop,
+                            step,
+                            exhausted: false,
+                        })
+                        .map(Some);
                 }
                 Object::Iterator { .. }
                 | Object::SequenceIterator { .. }
@@ -174,25 +201,12 @@ impl<'s> Vm<'s> {
                 | Object::Generator { .. } => {
                     // These iterators remain lazy; materializing either one here would permit an
                     // unbounded host allocation before the caller's loop can meter each item.
-                    return Ok(iterable);
+                    return Ok(Some(iterable));
                 }
                 _ => {}
             }
         }
-        if let Some(iterator) = self.snapshot_builtin_iterator(iterable)? {
-            return Ok(iterator);
-        }
-        if let Some(iterator) = self.class_iterator(&iterable)? {
-            return Ok(iterator);
-        }
-        if let Some(value) = protocol::builtin_payload(&self.state.heap, iterable)? {
-            return self.make_iterator(value);
-        }
-        let values = self.iterable_values(&iterable)?;
-        self.alloc_with(|builder| Object::Iterator {
-            values: builder.refs(values),
-            position: 0,
-        })
+        self.snapshot_builtin_iterator(iterable)
     }
 
     /// Builtin strings, byte strings and hash containers keep their existing snapshot iteration
@@ -202,16 +216,13 @@ impl<'s> Vm<'s> {
         &mut self,
         iterable: Value<'s>,
     ) -> Result<Option<Value<'s>>, String> {
-        if iterable.is_object() && matches!(self.get(iterable), Ok(Object::Instance { .. })) {
-            return Ok(None);
-        }
         let mut values = Vec::new();
-        if let Some(text) = protocol::string_value(&self.state.heap, iterable)? {
+        if let Some(text) = string::string_value(&self.state.heap, iterable)? {
             for character in text.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut values, character)?;
             }
-        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, iterable)? {
+        } else if let Some(bytes) = string::bytes_value(&self.state.heap, iterable)? {
             for byte in bytes {
                 self.push_materialized(&mut values, Value::Int(i64::from(byte)))?;
             }
@@ -842,7 +853,7 @@ impl<'s> Vm<'s> {
         if exception.kind != "StopIteration" {
             return Ok(ForwardedThrow::Raise(exception));
         }
-        let value = protocol::exception_args(&self.state.heap, exception.value)?
+        let value = exception_types::exception_args(self.state, exception.value)?
             .and_then(|(_, args)| args.first().copied())
             .unwrap_or(Value::None);
         Ok(ForwardedThrow::Returned(value))

@@ -5,9 +5,8 @@
 //! together with the space it points into.
 
 use super::{
-    ArgumentParserObject, ArgumentSpec, ArrayStorage, ClassObject, FunctionObject, GeneratorObject,
-    InstanceAttributes, InstancePayload, MatchObject, NamespaceTarget, Object, ProxyTarget, Ref,
-    ScopeObject, SubcommandSpec, SubparsersSpec,
+    ClassObject, FunctionObject, GeneratorObject, InstanceAttributes, NamespaceTarget, Object,
+    ProxyTarget, Ref, ScopeObject,
 };
 
 fn slots(slots: &[Ref]) -> Vec<Ref> {
@@ -26,16 +25,26 @@ fn named<K: Clone + Eq + std::hash::Hash>(
         .collect()
 }
 
+pub(super) fn dup_attributes(attributes: &InstanceAttributes) -> InstanceAttributes {
+    match attributes {
+        InstanceAttributes::Shaped { shape, values } => InstanceAttributes::Shaped {
+            shape: *shape,
+            values: slots(values),
+        },
+        InstanceAttributes::Dictionary(values) => {
+            InstanceAttributes::Dictionary(Box::new(named(values)))
+        }
+    }
+}
+
 pub(super) fn dup_object(object: &Object) -> Object {
     match object {
         Object::Bare => Object::Bare,
+        Object::Float(value) => Object::Float(*value),
         Object::String(value) => Object::String(value.clone()),
         Object::Bytes(value) => Object::Bytes(value.clone()),
         Object::ByteArray(value) => Object::ByteArray(value.clone()),
-        Object::Exception { kind, args } => Object::Exception {
-            kind: kind.clone(),
-            args: slots(args),
-        },
+        Object::Exception(args) => Object::Exception(slots(args)),
         Object::List(items) => Object::List(slots(items)),
         Object::Tuple(items) => Object::Tuple(slots(items)),
         Object::Slice { start, stop, step } => Object::Slice {
@@ -85,31 +94,6 @@ pub(super) fn dup_object(object: &Object) -> Object {
                 .collect(),
             enum_members: slots(&class.enum_members),
         })),
-        Object::Instance {
-            class,
-            payload,
-            attributes,
-        } => Object::Instance {
-            class: class.dup(),
-            payload: match payload {
-                InstancePayload::Object => InstancePayload::Object,
-                InstancePayload::Builtin(value) => InstancePayload::Builtin(value.dup()),
-            },
-            attributes: match attributes {
-                InstanceAttributes::Shaped { shape, values } => InstanceAttributes::Shaped {
-                    shape: *shape,
-                    values: slots(values),
-                },
-                InstanceAttributes::Dictionary(values) => {
-                    InstanceAttributes::Dictionary(Box::new(named(values)))
-                }
-            },
-        },
-        Object::EnumMember { class, name, value } => Object::EnumMember {
-            class: optional(class),
-            name: name.clone(),
-            value: value.dup(),
-        },
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,
@@ -201,21 +185,6 @@ pub(super) fn dup_object(object: &Object) -> Object {
             ProxyTarget::RegisteredType(type_id) => ProxyTarget::RegisteredType(*type_id),
             ProxyTarget::NativeModule(module) => ProxyTarget::NativeModule(module),
         }),
-        Object::ArrayStorage(ArrayStorage::Bytes(bytes)) => {
-            Object::ArrayStorage(ArrayStorage::Bytes(bytes.clone()))
-        }
-        Object::ArrayStorage(ArrayStorage::Values(values)) => {
-            Object::ArrayStorage(ArrayStorage::Values(slots(values)))
-        }
-        Object::Array {
-            storage,
-            view,
-            base,
-        } => Object::Array {
-            storage: storage.dup(),
-            view: view.clone(),
-            base: optional(base),
-        },
         Object::WideValue {
             type_id,
             kind,
@@ -225,64 +194,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
             kind: *kind,
             payload: *payload,
         },
-        Object::Regex { pattern, flags } => Object::Regex {
-            pattern: pattern.clone(),
-            flags: *flags,
-        },
-        Object::Match(matched) => Object::Match(Box::new(MatchObject {
-            subject: matched.subject.dup(),
-            regex: matched.regex.dup(),
-            text: matched.text.clone(),
-            groups: matched.groups.clone(),
-            group_names: matched.group_names.clone(),
-            spans: matched.spans.clone(),
-            pos: matched.pos,
-            endpos: matched.endpos,
-        })),
-        Object::ArgumentParser(parser) => Object::ArgumentParser(Box::new(ArgumentParserObject {
-            prog: parser.prog.clone(),
-            description: parser.description.clone(),
-            add_help: parser.add_help,
-            is_subcommand: parser.is_subcommand,
-            arguments: parser
-                .arguments
-                .iter()
-                .map(|argument| ArgumentSpec {
-                    names: argument.names.clone(),
-                    dest: argument.dest.clone(),
-                    required: argument.required,
-                    default: argument.default.dup(),
-                    store_true: argument.store_true,
-                    store_false: argument.store_false,
-                    integer: argument.integer,
-                    choices: slots(&argument.choices),
-                    help: argument.help.clone(),
-                })
-                .collect(),
-            subparsers: parser.subparsers.as_ref().map(|subparsers| SubparsersSpec {
-                dest: subparsers.dest.clone(),
-                required: subparsers.required,
-                help: subparsers.help.clone(),
-                commands: subparsers
-                    .commands
-                    .iter()
-                    .map(|command| SubcommandSpec {
-                        name: command.name.clone(),
-                        help: command.help.clone(),
-                        parser: command.parser.dup(),
-                    })
-                    .collect(),
-            }),
-        })),
-        Object::Namespace { values } => Object::Namespace {
-            values: values
-                .iter()
-                .map(|(name, value)| (name.clone(), value.dup()))
-                .collect(),
-        },
-        Object::RaisesContext { expected } => Object::RaisesContext {
-            expected: expected.clone(),
-        },
+        Object::Native(native) => Object::Native(native.dup()),
         Object::Property { getter, setter } => Object::Property {
             getter: getter.dup(),
             setter: optional(setter),

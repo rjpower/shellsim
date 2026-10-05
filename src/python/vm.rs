@@ -22,9 +22,9 @@ use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    Builder, ClassLayout, InstancePayload, KeyHash, NamespaceTarget, Object, OrderedMap,
-    OrderedSet, ProxyTarget, Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
+    Builder, ClassLayout, KeyHash, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget,
+    Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
@@ -40,10 +40,12 @@ use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::slice::SlicePlan;
 use super::source::Span;
+use super::string;
 use super::symbols::SymbolId;
 use super::{protocol, ExecResult, Out, ReplState, Value};
 
 mod calls;
+mod compare;
 mod dispatch;
 mod equality;
 mod format;
@@ -56,6 +58,8 @@ mod namespace;
 mod native_runtime;
 mod objects;
 mod operations;
+
+pub(super) use objects::scan_cost;
 mod summation;
 const VM_POLL_QUANTUM: usize = 64;
 
@@ -621,6 +625,8 @@ struct VmState {
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
+    /// Nesting of builtin sequence ordering in progress, bounded like other recursion.
+    compare_depth: usize,
     /// Frames collected by the most recent [`Vm::propagate_error`] unwind, freshest overwrites
     /// stale. Consumed by `render_execution` when reporting an uncaught exception's traceback.
     traceback_frames: Vec<TracebackFrame>,
@@ -666,6 +672,7 @@ impl Clone for VmState {
             class_bindings: self.class_bindings.clone(),
             call_depth: self.call_depth,
             pending_exception: self.pending_exception.clone(),
+            compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
             async_timer_deadlines: self.async_timer_deadlines.clone(),
@@ -709,13 +716,6 @@ impl Roots for VmState {
         for (class, receiver) in &mut self.method_frames {
             visitor(class);
             visitor(receiver);
-        }
-        for caches in self.code_caches.iter_mut() {
-            if let Some(attributes) = &mut caches.attributes {
-                for cache in attributes.iter_mut().flatten() {
-                    visitor(&mut cache.class);
-                }
-            }
         }
         for frame in &mut self.bytecode_frames {
             match &mut frame.pending_native_call {
@@ -849,7 +849,7 @@ impl Clone for CodeCaches {
                     .iter()
                     .map(|cache| {
                         cache.as_ref().map(|cache| LoadAttributeCache {
-                            class: cache.class.dup(),
+                            type_id: cache.type_id,
                             location: cache.location,
                         })
                     })
@@ -862,7 +862,7 @@ impl Clone for CodeCaches {
 /// One `LoadAttribute` site's last shaped lookup: valid while the receiver has this class and
 /// shape.
 struct LoadAttributeCache {
-    class: Ref,
+    type_id: TypeId,
     location: InstanceAttributeSlot,
 }
 
@@ -1360,18 +1360,28 @@ impl<'s> Vm<'s> {
         } else {
             vec![self.allocate_string(message)?]
         };
-        self.alloc_with(|builder| Object::Exception {
-            kind,
-            args: builder.refs(args),
-        })
+        self.allocate_exception_object(&kind, args)
+    }
+
+    /// An instance of the builtin exception class `kind` with the constructor arguments `args`.
+    /// The object header carries the class's type id, so `type()`, `isinstance` and slot
+    /// lookups read it directly.
+    fn allocate_exception_object(
+        &mut self,
+        kind: &str,
+        args: Vec<Value<'s>>,
+    ) -> Result<Value<'s>, String> {
+        let type_id = self
+            .state
+            .types
+            .exception_type_id(kind)
+            .ok_or_else(|| format!("exception type {kind:?} is not registered"))?;
+        self.alloc_with_typed(type_id, |builder| Object::Exception(builder.refs(args)))
     }
 
     /// Raise a builtin exception with the constructor arguments `args`.
     fn raise_exception_args(&mut self, kind: &str, args: Vec<Value<'s>>) -> String {
-        let value = match self.alloc_with(|builder| Object::Exception {
-            kind: kind.to_string(),
-            args: builder.refs(args),
-        }) {
+        let value = match self.allocate_exception_object(kind, args) {
             Ok(value) => value,
             Err(error) => return error,
         };
@@ -1404,9 +1414,6 @@ impl<'s> Vm<'s> {
 
     /// The type name CPython prints in error messages, such as `int` or a user class name.
     fn type_name_of(&self, value: &Value<'s>) -> Result<String, String> {
-        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
-            return Ok(kind);
-        }
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
     }
 
@@ -1471,16 +1478,13 @@ impl<'s> Vm<'s> {
         if self.has_python_iter(value)? {
             return self.materialize_through_bytecode(*value);
         }
-        if let Some(value) = protocol::builtin_payload(&self.state.heap, *value)? {
-            return self.iterable_values(&value);
-        }
         let mut result = Vec::new();
-        if let Some(value) = protocol::string_value(&self.state.heap, *value)? {
+        if let Some(value) = string::string_value(&self.state.heap, *value)? {
             for character in value.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut result, character)?;
             }
-        } else if let Some(value) = protocol::bytes_value(&self.state.heap, *value)? {
+        } else if let Some(value) = string::bytes_value(&self.state.heap, *value)? {
             for byte in value {
                 self.push_materialized(&mut result, Value::Int(i64::from(byte)))?;
             }
@@ -1512,7 +1516,7 @@ impl<'s> Vm<'s> {
                 Object::Class(class_object) if !class_object.enum_members.is_empty() => {
                     MaterializeSource::Values(self.handles(&class_object.enum_members))
                 }
-                Object::Instance { .. } => MaterializeSource::Instance,
+                _ if self.instance_class(*value)?.is_some() => MaterializeSource::Instance,
                 _ => MaterializeSource::NotIterable,
             };
             match source {
@@ -1559,6 +1563,14 @@ impl<'s> Vm<'s> {
     fn has_python_iter(&self, value: &Value<'s>) -> Result<bool, String> {
         if !value.is_object() {
             return Ok(false);
+        }
+        // An instance of a user class iterates through Python code only when the class (or a
+        // user ancestor) defines `__iter__`; an inherited builtin slot reads the payload natively.
+        if self.instance_class(*value)?.is_some() {
+            return Ok(matches!(
+                self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
+                Some(SlotValue::Descriptor(descriptor)) if !descriptor.is_none()
+            ));
         }
         if matches!(
             self.get(*value)?,
@@ -1642,10 +1654,8 @@ impl<'s> Vm<'s> {
                         return Err(error);
                     };
                     let exception_value = self.handle(&exception.value);
-                    let kind = match self.user_exception_base(&exception_value)? {
-                        Some(base) => base,
-                        None => exception.kind.as_str(),
-                    };
+                    let kind = exception_types::exception_base(self.state, exception_value)?
+                        .unwrap_or(exception.kind.as_str());
                     if !exception_types::exception_is_subclass(kind, "IndexError")
                         && !exception_types::exception_is_subclass(kind, "StopIteration")
                     {
@@ -1669,7 +1679,7 @@ impl<'s> Vm<'s> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
-        let payload = protocol::string_ref(&self.state.heap, value)?
+        let payload = string::string_ref(&self.state.heap, value)?
             .map_or(0, |text| text.byte_len().saturating_mul(2));
         self.reserve_result(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;
@@ -1974,7 +1984,7 @@ struct ClassDefinition<'s> {
     exception_base: Option<&'static str>,
     attributes: HashMap<String, Value<'s>>,
     dataclass_fields: Vec<(String, Option<Value<'s>>)>,
-    enum_members: Vec<Value<'s>>,
+    enum_members: Vec<(String, Value<'s>)>,
 }
 
 fn select_string_slice(

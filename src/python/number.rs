@@ -10,11 +10,33 @@ use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::hash;
-use super::heap::{Heap, InstancePayload, Object};
+use super::heap::{Heap, Object, Value};
 use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
     PyResult, PyRuntime, PyValue, ValueKindDef,
 };
+
+/// Return the integer payload of an immediate integer or an `int` subclass instance.
+pub(super) fn int_value(heap: &Heap, value: Value<'_>) -> Option<i64> {
+    match index(heap, &value)? {
+        NumberRef::Int(value) => Some(value),
+        NumberRef::BigInt(_)
+        | NumberRef::UInt(_)
+        | NumberRef::Float(_)
+        | NumberRef::Complex(..) => None,
+    }
+}
+
+/// Borrow the arbitrary-precision payload of a heap `int`; `None` for every other value.
+pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
+    if !value.is_object() {
+        return None;
+    }
+    match heap.get(value).ok()? {
+        Object::BigInt(value) => Some(value),
+        _ => None,
+    }
+}
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
 #[derive(Clone, Copy, Debug)]
@@ -120,6 +142,42 @@ fn slot_numeric_order<'s>(
         super::protocol::Comparison::Unordered => Ok(Some(PyValue::Bool(false))),
         super::protocol::Comparison::Unsupported => Ok(None),
     }
+}
+
+/// The comparison slot of `int`, `bool`, `float` and `complex`: numbers compare by value with
+/// any other number, a complex only for equality, and decline every other operand.
+pub(super) fn slot_number_compare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    let (Some(left_number), Some(right_number)) = (runtime.number(&left), runtime.number(&right))
+    else {
+        return Ok(None);
+    };
+    let complex = matches!(left_number, NumberRef::Complex(..))
+        || matches!(right_number, NumberRef::Complex(..));
+    match operator {
+        ComparisonOperator::Equal => return Ok(Some(numbers_equal(left_number, right_number))),
+        ComparisonOperator::NotEqual => return Ok(Some(!numbers_equal(left_number, right_number))),
+        _ if complex => return Ok(None),
+        _ => {}
+    }
+    // Big integers compare digit by digit; charge that scan like other linear comparisons.
+    if let (NumberRef::BigInt(left), NumberRef::BigInt(right)) = (left_number, right_number) {
+        runtime.charge_cpu(left.bits().min(right.bits()) / 512)?;
+    }
+    Ok(match runtime.physical_compare(&left, &right)? {
+        super::protocol::Comparison::Ordered(ordering) => Some(match operator {
+            ComparisonOperator::Less => ordering.is_lt(),
+            ComparisonOperator::LessEqual => ordering.is_le(),
+            ComparisonOperator::Greater => ordering.is_gt(),
+            _ => ordering.is_ge(),
+        }),
+        super::protocol::Comparison::Unordered => Some(false),
+        super::protocol::Comparison::Unsupported => None,
+    })
 }
 
 pub(super) fn slot_less<'s>(
@@ -240,15 +298,15 @@ pub(super) fn view<'s, 'a>(heap: &'a Heap, value: &PyValue<'s>) -> Option<Number
         return None;
     }
     match heap.get(*value).ok()? {
-        Object::BigInt(value) => Some(NumberRef::BigInt(value)),
+        // An `int` subclass instance boxes its value, so a machine-sized one reads as the plain
+        // integer every integer operation already handles.
+        Object::BigInt(value) => Some(
+            value
+                .to_i64()
+                .map_or(NumberRef::BigInt(value), NumberRef::Int),
+        ),
+        Object::Float(value) => Some(NumberRef::Float(*value)),
         Object::Complex { real, imag } => Some(NumberRef::Complex(*real, *imag)),
-        Object::Instance {
-            payload: InstancePayload::Builtin(value),
-            ..
-        } => {
-            let value: PyValue<'s> = heap.handle(value);
-            view(heap, &value)
-        }
         _ => None,
     }
 }
@@ -901,7 +959,7 @@ pub(super) fn parse_integer_text<'s>(text: &str, requested_base: i64) -> PyResul
     let invalid = || {
         PyError::value_error(format!(
             "invalid literal for int() with base {requested_base}: {}",
-            super::protocol::quote_string(text)
+            super::string::quote_string(text)
         ))
     };
     let mut text = text.trim();

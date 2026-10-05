@@ -29,24 +29,25 @@ use num_bigint::BigInt;
 
 use super::attributes::ShapeId;
 use super::bytecode::CodeRef;
-use super::native::PyArrayView;
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 
 mod gc;
 pub mod mapping;
+mod native_object;
 mod snapshot;
 mod stack;
 pub mod value;
 
 pub use gc::Roots;
 pub use mapping::{KeyHash, OrderedMap, OrderedSet};
+pub use native_object::NativeObject;
 pub use stack::ValueStack;
 pub use value::{Ref, Value};
 
 use value::Raw;
 
-pub(super) const MODELED_VALUE_BYTES: u64 = 24;
+pub(crate) const MODELED_VALUE_BYTES: u64 = 24;
 /// A dict entry holds its key, value, and hash in a slot plus one hash-index entry.
 const MAPPING_ENTRY_VALUES: usize = 4;
 pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 =
@@ -72,23 +73,19 @@ pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Resu
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClassLayout {
     Object,
-    /// A subclass of a builtin value type such as `int` or `tuple`, whose instances carry a
-    /// value of that type in [`InstancePayload::Builtin`].
+    /// A subclass of a builtin value type such as `int` or `tuple`. Its instances carry that
+    /// builtin's payload (an [`Object::BigInt`], [`Object::Tuple`], ...) under the subclass's
+    /// type id, so builtin operations the class does not override act on the payload directly.
     Builtin(BuiltinType),
     Type,
 }
 
-/// Type-erased payload carried by an instance while preserving its user-defined class identity.
-#[derive(Debug)]
-pub enum InstancePayload {
-    Object,
-    /// The builtin value an instance of a builtin subclass stands for, such as the `int` of
-    /// `class Flag(int)` or the `tuple` of a named tuple. Builtin operations that the class does
-    /// not override act on this value.
-    Builtin(Ref),
-}
-
-/// Attribute storage for one user-defined instance.
+/// Attribute storage for one instance of a user-defined class.
+///
+/// It hangs off the object header rather than the payload, like CPython's `__dict__` pointer, so
+/// an instance of a `list` subclass is an [`Object::List`] with attributes and an instance of a
+/// plain class is an [`Object::Bare`] with attributes. The box is allocated on the first
+/// attribute write; most builtin objects never pay for it.
 #[derive(Debug)]
 pub enum InstanceAttributes {
     Shaped {
@@ -117,6 +114,25 @@ impl Default for InstanceAttributes {
 pub(super) struct ObjectId(u64);
 
 const YOUNG_FLAG: u64 = 1 << 63;
+
+impl Object {
+    /// The module-owned payload behind [`Object::Native`] when it is a `T`; `None` for any other
+    /// payload, including another native type.
+    pub fn native<T: NativeObject>(&self) -> Option<&T> {
+        match self {
+            Object::Native(native) => (native.as_ref() as &dyn std::any::Any).downcast_ref(),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the module-owned payload when it is a `T`.
+    pub fn native_mut<T: NativeObject>(&mut self) -> Option<&mut T> {
+        match self {
+            Object::Native(native) => (native.as_mut() as &mut dyn std::any::Any).downcast_mut(),
+            _ => None,
+        }
+    }
+}
 
 impl ObjectId {
     const fn young(epoch: u32, index: usize) -> Self {
@@ -237,65 +253,6 @@ pub struct GeneratorObject {
     pub return_value: Ref,
 }
 
-/// A regular-expression match. Boxed inside [`Object::Match`] to keep heap slots small.
-///
-/// The subject string and the `re.Pattern` are held by reference so a match costs its own
-/// group text, not a copy of the string it was found in. `spans` are character offsets into
-/// the subject per group, `None` for a group that did not participate.
-#[derive(Debug)]
-pub struct MatchObject {
-    pub subject: Ref,
-    pub regex: Ref,
-    pub text: String,
-    pub groups: Vec<Option<String>>,
-    pub group_names: Vec<Option<String>>,
-    pub spans: Vec<Option<(usize, usize)>>,
-    pub pos: usize,
-    pub endpos: usize,
-}
-
-/// One declared `argparse` argument, with its default and choices stored as references.
-#[derive(Debug)]
-pub struct ArgumentSpec {
-    pub names: Vec<String>,
-    pub dest: String,
-    pub required: bool,
-    pub default: Ref,
-    pub store_true: bool,
-    pub store_false: bool,
-    pub integer: bool,
-    pub choices: Vec<Ref>,
-    pub help: Option<String>,
-}
-
-/// One command of an `argparse` subparser collection; `parser` is the sub-parser object.
-#[derive(Debug)]
-pub struct SubcommandSpec {
-    pub name: String,
-    pub help: Option<String>,
-    pub parser: Ref,
-}
-
-/// The one-level subparser surface of an `argparse.ArgumentParser`.
-#[derive(Debug)]
-pub struct SubparsersSpec {
-    pub dest: Option<String>,
-    pub required: bool,
-    pub help: Option<String>,
-    pub commands: Vec<SubcommandSpec>,
-}
-
-/// An `argparse.ArgumentParser`. Boxed inside [`Object::ArgumentParser`] to keep heap slots small.
-#[derive(Debug)]
-pub struct ArgumentParserObject {
-    pub prog: String,
-    pub description: Option<String>,
-    pub add_help: bool,
-    pub is_subcommand: bool,
-    pub arguments: Vec<ArgumentSpec>,
-    pub subparsers: Option<SubparsersSpec>,
-}
-
 /// A lexical scope: a function activation's compiler-assigned local slots, any dynamically
 /// bound names (module and class bodies, `exec`), and its enclosing scope. Name resolution
 /// lives in [`scopes`](super::scopes); the heap only stores and traces the object.
@@ -327,24 +284,6 @@ fn modeled_scope_size(scope: &ScopeObject) -> Result<u64, String> {
         .ok_or_else(|| "modeled scope size overflow".into())
 }
 
-/// Flat element storage shared by one or more array views: packed bytes, or traced Python
-/// references for object arrays.
-#[derive(Debug)]
-pub enum ArrayStorage {
-    Bytes(Vec<u8>),
-    Values(Vec<Ref>),
-}
-
-impl ArrayStorage {
-    /// Length of the addressable storage in bytes.
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::Values(values) => values.len().saturating_mul(16),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -352,11 +291,9 @@ pub enum Object {
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
-    /// An instance of a builtin exception class, with the constructor arguments `args`.
-    Exception {
-        kind: String,
-        args: Vec<Ref>,
-    },
+    /// The layout every exception instance inherits from `BaseException`: its constructor
+    /// arguments, `args`. The class is the object's type, builtin or user-defined.
+    Exception(Vec<Ref>),
     List(Vec<Ref>),
     Tuple(Vec<Ref>),
     /// `slice(start, stop, step)`. Bounds are any objects, as in CPython (`None` when
@@ -386,18 +323,11 @@ pub enum Object {
         stop: i64,
         step: i64,
     },
+    /// A boxed `float`, which only an instance of a `float` subclass needs: an exact float is an
+    /// immediate value.
+    Float(f64),
     Function(Box<FunctionObject>),
     Class(Box<ClassObject>),
-    Instance {
-        class: Ref,
-        payload: InstancePayload,
-        attributes: InstanceAttributes,
-    },
-    EnumMember {
-        class: Option<Ref>,
-        name: String,
-        value: Ref,
-    },
     DescriptorBoundMethod {
         receiver: Ref,
         descriptor: Ref,
@@ -471,38 +401,15 @@ pub enum Object {
     },
     /// A read-only mapping over a [`ProxyTarget`], like CPython's `mappingproxy`.
     MappingProxy(ProxyTarget),
-    /// Flat element storage shared by one or more array views.
-    ArrayStorage(ArrayStorage),
-    /// An ndarray view. Byte strides and offset map indices into `ArrayStorage`.
-    Array {
-        storage: Ref,
-        view: Box<PyArrayView>,
-        /// The array that owns the storage, for `ndarray.base`; `None` for owners.
-        base: Option<Ref>,
-    },
     /// A registered value kind whose payload does not fit inline, such as a complex128 scalar.
     WideValue {
         type_id: TypeId,
         kind: u8,
         payload: [u64; 2],
     },
-    /// A compiled regular expression.  The pattern is compiled at the operation boundary so
-    /// regex execution never gets a host capability; keeping the source and flags here also
-    /// makes the object cheap to copy and deterministic to inspect.
-    Regex {
-        pattern: String,
-        flags: u32,
-    },
-    /// A bounded regular-expression match result.  Captures are stored as owned text rather than
-    /// references into a host regex object, which keeps the heap self-contained.
-    Match(Box<MatchObject>),
-    ArgumentParser(Box<ArgumentParserObject>),
-    Namespace {
-        values: Vec<(String, Ref)>,
-    },
-    RaisesContext {
-        expected: String,
-    },
+    /// A payload owned by one stdlib module, such as a compiled regex or an argument parser. The
+    /// heap traces, sizes, copies and renders it through [`NativeObject`] alone.
+    Native(Box<dyn NativeObject>),
     Property {
         getter: Ref,
         setter: Option<Ref>,
@@ -527,6 +434,8 @@ struct HeapObject {
     /// lazily assigned identity, 0 while unassigned. Packed so a header stays within the slot.
     flags: Cell<u32>,
     payload: Object,
+    /// Attributes assigned on an instance of a user class; `None` until the first write.
+    attributes: Option<Box<InstanceAttributes>>,
     modeled_bytes: u64,
 }
 
@@ -818,6 +727,39 @@ impl Heap {
         value: Value<'_>,
         f: impl FnOnce(&Builder<'_>, &mut Object) -> R,
     ) -> Result<R, String> {
+        self.modify_object(value, |builder, object| f(builder, &mut object.payload))
+    }
+
+    /// The attributes stored on `value`, or `None` when none has been assigned (or `value` is
+    /// not an instance of a user class).
+    pub fn attributes(&self, value: Value<'_>) -> Result<Option<&InstanceAttributes>, String> {
+        Ok(self.object(self.object_id(value)?)?.attributes.as_deref())
+    }
+
+    /// `value`'s type together with its attributes, for inline caches that guard on both.
+    pub fn typed_attributes(
+        &self,
+        value: Value<'_>,
+    ) -> Result<(TypeId, Option<&InstanceAttributes>), String> {
+        let object = self.object(self.object_id(value)?)?;
+        Ok((object.type_id, object.attributes.as_deref()))
+    }
+
+    /// Mutate `value`'s attribute storage, creating or replacing it, with a [`Builder`] for
+    /// turning handles into stored references.
+    pub fn modify_attributes<R>(
+        &mut self,
+        value: Value<'_>,
+        f: impl FnOnce(&Builder<'_>, &mut Option<Box<InstanceAttributes>>) -> R,
+    ) -> Result<R, String> {
+        self.modify_object(value, |builder, object| f(builder, &mut object.attributes))
+    }
+
+    fn modify_object<R>(
+        &mut self,
+        value: Value<'_>,
+        f: impl FnOnce(&Builder<'_>, &mut HeapObject) -> R,
+    ) -> Result<R, String> {
         let id = self.object_id(value)?;
         let builder = Builder {
             handles: &self.handles,
@@ -842,7 +784,7 @@ impl Heap {
             }
             object
         };
-        Ok(f(&builder, &mut object.payload))
+        Ok(f(&builder, object))
     }
 
     pub fn type_id(&self, value: Value<'_>) -> Result<TypeId, String> {
@@ -890,9 +832,23 @@ impl Heap {
 
     /// Allocate `object` in the young space, collecting first when the space is full or the
     /// memory limit would be exceeded. `object`'s own references are rewritten if that
-    /// collection moves their targets.
+    /// collection moves their targets. The object's type is the builtin type of its payload.
     pub fn alloc<'s>(
         &mut self,
+        object: Object,
+        roots: &mut dyn Roots,
+        resources: &mut Resources,
+    ) -> Result<Value<'s>, String> {
+        let type_id = self.infer_type_id(&object)?;
+        self.alloc_typed(type_id, object, roots, resources)
+    }
+
+    /// Allocate `object` as an instance of `type_id`, which is how an instance of a user class
+    /// comes to carry a builtin payload: a `list` subclass instance is an [`Object::List`]
+    /// whose type is the subclass.
+    pub fn alloc_typed<'s>(
+        &mut self,
+        type_id: TypeId,
         mut object: Object,
         roots: &mut dyn Roots,
         resources: &mut Resources,
@@ -900,7 +856,6 @@ impl Heap {
         let bytes = modeled_size(&object)?;
         charge_construction(bytes, resources)?;
         self.make_room(bytes, Some(&mut object), roots, resources)?;
-        let type_id = self.infer_type_id(&object)?;
         self.modeled_bytes = self
             .modeled_bytes
             .checked_add(bytes)
@@ -911,6 +866,7 @@ impl Heap {
             type_id,
             flags: Cell::new(0),
             payload: object,
+            attributes: None,
             modeled_bytes: bytes,
         }));
         Ok(self.handle_raw(Raw::object(id)))
@@ -925,6 +881,53 @@ impl Heap {
     ) -> Result<Value<'s>, String> {
         let object = build(&self.builder());
         self.alloc(object, roots, resources)
+    }
+
+    /// [`Heap::alloc_with`] for an instance of `type_id`.
+    pub fn alloc_with_typed<'s>(
+        &mut self,
+        type_id: TypeId,
+        roots: &mut dyn Roots,
+        resources: &mut Resources,
+        build: impl FnOnce(&Builder<'_>) -> Object,
+    ) -> Result<Value<'s>, String> {
+        let object = build(&self.builder());
+        self.alloc_typed(type_id, object, roots, resources)
+    }
+
+    /// A fresh payload holding the same builtin value as `value`, for the instance of a builtin
+    /// subclass that `Class(value)` creates. Immediates are boxed; heap payloads are copied, so
+    /// the instance never aliases the object it was built from.
+    pub fn copy_builtin_payload(&self, value: Value<'_>) -> Result<Object, String> {
+        if let Some(value) = value.inline_string_ref() {
+            return Ok(Object::String(PyString::from(value.as_str())));
+        }
+        if let Some(value) = value.float_value() {
+            return Ok(Object::Float(value));
+        }
+        if let Some(value) = value.bool_value() {
+            return Ok(Object::BigInt(BigInt::from(value)));
+        }
+        if let Some(value) = value.immediate_int() {
+            return Ok(Object::BigInt(BigInt::from(value)));
+        }
+        if !value.is_object() {
+            return Err("value cannot be the payload of a builtin subclass instance".into());
+        }
+        match self.get(value)? {
+            object @ (Object::String(_)
+            | Object::Bytes(_)
+            | Object::ByteArray(_)
+            | Object::List(_)
+            | Object::Tuple(_)
+            | Object::Dict(_)
+            | Object::Set(_)
+            | Object::FrozenSet(_)
+            | Object::BigInt(_)
+            | Object::Float(_)
+            | Object::Complex { .. }) => Ok(snapshot::dup_object(object)),
+            _ => Err("value cannot be the payload of a builtin subclass instance".into()),
+        }
     }
 
     /// Make the young space and the memory limit accommodate `bytes` more, collecting as needed.
@@ -1089,7 +1092,7 @@ impl Heap {
             Object::String(_) => BuiltinType::String.id(),
             Object::Bytes(_) => BuiltinType::Bytes.id(),
             Object::ByteArray(_) => BuiltinType::ByteArray.id(),
-            Object::Exception { .. } => BuiltinType::Exception.id(),
+            Object::Exception(_) => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
             Object::Slice { .. } => BuiltinType::Slice.id(),
@@ -1098,6 +1101,7 @@ impl Heap {
             Object::FrozenSet(_) => BuiltinType::FrozenSet.id(),
             Object::BigInt(_) => BuiltinType::Int.id(),
             Object::Complex { .. } => BuiltinType::Complex.id(),
+            Object::Float(_) => BuiltinType::Float.id(),
             Object::Range { .. } => BuiltinType::Range.id(),
             Object::Function { .. } | Object::DescriptorBoundMethod { .. } => {
                 BuiltinType::Function.id()
@@ -1113,13 +1117,6 @@ impl Heap {
                         },
                         None => return Err("class has an invalid metaclass".into()),
                     },
-                }
-            }
-            Object::Instance { class, .. } => {
-                let class = class.0.object_id().ok_or("instance class is not a class")?;
-                match &self.object(class)?.payload {
-                    Object::Class(class_object) => class_object.instance_type,
-                    _ => return Err("instance class is not a class".into()),
                 }
             }
             Object::Iterator { .. }
@@ -1140,14 +1137,8 @@ impl Heap {
             },
             Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
             Object::GenericAlias { .. } => BuiltinType::GenericAlias.id(),
-            Object::ArrayStorage(_) => BuiltinType::Native.id(),
-            Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
-            Object::Regex { .. } => BuiltinType::Regex.id(),
-            Object::Match { .. } => BuiltinType::Match.id(),
-            Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
-            Object::RaisesContext { .. } => BuiltinType::RaisesContext.id(),
-            Object::EnumMember { .. } | Object::Namespace { .. } => BuiltinType::Native.id(),
+            Object::Native(native) => native.python_type(),
             Object::Property { .. } => BuiltinType::Property.id(),
             Object::StaticMethod { .. } => BuiltinType::StaticMethod.id(),
             Object::ClassMethod { .. } => BuiltinType::ClassMethod.id(),
@@ -1173,11 +1164,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     let slots = match object {
         Object::String(value) => return packed(value.len()),
         Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
-        Object::Exception { kind, args } => kind
-            .len()
-            .checked_add(args.len())
-            .ok_or("modeled object size overflow")?,
-        Object::List(values) | Object::Tuple(values) => values.len(),
+        Object::Exception(values) | Object::List(values) | Object::Tuple(values) => values.len(),
         Object::Set(values) | Object::FrozenSet(values) => values
             .len()
             .checked_mul(SET_MEMBER_VALUES)
@@ -1190,8 +1177,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                     .map_err(|_| "modeled big integer size overflow")?,
             )
         }
-        // Sixteen bytes of payload rounded up to one modeled value slot.
-        Object::Complex { .. } | Object::WideValue { .. } => 1,
+        // Up to sixteen bytes of payload rounded up to one modeled value slot.
+        Object::Complex { .. } | Object::WideValue { .. } | Object::Float(_) => 1,
         Object::Range { .. } => 3,
         Object::Dict(entries) => entries
             .len()
@@ -1241,11 +1228,6 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
                 .and_then(|size| size.checked_add(enum_members.len()))
                 .ok_or("modeled object size overflow")?
         }
-        Object::Instance { .. } => 0,
-        Object::EnumMember { name, .. } => name
-            .len()
-            .checked_add(1)
-            .ok_or("modeled object size overflow")?,
         Object::DescriptorBoundMethod { .. } => 3,
         Object::GenericAlias { arguments, .. } => arguments.len().saturating_add(1),
         Object::Iterator { values, .. } => values.len(),
@@ -1276,65 +1258,11 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         // The namespace it views is charged where that namespace actually lives (the scope or
         // the REPL/script global table), so the view itself is a fixed, minimal handle.
         Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
-        Object::ArrayStorage(ArrayStorage::Bytes(bytes)) => return packed(bytes.len()),
-        Object::ArrayStorage(ArrayStorage::Values(values)) => values.len(),
-        Object::Array { view, .. } => view
-            .shape
-            .len()
-            .checked_add(view.strides.len())
-            .and_then(|size| size.checked_add(3))
-            .ok_or("modeled object size overflow")?,
-        Object::Regex { pattern, .. } => pattern.len(),
-        Object::Match(match_object) => {
-            let MatchObject {
-                text,
-                groups,
-                group_names,
-                spans,
-                ..
-            } = &**match_object;
-            text.len()
-                .checked_add(spans.len().saturating_mul(16))
-                .and_then(|size| {
-                    size.checked_add(
-                        groups
-                            .iter()
-                            .map(|group| group.as_ref().map_or(0, String::len))
-                            .sum(),
-                    )
-                })
-                .and_then(|size| {
-                    size.checked_add(
-                        group_names
-                            .iter()
-                            .map(|name| name.as_ref().map_or(0, String::len))
-                            .sum(),
-                    )
-                })
-                .ok_or("modeled object size overflow")?
+        Object::Native(native) => {
+            return OBJECT_HEADER
+                .checked_add(native.modeled_bytes()?)
+                .ok_or_else(|| "modeled object size overflow".into())
         }
-        Object::ArgumentParser(parser_object) => {
-            let ArgumentParserObject {
-                prog,
-                description,
-                arguments,
-                subparsers,
-                ..
-            } = &**parser_object;
-            prog.len()
-                .checked_add(description.as_ref().map_or(0, String::len))
-                .and_then(|size| size.checked_add(arguments.len()))
-                .and_then(|size| {
-                    size.checked_add(
-                        subparsers
-                            .as_ref()
-                            .map_or(0, |subparsers| subparsers.commands.len()),
-                    )
-                })
-                .ok_or("modeled object size overflow")?
-        }
-        Object::Namespace { values } => values.len(),
-        Object::RaisesContext { expected } => expected.len(),
         Object::Property { setter, .. } => 1 + usize::from(setter.is_some()),
         Object::StaticMethod { .. } | Object::ClassMethod { .. } => 1,
         Object::Super { .. } => 2,

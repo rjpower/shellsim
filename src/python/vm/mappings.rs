@@ -15,7 +15,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: Value<'s>,
     ) -> Result<Option<Vec<(Value<'s>, Value<'s>)>>, String> {
-        let stored = self.builtin_view(value)?;
+        let stored = value;
         if stored.is_object() {
             let length = match self.get(stored)? {
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => Some(entries.len()),

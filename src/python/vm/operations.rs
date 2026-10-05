@@ -1,12 +1,11 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
-use super::super::heap::{Builder, Heap, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
+use super::super::heap::{Builder, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
 use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
-    number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
-    HashedMembers, NativeValue, Object, Ordering, SequenceKind, Slot, ToPrimitive, UnaryOperator,
-    Value, Vm,
+    number, protocol, string, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
+    HashedMembers, NativeValue, Object, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
 /// The new contents of a builtin container updated in place by an augmented assignment.
@@ -132,169 +131,28 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// The truth of `left <operator> right` under the full rich-comparison protocol, including
-    /// the reflected operand, as CPython's `PyObject_RichCompareBool` computes it for `min`,
-    /// `max` and sorting.
-    pub(super) fn compare_truth(
-        &mut self,
-        operator: ComparisonOperator,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<bool, String> {
-        self.push(*left);
-        self.push(*right);
-        self.compare(operator)?;
-        let result = self.pop()?;
-        self.truth_value(&result)
-    }
-
-    /// Compare two builtin strings directly. Code point order is UTF-8 byte order, so the
-    /// comparison is a byte scan, charged like the other string scans.
-    fn exact_string_comparison(
-        &mut self,
-        operator: ComparisonOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Option<bool>, String> {
-        // Only exact `str` values qualify: a `str` subclass may define its own comparison.
-        let is_plain = |heap: &Heap, value: Value<'s>| -> Result<bool, String> {
-            Ok(value.inline_string_ref().is_some()
-                || (value.is_object() && matches!(heap.get(value)?, Object::String(_))))
-        };
-        let ordering = {
-            let heap = &self.state.heap;
-            if !is_plain(heap, left)? || !is_plain(heap, right)? {
-                return Ok(None);
-            }
-            let (Some(left), Some(right)) = (
-                protocol::string_ref(heap, left)?,
-                protocol::string_ref(heap, right)?,
-            ) else {
-                return Ok(None);
-            };
-            left.as_str().cmp(right.as_str())
-        };
-        let result = match operator {
-            ComparisonOperator::Equal => ordering.is_eq(),
-            ComparisonOperator::NotEqual => ordering.is_ne(),
-            ComparisonOperator::Less => ordering.is_lt(),
-            ComparisonOperator::LessEqual => ordering.is_le(),
-            ComparisonOperator::Greater => ordering.is_gt(),
-            ComparisonOperator::GreaterEqual => ordering.is_ge(),
-            _ => return Ok(None),
-        };
-        self.charge_scan_pair(&left, &right)?;
-        Ok(Some(result))
-    }
-
+    /// `COMPARE`: pop two operands and push `left <operator> right`. Membership and identity
+    /// are their own protocols; the six rich comparisons go through [`Self::rich_compare`].
     pub(super) fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
         let right = self.pop()?;
         let left = self.pop()?;
-        if let Some(result) = number::exact_integer_comparison(operator, left, right)
-            .or_else(|| number::exact_float_comparison(operator, left, right))
-        {
-            self.push(Value::Bool(result));
-            return Ok(());
-        }
-        if let Some(result) = self.exact_string_comparison(operator, left, right)? {
-            self.push(Value::Bool(result));
-            return Ok(());
-        }
-        let comparison_slots = match operator {
-            ComparisonOperator::Equal => Some(((Slot::Equal, "__eq__"), (Slot::Equal, "__eq__"))),
-            ComparisonOperator::NotEqual => {
-                Some(((Slot::NotEqual, "__ne__"), (Slot::NotEqual, "__ne__")))
-            }
-            ComparisonOperator::Less => {
-                Some(((Slot::LessThan, "__lt__"), (Slot::GreaterThan, "__gt__")))
-            }
-            ComparisonOperator::LessEqual => {
-                Some(((Slot::LessEqual, "__le__"), (Slot::GreaterEqual, "__ge__")))
-            }
-            ComparisonOperator::Greater => {
-                Some(((Slot::GreaterThan, "__gt__"), (Slot::LessThan, "__lt__")))
-            }
-            ComparisonOperator::GreaterEqual => {
-                Some(((Slot::GreaterEqual, "__ge__"), (Slot::LessEqual, "__le__")))
-            }
-            _ => None,
-        };
-        let mut slot_result = None;
-        if let Some(((left_slot, left_name), (right_slot, right_name))) = comparison_slots {
-            let left_type = self.type_id(&left)?;
-            let right_type = self.type_id(&right)?;
-            let right_first = right_type != left_type
-                && self.state.types.is_subclass(right_type, left_type)?
-                && self
-                    .state
-                    .types
-                    .local_slot(right_type, right_slot)?
-                    .is_some();
-            if right_first {
-                slot_result =
-                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
-            }
-            if slot_result.is_none() {
-                slot_result =
-                    self.invoke_operator_slot(&left, left_slot, left_name, vec![right])?;
-            }
-            if slot_result.is_none() && !right_first {
-                slot_result =
-                    self.invoke_operator_slot(&right, right_slot, right_name, vec![left])?;
-            }
-        } else if matches!(operator, ComparisonOperator::In | ComparisonOperator::NotIn) {
-            slot_result = self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])?;
-        }
-        if slot_result.is_none() && matches!(operator, ComparisonOperator::NotEqual) {
-            let mut equality =
-                self.invoke_operator_slot(&left, Slot::Equal, "__eq__", vec![right])?;
-            if equality.is_none() {
-                equality = self.invoke_operator_slot(&right, Slot::Equal, "__eq__", vec![left])?;
-            }
-            if let Some(value) = equality {
-                slot_result = Some(Value::Bool(!self.truth_value(&value)?));
-            }
-        }
-        if let Some(value) = slot_result {
-            if matches!(operator, ComparisonOperator::NotIn) {
-                let result = !self.truth_value(&value)?;
-                self.push(Value::Bool(result));
-            } else {
-                self.push(value);
-            }
-            return Ok(());
-        }
-        // Instances of builtin subclasses compare as the values they hold; errors still name the
-        // subclasses.
-        let (subject_left, subject_right) = (left, right);
-        let (left, right) = (self.builtin_view(left)?, self.builtin_view(right)?);
         let result = match operator {
-            ComparisonOperator::Equal => self.builtin_equality(&left, &right)?,
-            ComparisonOperator::NotEqual => !self.builtin_equality(&left, &right)?,
-            ComparisonOperator::Less
-            | ComparisonOperator::LessEqual
-            | ComparisonOperator::Greater
-            | ComparisonOperator::GreaterEqual => {
-                let (symbol, accepted): (&str, &[Ordering]) = match operator {
-                    ComparisonOperator::Less => ("<", &[Ordering::Less]),
-                    ComparisonOperator::LessEqual => ("<=", &[Ordering::Less, Ordering::Equal]),
-                    ComparisonOperator::Greater => (">", &[Ordering::Greater]),
-                    _ => (">=", &[Ordering::Greater, Ordering::Equal]),
-                };
-                match self.compare_values(&left, &right)? {
-                    protocol::Comparison::Ordered(ordering) => accepted.contains(&ordering),
-                    protocol::Comparison::Unordered => false,
-                    protocol::Comparison::Unsupported => {
-                        return Err(self.raise_unorderable(symbol, &subject_left, &subject_right))
-                    }
-                }
+            ComparisonOperator::Is => Value::Bool(self.identical(left, right)),
+            ComparisonOperator::IsNot => Value::Bool(!self.identical(left, right)),
+            ComparisonOperator::In | ComparisonOperator::NotIn => {
+                let contained =
+                    match self.invoke_slot(&right, Slot::Contains, "__contains__", vec![left])? {
+                        Some(value) => self.truth_value(&value)?,
+                        None => {
+                            let container = right;
+                            self.contains_value(&container, &left)?
+                        }
+                    };
+                Value::Bool(contained == (operator == ComparisonOperator::In))
             }
-            ComparisonOperator::In => self.contains_value(&right, &left)?,
-            ComparisonOperator::NotIn => !self.contains_value(&right, &left)?,
-            ComparisonOperator::Is => self.identical(left, right),
-            ComparisonOperator::IsNot => !self.identical(left, right),
+            _ => self.rich_compare(operator, left, right)?,
         };
-        self.push(Value::Bool(result));
+        self.push(result);
         Ok(())
     }
 
@@ -306,15 +164,15 @@ impl<'s> Vm<'s> {
         container: &Value<'s>,
         needle: &Value<'s>,
     ) -> Result<bool, String> {
-        if protocol::string_ref(self.heap(), *container)?.is_some() {
-            let Some(needle_text) = protocol::string_ref(self.heap(), *needle)? else {
+        if string::string_ref(self.heap(), *container)?.is_some() {
+            let Some(needle_text) = string::string_ref(self.heap(), *needle)? else {
                 let message = format!(
                     "'in <string>' requires string as left operand, not {}",
                     self.type_name_of(needle)?
                 );
                 return Err(self.raise_exception("TypeError", message));
             };
-            let scanned = protocol::string_ref(self.heap(), *container)?
+            let scanned = string::string_ref(self.heap(), *container)?
                 .map_or(0, |text| text.byte_len())
                 .saturating_add(needle_text.byte_len());
             self.charge_cpu(super::objects::scan_cost(scanned))?;
@@ -336,16 +194,16 @@ impl<'s> Vm<'s> {
             | Object::FrozenSet(_)
             | Object::Dict(_)
             | Object::DefaultDict { .. } => true,
-            Object::Range { .. } => protocol::int_value(self.heap(), *needle).is_some(),
+            Object::Range { .. } => number::int_value(self.heap(), *needle).is_some(),
             _ => false,
         };
         if direct {
             if let Object::Bytes(value) | Object::ByteArray(value) = self.get(*container)? {
                 let length = value.len();
                 // A bytes needle is searched for in linear time; an int needle is one byte.
-                let needle_length = match protocol::bytes_ref(self.heap(), *needle)? {
+                let needle_length = match string::bytes_ref(self.heap(), *needle)? {
                     Some(needle) => needle.len(),
-                    None => match protocol::int_value(self.heap(), *needle) {
+                    None => match number::int_value(self.heap(), *needle) {
                         Some(byte) if (0..256).contains(&byte) => 1,
                         Some(_) => {
                             return Err(
@@ -576,20 +434,14 @@ impl<'s> Vm<'s> {
     /// Whether `|=` on object `value` is `dict.update`: a dict or namespace view, or a dict
     /// subclass instance whose class does not define `__ior__`.
     fn updates_dict_in_place(&mut self, value: Value<'s>) -> Result<bool, String> {
-        let class = match self.get(value)? {
-            Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_) => {
-                return Ok(true)
-            }
-            Object::Instance { class, .. } => self.handle(class),
-            _ => return Ok(false),
-        };
-        let holds_dict = match protocol::builtin_payload(self.heap(), value)? {
-            Some(payload) if payload.is_object() => {
-                matches!(self.get(payload)?, Object::Dict(_))
-            }
-            _ => false,
-        };
-        Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none())
+        if let Some(class) = self.instance_class(value)? {
+            let holds_dict = matches!(self.get(value)?, Object::Dict(_));
+            return Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none());
+        }
+        Ok(matches!(
+            self.get(value)?,
+            Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_)
+        ))
     }
 
     fn inplace_method(
@@ -894,7 +746,7 @@ impl<'s> Vm<'s> {
     ) -> Result<String, String> {
         let spec = self.allocate_string(format_spec.to_string())?;
         if let Some(result) = self.invoke_slot(value, Slot::Format, "__format__", vec![spec])? {
-            return protocol::string_value(self.heap(), result)?
+            return string::string_value(self.heap(), result)?
                 .ok_or_else(|| self.raise_exception("TypeError", "__format__ must return a str"));
         }
         if let Some(rendered) = self.format_registered_number(value, format_spec)? {
@@ -968,7 +820,7 @@ impl<'s> Vm<'s> {
                 let type_name = self.type_name_of(value)?;
                 format_integer(integer, text, &type_name)
             }
-            None => match protocol::string_value(self.heap(), *value)? {
+            None => match string::string_value(self.heap(), *value)? {
                 Some(string) => format_text(&string, text),
                 None => {
                     let type_name = self.type_name_of(value)?;

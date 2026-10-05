@@ -272,8 +272,6 @@ fn dump_value<'s>(
     if let Some(number) = float_subclass_value(runtime, &value) {
         return encode_float(number);
     }
-    // An `int` or `tuple` subclass encodes as the value it holds.
-    let value = runtime.builtin_payload(&value)?.unwrap_or(value);
     let kind = runtime.kind(&value)?;
     match kind {
         PyKind::None => return Ok("null".into()),
@@ -434,7 +432,6 @@ fn size_bound<'s>(
             ))
         };
     }
-    let value = runtime.builtin_payload(&value)?.unwrap_or(value);
     let kind = runtime.kind(&value)?;
     match kind {
         PyKind::None => return scalar(4),

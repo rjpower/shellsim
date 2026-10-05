@@ -8,7 +8,8 @@
 use super::super::hash;
 use super::super::heap::DictViewKind;
 use super::super::number::{self, NumberRef};
-use super::{protocol, BuiltinType, ClassLayout, Object, Slot, Value, Vm};
+use super::super::object_model::SlotValue;
+use super::{Object, Slot, Value, Vm};
 
 /// Combines the hashes of a container's items into the container's hash.
 type Combine = fn(&[i64]) -> i64;
@@ -30,19 +31,24 @@ impl<'s> Vm<'s> {
         if value.is_none() {
             return Ok(hash::NONE);
         }
-        // Instances of `int` subclasses have a numeric view but may define their own `__hash__`.
-        let user_instance = self.is_user_instance(value)?;
-        if !user_instance {
-            if let Some(number) = number::view(self.heap(), value) {
-                return Ok(number::number_hash(number));
-            }
+        // Instances of `int` or `str` subclasses hold a builtin payload but may define their own
+        // `__hash__`, so they take the class path before the payload is consulted.
+        if let Some(class) = self.instance_class(*value)? {
+            return self.instance_hash(value, class, depth);
         }
-        if !user_instance {
-            if let Some(text) = super::super::string::string_ref(self.heap(), *value)? {
-                let text = text.as_str().to_owned();
-                self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
-                return Ok(hash::string(&text));
-            }
+        self.payload_hash(value, depth)
+    }
+
+    /// The hash of a builtin value or payload, ignoring any user class the object belongs to.
+    /// This is what `tuple.__hash__(instance)` and the other builtin hash slots compute.
+    pub(super) fn payload_hash(&mut self, value: &Value<'s>, depth: usize) -> Result<i64, String> {
+        if let Some(number) = number::view(self.heap(), value) {
+            return Ok(number::number_hash(number));
+        }
+        if let Some(text) = super::super::string::string_ref(self.heap(), *value)? {
+            let text = text.as_str().to_owned();
+            self.charge_cpu(u64::try_from(text.len() / 32).unwrap_or(u64::MAX))?;
+            return Ok(hash::string(&text));
         }
         if let Some(native) = value.native_value() {
             let (payload, tag) = native.encode();
@@ -72,23 +78,6 @@ impl<'s> Vm<'s> {
                 return range_hash(start, stop, step);
             }
             Object::Slice { start, stop, step } => (self.handles([start, stop, step]), hash::slice),
-            Object::EnumMember { class, name, value } => {
-                let (class, name, item) = (
-                    self.handle_optional(class.as_ref()),
-                    name.clone(),
-                    self.handle(value),
-                );
-                if let Some(class) = class {
-                    if matches!(
-                        self.get(class)?,
-                        Object::Class(class_object)
-                            if class_object.layout == ClassLayout::Builtin(BuiltinType::String)
-                    ) {
-                        return self.hash_nested(&item, depth + 1);
-                    }
-                }
-                return Ok(hash::string(&name));
-            }
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
             }
@@ -103,10 +92,6 @@ impl<'s> Vm<'s> {
                 kind: DictViewKind::Keys | DictViewKind::Items,
                 ..
             } => return Err(self.unhashable(value)),
-            Object::Instance { class, .. } => {
-                let class = self.handle(class);
-                return self.instance_hash(value, class);
-            }
             _ => return Ok(hash::identity(self.identity_bits(value)?)),
         };
         let mut hashes = Vec::with_capacity(items.len());
@@ -116,55 +101,38 @@ impl<'s> Vm<'s> {
         Ok(combine(&hashes))
     }
 
-    fn is_user_instance(&self, value: &Value<'s>) -> Result<bool, String> {
-        if !value.is_object() {
-            return Ok(false);
-        }
-        Ok(matches!(self.get(*value)?, Object::Instance { .. }))
-    }
-
-    /// CPython's `object.__hash__` resolution for an instance of a user class.
-    fn instance_hash(&mut self, value: &Value<'s>, class: Value<'s>) -> Result<i64, String> {
+    /// `hash()` of an instance of a user class, resolved through the class's hash slot. A class
+    /// that defines `__eq__` without `__hash__` carries `__hash__ = None` and is unhashable, as
+    /// is a `@dataclass` with the default `eq=True`.
+    fn instance_hash(
+        &mut self,
+        value: &Value<'s>,
+        class: Value<'s>,
+        depth: usize,
+    ) -> Result<i64, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("instance has an invalid class".into());
         };
         let is_dataclass = class_object.is_dataclass;
-        let lineage: Vec<_> = std::iter::once(class)
-            .chain(self.handles(&class_object.mro))
-            .collect();
-        for ancestor in lineage {
-            self.charge_cpu(1)?;
-            let Object::Class(ancestor) = self.get(ancestor)? else {
-                return Err("class MRO contains a non-class object".into());
-            };
-            let attributes = &ancestor.attributes;
-            match attributes.get("__hash__") {
-                Some(method) if method.is_none() => return Err(self.unhashable(value)),
-                Some(_) => {
-                    let result = self
-                        .invoke_slot(value, Slot::Hash, "__hash__", Vec::new())?
-                        .ok_or("__hash__ slot disappeared during lookup")?;
-                    return self.hash_result(&result);
-                }
-                // A class that defines `__eq__` without `__hash__` gets `__hash__ = None`.
-                None if attributes.contains_key("__eq__") => return Err(self.unhashable(value)),
-                None => {}
+        match self.state.types.slot(self.type_id(value)?, Slot::Hash)? {
+            Some(SlotValue::Descriptor(descriptor)) if self.handle(&descriptor).is_none() => {
+                return Err(self.unhashable(value));
             }
+            Some(SlotValue::Descriptor(_) | SlotValue::NativeUnary(_)) => {
+                let result = self
+                    .invoke_slot(value, Slot::Hash, "__hash__", Vec::new())?
+                    .ok_or("__hash__ slot disappeared during lookup")?;
+                return self.hash_result(&result);
+            }
+            _ => {}
         }
         // `@dataclass` defaults to `eq=True, frozen=False`, which also sets `__hash__ = None`.
         if is_dataclass {
             return Err(self.unhashable(value));
         }
-        // An `int` or `tuple` subclass hashes as the value it holds; a `dict` subclass is
-        // unhashable like `dict`, and the error names the subclass.
-        if let Some(payload) = protocol::builtin_payload(self.heap(), *value)? {
-            let holds_dict = payload.is_object() && matches!(self.get(payload)?, Object::Dict(_));
-            if holds_dict {
-                return Err(self.unhashable(value));
-            }
-            return self.hash_value(&payload);
-        }
-        Ok(hash::identity(self.identity_bits(value)?))
+        // An `int` or `tuple` subclass hashes as the value it holds; a `dict` or `list` subclass
+        // is unhashable like its base, and the error names the subclass.
+        self.payload_hash(value, depth)
     }
 
     /// The stable identity of a heap object, as identity hashing consumes it.
