@@ -177,6 +177,77 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// `LoadMethod`: push the callable of `owner.name` and then its receiver, when `name` is a
+    /// plain function or native method of `owner`'s type that no instance attribute shadows.
+    /// `CallMethod` then passes the receiver as the first argument, which is what binding the
+    /// method and calling the bound method would do, without creating it. Any other attribute
+    /// is loaded as `LoadAttribute` would, followed by a no-receiver marker.
+    pub(super) fn load_method_at(
+        &mut self,
+        code: &CodeRef,
+        code_cache: usize,
+        site: usize,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<(), String> {
+        let owner = self.peek(0)?;
+        if let Some(method) = self.unbound_method(owner, symbol, name)? {
+            self.execution
+                .stack
+                .set(&self.state.heap, self.stack.len() - 1, method);
+            self.push(owner);
+            return Ok(());
+        }
+        self.load_attribute_at(code, code_cache, site, symbol, name)?;
+        self.push(Value::Native(NativeValue::NoReceiver));
+        Ok(())
+    }
+
+    fn unbound_method(
+        &mut self,
+        owner: Value<'s>,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<Option<Value<'s>>, String> {
+        // Only owners whose lookup is a plain walk of their type's MRO qualify: user instances
+        // without an attribute hook, and builtin values. Classes, `super` proxies and native
+        // module or type values resolve names their own way in `lookup_attribute`.
+        if owner.native_value().is_some() || self.class_type_id(&owner)?.is_some() {
+            return Ok(None);
+        }
+        let type_id = self.type_id(&owner)?;
+        if owner.is_object() {
+            if matches!(self.get(owner)?, Object::Class(_) | Object::Super { .. }) {
+                return Ok(None);
+            }
+            if self.instance_class(owner)?.is_some()
+                && self
+                    .state
+                    .types
+                    .slot(type_id, Slot::GetAttribute)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let Some((_, descriptor)) = self.type_lookup(type_id, name)? else {
+            return Ok(None);
+        };
+        let is_method = match descriptor.native_value() {
+            Some(NativeValue::NativeMethod(method)) => method.name != "__new__",
+            Some(_) => false,
+            None => descriptor.is_object() && matches!(self.get(descriptor)?, Object::Function(_)),
+        };
+        if !is_method {
+            return Ok(None);
+        }
+        // An instance attribute of the same name shadows a non-data descriptor.
+        if owner.is_object() && self.attribute_by_symbol(owner, symbol)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(descriptor))
+    }
+
     fn attribute_cache(&self, code_cache: usize, site: usize) -> Option<&LoadAttributeCache> {
         self.execution
             .code_caches

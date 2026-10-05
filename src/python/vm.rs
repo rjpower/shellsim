@@ -91,6 +91,9 @@ pub(super) enum NativeValue {
     Ellipsis,
     /// The `NotImplemented` singleton returned by binary and comparison methods that decline.
     NotImplemented,
+    /// `LoadMethod`'s marker for an attribute that was bound rather than loaded as a method.
+    /// It lives only on the operand stack between `LoadMethod` and `CallMethod`.
+    NoReceiver,
 }
 
 static MODULES: DefinitionTable<ModuleDef> = DefinitionTable::new();
@@ -115,6 +118,7 @@ impl NativeValue {
     const NOT_IMPLEMENTED: u8 = 12;
     const NATIVE_CLASS_METHOD: u8 = 13;
     const SLOT_WRAPPER: u8 = 14;
+    const NO_RECEIVER: u8 = 15;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -140,6 +144,7 @@ impl NativeValue {
             Self::TypingList => (0, Self::TYPING_LIST),
             Self::Ellipsis => (0, Self::ELLIPSIS),
             Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
+            Self::NoReceiver => (0, Self::NO_RECEIVER),
         }
     }
 
@@ -181,6 +186,7 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ELLIPSIS => Self::Ellipsis,
             Self::NOT_IMPLEMENTED => Self::NotImplemented,
+            Self::NO_RECEIVER => Self::NoReceiver,
             Self::VALUE_KIND => Self::ValueKind(VALUE_KINDS.get(payload).expect(INTERNED)),
             _ => unreachable!("invalid private native-value tag"),
         }

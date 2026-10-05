@@ -79,6 +79,12 @@ impl ValueStack {
             .collect()
     }
 
+    /// Remove the value `depth` entries below the top, closing the gap.
+    pub fn remove(&mut self, depth: usize) -> Option<Ref> {
+        let index = self.values.len().checked_sub(depth + 1)?;
+        Some(self.values.remove(index))
+    }
+
     pub fn swap(&mut self, first: usize, second: usize) {
         self.values.swap(first, second);
     }

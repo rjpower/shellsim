@@ -283,6 +283,24 @@ impl<'s> Vm<'s> {
                 Opcode::Call(call) => {
                     vm.dispatch_call(&dispatch.code, call, instruction_pointer, dispatch.span())
                 }
+                Opcode::LoadMethod(name) => {
+                    let symbol = vm
+                        .symbol_for(code, code_cache, name)
+                        .map_err(|error| (error, dispatch.span()))?;
+                    dispatch_next(vm.load_method_at(
+                        code,
+                        code_cache,
+                        instruction_pointer,
+                        symbol,
+                        code.name(name),
+                    ))
+                }
+                Opcode::CallMethod(call) => vm.dispatch_call_method(
+                    &dispatch.code,
+                    call,
+                    instruction_pointer,
+                    dispatch.span(),
+                ),
                 Opcode::Copy(depth) => dispatch_next(vm.copy(depth)),
                 Opcode::Swap(depth) => dispatch_next(vm.swap(depth)),
                 Opcode::PopTop => vm.pop().map(|_| DispatchControl::Next),
@@ -441,21 +459,75 @@ impl<'s> Vm<'s> {
         op_index: usize,
         span: super::super::source::Span,
     ) -> Result<DispatchControl, String> {
+        let call = code.call(call);
+        self.dispatch_call_spec(
+            code,
+            call.positional,
+            &call.keywords,
+            &call.starred,
+            op_index,
+            span,
+        )
+    }
+
+    /// `CallMethod`: the receiver slot `LoadMethod` left below the arguments is either the
+    /// receiver, called as the first positional argument, or a marker to drop first.
+    #[inline(never)]
+    fn dispatch_call_method(
+        &mut self,
+        code: &CodeRef,
+        call: CallId,
+        op_index: usize,
+        span: super::super::source::Span,
+    ) -> Result<DispatchControl, String> {
+        let call = code.call(call);
+        let count = call.positional + call.keywords.len();
+        let receiver_depth = count - 1;
+        let bound = matches!(
+            self.peek(receiver_depth)?.native_value(),
+            Some(NativeValue::NoReceiver)
+        );
+        if bound {
+            self.execution
+                .stack
+                .remove(receiver_depth)
+                .ok_or("stack underflow")?;
+            return self.dispatch_call_spec(
+                code,
+                call.positional - 1,
+                &call.keywords,
+                &call.starred[1..],
+                op_index,
+                span,
+            );
+        }
+        self.dispatch_call_spec(
+            code,
+            call.positional,
+            &call.keywords,
+            &call.starred,
+            op_index,
+            span,
+        )
+    }
+
+    fn dispatch_call_spec(
+        &mut self,
+        code: &CodeRef,
+        positional: usize,
+        keyword_names: &[Option<super::NameId>],
+        starred: &[bool],
+        op_index: usize,
+        span: super::super::source::Span,
+    ) -> Result<DispatchControl, String> {
         // Record the executing call so native code can attribute work to this line, as
         // `warnings.warn` does for its caller.
         self.active_frame_mut().instruction_pointer = op_index + 1;
-        let call = code.call(call);
-        let keywords = call
-            .keywords
+        let keywords = keyword_names
             .iter()
             .map(|name| name.map(|name| code.name(name).to_owned()))
             .collect::<Vec<_>>();
-        match self.call(
-            call.positional,
-            &keywords,
-            &call.starred,
-            CallMode::Deferred(span),
-        ) {
+        match self.call(positional, &keywords, starred, CallMode::Deferred(span)) {
             Ok(CallResult::Value(value)) => {
                 self.push(value);
                 Ok(DispatchControl::Next)

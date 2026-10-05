@@ -1263,10 +1263,22 @@ impl Compiler {
                 function,
                 arguments,
             } => {
-                self.expression(*function);
-                let mut positional = 0;
+                // `obj.name(...)` loads the method without binding it; the receiver slot
+                // counts as a leading positional argument of the call.
+                let method = match function.kind {
+                    ExpressionKind::Attribute { value, name } => {
+                        self.expression(*value);
+                        self.emit(Operation::LoadMethod(name), span);
+                        true
+                    }
+                    kind => {
+                        self.expression(Expression { kind, ..*function });
+                        false
+                    }
+                };
+                let mut positional = usize::from(method);
                 let mut keywords = Vec::new();
-                let mut starred = Vec::new();
+                let mut starred = vec![false; usize::from(method)];
                 for argument in arguments {
                     match argument.kind {
                         CallArgumentKind::Positional => {
@@ -1288,14 +1300,20 @@ impl Compiler {
                     }
                     self.expression(argument.value);
                 }
-                self.emit(
+                let call = if method {
+                    Operation::CallMethod {
+                        positional,
+                        keywords,
+                        starred,
+                    }
+                } else {
                     Operation::Call {
                         positional,
                         keywords,
                         starred,
-                    },
-                    span,
-                );
+                    }
+                };
+                self.emit(call, span);
             }
             ExpressionKind::Lambda { parameters, body } => {
                 let defaults = parameters

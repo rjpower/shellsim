@@ -239,6 +239,12 @@ pub enum Opcode {
     FormatValue(FormatId),
     Compare(ComparisonOperator),
     Call(CallId),
+    /// `obj.name` for an immediate call: pushes the callable and then the receiver when `name`
+    /// is a plain method of `obj`'s type, else the bound attribute and a no-receiver marker.
+    LoadMethod(NameId),
+    /// The call after `LoadMethod`. The spec counts the receiver slot as the first positional
+    /// argument; a marker in that slot is removed before the call.
+    CallMethod(CallId),
     Copy(usize),
     Swap(usize),
     PopTop,
@@ -345,6 +351,12 @@ pub enum Operation {
     },
     Compare(ComparisonOperator),
     Call {
+        positional: usize,
+        keywords: Vec<Option<String>>,
+        starred: Vec<bool>,
+    },
+    LoadMethod(String),
+    CallMethod {
         positional: usize,
         keywords: Vec<Option<String>>,
         starred: Vec<bool>,
@@ -546,6 +558,24 @@ impl CodeBuilder {
                     starred: starred.into_boxed_slice(),
                 });
                 Opcode::Call(id)
+            }
+            Operation::LoadMethod(name) => Opcode::LoadMethod(self.name(name)),
+            Operation::CallMethod {
+                positional,
+                keywords,
+                starred,
+            } => {
+                let keywords = keywords
+                    .into_iter()
+                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
+                    .collect();
+                let id = CallId::new(self.calls.len());
+                self.calls.push(CallSpec {
+                    positional,
+                    keywords,
+                    starred: starred.into_boxed_slice(),
+                });
+                Opcode::CallMethod(id)
             }
             Operation::Copy(depth) => Opcode::Copy(depth),
             Operation::Swap(depth) => Opcode::Swap(depth),
