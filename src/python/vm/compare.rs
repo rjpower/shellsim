@@ -228,29 +228,18 @@ impl<'s> Vm<'s> {
         Ok(result)
     }
 
-    /// The comparison once no slot has answered: builtin values compare structurally, with an
-    /// instance of a builtin subclass standing for the value it holds; anything else is equal
-    /// only to itself, and unordered.
+    /// The comparison once no slot has answered, as `object` defines it: a value is equal only
+    /// to itself, and nothing is ordered.
     fn default_compare(
         &mut self,
         operator: ComparisonOperator,
         left: Value<'s>,
         right: Value<'s>,
     ) -> Result<bool, String> {
-        let (left_view, right_view) = (self.builtin_view(left)?, self.builtin_view(right)?);
         match operator {
-            ComparisonOperator::Equal => self.builtin_equality(&left_view, &right_view),
-            ComparisonOperator::NotEqual => Ok(!self.builtin_equality(&left_view, &right_view)?),
-            _ => {
-                self.charge_scan_pair(&left_view, &right_view)?;
-                match protocol::compare(&self.state.heap, left_view, right_view)? {
-                    protocol::Comparison::Ordered(ordering) => Ok(operator.accepts(ordering)),
-                    protocol::Comparison::Unordered => Ok(false),
-                    protocol::Comparison::Unsupported => {
-                        Err(self.raise_unorderable(operator.symbol(), &left, &right))
-                    }
-                }
-            }
+            ComparisonOperator::Equal => Ok(self.identical(left, right)),
+            ComparisonOperator::NotEqual => Ok(!self.identical(left, right)),
+            _ => Err(self.raise_unorderable(operator.symbol(), &left, &right)),
         }
     }
 
@@ -270,16 +259,15 @@ impl<'s> Vm<'s> {
         self.raise_exception("TypeError", message)
     }
 
-    /// The comparison slot of a builtin container: lists and tuples order element by element,
-    /// and lists, tuples, dicts and sets compare equal element by element. Returns `None` when
-    /// the operands are not containers of one kind, which the caller reports as unordered.
+    /// The comparison slot of the builtin containers: lists and tuples order element by
+    /// element, and lists, tuples, dicts and sets compare equal element by element. `None` when
+    /// the operands are not containers of one kind, which the caller treats as `NotImplemented`.
     pub(super) fn container_compare(
         &mut self,
         operator: ComparisonOperator,
-        receiver: Value<'s>,
-        argument: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
-        let (left, right) = (self.builtin_view(receiver)?, self.builtin_view(argument)?);
+        left: Value<'s>,
+        right: Value<'s>,
+    ) -> Result<Option<bool>, String> {
         if !left.is_object() || !right.is_object() {
             return Ok(None);
         }
@@ -288,8 +276,14 @@ impl<'s> Vm<'s> {
                 ContainerPair::Sequences
             }
             (
-                Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_),
-                Object::Dict(_) | Object::DefaultDict { .. } | Object::NamespaceDict(_),
+                Object::Dict(_)
+                | Object::DefaultDict { .. }
+                | Object::NamespaceDict(_)
+                | Object::MappingProxy(_),
+                Object::Dict(_)
+                | Object::DefaultDict { .. }
+                | Object::NamespaceDict(_)
+                | Object::MappingProxy(_),
             ) => ContainerPair::Mappings,
             (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_)) => {
                 ContainerPair::Sets
@@ -304,15 +298,14 @@ impl<'s> Vm<'s> {
             | ComparisonOperator::Greater
             | ComparisonOperator::GreaterEqual => match kinds {
                 ContainerPair::Sequences => return self.sequence_order(operator, left, right),
-                ContainerPair::Mappings => return Ok(None),
-                ContainerPair::Sets => return Ok(None),
+                ContainerPair::Mappings | ContainerPair::Sets => return Ok(None),
             },
             ComparisonOperator::In
             | ComparisonOperator::NotIn
             | ComparisonOperator::Is
             | ComparisonOperator::IsNot => return Ok(None),
         };
-        Ok(Some(Value::Bool(result)))
+        Ok(Some(result))
     }
 
     /// Order two lists or two tuples as CPython does: find the first index whose items differ
@@ -324,7 +317,34 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value<'s>,
         right: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<bool>, String> {
+        self.nested_comparison(|vm| {
+            let mut index = 0;
+            loop {
+                let (Some(left_item), Some(right_item)) = (
+                    vm.sequence_item(left, index)?,
+                    vm.sequence_item(right, index)?,
+                ) else {
+                    let ordering = vm.sequence_len(left)?.cmp(&vm.sequence_len(right)?);
+                    return Ok(Some(operator.accepts(ordering)));
+                };
+                vm.charge_cpu(1)?;
+                if !vm.values_equal(&left_item, &right_item)? {
+                    return vm
+                        .compare_truth(operator, &left_item, &right_item)
+                        .map(Some);
+                }
+                index += 1;
+            }
+        })
+    }
+
+    /// Run one level of a container comparison, raising `RecursionError` instead of exhausting
+    /// the host stack when containers nest past [`MAX_COMPARE_DEPTH`].
+    pub(super) fn nested_comparison<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, String>,
+    ) -> Result<T, String> {
         if self.execution.compare_depth >= MAX_COMPARE_DEPTH {
             return Err(self.raise_exception(
                 "RecursionError",
@@ -332,32 +352,9 @@ impl<'s> Vm<'s> {
             ));
         }
         self.execution.compare_depth += 1;
-        let result = self.sequence_order_inner(operator, left, right);
+        let result = body(self);
         self.execution.compare_depth -= 1;
         result
-    }
-
-    fn sequence_order_inner(
-        &mut self,
-        operator: ComparisonOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
-        let mut index = 0;
-        loop {
-            let (Some(left_item), Some(right_item)) = (
-                self.sequence_item(left, index)?,
-                self.sequence_item(right, index)?,
-            ) else {
-                let ordering = self.sequence_len(left)?.cmp(&self.sequence_len(right)?);
-                return Ok(Some(Value::Bool(operator.accepts(ordering))));
-            };
-            self.charge_cpu(1)?;
-            if !self.values_equal(&left_item, &right_item)? {
-                return self.rich_compare(operator, left_item, right_item).map(Some);
-            }
-            index += 1;
-        }
     }
 }
 

@@ -122,6 +122,42 @@ fn slot_numeric_order<'s>(
     }
 }
 
+/// The comparison slot of `int`, `bool`, `float` and `complex`: numbers compare by value with
+/// any other number, a complex only for equality, and decline every other operand.
+pub(super) fn slot_number_compare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    let (Some(left_number), Some(right_number)) = (runtime.number(&left), runtime.number(&right))
+    else {
+        return Ok(None);
+    };
+    let complex = matches!(left_number, NumberRef::Complex(..))
+        || matches!(right_number, NumberRef::Complex(..));
+    match operator {
+        ComparisonOperator::Equal => return Ok(Some(numbers_equal(left_number, right_number))),
+        ComparisonOperator::NotEqual => return Ok(Some(!numbers_equal(left_number, right_number))),
+        _ if complex => return Ok(None),
+        _ => {}
+    }
+    // Big integers compare digit by digit; charge that scan like other linear comparisons.
+    if let (NumberRef::BigInt(left), NumberRef::BigInt(right)) = (left_number, right_number) {
+        runtime.charge_cpu(left.bits().min(right.bits()) / 512)?;
+    }
+    Ok(match runtime.physical_compare(&left, &right)? {
+        super::protocol::Comparison::Ordered(ordering) => Some(match operator {
+            ComparisonOperator::Less => ordering.is_lt(),
+            ComparisonOperator::LessEqual => ordering.is_le(),
+            ComparisonOperator::Greater => ordering.is_gt(),
+            _ => ordering.is_ge(),
+        }),
+        super::protocol::Comparison::Unordered => Some(false),
+        super::protocol::Comparison::Unsupported => None,
+    })
+}
+
 pub(super) fn slot_less<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     left: PyValue<'s>,

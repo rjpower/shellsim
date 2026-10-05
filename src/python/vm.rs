@@ -57,6 +57,8 @@ mod namespace;
 mod native_runtime;
 mod objects;
 mod operations;
+
+pub(super) use objects::scan_cost;
 mod summation;
 const VM_POLL_QUANTUM: usize = 64;
 

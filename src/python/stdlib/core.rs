@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
 
+use super::super::ast::ComparisonOperator;
 use super::super::heap::DictViewKind;
 use super::super::native::PyValue as Value;
 use super::super::native::{
@@ -4598,44 +4599,113 @@ fn set_is_subset<'s>(
     Ok(Some((subset, left.len() < right_len)))
 }
 
-pub(crate) fn slot_set_less<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    left: PyValue<'s>,
-    right: PyValue<'s>,
-) -> PyResult<'s, Option<PyValue<'s>>> {
-    let relation = set_is_subset(runtime, left, right)?;
-    Ok(relation.map(|(subset, smaller)| Value::Bool(subset && smaller)))
+/// Whether an ordering of two values satisfies `operator`.
+fn ordering_accepts(operator: ComparisonOperator, ordering: Ordering) -> bool {
+    match operator {
+        ComparisonOperator::Equal => ordering.is_eq(),
+        ComparisonOperator::NotEqual => ordering.is_ne(),
+        ComparisonOperator::Less => ordering.is_lt(),
+        ComparisonOperator::LessEqual => ordering.is_le(),
+        ComparisonOperator::Greater => ordering.is_gt(),
+        ComparisonOperator::GreaterEqual => ordering.is_ge(),
+        ComparisonOperator::In
+        | ComparisonOperator::NotIn
+        | ComparisonOperator::Is
+        | ComparisonOperator::IsNot => false,
+    }
 }
 
-pub(crate) fn slot_set_less_equal<'s>(
+/// The comparison slot of `str`: strings order by code point, which is UTF-8 byte order, and
+/// decline every other operand. Exact strings take the VM's direct path before any slot; this
+/// serves `str` subclasses and mixed operands.
+pub(crate) fn slot_str_compare<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     left: PyValue<'s>,
     right: PyValue<'s>,
-) -> PyResult<'s, Option<PyValue<'s>>> {
-    let relation = set_is_subset(runtime, left, right)?;
-    Ok(relation.map(|(subset, _)| Value::Bool(subset)))
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    let (Some(left), Some(right)) = (runtime.string_value(&left)?, runtime.string_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(super::super::vm::scan_cost(left.len().min(right.len())))?;
+    Ok(Some(ordering_accepts(operator, left.cmp(&right))))
 }
 
-pub(crate) fn slot_set_greater<'s>(
+/// The comparison slot of `bytes` and `bytearray`, which compare with each other by value.
+pub(crate) fn slot_bytes_compare<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     left: PyValue<'s>,
     right: PyValue<'s>,
-) -> PyResult<'s, Option<PyValue<'s>>> {
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    let (Some(left), Some(right)) = (runtime.bytes_value(&left)?, runtime.bytes_value(&right)?)
+    else {
+        return Ok(None);
+    };
+    runtime.charge_cpu(super::super::vm::scan_cost(left.len().min(right.len())))?;
+    Ok(Some(ordering_accepts(operator, left.cmp(&right))))
+}
+
+/// The comparison slot of `range`, `slice` and generic aliases: equal to another value of the
+/// same type when their parts are, and unordered.
+pub(crate) fn slot_structural_compare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    if !runtime.identical(&runtime.class_of(&left)?, &runtime.class_of(&right)?) {
+        return Ok(None);
+    }
+    match operator {
+        ComparisonOperator::Equal => runtime.physical_equals(&left, &right).map(Some),
+        ComparisonOperator::NotEqual => runtime.physical_equals(&left, &right).map(|eq| Some(!eq)),
+        _ => Ok(None),
+    }
+}
+
+/// The comparison slot of `list`, `tuple` and `dict`: element by element through the runtime,
+/// so a user `__eq__` or `__lt__` holds inside a container.
+pub(crate) fn slot_container_compare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
+    runtime.container_compare(operator, &left, &right)
+}
+
+/// The comparison slot of `set` and `frozenset`: equality element by element, and the subset
+/// relations for the ordering operators.
+pub(crate) fn slot_set_compare<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    left: PyValue<'s>,
+    right: PyValue<'s>,
+    operator: ComparisonOperator,
+) -> PyResult<'s, Option<bool>> {
     if right.cast::<PySet<'s>>(runtime).is_err() {
         return Ok(None);
     }
-    slot_set_less(runtime, right, left)
-}
-
-pub(crate) fn slot_set_greater_equal<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    left: PyValue<'s>,
-    right: PyValue<'s>,
-) -> PyResult<'s, Option<PyValue<'s>>> {
-    if right.cast::<PySet<'s>>(runtime).is_err() {
-        return Ok(None);
-    }
-    slot_set_less_equal(runtime, right, left)
+    let relation = match operator {
+        ComparisonOperator::Equal | ComparisonOperator::NotEqual => {
+            return runtime.container_compare(operator, &left, &right)
+        }
+        ComparisonOperator::Less | ComparisonOperator::LessEqual => {
+            set_is_subset(runtime, left, right)?
+        }
+        ComparisonOperator::Greater | ComparisonOperator::GreaterEqual => {
+            set_is_subset(runtime, right, left)?
+        }
+        ComparisonOperator::In
+        | ComparisonOperator::NotIn
+        | ComparisonOperator::Is
+        | ComparisonOperator::IsNot => return Ok(None),
+    };
+    Ok(relation.map(|(subset, strict)| match operator {
+        ComparisonOperator::Less | ComparisonOperator::Greater => subset && strict,
+        _ => subset,
+    }))
 }
 
 pub(crate) fn slot_set_subtract<'s>(

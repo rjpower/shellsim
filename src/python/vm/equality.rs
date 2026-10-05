@@ -1,41 +1,24 @@
 //! Element equality for containers, as CPython's `PyObject_RichCompareBool` defines it.
 //!
 //! Lists, tuples, dicts and sets compare their elements, find keys and answer `in` with the
-//! rule `x is y or x == y`, where `==` is the full rich-comparison protocol. A user class's
-//! `__eq__`, or a native type's equality slot such as a NumPy dtype's, therefore holds inside
-//! containers: `[Fraction(1, 2)] == [0.5]`, `(np.dtype("f8"),) == (np.float64,)`, and an equal
-//! key finds a dict entry. Builtin containers compare element by element through the same rule.
-//! Values whose types define no equality slot, such as numbers and strings, keep the structural
-//! fast path in `protocol::equals`.
+//! rule `x is y or x == y`, where `==` is the full rich comparison through `rich_compare`. A
+//! user class's `__eq__`, or a native type's equality slot such as a NumPy dtype's, therefore
+//! holds inside containers: `[Fraction(1, 2)] == [0.5]`, `(np.dtype("f8"),) == (np.float64,)`,
+//! and an equal key finds a dict entry.
 //!
-//! Nesting is bounded, so comparing two distinct self-containing lists raises `RecursionError`
-//! as it does in CPython, instead of recursing without limit.
+//! Nesting is bounded through the VM's comparison depth, so comparing two distinct
+//! self-containing lists raises `RecursionError` as it does in CPython.
 
 use super::super::ast::ComparisonOperator;
 use super::super::heap::Object;
 use super::super::protocol;
-use super::{Slot, Value, Vm};
-
-/// Nesting bound for builtin container comparison, matching the hash nesting bound.
-const MAX_EQUALITY_DEPTH: usize = 256;
+use super::{Value, Vm};
 
 /// Builtin containers of matching kinds, which compare element by element.
 enum ContainerPair {
     Sequences,
     Mappings,
     Sets,
-}
-
-/// How `values_equal` must compare a value.
-enum EqualityKind {
-    /// Equality is structural and cannot run user code.
-    Plain,
-    /// A builtin list, tuple, dict or set, a namespace view or a mapping proxy, compared
-    /// element by element.
-    Container,
-    /// A user class instance, which may define `__eq__`, or a value whose native type has an
-    /// equality slot.
-    Rich,
 }
 
 impl<'s> Vm<'s> {
@@ -78,57 +61,27 @@ impl<'s> Vm<'s> {
         left: &Value<'s>,
         right: &Value<'s>,
     ) -> Result<bool, String> {
-        self.values_equal_at(left, right, 0)
-    }
-
-    fn values_equal_at(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-        depth: usize,
-    ) -> Result<bool, String> {
         if self.identical(*left, *right) {
             return Ok(true);
         }
-        match (self.equality_kind(left)?, self.equality_kind(right)?) {
-            (EqualityKind::Rich, _) | (_, EqualityKind::Rich) => {
-                self.compare_truth(ComparisonOperator::Equal, left, right)
-            }
-            (EqualityKind::Plain, EqualityKind::Plain) => {
-                protocol::equals(self.heap(), *left, *right)
-            }
-            _ => self.builtin_equality_at(left, right, depth),
-        }
+        self.compare_truth(ComparisonOperator::Equal, left, right)
     }
 
-    /// `left == right` once neither operand's `__eq__` has answered: builtin containers of the
-    /// same kind compare their elements, and anything else compares structurally.
+    /// `left == right` for two builtin containers of one kind, element by element. Containers
+    /// of different kinds, such as a list and a tuple, are unequal.
     pub(super) fn builtin_equality(
         &mut self,
         left: &Value<'s>,
         right: &Value<'s>,
     ) -> Result<bool, String> {
-        self.builtin_equality_at(left, right, 0)
-    }
-
-    fn builtin_equality_at(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-        depth: usize,
-    ) -> Result<bool, String> {
-        if !left.is_object() || !right.is_object() {
-            return protocol::equals(self.heap(), *left, *right);
-        }
-        self.charge_scan_pair(left, right)?;
         // A namespace view or mapping proxy compares as the dict of its current entries, so
         // `globals() == globals()`, `vars(a) == {"x": 1}` and `A.__dict__ == A.__dict__` hold
         // as they do in CPython.
         if let Some(left) = self.mapping_snapshot(*left)? {
-            return self.builtin_equality_at(&left, right, depth);
+            return self.builtin_equality(&left, right);
         }
         if let Some(right) = self.mapping_snapshot(*right)? {
-            return self.builtin_equality_at(left, &right, depth);
+            return self.builtin_equality(left, &right);
         }
         let pair = match (self.get(*left)?, self.get(*right)?) {
             (Object::List(_), Object::List(_)) | (Object::Tuple(_), Object::Tuple(_)) => {
@@ -141,19 +94,14 @@ impl<'s> Vm<'s> {
             (Object::Set(_) | Object::FrozenSet(_), Object::Set(_) | Object::FrozenSet(_)) => {
                 ContainerPair::Sets
             }
-            _ => return protocol::equals(self.heap(), *left, *right),
+            _ => return Ok(false),
         };
-        if depth == MAX_EQUALITY_DEPTH {
-            return Err(self.raise_exception(
-                "RecursionError",
-                "maximum recursion depth exceeded in comparison",
-            ));
-        }
-        match pair {
-            ContainerPair::Sequences => self.sequences_equal(*left, *right, depth),
-            ContainerPair::Mappings => self.mappings_equal(*left, *right, depth),
-            ContainerPair::Sets => self.sets_equal(*left, *right),
-        }
+        let (left, right) = (*left, *right);
+        self.nested_comparison(|vm| match pair {
+            ContainerPair::Sequences => vm.sequences_equal(left, right),
+            ContainerPair::Mappings => vm.mappings_equal(left, right),
+            ContainerPair::Sets => vm.sets_equal(left, right),
+        })
     }
 
     /// A dict of the current entries when `value` is a namespace view or mapping proxy, whose
@@ -173,37 +121,9 @@ impl<'s> Vm<'s> {
         self.allocate_dict(entries).map(Some)
     }
 
-    fn equality_kind(&self, value: &Value<'s>) -> Result<EqualityKind, String> {
-        if value.is_object() {
-            match self.get(*value)? {
-                Object::Instance { .. } => return Ok(EqualityKind::Rich),
-                Object::List(_)
-                | Object::Tuple(_)
-                | Object::Dict(_)
-                | Object::DefaultDict { .. }
-                | Object::Set(_)
-                | Object::FrozenSet(_)
-                | Object::NamespaceDict(_)
-                | Object::MappingProxy(_) => return Ok(EqualityKind::Container),
-                _ => {}
-            }
-        }
-        let type_id = self.type_id(value)?;
-        Ok(if self.state.types.slot(type_id, Slot::Equal)?.is_some() {
-            EqualityKind::Rich
-        } else {
-            EqualityKind::Plain
-        })
-    }
-
     /// Lists or tuples: equal lengths and pairwise-equal items. Items are read by index on each
     /// step because a user `__eq__` may mutate either list, as in CPython.
-    fn sequences_equal(
-        &mut self,
-        left: Value<'s>,
-        right: Value<'s>,
-        depth: usize,
-    ) -> Result<bool, String> {
+    fn sequences_equal(&mut self, left: Value<'s>, right: Value<'s>) -> Result<bool, String> {
         if self.sequence_len(left)? != self.sequence_len(right)? {
             return Ok(false);
         }
@@ -213,7 +133,7 @@ impl<'s> Vm<'s> {
             self.sequence_item(right, index)?,
         ) {
             self.charge_cpu(1)?;
-            if !self.values_equal_at(&left_item, &right_item, depth + 1)? {
+            if !self.values_equal(&left_item, &right_item)? {
                 return Ok(false);
             }
             index += 1;
@@ -260,12 +180,7 @@ impl<'s> Vm<'s> {
 
     /// Dicts: the same number of entries, and every key of `left` found in `right` with an equal
     /// value.
-    fn mappings_equal(
-        &mut self,
-        left: Value<'s>,
-        right: Value<'s>,
-        depth: usize,
-    ) -> Result<bool, String> {
+    fn mappings_equal(&mut self, left: Value<'s>, right: Value<'s>) -> Result<bool, String> {
         if self.mapping_len(left)? != self.mapping_len(right)? {
             return Ok(false);
         }
@@ -277,7 +192,7 @@ impl<'s> Vm<'s> {
             let Some((_, other)) = self.mapping_entry(right, position)? else {
                 return Ok(false);
             };
-            if !self.values_equal_at(&value, &other, depth + 1)? {
+            if !self.values_equal(&value, &other)? {
                 return Ok(false);
             }
             index += 1;

@@ -9,6 +9,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
+use super::ast::ComparisonOperator;
 use super::heap::{self, DictViewKind};
 use super::Value;
 
@@ -24,6 +25,16 @@ pub(super) struct PyIdentity(pub(super) u32);
 /// Result of a Python runtime operation. `'s` is the scope of any value it carries; results
 /// without values ignore it.
 pub(super) type PyResult<'s, T = PyValue<'s>> = Result<T, PyError>;
+
+/// Native implementation of a type's six rich comparisons, stored in each comparison slot. The
+/// operands are the builtin values the receiver and argument stand for; `None` means the type
+/// does not compare with that operand (`NotImplemented`), so the reflected slot is tried next.
+pub(super) type CompareSlotFn = for<'s> fn(
+    &mut dyn PyRuntime<'s>,
+    PyValue<'s>,
+    PyValue<'s>,
+    ComparisonOperator,
+) -> PyResult<'s, Option<bool>>;
 
 /// Native implementation stored directly in a binary protocol slot.
 pub(super) type BinarySlotFn = for<'s> fn(
@@ -743,6 +754,18 @@ pub(super) trait PyRuntime<'s> {
         left: &PyValue<'s>,
         right: &PyValue<'s>,
     ) -> PyResult<'s, super::protocol::Comparison>;
+    /// Structural equality of builtin payloads without entering rich-comparison slots: the
+    /// `==` of ranges, slices and generic aliases, whose parts are compared as values.
+    fn physical_equals(&self, left: &PyValue<'s>, right: &PyValue<'s>) -> PyResult<'s, bool>;
+    /// The comparison slot of the builtin containers: lists and tuples order element by
+    /// element, and lists, tuples, dicts and sets compare equal element by element. `None`
+    /// when the operands are not containers of one kind.
+    fn container_compare(
+        &mut self,
+        operator: ComparisonOperator,
+        left: &PyValue<'s>,
+        right: &PyValue<'s>,
+    ) -> PyResult<'s, Option<bool>>;
     /// Allocate a builtin `complex` on the metered heap.
     fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<'s, PyValue<'s>>;
     /// The exact value of a builtin integer, or `None` for any other value.

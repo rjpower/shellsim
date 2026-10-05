@@ -40,7 +40,7 @@ const MAX_REPR_DEPTH: usize = 256;
 const SCAN_BYTES_PER_CPU_UNIT: usize = 16;
 
 /// CPU units for scanning `bytes` bytes of text or binary data.
-pub(super) fn scan_cost(bytes: usize) -> u64 {
+pub(crate) fn scan_cost(bytes: usize) -> u64 {
     u64::try_from(bytes / SCAN_BYTES_PER_CPU_UNIT).unwrap_or(u64::MAX) + 1
 }
 impl ContainerItems<'_> {
@@ -3158,13 +3158,17 @@ impl<'s> Vm<'s> {
         // A native slot implements a builtin type's behavior, which an instance of a builtin
         // subclass, as receiver or operand, takes part in through the value it holds.
         let slot_descriptor = match slot_value {
-            SlotValue::VmCompare => {
+            SlotValue::NativeCompare(call) => {
                 let [argument] = arguments.as_slice() else {
                     return Err("comparison slot received the wrong number of arguments".into());
                 };
                 let operator = ComparisonOperator::from_slot(slot)
                     .ok_or("comparison slot invoked for a non-comparison operator")?;
-                return self.container_compare(operator, *receiver, *argument);
+                let (receiver, argument) =
+                    (self.builtin_view(*receiver)?, self.builtin_view(*argument)?);
+                return call(self, receiver, argument, operator)
+                    .map(|result| result.map(Value::Bool))
+                    .map_err(|error| self.record_native_error(error));
             }
             SlotValue::VmHash => {
                 if !arguments.is_empty() {
@@ -3294,22 +3298,17 @@ impl<'s> Vm<'s> {
             let receiver = self.builtin_view(receiver)?;
             return self.hash_value(&receiver).map(Value::Int);
         }
-        if matches!(implementation, SlotValue::VmCompare) {
-            let [argument] = arguments.as_slice() else {
-                return Err("comparison slot received the wrong number of arguments".into());
-            };
-            let operator = ComparisonOperator::from_slot(slot)
-                .ok_or("comparison slot invoked for a non-comparison operator")?;
-            return Ok(self
-                .container_compare(operator, receiver, *argument)?
-                .unwrap_or(Value::Native(NativeValue::NotImplemented)));
-        }
         let receiver = self.builtin_view(receiver)?;
         let result = match implementation {
             SlotValue::VmRepr => unreachable!("handled before builtin payload view"),
             SlotValue::VmEnumString => unreachable!("handled before builtin payload view"),
             SlotValue::VmHash => unreachable!("handled before builtin payload view"),
-            SlotValue::VmCompare => unreachable!("handled before builtin payload view"),
+            SlotValue::NativeCompare(call) => {
+                let operator = ComparisonOperator::from_slot(slot)
+                    .ok_or("comparison slot invoked for a non-comparison operator")?;
+                let argument = self.builtin_view(arguments[0])?;
+                call(self, receiver, argument, operator).map(|result| result.map(Value::Bool))
+            }
             SlotValue::NativeMethod(method) => {
                 return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
                     .map_err(|error| self.record_native_error(error));

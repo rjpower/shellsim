@@ -806,6 +806,20 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
+    fn physical_equals(&self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, bool> {
+        protocol::equals(&self.state.heap, *left, *right).map_err(PyError::runtime_error)
+    }
+
+    fn container_compare(
+        &mut self,
+        operator: super::super::ast::ComparisonOperator,
+        left: &Value<'s>,
+        right: &Value<'s>,
+    ) -> PyResult<'s, Option<bool>> {
+        Vm::container_compare(self, operator, *left, *right)
+            .map_err(|message| self.raised_or_runtime_error(message))
+    }
+
     fn compare(&mut self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, Ordering> {
         self.sort_order(left, right).map_err(|message| {
             if self.pending_exception.is_some() {
