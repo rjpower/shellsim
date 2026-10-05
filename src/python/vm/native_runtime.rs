@@ -563,7 +563,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::String(_) => PyKind::String,
             Object::Bytes(_) => PyKind::Bytes,
             Object::ByteArray(_) => PyKind::ByteArray,
-            Object::Exception { .. } => PyKind::Native,
+            Object::Exception(_) => PyKind::Native,
             Object::List(_) => PyKind::List,
             Object::BigInt(_) => PyKind::Int,
             Object::Complex { .. } => PyKind::Complex,
@@ -907,12 +907,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &mut self,
         value: &Value<'s>,
     ) -> PyResult<'s, Option<(String, Vec<Value<'s>>)>> {
-        if let Some(exception) =
-            protocol::exception_args(&self.state.heap, *value).map_err(PyError::runtime_error)?
-        {
-            return Ok(Some(exception));
-        }
-        Ok(protocol::user_exception_args(self.state, *value)
+        Ok(protocol::exception_args(self.state, *value)
             .map_err(PyError::runtime_error)?
             .map(|(base, args)| (base.to_string(), args)))
     }
@@ -2025,7 +2020,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         // The exception is stored into a `RaisedException` only at the call, so no stored
         // reference is held across the allocation below.
         let (kind, value) = if let Some(kind) =
-            protocol::exception_kind(self.state, exception).map_err(PyError::runtime_error)?
+            protocol::exception_type_name(self.state, exception).map_err(PyError::runtime_error)?
         {
             (kind, exception)
         } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =

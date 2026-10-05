@@ -853,7 +853,7 @@ impl<'s> Vm<'s> {
         if exception.kind != "StopIteration" {
             return Ok(ForwardedThrow::Raise(exception));
         }
-        let value = protocol::exception_args(&self.state.heap, exception.value)?
+        let value = protocol::exception_args(self.state, exception.value)?
             .and_then(|(_, args)| args.first().copied())
             .unwrap_or(Value::None);
         Ok(ForwardedThrow::Returned(value))

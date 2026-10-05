@@ -58,11 +58,7 @@ fn display_inner(
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
     }
-    let user_exception = |state: &ReplState| {
-        user_exception_parts(state, value)
-            .map(|parts| parts.map(|exception| (exception.base.to_string(), exception.args)))
-    };
-    let Some((base, args)) = exception_args(heap, value)?.or(user_exception(state)?) else {
+    let Some((base, args)) = exception_args(state, value)? else {
         return render(state, value, active);
     };
     let id = heap
@@ -71,7 +67,7 @@ fn display_inner(
     if !active.insert(id) || active.len() >= MAX_RENDER_DEPTH {
         return Err(RECURSION_IN_STR.into());
     }
-    let message = exception_message(state, &base, &args, active);
+    let message = exception_message(state, base, &args, active);
     active.remove(&id);
     message
 }
@@ -184,37 +180,59 @@ pub fn bytes_ref<'heap>(
     })
 }
 
-/// The class name and `str()` of a builtin exception instance.
+/// The class name and `str()` of an exception instance, builtin or user-defined.
 pub fn exception_parts(
     state: &ReplState,
     value: Value<'_>,
 ) -> Result<Option<(String, String)>, String> {
-    let Some((kind, args)) = exception_args(&state.heap, value)? else {
+    let Some(name) = exception_type_name(state, value)? else {
         return Ok(None);
     };
+    let (base, args) = exception_args(state, value)?.ok_or("exception lost its type")?;
     let mut active = BTreeSet::new();
     if let Some(id) = state.heap.identity(value)? {
         active.insert(id);
     }
-    let message = exception_message(state, &kind, &args, &mut active)?;
-    Ok(Some((kind, message)))
+    let message = exception_message(state, base, &args, &mut active)?;
+    Ok(Some((name, message)))
 }
 
-/// The class name of a builtin exception instance, without rendering its message. Rendering can
-/// fail on self-referential arguments, so callers that only classify the value use this.
-pub fn exception_kind(state: &ReplState, value: Value<'_>) -> Result<Option<String>, String> {
-    Ok(exception_args(&state.heap, value)?.map(|(kind, _)| kind))
+/// The class name of an exception instance, or `None` when `value` is not one. Rendering the
+/// message can fail on self-referential arguments, so callers that only classify use this.
+pub fn exception_type_name(state: &ReplState, value: Value<'_>) -> Result<Option<String>, String> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let type_id = state.heap.type_id(value)?;
+    if !state.types.is_exception_type(type_id)? {
+        return Ok(None);
+    }
+    Ok(Some(state.types.get(type_id)?.name.clone()))
 }
 
-/// The class name and constructor arguments of a builtin exception instance.
+/// The closest builtin exception class an exception instance derives from, or `None` when
+/// `value` is not an exception.
+pub fn exception_base(state: &ReplState, value: Value<'_>) -> Result<Option<&'static str>, String> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    state.types.exception_base(state.heap.type_id(value)?)
+}
+
+/// The closest builtin exception class and the constructor arguments of an exception instance,
+/// which its payload holds as `BaseException.args`.
 pub fn exception_args<'s>(
-    heap: &Heap,
+    state: &ReplState,
     value: Value<'_>,
-) -> Result<Option<(String, Vec<Value<'s>>)>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Exception { kind, args }) => Some((kind.clone(), heap.handles(args))),
-        _ => None,
-    })
+) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
+    let Some(base) = exception_base(state, value)? else {
+        return Ok(None);
+    };
+    let heap = &state.heap;
+    let Object::Exception(args) = heap.get(value)? else {
+        return Err("exception instance has a non-exception layout".into());
+    };
+    Ok(Some((base, heap.handles(args))))
 }
 
 /// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
@@ -262,50 +280,6 @@ fn exception_message(
             Ok(format!("({})", values.join(", ")))
         }
     }
-}
-
-/// The closest builtin exception ancestor and the `args` of an instance of a user exception
-/// class.
-pub fn user_exception_args<'s>(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
-    Ok(user_exception_parts(state, value)?.map(|exception| (exception.base, exception.args)))
-}
-
-/// An instance of a user exception class: its closest builtin exception ancestor and `args`.
-struct UserException<'s> {
-    base: &'static str,
-    args: Vec<Value<'s>>,
-}
-
-fn user_exception_parts<'s>(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<UserException<'s>>, String> {
-    let heap = &state.heap;
-    let Some(class) = state.types.instance_class(heap, value)? else {
-        return Ok(None);
-    };
-    let Object::Class(class_object) = heap.get(class)? else {
-        return Ok(None);
-    };
-    let Some(base) = class_object.exception_base else {
-        return Ok(None);
-    };
-    let args = if let Some(symbol) = state.symbols.id("args") {
-        state
-            .shapes
-            .attribute_by_symbol(heap, value, symbol)?
-            .and_then(|args| match object(heap, args).ok()?? {
-                Object::Tuple(values) => Some(heap.handles(values)),
-                _ => None,
-            })
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-    Ok(Some(UserException { base, args }))
 }
 
 pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
@@ -364,7 +338,7 @@ fn render_inner(
                 Object::String(_) => "<str ...>",
                 Object::Bytes(_) => "<bytes ...>",
                 Object::ByteArray(_) => "<bytearray ...>",
-                Object::Exception { .. } => "<exception ...>",
+                Object::Exception(_) => "<exception ...>",
                 Object::List(_) => "[...]",
                 Object::Tuple(_) => "(...)",
                 Object::Slice { .. } => "slice(...)",
@@ -411,27 +385,18 @@ fn render_inner(
             Object::Bare => match state.types.instance_class(heap, value)? {
                 None => format!("<object object at {}>", address(id)),
                 Some(class) => match heap.get(class)? {
-                    Object::Class(class_object) if class_object.exception_base.is_some() => {
-                        let UserException { args, .. } = user_exception_parts(state, value)?
-                            .ok_or("exception instance lost its native base")?;
-                        let args = args
-                            .iter()
-                            .map(|argument| render(state, *argument, active))
-                            .collect::<Result<Vec<_>, _>>()?
-                            .join(", ");
-                        format!("{}({args})", class_object.name)
-                    }
                     Object::Class(class_object) => format!("<{} object>", class_object.name),
                     _ => return Err("instance has an invalid class".into()),
                 },
             },
+            Object::Exception(args) => {
+                let name = state.types.get(heap.type_id(value)?)?.name.clone();
+                format!("{name}({})", render_values(state, args, active)?.join(", "))
+            }
             Object::Float(value) => super::float_text::repr(*value),
             Object::String(value) => quote_string(value),
             Object::Bytes(value) => quote_bytes(value),
             Object::ByteArray(value) => format!("bytearray({})", quote_bytes(value)),
-            Object::Exception { kind, args } => {
-                format!("{kind}({})", render_values(state, args, active)?.join(", "))
-            }
             Object::List(values) => {
                 format!("[{}]", render_values(state, values, active)?.join(", "))
             }
@@ -646,7 +611,7 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         Object::String(value) => !value.is_empty(),
         Object::Bytes(value) => !value.is_empty(),
         Object::ByteArray(value) => !value.is_empty(),
-        Object::Exception { .. } => true,
+        Object::Exception(_) => true,
         Object::List(values) | Object::Tuple(values) => !values.is_empty(),
         Object::Set(values) | Object::FrozenSet(values) => !values.is_empty(),
         Object::Slice { .. } => true,
@@ -1135,7 +1100,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             Object::Bare
             | Object::Float(_)
             | Object::String(_)
-            | Object::Exception { .. }
+            | Object::Exception(_)
             | Object::Slice { .. } => Err("object is not a container".into()),
             Object::Bytes(value) | Object::ByteArray(value) => {
                 if let Some(needle) = bytes_ref(heap, needle)? {

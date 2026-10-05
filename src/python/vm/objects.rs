@@ -139,7 +139,7 @@ impl<'s> Vm<'s> {
                 let class_name = &class_object.name;
                 format!("type object '{class_name}' has no attribute '{name}'")
             }
-            Some(Ok(Object::Bare | Object::Exception { .. })) => match self.type_name_of(owner) {
+            Some(Ok(Object::Bare)) => match self.type_name_of(owner) {
                 Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
                 Err(error) => return error,
             },
@@ -408,7 +408,7 @@ impl<'s> Vm<'s> {
             let overridable_getter = matches!(
                 descriptor.native_value(),
                 Some(NativeValue::NativeGetter(_))
-            ) && self.user_exception_base(&owner)?.is_some();
+            ) && protocol::exception_base(self.state, owner)?.is_some();
             let instance_value = match (overridable_getter, symbol) {
                 (true, Some(symbol)) => self.attribute_by_symbol(owner, symbol)?,
                 _ => None,
@@ -568,6 +568,13 @@ impl<'s> Vm<'s> {
         }
         if let Some(class) = instance_class {
             return self.lookup_instance_attribute(owner, class, symbol, name);
+        }
+        if let Some(symbol) = symbol {
+            if protocol::exception_base(self.state, owner)?.is_some() {
+                if let Some(value) = self.attribute_by_symbol(owner, symbol)? {
+                    return Ok(Some(value));
+                }
+            }
         }
         if owner.is_object() {
             match self.get(owner)? {
@@ -792,7 +799,7 @@ impl<'s> Vm<'s> {
                     .ok_or("exception type is not registered")?;
                 Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
             }
-            _ if self.instance_class(owner)?.is_some() => {
+            _ if self.has_instance_dict(owner)? => {
                 return self
                     .alloc_with(|b| {
                         Object::NamespaceDict(NamespaceTarget::Instance(b.store(owner)))
@@ -890,6 +897,24 @@ impl<'s> Vm<'s> {
         name: &str,
         value: Value<'s>,
     ) -> Result<(), String> {
+        // `BaseException.args` is writable and stores any iterable as a tuple.
+        if name == "args" && protocol::exception_base(self.state, owner)?.is_some() {
+            let current = match self.get(owner)? {
+                Object::Exception(args) => args.len(),
+                _ => return Err("exception instance has a non-exception layout".into()),
+            };
+            let items = self.iterable_values(&value)?;
+            let bytes = u64::try_from(items.len().saturating_sub(current))
+                .unwrap_or(u64::MAX)
+                .saturating_mul(super::MODELED_VALUE_BYTES);
+            self.reserve_object_growth(owner, bytes)?;
+            return self.modify(owner, |b, object| {
+                let Object::Exception(args) = object else {
+                    unreachable!("checked above")
+                };
+                *args = b.refs(items);
+            });
+        }
         let Some(class) = self.instance_class(owner)? else {
             if owner.is_object() {
                 match self.get(owner)? {
@@ -903,23 +928,11 @@ impl<'s> Vm<'s> {
                         let namespace = self.module_namespace(self.handle(scope))?;
                         return self.namespace_store(namespace, name.to_string(), value);
                     }
-                    // `BaseException.args` is writable and stores any iterable as a tuple.
-                    Object::Exception { args, .. } if name == "args" => {
-                        let current = args.len();
-                        let items = self.iterable_values(&value)?;
-                        let bytes = u64::try_from(items.len().saturating_sub(current))
-                            .unwrap_or(u64::MAX)
-                            .saturating_mul(super::MODELED_VALUE_BYTES);
-                        self.reserve_object_growth(owner, bytes)?;
-                        self.modify(owner, |b, object| {
-                            let Object::Exception { args, .. } = object else {
-                                unreachable!("checked above")
-                            };
-                            *args = b.refs(items);
-                        })?;
-                        return Ok(());
-                    }
                     _ => {}
+                }
+                // A builtin exception instance has an attribute dictionary like any instance.
+                if protocol::exception_base(self.state, owner)?.is_some() {
+                    return self.insert_attribute(owner, name, value);
                 }
             }
             return Err(self.reject_builtin_attribute_store(owner, name));
@@ -973,7 +986,7 @@ impl<'s> Vm<'s> {
             ) && !(matches!(
                 name,
                 "args" | "errno" | "strerror" | "filename" | "filename2"
-            ) && self.user_exception_base(&owner)?.is_some())
+            ) && protocol::exception_base(self.state, owner)?.is_some())
             {
                 let type_name = self.type_name_of(&owner)?;
                 return Err(self.raise_exception(
@@ -1073,6 +1086,12 @@ impl<'s> Vm<'s> {
         let class = match self.get(owner)? {
             _ if self.instance_class(owner)?.is_some() => {
                 self.instance_class(owner)?.expect("checked above")
+            }
+            _ if protocol::exception_base(self.state, owner)?.is_some() => {
+                if self.remove_attribute_by_symbol(owner, symbol)?.is_none() {
+                    return Err(self.missing_attribute(&owner, name));
+                }
+                return Ok(());
             }
             Object::Class { .. } => return self.set_class_attribute(owner, name, None),
             Object::Function { .. } => return self.set_function_attribute(owner, name, None),
@@ -1310,6 +1329,13 @@ impl<'s> Vm<'s> {
         self.state.types.instance_class(&self.state.heap, value)
     }
 
+    /// Whether `value` keeps its own attribute dictionary: an instance of a user class, or an
+    /// exception instance, whose builtin classes also give instances a `__dict__`.
+    pub(super) fn has_instance_dict(&self, value: Value<'s>) -> Result<bool, String> {
+        Ok(self.instance_class(value)?.is_some()
+            || protocol::exception_base(self.state, value)?.is_some())
+    }
+
     /// Whether `value` is an instance of a user class with the plain `object` layout and no
     /// exception base: the objects whose default `repr()` and `str()` are `<Name object at ...>`.
     fn is_plain_instance(&self, value: &Value<'s>) -> Result<bool, String> {
@@ -1492,7 +1518,7 @@ impl<'s> Vm<'s> {
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
                 | Object::Slice { .. }
-                | Object::Exception { .. }
+                | Object::Exception(_)
                 | Object::FrozenSet(_)
                 | Object::BigInt(_)
                 | Object::Complex { .. }

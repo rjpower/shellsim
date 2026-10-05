@@ -88,7 +88,7 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         | Object::Tuple(items)
         | Object::ArrayStorage(ArrayStorage::Values(items))
         | Object::Iterator { values: items, .. }
-        | Object::Exception { args: items, .. } => slots(items, f),
+        | Object::Exception(items) => slots(items, f),
         Object::Set(members) | Object::FrozenSet(members) => members.visit_refs(f),
         Object::Dict(entries) => entries.visit_refs(f),
         Object::DefaultDict { factory, entries } => {

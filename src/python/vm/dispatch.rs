@@ -485,11 +485,7 @@ impl<'s> Vm<'s> {
             self.push(value);
             return Ok(DispatchControl::Next);
         }
-        let kind = if let Some(kind) = protocol::exception_kind(self.state, value)? {
-            kind
-        } else if let Some(kind) = self.user_exception_kind(&value)? {
-            kind
-        } else {
+        let Some(kind) = protocol::exception_type_name(self.state, value)? else {
             return Err("coroutine scheduler injected a non-exception".into());
         };
         self.pending_exception = Some(RaisedException {
@@ -504,12 +500,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
         let exception = if has_value {
             let value = self.pop()?;
-            if let Some(kind) = protocol::exception_kind(self.state, value)? {
-                RaisedException {
-                    kind,
-                    value: self.store(value),
-                }
-            } else if let Some(kind) = self.user_exception_kind(&value)? {
+            if let Some(kind) = protocol::exception_type_name(self.state, value)? {
                 RaisedException {
                     kind,
                     value: self.store(value),
@@ -535,8 +526,7 @@ impl<'s> Vm<'s> {
                         unreachable!("immediate call cannot suspend")
                     }
                 };
-                let kind = self
-                    .user_exception_kind(&instance)?
+                let kind = protocol::exception_type_name(self.state, instance)?
                     .ok_or("exception class produced a non-exception instance")?;
                 RaisedException {
                     kind,
@@ -563,8 +553,7 @@ impl<'s> Vm<'s> {
     fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
         let cause = self.pop()?;
         let valid = cause.is_none()
-            || protocol::exception_kind(self.state, cause)?.is_some()
-            || self.user_exception_kind(&cause)?.is_some()
+            || protocol::exception_type_name(self.state, cause)?.is_some()
             || self.exception_class_base(&cause)?.is_some();
         if !valid {
             return Err(self.raise_exception(
@@ -694,7 +683,10 @@ impl<'s> Vm<'s> {
     }
 
     fn exception_class(&self, kind: &str, value: &Value<'s>) -> Result<Value<'s>, String> {
-        if protocol::exception_kind(self.state, *value)?.is_some() {
+        // A builtin exception instance has no class object; its class is the registered type.
+        if protocol::exception_base(self.state, *value)?.is_some()
+            && self.instance_class(*value)?.is_none()
+        {
             let name = super::known_exception_type(kind)
                 .ok_or_else(|| format!("exception type metadata is not modeled for {kind:?}"))?;
             Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(

@@ -329,32 +329,6 @@ impl<'s> Vm<'s> {
         }
     }
 
-    pub(super) fn user_exception_kind(&self, value: &Value<'_>) -> Result<Option<String>, String> {
-        let Some(class) = self.instance_class(*value)? else {
-            return Ok(None);
-        };
-        let Object::Class(class_object) = self.get(class)? else {
-            return Ok(None);
-        };
-        Ok(class_object
-            .exception_base
-            .map(|_| class_object.name.clone()))
-    }
-
-    /// The modeled exception class a user exception instance derives from, if `value` is one.
-    pub(super) fn user_exception_base(
-        &self,
-        value: &Value<'_>,
-    ) -> Result<Option<&'static str>, String> {
-        let Some(class) = self.instance_class(*value)? else {
-            return Ok(None);
-        };
-        let Object::Class(class_object) = self.get(class)? else {
-            return Ok(None);
-        };
-        Ok(class_object.exception_base)
-    }
-
     #[inline(always)]
     pub(super) fn store_global(
         &mut self,

@@ -992,3 +992,41 @@ def test_builtin_subclass_instances_carry_the_builtin_payload():
         _ = [object() for _ in range(20)]
     assert all(item.index == index for index, item in enumerate(kept))
     assert kept[1].extra == 1 and kept[3].__dict__ == {"extra": 3, "index": 3}
+
+
+class _Custom(ValueError):
+    pass
+
+
+def test_exception_instances_are_ordinary_instances():
+    # Builtin and user exception instances share one layout: the registered class as their type
+    # and `args` plus any assigned attribute in an instance dictionary.
+    for error in (KeyError("k"), _Custom("v", 2)):
+        error.extra = 5
+        error.note = "n"
+        del error.note
+        assert error.extra == 5 and vars(error) == {"extra": 5}
+        error.args = [1, 2]
+        assert error.args == (1, 2) and type(error.args) is tuple
+    empty = ValueError()
+    assert (empty.args, repr(empty), str(empty), vars(empty)) == ((), "ValueError()", "", {})
+    custom = _Custom("v", 2)
+    assert (repr(custom), str(custom), custom.args) == ("_Custom('v', 2)", "('v', 2)", ("v", 2))
+    assert isinstance(custom, ValueError) and type(custom) is _Custom
+    try:
+        raise custom
+    except ValueError as caught:
+        assert caught is custom and caught.extra if hasattr(caught, "extra") else True
+    key = KeyError("k")
+    assert (str(key), repr(key), key.args) == ("'k'", "KeyError('k')", ("k",))
+    try:
+        {}["missing"]
+    except KeyError as caught:
+        caught.extra = "seen"
+        assert caught.args == ("missing",) and caught.extra == "seen" and str(caught) == "'missing'"
+    try:
+        (1).extra = 2
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("int accepted an attribute")

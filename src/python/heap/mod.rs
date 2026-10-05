@@ -348,11 +348,9 @@ pub enum Object {
     String(PyString),
     Bytes(Vec<u8>),
     ByteArray(Vec<u8>),
-    /// An instance of a builtin exception class, with the constructor arguments `args`.
-    Exception {
-        kind: String,
-        args: Vec<Ref>,
-    },
+    /// The layout every exception instance inherits from `BaseException`: its constructor
+    /// arguments, `args`. The class is the object's type, builtin or user-defined.
+    Exception(Vec<Ref>),
     List(Vec<Ref>),
     Tuple(Vec<Ref>),
     /// `slice(start, stop, step)`. Bounds are any objects, as in CPython (`None` when
@@ -978,6 +976,18 @@ impl Heap {
         self.alloc(object, roots, resources)
     }
 
+    /// [`Heap::alloc_with`] for an instance of `type_id`.
+    pub fn alloc_with_typed<'s>(
+        &mut self,
+        type_id: TypeId,
+        roots: &mut dyn Roots,
+        resources: &mut Resources,
+        build: impl FnOnce(&Builder<'_>) -> Object,
+    ) -> Result<Value<'s>, String> {
+        let object = build(&self.builder());
+        self.alloc_typed(type_id, object, roots, resources)
+    }
+
     /// A fresh payload holding the same builtin value as `value`, for the instance of a builtin
     /// subclass that `Class(value)` creates. Immediates are boxed; heap payloads are copied, so
     /// the instance never aliases the object it was built from.
@@ -1175,7 +1185,7 @@ impl Heap {
             Object::String(_) => BuiltinType::String.id(),
             Object::Bytes(_) => BuiltinType::Bytes.id(),
             Object::ByteArray(_) => BuiltinType::ByteArray.id(),
-            Object::Exception { .. } => BuiltinType::Exception.id(),
+            Object::Exception(_) => BuiltinType::Exception.id(),
             Object::List(_) => BuiltinType::List.id(),
             Object::Tuple(_) => BuiltinType::Tuple.id(),
             Object::Slice { .. } => BuiltinType::Slice.id(),
@@ -1253,11 +1263,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
     let slots = match object {
         Object::String(value) => return packed(value.len()),
         Object::Bytes(value) | Object::ByteArray(value) => return packed(value.len()),
-        Object::Exception { kind, args } => kind
-            .len()
-            .checked_add(args.len())
-            .ok_or("modeled object size overflow")?,
-        Object::List(values) | Object::Tuple(values) => values.len(),
+        Object::Exception(values) | Object::List(values) | Object::Tuple(values) => values.len(),
         Object::Set(values) | Object::FrozenSet(values) => values
             .len()
             .checked_mul(SET_MEMBER_VALUES)

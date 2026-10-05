@@ -1503,16 +1503,18 @@ impl<'s> Vm<'s> {
         let instance_type = self
             .class_type_id(&class)?
             .ok_or("class has no registered type")?;
-        let payload = match builtin_payload {
-            Some(value) => self.state.heap.copy_builtin_payload(value)?,
-            None => Object::Bare,
+        let instance = if exception_base.is_some() {
+            let args = arguments.clone();
+            self.alloc_with_typed(instance_type, |builder| {
+                Object::Exception(builder.refs(args))
+            })?
+        } else {
+            let payload = match builtin_payload {
+                Some(value) => self.state.heap.copy_builtin_payload(value)?,
+                None => Object::Bare,
+            };
+            self.allocate_typed(instance_type, payload)?
         };
-        let instance = self.allocate_typed(instance_type, payload)?;
-        if exception_base.is_some() {
-            let exception_args =
-                self.alloc_with(|builder| Object::Tuple(builder.refs(arguments.iter().copied())))?;
-            self.insert_attribute(instance, "args", exception_args)?;
-        }
         if is_dataclass {
             let mut values = Vec::new();
             for (index, (field, default)) in dataclass_fields.iter().enumerate() {

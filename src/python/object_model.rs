@@ -578,6 +578,8 @@ pub struct TypeRegistry {
     types: Vec<PyType>,
     value_kinds: Vec<&'static super::native::ValueKindDef>,
     exception_types: HashMap<&'static str, TypeId>,
+    /// The inverse of `exception_types`, for the builtin ancestor of an exception type.
+    exception_names: HashMap<TypeId, &'static str>,
     modeled_bytes: u64,
 }
 
@@ -588,6 +590,7 @@ impl Clone for TypeRegistry {
             types: self.types.clone(),
             value_kinds: self.value_kinds.clone(),
             exception_types: self.exception_types.clone(),
+            exception_names: self.exception_names.clone(),
             modeled_bytes: self.modeled_bytes,
         }
     }
@@ -818,6 +821,7 @@ impl Default for TypeRegistry {
             types,
             value_kinds: Vec::new(),
             exception_types: HashMap::new(),
+            exception_names: HashMap::new(),
             modeled_bytes: builtin_bytes,
         };
         for kind in super::stdlib::value_kinds() {
@@ -838,7 +842,22 @@ impl TypeRegistry {
         self.types[base.raw() as usize].value = Some(Ref::from_immediate(Value::Native(
             NativeValue::ExceptionType(ExceptionType("BaseException")),
         )));
+        // Exception instances keep an attribute dictionary, like instances of heap classes.
+        let base_type = &mut self.types[base.raw() as usize];
+        let before = modeled_type_bytes(base_type);
+        base_type.attributes.insert(
+            "__dict__".into(),
+            Ref::from_immediate(Value::Native(NativeValue::NativeGetter(
+                &super::stdlib::core::INSTANCE_DICT_GETTER,
+            ))),
+        );
+        let after = modeled_type_bytes(base_type);
+        self.modeled_bytes = self
+            .modeled_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
         self.exception_types.insert("BaseException", base);
+        self.exception_names.insert(base, "BaseException");
         for definition in super::exception_types::EXCEPTION_TYPES.iter().skip(1) {
             let parent = definition.parent.expect("non-root exception has a parent");
             let parent = self.exception_types[parent];
@@ -869,11 +888,30 @@ impl TypeRegistry {
             self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
             self.types.push(ty);
             self.exception_types.insert(definition.name, id);
+            self.exception_names.insert(id, definition.name);
         }
     }
 
     pub(super) fn exception_type_id(&self, name: &str) -> Option<TypeId> {
         self.exception_types.get(name).copied()
+    }
+
+    /// Whether instances of `id` are exceptions: `id` derives from `BaseException`.
+    pub fn is_exception_type(&self, id: TypeId) -> Result<bool, String> {
+        self.is_subclass(id, BuiltinType::Exception.id())
+    }
+
+    /// The closest builtin exception class that `id` is or derives from, which decides how its
+    /// instances render and which native behavior they inherit. `None` for non-exception types.
+    pub fn exception_base(&self, id: TypeId) -> Result<Option<&'static str>, String> {
+        if let Some(name) = self.exception_names.get(&id) {
+            return Ok(Some(name));
+        }
+        Ok(self
+            .get(id)?
+            .mro
+            .iter()
+            .find_map(|ancestor| self.exception_names.get(ancestor).copied()))
     }
 
     /// Conservative modeled size of registry metadata retained between executions.

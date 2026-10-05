@@ -45,10 +45,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
         Object::String(value) => Object::String(value.clone()),
         Object::Bytes(value) => Object::Bytes(value.clone()),
         Object::ByteArray(value) => Object::ByteArray(value.clone()),
-        Object::Exception { kind, args } => Object::Exception {
-            kind: kind.clone(),
-            args: slots(args),
-        },
+        Object::Exception(args) => Object::Exception(slots(args)),
         Object::List(items) => Object::List(slots(items)),
         Object::Tuple(items) => Object::Tuple(slots(items)),
         Object::Slice { start, stop, step } => Object::Slice {

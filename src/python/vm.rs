@@ -1370,14 +1370,12 @@ impl<'s> Vm<'s> {
         kind: &str,
         args: Vec<Value<'s>>,
     ) -> Result<Value<'s>, String> {
-        let value = self.alloc_with(|builder| Object::Exception {
-            kind: kind.to_string(),
-            args: builder.refs(args),
-        })?;
-        if let Some(type_id) = self.state.types.exception_type_id(kind) {
-            self.state.heap.set_type_id(value, type_id)?;
-        }
-        Ok(value)
+        let type_id = self
+            .state
+            .types
+            .exception_type_id(kind)
+            .ok_or_else(|| format!("exception type {kind:?} is not registered"))?;
+        self.alloc_with_typed(type_id, |builder| Object::Exception(builder.refs(args)))
     }
 
     /// Raise a builtin exception with the constructor arguments `args`.
@@ -1415,9 +1413,6 @@ impl<'s> Vm<'s> {
 
     /// The type name CPython prints in error messages, such as `int` or a user class name.
     fn type_name_of(&self, value: &Value<'s>) -> Result<String, String> {
-        if let Some(kind) = protocol::exception_kind(self.state, *value)? {
-            return Ok(kind);
-        }
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
     }
 
@@ -1658,10 +1653,8 @@ impl<'s> Vm<'s> {
                         return Err(error);
                     };
                     let exception_value = self.handle(&exception.value);
-                    let kind = match self.user_exception_base(&exception_value)? {
-                        Some(base) => base,
-                        None => exception.kind.as_str(),
-                    };
+                    let kind = protocol::exception_base(self.state, exception_value)?
+                        .unwrap_or(exception.kind.as_str());
                     if !exception_types::exception_is_subclass(kind, "IndexError")
                         && !exception_types::exception_is_subclass(kind, "StopIteration")
                     {
