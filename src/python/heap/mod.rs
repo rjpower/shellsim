@@ -509,6 +509,7 @@ impl Builder<'_> {
     }
 }
 
+#[inline(always)]
 fn resolve(handles: &RefCell<Vec<Raw>>, value: Value<'_>) -> Raw {
     match value.raw().handle_index() {
         Some(index) => *handles
@@ -608,17 +609,20 @@ impl Heap {
     // ----- handles -------------------------------------------------------------------------
 
     /// Number of live handle-stack entries; a scope records this when it opens.
+    #[inline(always)]
     pub fn handle_count(&self) -> usize {
         self.handles.borrow().len()
     }
 
     /// Drop every handle created since the stack had `len` entries; a scope does this when it
     /// closes. The entries above `len` can no longer be named, so nothing dangles.
+    #[inline(always)]
     pub fn truncate_handles(&self, len: usize) {
         self.handles.borrow_mut().truncate(len);
     }
 
     /// A scoped handle for a stored reference. Immediates pass through without a stack entry.
+    #[inline(always)]
     pub fn handle<'s>(&self, slot: &Ref) -> Value<'s> {
         self.handle_raw(slot.0)
     }
@@ -631,6 +635,7 @@ impl Heap {
         slots.into_iter().map(|slot| self.handle(slot)).collect()
     }
 
+    #[inline(always)]
     fn handle_raw<'s>(&self, raw: Raw) -> Value<'s> {
         if raw.is_object() {
             let mut handles = self.handles.borrow_mut();
@@ -644,10 +649,12 @@ impl Heap {
     /// The stored form of a handle, for the VM's own root containers. The result must be placed
     /// in a root before the next allocation; it is not a handle and the collector cannot see it
     /// in a Rust local.
+    #[inline(always)]
     pub fn store(&self, value: Value<'_>) -> Ref {
         Ref(self.resolve(value))
     }
 
+    #[inline(always)]
     fn resolve(&self, value: Value<'_>) -> Raw {
         resolve(&self.handles, value)
     }

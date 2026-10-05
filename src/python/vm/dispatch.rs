@@ -120,6 +120,8 @@ impl<'s> Vm<'s> {
     ) -> Result<Flow, (String, super::super::source::Span)> {
         // Handles made while executing live in this child scope and die with each instruction;
         // only stored references in the VM's roots carry values from one instruction to the next.
+        // An instruction that works in place on the operand stack makes no handle at all, so
+        // the operand stack, a root, is what keeps its values alive.
         let mut vm = self.scope();
         // The VM runs synchronously for one bounded quantum. Interrupt state can change only when
         // control returns to the scheduler, so one check defines the quantum's safe-point edge.
@@ -135,7 +137,7 @@ impl<'s> Vm<'s> {
             // Handles and native scratch live for one semantic instruction. Releasing the
             // previous instruction's here avoids double-counting a materialized result after it
             // has moved into a heap object.
-            vm.reset_scope();
+            vm.reset_scope_if_used();
             let instruction_pointer = dispatch.op_index;
             let code = &dispatch.code;
             let code_cache = dispatch.code_cache;
@@ -346,7 +348,7 @@ impl<'s> Vm<'s> {
                 ),
                 Opcode::Copy(depth) => dispatch_next(vm.copy(depth)),
                 Opcode::Swap(depth) => dispatch_next(vm.swap(depth)),
-                Opcode::PopTop => vm.pop().map(|_| Flow::Next),
+                Opcode::PopTop => vm.pop_ref().map(|_| Flow::Next),
                 Opcode::Jump(target) => Ok(Flow::Jump(target)),
                 Opcode::JumpIfFalseOrPop(target) => match vm.jump_if_or_pop(false) {
                     Ok(true) => Ok(Flow::Jump(target)),
@@ -370,17 +372,16 @@ impl<'s> Vm<'s> {
                     }
                 }
                 Opcode::Return => {
-                    let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    if vm.finish_called_frame(value) {
-                        Ok(Flow::Refresh)
-                    } else {
-                        Ok(Flow::Return(vm.store(value)))
+                    let value = vm.pop_ref().map_err(|error| (error, dispatch.span()))?;
+                    match vm.finish_called_frame(value) {
+                        Ok(()) => Ok(Flow::Refresh),
+                        Err(value) => Ok(Flow::Return(value)),
                     }
                 }
                 Opcode::Yield => {
-                    let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
+                    let value = vm.pop_ref().map_err(|error| (error, dispatch.span()))?;
                     vm.active_frame_mut().instruction_pointer = instruction_pointer + 1;
-                    Ok(Flow::Yield(vm.store(value)))
+                    Ok(Flow::Yield(value))
                 }
                 Opcode::YieldFromSend(target) => match vm.yield_from_send() {
                     Ok(ForIterOutcome::Yielded) => {
@@ -453,13 +454,10 @@ impl<'s> Vm<'s> {
                 Opcode::AsyncWithExitException => vm.dispatch_async_with_exit_exception(),
                 Opcode::AsyncWithFinishException => vm.dispatch_async_with_finish_exception(),
                 Opcode::PopExpression => vm.dispatch_pop_expression(),
-                Opcode::Halt => {
-                    if vm.finish_called_frame(Value::None) {
-                        Ok(Flow::Refresh)
-                    } else {
-                        Ok(Flow::Halt)
-                    }
-                }
+                Opcode::Halt => match vm.finish_called_frame(Ref::from_immediate(Value::None)) {
+                    Ok(()) => Ok(Flow::Refresh),
+                    Err(_) => Ok(Flow::Halt),
+                },
             };
             match result {
                 Ok(Flow::Next) => dispatch.op_index += 1,
@@ -989,12 +987,14 @@ impl<'s> Vm<'s> {
 
     /// Return `value` from a called frame to its caller. `false` when the active frame was
     /// entered synchronously by Rust code, which takes the value from the dispatch loop.
-    fn finish_called_frame(&mut self, value: Value<'_>) -> bool {
+    /// Pop the active frame when a call entered it and leave `value` on the caller's stack.
+    /// A frame Rust code entered stays in place and the value comes back for it to return.
+    fn finish_called_frame(&mut self, value: Ref) -> Result<(), Ref> {
         if self.unwind_called_frame().is_none() {
-            return false;
+            return Err(value);
         }
-        self.push(value);
-        true
+        self.execution.stack.push_ref(&value);
+        Ok(())
     }
 
     /// `__file__` of the module whose code the active frame runs, when that module was imported.

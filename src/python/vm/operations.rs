@@ -17,6 +17,16 @@ enum Replacement<'s> {
 
 impl<'s> Vm<'s> {
     pub(super) fn unary(&mut self, operator: UnaryOperator) -> Result<(), String> {
+        // An exact number is rewritten in place on the stack; everything else leaves it as a
+        // handle for the slot protocol.
+        let value = self.peek(0)?;
+        if let Some(result) = number::exact_unary(self, operator, value)
+            .map_err(|error| self.record_native_error(error))?
+        {
+            let slot = self.stack.len() - 1;
+            self.execution.stack.set(&self.state.heap, slot, result);
+            return Ok(());
+        }
         let value = self.pop()?;
         if operator == UnaryOperator::Not {
             let value = Value::Bool(!self.truth_value(&value)?);

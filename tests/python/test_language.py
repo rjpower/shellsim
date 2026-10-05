@@ -1051,6 +1051,51 @@ def test_positional_only_parameters_reject_keywords():
         raise AssertionError("a positional-only parameter was bound by keyword")
 
 
+def spread(a, *args, k):
+    return (a, args, k)
+
+
+def defaults(a, b=2, *, c, d=4):
+    return (a, b, c, d)
+
+
+def test_argument_binding_fills_variadic_and_keyword_only_slots():
+    assert spread(1, 2, 3, 4, k=5) == (1, (2, 3, 4), 5)
+
+    class Receiver:
+        def everything(*args, **kwargs):
+            return (len(args), kwargs)
+
+        def positional_only_receiver(self, x=1, /, **kwargs):
+            return (x, kwargs)
+
+    receiver = Receiver()
+    assert receiver.everything(1, 2, q=3) == (3, {"q": 3})
+    assert receiver.positional_only_receiver(2, x=5) == (2, {"x": 5})
+    assert defaults(1, c=3) == (1, 2, 3, 4)
+    assert defaults(*[1], **{"c": 9}) == (1, 2, 9, 4)
+    messages = []
+    for call in (
+        lambda: defaults(1),
+        lambda: defaults(1, 2, 3, c=1),
+        lambda: defaults(1, c=1, a=2),
+        lambda: defaults(1, c=1, e=2),
+        lambda: spread(1),
+    ):
+        try:
+            call()
+        except TypeError as error:
+            messages.append(str(error))
+    assert messages == [
+        "defaults() missing 1 required keyword-only argument: 'c'",
+        "defaults() takes from 1 to 2 positional arguments but 3 positional arguments "
+        "(and 1 keyword-only argument) were given",
+        "defaults() got multiple values for argument 'a'",
+        "defaults() got an unexpected keyword argument 'e'",
+        "spread() missing 1 required keyword-only argument: 'k'",
+    ]
+
+
 def test_container_repr_uses_item_repr_and_marks_self_references():
     class Item:
         def __repr__(self):

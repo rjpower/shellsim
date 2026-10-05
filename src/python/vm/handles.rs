@@ -79,6 +79,19 @@ impl<'s> Vm<'s> {
         self.release_transient_memory();
     }
 
+    /// [`Self::reset_scope`] when the scope holds a handle or scratch; the dispatch loop calls
+    /// this once per instruction, so an instruction that works in place on the operand stack
+    /// pays two comparisons.
+    #[inline(always)]
+    pub(super) fn reset_scope_if_used(&mut self) {
+        if self.state.heap.handle_count() != self.handle_base {
+            self.state.heap.truncate_handles(self.handle_base);
+        }
+        if self.execution.transient_memory != self.transient_base {
+            self.release_transient_memory();
+        }
+    }
+
     // ----- heap access ---------------------------------------------------------------------
 
     pub(super) fn heap(&self) -> &Heap {
@@ -86,6 +99,7 @@ impl<'s> Vm<'s> {
     }
 
     /// A handle for a stored reference.
+    #[inline(always)]
     pub(super) fn handle(&self, slot: &Ref) -> Value<'s> {
         self.state.heap.handle(slot)
     }
@@ -100,6 +114,7 @@ impl<'s> Vm<'s> {
 
     /// The stored form of a handle, for the VM's root containers. Place it in a root before the
     /// next allocation.
+    #[inline(always)]
     pub(super) fn store(&self, value: Value<'_>) -> Ref {
         self.state.heap.store(value)
     }
@@ -229,8 +244,36 @@ impl<'s> Vm<'s> {
 
     // ----- operand stack -------------------------------------------------------------------
 
+    #[inline(always)]
     pub(super) fn push(&mut self, value: Value<'_>) {
         self.execution.stack.push(&self.state.heap, value);
+    }
+
+    /// Pop the top stored reference without making a handle, for moving a value between roots
+    /// or discarding it.
+    #[inline(always)]
+    pub(super) fn pop_ref(&mut self) -> Result<Ref, String> {
+        if self.frame_stack_len() == 0 {
+            return Err("invalid bytecode stack effect".into());
+        }
+        Ok(self
+            .execution
+            .stack
+            .pop_ref()
+            .expect("non-empty frame stack was checked"))
+    }
+
+    /// The stored reference `depth` entries below the top of the stack (0 is the top), for
+    /// instructions that work in place.
+    #[inline(always)]
+    pub(super) fn peek_ref(&self, depth: usize) -> Result<&Ref, String> {
+        if self.frame_stack_len() <= depth {
+            return Err("stack underflow".into());
+        }
+        self.execution
+            .stack
+            .top(depth)
+            .ok_or_else(|| "stack underflow".into())
     }
 
     /// Leave a call's result on the operand stack, where the caller expects it.
@@ -240,6 +283,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The value `depth` entries below the top of the stack (0 is the top).
+    #[inline(always)]
     pub(super) fn peek(&self, depth: usize) -> Result<Value<'s>, String> {
         self.execution
             .stack

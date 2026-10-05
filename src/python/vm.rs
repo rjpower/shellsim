@@ -2046,6 +2046,7 @@ impl<'s> Vm<'s> {
         Ok((hash, None))
     }
 
+    #[inline(always)]
     fn pop(&mut self) -> Result<Value<'s>, String> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
@@ -2068,8 +2069,8 @@ impl<'s> Vm<'s> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
-        let value = self.peek(depth - 1)?;
-        self.push(value);
+        let value = self.peek_ref(depth - 1)?.dup();
+        self.execution.stack.push_ref(&value);
         Ok(())
     }
 
@@ -2100,6 +2101,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    #[inline(always)]
     fn frame_stack_len(&self) -> usize {
         let stack_base = self
             .bytecode_frames
