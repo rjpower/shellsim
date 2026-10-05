@@ -35,12 +35,14 @@ use super::string::PyString;
 
 mod gc;
 pub mod mapping;
+mod native_object;
 mod snapshot;
 mod stack;
 pub mod value;
 
 pub use gc::Roots;
 pub use mapping::{KeyHash, OrderedMap, OrderedSet};
+pub use native_object::NativeObject;
 pub use stack::ValueStack;
 pub use value::{Ref, Value};
 
@@ -113,6 +115,25 @@ impl Default for InstanceAttributes {
 pub(super) struct ObjectId(u64);
 
 const YOUNG_FLAG: u64 = 1 << 63;
+
+impl Object {
+    /// The module-owned payload behind [`Object::Native`] when it is a `T`; `None` for any other
+    /// payload, including another native type.
+    pub fn native<T: NativeObject>(&self) -> Option<&T> {
+        match self {
+            Object::Native(native) => (native.as_ref() as &dyn std::any::Any).downcast_ref(),
+            _ => None,
+        }
+    }
+
+    /// Mutable access to the module-owned payload when it is a `T`.
+    pub fn native_mut<T: NativeObject>(&mut self) -> Option<&mut T> {
+        match self {
+            Object::Native(native) => (native.as_mut() as &mut dyn std::any::Any).downcast_mut(),
+            _ => None,
+        }
+    }
+}
 
 impl ObjectId {
     const fn young(epoch: u32, index: usize) -> Self {
@@ -231,65 +252,6 @@ pub struct GeneratorObject {
     pub exhausted: bool,
     pub running: bool,
     pub return_value: Ref,
-}
-
-/// A regular-expression match. Boxed inside [`Object::Match`] to keep heap slots small.
-///
-/// The subject string and the `re.Pattern` are held by reference so a match costs its own
-/// group text, not a copy of the string it was found in. `spans` are character offsets into
-/// the subject per group, `None` for a group that did not participate.
-#[derive(Debug)]
-pub struct MatchObject {
-    pub subject: Ref,
-    pub regex: Ref,
-    pub text: String,
-    pub groups: Vec<Option<String>>,
-    pub group_names: Vec<Option<String>>,
-    pub spans: Vec<Option<(usize, usize)>>,
-    pub pos: usize,
-    pub endpos: usize,
-}
-
-/// One declared `argparse` argument, with its default and choices stored as references.
-#[derive(Debug)]
-pub struct ArgumentSpec {
-    pub names: Vec<String>,
-    pub dest: String,
-    pub required: bool,
-    pub default: Ref,
-    pub store_true: bool,
-    pub store_false: bool,
-    pub integer: bool,
-    pub choices: Vec<Ref>,
-    pub help: Option<String>,
-}
-
-/// One command of an `argparse` subparser collection; `parser` is the sub-parser object.
-#[derive(Debug)]
-pub struct SubcommandSpec {
-    pub name: String,
-    pub help: Option<String>,
-    pub parser: Ref,
-}
-
-/// The one-level subparser surface of an `argparse.ArgumentParser`.
-#[derive(Debug)]
-pub struct SubparsersSpec {
-    pub dest: Option<String>,
-    pub required: bool,
-    pub help: Option<String>,
-    pub commands: Vec<SubcommandSpec>,
-}
-
-/// An `argparse.ArgumentParser`. Boxed inside [`Object::ArgumentParser`] to keep heap slots small.
-#[derive(Debug)]
-pub struct ArgumentParserObject {
-    pub prog: String,
-    pub description: Option<String>,
-    pub add_help: bool,
-    pub is_subcommand: bool,
-    pub arguments: Vec<ArgumentSpec>,
-    pub subparsers: Option<SubparsersSpec>,
 }
 
 /// A lexical scope: a function activation's compiler-assigned local slots, any dynamically
@@ -473,23 +435,9 @@ pub enum Object {
         kind: u8,
         payload: [u64; 2],
     },
-    /// A compiled regular expression.  The pattern is compiled at the operation boundary so
-    /// regex execution never gets a host capability; keeping the source and flags here also
-    /// makes the object cheap to copy and deterministic to inspect.
-    Regex {
-        pattern: String,
-        flags: u32,
-    },
-    /// A bounded regular-expression match result.  Captures are stored as owned text rather than
-    /// references into a host regex object, which keeps the heap self-contained.
-    Match(Box<MatchObject>),
-    ArgumentParser(Box<ArgumentParserObject>),
-    Namespace {
-        values: Vec<(String, Ref)>,
-    },
-    RaisesContext {
-        expected: String,
-    },
+    /// A payload owned by one stdlib module, such as a compiled regex or an argument parser. The
+    /// heap traces, sizes, copies and renders it through [`NativeObject`] alone.
+    Native(Box<dyn NativeObject>),
     Property {
         getter: Ref,
         setter: Option<Ref>,
@@ -1220,11 +1168,7 @@ impl Heap {
             Object::ArrayStorage(_) => BuiltinType::Native.id(),
             Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
-            Object::Regex { .. } => BuiltinType::Regex.id(),
-            Object::Match { .. } => BuiltinType::Match.id(),
-            Object::ArgumentParser { .. } => BuiltinType::ArgumentParser.id(),
-            Object::RaisesContext { .. } => BuiltinType::RaisesContext.id(),
-            Object::Namespace { .. } => BuiltinType::Native.id(),
+            Object::Native(native) => native.python_type(),
             Object::Property { .. } => BuiltinType::Property.id(),
             Object::StaticMethod { .. } => BuiltinType::StaticMethod.id(),
             Object::ClassMethod { .. } => BuiltinType::ClassMethod.id(),
@@ -1352,57 +1296,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
             .checked_add(view.strides.len())
             .and_then(|size| size.checked_add(3))
             .ok_or("modeled object size overflow")?,
-        Object::Regex { pattern, .. } => pattern.len(),
-        Object::Match(match_object) => {
-            let MatchObject {
-                text,
-                groups,
-                group_names,
-                spans,
-                ..
-            } = &**match_object;
-            text.len()
-                .checked_add(spans.len().saturating_mul(16))
-                .and_then(|size| {
-                    size.checked_add(
-                        groups
-                            .iter()
-                            .map(|group| group.as_ref().map_or(0, String::len))
-                            .sum(),
-                    )
-                })
-                .and_then(|size| {
-                    size.checked_add(
-                        group_names
-                            .iter()
-                            .map(|name| name.as_ref().map_or(0, String::len))
-                            .sum(),
-                    )
-                })
-                .ok_or("modeled object size overflow")?
-        }
-        Object::ArgumentParser(parser_object) => {
-            let ArgumentParserObject {
-                prog,
-                description,
-                arguments,
-                subparsers,
-                ..
-            } = &**parser_object;
-            prog.len()
-                .checked_add(description.as_ref().map_or(0, String::len))
-                .and_then(|size| size.checked_add(arguments.len()))
-                .and_then(|size| {
-                    size.checked_add(
-                        subparsers
-                            .as_ref()
-                            .map_or(0, |subparsers| subparsers.commands.len()),
-                    )
-                })
-                .ok_or("modeled object size overflow")?
-        }
-        Object::Namespace { values } => values.len(),
-        Object::RaisesContext { expected } => expected.len(),
+        Object::Native(native) => native.modeled_slots()?,
         Object::Property { setter, .. } => 1 + usize::from(setter.is_some()),
         Object::StaticMethod { .. } | Object::ClassMethod { .. } => 1,
         Object::Super { .. } => 2,

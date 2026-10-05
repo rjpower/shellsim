@@ -5,9 +5,8 @@
 //! together with the space it points into.
 
 use super::{
-    ArgumentParserObject, ArgumentSpec, ArrayStorage, ClassObject, FunctionObject, GeneratorObject,
-    InstanceAttributes, MatchObject, NamespaceTarget, Object, ProxyTarget, Ref, ScopeObject,
-    SubcommandSpec, SubparsersSpec,
+    ArrayStorage, ClassObject, FunctionObject, GeneratorObject, InstanceAttributes,
+    NamespaceTarget, Object, ProxyTarget, Ref, ScopeObject,
 };
 
 fn slots(slots: &[Ref]) -> Vec<Ref> {
@@ -210,64 +209,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
             kind: *kind,
             payload: *payload,
         },
-        Object::Regex { pattern, flags } => Object::Regex {
-            pattern: pattern.clone(),
-            flags: *flags,
-        },
-        Object::Match(matched) => Object::Match(Box::new(MatchObject {
-            subject: matched.subject.dup(),
-            regex: matched.regex.dup(),
-            text: matched.text.clone(),
-            groups: matched.groups.clone(),
-            group_names: matched.group_names.clone(),
-            spans: matched.spans.clone(),
-            pos: matched.pos,
-            endpos: matched.endpos,
-        })),
-        Object::ArgumentParser(parser) => Object::ArgumentParser(Box::new(ArgumentParserObject {
-            prog: parser.prog.clone(),
-            description: parser.description.clone(),
-            add_help: parser.add_help,
-            is_subcommand: parser.is_subcommand,
-            arguments: parser
-                .arguments
-                .iter()
-                .map(|argument| ArgumentSpec {
-                    names: argument.names.clone(),
-                    dest: argument.dest.clone(),
-                    required: argument.required,
-                    default: argument.default.dup(),
-                    store_true: argument.store_true,
-                    store_false: argument.store_false,
-                    integer: argument.integer,
-                    choices: slots(&argument.choices),
-                    help: argument.help.clone(),
-                })
-                .collect(),
-            subparsers: parser.subparsers.as_ref().map(|subparsers| SubparsersSpec {
-                dest: subparsers.dest.clone(),
-                required: subparsers.required,
-                help: subparsers.help.clone(),
-                commands: subparsers
-                    .commands
-                    .iter()
-                    .map(|command| SubcommandSpec {
-                        name: command.name.clone(),
-                        help: command.help.clone(),
-                        parser: command.parser.dup(),
-                    })
-                    .collect(),
-            }),
-        })),
-        Object::Namespace { values } => Object::Namespace {
-            values: values
-                .iter()
-                .map(|(name, value)| (name.clone(), value.dup()))
-                .collect(),
-        },
-        Object::RaisesContext { expected } => Object::RaisesContext {
-            expected: expected.clone(),
-        },
+        Object::Native(native) => Object::Native(native.dup()),
         Object::Property { getter, setter } => Object::Property {
             getter: getter.dup(),
             setter: optional(setter),

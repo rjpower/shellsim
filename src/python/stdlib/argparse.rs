@@ -5,12 +5,182 @@
 //! level. Unsupported actions and nested subcommands fail explicitly rather than approximating a
 //! larger parser framework.
 
+use super::super::heap::{NativeObject, Ref};
 use super::super::native::PyValue as Value;
 use super::super::native::{
-    CallArgs, FunctionDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString, PyArgumentParser,
-    PyArgumentParserData, PyArgumentSpec, PyError, PyKind, PyList, PyMarker, PyResult, PyRuntime,
-    PySubcommandSpec, PySubparsersSpec, PyValueCast,
+    CallArgs, FunctionDef, GetterDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString,
+    PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyError, PyKind, PyList, PyMarker,
+    PyResult, PyRuntime, PySubcommandSpec, PySubparsersSpec, PyValueCast,
 };
+use super::super::object_model::{BuiltinType, TypeId};
+
+/// One declared argument as the heap stores it, with its default and choices as references.
+#[derive(Debug)]
+pub(crate) struct ArgumentSpec {
+    pub names: Vec<String>,
+    pub dest: String,
+    pub required: bool,
+    pub default: Ref,
+    pub store_true: bool,
+    pub store_false: bool,
+    pub integer: bool,
+    pub choices: Vec<Ref>,
+    pub help: Option<String>,
+}
+
+/// One command of a subparser collection; `parser` is the sub-parser object.
+#[derive(Debug)]
+pub(crate) struct SubcommandSpec {
+    pub name: String,
+    pub help: Option<String>,
+    pub parser: Ref,
+}
+
+/// The one-level subparser surface of an `ArgumentParser`.
+#[derive(Debug)]
+pub(crate) struct SubparsersSpec {
+    pub dest: Option<String>,
+    pub required: bool,
+    pub help: Option<String>,
+    pub commands: Vec<SubcommandSpec>,
+}
+
+/// An `argparse.ArgumentParser` as the heap stores it.
+#[derive(Debug)]
+pub(crate) struct ArgumentParserObject {
+    pub prog: String,
+    pub description: Option<String>,
+    pub add_help: bool,
+    pub is_subcommand: bool,
+    pub arguments: Vec<ArgumentSpec>,
+    pub subparsers: Option<SubparsersSpec>,
+}
+
+impl NativeObject for ArgumentParserObject {
+    fn python_type(&self) -> TypeId {
+        BuiltinType::ArgumentParser.id()
+    }
+
+    fn modeled_slots(&self) -> Result<usize, String> {
+        let commands = self
+            .subparsers
+            .as_ref()
+            .map_or(0, |subparsers| subparsers.commands.len());
+        self.prog
+            .len()
+            .checked_add(self.description.as_ref().map_or(0, String::len))
+            .and_then(|size| size.checked_add(self.arguments.len()))
+            .and_then(|size| size.checked_add(commands))
+            .ok_or_else(|| "modeled object size overflow".into())
+    }
+
+    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+        for argument in &mut self.arguments {
+            visit(&mut argument.default);
+            for choice in &mut argument.choices {
+                visit(choice);
+            }
+        }
+        if let Some(subparsers) = &mut self.subparsers {
+            for command in &mut subparsers.commands {
+                visit(&mut command.parser);
+            }
+        }
+    }
+
+    fn dup(&self) -> Box<dyn NativeObject> {
+        Box::new(Self {
+            prog: self.prog.clone(),
+            description: self.description.clone(),
+            add_help: self.add_help,
+            is_subcommand: self.is_subcommand,
+            arguments: self
+                .arguments
+                .iter()
+                .map(|argument| ArgumentSpec {
+                    names: argument.names.clone(),
+                    dest: argument.dest.clone(),
+                    required: argument.required,
+                    default: argument.default.dup(),
+                    store_true: argument.store_true,
+                    store_false: argument.store_false,
+                    integer: argument.integer,
+                    choices: argument.choices.iter().map(Ref::dup).collect(),
+                    help: argument.help.clone(),
+                })
+                .collect(),
+            subparsers: self.subparsers.as_ref().map(|subparsers| SubparsersSpec {
+                dest: subparsers.dest.clone(),
+                required: subparsers.required,
+                help: subparsers.help.clone(),
+                commands: subparsers
+                    .commands
+                    .iter()
+                    .map(|command| SubcommandSpec {
+                        name: command.name.clone(),
+                        help: command.help.clone(),
+                        parser: command.parser.dup(),
+                    })
+                    .collect(),
+            }),
+        })
+    }
+
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+        Ok("<argparse.ArgumentParser>".into())
+    }
+}
+
+/// An `argparse.Namespace`: the parsed values, readable as attributes in declaration order.
+#[derive(Debug)]
+pub(crate) struct NamespaceObject {
+    pub values: Vec<(String, Ref)>,
+}
+
+impl NativeObject for NamespaceObject {
+    fn python_type(&self) -> TypeId {
+        BuiltinType::Native.id()
+    }
+
+    fn modeled_slots(&self) -> Result<usize, String> {
+        Ok(self.values.len())
+    }
+
+    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+        for (_, slot) in &mut self.values {
+            visit(slot);
+        }
+    }
+
+    fn dup(&self) -> Box<dyn NativeObject> {
+        Box::new(Self {
+            values: self
+                .values
+                .iter()
+                .map(|(name, slot)| (name.clone(), slot.dup()))
+                .collect(),
+        })
+    }
+
+    fn repr(
+        &self,
+        nested: &mut dyn FnMut(&Ref) -> Result<String, String>,
+    ) -> Result<String, String> {
+        let rendered = self
+            .values
+            .iter()
+            .map(|(name, slot)| Ok(format!("{name}={}", nested(slot)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(format!("Namespace({})", rendered.join(", ")))
+    }
+
+    fn attribute(&self, name: &str) -> Option<&Ref> {
+        self.values
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, slot)| slot)
+    }
+}
 
 type NamespaceValues<'s> = Vec<(String, Value<'s>)>;
 type ParsedArguments<'s> = Result<(NamespaceValues<'s>, Vec<String>), PyError>;
@@ -54,8 +224,18 @@ pub(crate) static ARGUMENT_PARSER_TYPE: NativeTypeDef = NativeTypeDef {
             call: print_help,
         },
     ],
-    getters: &[],
+    getters: &[GetterDef {
+        owner: "argparse.ArgumentParser",
+        name: "prog",
+        get: parser_prog,
+    }],
 };
+
+fn parser_prog<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s> {
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
+    let prog = runtime.argument_parser_parts(parser)?.prog;
+    runtime.new_string(prog)
+}
 
 pub(super) static MODULE: ModuleDef = ModuleDef {
     name: "argparse",

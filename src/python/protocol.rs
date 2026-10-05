@@ -364,11 +364,7 @@ fn render_inner(
                 Object::ArrayStorage(_) => "<array storage ...>",
                 Object::WideValue { .. } => "<value ...>",
                 Object::Array { .. } => "array(...)",
-                Object::Regex { .. } => "re.compile(...) ",
-                Object::Match { .. } => "<re.Match ...>",
-                Object::ArgumentParser { .. } => "<argparse.ArgumentParser ...>",
-                Object::Namespace { .. } => "<argparse.Namespace ...>",
-                Object::RaisesContext { .. } => "<pytest.raises ...>",
+                Object::Native(_) => "<native ...>",
                 Object::Property { .. } => "<property ...>",
                 Object::StaticMethod { .. } => "<staticmethod ...>",
                 Object::ClassMethod { .. } => "<classmethod ...>",
@@ -511,36 +507,9 @@ fn render_inner(
             Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
-            Object::Regex { pattern, flags } => {
-                let flags = super::stdlib::re::flag_repr(*flags);
-                if flags.is_empty() {
-                    format!("re.compile({})", quote_string(pattern))
-                } else {
-                    format!("re.compile({}, {flags})", quote_string(pattern))
-                }
+            Object::Native(native) => {
+                native.repr(&mut |slot| render(state, heap.handle(slot), active))?
             }
-            Object::Match(found) => {
-                let (start, end) = found.spans.first().copied().flatten().unwrap_or((0, 0));
-                format!(
-                    "<re.Match object; span=({start}, {end}), match={}>",
-                    quote_string(&found.text)
-                )
-            }
-            Object::ArgumentParser { .. } => "<argparse.ArgumentParser>".into(),
-            Object::Namespace { values } => {
-                let rendered = values
-                    .iter()
-                    .map(|(name, value)| {
-                        Ok(format!(
-                            "{}={}",
-                            name,
-                            render(state, heap.handle(value), active)?
-                        ))
-                    })
-                    .collect::<Result<Vec<_>, String>>()?;
-                format!("Namespace({})", rendered.join(", "))
-            }
-            Object::RaisesContext { .. } => "<pytest.raises>".into(),
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),
             Object::ClassMethod { .. } => "<classmethod>".into(),
@@ -621,15 +590,11 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         | Object::ArrayStorage(_)
         | Object::Array { .. }
         | Object::WideValue { .. }
-        | Object::Regex { .. }
-        | Object::Match { .. }
-        | Object::ArgumentParser { .. }
-        | Object::Namespace { .. }
+        | Object::Native(_)
         | Object::NamespaceDict(_)
         | Object::DictView { .. }
         | Object::MappingProxy(_) => true,
         Object::GenericAlias { .. } => true,
-        Object::RaisesContext { .. } => true,
         Object::Property { .. }
         | Object::StaticMethod { .. }
         | Object::ClassMethod { .. }
@@ -798,10 +763,7 @@ fn equals_inner(
                 | (Object::CallableIterator { .. }, Object::CallableIterator { .. })
                 | (Object::Generator { .. }, Object::Generator { .. })
                 | (Object::Module { .. }, Object::Module { .. })
-                | (Object::Regex { .. }, Object::Regex { .. })
-                | (Object::Match { .. }, Object::Match { .. })
-                | (Object::ArgumentParser { .. }, Object::ArgumentParser { .. })
-                | (Object::Namespace { .. }, Object::Namespace { .. }) => false,
+                | (Object::Native(_), Object::Native(_)) => false,
                 (Object::Property { .. }, Object::Property { .. })
                 | (Object::StaticMethod { .. }, Object::StaticMethod { .. })
                 | (Object::ClassMethod { .. }, Object::ClassMethod { .. })
@@ -1143,15 +1105,11 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             | Object::ArrayStorage(_)
             | Object::Array { .. }
             | Object::WideValue { .. }
-            | Object::Regex { .. }
-            | Object::Match { .. }
-            | Object::ArgumentParser { .. }
-            | Object::Namespace { .. }
+            | Object::Native(_)
             | Object::NamespaceDict(_)
             | Object::DictView { .. }
             | Object::MappingProxy(_) => Err("object is not a container".into()),
             Object::GenericAlias { .. } => Err("object is not a container".into()),
-            Object::RaisesContext { .. } => Err("object is not a container".into()),
             Object::Property { .. }
             | Object::StaticMethod { .. }
             | Object::ClassMethod { .. }

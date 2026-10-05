@@ -1,11 +1,13 @@
 //! Bounded assertion methods for the capability-free :mod:`unittest` compatibility surface.
 
 use super::super::exception_types;
+use super::super::heap::{NativeObject, Ref};
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, MethodDef, ModuleDef, NativeTypeDef, PyError, PyExceptionType, PyMarker,
     PyRaisesContext, PyResult, PyRuntime, PyValueCast, ValueDef,
 };
+use super::super::object_model::{BuiltinType, TypeId};
 
 pub(crate) static TEST_CASE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "unittest.TestCase",
@@ -149,6 +151,32 @@ fn assert_raises<'s>(
     args.reject_keywords("assertRaises")?;
     let PyExceptionType(expected) = args.positional()[0].cast(runtime)?;
     runtime.new_raises_context(expected.to_string())
+}
+
+/// A `pytest.raises(...)` context manager as the heap stores it: the expected exception name.
+#[derive(Debug)]
+pub(crate) struct RaisesContextObject {
+    pub expected: String,
+}
+
+impl NativeObject for RaisesContextObject {
+    fn python_type(&self) -> TypeId {
+        BuiltinType::RaisesContext.id()
+    }
+
+    fn modeled_slots(&self) -> Result<usize, String> {
+        Ok(self.expected.len())
+    }
+
+    fn dup(&self) -> Box<dyn NativeObject> {
+        Box::new(Self {
+            expected: self.expected.clone(),
+        })
+    }
+
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+        Ok("<pytest.raises>".into())
+    }
 }
 
 pub(crate) static RAISES_CONTEXT_TYPE: NativeTypeDef = NativeTypeDef {

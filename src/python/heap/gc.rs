@@ -19,9 +19,8 @@ use crate::resources::Resources;
 
 use super::value::Raw;
 use super::{
-    ArgumentParserObject, ArrayStorage, ClassObject, FunctionObject, GeneratorObject, Heap,
-    HeapObject, InstanceAttributes, NamespaceTarget, Object, ObjectId, ProxyTarget, Ref,
-    ScopeObject,
+    ArrayStorage, ClassObject, FunctionObject, GeneratorObject, Heap, HeapObject,
+    InstanceAttributes, NamespaceTarget, Object, ObjectId, ProxyTarget, Ref, ScopeObject,
 };
 
 /// Stored references held outside the heap, which the collector must trace and may rewrite.
@@ -136,10 +135,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
             }
             slots(enum_members, f);
         }
-        Object::Match(matched) => {
-            f(&mut matched.subject.0);
-            f(&mut matched.regex.0);
-        }
         Object::DescriptorBoundMethod {
             receiver,
             descriptor,
@@ -206,27 +201,7 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
             f(&mut storage.0);
             optional(base, f);
         }
-        Object::ArgumentParser(parser) => {
-            let ArgumentParserObject {
-                arguments,
-                subparsers,
-                ..
-            } = &mut **parser;
-            for argument in arguments {
-                f(&mut argument.default.0);
-                slots(&mut argument.choices, f);
-            }
-            if let Some(subparsers) = subparsers {
-                for command in &mut subparsers.commands {
-                    f(&mut command.parser.0);
-                }
-            }
-        }
-        Object::Namespace { values } => {
-            for (_, slot) in values {
-                f(&mut slot.0);
-            }
-        }
+        Object::Native(native) => native.visit_refs(&mut |slot| f(&mut slot.0)),
         Object::Property { getter, setter } => {
             f(&mut getter.0);
             optional(setter, f);
@@ -251,9 +226,7 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         | Object::Range { .. }
         | Object::RangeIterator { .. }
         | Object::CountIterator { .. }
-        | Object::StreamIterator { .. }
-        | Object::Regex { .. }
-        | Object::RaisesContext { .. } => {}
+        | Object::StreamIterator { .. } => {}
     }
 }
 

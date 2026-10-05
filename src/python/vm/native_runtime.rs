@@ -1,8 +1,11 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
-use super::super::heap::{
-    self, ArgumentParserObject, Builder, FunctionObject, MatchObject, OrderedMap,
+use super::super::heap::{self, Builder, FunctionObject, OrderedMap};
+use super::super::stdlib::argparse::{
+    ArgumentParserObject, ArgumentSpec, NamespaceObject, SubcommandSpec, SubparsersSpec,
 };
+use super::super::stdlib::re::{MatchObject, RegexObject};
+use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
 use super::{
     protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
@@ -477,8 +480,8 @@ impl<'s> Vm<'s> {
 }
 
 /// The stored form of a subcommand registered on a parser's subparsers.
-fn stored_subcommand(builder: &Builder<'_>, command: PySubcommandSpec<'_>) -> heap::SubcommandSpec {
-    heap::SubcommandSpec {
+fn stored_subcommand(builder: &Builder<'_>, command: PySubcommandSpec<'_>) -> SubcommandSpec {
+    SubcommandSpec {
         name: command.name,
         help: command.help,
         parser: builder.store(command.parser.value()),
@@ -588,11 +591,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::DictView { .. } | Object::MappingProxy(_) => PyKind::Native,
             Object::Array { .. } => PyKind::Array,
             Object::ArrayStorage(_) | Object::WideValue { .. } => PyKind::Native,
-            Object::Regex { .. }
-            | Object::Match { .. }
-            | Object::ArgumentParser { .. }
-            | Object::Namespace { .. }
-            | Object::RaisesContext { .. } => PyKind::Native,
+            Object::Native(_) => PyKind::Native,
             Object::Property { .. }
             | Object::StaticMethod { .. }
             | Object::ClassMethod { .. }
@@ -626,13 +625,18 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         if !value.is_object() {
             return Ok(None);
         }
-        Ok(match self.get(*value).map_err(PyError::runtime_error)? {
-            Object::Regex { .. } => Some(PyNativeKind::Regex),
-            Object::Match { .. } => Some(PyNativeKind::Match),
-            Object::ArgumentParser { .. } => Some(PyNativeKind::ArgumentParser),
-            Object::RaisesContext { .. } => Some(PyNativeKind::RaisesContext),
+        let object = self.get(*value).map_err(PyError::runtime_error)?;
+        Ok(match object {
             Object::Property { .. } => Some(PyNativeKind::Property),
             Object::Array { .. } => Some(PyNativeKind::Array),
+            _ if object.native::<RegexObject>().is_some() => Some(PyNativeKind::Regex),
+            _ if object.native::<MatchObject>().is_some() => Some(PyNativeKind::Match),
+            _ if object.native::<ArgumentParserObject>().is_some() => {
+                Some(PyNativeKind::ArgumentParser)
+            }
+            _ if object.native::<RaisesContextObject>().is_some() => {
+                Some(PyNativeKind::RaisesContext)
+            }
             _ => None,
         })
     }
@@ -2447,7 +2451,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<'s, Value<'s>> {
-        Vm::allocate_object(self, Object::Regex { pattern, flags }).map_err(PyError::resource_error)
+        Vm::allocate_object(
+            self,
+            Object::Native(Box::new(RegexObject { pattern, flags })),
+        )
+        .map_err(PyError::resource_error)
     }
 
     fn new_match(&mut self, data: PyMatchData<'s>) -> PyResult<'s, Value<'s>> {
@@ -2462,7 +2470,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             endpos,
         } = data;
         self.alloc_with(|builder| {
-            Object::Match(Box::new(MatchObject {
+            Object::Native(Box::new(MatchObject {
                 subject: builder.store(subject),
                 regex: builder.store(regex),
                 text,
@@ -2477,14 +2485,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn regex_parts(&mut self, regex: PyRegex<'s>) -> PyResult<'s, (String, u32)> {
-        let Object::Regex { pattern, flags } = self
+        let RegexObject { pattern, flags } = self
             .state
             .heap
             .get(regex.value())
             .map_err(PyError::runtime_error)?
-        else {
-            return Err(PyError::runtime_error("regex handle changed object kind"));
-        };
+            .native::<RegexObject>()
+            .ok_or_else(|| PyError::runtime_error("regex handle changed object kind"))?;
         let pattern = pattern.clone();
         let flags = *flags;
         self.reserve_memory(pattern.len())?;
@@ -2492,14 +2499,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData<'s>> {
-        let Object::Match(match_object) = self
+        let match_object = self
             .state
             .heap
             .get(matched.value())
             .map_err(PyError::runtime_error)?
-        else {
-            return Err(PyError::runtime_error("match handle changed object kind"));
-        };
+            .native::<MatchObject>()
+            .ok_or_else(|| PyError::runtime_error("match handle changed object kind"))?;
         let bytes = match_object
             .groups
             .iter()
@@ -2571,7 +2577,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     ) -> PyResult<'s, Value<'s>> {
         Vm::allocate_object(
             self,
-            Object::ArgumentParser(Box::new(ArgumentParserObject {
+            Object::Native(Box::new(ArgumentParserObject {
                 prog: program,
                 description,
                 add_help,
@@ -2587,11 +2593,6 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &mut self,
         parser: PyArgumentParser<'s>,
     ) -> PyResult<'s, PyArgumentParserData<'s>> {
-        let Object::ArgumentParser(parser_object) =
-            self.get(parser.value()).map_err(PyError::runtime_error)?
-        else {
-            return Err(PyError::runtime_error("parser handle changed object kind"));
-        };
         let ArgumentParserObject {
             prog,
             description,
@@ -2599,7 +2600,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             arguments,
             subparsers,
             ..
-        } = &**parser_object;
+        } = self
+            .get(parser.value())
+            .map_err(PyError::runtime_error)?
+            .native::<ArgumentParserObject>()
+            .ok_or_else(|| PyError::runtime_error("parser handle changed object kind"))?;
         let bytes = prog
             .len()
             .saturating_add(description.as_ref().map_or(0, String::len))
@@ -2661,7 +2666,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.reserve_object_growth(parser.value(), 96)
             .map_err(PyError::resource_error)?;
         self.modify(parser.value(), |builder, object| {
-            let Object::ArgumentParser(parser_object) = object else {
+            let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
             let PyArgumentSpec {
@@ -2675,7 +2680,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 choices,
                 help,
             } = argument;
-            parser_object.arguments.push(heap::ArgumentSpec {
+            parser_object.arguments.push(ArgumentSpec {
                 names,
                 dest,
                 required,
@@ -2697,14 +2702,14 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         subparsers: PySubparsersSpec<'s>,
     ) -> PyResult<'s, ()> {
         self.modify(parser.value(), |builder, object| {
-            let Object::ArgumentParser(parser_object) = object else {
+            let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
             let ArgumentParserObject {
                 is_subcommand,
                 subparsers: current,
                 ..
-            } = &mut **parser_object;
+            } = parser_object;
             if *is_subcommand {
                 return Err(PyError::value_error(
                     "nested argparse subparsers are not supported",
@@ -2719,7 +2724,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 help,
                 commands,
             } = subparsers;
-            *current = Some(heap::SubparsersSpec {
+            *current = Some(SubparsersSpec {
                 dest,
                 required,
                 help,
@@ -2741,10 +2746,10 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.reserve_object_growth(parser.value(), 96)
             .map_err(PyError::resource_error)?;
         self.modify(parser.value(), |builder, object| {
-            let Object::ArgumentParser(parser_object) = object else {
+            let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
-            let ArgumentParserObject { subparsers, .. } = &mut **parser_object;
+            let ArgumentParserObject { subparsers, .. } = parser_object;
             let subparsers = subparsers
                 .as_mut()
                 .ok_or_else(|| PyError::value_error("add_subparsers() must be called first"))?;
@@ -2866,29 +2871,33 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn new_namespace(&mut self, values: Vec<(String, Value<'s>)>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::Namespace {
-            values: values
-                .into_iter()
-                .map(|(name, value)| (name, builder.store(value)))
-                .collect(),
+        self.alloc_with(|builder| {
+            Object::Native(Box::new(NamespaceObject {
+                values: values
+                    .into_iter()
+                    .map(|(name, value)| (name, builder.store(value)))
+                    .collect(),
+            }))
         })
         .map_err(PyError::resource_error)
     }
 
     fn new_raises_context(&mut self, expected: String) -> PyResult<'s, Value<'s>> {
-        Vm::allocate_object(self, Object::RaisesContext { expected })
-            .map_err(PyError::resource_error)
+        Vm::allocate_object(
+            self,
+            Object::Native(Box::new(RaisesContextObject { expected })),
+        )
+        .map_err(PyError::resource_error)
     }
 
     fn raises_expected(&self, context: PyRaisesContext<'s>) -> PyResult<'s, String> {
-        let Object::RaisesContext { expected } = self
+        let RaisesContextObject { expected } = self
             .state
             .heap
             .get(context.value())
             .map_err(PyError::runtime_error)?
-        else {
-            return Err(PyError::runtime_error("raises handle changed object kind"));
-        };
+            .native::<RaisesContextObject>()
+            .ok_or_else(|| PyError::runtime_error("raises handle changed object kind"))?;
         Ok(expected.clone())
     }
 

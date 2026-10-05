@@ -3,9 +3,7 @@
 use std::collections::BTreeSet;
 
 use super::super::attributes;
-use super::super::heap::{
-    ArgumentParserObject, ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget,
-};
+use super::super::heap::{ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget};
 use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
@@ -682,21 +680,10 @@ impl<'s> Vm<'s> {
                         _ => self.lookup_attribute(descriptor, None, name),
                     };
                 }
-                Object::Match { .. } => {}
-                Object::ArgumentParser(parser_object) => {
-                    let ArgumentParserObject { prog, .. } = &**parser_object;
-                    if name == "prog" {
-                        let prog = prog.clone();
-                        let prog = self.allocate_string(prog)?;
-                        return Ok(Some(prog));
+                Object::Native(native) => {
+                    if let Some(slot) = native.attribute(name) {
+                        return Ok(Some(self.handle(slot)));
                     }
-                }
-                Object::Namespace { values } => {
-                    let value = values
-                        .iter()
-                        .find(|(key, _)| key == name)
-                        .map(|(_, value)| self.handle(value));
-                    return Ok(value);
                 }
                 // `classmethod` and `staticmethod` expose the wrapped callable and forward the
                 // metadata attributes `functools.wraps` and `abc` read from it.
@@ -1497,11 +1484,7 @@ impl<'s> Vm<'s> {
                 | Object::ArrayStorage(_)
                 | Object::Array { .. }
                 | Object::WideValue { .. }
-                | Object::Regex { .. }
-                | Object::Match { .. }
-                | Object::ArgumentParser { .. }
-                | Object::Namespace { .. }
-                | Object::RaisesContext { .. }
+                | Object::Native(_)
                 | Object::NamespaceDict(_)
                 | Object::DictView { .. }
                 | Object::MappingProxy(_) => BuiltinSubscript::Unsupported,
