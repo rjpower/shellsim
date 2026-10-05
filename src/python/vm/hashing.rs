@@ -115,10 +115,12 @@ impl<'s> Vm<'s> {
         };
         let is_dataclass = class_object.is_dataclass;
         match self.state.types.slot(self.type_id(value)?, Slot::Hash)? {
-            Some(SlotValue::Descriptor(descriptor)) if self.handle(&descriptor).is_none() => {
+            Some(SlotValue::Descriptor {
+                value: descriptor, ..
+            }) if self.handle(&descriptor).is_none() => {
                 return Err(self.unhashable(value));
             }
-            Some(SlotValue::Descriptor(_) | SlotValue::NativeUnary(_)) => {
+            Some(SlotValue::Descriptor { .. } | SlotValue::NativeUnary(_)) => {
                 let result = self
                     .invoke_slot(value, Slot::Hash, "__hash__", Vec::new())?
                     .ok_or("__hash__ slot disappeared during lookup")?;

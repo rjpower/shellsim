@@ -8,9 +8,10 @@ use super::super::heap::Builder;
 use super::super::object_model::TypeId;
 use super::super::scopes;
 use super::{
-    cpython_names, exception_types, string, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
-    HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader,
-    PyRuntime, RaisedException, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
+    cpython_names, exception_types, string, Arc, BuiltinType, BytecodeFrame, CodeRef,
+    ExceptionType, Execution, FrameEntry, HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue,
+    Object, ProxyTarget, PyModuleLoader, PyRuntime, RaisedException, SymbolId, Value, Vm,
+    BUILTIN_FUNCTIONS,
 };
 
 /// A [`NamespaceTarget`] whose references are handles in the current scope, so it can be held
@@ -60,9 +61,44 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// The innermost lexical scope, if code is running inside one.
-    pub(super) fn current_scope(&self) -> Option<Value<'s>> {
-        self.local_scopes.last().map(|scope| self.handle(scope))
+    /// The active frame's own heap scope, when its names live in one.
+    pub(super) fn active_scope(&self) -> Option<Value<'s>> {
+        self.handle_optional(
+            self.bytecode_frames
+                .last()
+                .and_then(|frame| frame.scope.as_ref()),
+        )
+    }
+
+    /// The scope the active frame resolves free names through: its own scope, else the
+    /// closure of the function it runs. `None` means the main program's global table.
+    pub(super) fn lookup_scope(&self) -> Option<Value<'s>> {
+        self.handle_optional(
+            self.bytecode_frames
+                .last()
+                .and_then(BytecodeFrame::lookup_scope),
+        )
+    }
+
+    /// The scope `hops` lexical levels above the active frame's own level; `None` past the
+    /// outermost scope. A frame without a scope of its own counts its closure as one hop.
+    fn enclosing_scope(&self, hops: usize) -> Result<Option<Value<'s>>, String> {
+        let frame = self
+            .bytecode_frames
+            .last()
+            .ok_or("scope walk requires an active frame")?;
+        let (mut target, hops) = match (&frame.scope, hops) {
+            (Some(scope), hops) => (Some(self.handle(scope)), hops),
+            (None, 0) => return Err("invalid enclosing scope hop count".into()),
+            (None, hops) => (self.handle_optional(frame.enclosing.as_ref()), hops - 1),
+        };
+        for _ in 0..hops {
+            target = target
+                .map(|scope| scopes::parent(self.heap(), scope))
+                .transpose()?
+                .flatten();
+        }
+        Ok(target)
     }
 
     pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
@@ -75,7 +111,7 @@ impl<'s> Vm<'s> {
             self.push(class);
             return Ok(());
         }
-        let local_scope = self.current_scope();
+        let local_scope = self.lookup_scope();
         let scoped = match local_scope {
             Some(scope) => self.scope_get(scope, name)?,
             None => None,
@@ -103,7 +139,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         name: NameId,
     ) -> Result<(), String> {
-        if self.local_scopes.is_empty() {
+        if self.lookup_scope().is_none() {
             if let Some(value) = self.state.globals.get_ref(symbol) {
                 self.execution.stack.push_ref(value);
                 return Ok(());
@@ -121,7 +157,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         name: NameId,
     ) -> Result<(), String> {
-        let scope = self.current_scope().expect("checked by load_global");
+        let scope = self.lookup_scope().expect("checked by load_global");
         let root = scopes::root(self.heap(), scope)?;
         let value = if scopes::uses_repl_globals(self.heap(), root)? {
             self.state.globals.get(&self.state.heap, symbol)
@@ -202,16 +238,9 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn delete_local(&mut self, slot: usize) -> Result<(), String> {
-        let scope = self
-            .current_scope()
-            .ok_or("local bytecode requires a lexical scope")?;
-        scopes::remove_local(&mut self.state.heap, scope, slot).map(|_| ())
-    }
-
     pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         let value = self.pop()?;
-        if let Some(scope) = self.current_scope() {
+        if let Some(scope) = self.active_scope() {
             let in_class_body = self
                 .class_scopes
                 .last()
@@ -246,14 +275,7 @@ impl<'s> Vm<'s> {
         scope_hops: usize,
     ) -> Result<(), String> {
         let value = self.pop()?;
-        let mut target = self.current_scope();
-        for _ in 0..scope_hops {
-            target = target
-                .map(|scope| scopes::parent(self.heap(), scope))
-                .transpose()?
-                .flatten();
-        }
-        if let Some(scope) = target {
+        if let Some(scope) = self.enclosing_scope(scope_hops)? {
             self.scope_insert(scope, name.to_string(), value)
         } else {
             self.state.globals.insert(
@@ -268,10 +290,10 @@ impl<'s> Vm<'s> {
 
     pub(super) fn store_nonlocal(&mut self, name: &str) -> Result<(), String> {
         let value = self.pop()?;
-        let scope = self
-            .current_scope()
+        let start = self
+            .enclosing_scope(1)?
             .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
-        scopes::store_nonlocal(&mut self.state.heap, scope, name, value)
+        scopes::store_nonlocal(&mut self.state.heap, start, name, value)
     }
 
     pub(super) fn exception_type_matches(
@@ -337,7 +359,7 @@ impl<'s> Vm<'s> {
         name: NameId,
         value: Value<'s>,
     ) -> Result<(), String> {
-        let Some(scope) = self.current_scope() else {
+        let Some(scope) = self.lookup_scope() else {
             self.state.globals.insert(
                 &self.state.heap,
                 symbol,
@@ -379,7 +401,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         name: NameId,
     ) -> Result<(), String> {
-        let Some(scope) = self.current_scope() else {
+        let Some(scope) = self.lookup_scope() else {
             self.state.globals.remove(&self.state.heap, symbol);
             return Ok(());
         };
@@ -398,7 +420,7 @@ impl<'s> Vm<'s> {
     /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
     /// exactly, so `globals()` always names the same namespace a bare name lookup would.
     pub(super) fn current_globals_target(&self) -> Result<NamespaceHandle<'s>, String> {
-        let Some(scope) = self.current_scope() else {
+        let Some(scope) = self.lookup_scope() else {
             return Ok(NamespaceHandle::Repl);
         };
         let root = scopes::root(self.heap(), scope)?;
@@ -414,8 +436,28 @@ impl<'s> Vm<'s> {
     /// Inside a function it is a detached `dict` of that call's local variables: CPython's
     /// `locals()` there is a snapshot too, and writing to it never rebinds a local.
     pub(super) fn current_locals(&mut self) -> Result<Value<'s>, String> {
-        let Some(scope) = self.current_scope() else {
+        // `exec`/`eval` code reports the locals of the frame that ran it.
+        let Some(frame) = self
+            .bytecode_frames
+            .iter()
+            .rev()
+            .find(|frame| frame.scope.is_some() || frame.locals_base.is_some())
+        else {
             return self.alloc(Object::NamespaceDict(NamespaceTarget::Repl));
+        };
+        let Some(scope) = self.handle_optional(frame.scope.as_ref()) else {
+            let base = frame
+                .locals_base
+                .expect("frame without a scope was chosen for its slots");
+            let names = frame.code.local_names.clone();
+            let mut items = Vec::with_capacity(names.len());
+            for (slot, name) in names.iter().enumerate() {
+                if let Some(value) = self.locals.get(base + slot).and_then(Option::as_ref) {
+                    let value = self.handle(value);
+                    items.push((self.allocate_string(name.clone())?, value));
+                }
+            }
+            return self.allocate_dict(items);
         };
         // A module's own scope is the only one with no parent that does not defer to the
         // REPL/script table; function calls either have a lexical parent or defer to it.
@@ -773,10 +815,7 @@ impl<'s> Vm<'s> {
         if let Some(path) = &temporary_import_path {
             self.state.temporary_import_paths.insert(0, path.clone());
         }
-        let stored_scope = self.store(scope);
-        self.local_scopes.push(stored_scope);
-        let execution = self.execute_code(&code);
-        self.local_scopes.pop();
+        let execution = self.execute_code(&code, FrameEntry::scoped(scope));
         if temporary_import_path.is_some() {
             self.state.temporary_import_paths.remove(0);
         }
@@ -815,7 +854,7 @@ impl<'s> Vm<'s> {
             return Ok(requested.to_string());
         }
         let scope = self
-            .current_scope()
+            .lookup_scope()
             .ok_or("relative import requires a package context")?;
         let package = self
             .scope_get(scope, "__package__")?
@@ -961,7 +1000,7 @@ impl<'s> Vm<'s> {
             let Some(value) = self.resolve_attribute(module, &name)? else {
                 return Err(self.missing_attribute(&module, &name));
             };
-            if let Some(scope) = self.current_scope() {
+            if let Some(scope) = self.active_scope() {
                 self.scope_insert(scope, name, value)?;
             } else {
                 let symbol = self.intern_symbol(&name)?;

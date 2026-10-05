@@ -218,7 +218,8 @@ pub fn insert(
     })
 }
 
-/// Rebind `name` in the nearest enclosing scope that already binds it (`nonlocal`).
+/// Rebind `name` in the nearest scope, starting at `start`, that already binds it
+/// (`nonlocal`). `start` is the scope enclosing the one that declared the name.
 pub fn store_nonlocal(
     heap: &mut Heap,
     start: Value<'_>,
@@ -226,7 +227,7 @@ pub fn store_nonlocal(
     value: Value<'_>,
 ) -> Result<(), String> {
     let missing = || format!("no binding for nonlocal {name:?} found");
-    let mut current: Value<'_> = parent(heap, start)?.ok_or_else(missing)?;
+    let mut current: Value<'_> = start;
     loop {
         let candidate = scope(heap, current)?;
         let next = heap.handle_optional(candidate.parent.as_ref());

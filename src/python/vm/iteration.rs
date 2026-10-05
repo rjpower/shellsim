@@ -7,9 +7,9 @@
 
 use super::super::heap::Ref;
 use super::{
-    exception_types, number, string, CallArgs, Execution, ForIterOutcome, IteratorAdvance,
-    NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException,
-    Slot, SlotValue, Stream, Value, Vm,
+    exception_types, number, string, CallArgs, Execution, ForIterOutcome, FrameEntry,
+    IteratorAdvance, NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead,
+    RaisedException, Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// An exception on its way into or out of a generator frame, with its value as a handle so it
@@ -267,7 +267,7 @@ impl<'s> Vm<'s> {
         }
         Ok(matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Next)?,
-            Some(slot) if !matches!(&slot, SlotValue::Descriptor(descriptor) if descriptor.is_none())
+            Some(slot) if !matches!(&slot, SlotValue::Descriptor { value, .. } if value.is_none())
         ))
     }
 
@@ -284,7 +284,9 @@ impl<'s> Vm<'s> {
     ) -> Result<Option<Value<'s>>, String> {
         match self.state.types.slot(self.type_id(iterable)?, Slot::Iter)? {
             None => return Ok(None),
-            Some(SlotValue::Descriptor(descriptor)) if descriptor.is_none() => {
+            Some(SlotValue::Descriptor {
+                value: descriptor, ..
+            }) if descriptor.is_none() => {
                 return Err(self.raise_object_type_error(iterable, "is not iterable"));
             }
             Some(_) => {}
@@ -1062,12 +1064,10 @@ impl<'s> Vm<'s> {
             }
             (GeneratorResume::Throw(_), None) => unreachable!("an unhandled throw returned above"),
         };
-        let scope = self.store(scope);
-        self.local_scopes.push(scope);
         self.call_depth += 1;
-        let result = self.execute_code_from(&code, start, &mut handlers, 0);
+        let result =
+            self.execute_code_from(&code, start, &mut handlers, 0, FrameEntry::scoped(scope));
         self.call_depth -= 1;
-        self.local_scopes.pop();
         // Re-root the frame's result before anything below can allocate.
         let result = result.map(|execution| match execution {
             Execution::Pending => unreachable!("execute_code_from drains pending quanta"),

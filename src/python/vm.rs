@@ -91,6 +91,9 @@ pub(super) enum NativeValue {
     Ellipsis,
     /// The `NotImplemented` singleton returned by binary and comparison methods that decline.
     NotImplemented,
+    /// `LoadMethod`'s marker for an attribute that was bound rather than loaded as a method.
+    /// It lives only on the operand stack between `LoadMethod` and `CallMethod`.
+    NoReceiver,
 }
 
 static MODULES: DefinitionTable<ModuleDef> = DefinitionTable::new();
@@ -115,6 +118,7 @@ impl NativeValue {
     const NOT_IMPLEMENTED: u8 = 12;
     const NATIVE_CLASS_METHOD: u8 = 13;
     const SLOT_WRAPPER: u8 = 14;
+    const NO_RECEIVER: u8 = 15;
 
     pub(super) fn encode(self) -> (u64, u8) {
         match self {
@@ -140,6 +144,7 @@ impl NativeValue {
             Self::TypingList => (0, Self::TYPING_LIST),
             Self::Ellipsis => (0, Self::ELLIPSIS),
             Self::NotImplemented => (0, Self::NOT_IMPLEMENTED),
+            Self::NoReceiver => (0, Self::NO_RECEIVER),
         }
     }
 
@@ -181,6 +186,7 @@ impl NativeValue {
             Self::TYPING_LIST => Self::TypingList,
             Self::ELLIPSIS => Self::Ellipsis,
             Self::NOT_IMPLEMENTED => Self::NotImplemented,
+            Self::NO_RECEIVER => Self::NoReceiver,
             Self::VALUE_KIND => Self::ValueKind(VALUE_KINDS.get(payload).expect(INTERNED)),
             _ => unreachable!("invalid private native-value tag"),
         }
@@ -518,15 +524,10 @@ impl VmProgram {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            vm.bytecode_frames.push(BytecodeFrame {
-                code: self.code.clone(),
-                instruction_pointer: 0,
-                stack_base: 0,
-                handlers: Vec::new(),
-                exception_base: 0,
-                function_return: None,
-                pending_native_call: None,
-            });
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), None) else {
+                return VmPoll::Ready(ExecResult::Exit(137));
+            };
+            vm.bytecode_frames.push(frame);
             if let Some(docstring) = self.code.docstring.clone() {
                 // The script's leading string literal is `__doc__` in the main module, unless an
                 // interactive session already bound the name.
@@ -620,7 +621,9 @@ pub(super) struct ProcessInput<'a> {
 struct VmState {
     stack: ValueStack,
     bytecode_frames: Vec<BytecodeFrame>,
-    local_scopes: Vec<Ref>,
+    /// Local slots of every frame that keeps its locals in the VM, frames stacked in call
+    /// order; `None` is an unbound local. Rooted like the operand stack.
+    locals: Vec<Option<Ref>>,
     class_scopes: Vec<Ref>,
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
@@ -667,7 +670,11 @@ impl Clone for VmState {
         Self {
             stack: self.stack.clone(),
             bytecode_frames: self.bytecode_frames.clone(),
-            local_scopes: self.local_scopes.iter().map(Ref::dup).collect(),
+            locals: self
+                .locals
+                .iter()
+                .map(|slot| slot.as_ref().map(Ref::dup))
+                .collect(),
             class_scopes: self.class_scopes.iter().map(Ref::dup).collect(),
             class_bindings: self.class_bindings.clone(),
             call_depth: self.call_depth,
@@ -699,12 +706,10 @@ impl Clone for VmState {
 impl Roots for VmState {
     fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
         self.stack.visit_refs(visitor);
-        for slot in self
-            .local_scopes
-            .iter_mut()
-            .chain(&mut self.class_scopes)
-            .chain(&mut self.with_contexts)
-        {
+        for slot in self.locals.iter_mut().flatten() {
+            visitor(slot);
+        }
+        for slot in self.class_scopes.iter_mut().chain(&mut self.with_contexts) {
             visitor(slot);
         }
         if let Some(exception) = &mut self.pending_exception {
@@ -718,6 +723,12 @@ impl Roots for VmState {
             visitor(receiver);
         }
         for frame in &mut self.bytecode_frames {
+            for slot in frame.scope.iter_mut().chain(&mut frame.enclosing) {
+                visitor(slot);
+            }
+            if let Some(function_return) = &mut frame.function_return {
+                visitor(&mut function_return.function);
+            }
             match &mut frame.pending_native_call {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
@@ -867,12 +878,27 @@ struct LoadAttributeCache {
 }
 
 /// An executing code object's resumable control state.
-#[derive(Clone)]
+///
+/// Names resolve through two optional heap scopes. `scope` is the frame's own scope: module
+/// and class bodies, generators, and functions whose code sets
+/// [`CallSignature::heap_locals`](super::bytecode::CallSignature) bind their names there.
+/// Every other function keeps its local slots in the VM's shared `locals` stack from
+/// `locals_base` and resolves free names through `enclosing`, the function's closure. The
+/// main program and `exec`/`eval` code own neither and fall through to the global table.
 struct BytecodeFrame {
     code: CodeRef,
+    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
+    code_cache: usize,
     instruction_pointer: usize,
     /// First operand owned by this frame in the VM's shared value stack.
     stack_base: usize,
+    /// First slot owned by this frame in the VM's shared locals stack, when its locals live
+    /// there rather than in `scope`.
+    locals_base: Option<usize>,
+    /// The frame's own heap scope, holding its locals and dynamically bound names.
+    scope: Option<Ref>,
+    /// Where free-name lookup continues for a frame without a scope of its own.
+    enclosing: Option<Ref>,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     handlers: Vec<(usize, usize, usize)>,
     /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
@@ -881,6 +907,73 @@ struct BytecodeFrame {
     exception_base: usize,
     function_return: Option<FunctionReturn>,
     pending_native_call: Option<PendingNativeCall>,
+}
+
+impl Clone for BytecodeFrame {
+    fn clone(&self) -> Self {
+        Self {
+            code: self.code.clone(),
+            code_cache: self.code_cache,
+            instruction_pointer: self.instruction_pointer,
+            stack_base: self.stack_base,
+            locals_base: self.locals_base,
+            scope: self.scope.as_ref().map(Ref::dup),
+            enclosing: self.enclosing.as_ref().map(Ref::dup),
+            handlers: self.handlers.clone(),
+            exception_base: self.exception_base,
+            function_return: self.function_return.clone(),
+            pending_native_call: self.pending_native_call.clone(),
+        }
+    }
+}
+
+impl BytecodeFrame {
+    /// The scope free names resolve through: the frame's own, else its closure.
+    fn lookup_scope(&self) -> Option<&Ref> {
+        self.scope.as_ref().or(self.enclosing.as_ref())
+    }
+}
+
+/// The scopes and local slots a new frame starts with. See [`BytecodeFrame`].
+struct FrameEntry<'v> {
+    scope: Option<Value<'v>>,
+    enclosing: Option<Value<'v>>,
+    /// Base of the frame's already-bound local slots on the VM's locals stack, for a frame
+    /// that keeps them there rather than in `scope`.
+    locals_base: Option<usize>,
+}
+
+impl FrameEntry<'_> {
+    /// A frame for code that binds no locals of its own and resolves every name globally: the
+    /// main program.
+    fn bare() -> Self {
+        Self {
+            scope: None,
+            enclosing: None,
+            locals_base: None,
+        }
+    }
+
+    /// A frame whose names all live in `scope`: module and class bodies, generators, and
+    /// functions with heap-resident locals.
+    fn scoped(scope: Value<'_>) -> FrameEntry<'_> {
+        FrameEntry {
+            scope: Some(scope),
+            enclosing: None,
+            locals_base: None,
+        }
+    }
+}
+
+/// Where the active frame's local slots live, fixed for one dispatch quantum.
+#[derive(Clone, Copy)]
+enum LocalsLocation {
+    /// Slots start at this index of the VM's shared locals stack.
+    Stack(usize),
+    /// Slots live in the frame's heap scope.
+    Heap,
+    /// The code declares no local slots.
+    None,
 }
 
 /// Hot dispatch state retained in registers for one scheduler quantum.
@@ -892,6 +985,7 @@ struct DispatchCursor {
     code: CodeRef,
     code_cache: usize,
     op_index: usize,
+    locals: LocalsLocation,
 }
 
 /// Control-flow effect of one successfully decoded opcode.
@@ -992,12 +1086,18 @@ impl DispatchCursor {
             .last()
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
+        let code_cache = frame.code_cache;
         let op_index = frame.instruction_pointer;
-        let code_cache = vm.ensure_code_cache(&code)?;
+        let locals = match (frame.locals_base, &frame.scope) {
+            (Some(base), _) => LocalsLocation::Stack(base),
+            (None, Some(_)) => LocalsLocation::Heap,
+            (None, None) => LocalsLocation::None,
+        };
         Ok(Self {
             code,
             code_cache,
             op_index,
+            locals,
         })
     }
 
@@ -1139,18 +1239,22 @@ impl PendingNativeCall {
     }
 }
 
-#[derive(Clone)]
+/// What a frame entered by a call needs on the way out: the function, for tracebacks, the
+/// call site to resume, and whether it installed a `method_frames` entry.
 struct FunctionReturn {
-    name: String,
+    function: Ref,
     call_span: super::source::Span,
     pop_method_frame: bool,
 }
 
-struct FunctionInvocation<'s> {
-    arguments: Vec<Value<'s>>,
-    keyword_arguments: Vec<(String, Value<'s>)>,
-    mode: CallMode,
-    pop_method_frame: bool,
+impl Clone for FunctionReturn {
+    fn clone(&self) -> Self {
+        Self {
+            function: self.function.dup(),
+            call_span: self.call_span,
+            pop_method_frame: self.pop_method_frame,
+        }
+    }
 }
 
 impl Deref for Vm<'_> {
@@ -1569,7 +1673,7 @@ impl<'s> Vm<'s> {
         if self.instance_class(*value)?.is_some() {
             return Ok(matches!(
                 self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-                Some(SlotValue::Descriptor(descriptor)) if !descriptor.is_none()
+                Some(SlotValue::Descriptor { value: descriptor, .. }) if !descriptor.is_none()
             ));
         }
         if matches!(
@@ -1595,7 +1699,7 @@ impl<'s> Vm<'s> {
         }
         Ok(matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Iter)?,
-            Some(slot) if !matches!(&slot, SlotValue::Descriptor(descriptor) if descriptor.is_none())
+            Some(slot) if !matches!(&slot, SlotValue::Descriptor { value, .. } if value.is_none())
         ))
     }
 

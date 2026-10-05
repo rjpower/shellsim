@@ -69,7 +69,17 @@ pub struct Code {
 pub struct CallSignature {
     pub is_generator: bool,
     pub is_coroutine: bool,
+    /// Whether an activation's local slots must live in a heap scope object rather than in the
+    /// VM's frame. Nested functions and classes resolve enclosing names by walking heap scopes,
+    /// and a generator's locals outlive each resumption, so such code keeps a scope; every other
+    /// function binds its locals in the frame and never allocates per call.
+    pub heap_locals: bool,
     pub positional_count: usize,
+    /// Positional parameters without a default, which every call must supply.
+    pub required_positional: usize,
+    /// Whether some keyword-only parameter has no default, so a positional-only call cannot
+    /// bind the signature.
+    pub keyword_only_required: bool,
     pub variadic_slot: Option<usize>,
     pub keyword_variadic_slot: Option<usize>,
     pub default_slots: Box<[usize]>,
@@ -229,6 +239,12 @@ pub enum Opcode {
     FormatValue(FormatId),
     Compare(ComparisonOperator),
     Call(CallId),
+    /// `obj.name` for an immediate call: pushes the callable and then the receiver when `name`
+    /// is a plain method of `obj`'s type, else the bound attribute and a no-receiver marker.
+    LoadMethod(NameId),
+    /// The call after `LoadMethod`. The spec counts the receiver slot as the first positional
+    /// argument; a marker in that slot is removed before the call.
+    CallMethod(CallId),
     Copy(usize),
     Swap(usize),
     PopTop,
@@ -335,6 +351,12 @@ pub enum Operation {
     },
     Compare(ComparisonOperator),
     Call {
+        positional: usize,
+        keywords: Vec<Option<String>>,
+        starred: Vec<bool>,
+    },
+    LoadMethod(String),
+    CallMethod {
         positional: usize,
         keywords: Vec<Option<String>>,
         starred: Vec<bool>,
@@ -537,6 +559,24 @@ impl CodeBuilder {
                 });
                 Opcode::Call(id)
             }
+            Operation::LoadMethod(name) => Opcode::LoadMethod(self.name(name)),
+            Operation::CallMethod {
+                positional,
+                keywords,
+                starred,
+            } => {
+                let keywords = keywords
+                    .into_iter()
+                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
+                    .collect();
+                let id = CallId::new(self.calls.len());
+                self.calls.push(CallSpec {
+                    positional,
+                    keywords,
+                    starred: starred.into_boxed_slice(),
+                });
+                Opcode::CallMethod(id)
+            }
             Operation::Copy(depth) => Opcode::Copy(depth),
             Operation::Swap(depth) => Opcode::Swap(depth),
             Operation::PopTop => Opcode::PopTop,
@@ -589,12 +629,27 @@ impl CodeBuilder {
                 )
             })
             .count();
+        let is_generator = instructions.iter().any(|instruction| {
+            matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
+        });
+        let defines_scopes = instructions.iter().any(|instruction| {
+            matches!(
+                instruction.opcode,
+                Opcode::MakeFunction(_) | Opcode::MakeClass(_)
+            )
+        });
         let call_signature = CallSignature {
-            is_generator: instructions.iter().any(|instruction| {
-                matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
-            }),
+            is_generator,
             is_coroutine,
+            heap_locals: is_generator || is_coroutine || defines_scopes,
             positional_count,
+            required_positional: parameters[..positional_count]
+                .iter()
+                .filter(|parameter| !parameter.has_default)
+                .count(),
+            keyword_only_required: parameters.iter().any(|parameter| {
+                parameter.kind == ParameterKind::KeywordOnly && !parameter.has_default
+            }),
             variadic_slot: parameters
                 .iter()
                 .position(|parameter| parameter.kind == ParameterKind::Variadic),

@@ -10,8 +10,8 @@ use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
 use super::{
     exception_types, number, protocol, string, Arc, BigInt, BuiltinType, CallArgs, CallMode,
-    CallResult, ClassDefinition, ClassLayout, ExceptionType, Execution, HashMap, NativeValue,
-    Object, Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray,
+    CallResult, ClassDefinition, ClassLayout, ExceptionType, Execution, FrameEntry, HashMap,
+    NativeValue, Object, Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray,
     PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader,
     PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
     PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
@@ -2823,14 +2823,12 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         else {
             return Err(PyError::runtime_error("module handle changed object kind"));
         };
-        let scope = self.store(self.handle(scope));
+        let scope = self.handle(scope);
         let import_root = path
             .rsplit_once('/')
             .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
         self.state.temporary_import_paths.insert(0, import_root);
-        self.local_scopes.push(scope);
-        let execution = self.execute_code(&code);
-        self.local_scopes.pop();
+        let execution = self.execute_code(&code, FrameEntry::scoped(scope));
         self.state.temporary_import_paths.remove(0);
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
@@ -3003,14 +3001,12 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn frame_module_name(&mut self, depth: usize) -> PyResult<'s, Option<Value<'s>>> {
-        // Function calls, generator resumptions, class bodies and imported modules each push a
-        // scope; the main script runs beneath them all in the global namespace.
-        let frames = self.local_scopes.len();
-        let scope = match depth.cmp(&frames) {
-            std::cmp::Ordering::Less => Some(self.handle(&self.local_scopes[frames - 1 - depth])),
-            std::cmp::Ordering::Equal => None,
-            std::cmp::Ordering::Greater => return Ok(None),
+        // Each frame resolves names through a scope that roots in its module; the main script's
+        // frames root in the global namespace.
+        let Some(frame) = self.bytecode_frames.iter().rev().nth(depth) else {
+            return Ok(None);
         };
+        let scope = self.handle_optional(frame.lookup_scope());
         self.module_name_of(scope).map_err(PyError::runtime_error)
     }
 

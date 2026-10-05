@@ -10,8 +10,9 @@ use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
     ClassField, ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution,
-    HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
-    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    FrameEntry, HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime,
+    RaisedException, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm,
+    MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -174,6 +175,77 @@ impl<'s> Vm<'s> {
         }
         self.push(value);
         Ok(())
+    }
+
+    /// `LoadMethod`: push the callable of `owner.name` and then its receiver, when `name` is a
+    /// plain function or native method of `owner`'s type that no instance attribute shadows.
+    /// `CallMethod` then passes the receiver as the first argument, which is what binding the
+    /// method and calling the bound method would do, without creating it. Any other attribute
+    /// is loaded as `LoadAttribute` would, followed by a no-receiver marker.
+    pub(super) fn load_method_at(
+        &mut self,
+        code: &CodeRef,
+        code_cache: usize,
+        site: usize,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<(), String> {
+        let owner = self.peek(0)?;
+        if let Some(method) = self.unbound_method(owner, symbol, name)? {
+            self.execution
+                .stack
+                .set(&self.state.heap, self.stack.len() - 1, method);
+            self.push(owner);
+            return Ok(());
+        }
+        self.load_attribute_at(code, code_cache, site, symbol, name)?;
+        self.push(Value::Native(NativeValue::NoReceiver));
+        Ok(())
+    }
+
+    fn unbound_method(
+        &mut self,
+        owner: Value<'s>,
+        symbol: SymbolId,
+        name: &str,
+    ) -> Result<Option<Value<'s>>, String> {
+        // Only owners whose lookup is a plain walk of their type's MRO qualify: user instances
+        // without an attribute hook, and builtin values. Classes, `super` proxies and native
+        // module or type values resolve names their own way in `lookup_attribute`.
+        if owner.native_value().is_some() || self.class_type_id(&owner)?.is_some() {
+            return Ok(None);
+        }
+        let type_id = self.type_id(&owner)?;
+        if owner.is_object() {
+            if matches!(self.get(owner)?, Object::Class(_) | Object::Super { .. }) {
+                return Ok(None);
+            }
+            if self.instance_class(owner)?.is_some()
+                && self
+                    .state
+                    .types
+                    .slot(type_id, Slot::GetAttribute)?
+                    .is_some()
+            {
+                return Ok(None);
+            }
+        }
+        let Some((_, descriptor)) = self.type_lookup(type_id, name)? else {
+            return Ok(None);
+        };
+        let is_method = match descriptor.native_value() {
+            Some(NativeValue::NativeMethod(method)) => method.name != "__new__",
+            Some(_) => false,
+            None => descriptor.is_object() && matches!(self.get(descriptor)?, Object::Function(_)),
+        };
+        if !is_method {
+            return Ok(None);
+        }
+        // An instance attribute of the same name shadows a non-data descriptor.
+        if owner.is_object() && self.attribute_by_symbol(owner, symbol)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(descriptor))
     }
 
     fn attribute_cache(&self, code_cache: usize, site: usize) -> Option<&LoadAttributeCache> {
@@ -1988,7 +2060,7 @@ impl<'s> Vm<'s> {
             .execution
             .stack
             .split_off(&self.state.heap, defaults_start);
-        let mut closure = self.handle_optional(self.local_scopes.last());
+        let mut closure = self.lookup_scope();
         let class_scope = self.handle_optional(self.class_scopes.last());
         if let (Some(scope), Some(class_scope)) = (closure, class_scope) {
             if self.identical(scope, class_scope) {
@@ -2256,7 +2328,7 @@ impl<'s> Vm<'s> {
                 prepared_namespace.insert("__module__".into(), module);
             }
         }
-        let parent = self.handle_optional(self.local_scopes.last());
+        let parent = self.lookup_scope();
         let uses_repl_globals = parent
             .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
@@ -2264,17 +2336,14 @@ impl<'s> Vm<'s> {
         let scope =
             self.alloc_scope_named(parent, uses_repl_globals, Arc::from([]), prepared_namespace)?;
         let stored = self.store(scope);
-        self.local_scopes.push(stored);
-        let stored = self.store(scope);
         self.class_scopes.push(stored);
         self.class_bindings.push(Vec::new());
-        let execution = self.execute_code(code);
+        let execution = self.execute_code(code, FrameEntry::scoped(scope));
         let bindings = self
             .class_bindings
             .pop()
             .expect("class binding stack is present");
         self.class_scopes.pop();
-        self.local_scopes.pop();
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
@@ -2617,7 +2686,7 @@ impl<'s> Vm<'s> {
     }
 
     fn current_module_name(&mut self) -> Result<Option<Value<'s>>, String> {
-        let scope = self.handle_optional(self.local_scopes.last());
+        let scope = self.lookup_scope();
         self.module_name_of(scope)
     }
 
@@ -3200,10 +3269,28 @@ impl<'s> Vm<'s> {
                 let receiver = *receiver;
                 return call(self, receiver).map_err(|error| self.record_native_error(error));
             }
-            SlotValue::Descriptor(descriptor) => self.handle(&descriptor),
+            SlotValue::Descriptor { value, owner } => (self.handle(&value), owner),
         };
         if !receiver.is_object() {
             return Ok(None);
+        }
+        let (descriptor, owner) = slot_descriptor;
+        // A plain function is called with the receiver prepended, which is what binding it
+        // and calling the bound method would do, without the bound method.
+        if descriptor.is_object() && matches!(self.get(descriptor)?, Object::Function(_)) {
+            let positional = arguments.len().saturating_add(1);
+            self.push(descriptor);
+            self.push(*receiver);
+            for argument in arguments {
+                self.push(argument);
+            }
+            let result = self.call(
+                positional,
+                &[],
+                &vec![false; positional],
+                CallMode::Immediate,
+            );
+            return self.immediate_call_value(result, method_name).map(Some);
         }
         let class = match (self.instance_class(*receiver)?, self.get(*receiver)?) {
             (Some(class), _) => class,
@@ -3212,12 +3299,25 @@ impl<'s> Vm<'s> {
             }
             _ => return Ok(None),
         };
-        let (defining_class, _) = self
-            .class_attribute_entry(class, method_name)?
-            .ok_or("cached type slot has no descriptor")?;
-        let callable =
-            self.bind_descriptor(slot_descriptor, Some(*receiver), class, defining_class)?;
+        let defining_class = self.type_value(owner)?;
+        let callable = self.bind_descriptor(descriptor, Some(*receiver), class, defining_class)?;
         self.invoke_value(callable, arguments).map(Some)
+    }
+
+    /// The value of an immediate call, which cannot suspend or leave a frame behind.
+    fn immediate_call_value(
+        &mut self,
+        result: Result<CallResult<'s>, String>,
+        what: &str,
+    ) -> Result<Value<'s>, String> {
+        match result? {
+            CallResult::Value(value) => Ok(value),
+            CallResult::Exit(status) => Err(format!("{what} exited with status {status}")),
+            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
+            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
+                unreachable!("immediate call cannot suspend")
+            }
+        }
     }
 
     /// Execute the defining type's native slot for an explicit dunder call. The receiver check
@@ -3288,7 +3388,7 @@ impl<'s> Vm<'s> {
                 let second = arguments[1];
                 call(self, receiver, first, second)
             }
-            SlotValue::Descriptor(_) => return Err("slot wrapper is not native".into()),
+            SlotValue::Descriptor { .. } => return Err("slot wrapper is not native".into()),
         };
         result
             .map(|result| result.unwrap_or(Value::Native(NativeValue::NotImplemented)))

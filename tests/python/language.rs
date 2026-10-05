@@ -478,3 +478,141 @@ for view in (globals(), vars(Box())):
         (0, "TypeError\nTypeError\n".into(), String::new())
     );
 }
+
+/// Locals of a function without nested scopes live in the VM frame, not in a heap scope, so
+/// they must stay rooted across collections and still be visible to `locals()`, `eval` and
+/// nested frames, while closures, `nonlocal` and comprehension walruses keep working through
+/// the heap scopes of the functions that need them.
+#[test]
+fn frame_held_locals_survive_collection_and_scope_protocols() {
+    let source = r#"def churn(n):
+    keep = [i for i in range(8)]
+    first = keep[:]
+    for i in range(n):
+        garbage = [i] * 64
+        if i % 1000 == 0:
+            keep = keep + [i]
+    return first, keep[-1], len(keep)
+
+print(churn(20000))
+
+def snapshot(a, b=2):
+    c = a + b
+    del b
+    return sorted(locals().items()), eval("a + c")
+
+print(snapshot(1))
+
+def outer():
+    count = 0
+    def bump():
+        nonlocal count
+        count += 1
+        return count
+    squares = [(last := i * i) for i in range(4)]
+    return bump(), bump(), squares, last
+
+print(outer())
+
+def recurse(depth):
+    local = depth * 2
+    if depth == 0:
+        return [local]
+    return recurse(depth - 1) + [local]
+
+print(recurse(5))
+
+def gen(n):
+    total = 0
+    for i in range(n):
+        total += i
+        yield total
+
+print(list(gen(5)))
+"#;
+    assert_eq!(
+        super::support::run_python_text(source),
+        (
+            0,
+            "([0, 1, 2, 3, 4, 5, 6, 7], 19000, 28)\n\
+             ([('a', 1), ('c', 3)], 4)\n\
+             (1, 2, [0, 1, 4, 9], 9)\n\
+             [0, 2, 4, 6, 8, 10]\n\
+             [0, 1, 3, 6, 10]\n"
+                .into(),
+            String::new()
+        )
+    );
+}
+
+/// `obj.name(...)` loads the method and passes the receiver as the first argument without
+/// creating a bound method, but only when `name` is a plain method of the type. Every other
+/// shape of attribute call keeps full attribute semantics.
+#[test]
+fn method_calls_bind_the_receiver_without_a_bound_method_object() {
+    let source = r#"import math
+
+class Base:
+    def who(self):
+        return "base"
+
+class C(Base):
+    def __init__(self):
+        self.shadow = lambda: "instance"
+        self.cb = lambda x: x * 2
+    def shadow(self):
+        return "class"
+    def who(self):
+        return "C+" + super().who()
+    @classmethod
+    def make(cls):
+        return cls.__name__
+    @staticmethod
+    def plain(x):
+        return x + 1
+    @property
+    def getter(self):
+        return lambda: "prop"
+    def __call__(self, x):
+        return x - 1
+
+class Hooked:
+    def __getattribute__(self, name):
+        return lambda *args: ("hooked", name, args)
+
+c = C()
+print(c.shadow(), c.who(), c.make(), c.plain(1), c.getter(), c.cb(4), c(5))
+print(Hooked().anything(1, 2))
+print(C.make(), C.plain(2), Base.who(c))
+items = [3, 1, 2]
+items.append(0)
+items.sort()
+print(items, "ab".upper(), (1, 2).count(1), math.sqrt(16), {1: 2}.get(1))
+m = c.who
+print(m())
+try:
+    c.missing()
+except AttributeError as error:
+    print("AttributeError")
+class E(Exception):
+    pass
+e = E("boom")
+e.extra = lambda: "attr"
+print(e.extra(), e.args)
+"#;
+    assert_eq!(
+        super::support::run_python_text(source),
+        (
+            0,
+            "instance C+base C 2 prop 8 4\n\
+             ('hooked', 'anything', (1, 2))\n\
+             C 3 base\n\
+             [0, 1, 2, 3] AB 1 4.0 2\n\
+             C+base\n\
+             AttributeError\n\
+             attr ('boom',)\n"
+                .into(),
+            String::new()
+        )
+    );
+}
