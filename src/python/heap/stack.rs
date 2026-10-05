@@ -12,6 +12,7 @@ pub struct ValueStack {
 }
 
 impl ValueStack {
+    #[inline(always)]
     pub fn len(&self) -> usize {
         self.values.len()
     }
@@ -20,31 +21,43 @@ impl ValueStack {
         self.values.truncate(len);
     }
 
+    #[inline(always)]
     pub fn push(&mut self, heap: &Heap, value: Value<'_>) {
         self.values.push(heap.store(value));
     }
 
     /// Push a stored reference without creating a handle.
+    #[inline(always)]
     pub fn push_ref(&mut self, slot: &Ref) {
         self.values.push(slot.dup());
     }
 
+    #[inline(always)]
     pub fn pop<'s>(&mut self, heap: &Heap) -> Option<Value<'s>> {
-        self.values.pop().map(|slot| heap.handle(&slot))
+        let slot = self.values.pop()?;
+        Some(heap.handle(&slot))
     }
 
     /// Pop the top value as a stored reference. The result must go straight into a root.
+    #[inline(always)]
     pub fn pop_ref(&mut self) -> Option<Ref> {
         self.values.pop()
     }
 
-    /// The value `depth` entries below the top (0 is the top).
-    pub fn peek<'s>(&self, heap: &Heap, depth: usize) -> Option<Value<'s>> {
+    /// The stored reference `depth` entries below the top (0 is the top), without a handle.
+    #[inline(always)]
+    pub fn top(&self, depth: usize) -> Option<&Ref> {
         self.values
             .len()
             .checked_sub(depth + 1)
             .and_then(|index| self.values.get(index))
-            .map(|slot| heap.handle(slot))
+    }
+
+    /// The value `depth` entries below the top (0 is the top).
+    #[inline(always)]
+    pub fn peek<'s>(&self, heap: &Heap, depth: usize) -> Option<Value<'s>> {
+        let slot = self.top(depth)?;
+        Some(heap.handle(slot))
     }
 
     pub fn set(&mut self, heap: &Heap, index: usize, value: Value<'_>) -> bool {

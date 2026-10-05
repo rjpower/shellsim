@@ -240,12 +240,15 @@ pub struct FunctionObject {
 /// A suspended generator frame. Boxed inside [`Object::Generator`] to keep heap slots small.
 #[derive(Debug)]
 pub struct GeneratorObject {
-    pub name: String,
+    /// The generator function, for its name and for zero-argument `super()` in its body.
+    pub function: Ref,
     pub code: CodeRef,
     pub scope: Ref,
     pub instruction_pointer: usize,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     pub handlers: Vec<(usize, usize, usize)>,
+    /// Context managers entered and not yet exited at the suspension point.
+    pub contexts: Vec<Ref>,
     pub exceptions: Vec<(String, Ref)>,
     pub stack: Vec<Ref>,
     pub exhausted: bool,
@@ -264,6 +267,8 @@ pub struct ScopeObject {
     pub uses_repl_globals: bool,
     pub local_names: std::sync::Arc<[String]>,
     pub locals: Vec<Option<Ref>>,
+    /// Dynamic names in first-binding order; `values` holds their current bindings.
+    pub order: Vec<String>,
     pub values: HashMap<String, Ref>,
 }
 
@@ -504,6 +509,7 @@ impl Builder<'_> {
     }
 }
 
+#[inline(always)]
 fn resolve(handles: &RefCell<Vec<Raw>>, value: Value<'_>) -> Raw {
     match value.raw().handle_index() {
         Some(index) => *handles
@@ -603,17 +609,20 @@ impl Heap {
     // ----- handles -------------------------------------------------------------------------
 
     /// Number of live handle-stack entries; a scope records this when it opens.
+    #[inline(always)]
     pub fn handle_count(&self) -> usize {
         self.handles.borrow().len()
     }
 
     /// Drop every handle created since the stack had `len` entries; a scope does this when it
     /// closes. The entries above `len` can no longer be named, so nothing dangles.
+    #[inline(always)]
     pub fn truncate_handles(&self, len: usize) {
         self.handles.borrow_mut().truncate(len);
     }
 
     /// A scoped handle for a stored reference. Immediates pass through without a stack entry.
+    #[inline(always)]
     pub fn handle<'s>(&self, slot: &Ref) -> Value<'s> {
         self.handle_raw(slot.0)
     }
@@ -626,6 +635,7 @@ impl Heap {
         slots.into_iter().map(|slot| self.handle(slot)).collect()
     }
 
+    #[inline(always)]
     fn handle_raw<'s>(&self, raw: Raw) -> Value<'s> {
         if raw.is_object() {
             let mut handles = self.handles.borrow_mut();
@@ -639,10 +649,12 @@ impl Heap {
     /// The stored form of a handle, for the VM's own root containers. The result must be placed
     /// in a root before the next allocation; it is not a handle and the collector cannot see it
     /// in a Rust local.
+    #[inline(always)]
     pub fn store(&self, value: Value<'_>) -> Ref {
         Ref(self.resolve(value))
     }
 
+    #[inline(always)]
     fn resolve(&self, value: Value<'_>) -> Raw {
         resolve(&self.handles, value)
     }
@@ -1239,16 +1251,15 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::StreamIterator { .. } => 1,
         Object::Generator(generator_object) => {
             let GeneratorObject {
-                name,
                 code,
                 handlers,
                 exceptions,
                 stack,
                 ..
             } = &**generator_object;
-            name.len()
-                .checked_add(code.instructions.len())
-                .and_then(|size| size.checked_add(handlers.len()))
+            code.instructions
+                .len()
+                .checked_add(handlers.len())
                 .and_then(|size| size.checked_add(exceptions.len()))
                 .and_then(|size| size.checked_add(stack.len()))
                 .ok_or("modeled object size overflow")?

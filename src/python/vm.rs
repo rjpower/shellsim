@@ -15,7 +15,7 @@ use num_bigint::BigInt;
 use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
-use super::attributes::InstanceAttributeSlot;
+use super::attributes::ShapeId;
 use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
 use super::cpython_names;
 use super::definitions::DefinitionTable;
@@ -524,7 +524,7 @@ impl VmProgram {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), None) else {
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), false) else {
                 return VmPoll::Ready(ExecResult::Exit(137));
             };
             vm.bytecode_frames.push(frame);
@@ -574,8 +574,14 @@ impl VmProgram {
             return VmPoll::Ready(ExecResult::Exit(137));
         }
         match &execution {
-            Ok(Execution::Pending) => return VmPoll::Runnable,
-            Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(reason.clone()),
+            Ok(Flow::Pending) => return VmPoll::Runnable,
+            Ok(Flow::Blocked) => {
+                let suspension = vm
+                    .suspension
+                    .as_ref()
+                    .expect("a blocked frame records its suspension");
+                return VmPoll::Blocked(suspension.reason.clone());
+            }
             _ => {}
         }
         vm.bytecode_frames
@@ -625,8 +631,9 @@ struct VmState {
     /// Local slots of every frame that keeps its locals in the VM, frames stacked in call
     /// order; `None` is an unbound local. Rooted like the operand stack.
     locals: Vec<Option<Ref>>,
-    class_scopes: Vec<Ref>,
-    class_bindings: Vec<Vec<String>>,
+    /// Open `try` regions of every frame as `(handler target, operand stack depth, exception
+    /// stack depth)`, each frame's above its `handler_base`.
+    handlers: Vec<(usize, usize, usize)>,
     call_depth: usize,
     pending_exception: Option<RaisedException>,
     /// Nesting of builtin sequence ordering in progress, bounded like other recursion.
@@ -635,6 +642,10 @@ struct VmState {
     /// stale. Consumed by `render_execution` when reporting an uncaught exception's traceback.
     traceback_frames: Vec<TracebackFrame>,
     pending_wait: Option<crate::scheduler::WaitReason>,
+    /// Why the process last left the dispatch loop to wait, and the native call to retry when
+    /// it resumes. At most one frame can be suspended, so this lives beside the frames rather
+    /// than in each of them.
+    suspension: Option<Box<Suspension>>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
     /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
@@ -642,9 +653,8 @@ struct VmState {
     /// any is active, natives finish blocking operations instead of suspending.
     synchronous_frames: usize,
     exception_stack: Vec<RaisedException>,
+    /// Context managers entered by every frame, each frame's above its `context_base`.
     with_contexts: Vec<Ref>,
-    /// (class, receiver) pairs for frames executing a method, for zero-argument `super()`.
-    method_frames: Vec<(Ref, Ref)>,
     code_caches: CodeCacheTable,
     stdin_position: usize,
     stdin_text: Option<String>,
@@ -677,23 +687,18 @@ impl Clone for VmState {
                 .iter()
                 .map(|slot| slot.as_ref().map(Ref::dup))
                 .collect(),
-            class_scopes: self.class_scopes.iter().map(Ref::dup).collect(),
-            class_bindings: self.class_bindings.clone(),
+            handlers: self.handlers.clone(),
             call_depth: self.call_depth,
             pending_exception: self.pending_exception.clone(),
             compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
+            suspension: self.suspension.clone(),
             async_timer_deadlines: self.async_timer_deadlines.clone(),
             native_suspend_allowed: self.native_suspend_allowed,
             synchronous_frames: self.synchronous_frames,
             exception_stack: self.exception_stack.clone(),
             with_contexts: self.with_contexts.iter().map(Ref::dup).collect(),
-            method_frames: self
-                .method_frames
-                .iter()
-                .map(|(class, receiver)| (class.dup(), receiver.dup()))
-                .collect(),
             code_caches: self.code_caches.clone(),
             stdin_position: self.stdin_position,
             stdin_text: self.stdin_text.clone(),
@@ -730,7 +735,7 @@ impl Roots for VmState {
         for slot in self.locals.iter_mut().flatten() {
             visitor(slot);
         }
-        for slot in self.class_scopes.iter_mut().chain(&mut self.with_contexts) {
+        for slot in &mut self.with_contexts {
             visitor(slot);
         }
         if let Some(exception) = &mut self.pending_exception {
@@ -739,18 +744,16 @@ impl Roots for VmState {
         for exception in &mut self.exception_stack {
             visitor(&mut exception.value);
         }
-        for (class, receiver) in &mut self.method_frames {
-            visitor(class);
-            visitor(receiver);
-        }
         for frame in &mut self.bytecode_frames {
-            for slot in frame.scope.iter_mut().chain(&mut frame.enclosing) {
+            for slot in frame.scope.iter_mut().chain(&mut frame.callee) {
                 visitor(slot);
             }
-            if let Some(function_return) = &mut frame.function_return {
-                visitor(&mut function_return.function);
-            }
-            match &mut frame.pending_native_call {
+        }
+        for caches in self.code_caches.iter_mut() {
+            caches.visit_refs(visitor);
+        }
+        if let Some(suspension) = &mut self.suspension {
+            match &mut suspension.retry {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
                 }
@@ -771,7 +774,23 @@ impl Roots for VmState {
 struct CodeCaches {
     code: CodeRef,
     names: Vec<Option<SymbolId>>,
-    attributes: Option<Vec<Option<LoadAttributeCache>>>,
+    /// One entry per instruction, filled for `LoadAttribute` and `LoadMethod` sites.
+    sites: Option<Vec<Option<SiteCache>>>,
+}
+
+impl CodeCaches {
+    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+        for site in self.sites.iter_mut().flatten().flatten() {
+            match &mut site.resolved {
+                Resolved::InstanceSlot(_) => {}
+                Resolved::ClassValue(value) => visitor(value),
+                Resolved::Method { descriptor, owner } => {
+                    visitor(descriptor);
+                    visitor(owner);
+                }
+            }
+        }
+    }
 }
 
 /// Per-code inline caches in stable slots.
@@ -844,6 +863,7 @@ impl CodeCacheTable {
 impl std::ops::Index<usize> for CodeCacheTable {
     type Output = CodeCaches;
 
+    #[inline(always)]
     fn index(&self, slot: usize) -> &CodeCaches {
         self.slots[slot].as_ref().expect("code cache slot is live")
     }
@@ -861,13 +881,13 @@ fn code_cache_bytes(caches: &CodeCaches) -> usize {
         .names
         .len()
         .saturating_mul(std::mem::size_of::<Option<SymbolId>>());
-    let attributes = caches.attributes.as_ref().map_or(0, |attributes| {
-        attributes
+    let sites = caches.sites.as_ref().map_or(0, |sites| {
+        sites
             .len()
-            .saturating_mul(std::mem::size_of::<Option<LoadAttributeCache>>())
+            .saturating_mul(std::mem::size_of::<Option<SiteCache>>())
     });
     names
-        .saturating_add(attributes)
+        .saturating_add(sites)
         .saturating_add(std::mem::size_of::<CodeCaches>())
 }
 
@@ -876,13 +896,21 @@ impl Clone for CodeCaches {
         Self {
             code: self.code.clone(),
             names: self.names.clone(),
-            attributes: self.attributes.as_ref().map(|caches| {
-                caches
+            sites: self.sites.as_ref().map(|sites| {
+                sites
                     .iter()
-                    .map(|cache| {
-                        cache.as_ref().map(|cache| LoadAttributeCache {
-                            type_id: cache.type_id,
-                            location: cache.location,
+                    .map(|site| {
+                        site.as_ref().map(|site| SiteCache {
+                            type_id: site.type_id,
+                            shape: site.shape,
+                            resolved: match &site.resolved {
+                                Resolved::InstanceSlot(slot) => Resolved::InstanceSlot(*slot),
+                                Resolved::ClassValue(value) => Resolved::ClassValue(value.dup()),
+                                Resolved::Method { descriptor, owner } => Resolved::Method {
+                                    descriptor: descriptor.dup(),
+                                    owner: owner.dup(),
+                                },
+                            },
                         })
                     })
                     .collect()
@@ -891,77 +919,117 @@ impl Clone for CodeCaches {
     }
 }
 
-/// One `LoadAttribute` site's last shaped lookup: valid while the receiver has this class and
-/// shape.
-struct LoadAttributeCache {
+/// One name-keyed site's last lookup, valid while the receiver has the same type and the same
+/// instance-attribute shape, which is what decides every plain attribute lookup: a shaped
+/// slot, a class attribute no instance attribute shadows, or a method of the type. Every
+/// class attribute store clears the sites of every code object, so a hit needs no version
+/// check.
+struct SiteCache {
     type_id: TypeId,
-    location: InstanceAttributeSlot,
+    /// The receiver's instance-attribute shape; `None` for a value without instance attributes.
+    shape: Option<ShapeId>,
+    resolved: Resolved,
 }
 
-/// An executing code object's resumable control state.
+/// What a site resolved to.
+enum Resolved {
+    /// The attribute lives in this shaped slot of the receiver.
+    InstanceSlot(usize),
+    /// A class attribute that binding leaves as it is, such as a constant or a nested class.
+    ClassValue(Ref),
+    /// A plain function or native method of the receiver's type: `LoadMethod` pushes it with
+    /// the receiver, `LoadAttribute` binds it to the receiver with `owner`, the defining class.
+    Method { descriptor: Ref, owner: Ref },
+}
+
+/// An executing code object's activation record: everything the frame owns is either in
+/// this struct or on a shared VM stack it indexes (`stack`, `locals`, `handlers`,
+/// `with_contexts`, `exception_stack`), so entering a frame allocates nothing and leaving it
+/// truncates those stacks back to the recorded bases.
 ///
-/// Names resolve through two optional heap scopes. `scope` is the frame's own scope: module
-/// and class bodies, generators, and functions whose code sets
-/// [`CallSignature::heap_locals`](super::bytecode::CallSignature) bind their names there.
-/// Every other function keeps its local slots in the VM's shared `locals` stack from
-/// `locals_base` and resolves free names through `enclosing`, the function's closure. The
-/// main program and `exec`/`eval` code own neither and fall through to the global table.
+/// Names resolve through `scope`. When `own_scope` is set it is the frame's own heap scope,
+/// holding its locals and dynamically bound names: module and class bodies, generators, and
+/// functions whose code sets [`CallSignature::heap_locals`](super::bytecode::CallSignature).
+/// Otherwise the frame keeps its local slots on the shared locals stack from `locals_base`
+/// and `scope` is where free-name lookup continues, the function's closure. The main program
+/// owns neither and falls through to the global table.
 struct BytecodeFrame {
     code: CodeRef,
-    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
-    code_cache: usize,
     instruction_pointer: usize,
-    /// First operand owned by this frame in the VM's shared value stack.
-    stack_base: usize,
-    /// First slot owned by this frame in the VM's shared locals stack, when its locals live
-    /// there rather than in `scope`.
-    locals_base: Option<usize>,
-    /// The frame's own heap scope, holding its locals and dynamically bound names.
-    scope: Option<Ref>,
-    /// Where free-name lookup continues for a frame without a scope of its own.
-    enclosing: Option<Ref>,
-    /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
-    handlers: Vec<(usize, usize, usize)>,
+    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
+    code_cache: u32,
     /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
     /// route truncates the exception stack here, so a `return` inside an `except` body or an
     /// exception escaping a handler cannot leave its handled exception behind.
-    exception_base: usize,
-    function_return: Option<FunctionReturn>,
-    pending_native_call: Option<PendingNativeCall>,
+    exception_base: u32,
+    /// First operand owned by this frame in the VM's shared value stack.
+    stack_base: u32,
+    handler_base: u32,
+    context_base: u32,
+    /// First slot owned by this frame in the VM's shared locals stack, when its locals live
+    /// there rather than in `scope`.
+    locals_base: Option<u32>,
+    scope: Option<Ref>,
+    /// The function this frame runs, for tracebacks and zero-argument `super()`; `None` for
+    /// module, class and dynamic code.
+    callee: Option<Ref>,
+    /// Whether `scope` is the frame's own rather than its closure.
+    own_scope: bool,
+    /// Whether a call entered this frame from the frame below, which resumes when it returns.
+    /// Other frames are run synchronously by Rust code and return to it instead.
+    called: bool,
+    class_body: bool,
 }
 
 impl Clone for BytecodeFrame {
     fn clone(&self) -> Self {
         Self {
             code: self.code.clone(),
-            code_cache: self.code_cache,
             instruction_pointer: self.instruction_pointer,
+            code_cache: self.code_cache,
+            exception_base: self.exception_base,
             stack_base: self.stack_base,
+            handler_base: self.handler_base,
+            context_base: self.context_base,
             locals_base: self.locals_base,
             scope: self.scope.as_ref().map(Ref::dup),
-            enclosing: self.enclosing.as_ref().map(Ref::dup),
-            handlers: self.handlers.clone(),
-            exception_base: self.exception_base,
-            function_return: self.function_return.clone(),
-            pending_native_call: self.pending_native_call.clone(),
+            callee: self.callee.as_ref().map(Ref::dup),
+            own_scope: self.own_scope,
+            called: self.called,
+            class_body: self.class_body,
         }
     }
 }
 
 impl BytecodeFrame {
-    /// The scope free names resolve through: the frame's own, else its closure.
-    fn lookup_scope(&self) -> Option<&Ref> {
-        self.scope.as_ref().or(self.enclosing.as_ref())
+    /// The frame's own heap scope, when its names live in one.
+    fn active_scope(&self) -> Option<&Ref> {
+        self.own_scope.then_some(self.scope.as_ref()).flatten()
     }
+
+    fn stack_base(&self) -> usize {
+        self.stack_base as usize
+    }
+
+    fn locals_base(&self) -> Option<usize> {
+        self.locals_base.map(|base| base as usize)
+    }
+}
+
+/// A stack depth recorded in a frame.
+fn frame_index(depth: usize) -> Result<u32, String> {
+    u32::try_from(depth).map_err(|_| "VM stack depth exceeds the frame index range".into())
 }
 
 /// The scopes and local slots a new frame starts with. See [`BytecodeFrame`].
 struct FrameEntry<'v> {
     scope: Option<Value<'v>>,
-    enclosing: Option<Value<'v>>,
+    own_scope: bool,
     /// Base of the frame's already-bound local slots on the VM's locals stack, for a frame
     /// that keeps them there rather than in `scope`.
     locals_base: Option<usize>,
+    callee: Option<Value<'v>>,
+    class_body: bool,
 }
 
 impl FrameEntry<'_> {
@@ -970,18 +1038,66 @@ impl FrameEntry<'_> {
     fn bare() -> Self {
         Self {
             scope: None,
-            enclosing: None,
+            own_scope: false,
             locals_base: None,
+            callee: None,
+            class_body: false,
         }
     }
 
-    /// A frame whose names all live in `scope`: module and class bodies, generators, and
-    /// functions with heap-resident locals.
+    /// A frame whose names all live in `scope`: module bodies, generators, and functions with
+    /// heap-resident locals.
     fn scoped(scope: Value<'_>) -> FrameEntry<'_> {
         FrameEntry {
             scope: Some(scope),
-            enclosing: None,
+            own_scope: true,
             locals_base: None,
+            callee: None,
+            class_body: false,
+        }
+    }
+
+    /// A class body: its own scope, whose bindings become the class namespace, and which
+    /// functions defined inside skip when they close over names.
+    fn class_body(scope: Value<'_>) -> FrameEntry<'_> {
+        FrameEntry {
+            class_body: true,
+            ..Self::scoped(scope)
+        }
+    }
+
+    /// A function whose local slots are already bound on the locals stack from `locals_base`
+    /// and whose free names resolve through `closure`.
+    fn with_locals<'v>(
+        function: Value<'v>,
+        closure: Option<Value<'v>>,
+        locals_base: usize,
+    ) -> FrameEntry<'v> {
+        FrameEntry {
+            scope: closure,
+            own_scope: false,
+            locals_base: Some(locals_base),
+            callee: Some(function),
+            class_body: false,
+        }
+    }
+
+    /// A function whose locals live in `scope`, a heap scope of its own.
+    fn function<'v>(function: Value<'v>, scope: Value<'v>) -> FrameEntry<'v> {
+        FrameEntry {
+            callee: Some(function),
+            ..Self::scoped(scope)
+        }
+    }
+
+    /// `exec`/`eval` code: no names of its own, free names resolved through `enclosing`.
+    fn dynamic(enclosing: Option<Value<'_>>) -> FrameEntry<'_> {
+        FrameEntry {
+            scope: enclosing,
+            own_scope: false,
+            locals_base: None,
+            callee: None,
+            class_body: false,
         }
     }
 }
@@ -1009,12 +1125,50 @@ struct DispatchCursor {
     locals: LocalsLocation,
 }
 
-/// Control-flow effect of one successfully decoded opcode.
-enum DispatchControl {
+/// Control leaving an opcode arm, a call, or a frame: the one type every routine that touches
+/// the dispatch loop returns.
+///
+/// A value a call or an arm produces is left on the operand stack, which roots it, so no
+/// variant carries a handle. `Return` and `Yield` carry stored references because they cross
+/// the handle scope of the frame that produced them; the receiver re-roots them with
+/// `Vm::handle` before anything can allocate. `Blocked` reports a wait whose reason, and the
+/// native call to retry, sit in [`VmState::suspension`].
+#[derive(Debug)]
+enum Flow {
+    /// Continue with the next instruction.
     Next,
     Jump(usize),
-    RefreshFrame,
-    Complete(Execution),
+    /// The active frame changed; the dispatch cursor reloads from it.
+    Refresh,
+    /// The active frame returned this value.
+    Return(Ref),
+    /// A generator frame yielded this value; its instruction pointer is already advanced to
+    /// the resumption point.
+    Yield(Ref),
+    /// The code object ran off its end: a module, class body or the main program finished.
+    Halt,
+    Exit(i32),
+    /// The quantum's budget ran out with work remaining.
+    Pending,
+    /// The process must wait; see [`VmState::suspension`].
+    Blocked,
+}
+
+/// Why the process is waiting and what to retry when it wakes.
+struct Suspension {
+    reason: crate::scheduler::WaitReason,
+    /// A native call interrupted by the wait, retried before the next instruction. `None`
+    /// when the native completed and only asked the scheduler to wait afterwards.
+    retry: Option<PendingNativeCall>,
+}
+
+impl Clone for Suspension {
+    fn clone(&self) -> Self {
+        Self {
+            reason: self.reason.clone(),
+            retry: self.retry.clone(),
+        }
+    }
 }
 
 /// Result of classifying one heap iterator at its mutation boundary.
@@ -1096,8 +1250,8 @@ impl HashedEntries<'_> {
 }
 
 #[inline(always)]
-fn dispatch_next(result: Result<(), String>) -> Result<DispatchControl, String> {
-    result.map(|()| DispatchControl::Next)
+fn dispatch_next(result: Result<(), String>) -> Result<Flow, String> {
+    result.map(|()| Flow::Next)
 }
 
 impl DispatchCursor {
@@ -1107,12 +1261,12 @@ impl DispatchCursor {
             .last()
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
-        let code_cache = frame.code_cache;
+        let code_cache = frame.code_cache as usize;
         let op_index = frame.instruction_pointer;
-        let locals = match (frame.locals_base, &frame.scope) {
+        let locals = match (frame.locals_base(), frame.own_scope) {
             (Some(base), _) => LocalsLocation::Stack(base),
-            (None, Some(_)) => LocalsLocation::Heap,
-            (None, None) => LocalsLocation::None,
+            (None, true) => LocalsLocation::Heap,
+            (None, false) => LocalsLocation::None,
         };
         Ok(Self {
             code,
@@ -1136,7 +1290,25 @@ impl DispatchCursor {
             .bytecode_frames
             .last_mut()
             .expect("bytecode execution requires an active frame");
-        debug_assert!(Arc::ptr_eq(&self.code, &frame.code));
+        if !Arc::ptr_eq(&self.code, &frame.code) {
+            let frames = vm
+                .bytecode_frames
+                .iter()
+                .map(|f| {
+                    format!(
+                        "(code={:p} called={} ip={})",
+                        Arc::as_ptr(&f.code),
+                        f.called,
+                        f.instruction_pointer
+                    )
+                })
+                .collect::<Vec<_>>();
+            panic!(
+                "SYNC MISMATCH op_index={} cursor_code={:p} frames={frames:?}",
+                self.op_index,
+                Arc::as_ptr(&self.code)
+            );
+        }
         frame.instruction_pointer = self.op_index;
     }
 }
@@ -1260,24 +1432,6 @@ impl PendingNativeCall {
     }
 }
 
-/// What a frame entered by a call needs on the way out: the function, for tracebacks, the
-/// call site to resume, and whether it installed a `method_frames` entry.
-struct FunctionReturn {
-    function: Ref,
-    call_span: super::source::Span,
-    pop_method_frame: bool,
-}
-
-impl Clone for FunctionReturn {
-    fn clone(&self) -> Self {
-        Self {
-            function: self.function.dup(),
-            call_span: self.call_span,
-            pop_method_frame: self.pop_method_frame,
-        }
-    }
-}
-
 impl Deref for Vm<'_> {
     type Target = VmState;
 
@@ -1357,15 +1511,12 @@ impl<'s> Vm<'s> {
 
     fn render_execution(
         &mut self,
-        execution: Result<Execution, (String, super::source::Span)>,
+        execution: Result<Flow, (String, super::source::Span)>,
     ) -> ExecResult {
         match execution {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("synchronous Python cannot suspend"),
-            Ok(Execution::Halt) | Ok(Execution::Return(_)) | Ok(Execution::Yield(_, _)) => {
-                ExecResult::Continue
-            }
-            Ok(Execution::Exit(status)) => ExecResult::Exit(status),
+            Ok(Flow::Halt | Flow::Return(_) | Flow::Yield(_)) => ExecResult::Continue,
+            Ok(Flow::Exit(status)) => ExecResult::Exit(status),
+            Ok(flow) => unreachable!("a completed program cannot end with {flow:?}"),
             Err((error, span)) => {
                 if let Some(reason) = self.interp.resources.stop_reason() {
                     ExecResult::Exit(reason.exit_status())
@@ -1957,15 +2108,15 @@ impl<'s> Vm<'s> {
         Ok((hash, None))
     }
 
+    #[inline(always)]
     fn pop(&mut self) -> Result<Value<'s>, String> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
-        Ok(self
-            .execution
+        self.execution
             .stack
             .pop(&self.state.heap)
-            .expect("non-empty frame stack was checked"))
+            .ok_or_else(|| "invalid bytecode stack effect".into())
     }
 
     fn take(&mut self, count: usize) -> Result<Vec<Value<'s>>, String> {
@@ -1979,8 +2130,8 @@ impl<'s> Vm<'s> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
-        let value = self.peek(depth - 1)?;
-        self.push(value);
+        let value = self.peek_ref(depth - 1)?.dup();
+        self.execution.stack.push_ref(&value);
         Ok(())
     }
 
@@ -2011,11 +2162,12 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    #[inline(always)]
     fn frame_stack_len(&self) -> usize {
         let stack_base = self
             .bytecode_frames
             .last()
-            .map_or(0, |frame| frame.stack_base);
+            .map_or(0, BytecodeFrame::stack_base);
         self.stack.len().saturating_sub(stack_base)
     }
 
@@ -2066,30 +2218,10 @@ impl<'s> Vm<'s> {
     }
 }
 
-enum CallResult<'s> {
-    Value(Value<'s>),
-    Exit(i32),
-    EnteredFrame,
-    Blocked(crate::scheduler::WaitReason, Value<'s>),
-    Retry(crate::scheduler::WaitReason, PendingNativeCall),
-}
-
 #[derive(Clone, Copy)]
 enum CallMode {
     Immediate,
     Deferred(super::source::Span),
-}
-
-/// Outcome of executing a frame. `Return` and `Yield` carry stored references because they
-/// cross the boundary of the scope that produced them; the receiver re-roots them with
-/// `Vm::handle` before anything can allocate.
-enum Execution {
-    Pending,
-    Blocked(crate::scheduler::WaitReason),
-    Halt,
-    Return(Ref),
-    Yield(Ref, usize),
-    Exit(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2174,6 +2306,20 @@ fn expect_arity(arguments: &[Value<'_>], minimum: usize, maximum: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control type every opcode arm returns is one stored reference plus a tag; a payload
+    /// that would grow it moves to `VmState` instead, as the suspension did.
+    #[test]
+    fn control_flow_stays_small() {
+        assert_eq!(
+            std::mem::size_of::<Flow>(),
+            std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
+        );
+        assert!(std::mem::size_of::<Result<Flow, String>>() <= 32);
+        // Five words of indices, two optional references and three flags: pushed and popped
+        // by value on every call.
+        assert!(std::mem::size_of::<BytecodeFrame>() <= 80);
+    }
 
     #[test]
     fn native_handles_round_trip_without_pointers() {

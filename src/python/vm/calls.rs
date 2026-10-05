@@ -1,25 +1,18 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
+use std::sync::Arc;
+
 use super::super::ast::{Program, Statement, StatementKind};
+use super::super::bytecode::{KeywordName, ParameterKind};
 use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
-    CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, ExceptionType,
-    Execution, FrameEntry, FunctionReturn, HashMap, NativeValue, Object, PendingNativeCall,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot, StoredCallArgs, Stream,
-    Value, Vm,
+    CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
+    HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead,
+    RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
-
-/// The parts of a Python function object a call needs, as handles in the caller's scope.
-struct FunctionParts<'s> {
-    name: String,
-    code: CodeRef,
-    closure: Option<Value<'s>>,
-    defaults: Vec<Value<'s>>,
-    defining_class: Option<Value<'s>>,
-}
 
 impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
@@ -188,15 +181,19 @@ impl<'s> Vm<'s> {
         Ok(names)
     }
 
+    /// Call the value below the arguments on the operand stack. `positional` values follow the
+    /// callee, then one value per `keywords` entry; `starred` marks the `*iterable` and
+    /// `**mapping` operands among them. Python functions bind straight from the stack through
+    /// [`Self::call_python`]; every other callee receives owned arguments.
     pub(super) fn call(
         &mut self,
         positional: usize,
-        keyword_names: &[Option<String>],
+        keywords: &[KeywordName],
         starred: &[bool],
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let count = positional
-            .checked_add(keyword_names.len())
+            .checked_add(keywords.len())
             .ok_or("too many call arguments")?;
         if starred.len() != count {
             return Err("invalid bytecode call argument metadata".into());
@@ -204,36 +201,51 @@ impl<'s> Vm<'s> {
         if self.frame_stack_len() < count + 1 {
             return Err("invalid bytecode stack effect".into());
         }
-        if keyword_names.is_empty() && !starred.contains(&true) {
-            if let Some(result) = self.call_python_direct(positional, mode)? {
-                return Ok(result);
-            }
+        if starred.contains(&true) {
+            let (positional, keywords) =
+                self.expand_starred_arguments(positional, keywords, starred)?;
+            return self.call_expanded(positional, &keywords, mode);
         }
-        let arguments_start = self.stack.len() - count;
+        self.call_expanded(positional, keywords, mode)
+    }
+
+    /// Replace the call operands on the stack with their expansion: each `*iterable` by its
+    /// items and each `**mapping` by its values, whose names join the returned keyword list.
+    /// Returns the expanded positional count and keyword names.
+    fn expand_starred_arguments(
+        &mut self,
+        positional: usize,
+        keywords: &[KeywordName],
+        starred: &[bool],
+    ) -> Result<(usize, Vec<KeywordName>), String> {
+        let arguments_start = self.stack.len() - positional - keywords.len();
         let mut raw_arguments = self
             .execution
             .stack
             .split_off(&self.state.heap, arguments_start);
         let keyword_values = raw_arguments.split_off(positional);
-        let positional_starred = &starred[..positional];
-        let mut arguments = Vec::new();
-        for (argument, expanded) in raw_arguments.into_iter().zip(positional_starred) {
-            if *expanded {
+        let mut expanded = 0usize;
+        for (argument, starred) in raw_arguments.into_iter().zip(&starred[..positional]) {
+            if *starred {
                 for value in self.iterable_values(&argument)? {
-                    self.push_materialized(&mut arguments, value)?;
+                    self.push_argument(value)?;
+                    expanded += 1;
                 }
             } else {
-                self.push_materialized(&mut arguments, argument)?;
+                self.push_argument(argument)?;
+                expanded += 1;
             }
         }
-        let mut keyword_arguments = Vec::new();
-        for ((name, value), expanded) in keyword_names
+        let mut names = Vec::with_capacity(keywords.len());
+        for ((name, value), starred) in keywords
             .iter()
             .zip(keyword_values)
             .zip(&starred[positional..])
         {
-            let additions = match (name, expanded) {
-                (Some(name), false) => vec![(name.clone(), value)],
+            match (name, starred) {
+                (Some(name), false) => {
+                    self.push_keyword_argument(&mut names, name.clone(), value)?;
+                }
                 (None, true) => {
                     let Some(entries) = self.mapping_items(value)? else {
                         let message = format!(
@@ -242,49 +254,106 @@ impl<'s> Vm<'s> {
                         );
                         return Err(self.raise_exception("TypeError", message));
                     };
-                    self.reserve_result(entries.len().saturating_mul(64))?;
-                    let mut additions = Vec::with_capacity(entries.len());
                     for (key, value) in entries {
                         let Some(name) = string::string_value(&self.state.heap, key)? else {
                             return Err(
                                 self.raise_exception("TypeError", "keywords must be strings")
                             );
                         };
-                        self.reserve_result(64usize.saturating_add(name.len()))?;
-                        self.charge_cpu(1)?;
-                        additions.push((name, value));
+                        self.push_keyword_argument(&mut names, Arc::from(name), value)?;
                     }
-                    additions
                 }
                 _ => return Err("invalid keyword argument metadata".into()),
-            };
-            for (name, value) in additions {
-                if keyword_arguments
-                    .iter()
-                    .any(|(existing, _)| existing == &name)
-                {
-                    let message = format!("got multiple values for keyword argument '{name}'");
-                    return Err(self.raise_exception("TypeError", message));
-                }
-                self.reserve_result(64usize.saturating_add(name.len()))?;
-                self.charge_cpu(1)?;
-                keyword_arguments.push((name, value));
             }
+        }
+        Ok((expanded, names))
+    }
+
+    /// Push one expanded positional argument, metering the stack growth.
+    fn push_argument(&mut self, value: Value<'s>) -> Result<(), String> {
+        self.reserve_result(64)?;
+        self.charge_cpu(1)?;
+        self.push(value);
+        Ok(())
+    }
+
+    /// Push one expanded keyword argument and record its name, rejecting a repeated name.
+    fn push_keyword_argument(
+        &mut self,
+        names: &mut Vec<KeywordName>,
+        name: Arc<str>,
+        value: Value<'s>,
+    ) -> Result<(), String> {
+        if names
+            .iter()
+            .any(|existing| existing.as_deref() == Some(&*name))
+        {
+            let message = format!("got multiple values for keyword argument '{name}'");
+            return Err(self.raise_exception("TypeError", message));
+        }
+        self.reserve_result(64usize.saturating_add(name.len()))?;
+        self.charge_cpu(1)?;
+        self.push(value);
+        names.push(Some(name));
+        Ok(())
+    }
+
+    /// Dispatch a call whose operands hold no starred entries.
+    fn call_expanded(
+        &mut self,
+        positional: usize,
+        keywords: &[KeywordName],
+        mode: CallMode,
+    ) -> Result<Flow, String> {
+        let count = positional + keywords.len();
+        let callee = self.peek(count)?;
+        if callee.is_object() {
+            match self.get(callee)? {
+                Object::Function(_) => {
+                    return self.call_python(callee, None, positional, keywords, mode);
+                }
+                Object::DescriptorBoundMethod {
+                    receiver,
+                    descriptor,
+                    ..
+                } if descriptor.is_object() => {
+                    let (receiver, descriptor) = (self.handle(receiver), self.handle(descriptor));
+                    return self.call_python(
+                        descriptor,
+                        Some(receiver),
+                        positional,
+                        keywords,
+                        mode,
+                    );
+                }
+                _ => {}
+            }
+        }
+        self.reserve_result(count.saturating_mul(64))?;
+        self.charge_cpu(count as u64)?;
+        let arguments_start = self.stack.len() - count;
+        let mut arguments = self
+            .execution
+            .stack
+            .split_off(&self.state.heap, arguments_start);
+        let keyword_values = arguments.split_off(positional);
+        let mut keyword_arguments = Vec::with_capacity(keywords.len());
+        for (name, value) in keywords.iter().zip(keyword_values) {
+            let name = name.as_ref().ok_or("invalid keyword argument metadata")?;
+            keyword_arguments.push((name.to_string(), value));
         }
         let function = self.pop()?;
         if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
             return call(self, function, CallArgs::new(arguments, keyword_arguments))
-                .map(CallResult::Value)
+                .map(|value| self.produce(value))
                 .map_err(|error| self.record_native_error(error));
         }
         if function.is_object() {
             /// What a heap callable is, with the handles its call needs.
             enum Callee<'v> {
-                Function,
                 BoundMethod {
                     receiver: Value<'v>,
                     descriptor: Value<'v>,
-                    owner: Option<Value<'v>>,
                 },
                 GenericAlias(Value<'v>),
                 Instance(Value<'v>),
@@ -292,15 +361,13 @@ impl<'s> Vm<'s> {
                 Other,
             }
             let callee = match self.get(function)? {
-                Object::Function(_) => Callee::Function,
                 Object::DescriptorBoundMethod {
                     receiver,
                     descriptor,
-                    owner,
+                    ..
                 } => Callee::BoundMethod {
                     receiver: self.handle(receiver),
                     descriptor: self.handle(descriptor),
-                    owner: self.handle_optional(owner.as_ref()),
                 },
                 Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.handle(origin)),
                 Object::Class(_) => Callee::Class,
@@ -310,33 +377,15 @@ impl<'s> Vm<'s> {
                 },
             };
             return match callee {
-                Callee::Function => self.call_python_general(
-                    function,
-                    None,
-                    None,
-                    arguments,
-                    keyword_arguments,
-                    mode,
-                ),
                 Callee::BoundMethod {
                     receiver,
                     descriptor,
-                    owner,
                 } => {
-                    if descriptor.is_object() {
-                        self.call_python_general(
-                            descriptor,
-                            Some(receiver),
-                            owner,
-                            arguments,
-                            keyword_arguments,
-                            mode,
-                        )
-                    } else if let Some(NativeValue::SlotWrapper { owner, slot }) =
+                    if let Some(NativeValue::SlotWrapper { owner, slot }) =
                         descriptor.native_value()
                     {
                         self.call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
-                            .map(CallResult::Value)
+                            .map(|value| self.produce(value))
                     } else if let Some(NativeValue::NativeMethod(method)) =
                         descriptor.native_value()
                     {
@@ -376,7 +425,7 @@ impl<'s> Vm<'s> {
         if let Some(NativeValue::ValueKind(kind)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
             return (kind.construct)(self, call)
-                .map(CallResult::Value)
+                .map(|value| self.produce(value))
                 .map_err(|error| self.record_native_error(error));
         }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
@@ -392,9 +441,10 @@ impl<'s> Vm<'s> {
                 }
                 _ => exception_type.0,
             };
-            return Ok(CallResult::Value(
-                self.allocate_exception_object(kind, arguments)?,
-            ));
+            return {
+                let value = self.allocate_exception_object(kind, arguments)?;
+                Ok(self.produce(value))
+            };
         }
         if let Some(NativeValue::SlotWrapper { owner, slot }) = function.native_value() {
             if arguments.is_empty() {
@@ -403,7 +453,7 @@ impl<'s> Vm<'s> {
             let receiver = arguments.remove(0);
             return self
                 .call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
-                .map(CallResult::Value);
+                .map(|value| self.produce(value));
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
             if arguments.is_empty() {
@@ -427,26 +477,23 @@ impl<'s> Vm<'s> {
             let result = (function.call)(self, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
-                Ok(value) => match self.pending_wait.take() {
-                    Some(reason) => Ok(CallResult::Blocked(reason, value)),
-                    None => Ok(CallResult::Value(value)),
-                },
+                Ok(value) => Ok(self.native_result(value)),
                 Err(PyError {
                     kind: PyErrorKind::Exit(status),
                     ..
-                }) => Ok(CallResult::Exit(status)),
+                }) => Ok(Flow::Exit(status)),
                 Err(PyError {
                     kind: PyErrorKind::Suspend(reason),
                     ..
                 }) => match (mode, retry_arguments) {
-                    (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
-                        reason,
-                        PendingNativeCall::Function {
+                    (CallMode::Deferred(call_span), Some(arguments)) => {
+                        let retry = PendingNativeCall::Function {
                             function,
                             arguments: StoredCallArgs::store(self, &arguments),
                             call_span,
-                        },
-                    )),
+                        };
+                        Ok(self.suspend(reason, Some(retry)))
+                    }
                     _ => Err("native call suspended outside scheduler dispatch".into()),
                 },
                 Err(error) => Err(self.record_native_error(error)),
@@ -516,7 +563,7 @@ impl<'s> Vm<'s> {
                 if let Some(NativeValue::Stream(stream)) = target.native_value() {
                     self.write_output(stream, text.as_bytes());
                     self.write_output(stream, ending.as_bytes());
-                    return Ok(CallResult::Value(Value::None));
+                    return Ok(self.produce(Value::None));
                 }
                 let write = self
                     .resolve_attribute(target, "write")?
@@ -530,7 +577,7 @@ impl<'s> Vm<'s> {
                         self.invoke_value(flush, Vec::new())?;
                     }
                 }
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::Input => {
                 expect_arity(&arguments, 0, 1)?;
@@ -548,13 +595,17 @@ impl<'s> Vm<'s> {
                 let result = self.read_stream(&marker, None, true);
                 self.native_suspend_allowed = previous_suspend;
                 match result {
-                    Ok(read) => self.finish_input(read).map(CallResult::Value),
+                    Ok(read) => {
+                        let value = self.finish_input(read)?;
+                        Ok(self.produce(value))
+                    }
                     Err(PyError {
                         kind: PyErrorKind::Suspend(reason),
                         ..
-                    }) => retry
-                        .map(|pending| CallResult::Retry(reason, pending))
-                        .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
+                    }) => match retry {
+                        Some(pending) => Ok(self.suspend(reason, Some(pending))),
+                        None => Err("native call suspended outside scheduler dispatch".into()),
+                    },
                     Err(error) => Err(self.record_native_error(error)),
                 }
             }
@@ -564,14 +615,9 @@ impl<'s> Vm<'s> {
                 let code = super::super::compiler::compile(program);
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
-                    Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
-                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
-                    Ok(
-                        Execution::Pending
-                        | Execution::Blocked(_)
-                        | Execution::Return(_)
-                        | Execution::Yield(_, _),
-                    ) => Err("exec source did not finish normally".into()),
+                    Ok(Flow::Halt) => Ok(self.produce(Value::None)),
+                    Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+                    Ok(_) => Err("exec source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in exec source at line {}, column {}",
                         span.line, span.column
@@ -591,14 +637,12 @@ impl<'s> Vm<'s> {
                 let code = super::super::compiler::compile_expression(expression);
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
-                    Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
-                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
-                    Ok(
-                        Execution::Halt
-                        | Execution::Pending
-                        | Execution::Blocked(_)
-                        | Execution::Yield(_, _),
-                    ) => Err("eval source did not finish normally".into()),
+                    Ok(Flow::Return(value)) => {
+                        self.execution.stack.push_ref(&value);
+                        Ok(Flow::Next)
+                    }
+                    Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+                    Ok(_) => Err("eval source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in eval source at line {}, column {}",
                         span.line, span.column
@@ -611,7 +655,7 @@ impl<'s> Vm<'s> {
                     .first()
                     .and_then(|value| value.as_int())
                     .unwrap_or_default();
-                Ok(CallResult::Exit(status as i32))
+                Ok(Flow::Exit(status as i32))
             }
             Builtin::Character => {
                 expect_arity(&arguments, 1, 1)?;
@@ -622,9 +666,10 @@ impl<'s> Vm<'s> {
                         self.raise_exception("ValueError", "chr() arg not in range(0x110000)")
                     );
                 };
-                Ok(CallResult::Value(
-                    self.allocate_string(codepoint.to_string())?,
-                ))
+                {
+                    let value = self.allocate_string(codepoint.to_string())?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Ordinal => {
                 expect_arity(&arguments, 1, 1)?;
@@ -647,7 +692,7 @@ impl<'s> Vm<'s> {
                 } else {
                     return Err("ord() expected string of length 1".into());
                 };
-                Ok(CallResult::Value(Value::Int(value)))
+                Ok(self.produce(Value::Int(value)))
             }
             Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
                 expect_arity(&arguments, 1, 1)?;
@@ -677,12 +722,18 @@ impl<'s> Vm<'s> {
                 } else {
                     format!("{prefix}{digits}")
                 };
-                Ok(CallResult::Value(self.allocate_string(rendered)?))
+                {
+                    let value = self.allocate_string(rendered)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Repr => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = self.repr_value(&arguments[0])?;
-                Ok(CallResult::Value(self.allocate_string(value)?))
+                {
+                    let value = self.allocate_string(value)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Format => {
                 if !keyword_arguments.is_empty() {
@@ -712,18 +763,21 @@ impl<'s> Vm<'s> {
                 };
                 self.reserve_format_spec(&spec)?;
                 let value = self.format_object(&arguments[0], &spec)?;
-                Ok(CallResult::Value(self.allocate_string(value)?))
+                {
+                    let value = self.allocate_string(value)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Hash => {
                 expect_arity(&arguments, 1, 1)?;
                 let hash = self.hash_value(&arguments[0])?;
-                Ok(CallResult::Value(Value::Int(hash)))
+                Ok(self.produce(Value::Int(hash)))
             }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
                 if let Some(value) = arguments.first() {
                     if let Some(names) = self.custom_dir(value)? {
-                        return Ok(CallResult::Value(names));
+                        return Ok(self.produce(names));
                     }
                 }
                 let mut names = if let Some(value) = arguments.first() {
@@ -755,21 +809,24 @@ impl<'s> Vm<'s> {
                     .into_iter()
                     .map(|name| self.allocate_string(name))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(values))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::IsInstance => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(Value::Bool(
-                    self.is_instance(&arguments[0], &arguments[1])?,
-                )))
+                {
+                    let value = Value::Bool(self.is_instance(&arguments[0], &arguments[1])?);
+                    Ok(self.produce(value))
+                }
             }
             Builtin::IsSubclass => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(Value::Bool(
-                    self.is_subclass(&arguments[0], &arguments[1])?,
-                )))
+                {
+                    let value = Value::Bool(self.is_subclass(&arguments[0], &arguments[1])?);
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Length => {
                 expect_arity(&arguments, 1, 1)?;
@@ -781,7 +838,7 @@ impl<'s> Vm<'s> {
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
                     }
-                    return Ok(CallResult::Value(Value::Int(length)));
+                    return Ok(self.produce(Value::Int(length)));
                 }
                 let Some(length) = self.physical_length(arguments[0])? else {
                     let message = format!(
@@ -792,7 +849,7 @@ impl<'s> Vm<'s> {
                 };
                 let length = i64::try_from(length)
                     .map_err(|_| self.raise_exception("OverflowError", "length is too large"))?;
-                Ok(CallResult::Value(Value::Int(length)))
+                Ok(self.produce(Value::Int(length)))
             }
             Builtin::Sorted => {
                 expect_arity(&arguments, 1, 1)?;
@@ -825,15 +882,10 @@ impl<'s> Vm<'s> {
                     let key = if let Some(function) = &key_function {
                         self.push(*function);
                         self.push(value);
-                        match self.call(1, &[], &[false], CallMode::Immediate)? {
-                            CallResult::Value(key) => key,
-                            CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                            CallResult::EnteredFrame => {
-                                unreachable!("immediate call entered a frame")
-                            }
-                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                unreachable!("immediate call cannot suspend")
-                            }
+                        let flow = self.call(1, &[], &[false], CallMode::Immediate)?;
+                        match self.immediate_value(flow)? {
+                            Ok(key) => key,
+                            Err(flow) => return Ok(flow),
                         }
                     } else {
                         value
@@ -853,9 +905,10 @@ impl<'s> Vm<'s> {
                     self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
                 })?;
                 let values = keyed.into_iter().map(|(_, value)| value);
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(values))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Minimum | Builtin::Maximum => {
                 let (name, operator) = match function {
@@ -899,15 +952,10 @@ impl<'s> Vm<'s> {
                         Some(function) => {
                             self.push(function);
                             self.push(value);
-                            match self.call(1, &[], &[false], CallMode::Immediate)? {
-                                CallResult::Value(key) => key,
-                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                                CallResult::EnteredFrame => {
-                                    unreachable!("immediate call entered a frame")
-                                }
-                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                    unreachable!("immediate call cannot suspend")
-                                }
+                            let flow = self.call(1, &[], &[false], CallMode::Immediate)?;
+                            match self.immediate_value(flow)? {
+                                Ok(key) => key,
+                                Err(flow) => return Ok(flow),
                             }
                         }
                         None => value,
@@ -923,8 +971,8 @@ impl<'s> Vm<'s> {
                     }
                 }
                 match (selected, default) {
-                    (Some((_, value)), _) => Ok(CallResult::Value(value)),
-                    (None, Some(default)) => Ok(CallResult::Value(default)),
+                    (Some((_, value)), _) => Ok(self.produce(value)),
+                    (None, Some(default)) => Ok(self.produce(default)),
                     (None, None) => {
                         let message = format!("{name}() iterable argument is empty");
                         Err(self.raise_exception("ValueError", message))
@@ -935,11 +983,17 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
                 let start = arguments.get(1).copied().unwrap_or(Value::Int(0));
-                Ok(CallResult::Value(self.builtin_sum(values, start)?))
+                {
+                    let value = self.builtin_sum(values, start)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.absolute(arguments[0])?))
+                {
+                    let value = self.absolute(arguments[0])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Power => {
                 expect_arity(&arguments, 2, 3)?;
@@ -984,19 +1038,20 @@ impl<'s> Vm<'s> {
                     }
                     let result = <Self as PyRuntime>::new_bigint(self, result)
                         .map_err(|error| error.to_string())?;
-                    return Ok(CallResult::Value(result));
+                    return Ok(self.produce(result));
                 }
-                Ok(CallResult::Value(self.binary_value(
-                    BinaryOperator::Power,
-                    arguments[0],
-                    arguments[1],
-                )?))
+                {
+                    let value =
+                        self.binary_value(BinaryOperator::Power, arguments[0], arguments[1])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Divmod => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(
-                    self.divmod_value(arguments[0], arguments[1])?,
-                ))
+                {
+                    let value = self.divmod_value(arguments[0], arguments[1])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::SetAttribute => {
                 if arguments.len() != 3 {
@@ -1013,7 +1068,7 @@ impl<'s> Vm<'s> {
                 // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
                 let symbol = self.intern_symbol(&name)?;
                 self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::DeleteAttribute => {
                 if arguments.len() != 2 {
@@ -1029,13 +1084,13 @@ impl<'s> Vm<'s> {
                 };
                 let symbol = self.intern_symbol(&name)?;
                 self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
                 let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
                     .map_err(|error| error.to_string())?;
-                Ok(CallResult::Value(Value::Bool(callable)))
+                Ok(self.produce(Value::Bool(callable)))
             }
             Builtin::Iter => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1045,15 +1100,19 @@ impl<'s> Vm<'s> {
                     {
                         return Err("iter(v, w): v must be callable".into());
                     }
-                    return Ok(CallResult::Value(self.alloc_with(|builder| {
-                        Object::CallableIterator {
+                    return {
+                        let value = self.alloc_with(|builder| Object::CallableIterator {
                             callable: builder.store(arguments[0]),
                             sentinel: builder.store(arguments[1]),
                             exhausted: false,
-                        }
-                    })?));
+                        })?;
+                        Ok(self.produce(value))
+                    };
                 }
-                Ok(CallResult::Value(self.make_iterator(arguments[0])?))
+                {
+                    let value = self.make_iterator(arguments[0])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Next => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1072,7 +1131,7 @@ impl<'s> Vm<'s> {
                         None => return Err(self.raise_stop_iteration(&arguments[0])),
                     },
                 };
-                Ok(CallResult::Value(value))
+                Ok(self.produce(value))
             }
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1093,9 +1152,10 @@ impl<'s> Vm<'s> {
                         Object::Tuple(vec![builder.store(Value::Int(index)), builder.store(value)])
                     })?);
                 }
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(result))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Zip => {
                 let sequences = arguments
@@ -1110,9 +1170,10 @@ impl<'s> Vm<'s> {
                     let tuple = sequences.iter().map(|values| values[index]);
                     result.push(self.alloc_with(|builder| Object::Tuple(builder.refs(tuple)))?);
                 }
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(result))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Any | Builtin::All => {
                 expect_arity(&arguments, 1, 1)?;
@@ -1130,15 +1191,13 @@ impl<'s> Vm<'s> {
                         break;
                     }
                 }
-                Ok(CallResult::Value(Value::Bool(result)))
+                Ok(self.produce(Value::Bool(result)))
             }
             Builtin::Super => {
                 expect_arity(&arguments, 0, 2)?;
                 let (start_class, receiver) = match arguments.as_slice() {
                     [] => self
-                        .method_frames
-                        .last()
-                        .map(|(class, receiver)| (self.handle(class), self.handle(receiver)))
+                        .method_context()?
                         .ok_or("super(): no current method context")?,
                     [start_class, receiver]
                         if start_class.is_object()
@@ -1148,28 +1207,37 @@ impl<'s> Vm<'s> {
                     }
                     _ => return Err("super() expects a class and instance".into()),
                 };
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::Super {
+                {
+                    let value = self.alloc_with(|builder| Object::Super {
                         start_class: builder.store(start_class),
                         receiver: builder.store(receiver),
-                    }
-                })?))
+                    })?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Globals => {
                 expect_arity(&arguments, 0, 0)?;
                 let target = self.current_globals_target()?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::NamespaceDict(target.store(builder))
-                })?))
+                {
+                    let value =
+                        self.alloc_with(|builder| Object::NamespaceDict(target.store(builder)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Locals => {
                 expect_arity(&arguments, 0, 0)?;
-                Ok(CallResult::Value(self.current_locals()?))
+                {
+                    let value = self.current_locals()?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Vars => {
                 expect_arity(&arguments, 0, 1)?;
                 let Some(owner) = arguments.first() else {
-                    return Ok(CallResult::Value(self.current_locals()?));
+                    return {
+                        let value = self.current_locals()?;
+                        Ok(self.produce(value))
+                    };
                 };
                 // `vars(obj)` is `obj.__dict__`: a namespace view, or a class's or native
                 // module's read-only proxy.
@@ -1179,7 +1247,7 @@ impl<'s> Vm<'s> {
                         "vars() argument must have __dict__ attribute",
                     ));
                 };
-                Ok(CallResult::Value(namespace))
+                Ok(self.produce(namespace))
             }
         }
     }
@@ -1190,7 +1258,7 @@ impl<'s> Vm<'s> {
         &mut self,
         class: Value<'s>,
         args: CallArgs<'s>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let (arguments, keyword_arguments) = args.into_parts();
         if class.is_object() && matches!(self.get(class)?, Object::Class { .. }) {
             return self.call_user_class(class, arguments, keyword_arguments, false);
@@ -1210,22 +1278,6 @@ impl<'s> Vm<'s> {
 
     /// The name, code, closure, defaults and defining class of a Python function object, or
     /// `None` when `function` is some other value.
-    fn function_parts(&self, function: Value<'s>) -> Result<Option<FunctionParts<'s>>, String> {
-        if !function.is_object() {
-            return Ok(None);
-        }
-        let Object::Function(function_object) = self.get(function)? else {
-            return Ok(None);
-        };
-        Ok(Some(FunctionParts {
-            name: function_object.name.clone(),
-            code: function_object.code.clone(),
-            closure: self.handle_optional(function_object.closure.as_ref()),
-            defaults: self.handles(&function_object.defaults),
-            defining_class: self.handle_optional(function_object.defining_class.as_ref()),
-        }))
-    }
-
     /// Call a native method. A deferred call that suspends returns a retry that passes
     /// `receiver` and the same arguments again; this call passes `native_receiver`.
     fn call_native_method(
@@ -1235,7 +1287,7 @@ impl<'s> Vm<'s> {
         native_receiver: Value<'s>,
         call: CallArgs<'s>,
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         // Kept as handles so a suspension can store them for the retry.
         let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
         let previous_suspend = self.native_suspend_allowed;
@@ -1243,24 +1295,24 @@ impl<'s> Vm<'s> {
         let result = (method.call)(self, native_receiver, call);
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(value) => Ok(CallResult::Value(value)),
+            Ok(value) => Ok(self.produce(value)),
             Err(PyError {
                 kind: PyErrorKind::Exit(status),
                 ..
-            }) => Ok(CallResult::Exit(status)),
+            }) => Ok(Flow::Exit(status)),
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
             }) => match (mode, retry_arguments) {
-                (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
-                    reason,
-                    PendingNativeCall::Method {
+                (CallMode::Deferred(call_span), Some(arguments)) => {
+                    let retry = PendingNativeCall::Method {
                         method,
                         receiver: self.store(receiver),
                         arguments: StoredCallArgs::store(self, &arguments),
                         call_span,
-                    },
-                )),
+                    };
+                    Ok(self.suspend(reason, Some(retry)))
+                }
                 _ => Err("native call suspended outside scheduler dispatch".into()),
             },
             Err(error) => Err(self.record_native_error(error)),
@@ -1324,7 +1376,7 @@ impl<'s> Vm<'s> {
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
         dispatch_metaclass: bool,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("type.__call__ requires a class".into());
         };
@@ -1356,7 +1408,7 @@ impl<'s> Vm<'s> {
                     .attribute_by_symbol(member, value_symbol)?
                     .ok_or("enum member has no value")?;
                 if self.values_equal(&value, &arguments[0])? {
-                    return Ok(CallResult::Value(member));
+                    return Ok(self.produce(member));
                 }
             }
             let rendered = self.repr_value(&arguments[0])?;
@@ -1405,19 +1457,14 @@ impl<'s> Vm<'s> {
                 {
                     let constructor =
                         self.bind_descriptor(constructor, Some(class), class, owner)?;
-                    match self.invoke_call(
+                    let flow = self.invoke_call(
                         constructor,
                         arguments.clone(),
                         keyword_arguments.clone(),
-                    )? {
-                        CallResult::Value(value) => value,
-                        CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                        CallResult::EnteredFrame => {
-                            unreachable!("invoke_call is immediate")
-                        }
-                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                            unreachable!("immediate call cannot suspend")
-                        }
+                    )?;
+                    match self.immediate_value(flow)? {
+                        Ok(value) => value,
+                        Err(flow) => return Ok(flow),
                     }
                 } else {
                     if !keyword_arguments.is_empty() || arguments.len() != 3 {
@@ -1434,23 +1481,17 @@ impl<'s> Vm<'s> {
                     {
                         let initializer =
                             self.bind_descriptor(initializer, Some(created), class, owner)?;
-                        let result =
-                            match self.invoke_call(initializer, arguments, keyword_arguments)? {
-                                CallResult::Value(value) => value,
-                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                                CallResult::EnteredFrame => {
-                                    unreachable!("invoke_call is immediate")
-                                }
-                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                    unreachable!("immediate call cannot suspend")
-                                }
-                            };
+                        let flow = self.invoke_call(initializer, arguments, keyword_arguments)?;
+                        let result = match self.immediate_value(flow)? {
+                            Ok(value) => value,
+                            Err(flow) => return Ok(flow),
+                        };
                         if !result.is_none() {
                             return Err("metaclass __init__() should return None".into());
                         }
                     }
                 }
-                return Ok(CallResult::Value(created));
+                return Ok(self.produce(created));
             }
         };
         let instance_type = self
@@ -1516,29 +1557,30 @@ impl<'s> Vm<'s> {
             if !initializer.is_object() {
                 return Err(format!("{name}.__init__ is not callable"));
             }
-            if self.function_parts(initializer)?.is_none() {
+            if !matches!(self.get(initializer)?, Object::Function(_)) {
                 return Err(format!("{name}.__init__ is not a function"));
             }
-            // Zero-argument `super()` in the initializer reads the method frame the call
-            // installs from the function's defining class.
-            let result = self.call_python_general(
+            let positional = arguments.len();
+            self.push(initializer);
+            for argument in arguments {
+                self.push(argument);
+            }
+            let mut keywords = Vec::with_capacity(keyword_arguments.len());
+            for (keyword, value) in keyword_arguments {
+                keywords.push(Some(Arc::from(keyword)));
+                self.push(value);
+            }
+            let flow = self.call_python(
                 initializer,
                 Some(instance),
-                None,
-                arguments,
-                keyword_arguments,
+                positional,
+                &keywords,
                 CallMode::Immediate,
-            );
-            match result? {
-                CallResult::Value(value) if value.is_none() => {}
-                CallResult::Value(_) => return Err("__init__() should return None".into()),
-                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                CallResult::EnteredFrame => {
-                    unreachable!("immediate initializer entered a frame")
-                }
-                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                    unreachable!("immediate initializer cannot suspend")
-                }
+            )?;
+            match self.immediate_value(flow)? {
+                Ok(value) if value.is_none() => {}
+                Ok(_) => return Err("__init__() should return None".into()),
+                Err(flow) => return Ok(flow),
             }
         } else if exception_base.is_some() && !keyword_arguments.is_empty() {
             return Err(format!("{name}() does not accept keyword arguments"));
@@ -1548,197 +1590,352 @@ impl<'s> Vm<'s> {
         {
             return Err(format!("{name}() takes no arguments"));
         }
-        Ok(CallResult::Value(instance))
+        Ok(self.produce(instance))
     }
 
     const MAX_CALL_DEPTH: usize = 256;
 
-    /// Bind a plain positional call of a Python function, or of a bound method wrapping one,
-    /// straight from the operand stack into the new frame's local slots, and enter it.
-    ///
-    /// The callee sits below the `positional` arguments on the stack. `None` leaves the call to
-    /// [`Self::call_python_general`]: any other callee, a generator or coroutine, a function
-    /// with heap-resident locals, a signature with variadic or required keyword-only
-    /// parameters, and an arity the signature cannot bind, whose error the general path
-    /// reports. Nothing here allocates, so stored references move between roots directly.
-    fn call_python_direct(
+    /// Call the Python `function` whose arguments sit on top of the operand stack above the
+    /// callee slot: `positional` values, then one value per `keywords` entry. `receiver`
+    /// becomes the first argument. Binding validates the call against the signature first,
+    /// then moves the stored references straight into the new frame's slots on the shared
+    /// locals stack, so a call with no `*args` or `**kwargs` parameter allocates nothing. A
+    /// generator or coroutine, or code whose nested scopes read its locals, then moves the
+    /// bound slots into a heap scope.
+    fn call_python(
         &mut self,
+        function: Value<'s>,
+        receiver: Option<Value<'s>>,
         positional: usize,
+        keywords: &[KeywordName],
         mode: CallMode,
-    ) -> Result<Option<CallResult<'s>>, String> {
-        let callee = self.peek(positional)?;
-        if !callee.is_object() {
-            return Ok(None);
-        }
-        let (function, receiver, bound_owner) = match self.get(callee)? {
-            Object::Function(_) => (callee, None, None),
-            Object::DescriptorBoundMethod {
-                receiver,
-                descriptor,
-                owner,
-            } if descriptor.is_object() => (
-                self.handle(descriptor),
-                Some(self.handle(receiver)),
-                self.handle_optional(owner.as_ref()),
-            ),
-            _ => return Ok(None),
+    ) -> Result<Flow, String> {
+        let Object::Function(function_object) = self.get(function)? else {
+            return Err("bound descriptor is not callable".into());
         };
-        let Object::Function(function_object) = self.state.heap.get(function)? else {
-            return Ok(None);
-        };
-        let signature = &function_object.code.call_signature;
-        let given = positional + usize::from(receiver.is_some());
-        if signature.heap_locals
-            || signature.variadic_slot.is_some()
-            || signature.keyword_variadic_slot.is_some()
-            || signature.keyword_only_required
-            || given < signature.required_positional
-            || given > signature.positional_count
-        {
-            return Ok(None);
-        }
-        if self.call_depth == Self::MAX_CALL_DEPTH {
-            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
-        }
         let code = function_object.code.clone();
         let closure = self.handle_optional(function_object.closure.as_ref());
-        let method_owner =
-            bound_owner.or(self.handle_optional(function_object.defining_class.as_ref()));
-        let first_argument = match receiver {
-            Some(receiver) => Some(receiver),
-            None if positional > 0 => Some(self.peek(positional - 1)?),
+        let signature = &code.call_signature;
+        let suspends = signature.is_generator || signature.is_coroutine;
+        if !suspends && self.call_depth == Self::MAX_CALL_DEPTH {
+            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
+        }
+        let locals_base = self.execution.locals.len();
+        if let Err(error) =
+            self.bind_arguments(function, &code, receiver, positional, keywords, locals_base)
+        {
+            self.execution.locals.truncate(locals_base);
+            return Err(error);
+        }
+        if suspends || signature.heap_locals {
+            let locals = self.execution.locals[locals_base..]
+                .iter()
+                .map(|slot| self.handle_optional(slot.as_ref()))
+                .collect::<Vec<_>>();
+            self.execution.locals.truncate(locals_base);
+            if suspends {
+                return self.create_generator(function, &code, closure, locals);
+            }
+            let scope = self.function_scope(&code, closure, locals)?;
+            let entry = FrameEntry::function(function, scope);
+            return self.enter_python_function(function, &code, entry, mode);
+        }
+        let entry = FrameEntry::with_locals(function, closure, locals_base);
+        self.enter_python_function(function, &code, entry, mode)
+    }
+
+    /// Bind the call operands on the stack into `code`'s local slots at `locals_base` on the
+    /// locals stack, consuming the operands and the callee slot. Every `TypeError` the
+    /// signature can raise is detected before the stack changes; the caller discards the
+    /// partially extended locals on error.
+    fn bind_arguments(
+        &mut self,
+        function: Value<'s>,
+        code: &CodeRef,
+        receiver: Option<Value<'s>>,
+        positional: usize,
+        keywords: &[KeywordName],
+        locals_base: usize,
+    ) -> Result<(), String> {
+        let signature = &code.call_signature;
+        let receiver_offset = usize::from(receiver.is_some());
+        let given = positional + receiver_offset;
+        let count = positional + keywords.len();
+        let arguments_start = self.stack.len() - count;
+        if given > signature.positional_count && signature.variadic_slot.is_none() {
+            return Err(self.too_many_positional(function, code, given, keywords));
+        }
+        // Slots the positional arguments fill; the rest of them go to `*args`.
+        let filled = given.min(signature.positional_count);
+        // Validate the keywords and the required parameters before touching the stack.
+        let mut extra_keywords = 0usize;
+        for (index, keyword) in keywords.iter().enumerate() {
+            let name = keyword
+                .as_deref()
+                .ok_or("invalid keyword argument metadata")?;
+            let repeated = keywords[..index]
+                .iter()
+                .any(|earlier| earlier.as_deref() == Some(name));
+            match keyword_target(code, name) {
+                KeywordTarget::Slot(slot) if slot < filled || repeated => {
+                    let message = format!(
+                        "{}() got multiple values for argument '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                KeywordTarget::Slot(_) => {}
+                // A name that binds no slot, including a positional-only parameter's, lands in
+                // `**kwargs` when the signature has one.
+                KeywordTarget::Unknown | KeywordTarget::PositionalOnly
+                    if signature.keyword_variadic_slot.is_some() =>
+                {
+                    if repeated {
+                        let message = format!(
+                            "{}() got multiple values for argument '{name}'",
+                            self.function_name(&self.store(function))
+                        );
+                        return Err(self.raise_exception("TypeError", message));
+                    }
+                    extra_keywords += 1;
+                }
+                KeywordTarget::Unknown => {
+                    let message = format!(
+                        "{}() got an unexpected keyword argument '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+                KeywordTarget::PositionalOnly => {
+                    let message = format!(
+                        "{}() got some positional-only arguments passed as keyword \
+                         arguments: '{name}'",
+                        self.function_name(&self.store(function))
+                    );
+                    return Err(self.raise_exception("TypeError", message));
+                }
+            }
+        }
+        if given < signature.required_positional
+            || signature.keyword_only_required
+            || !keywords.is_empty()
+        {
+            self.check_required_parameters(function, code, filled, keywords)?;
+        }
+        // Allocate the variadic containers from the stack values, which stay rooted meanwhile.
+        let variadic = match signature.variadic_slot {
+            Some(_) if given > signature.positional_count => {
+                let first_extra = signature.positional_count.saturating_sub(receiver_offset);
+                let mut extras = Vec::with_capacity(given - signature.positional_count);
+                if signature.positional_count == 0 {
+                    extras.extend(receiver);
+                }
+                for index in first_extra..positional {
+                    extras.push(self.peek(count - 1 - index)?);
+                }
+                self.reserve_result(extras.len().saturating_mul(64))?;
+                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extras)))?)
+            }
+            Some(_) => Some(self.alloc_with(|builder| Object::Tuple(builder.refs([])))?),
             None => None,
         };
-        let locals_base = self.execution.locals.len();
-        if let Some(receiver) = receiver {
-            let receiver = self.store(receiver);
-            self.execution.locals.push(Some(receiver));
-        }
-        let arguments_start = self.stack.len() - positional;
-        let super::VmState { locals, stack, .. } = &mut *self.execution;
-        locals.extend(stack.drain_refs(arguments_start).map(Some));
-        stack.pop_ref();
-        locals.extend(std::iter::repeat_with(|| None).take(code.local_names.len() - given));
-        let Object::Function(function_object) = self.state.heap.get(function)? else {
-            unreachable!("function was checked above and nothing has allocated");
+        let keyword_variadic = match signature.keyword_variadic_slot {
+            Some(_) => {
+                let mut entries = Vec::with_capacity(extra_keywords);
+                for (index, keyword) in keywords.iter().enumerate() {
+                    let name = keyword.as_deref().expect("keywords were validated above");
+                    if !matches!(keyword_target(code, name), KeywordTarget::Slot(_)) {
+                        let key = self.allocate_string(name.to_string())?;
+                        self.reserve_result(64)?;
+                        entries.push((key, self.peek(keywords.len() - 1 - index)?));
+                    }
+                }
+                Some(self.allocate_dict(entries)?)
+            }
+            None => None,
         };
+        // Move the operands into the slots.
+        let receiver = receiver.map(|receiver| self.store(receiver));
+        let variadic = variadic.map(|value| self.store(value));
+        let keyword_variadic = keyword_variadic.map(|value| self.store(value));
+        let super::VmState { locals, stack, .. } = &mut *self.execution;
+        locals.extend(std::iter::repeat_with(|| None).take(code.local_names.len()));
+        let slots = &mut locals[locals_base..];
+        if let (Some(receiver), true) = (receiver, signature.positional_count > 0) {
+            slots[0] = Some(receiver);
+        }
+        for (index, value) in stack.drain_refs(arguments_start).enumerate() {
+            if index < positional {
+                let slot = index + receiver_offset;
+                if slot < signature.positional_count {
+                    slots[slot] = Some(value);
+                }
+            } else {
+                let name = keywords[index - positional]
+                    .as_deref()
+                    .expect("keywords were validated above");
+                if let KeywordTarget::Slot(slot) = keyword_target(code, name) {
+                    slots[slot] = Some(value);
+                }
+            }
+        }
+        stack.pop_ref();
+        if let (Some(slot), Some(value)) = (signature.variadic_slot, variadic) {
+            slots[slot] = Some(value);
+        }
+        if let (Some(slot), Some(value)) = (signature.keyword_variadic_slot, keyword_variadic) {
+            slots[slot] = Some(value);
+        }
+        let Object::Function(function_object) = self.state.heap.get(function)? else {
+            unreachable!("function was checked by the caller and remains a function");
+        };
+        if function_object.defaults.len() != signature.default_slots.len() {
+            return Err(format!(
+                "{}() has invalid default argument metadata",
+                function_object.name
+            ));
+        }
         for (&slot, default) in signature
             .default_slots
             .iter()
             .zip(&function_object.defaults)
         {
-            let local = &mut locals[locals_base + slot];
+            let local = &mut self.execution.locals[locals_base + slot];
             if local.is_none() {
                 *local = Some(default.dup());
             }
         }
-        let entry = FrameEntry {
-            scope: None,
-            enclosing: closure,
-            locals_base: Some(locals_base),
-        };
-        let method_frame = method_owner.zip(first_argument);
-        self.enter_python_function(function, &code, entry, method_frame, mode)
-            .map(Some)
+        Ok(())
     }
 
-    /// Call a Python function through full argument binding: keyword and starred arguments,
-    /// variadic parameters, generators, heap-resident locals, and arity errors. `receiver`
-    /// becomes the first argument; `bound_owner` is the class a bound method was taken from.
-    fn call_python_general(
+    /// The `TypeError` for a call that passes more positional arguments than the signature
+    /// takes, worded as CPython words it.
+    fn too_many_positional(
         &mut self,
         function: Value<'s>,
-        receiver: Option<Value<'s>>,
-        bound_owner: Option<Value<'s>>,
-        mut arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-        mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
-        let FunctionParts {
-            name,
-            code,
-            closure,
-            defaults,
-            defining_class,
-        } = self
-            .function_parts(function)?
-            .ok_or("bound descriptor is not callable")?;
-        if let Some(receiver) = receiver {
-            arguments.insert(0, receiver);
-        }
-        let method_frame = bound_owner
-            .or(defining_class)
-            .zip(arguments.first().copied());
-        let locals =
-            self.bind_function_locals(&name, &code, &defaults, arguments, keyword_arguments)?;
-        if code.call_signature.is_generator || code.call_signature.is_coroutine {
-            return self.create_generator(name, &code, closure, locals);
-        }
-        if self.call_depth == Self::MAX_CALL_DEPTH {
-            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
-        }
-        let entry = if code.call_signature.heap_locals {
-            FrameEntry::scoped(self.function_scope(&code, closure, locals)?)
+        code: &CodeRef,
+        given: usize,
+        keywords: &[KeywordName],
+    ) -> String {
+        let count = code.call_signature.positional_count;
+        let required = code.parameters[..count]
+            .iter()
+            .filter(|parameter| !parameter.has_default)
+            .count();
+        let takes = if required == count {
+            format!(
+                "{count} positional argument{}",
+                if count == 1 { "" } else { "s" }
+            )
         } else {
-            let locals_base = self.execution.locals.len();
-            let stored = locals
-                .into_iter()
-                .map(|value| value.map(|value| self.store(value)))
-                .collect::<Vec<_>>();
-            self.execution.locals.extend(stored);
-            FrameEntry {
-                scope: None,
-                enclosing: closure,
-                locals_base: Some(locals_base),
-            }
+            format!("from {required} to {count} positional arguments")
         };
-        self.enter_python_function(function, &code, entry, method_frame, mode)
+        let keyword_only = keywords
+            .iter()
+            .filter(|keyword| {
+                code.parameters.iter().any(|parameter| {
+                    Some(parameter.name.as_str()) == keyword.as_deref()
+                        && parameter.kind == ParameterKind::KeywordOnly
+                })
+            })
+            .count();
+        let keyword_detail = if keyword_only == 0 {
+            String::new()
+        } else {
+            format!(
+                " positional argument{} (and {keyword_only} keyword-only argument{})",
+                if given == 1 { "" } else { "s" },
+                if keyword_only == 1 { "" } else { "s" }
+            )
+        };
+        let verb = if given == 1 && keyword_only == 0 {
+            "was"
+        } else {
+            "were"
+        };
+        let message = format!(
+            "{}() takes {takes} but {given}{keyword_detail} {verb} given",
+            self.function_name(&self.store(function))
+        );
+        self.raise_exception("TypeError", message)
+    }
+
+    /// Raise the `TypeError` for parameters without a default that neither the `filled`
+    /// positional slots nor `keywords` supply.
+    fn check_required_parameters(
+        &mut self,
+        function: Value<'s>,
+        code: &CodeRef,
+        filled: usize,
+        keywords: &[KeywordName],
+    ) -> Result<(), String> {
+        let missing = |keyword_only: bool| {
+            code.parameters
+                .iter()
+                .enumerate()
+                .filter(|(slot, parameter)| {
+                    let kind_matches = match parameter.kind {
+                        ParameterKind::PositionalOnly | ParameterKind::Positional => !keyword_only,
+                        ParameterKind::KeywordOnly => keyword_only,
+                        ParameterKind::Variadic | ParameterKind::KeywordVariadic => false,
+                    };
+                    let supplied = *slot < filled
+                        || keywords
+                            .iter()
+                            .any(|keyword| keyword.as_deref() == Some(parameter.name.as_str()));
+                    kind_matches && !supplied && !parameter.has_default
+                })
+                .map(|(_, parameter)| format!("'{}'", parameter.name))
+                .collect::<Vec<_>>()
+        };
+        for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
+            let names = missing(keyword_only);
+            if names.is_empty() {
+                continue;
+            }
+            let plural = if names.len() == 1 { "" } else { "s" };
+            let message = format!(
+                "{}() missing {} required {description} argument{plural}: {}",
+                self.function_name(&self.store(function)),
+                names.len(),
+                english_list(&names)
+            );
+            return Err(self.raise_exception("TypeError", message));
+        }
+        Ok(())
     }
 
     /// Run `code` for `function` in a frame whose locals are already bound. A deferred call
     /// leaves the frame installed for the dispatch loop; an immediate call runs it to
-    /// completion here. `method_frame` is the `(class, receiver)` pair zero-argument
-    /// `super()` sees while the frame runs.
+    /// completion here.
     fn enter_python_function(
         &mut self,
         function: Value<'s>,
         code: &CodeRef,
         entry: FrameEntry<'_>,
-        method_frame: Option<(Value<'s>, Value<'s>)>,
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
-        let pop_method_frame = method_frame.is_some();
-        if let Some((owner, receiver)) = method_frame {
-            let frame = (self.store(owner), self.store(receiver));
-            self.method_frames.push(frame);
-        }
+    ) -> Result<Flow, String> {
         self.call_depth += 1;
-        if let CallMode::Deferred(call_span) = mode {
+        if let CallMode::Deferred(_) = mode {
             let stack_base = self.stack.len();
-            let function_return = FunctionReturn {
-                function: self.store(function),
-                call_span,
-                pop_method_frame,
-            };
-            let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return))?;
+            let frame = self.enter_frame(code, 0, stack_base, entry, true)?;
             self.bytecode_frames.push(frame);
-            return Ok(CallResult::EnteredFrame);
+            return Ok(Flow::Refresh);
         }
         let result = self.execute_code(code, entry);
         self.call_depth -= 1;
-        if pop_method_frame {
-            self.method_frames.pop();
-        }
         match result {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
-            Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
-            Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
-            Ok(Execution::Yield(_, _)) => Err(format!(
+            Ok(Flow::Return(value)) => {
+                self.execution.stack.push_ref(&value);
+                Ok(Flow::Next)
+            }
+            Ok(Flow::Halt) => Ok(self.produce(Value::None)),
+            Ok(Flow::Yield(_)) => Err(format!(
                 "unexpected yield in ordinary function {}",
                 self.function_name(&self.store(function))
             )),
-            Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
+            Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+            Ok(flow) => unreachable!("an immediate call cannot end with {flow:?}"),
             Err((error, span)) => Err(format!(
                 "{error} in {} at line {}, column {}",
                 self.function_name(&self.store(function)),
@@ -1758,19 +1955,20 @@ impl<'s> Vm<'s> {
 
     fn create_generator(
         &mut self,
-        name: String,
+        function: Value<'s>,
         code: &CodeRef,
         closure: Option<Value<'s>>,
         locals: Vec<Option<Value<'s>>>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc_with(|builder| {
             Object::Generator(Box::new(GeneratorObject {
-                name,
+                function: builder.store(function),
                 code: code.clone(),
                 scope: builder.store(scope),
                 instruction_pointer: 0,
                 handlers: Vec::new(),
+                contexts: Vec::new(),
                 exceptions: Vec::new(),
                 stack: Vec::new(),
                 exhausted: false,
@@ -1778,7 +1976,7 @@ impl<'s> Vm<'s> {
                 return_value: builder.store(Value::None),
             }))
         })?;
-        Ok(CallResult::Value(generator))
+        Ok(self.produce(generator))
     }
 
     /// The frame entry for `exec`/`eval` code: no locals of its own, names resolved through the
@@ -1789,23 +1987,15 @@ impl<'s> Vm<'s> {
         let Some((base, code)) = self
             .bytecode_frames
             .last()
-            .and_then(|frame| Some((frame.locals_base?, frame.code.clone())))
+            .and_then(|frame| Some((frame.locals_base()?, frame.code.clone())))
         else {
-            return Ok(FrameEntry {
-                scope: None,
-                enclosing,
-                locals_base: None,
-            });
+            return Ok(FrameEntry::dynamic(enclosing));
         };
         let locals = (0..code.local_names.len())
             .map(|slot| self.handle_optional(self.locals.get(base + slot)?.as_ref()))
             .collect();
         let snapshot = self.function_scope(&code, enclosing, locals)?;
-        Ok(FrameEntry {
-            scope: None,
-            enclosing: Some(snapshot),
-            locals_base: None,
-        })
+        Ok(FrameEntry::dynamic(Some(snapshot)))
     }
 
     /// Allocate the heap scope of an activation whose locals must outlive the frame or be
@@ -1829,149 +2019,6 @@ impl<'s> Vm<'s> {
         )
     }
 
-    /// Bind one invocation directly into the compiler's local-slot layout.
-    fn bind_function_locals(
-        &mut self,
-        name: &str,
-        code: &CodeRef,
-        defaults: &[Value<'s>],
-        mut arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<Vec<Option<Value<'s>>>, String> {
-        let signature = &code.call_signature;
-        if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
-            let required = code.parameters[..signature.positional_count]
-                .iter()
-                .filter(|parameter| !parameter.has_default)
-                .count();
-            let takes = match (required, signature.positional_count) {
-                (required, count) if required == count => format!(
-                    "{count} positional argument{}",
-                    if count == 1 { "" } else { "s" }
-                ),
-                (required, count) => format!("from {required} to {count} positional arguments"),
-            };
-            let given = arguments.len();
-            let keyword_only = keyword_arguments
-                .iter()
-                .filter(|(keyword, _)| {
-                    code.parameters.iter().any(|parameter| {
-                        parameter.name == *keyword
-                            && parameter.kind == super::super::bytecode::ParameterKind::KeywordOnly
-                    })
-                })
-                .count();
-            let keyword_detail = if keyword_only == 0 {
-                String::new()
-            } else {
-                format!(
-                    " positional argument{} (and {keyword_only} keyword-only argument{})",
-                    if given == 1 { "" } else { "s" },
-                    if keyword_only == 1 { "" } else { "s" }
-                )
-            };
-            let verb = if given == 1 && keyword_only == 0 {
-                "was"
-            } else {
-                "were"
-            };
-            let message =
-                format!("{name}() takes {takes} but {given}{keyword_detail} {verb} given");
-            return Err(self.raise_exception("TypeError", message));
-        }
-        let extra_positional =
-            if signature.variadic_slot.is_some() && arguments.len() > signature.positional_count {
-                arguments.split_off(signature.positional_count)
-            } else {
-                Vec::new()
-            };
-        let mut locals = vec![None; code.local_names.len()];
-        for (slot, value) in arguments.into_iter().enumerate() {
-            locals[slot] = Some(value);
-        }
-        if let Some(slot) = signature.variadic_slot {
-            locals[slot] =
-                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extra_positional)))?);
-        }
-        let mut extra_keywords = Vec::new();
-        for (keyword, value) in keyword_arguments {
-            let slot = code.parameters.iter().position(|parameter| {
-                parameter.name == keyword
-                    && matches!(
-                        parameter.kind,
-                        super::super::bytecode::ParameterKind::Positional
-                            | super::super::bytecode::ParameterKind::KeywordOnly
-                    )
-            });
-            let Some(slot) = slot else {
-                if signature.keyword_variadic_slot.is_some() {
-                    let key = self.allocate_string(keyword)?;
-                    self.reserve_result(64)?;
-                    extra_keywords.push((key, value));
-                    continue;
-                }
-                let positional_only = code.parameters.iter().any(|parameter| {
-                    parameter.name == keyword
-                        && parameter.kind == super::super::bytecode::ParameterKind::PositionalOnly
-                });
-                let message = if positional_only {
-                    format!(
-                        "{name}() got some positional-only arguments passed as keyword \
-                         arguments: '{keyword}'"
-                    )
-                } else {
-                    format!("{name}() got an unexpected keyword argument '{keyword}'")
-                };
-                return Err(self.raise_exception("TypeError", message));
-            };
-            if locals[slot].replace(value).is_some() {
-                let message = format!("{name}() got multiple values for argument '{keyword}'");
-                return Err(self.raise_exception("TypeError", message));
-            }
-        }
-        if let Some(slot) = signature.keyword_variadic_slot {
-            locals[slot] = Some(self.allocate_dict(extra_keywords)?);
-        }
-        if defaults.len() != signature.default_slots.len() {
-            return Err(format!("{name}() has invalid default argument metadata"));
-        }
-        for (&slot, default) in signature.default_slots.iter().zip(defaults) {
-            if locals[slot].is_none() {
-                locals[slot] = Some(*default);
-            }
-        }
-        let missing = |keyword_only: bool| {
-            code.parameters
-                .iter()
-                .enumerate()
-                .filter(|(slot, parameter)| {
-                    let kind_matches = match parameter.kind {
-                        super::super::bytecode::ParameterKind::PositionalOnly
-                        | super::super::bytecode::ParameterKind::Positional => !keyword_only,
-                        super::super::bytecode::ParameterKind::KeywordOnly => keyword_only,
-                        _ => false,
-                    };
-                    kind_matches && locals[*slot].is_none() && !parameter.has_default
-                })
-                .map(|(_, parameter)| format!("'{}'", parameter.name))
-                .collect::<Vec<_>>()
-        };
-        for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
-            let names = missing(keyword_only);
-            if names.is_empty() {
-                continue;
-            }
-            let plural = if names.len() == 1 { "" } else { "s" };
-            let message = format!(
-                "{name}() missing {} required {description} argument{plural}: {}",
-                names.len(),
-                english_list(&names)
-            );
-            return Err(self.raise_exception("TypeError", message));
-        }
-        Ok(locals)
-    }
-
     /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
     /// A user iterator's `StopIteration` stays pending as an error, so callers that treat it as
     /// exhaustion check [`Self::pending_stop_iteration`].
@@ -1986,7 +2033,7 @@ impl<'s> Vm<'s> {
         constructor: Value<'s>,
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         // `__new__` is a static method that receives the class explicitly.
         let constructor = self
             .bind_type_attribute(constructor, None, class_type, owner)?
@@ -1994,17 +2041,13 @@ impl<'s> Vm<'s> {
         let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
         new_arguments.push(class);
         new_arguments.extend(arguments.iter().copied());
-        let created =
-            match self.invoke_call(constructor, new_arguments, keyword_arguments.clone())? {
-                CallResult::Value(value) => value,
-                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                    unreachable!("immediate call cannot suspend")
-                }
-            };
+        let flow = self.invoke_call(constructor, new_arguments, keyword_arguments.clone())?;
+        let created = match self.immediate_value(flow)? {
+            Ok(value) => value,
+            Err(flow) => return Ok(flow),
+        };
         if !self.is_instance(&created, &class)? {
-            return Ok(CallResult::Value(created));
+            return Ok(self.produce(created));
         }
         let layout = match self.get(class)? {
             Object::Class(class_object) => class_object.layout,
@@ -2027,25 +2070,22 @@ impl<'s> Vm<'s> {
                 .transpose()?
         };
         let Some((owner, initializer)) = initializer else {
-            return Ok(CallResult::Value(created));
+            return Ok(self.produce(created));
         };
         let initializer = self
             .bind_type_attribute(initializer, Some(created), class_type, owner)?
             .ok_or("__init__ descriptor has no value")?;
-        match self.invoke_call(initializer, arguments, keyword_arguments)? {
-            CallResult::Value(value) if value.is_none() => Ok(CallResult::Value(created)),
-            CallResult::Value(value) => {
+        let flow = self.invoke_call(initializer, arguments, keyword_arguments)?;
+        match self.immediate_value(flow)? {
+            Ok(value) if value.is_none() => Ok(self.produce(created)),
+            Ok(value) => {
                 let type_name = self.type_name_of(&value)?;
                 Err(self.raise_exception(
                     "TypeError",
                     format!("__init__() should return None, not '{type_name}'"),
                 ))
             }
-            CallResult::Exit(status) => Ok(CallResult::Exit(status)),
-            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+            Err(flow) => Ok(flow),
         }
     }
 
@@ -2058,7 +2098,7 @@ impl<'s> Vm<'s> {
         keyword_arguments: Vec<(String, Value<'s>)>,
     ) -> Result<Value<'s>, String> {
         match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
-            CallResult::Value(value) => Ok(value),
+            Flow::Next => self.pop(),
             _ => Err(format!("{}() did not produce a value", builtin.name())),
         }
     }
@@ -2353,7 +2393,7 @@ impl<'s> Vm<'s> {
     pub(super) fn resume_native_call(
         &mut self,
         pending: PendingNativeCall,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         /// The native a retried call invokes, with its receiver as a handle.
         #[derive(Clone, Copy)]
         enum Target<'v> {
@@ -2391,14 +2431,11 @@ impl<'s> Vm<'s> {
         };
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(value) => match self.pending_wait.take() {
-                Some(reason) => Ok(CallResult::Blocked(reason, value)),
-                None => Ok(CallResult::Value(value)),
-            },
+            Ok(value) => Ok(self.native_result(value)),
             Err(PyError {
                 kind: PyErrorKind::Exit(status),
                 ..
-            }) => Ok(CallResult::Exit(status)),
+            }) => Ok(Flow::Exit(status)),
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
@@ -2417,13 +2454,23 @@ impl<'s> Vm<'s> {
                         call_span,
                     },
                 };
-                Ok(CallResult::Retry(reason, retry))
+                Ok(self.suspend(reason, Some(retry)))
             }
             Err(error) => Err(self.record_native_error(error)),
         }
     }
 
-    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<CallResult<'s>, String> {
+    /// A native function's result goes on the stack; a wait it requested afterwards, through
+    /// `pending_wait`, blocks the process once the result is in place.
+    fn native_result(&mut self, value: Value<'s>) -> Flow {
+        self.push(value);
+        match self.pending_wait.take() {
+            Some(reason) => self.suspend(reason, None),
+            None => Flow::Next,
+        }
+    }
+
+    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<Flow, String> {
         let PendingNativeCall::Input { call_span } = pending else {
             unreachable!("caller checked the variant");
         };
@@ -2433,14 +2480,14 @@ impl<'s> Vm<'s> {
         let result = self.read_stream(&marker, None, true);
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(read) => self.finish_input(read).map(CallResult::Value),
+            Ok(read) => {
+                let value = self.finish_input(read)?;
+                Ok(self.produce(value))
+            }
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
-            }) => Ok(CallResult::Retry(
-                reason,
-                PendingNativeCall::Input { call_span },
-            )),
+            }) => Ok(self.suspend(reason, Some(PendingNativeCall::Input { call_span }))),
             Err(error) => Err(self.record_native_error(error)),
         }
     }
@@ -2465,6 +2512,32 @@ impl<'s> Vm<'s> {
             }
         }
         self.allocate_string(text)
+    }
+}
+
+/// Where a keyword argument lands in a signature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum KeywordTarget {
+    /// The local slot of a parameter the keyword may bind.
+    Slot(usize),
+    /// A positional-only parameter, which a keyword cannot bind.
+    PositionalOnly,
+    /// No parameter of that name; `**kwargs` collects it when the signature has one.
+    Unknown,
+}
+
+fn keyword_target(code: &CodeRef, name: &str) -> KeywordTarget {
+    match code
+        .parameters
+        .iter()
+        .position(|parameter| parameter.name == name)
+    {
+        Some(slot) => match code.parameters[slot].kind {
+            ParameterKind::Positional | ParameterKind::KeywordOnly => KeywordTarget::Slot(slot),
+            ParameterKind::PositionalOnly => KeywordTarget::PositionalOnly,
+            ParameterKind::Variadic | ParameterKind::KeywordVariadic => KeywordTarget::Unknown,
+        },
+        None => KeywordTarget::Unknown,
     }
 }
 

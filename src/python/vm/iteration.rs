@@ -7,9 +7,9 @@
 
 use super::super::heap::Ref;
 use super::{
-    exception_types, number, string, CallArgs, Execution, ForIterOutcome, FrameEntry,
-    IteratorAdvance, NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead,
-    RaisedException, Slot, SlotValue, Stream, Value, Vm,
+    dispatch::ResumePoint, exception_types, number, string, CallArgs, Flow, ForIterOutcome,
+    FrameEntry, IteratorAdvance, NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime,
+    PyStreamRead, RaisedException, Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// An exception on its way into or out of a generator frame, with its value as a handle so it
@@ -953,9 +953,11 @@ impl<'s> Vm<'s> {
             return Err("object is not a generator".into());
         };
         let code = state.code.clone();
+        let function = self.handle(&state.function);
         let scope = self.handle(&state.scope);
         let mut instruction_pointer = state.instruction_pointer;
         let mut handlers = state.handlers.clone();
+        let contexts = state.contexts.iter().map(Ref::dup).collect();
         let exhausted = state.exhausted;
         let running = state.running;
         let subiterator = self.handle_optional(state.stack.last());
@@ -1065,18 +1067,25 @@ impl<'s> Vm<'s> {
             (GeneratorResume::Throw(_), None) => unreachable!("an unhandled throw returned above"),
         };
         self.call_depth += 1;
-        let result =
-            self.execute_code_from(&code, start, &mut handlers, 0, FrameEntry::scoped(scope));
+        let mut resume = ResumePoint {
+            instruction_pointer: start,
+            handlers,
+            contexts,
+        };
+        let entry = FrameEntry::function(function, scope);
+        let result = self.execute_code_from(&code, &mut resume, 0, entry);
         self.call_depth -= 1;
+        let ResumePoint {
+            instruction_pointer: next_instruction,
+            handlers,
+            contexts,
+        } = resume;
         // Re-root the frame's result before anything below can allocate.
-        let result = result.map(|execution| match execution {
-            Execution::Pending => unreachable!("execute_code_from drains pending quanta"),
-            Execution::Blocked(_) => unreachable!("generator execution cannot suspend"),
-            Execution::Yield(value, next_instruction) => {
-                GeneratorStep::Yielded(self.handle(&value), next_instruction)
-            }
-            Execution::Return(value) => GeneratorStep::Returned(self.handle(&value)),
-            Execution::Halt | Execution::Exit(_) => GeneratorStep::Finished,
+        let result = result.map(|flow| match flow {
+            Flow::Yield(value) => GeneratorStep::Yielded(self.handle(&value), next_instruction),
+            Flow::Return(value) => GeneratorStep::Returned(self.handle(&value)),
+            Flow::Halt | Flow::Exit(_) => GeneratorStep::Finished,
+            flow => unreachable!("a generator step cannot end with {flow:?}"),
         });
         let generator_exceptions = std::mem::take(&mut self.execution.exception_stack)
             .into_iter()
@@ -1097,6 +1106,7 @@ impl<'s> Vm<'s> {
                     if let Object::Generator(state) = object {
                         state.instruction_pointer = next_instruction;
                         state.handlers = handlers;
+                        state.contexts = contexts;
                         state.exceptions = generator_exceptions
                             .into_iter()
                             .map(|(kind, value)| (kind, builder.store(value)))

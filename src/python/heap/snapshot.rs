@@ -145,11 +145,12 @@ pub(super) fn dup_object(object: &Object) -> Object {
         },
         Object::StreamIterator { binary } => Object::StreamIterator { binary: *binary },
         Object::Generator(generator) => Object::Generator(Box::new(GeneratorObject {
-            name: generator.name.clone(),
+            function: generator.function.dup(),
             code: generator.code.clone(),
             scope: generator.scope.dup(),
             instruction_pointer: generator.instruction_pointer,
             handlers: generator.handlers.clone(),
+            contexts: slots(&generator.contexts),
             exceptions: generator
                 .exceptions
                 .iter()
@@ -169,6 +170,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
             uses_repl_globals: scope.uses_repl_globals,
             local_names: scope.local_names.clone(),
             locals: scope.locals.iter().map(optional).collect(),
+            order: scope.order.clone(),
             values: named(&scope.values),
         })),
         Object::NamespaceDict(target) => Object::NamespaceDict(match target {

@@ -8,7 +8,7 @@ use std::cmp::Ordering;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
-use super::ast::{BinaryOperator, ComparisonOperator};
+use super::ast::{BinaryOperator, ComparisonOperator, UnaryOperator};
 use super::hash;
 use super::heap::{Heap, Object, Value};
 use super::native::{
@@ -1630,6 +1630,27 @@ enum UnaryNumericOperation {
     Absolute,
 }
 
+/// Negate, invert or copy an exact builtin number without consulting Python type slots, as
+/// [`exact_binary`] does for the binary operators. Only immediate ints, bools and floats enter;
+/// `None` leaves everything else, including `not`, to the slot protocol.
+#[inline]
+pub(super) fn exact_unary<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    operator: UnaryOperator,
+    value: PyValue<'s>,
+) -> PyResult<'s, Option<PyValue<'s>>> {
+    let operation = match operator {
+        UnaryOperator::Positive => UnaryNumericOperation::Positive,
+        UnaryOperator::Negative => UnaryNumericOperation::Negative,
+        UnaryOperator::Invert => UnaryNumericOperation::Invert,
+        UnaryOperator::Not => return Ok(None),
+    };
+    let Some(number) = exact_number(value) else {
+        return Ok(None);
+    };
+    unary_number(runtime, number, operation)
+}
+
 fn slot_unary<'s>(
     runtime: &mut dyn PyRuntime<'s>,
     value: PyValue<'s>,
@@ -1638,6 +1659,14 @@ fn slot_unary<'s>(
     let Some(value) = try_number(runtime, value)? else {
         return Ok(None);
     };
+    unary_number(runtime, value, operation)
+}
+
+fn unary_number<'s>(
+    runtime: &mut dyn PyRuntime<'s>,
+    value: PyNumber,
+    operation: UnaryNumericOperation,
+) -> PyResult<'s, Option<PyValue<'s>>> {
     match value {
         PyNumber::Float(value) => Ok(match operation {
             UnaryNumericOperation::Positive => Some(PyValue::Float(value)),
