@@ -10,8 +10,9 @@ use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
     ClassField, ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution,
-    HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
-    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    FrameEntry, HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime,
+    RaisedException, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm,
+    MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -1988,7 +1989,7 @@ impl<'s> Vm<'s> {
             .execution
             .stack
             .split_off(&self.state.heap, defaults_start);
-        let mut closure = self.handle_optional(self.local_scopes.last());
+        let mut closure = self.lookup_scope();
         let class_scope = self.handle_optional(self.class_scopes.last());
         if let (Some(scope), Some(class_scope)) = (closure, class_scope) {
             if self.identical(scope, class_scope) {
@@ -2256,7 +2257,7 @@ impl<'s> Vm<'s> {
                 prepared_namespace.insert("__module__".into(), module);
             }
         }
-        let parent = self.handle_optional(self.local_scopes.last());
+        let parent = self.lookup_scope();
         let uses_repl_globals = parent
             .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
@@ -2264,17 +2265,14 @@ impl<'s> Vm<'s> {
         let scope =
             self.alloc_scope_named(parent, uses_repl_globals, Arc::from([]), prepared_namespace)?;
         let stored = self.store(scope);
-        self.local_scopes.push(stored);
-        let stored = self.store(scope);
         self.class_scopes.push(stored);
         self.class_bindings.push(Vec::new());
-        let execution = self.execute_code(code);
+        let execution = self.execute_code(code, FrameEntry::scoped(scope));
         let bindings = self
             .class_bindings
             .pop()
             .expect("class binding stack is present");
         self.class_scopes.pop();
-        self.local_scopes.pop();
         match execution {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
@@ -2617,7 +2615,7 @@ impl<'s> Vm<'s> {
     }
 
     fn current_module_name(&mut self) -> Result<Option<Value<'s>>, String> {
-        let scope = self.handle_optional(self.local_scopes.last());
+        let scope = self.lookup_scope();
         self.module_name_of(scope)
     }
 

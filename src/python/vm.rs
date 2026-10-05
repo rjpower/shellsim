@@ -522,6 +522,9 @@ impl VmProgram {
                 code: self.code.clone(),
                 instruction_pointer: 0,
                 stack_base: 0,
+                locals_base: None,
+                scope: None,
+                enclosing: None,
                 handlers: Vec::new(),
                 exception_base: 0,
                 function_return: None,
@@ -620,7 +623,9 @@ pub(super) struct ProcessInput<'a> {
 struct VmState {
     stack: ValueStack,
     bytecode_frames: Vec<BytecodeFrame>,
-    local_scopes: Vec<Ref>,
+    /// Local slots of every frame that keeps its locals in the VM, frames stacked in call
+    /// order; `None` is an unbound local. Rooted like the operand stack.
+    locals: Vec<Option<Ref>>,
     class_scopes: Vec<Ref>,
     class_bindings: Vec<Vec<String>>,
     call_depth: usize,
@@ -667,7 +672,11 @@ impl Clone for VmState {
         Self {
             stack: self.stack.clone(),
             bytecode_frames: self.bytecode_frames.clone(),
-            local_scopes: self.local_scopes.iter().map(Ref::dup).collect(),
+            locals: self
+                .locals
+                .iter()
+                .map(|slot| slot.as_ref().map(Ref::dup))
+                .collect(),
             class_scopes: self.class_scopes.iter().map(Ref::dup).collect(),
             class_bindings: self.class_bindings.clone(),
             call_depth: self.call_depth,
@@ -699,12 +708,10 @@ impl Clone for VmState {
 impl Roots for VmState {
     fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
         self.stack.visit_refs(visitor);
-        for slot in self
-            .local_scopes
-            .iter_mut()
-            .chain(&mut self.class_scopes)
-            .chain(&mut self.with_contexts)
-        {
+        for slot in self.locals.iter_mut().flatten() {
+            visitor(slot);
+        }
+        for slot in self.class_scopes.iter_mut().chain(&mut self.with_contexts) {
             visitor(slot);
         }
         if let Some(exception) = &mut self.pending_exception {
@@ -718,6 +725,9 @@ impl Roots for VmState {
             visitor(receiver);
         }
         for frame in &mut self.bytecode_frames {
+            for slot in frame.scope.iter_mut().chain(&mut frame.enclosing) {
+                visitor(slot);
+            }
             match &mut frame.pending_native_call {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
@@ -867,12 +877,25 @@ struct LoadAttributeCache {
 }
 
 /// An executing code object's resumable control state.
-#[derive(Clone)]
+///
+/// Names resolve through two optional heap scopes. `scope` is the frame's own scope: module
+/// and class bodies, generators, and functions whose code sets
+/// [`CallSignature::heap_locals`](super::bytecode::CallSignature) bind their names there.
+/// Every other function keeps its local slots in the VM's shared `locals` stack from
+/// `locals_base` and resolves free names through `enclosing`, the function's closure. The
+/// main program and `exec`/`eval` code own neither and fall through to the global table.
 struct BytecodeFrame {
     code: CodeRef,
     instruction_pointer: usize,
     /// First operand owned by this frame in the VM's shared value stack.
     stack_base: usize,
+    /// First slot owned by this frame in the VM's shared locals stack, when its locals live
+    /// there rather than in `scope`.
+    locals_base: Option<usize>,
+    /// The frame's own heap scope, holding its locals and dynamically bound names.
+    scope: Option<Ref>,
+    /// Where free-name lookup continues for a frame without a scope of its own.
+    enclosing: Option<Ref>,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     handlers: Vec<(usize, usize, usize)>,
     /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
@@ -881,6 +904,61 @@ struct BytecodeFrame {
     exception_base: usize,
     function_return: Option<FunctionReturn>,
     pending_native_call: Option<PendingNativeCall>,
+}
+
+impl Clone for BytecodeFrame {
+    fn clone(&self) -> Self {
+        Self {
+            code: self.code.clone(),
+            instruction_pointer: self.instruction_pointer,
+            stack_base: self.stack_base,
+            locals_base: self.locals_base,
+            scope: self.scope.as_ref().map(Ref::dup),
+            enclosing: self.enclosing.as_ref().map(Ref::dup),
+            handlers: self.handlers.clone(),
+            exception_base: self.exception_base,
+            function_return: self.function_return.clone(),
+            pending_native_call: self.pending_native_call.clone(),
+        }
+    }
+}
+
+impl BytecodeFrame {
+    /// The scope free names resolve through: the frame's own, else its closure.
+    fn lookup_scope(&self) -> Option<&Ref> {
+        self.scope.as_ref().or(self.enclosing.as_ref())
+    }
+}
+
+/// The scopes and local slots a new frame starts with. See [`BytecodeFrame`].
+struct FrameEntry<'v> {
+    scope: Option<Value<'v>>,
+    enclosing: Option<Value<'v>>,
+    /// Bound local slots for a frame that keeps them in the VM rather than in `scope`.
+    locals: Option<Vec<Option<Value<'v>>>>,
+}
+
+impl FrameEntry<'_> {
+    /// A frame whose names all live in `scope`: module and class bodies, generators, and
+    /// functions with heap-resident locals.
+    fn scoped(scope: Value<'_>) -> FrameEntry<'_> {
+        FrameEntry {
+            scope: Some(scope),
+            enclosing: None,
+            locals: None,
+        }
+    }
+}
+
+/// Where the active frame's local slots live, fixed for one dispatch quantum.
+#[derive(Clone, Copy)]
+enum LocalsLocation {
+    /// Slots start at this index of the VM's shared locals stack.
+    Stack(usize),
+    /// Slots live in the frame's heap scope.
+    Heap,
+    /// The code declares no local slots.
+    None,
 }
 
 /// Hot dispatch state retained in registers for one scheduler quantum.
@@ -892,6 +970,7 @@ struct DispatchCursor {
     code: CodeRef,
     code_cache: usize,
     op_index: usize,
+    locals: LocalsLocation,
 }
 
 /// Control-flow effect of one successfully decoded opcode.
@@ -993,11 +1072,17 @@ impl DispatchCursor {
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
         let op_index = frame.instruction_pointer;
+        let locals = match (frame.locals_base, &frame.scope) {
+            (Some(base), _) => LocalsLocation::Stack(base),
+            (None, Some(_)) => LocalsLocation::Heap,
+            (None, None) => LocalsLocation::None,
+        };
         let code_cache = vm.ensure_code_cache(&code)?;
         Ok(Self {
             code,
             code_cache,
             op_index,
+            locals,
         })
     }
 

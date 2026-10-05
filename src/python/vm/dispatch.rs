@@ -3,37 +3,39 @@
 use super::super::scopes;
 use super::{
     dispatch_next, exception_types, protocol, string, BytecodeFrame, CallId, CallMode, CallResult,
-    CodeRef, DispatchControl, DispatchCursor, ExceptionType, Execution, ForIterOutcome,
-    FunctionReturn, NativeValue, Opcode, RaisedException, SequenceKind, TracebackFrame, Value, Vm,
-    VM_POLL_QUANTUM,
+    CodeRef, DispatchControl, DispatchCursor, ExceptionType, Execution, ForIterOutcome, FrameEntry,
+    FunctionReturn, LocalsLocation, NativeValue, Opcode, RaisedException, SequenceKind,
+    TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
 };
 
 impl<'s> Vm<'s> {
+    /// Run `code` to completion in a new frame, synchronously.
     pub(super) fn execute_code(
         &mut self,
         code: &CodeRef,
+        entry: FrameEntry<'_>,
     ) -> Result<Execution, (String, super::super::source::Span)> {
         let mut handlers: Vec<(usize, usize, usize)> = Vec::new();
         let stack_base = self.stack.len();
-        self.execute_code_from(code, 0, &mut handlers, stack_base)
+        self.execute_code_from(code, 0, &mut handlers, stack_base, entry)
     }
 
+    /// Run `code` from `instruction_pointer` in a new frame, synchronously, as `execute_code`
+    /// does for a fresh start and generator resumption does from a suspension point.
     pub(super) fn execute_code_from(
         &mut self,
         code: &CodeRef,
         instruction_pointer: usize,
         handlers: &mut Vec<(usize, usize, usize)>,
         stack_base: usize,
+        entry: FrameEntry<'_>,
     ) -> Result<Execution, (String, super::super::source::Span)> {
         let exception_base = self.exception_stack.len();
+        let frame = self.enter_frame(code, instruction_pointer, stack_base, entry, None);
         self.bytecode_frames.push(BytecodeFrame {
-            code: code.clone(),
-            instruction_pointer,
-            stack_base,
             handlers: std::mem::take(handlers),
             exception_base,
-            function_return: None,
-            pending_native_call: None,
+            ..frame
         });
         self.synchronous_frames += 1;
         let result = loop {
@@ -51,8 +53,46 @@ impl<'s> Vm<'s> {
             self.stack.truncate(frame.stack_base);
             self.exception_stack.truncate(frame.exception_base);
         }
+        if let Some(base) = frame.locals_base {
+            self.locals.truncate(base);
+        }
         *handlers = frame.handlers;
         result
+    }
+
+    /// Build a frame for `code`, moving `entry`'s local slots onto the locals stack.
+    ///
+    /// The frame owns the slots pushed here; popping it truncates the locals stack back to
+    /// `locals_base`. `handlers` and `exception_base` start empty and at the current depth.
+    pub(super) fn enter_frame(
+        &mut self,
+        code: &CodeRef,
+        instruction_pointer: usize,
+        stack_base: usize,
+        entry: FrameEntry<'_>,
+        function_return: Option<FunctionReturn>,
+    ) -> BytecodeFrame {
+        let locals_base = entry.locals.map(|locals| {
+            let base = self.execution.locals.len();
+            let stored = locals
+                .into_iter()
+                .map(|value| value.map(|value| self.store(value)))
+                .collect::<Vec<_>>();
+            self.execution.locals.extend(stored);
+            base
+        });
+        BytecodeFrame {
+            code: code.clone(),
+            instruction_pointer,
+            stack_base,
+            locals_base,
+            scope: entry.scope.map(|scope| self.store(scope)),
+            enclosing: entry.enclosing.map(|scope| self.store(scope)),
+            handlers: Vec::new(),
+            exception_base: self.exception_stack.len(),
+            function_return,
+            pending_native_call: None,
+        }
     }
 
     pub(super) fn execute_active_frame(
@@ -115,8 +155,8 @@ impl<'s> Vm<'s> {
                         .map_err(|error| (error, dispatch.span()))?;
                     dispatch_next(vm.store_name(symbol, code.name(name)))
                 }
-                Opcode::LoadLocal(slot) => dispatch_next(vm.load_fast(slot)),
-                Opcode::StoreLocal(slot) => dispatch_next(vm.store_fast(slot)),
+                Opcode::LoadLocal(slot) => dispatch_next(vm.load_fast(dispatch.locals, slot)),
+                Opcode::StoreLocal(slot) => dispatch_next(vm.store_fast(dispatch.locals, slot)),
                 Opcode::StoreEnclosing { name, scope_hops } => {
                     let symbol = vm
                         .symbol_for(code, code_cache, name)
@@ -157,7 +197,7 @@ impl<'s> Vm<'s> {
                         .symbol_for(code, code_cache, name)
                         .map_err(|error| (error, dispatch.span()))?;
                     let name = code.name(name);
-                    let scope = vm.handle_optional(vm.local_scopes.last());
+                    let scope = vm.active_scope();
                     let result = if let Some(scope) = scope {
                         scopes::remove(&mut vm.state.heap, scope, name).map(|_| ())
                     } else {
@@ -166,7 +206,7 @@ impl<'s> Vm<'s> {
                     };
                     dispatch_next(result)
                 }
-                Opcode::DeleteLocal(slot) => dispatch_next(vm.delete_local(slot)),
+                Opcode::DeleteLocal(slot) => dispatch_next(vm.delete_local(dispatch.locals, slot)),
                 Opcode::DeleteGlobal(name) => {
                     let symbol = vm
                         .symbol_for(code, code_cache, name)
@@ -766,14 +806,26 @@ impl<'s> Vm<'s> {
     /// `LoadLocal`: copy a local slot's stored reference onto the operand stack without making
     /// a handle.
     #[inline(always)]
-    fn load_fast(&mut self, slot: usize) -> Result<(), String> {
-        let scope = self.handle(
-            self.local_scopes
-                .last()
-                .ok_or("local bytecode requires a lexical scope")?,
-        );
-        let value = scopes::local_ref(&self.state.heap, scope, slot)?
-            .ok_or_else(|| "local variable referenced before assignment".to_string())?;
+    fn load_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
+        let value = match locals {
+            LocalsLocation::Stack(base) => {
+                let value = self
+                    .execution
+                    .locals
+                    .get(base + slot)
+                    .and_then(Option::as_ref)
+                    .ok_or("local variable referenced before assignment")?
+                    .dup();
+                self.execution.stack.push_ref(&value);
+                return Ok(());
+            }
+            LocalsLocation::Heap => {
+                let scope = self.active_scope().expect("heap locals have a scope");
+                scopes::local_ref(&self.state.heap, scope, slot)?
+            }
+            LocalsLocation::None => return Err("local bytecode requires local slots".into()),
+        };
+        let value = value.ok_or("local variable referenced before assignment")?;
         self.execution.stack.push_ref(value);
         Ok(())
     }
@@ -781,7 +833,7 @@ impl<'s> Vm<'s> {
     /// `StoreLocal`: move the operand stack's top reference into a local slot without making a
     /// handle for it.
     #[inline(always)]
-    fn store_fast(&mut self, slot: usize) -> Result<(), String> {
+    fn store_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -790,12 +842,40 @@ impl<'s> Vm<'s> {
             .stack
             .pop_ref()
             .expect("non-empty frame stack was checked");
-        let scope = self.handle(
-            self.local_scopes
-                .last()
-                .ok_or("local bytecode requires a lexical scope")?,
-        );
-        scopes::store_local_ref(&mut self.state.heap, scope, slot, value)
+        match locals {
+            LocalsLocation::Stack(base) => {
+                let local = self
+                    .locals
+                    .get_mut(base + slot)
+                    .ok_or("invalid local slot")?;
+                *local = Some(value);
+                Ok(())
+            }
+            LocalsLocation::Heap => {
+                let scope = self.active_scope().expect("heap locals have a scope");
+                scopes::store_local_ref(&mut self.state.heap, scope, slot, value)
+            }
+            LocalsLocation::None => Err("local bytecode requires local slots".into()),
+        }
+    }
+
+    /// `DeleteLocal`: unbind a local slot.
+    fn delete_local(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
+        match locals {
+            LocalsLocation::Stack(base) => {
+                let local = self
+                    .locals
+                    .get_mut(base + slot)
+                    .ok_or("invalid local slot")?;
+                *local = None;
+                Ok(())
+            }
+            LocalsLocation::Heap => {
+                let scope = self.active_scope().expect("heap locals have a scope");
+                scopes::remove_local(&mut self.state.heap, scope, slot).map(|_| ())
+            }
+            LocalsLocation::None => Err("local bytecode requires local slots".into()),
+        }
     }
 
     fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
@@ -862,7 +942,7 @@ impl<'s> Vm<'s> {
     /// the scope chain, so its frames find no `__file__` here.
     fn imported_module_file(&self) -> Option<String> {
         let heap = &self.state.heap;
-        let root = scopes::root(heap, self.handle(self.local_scopes.last()?)).ok()?;
+        let root = scopes::root(heap, self.lookup_scope()?).ok()?;
         let file = scopes::get(heap, root, "__file__").ok()??;
         string::string_value(heap, file).ok().flatten()
     }
@@ -879,9 +959,9 @@ impl<'s> Vm<'s> {
             .function_return
             .expect("deferred function frame must own return state");
         self.call_depth = self.call_depth.saturating_sub(1);
-        self.local_scopes
-            .pop()
-            .expect("deferred function frame must own a local scope");
+        if let Some(base) = frame.locals_base {
+            self.locals.truncate(base);
+        }
         if function_return.pop_method_frame {
             self.method_frames
                 .pop()

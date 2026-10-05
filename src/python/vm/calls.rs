@@ -5,8 +5,8 @@ use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
-    BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
-    ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, NativeValue, Object,
+    CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, ExceptionType,
+    Execution, FrameEntry, FunctionInvocation, FunctionReturn, HashMap, NativeValue, Object,
     PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot,
     StoredCallArgs, Stream, Value, Vm,
 };
@@ -604,7 +604,8 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 1, 1)?;
                 let program = self.parse_dynamic_source("exec", &arguments[0])?;
                 let code = super::super::compiler::compile(program);
-                match self.execute_code(&code) {
+                let entry = self.dynamic_code_entry()?;
+                match self.execute_code(&code, entry) {
                     Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
                     Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
                     Ok(
@@ -630,7 +631,8 @@ impl<'s> Vm<'s> {
                     _ => return Err(self.raise_exception("SyntaxError", "invalid syntax")),
                 };
                 let code = super::super::compiler::compile_expression(expression);
-                match self.execute_code(&code) {
+                let entry = self.dynamic_code_entry()?;
+                match self.execute_code(&code, entry) {
                     Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
                     Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
                     Ok(
@@ -1637,32 +1639,31 @@ impl<'s> Vm<'s> {
         if self.call_depth == MAX_CALL_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
-        let scope =
-            self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
-        let scope = self.store(scope);
-        self.local_scopes.push(scope);
+        let locals =
+            self.bind_function_locals(name, code, defaults, arguments, keyword_arguments)?;
+        let entry = if code.call_signature.heap_locals {
+            FrameEntry::scoped(self.function_scope(code, closure, locals)?)
+        } else {
+            FrameEntry {
+                scope: None,
+                enclosing: closure,
+                locals: Some(locals),
+            }
+        };
         self.call_depth += 1;
         if let CallMode::Deferred(call_span) = mode {
             let stack_base = self.stack.len();
-            let exception_base = self.exception_stack.len();
-            self.bytecode_frames.push(BytecodeFrame {
-                code: code.clone(),
-                instruction_pointer: 0,
-                stack_base,
-                handlers: Vec::new(),
-                exception_base,
-                function_return: Some(FunctionReturn {
-                    name: name.to_string(),
-                    call_span,
-                    pop_method_frame,
-                }),
-                pending_native_call: None,
-            });
+            let function_return = FunctionReturn {
+                name: name.to_string(),
+                call_span,
+                pop_method_frame,
+            };
+            let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return));
+            self.bytecode_frames.push(frame);
             return Ok(CallResult::EnteredFrame);
         }
-        let result = self.execute_code(code);
+        let result = self.execute_code(code, entry);
         self.call_depth -= 1;
-        self.local_scopes.pop();
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
@@ -1688,8 +1689,9 @@ impl<'s> Vm<'s> {
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
     ) -> Result<CallResult<'s>, String> {
-        let scope =
-            self.bind_function_scope(name, code, closure, defaults, arguments, keyword_arguments)?;
+        let locals =
+            self.bind_function_locals(name, code, defaults, arguments, keyword_arguments)?;
+        let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc_with(|builder| {
             Object::Generator(Box::new(GeneratorObject {
                 name: name.to_string(),
@@ -1707,17 +1709,63 @@ impl<'s> Vm<'s> {
         Ok(CallResult::Value(generator))
     }
 
-    /// Bind one invocation directly into the compiler's local-slot layout, returning the new
-    /// scope.
-    fn bind_function_scope(
+    /// The frame entry for `exec`/`eval` code: no locals of its own, names resolved through the
+    /// calling frame's scope. A caller that keeps its locals in the frame exposes a snapshot of
+    /// them, which the dynamic code can read but, as in CPython, not rebind.
+    fn dynamic_code_entry(&mut self) -> Result<FrameEntry<'s>, String> {
+        let enclosing = self.lookup_scope();
+        let Some((base, code)) = self
+            .bytecode_frames
+            .last()
+            .and_then(|frame| Some((frame.locals_base?, frame.code.clone())))
+        else {
+            return Ok(FrameEntry {
+                scope: None,
+                enclosing,
+                locals: None,
+            });
+        };
+        let locals = (0..code.local_names.len())
+            .map(|slot| self.handle_optional(self.locals.get(base + slot)?.as_ref()))
+            .collect();
+        let snapshot = self.function_scope(&code, enclosing, locals)?;
+        Ok(FrameEntry {
+            scope: None,
+            enclosing: Some(snapshot),
+            locals: None,
+        })
+    }
+
+    /// Allocate the heap scope of an activation whose locals must outlive the frame or be
+    /// visible to nested scopes.
+    fn function_scope(
+        &mut self,
+        code: &CodeRef,
+        closure: Option<Value<'s>>,
+        locals: Vec<Option<Value<'s>>>,
+    ) -> Result<Value<'s>, String> {
+        let uses_repl_globals = closure
+            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
+            .transpose()?
+            .unwrap_or(true);
+        self.alloc_scope(
+            closure,
+            uses_repl_globals,
+            code.local_names.clone(),
+            locals,
+            HashMap::new(),
+        )
+    }
+
+    /// Bind one invocation directly into the compiler's local-slot layout.
+    fn bind_function_locals(
         &mut self,
         name: &str,
         code: &CodeRef,
-        closure: Option<Value<'s>>,
         defaults: &[Value<'s>],
         mut arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<Value<'s>, String> {
+    ) -> Result<Vec<Option<Value<'s>>>, String> {
         let signature = &code.call_signature;
         if signature.variadic_slot.is_none() && arguments.len() > signature.positional_count {
             let required = code.parameters[..signature.positional_count]
@@ -1849,17 +1897,7 @@ impl<'s> Vm<'s> {
             );
             return Err(self.raise_exception("TypeError", message));
         }
-        let uses_repl_globals = closure
-            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
-            .transpose()?
-            .unwrap_or(true);
-        self.alloc_scope(
-            closure,
-            uses_repl_globals,
-            code.local_names.clone(),
-            locals,
-            HashMap::new(),
-        )
+        Ok(locals)
     }
 
     /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.

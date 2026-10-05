@@ -7,9 +7,9 @@
 
 use super::super::heap::Ref;
 use super::{
-    exception_types, number, string, CallArgs, Execution, ForIterOutcome, IteratorAdvance,
-    NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException,
-    Slot, SlotValue, Stream, Value, Vm,
+    exception_types, number, string, CallArgs, Execution, ForIterOutcome, FrameEntry,
+    IteratorAdvance, NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead,
+    RaisedException, Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// An exception on its way into or out of a generator frame, with its value as a handle so it
@@ -1062,12 +1062,10 @@ impl<'s> Vm<'s> {
             }
             (GeneratorResume::Throw(_), None) => unreachable!("an unhandled throw returned above"),
         };
-        let scope = self.store(scope);
-        self.local_scopes.push(scope);
         self.call_depth += 1;
-        let result = self.execute_code_from(&code, start, &mut handlers, 0);
+        let result =
+            self.execute_code_from(&code, start, &mut handlers, 0, FrameEntry::scoped(scope));
         self.call_depth -= 1;
-        self.local_scopes.pop();
         // Re-root the frame's result before anything below can allocate.
         let result = result.map(|execution| match execution {
             Execution::Pending => unreachable!("execute_code_from drains pending quanta"),

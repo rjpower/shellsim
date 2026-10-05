@@ -69,6 +69,11 @@ pub struct Code {
 pub struct CallSignature {
     pub is_generator: bool,
     pub is_coroutine: bool,
+    /// Whether an activation's local slots must live in a heap scope object rather than in the
+    /// VM's frame. Nested functions and classes resolve enclosing names by walking heap scopes,
+    /// and a generator's locals outlive each resumption, so such code keeps a scope; every other
+    /// function binds its locals in the frame and never allocates per call.
+    pub heap_locals: bool,
     pub positional_count: usize,
     pub variadic_slot: Option<usize>,
     pub keyword_variadic_slot: Option<usize>,
@@ -589,11 +594,19 @@ impl CodeBuilder {
                 )
             })
             .count();
+        let is_generator = instructions.iter().any(|instruction| {
+            matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
+        });
+        let defines_scopes = instructions.iter().any(|instruction| {
+            matches!(
+                instruction.opcode,
+                Opcode::MakeFunction(_) | Opcode::MakeClass(_)
+            )
+        });
         let call_signature = CallSignature {
-            is_generator: instructions.iter().any(|instruction| {
-                matches!(instruction.opcode, Opcode::Yield | Opcode::YieldFromSend(_))
-            }),
+            is_generator,
             is_coroutine,
+            heap_locals: is_generator || is_coroutine || defines_scopes,
             positional_count,
             variadic_slot: parameters
                 .iter()
