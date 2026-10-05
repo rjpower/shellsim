@@ -75,6 +75,11 @@ pub struct CallSignature {
     /// function binds its locals in the frame and never allocates per call.
     pub heap_locals: bool,
     pub positional_count: usize,
+    /// Positional parameters without a default, which every call must supply.
+    pub required_positional: usize,
+    /// Whether some keyword-only parameter has no default, so a positional-only call cannot
+    /// bind the signature.
+    pub keyword_only_required: bool,
     pub variadic_slot: Option<usize>,
     pub keyword_variadic_slot: Option<usize>,
     pub default_slots: Box<[usize]>,
@@ -608,6 +613,13 @@ impl CodeBuilder {
             is_coroutine,
             heap_locals: is_generator || is_coroutine || defines_scopes,
             positional_count,
+            required_positional: parameters[..positional_count]
+                .iter()
+                .filter(|parameter| !parameter.has_default)
+                .count(),
+            keyword_only_required: parameters.iter().any(|parameter| {
+                parameter.kind == ParameterKind::KeywordOnly && !parameter.has_default
+            }),
             variadic_slot: parameters
                 .iter()
                 .position(|parameter| parameter.kind == ParameterKind::Variadic),

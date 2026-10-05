@@ -6,9 +6,9 @@ use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, ExceptionType,
-    Execution, FrameEntry, FunctionInvocation, FunctionReturn, HashMap, NativeValue, Object,
-    PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot,
-    StoredCallArgs, Stream, Value, Vm,
+    Execution, FrameEntry, FunctionReturn, HashMap, NativeValue, Object, PendingNativeCall,
+    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot, StoredCallArgs, Stream,
+    Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
 
@@ -204,6 +204,11 @@ impl<'s> Vm<'s> {
         if self.frame_stack_len() < count + 1 {
             return Err("invalid bytecode stack effect".into());
         }
+        if keyword_names.is_empty() && !starred.contains(&true) {
+            if let Some(result) = self.call_python_direct(positional, mode)? {
+                return Ok(result);
+            }
+        }
         let arguments_start = self.stack.len() - count;
         let mut raw_arguments = self
             .execution
@@ -305,75 +310,28 @@ impl<'s> Vm<'s> {
                 },
             };
             return match callee {
-                Callee::Function => {
-                    let FunctionParts {
-                        name,
-                        code,
-                        closure,
-                        defaults,
-                        defining_class,
-                    } = self
-                        .function_parts(function)?
-                        .ok_or("function changed object kind")?;
-                    let method_frame = defining_class.zip(arguments.first().copied());
-                    if let Some((owner, receiver)) = method_frame {
-                        let frame = (self.store(owner), self.store(receiver));
-                        self.method_frames.push(frame);
-                    }
-                    let result = self.call_python_function(
-                        &name,
-                        &code,
-                        closure,
-                        &defaults,
-                        FunctionInvocation {
-                            arguments,
-                            keyword_arguments,
-                            mode,
-                            pop_method_frame: method_frame.is_some(),
-                        },
-                    );
-                    if method_frame.is_some() && !matches!(result, Ok(CallResult::EnteredFrame)) {
-                        self.method_frames.pop();
-                    }
-                    result
-                }
+                Callee::Function => self.call_python_general(
+                    function,
+                    None,
+                    None,
+                    arguments,
+                    keyword_arguments,
+                    mode,
+                ),
                 Callee::BoundMethod {
                     receiver,
                     descriptor,
                     owner,
                 } => {
                     if descriptor.is_object() {
-                        let Some(FunctionParts {
-                            name,
-                            code,
-                            closure,
-                            defaults,
-                            ..
-                        }) = self.function_parts(descriptor)?
-                        else {
-                            return Err("bound descriptor is not callable".into());
-                        };
-                        arguments.insert(0, receiver);
-                        if let Some(owner) = owner {
-                            let frame = (self.store(owner), self.store(receiver));
-                            self.method_frames.push(frame);
-                        }
-                        let result = self.call_python_function(
-                            &name,
-                            &code,
-                            closure,
-                            &defaults,
-                            FunctionInvocation {
-                                arguments,
-                                keyword_arguments,
-                                mode,
-                                pop_method_frame: owner.is_some(),
-                            },
-                        );
-                        if owner.is_some() && !matches!(result, Ok(CallResult::EnteredFrame)) {
-                            self.method_frames.pop();
-                        }
-                        result
+                        self.call_python_general(
+                            descriptor,
+                            Some(receiver),
+                            owner,
+                            arguments,
+                            keyword_arguments,
+                            mode,
+                        )
                     } else if let Some(NativeValue::SlotWrapper { owner, slot }) =
                         descriptor.native_value()
                     {
@@ -1363,7 +1321,7 @@ impl<'s> Vm<'s> {
     fn call_user_class(
         &mut self,
         class: Value<'s>,
-        mut arguments: Vec<Value<'s>>,
+        arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
         dispatch_metaclass: bool,
     ) -> Result<CallResult<'s>, String> {
@@ -1558,37 +1516,19 @@ impl<'s> Vm<'s> {
             if !initializer.is_object() {
                 return Err(format!("{name}.__init__ is not callable"));
             }
-            let Some(FunctionParts {
-                name: function_name,
-                code,
-                closure,
-                defaults,
-                defining_class,
-            }) = self.function_parts(initializer)?
-            else {
+            if self.function_parts(initializer)?.is_none() {
                 return Err(format!("{name}.__init__ is not a function"));
-            };
-            arguments.insert(0, instance);
-            // Zero-argument `super()` in the initializer reads this frame.
-            if let Some(owner) = defining_class {
-                let frame = (self.store(owner), self.store(instance));
-                self.method_frames.push(frame);
             }
-            let result = self.call_python_function(
-                &function_name,
-                &code,
-                closure,
-                &defaults,
-                FunctionInvocation {
-                    arguments,
-                    keyword_arguments,
-                    mode: CallMode::Immediate,
-                    pop_method_frame: false,
-                },
+            // Zero-argument `super()` in the initializer reads the method frame the call
+            // installs from the function's defining class.
+            let result = self.call_python_general(
+                initializer,
+                Some(instance),
+                None,
+                arguments,
+                keyword_arguments,
+                CallMode::Immediate,
             );
-            if defining_class.is_some() {
-                self.method_frames.pop();
-            }
             match result? {
                 CallResult::Value(value) if value.is_none() => {}
                 CallResult::Value(_) => return Err("__init__() should return None".into()),
@@ -1611,50 +1551,172 @@ impl<'s> Vm<'s> {
         Ok(CallResult::Value(instance))
     }
 
-    fn call_python_function(
+    const MAX_CALL_DEPTH: usize = 256;
+
+    /// Bind a plain positional call of a Python function, or of a bound method wrapping one,
+    /// straight from the operand stack into the new frame's local slots, and enter it.
+    ///
+    /// The callee sits below the `positional` arguments on the stack. `None` leaves the call to
+    /// [`Self::call_python_general`]: any other callee, a generator or coroutine, a function
+    /// with heap-resident locals, a signature with variadic or required keyword-only
+    /// parameters, and an arity the signature cannot bind, whose error the general path
+    /// reports. Nothing here allocates, so stored references move between roots directly.
+    fn call_python_direct(
         &mut self,
-        name: &str,
-        code: &CodeRef,
-        closure: Option<Value<'s>>,
-        defaults: &[Value<'s>],
-        invocation: FunctionInvocation<'s>,
-    ) -> Result<CallResult<'s>, String> {
-        let FunctionInvocation {
-            arguments,
-            keyword_arguments,
-            mode,
-            pop_method_frame,
-        } = invocation;
-        if code.call_signature.is_generator || code.call_signature.is_coroutine {
-            return self.create_generator(
-                name,
-                code,
-                closure,
-                defaults,
-                arguments,
-                keyword_arguments,
-            );
+        positional: usize,
+        mode: CallMode,
+    ) -> Result<Option<CallResult<'s>>, String> {
+        let callee = self.peek(positional)?;
+        if !callee.is_object() {
+            return Ok(None);
         }
-        const MAX_CALL_DEPTH: usize = 256;
-        if self.call_depth == MAX_CALL_DEPTH {
+        let (function, receiver, bound_owner) = match self.get(callee)? {
+            Object::Function(_) => (callee, None, None),
+            Object::DescriptorBoundMethod {
+                receiver,
+                descriptor,
+                owner,
+            } if descriptor.is_object() => (
+                self.handle(descriptor),
+                Some(self.handle(receiver)),
+                self.handle_optional(owner.as_ref()),
+            ),
+            _ => return Ok(None),
+        };
+        let Object::Function(function_object) = self.state.heap.get(function)? else {
+            return Ok(None);
+        };
+        let signature = &function_object.code.call_signature;
+        let given = positional + usize::from(receiver.is_some());
+        if signature.heap_locals
+            || signature.variadic_slot.is_some()
+            || signature.keyword_variadic_slot.is_some()
+            || signature.keyword_only_required
+            || given < signature.required_positional
+            || given > signature.positional_count
+        {
+            return Ok(None);
+        }
+        if self.call_depth == Self::MAX_CALL_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
+        let code = function_object.code.clone();
+        let closure = self.handle_optional(function_object.closure.as_ref());
+        let method_owner =
+            bound_owner.or(self.handle_optional(function_object.defining_class.as_ref()));
+        let first_argument = match receiver {
+            Some(receiver) => Some(receiver),
+            None if positional > 0 => Some(self.peek(positional - 1)?),
+            None => None,
+        };
+        let locals_base = self.execution.locals.len();
+        if let Some(receiver) = receiver {
+            let receiver = self.store(receiver);
+            self.execution.locals.push(Some(receiver));
+        }
+        let arguments_start = self.stack.len() - positional;
+        let super::VmState { locals, stack, .. } = &mut *self.execution;
+        locals.extend(stack.drain_refs(arguments_start).map(Some));
+        stack.pop_ref();
+        locals.extend(std::iter::repeat_with(|| None).take(code.local_names.len() - given));
+        let Object::Function(function_object) = self.state.heap.get(function)? else {
+            unreachable!("function was checked above and nothing has allocated");
+        };
+        for (&slot, default) in signature
+            .default_slots
+            .iter()
+            .zip(&function_object.defaults)
+        {
+            let local = &mut locals[locals_base + slot];
+            if local.is_none() {
+                *local = Some(default.dup());
+            }
+        }
+        let entry = FrameEntry {
+            scope: None,
+            enclosing: closure,
+            locals_base: Some(locals_base),
+        };
+        let method_frame = method_owner.zip(first_argument);
+        self.enter_python_function(function, &code, entry, method_frame, mode)
+            .map(Some)
+    }
+
+    /// Call a Python function through full argument binding: keyword and starred arguments,
+    /// variadic parameters, generators, heap-resident locals, and arity errors. `receiver`
+    /// becomes the first argument; `bound_owner` is the class a bound method was taken from.
+    fn call_python_general(
+        &mut self,
+        function: Value<'s>,
+        receiver: Option<Value<'s>>,
+        bound_owner: Option<Value<'s>>,
+        mut arguments: Vec<Value<'s>>,
+        keyword_arguments: Vec<(String, Value<'s>)>,
+        mode: CallMode,
+    ) -> Result<CallResult<'s>, String> {
+        let FunctionParts {
+            name,
+            code,
+            closure,
+            defaults,
+            defining_class,
+        } = self
+            .function_parts(function)?
+            .ok_or("bound descriptor is not callable")?;
+        if let Some(receiver) = receiver {
+            arguments.insert(0, receiver);
+        }
+        let method_frame = bound_owner
+            .or(defining_class)
+            .zip(arguments.first().copied());
         let locals =
-            self.bind_function_locals(name, code, defaults, arguments, keyword_arguments)?;
+            self.bind_function_locals(&name, &code, &defaults, arguments, keyword_arguments)?;
+        if code.call_signature.is_generator || code.call_signature.is_coroutine {
+            return self.create_generator(name, &code, closure, locals);
+        }
+        if self.call_depth == Self::MAX_CALL_DEPTH {
+            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
+        }
         let entry = if code.call_signature.heap_locals {
-            FrameEntry::scoped(self.function_scope(code, closure, locals)?)
+            FrameEntry::scoped(self.function_scope(&code, closure, locals)?)
         } else {
+            let locals_base = self.execution.locals.len();
+            let stored = locals
+                .into_iter()
+                .map(|value| value.map(|value| self.store(value)))
+                .collect::<Vec<_>>();
+            self.execution.locals.extend(stored);
             FrameEntry {
                 scope: None,
                 enclosing: closure,
-                locals: Some(locals),
+                locals_base: Some(locals_base),
             }
         };
+        self.enter_python_function(function, &code, entry, method_frame, mode)
+    }
+
+    /// Run `code` for `function` in a frame whose locals are already bound. A deferred call
+    /// leaves the frame installed for the dispatch loop; an immediate call runs it to
+    /// completion here. `method_frame` is the `(class, receiver)` pair zero-argument
+    /// `super()` sees while the frame runs.
+    fn enter_python_function(
+        &mut self,
+        function: Value<'s>,
+        code: &CodeRef,
+        entry: FrameEntry<'_>,
+        method_frame: Option<(Value<'s>, Value<'s>)>,
+        mode: CallMode,
+    ) -> Result<CallResult<'s>, String> {
+        let pop_method_frame = method_frame.is_some();
+        if let Some((owner, receiver)) = method_frame {
+            let frame = (self.store(owner), self.store(receiver));
+            self.method_frames.push(frame);
+        }
         self.call_depth += 1;
         if let CallMode::Deferred(call_span) = mode {
             let stack_base = self.stack.len();
             let function_return = FunctionReturn {
-                name: name.to_string(),
+                function: self.store(function),
                 call_span,
                 pop_method_frame,
             };
@@ -1664,37 +1726,47 @@ impl<'s> Vm<'s> {
         }
         let result = self.execute_code(code, entry);
         self.call_depth -= 1;
+        if pop_method_frame {
+            self.method_frames.pop();
+        }
         match result {
             Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
             Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
             Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
             Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
-            Ok(Execution::Yield(_, _)) => {
-                Err(format!("unexpected yield in ordinary function {name}"))
-            }
+            Ok(Execution::Yield(_, _)) => Err(format!(
+                "unexpected yield in ordinary function {}",
+                self.function_name(&self.store(function))
+            )),
             Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
             Err((error, span)) => Err(format!(
-                "{error} in {name} at line {}, column {}",
-                span.line, span.column
+                "{error} in {} at line {}, column {}",
+                self.function_name(&self.store(function)),
+                span.line,
+                span.column
             )),
+        }
+    }
+
+    /// The `__name__` of a function object, for tracebacks and error messages.
+    pub(super) fn function_name(&self, function: &super::super::heap::Ref) -> String {
+        match self.state.heap.get(self.handle(function)) {
+            Ok(Object::Function(function_object)) => function_object.name.clone(),
+            _ => "<function>".to_string(),
         }
     }
 
     fn create_generator(
         &mut self,
-        name: &str,
+        name: String,
         code: &CodeRef,
         closure: Option<Value<'s>>,
-        defaults: &[Value<'s>],
-        arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
+        locals: Vec<Option<Value<'s>>>,
     ) -> Result<CallResult<'s>, String> {
-        let locals =
-            self.bind_function_locals(name, code, defaults, arguments, keyword_arguments)?;
         let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc_with(|builder| {
             Object::Generator(Box::new(GeneratorObject {
-                name: name.to_string(),
+                name,
                 code: code.clone(),
                 scope: builder.store(scope),
                 instruction_pointer: 0,
@@ -1722,7 +1794,7 @@ impl<'s> Vm<'s> {
             return Ok(FrameEntry {
                 scope: None,
                 enclosing,
-                locals: None,
+                locals_base: None,
             });
         };
         let locals = (0..code.local_names.len())
@@ -1732,7 +1804,7 @@ impl<'s> Vm<'s> {
         Ok(FrameEntry {
             scope: None,
             enclosing: Some(snapshot),
-            locals: None,
+            locals_base: None,
         })
     }
 

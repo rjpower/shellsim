@@ -728,6 +728,9 @@ impl Roots for VmState {
             for slot in frame.scope.iter_mut().chain(&mut frame.enclosing) {
                 visitor(slot);
             }
+            if let Some(function_return) = &mut frame.function_return {
+                visitor(&mut function_return.function);
+            }
             match &mut frame.pending_native_call {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
@@ -934,8 +937,9 @@ impl BytecodeFrame {
 struct FrameEntry<'v> {
     scope: Option<Value<'v>>,
     enclosing: Option<Value<'v>>,
-    /// Bound local slots for a frame that keeps them in the VM rather than in `scope`.
-    locals: Option<Vec<Option<Value<'v>>>>,
+    /// Base of the frame's already-bound local slots on the VM's locals stack, for a frame
+    /// that keeps them there rather than in `scope`.
+    locals_base: Option<usize>,
 }
 
 impl FrameEntry<'_> {
@@ -945,7 +949,7 @@ impl FrameEntry<'_> {
         FrameEntry {
             scope: Some(scope),
             enclosing: None,
-            locals: None,
+            locals_base: None,
         }
     }
 }
@@ -1224,18 +1228,22 @@ impl PendingNativeCall {
     }
 }
 
-#[derive(Clone)]
+/// What a frame entered by a call needs on the way out: the function, for tracebacks, the
+/// call site to resume, and whether it installed a `method_frames` entry.
 struct FunctionReturn {
-    name: String,
+    function: Ref,
     call_span: super::source::Span,
     pop_method_frame: bool,
 }
 
-struct FunctionInvocation<'s> {
-    arguments: Vec<Value<'s>>,
-    keyword_arguments: Vec<(String, Value<'s>)>,
-    mode: CallMode,
-    pop_method_frame: bool,
+impl Clone for FunctionReturn {
+    fn clone(&self) -> Self {
+        Self {
+            function: self.function.dup(),
+            call_span: self.call_span,
+            pop_method_frame: self.pop_method_frame,
+        }
+    }
 }
 
 impl Deref for Vm<'_> {

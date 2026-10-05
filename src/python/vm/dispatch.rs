@@ -60,10 +60,9 @@ impl<'s> Vm<'s> {
         result
     }
 
-    /// Build a frame for `code`, moving `entry`'s local slots onto the locals stack.
-    ///
-    /// The frame owns the slots pushed here; popping it truncates the locals stack back to
-    /// `locals_base`. `handlers` and `exception_base` start empty and at the current depth.
+    /// Build a frame for `code`. The frame owns the local slots above `entry.locals_base`;
+    /// popping it truncates the locals stack back there. `handlers` and `exception_base`
+    /// start empty and at the current depth.
     pub(super) fn enter_frame(
         &mut self,
         code: &CodeRef,
@@ -72,20 +71,11 @@ impl<'s> Vm<'s> {
         entry: FrameEntry<'_>,
         function_return: Option<FunctionReturn>,
     ) -> BytecodeFrame {
-        let locals_base = entry.locals.map(|locals| {
-            let base = self.execution.locals.len();
-            let stored = locals
-                .into_iter()
-                .map(|value| value.map(|value| self.store(value)))
-                .collect::<Vec<_>>();
-            self.execution.locals.extend(stored);
-            base
-        });
         BytecodeFrame {
             code: code.clone(),
             instruction_pointer,
             stack_base,
-            locals_base,
+            locals_base: entry.locals_base,
             scope: entry.scope.map(|scope| self.store(scope)),
             enclosing: entry.enclosing.map(|scope| self.store(scope)),
             handlers: Vec::new(),
@@ -910,14 +900,15 @@ impl<'s> Vm<'s> {
                 self.traceback_frames = frames;
                 return Err((error, span));
             };
+            let name = self.function_name(&function_return.function);
             frames.push(TracebackFrame {
-                name: function_return.name.clone(),
+                name: name.clone(),
                 span,
                 file,
             });
             error = format!(
-                "{error} in {} at line {}, column {}",
-                function_return.name, span.line, span.column
+                "{error} in {name} at line {}, column {}",
+                span.line, span.column
             );
             span = function_return.call_span;
         }

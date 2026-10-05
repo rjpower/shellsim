@@ -63,6 +63,13 @@ impl ValueStack {
         Some(self.split_off(heap, base))
     }
 
+    /// Move every stored reference at or above `base` out, bottom-first, without making
+    /// handles. Each must go straight into a root.
+    pub fn drain_refs(&mut self, base: usize) -> std::vec::Drain<'_, Ref> {
+        let base = base.min(self.values.len());
+        self.values.drain(base..)
+    }
+
     /// Remove and return every value at or above `base`, bottom-first.
     pub fn split_off<'s>(&mut self, heap: &Heap, base: usize) -> Vec<Value<'s>> {
         let base = base.min(self.values.len());
