@@ -8,7 +8,7 @@ use super::super::heap::Builder;
 use super::super::object_model::TypeId;
 use super::super::scopes;
 use super::{
-    cpython_names, exception_types, protocol, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
+    cpython_names, exception_types, string, Arc, BuiltinType, CodeRef, ExceptionType, Execution,
     HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue, Object, ProxyTarget, PyModuleLoader,
     PyRuntime, RaisedException, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
@@ -820,7 +820,7 @@ impl<'s> Vm<'s> {
         let package = self
             .scope_get(scope, "__package__")?
             .ok_or("relative import requires __package__")?;
-        let package = protocol::string_value(&self.state.heap, package)?
+        let package = string::string_value(&self.state.heap, package)?
             .filter(|package| !package.is_empty())
             .ok_or("relative import requires a non-empty package")?;
         let mut parts = package.split('.').collect::<Vec<_>>();
@@ -933,7 +933,7 @@ impl<'s> Vm<'s> {
                         };
                         let mut names = Vec::with_capacity(items.len());
                         for item in items {
-                            let Some(name) = protocol::string_value(&self.state.heap, item)? else {
+                            let Some(name) = string::string_value(&self.state.heap, item)? else {
                                 let message = format!(
                                     "Item in {module_name}.__all__ must be str, not {}",
                                     self.type_name_of(&item)?

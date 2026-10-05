@@ -1,7 +1,9 @@
-//! Central Python value protocols for truth, representation, equality, ordering, and containment.
+//! Heap-only Python value protocols: representation, truth, equality, ordering and containment.
 //!
-//! Container algorithms are deliberately linear. Correct behavior and one auditable dispatch
-//! point matter more than asymptotic performance for the bounded evaluator.
+//! These read builtin payloads directly and never run Python code, so the VM uses them as the
+//! fallback once no slot on the value's type claims the operation, and the REPL uses them to
+//! print values. Container algorithms are deliberately linear: correct behavior and one
+//! auditable dispatch point matter more than asymptotic performance for the bounded evaluator.
 
 use std::cmp::Ordering;
 use std::collections::BTreeSet;
@@ -9,9 +11,11 @@ use std::collections::BTreeSet;
 use num_bigint::BigInt;
 use num_traits::{FromPrimitive, Zero};
 
+use super::exception_types::{exception_args, exception_type_name};
 use super::heap::{Heap, NamespaceTarget, Object, Ref};
+use super::number::{bigint_value, int_value};
 use super::scopes;
-pub use super::string::{string_ref, string_value};
+use super::string::{bytes_ref, bytes_value, quote_bytes, quote_string, string_value};
 use super::{ReplState, Value};
 
 /// The object behind `value`, or `None` for an immediate.
@@ -93,93 +97,6 @@ pub fn repr(state: &ReplState, value: Value<'_>) -> Result<String, String> {
     render(state, value, &mut BTreeSet::new())
 }
 
-/// Return the integer payload of an immediate integer or an `int` subclass instance.
-pub fn int_value(heap: &Heap, value: Value<'_>) -> Option<i64> {
-    match super::number::index(heap, &value)? {
-        super::number::NumberRef::Int(value) => Some(value),
-        super::number::NumberRef::BigInt(_)
-        | super::number::NumberRef::UInt(_)
-        | super::number::NumberRef::Float(_)
-        | super::number::NumberRef::Complex(..) => None,
-    }
-}
-
-/// The outcome of `owner[index]` when `owner` may be a string.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StringIndex {
-    NotString,
-    Character(char),
-    /// CPython raises `TypeError` for a non-integer index.
-    NotInteger,
-    /// CPython raises `IndexError`.
-    OutOfRange,
-}
-
-/// Return one Python string code point without materializing the complete string as characters.
-///
-/// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
-/// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
-pub fn string_index(
-    heap: &Heap,
-    owner: Value<'_>,
-    index: Value<'_>,
-) -> Result<StringIndex, String> {
-    let Some(text) = string_ref(heap, owner)? else {
-        return Ok(StringIndex::NotString);
-    };
-    let Some(index) = int_value(heap, index) else {
-        return Ok(StringIndex::NotInteger);
-    };
-    Ok(indexed_char(text.as_str(), index, text.is_ascii())
-        .map_or(StringIndex::OutOfRange, StringIndex::Character))
-}
-
-/// Return a string's Python length without cloning its arena payload.
-pub fn string_length(heap: &Heap, value: Value<'_>) -> Result<Option<usize>, String> {
-    let Some(text) = string_ref(heap, value)? else {
-        return Ok(None);
-    };
-    Ok(Some(if text.is_ascii() {
-        text.byte_len()
-    } else {
-        text.as_str().chars().count()
-    }))
-}
-
-fn indexed_char(value: &str, index: i64, is_ascii: bool) -> Option<char> {
-    if is_ascii {
-        let index = normalize_index(value.len(), index)?;
-        return value.as_bytes().get(index).copied().map(char::from);
-    }
-
-    let index = normalize_index(value.chars().count(), index)?;
-    value.chars().nth(index)
-}
-
-fn normalize_index(length: usize, index: i64) -> Option<usize> {
-    let index = if index < 0 {
-        length.checked_sub(usize::try_from(index.unsigned_abs()).ok()?)?
-    } else {
-        usize::try_from(index).ok()?
-    };
-    (index < length).then_some(index)
-}
-
-pub fn bytes_value(heap: &Heap, value: Value<'_>) -> Result<Option<Vec<u8>>, String> {
-    Ok(bytes_ref(heap, value)?.map(<[u8]>::to_vec))
-}
-
-/// Borrow the contents of a `bytes` or `bytearray` without copying them.
-pub fn bytes_ref<'heap>(
-    heap: &'heap Heap,
-    value: Value<'_>,
-) -> Result<Option<&'heap [u8]>, String> {
-    Ok(match object(heap, value)? {
-        Some(Object::Bytes(value) | Object::ByteArray(value)) => Some(value),
-        _ => None,
-    })
-}
-
 /// The class name and `str()` of an exception instance, builtin or user-defined.
 pub fn exception_parts(
     state: &ReplState,
@@ -195,44 +112,6 @@ pub fn exception_parts(
     }
     let message = exception_message(state, base, &args, &mut active)?;
     Ok(Some((name, message)))
-}
-
-/// The class name of an exception instance, or `None` when `value` is not one. Rendering the
-/// message can fail on self-referential arguments, so callers that only classify use this.
-pub fn exception_type_name(state: &ReplState, value: Value<'_>) -> Result<Option<String>, String> {
-    if !value.is_object() {
-        return Ok(None);
-    }
-    let type_id = state.heap.type_id(value)?;
-    if !state.types.is_exception_type(type_id)? {
-        return Ok(None);
-    }
-    Ok(Some(state.types.get(type_id)?.name.clone()))
-}
-
-/// The closest builtin exception class an exception instance derives from, or `None` when
-/// `value` is not an exception.
-pub fn exception_base(state: &ReplState, value: Value<'_>) -> Result<Option<&'static str>, String> {
-    if !value.is_object() {
-        return Ok(None);
-    }
-    state.types.exception_base(state.heap.type_id(value)?)
-}
-
-/// The closest builtin exception class and the constructor arguments of an exception instance,
-/// which its payload holds as `BaseException.args`.
-pub fn exception_args<'s>(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
-    let Some(base) = exception_base(state, value)? else {
-        return Ok(None);
-    };
-    let heap = &state.heap;
-    let Object::Exception(args) = heap.get(value)? else {
-        return Err("exception instance has a non-exception layout".into());
-    };
-    Ok(Some((base, heap.handles(args))))
 }
 
 /// `str()` of an exception of class `kind` (a builtin exception class name) with arguments
@@ -279,13 +158,6 @@ fn exception_message(
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(format!("({})", values.join(", ")))
         }
-    }
-}
-
-pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
-    match object(heap, value).ok()?? {
-        Object::BigInt(value) => Some(value),
-        _ => None,
     }
 }
 
@@ -1113,95 +985,10 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
     }
 }
 
-/// CPython's `repr(str)`: single quotes unless the text contains a single quote and no double
-/// quote, with backslash escapes for the quote, backslash, control characters and characters
-/// Python does not consider printable.
-pub(super) fn quote_string(value: &str) -> String {
-    let quote = if value.contains('\'') && !value.contains('"') {
-        '"'
-    } else {
-        '\''
-    };
-    let mut rendered = String::with_capacity(value.len() + 2);
-    rendered.push(quote);
-    for character in value.chars() {
-        match character {
-            '\\' => rendered.push_str("\\\\"),
-            '\n' => rendered.push_str("\\n"),
-            '\r' => rendered.push_str("\\r"),
-            '\t' => rendered.push_str("\\t"),
-            character if character == quote => {
-                rendered.push('\\');
-                rendered.push(character);
-            }
-            character if is_printable(character) => rendered.push(character),
-            character => {
-                let code = u32::from(character);
-                if code <= 0xff {
-                    rendered.push_str(&format!("\\x{code:02x}"));
-                } else if code <= 0xffff {
-                    rendered.push_str(&format!("\\u{code:04x}"));
-                } else {
-                    rendered.push_str(&format!("\\U{code:08x}"));
-                }
-            }
-        }
-    }
-    rendered.push(quote);
-    rendered
-}
-
-/// Python's `str.isprintable` for one character, approximated without Unicode category tables:
-/// controls, separators other than the ASCII space, and the common format characters are not
-/// printable.
-fn is_printable(character: char) -> bool {
-    !(character.is_control()
-        || (character.is_whitespace() && character != ' ')
-        || matches!(
-            character,
-            '\u{ad}' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{2064}' | '\u{feff}'
-        ))
-}
-
-/// CPython's bytes repr: single quotes unless the value contains `'` but no `"`, escaping only
-/// the chosen quote.
-fn quote_bytes(value: &[u8]) -> String {
-    let quote = if value.contains(&b'\'') && !value.contains(&b'"') {
-        b'"'
-    } else {
-        b'\''
-    };
-    let mut rendered = String::from("b");
-    rendered.push(char::from(quote));
-    for byte in value {
-        match byte {
-            b'\\' => rendered.push_str("\\\\"),
-            byte if *byte == quote => {
-                rendered.push('\\');
-                rendered.push(char::from(quote));
-            }
-            b'\n' => rendered.push_str("\\n"),
-            b'\r' => rendered.push_str("\\r"),
-            b'\t' => rendered.push_str("\\t"),
-            0x20..=0x7e => rendered.push(char::from(*byte)),
-            _ => rendered.push_str(&format!("\\x{byte:02x}")),
-        }
-    }
-    rendered.push(char::from(quote));
-    rendered
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resources::{Limits, Resources};
-
-    #[test]
-    fn bytes_repr_switches_quotes_like_cpython() {
-        assert_eq!(quote_bytes(b"it's"), r#"b"it's""#);
-        assert_eq!(quote_bytes(br#"it's "x""#), r#"b'it\'s "x"'"#);
-        assert_eq!(quote_bytes(b"\"\\\n\x00"), r#"b'"\\\n\x00'"#);
-    }
 
     #[test]
     fn dict_and_set_equality_are_order_independent() {
@@ -1248,60 +1035,5 @@ mod tests {
         assert!(!equals(&heap, nan, nan).unwrap());
         assert!(contains(&heap, first, nan).unwrap());
         assert!(equals(&heap, first, second).unwrap());
-    }
-
-    #[test]
-    fn string_protocols_handle_inline_heap_ascii_and_unicode_values() {
-        let mut heap = Heap::default();
-        let mut resources = Resources::new(Limits::unlimited());
-        let inline = Value::inline_string("café").unwrap();
-        let ascii = heap
-            .alloc(
-                Object::String("a long ASCII string".into()),
-                &mut (),
-                &mut resources,
-            )
-            .unwrap();
-        let unicode = heap
-            .alloc(Object::String("☃ snow".into()), &mut (), &mut resources)
-            .unwrap();
-
-        let inline_ref = string_ref(&heap, inline).unwrap().unwrap();
-        assert_eq!(inline_ref.as_str(), "café");
-        assert!(!inline_ref.is_ascii());
-        let ascii_ref = string_ref(&heap, ascii).unwrap().unwrap();
-        assert_eq!(ascii_ref.as_str(), "a long ASCII string");
-        assert!(ascii_ref.is_ascii());
-        assert_eq!(
-            string_index(&heap, inline, Value::Int(3)).unwrap(),
-            StringIndex::Character('é')
-        );
-        assert_eq!(
-            string_index(&heap, inline, Value::Int(-4)).unwrap(),
-            StringIndex::Character('c')
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::Int(7)).unwrap(),
-            StringIndex::Character('A')
-        );
-        assert_eq!(
-            string_index(&heap, unicode, Value::Int(-6)).unwrap(),
-            StringIndex::Character('☃')
-        );
-        assert_eq!(string_length(&heap, inline).unwrap(), Some(4));
-        assert_eq!(string_length(&heap, ascii).unwrap(), Some(19));
-        assert_eq!(string_length(&heap, unicode).unwrap(), Some(6));
-        assert_eq!(
-            string_index(&heap, Value::Int(1), Value::Int(0)).unwrap(),
-            StringIndex::NotString
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::Int(99)).unwrap(),
-            StringIndex::OutOfRange
-        );
-        assert_eq!(
-            string_index(&heap, ascii, Value::None).unwrap(),
-            StringIndex::NotInteger
-        );
     }
 }

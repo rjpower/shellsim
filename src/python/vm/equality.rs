@@ -11,8 +11,7 @@
 
 use super::super::ast::ComparisonOperator;
 use super::super::heap::Object;
-use super::super::protocol;
-use super::{Value, Vm};
+use super::{number, string, Value, Vm};
 
 /// Builtin containers of matching kinds, which compare element by element.
 enum ContainerPair {
@@ -32,18 +31,18 @@ impl<'s> Vm<'s> {
     ) -> Result<(), String> {
         let heap = self.heap();
         let scanned = match (
-            protocol::string_ref(heap, *left)?,
-            protocol::string_ref(heap, *right)?,
+            string::string_ref(heap, *left)?,
+            string::string_ref(heap, *right)?,
         ) {
             (Some(left), Some(right)) => left.byte_len().min(right.byte_len()),
             _ => match (
-                protocol::bytes_ref(heap, *left)?,
-                protocol::bytes_ref(heap, *right)?,
+                string::bytes_ref(heap, *left)?,
+                string::bytes_ref(heap, *right)?,
             ) {
                 (Some(left), Some(right)) => left.len().min(right.len()),
                 _ => match (
-                    protocol::bigint_value(heap, *left),
-                    protocol::bigint_value(heap, *right),
+                    number::bigint_value(heap, *left),
+                    number::bigint_value(heap, *right),
                 ) {
                     (Some(left), Some(right)) => {
                         usize::try_from(left.bits().min(right.bits()) / 8).unwrap_or(usize::MAX)

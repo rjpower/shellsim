@@ -7,9 +7,9 @@
 
 use super::super::heap::Ref;
 use super::{
-    protocol, CallArgs, Execution, ForIterOutcome, IteratorAdvance, NativeValue, Object, Opcode,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot, SlotValue, Stream, Value,
-    Vm,
+    exception_types, number, string, CallArgs, Execution, ForIterOutcome, IteratorAdvance,
+    NativeValue, Object, Opcode, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException,
+    Slot, SlotValue, Stream, Value, Vm,
 };
 
 /// An exception on its way into or out of a generator frame, with its value as a handle so it
@@ -79,7 +79,7 @@ impl<'s> Vm<'s> {
                     | Object::ByteArray(_)
             )
         } else {
-            protocol::string_value(&self.state.heap, subject)?.is_some()
+            string::string_value(&self.state.heap, subject)?.is_some()
         };
         let getitem = self
             .state
@@ -94,7 +94,7 @@ impl<'s> Vm<'s> {
         }
         let length = match self.invoke_slot(&value, Slot::Length, "__len__", Vec::new())? {
             Some(length) => {
-                let length = protocol::int_value(&self.state.heap, length).ok_or_else(|| {
+                let length = number::int_value(&self.state.heap, length).ok_or_else(|| {
                     self.raise_exception("TypeError", "__len__() should return an integer")
                 })?;
                 usize::try_from(length).map_err(|_| {
@@ -217,12 +217,12 @@ impl<'s> Vm<'s> {
         iterable: Value<'s>,
     ) -> Result<Option<Value<'s>>, String> {
         let mut values = Vec::new();
-        if let Some(text) = protocol::string_value(&self.state.heap, iterable)? {
+        if let Some(text) = string::string_value(&self.state.heap, iterable)? {
             for character in text.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut values, character)?;
             }
-        } else if let Some(bytes) = protocol::bytes_value(&self.state.heap, iterable)? {
+        } else if let Some(bytes) = string::bytes_value(&self.state.heap, iterable)? {
             for byte in bytes {
                 self.push_materialized(&mut values, Value::Int(i64::from(byte)))?;
             }
@@ -853,7 +853,7 @@ impl<'s> Vm<'s> {
         if exception.kind != "StopIteration" {
             return Ok(ForwardedThrow::Raise(exception));
         }
-        let value = protocol::exception_args(self.state, exception.value)?
+        let value = exception_types::exception_args(self.state, exception.value)?
             .and_then(|(_, args)| args.first().copied())
             .unwrap_or(Value::None);
         Ok(ForwardedThrow::Returned(value))

@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 
 use super::super::ast::ComparisonOperator;
 use super::super::heap::{Heap, Object};
-use super::{number, protocol, BuiltinType, Slot, Value, Vm};
+use super::{number, string, BuiltinType, Slot, Value, Vm};
 
 /// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
 const MAX_COMPARE_DEPTH: usize = 256;
@@ -171,8 +171,8 @@ impl<'s> Vm<'s> {
                 return Ok(None);
             }
             let (Some(left), Some(right)) = (
-                protocol::string_ref(heap, left)?,
-                protocol::string_ref(heap, right)?,
+                string::string_ref(heap, left)?,
+                string::string_ref(heap, right)?,
             ) else {
                 return Ok(None);
             };

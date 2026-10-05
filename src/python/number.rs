@@ -10,11 +10,33 @@ use num_traits::{FromPrimitive, Signed, ToPrimitive, Zero};
 
 use super::ast::{BinaryOperator, ComparisonOperator};
 use super::hash;
-use super::heap::{Heap, Object};
+use super::heap::{Heap, Object, Value};
 use super::native::{
     CallArgs, FromPyValue, GetterDef, KindNumber, MethodDef, NativeTypeDef, PyError, PyKind,
     PyResult, PyRuntime, PyValue, ValueKindDef,
 };
+
+/// Return the integer payload of an immediate integer or an `int` subclass instance.
+pub(super) fn int_value(heap: &Heap, value: Value<'_>) -> Option<i64> {
+    match index(heap, &value)? {
+        NumberRef::Int(value) => Some(value),
+        NumberRef::BigInt(_)
+        | NumberRef::UInt(_)
+        | NumberRef::Float(_)
+        | NumberRef::Complex(..) => None,
+    }
+}
+
+/// Borrow the arbitrary-precision payload of a heap `int`; `None` for every other value.
+pub(super) fn bigint_value<'a>(heap: &'a Heap, value: Value<'_>) -> Option<&'a BigInt> {
+    if !value.is_object() {
+        return None;
+    }
+    match heap.get(value).ok()? {
+        Object::BigInt(value) => Some(value),
+        _ => None,
+    }
+}
 
 /// Borrowed numeric payload used by VM protocols without exposing physical value tags.
 #[derive(Clone, Copy, Debug)]
@@ -937,7 +959,7 @@ pub(super) fn parse_integer_text<'s>(text: &str, requested_base: i64) -> PyResul
     let invalid = || {
         PyError::value_error(format!(
             "invalid literal for int() with base {requested_base}: {}",
-            super::protocol::quote_string(text)
+            super::string::quote_string(text)
         ))
     };
     let mut text = text.trim();

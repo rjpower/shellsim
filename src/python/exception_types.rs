@@ -1,9 +1,14 @@
 //! The closed table of exception classes that the VM and native modules can name, with CPython's
-//! class hierarchy.
+//! class hierarchy, and the questions the runtime asks of an exception instance.
 //!
 //! Builtin exceptions, shellsim's pytest outcomes and exceptions raised by native stdlib modules
 //! share one table. The type registry linearizes their bases with C3, including NumPy's AxisError
 //! with its two parents. A user class records an exception ancestor for its instance layout.
+//! An exception instance is an ordinary object whose type is registered here and whose payload
+//! is its `args`; the helpers at the end classify one and read those arguments.
+
+use super::heap::Object;
+use super::{ReplState, Value};
 
 /// One exception class: its name, its parent, whether `builtins` binds the name, and the
 /// `__module__` CPython reports for it.
@@ -182,6 +187,50 @@ pub(super) fn os_error_subclass(errno: i32) -> &'static str {
         111 => "ConnectionRefusedError",
         _ => "OSError",
     }
+}
+
+/// The class name of an exception instance, or `None` when `value` is not one. Rendering the
+/// message can fail on self-referential arguments, so callers that only classify use this.
+pub(super) fn exception_type_name(
+    state: &ReplState,
+    value: Value<'_>,
+) -> Result<Option<String>, String> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    let type_id = state.heap.type_id(value)?;
+    if !state.types.is_exception_type(type_id)? {
+        return Ok(None);
+    }
+    Ok(Some(state.types.get(type_id)?.name.clone()))
+}
+
+/// The closest builtin exception class an exception instance derives from, or `None` when
+/// `value` is not an exception.
+pub(super) fn exception_base(
+    state: &ReplState,
+    value: Value<'_>,
+) -> Result<Option<&'static str>, String> {
+    if !value.is_object() {
+        return Ok(None);
+    }
+    state.types.exception_base(state.heap.type_id(value)?)
+}
+
+/// The closest builtin exception class and the constructor arguments of an exception instance,
+/// which its payload holds as `BaseException.args`.
+pub(super) fn exception_args<'s>(
+    state: &ReplState,
+    value: Value<'_>,
+) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
+    let Some(base) = exception_base(state, value)? else {
+        return Ok(None);
+    };
+    let heap = &state.heap;
+    let Object::Exception(args) = heap.get(value)? else {
+        return Err("exception instance has a non-exception layout".into());
+    };
+    Ok(Some((base, heap.handles(args))))
 }
 
 #[cfg(test)]

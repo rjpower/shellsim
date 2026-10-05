@@ -9,16 +9,17 @@ use super::super::stdlib::re::{MatchObject, RegexObject};
 use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
 use super::{
-    protocol, Arc, BigInt, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
-    ClassLayout, ExceptionType, Execution, HashMap, NativeValue, Object, Ordering,
-    PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
-    PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader, PyArrayRef, PyArrayView, PyByteArray,
-    PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind, PyFilesystem,
-    PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule,
-    PyNativeKind, PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult,
-    PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject,
-    PyValueCast, RaisedException, Stream, ToPrimitive, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
+    exception_types, number, protocol, string, Arc, BigInt, BuiltinType, CallArgs, CallMode,
+    CallResult, ClassDefinition, ClassLayout, ExceptionType, Execution, HashMap, NativeValue,
+    Object, Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray,
+    PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader,
+    PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
+    PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
+    PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessRunner,
+    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
+    PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast, RaisedException,
+    Stream, ToPrimitive, Value, Vm, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::heap::DictViewKind;
@@ -608,11 +609,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn string_value(&self, value: &Value<'s>) -> PyResult<'s, Option<String>> {
-        protocol::string_value(&self.state.heap, *value).map_err(PyError::runtime_error)
+        string::string_value(&self.state.heap, *value).map_err(PyError::runtime_error)
     }
 
     fn bytes_value(&self, value: &Value<'s>) -> PyResult<'s, Option<Vec<u8>>> {
-        protocol::bytes_value(&self.state.heap, *value).map_err(PyError::runtime_error)
+        string::bytes_value(&self.state.heap, *value).map_err(PyError::runtime_error)
     }
 
     fn new_string(&mut self, value: String) -> PyResult<'s, Value<'s>> {
@@ -665,7 +666,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn int_value(&self, value: &Value<'s>) -> Option<i64> {
-        protocol::int_value(&self.state.heap, *value)
+        number::int_value(&self.state.heap, *value)
     }
 
     fn is_integer_type(&self, value: &Value<'s>) -> bool {
@@ -917,7 +918,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &mut self,
         value: &Value<'s>,
     ) -> PyResult<'s, Option<(String, Vec<Value<'s>>)>> {
-        Ok(protocol::exception_args(self.state, *value)
+        Ok(exception_types::exception_args(self.state, *value)
             .map_err(PyError::runtime_error)?
             .map(|(base, args)| (base.to_string(), args)))
     }
@@ -1624,7 +1625,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         };
         let mut attributes = HashMap::new();
         for (key, value) in entries {
-            let key = protocol::string_value(&self.state.heap, key)
+            let key = string::string_value(&self.state.heap, key)
                 .map_err(PyError::runtime_error)?
                 .ok_or_else(|| PyError::type_error("type.__new__() keys must be strings"))?;
             attributes.insert(key, value);
@@ -2030,7 +2031,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         // The exception is stored into a `RaisedException` only at the call, so no stored
         // reference is held across the allocation below.
         let (kind, value) = if let Some(kind) =
-            protocol::exception_type_name(self.state, exception).map_err(PyError::runtime_error)?
+            exception_types::exception_type_name(self.state, exception)
+                .map_err(PyError::runtime_error)?
         {
             (kind, exception)
         } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =

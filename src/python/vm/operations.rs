@@ -4,7 +4,7 @@ use super::super::heap::{Builder, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES}
 use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
-    number, protocol, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
+    number, protocol, string, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
     HashedMembers, NativeValue, Object, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
 
@@ -164,15 +164,15 @@ impl<'s> Vm<'s> {
         container: &Value<'s>,
         needle: &Value<'s>,
     ) -> Result<bool, String> {
-        if protocol::string_ref(self.heap(), *container)?.is_some() {
-            let Some(needle_text) = protocol::string_ref(self.heap(), *needle)? else {
+        if string::string_ref(self.heap(), *container)?.is_some() {
+            let Some(needle_text) = string::string_ref(self.heap(), *needle)? else {
                 let message = format!(
                     "'in <string>' requires string as left operand, not {}",
                     self.type_name_of(needle)?
                 );
                 return Err(self.raise_exception("TypeError", message));
             };
-            let scanned = protocol::string_ref(self.heap(), *container)?
+            let scanned = string::string_ref(self.heap(), *container)?
                 .map_or(0, |text| text.byte_len())
                 .saturating_add(needle_text.byte_len());
             self.charge_cpu(super::objects::scan_cost(scanned))?;
@@ -194,16 +194,16 @@ impl<'s> Vm<'s> {
             | Object::FrozenSet(_)
             | Object::Dict(_)
             | Object::DefaultDict { .. } => true,
-            Object::Range { .. } => protocol::int_value(self.heap(), *needle).is_some(),
+            Object::Range { .. } => number::int_value(self.heap(), *needle).is_some(),
             _ => false,
         };
         if direct {
             if let Object::Bytes(value) | Object::ByteArray(value) = self.get(*container)? {
                 let length = value.len();
                 // A bytes needle is searched for in linear time; an int needle is one byte.
-                let needle_length = match protocol::bytes_ref(self.heap(), *needle)? {
+                let needle_length = match string::bytes_ref(self.heap(), *needle)? {
                     Some(needle) => needle.len(),
-                    None => match protocol::int_value(self.heap(), *needle) {
+                    None => match number::int_value(self.heap(), *needle) {
                         Some(byte) if (0..256).contains(&byte) => 1,
                         Some(_) => {
                             return Err(
@@ -746,7 +746,7 @@ impl<'s> Vm<'s> {
     ) -> Result<String, String> {
         let spec = self.allocate_string(format_spec.to_string())?;
         if let Some(result) = self.invoke_slot(value, Slot::Format, "__format__", vec![spec])? {
-            return protocol::string_value(self.heap(), result)?
+            return string::string_value(self.heap(), result)?
                 .ok_or_else(|| self.raise_exception("TypeError", "__format__ must return a str"));
         }
         if let Some(rendered) = self.format_registered_number(value, format_spec)? {
@@ -820,7 +820,7 @@ impl<'s> Vm<'s> {
                 let type_name = self.type_name_of(value)?;
                 format_integer(integer, text, &type_name)
             }
-            None => match protocol::string_value(self.heap(), *value)? {
+            None => match string::string_value(self.heap(), *value)? {
                 Some(string) => format_text(&string, text),
                 None => {
                     let type_name = self.type_name_of(value)?;

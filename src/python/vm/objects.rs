@@ -7,11 +7,11 @@ use super::super::heap::{ClassObject, DictViewKind, FunctionObject, NamespaceTar
 use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
-    expect_arity, protocol, range_length, select_string_slice, Arc, BuiltinSubscript, BuiltinType,
-    CallArgs, CallMode, CallResult, ClassDefinition, ClassField, ClassLayout, CodeCaches, CodeRef,
-    ComparisonOperator, ExceptionType, Execution, HashMap, LoadAttributeCache, NameId, NativeValue,
-    Object, PyError, PyRuntime, RaisedException, SlicePlan, Slot, SlotValue, SymbolId, TypeId,
-    Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
+    Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
+    ClassField, ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution,
+    HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
+    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -406,7 +406,8 @@ impl<'s> Vm<'s> {
             let overridable_getter = matches!(
                 descriptor.native_value(),
                 Some(NativeValue::NativeGetter(_))
-            ) && protocol::exception_base(self.state, owner)?.is_some();
+            ) && exception_types::exception_base(self.state, owner)?
+                .is_some();
             let instance_value = match (overridable_getter, symbol) {
                 (true, Some(symbol)) => self.attribute_by_symbol(owner, symbol)?,
                 _ => None,
@@ -568,7 +569,7 @@ impl<'s> Vm<'s> {
             return self.lookup_instance_attribute(owner, class, symbol, name);
         }
         if let Some(symbol) = symbol {
-            if protocol::exception_base(self.state, owner)?.is_some() {
+            if exception_types::exception_base(self.state, owner)?.is_some() {
                 if let Some(value) = self.attribute_by_symbol(owner, symbol)? {
                     return Ok(Some(value));
                 }
@@ -855,7 +856,7 @@ impl<'s> Vm<'s> {
         value: Value<'s>,
     ) -> Result<(), String> {
         // `BaseException.args` is writable and stores any iterable as a tuple.
-        if name == "args" && protocol::exception_base(self.state, owner)?.is_some() {
+        if name == "args" && exception_types::exception_base(self.state, owner)?.is_some() {
             let current = match self.get(owner)? {
                 Object::Exception(args) => args.len(),
                 _ => return Err("exception instance has a non-exception layout".into()),
@@ -888,7 +889,7 @@ impl<'s> Vm<'s> {
                     _ => {}
                 }
                 // A builtin exception instance has an attribute dictionary like any instance.
-                if protocol::exception_base(self.state, owner)?.is_some() {
+                if exception_types::exception_base(self.state, owner)?.is_some() {
                     return self.insert_attribute(owner, name, value);
                 }
             }
@@ -943,7 +944,7 @@ impl<'s> Vm<'s> {
             ) && !(matches!(
                 name,
                 "args" | "errno" | "strerror" | "filename" | "filename2"
-            ) && protocol::exception_base(self.state, owner)?.is_some())
+            ) && exception_types::exception_base(self.state, owner)?.is_some())
             {
                 let type_name = self.type_name_of(&owner)?;
                 return Err(self.raise_exception(
@@ -973,7 +974,7 @@ impl<'s> Vm<'s> {
                     .collect();
                 let mut named = Vec::with_capacity(entries.len());
                 for (key, value) in entries {
-                    let Some(name) = protocol::string_value(&self.state.heap, key)? else {
+                    let Some(name) = string::string_value(&self.state.heap, key)? else {
                         let message = format!(
                             "namespace keys must be str, not {}",
                             self.type_name_of(&key)?
@@ -1044,7 +1045,7 @@ impl<'s> Vm<'s> {
             _ if self.instance_class(owner)?.is_some() => {
                 self.instance_class(owner)?.expect("checked above")
             }
-            _ if protocol::exception_base(self.state, owner)?.is_some() => {
+            _ if exception_types::exception_base(self.state, owner)?.is_some() => {
                 if self.remove_attribute_by_symbol(owner, symbol)?.is_none() {
                     return Err(self.missing_attribute(&owner, name));
                 }
@@ -1124,7 +1125,7 @@ impl<'s> Vm<'s> {
     ) -> Result<(), String> {
         if name == "__name__" {
             let Some(text) = value
-                .map(|value| protocol::string_ref(&self.state.heap, value))
+                .map(|value| string::string_ref(&self.state.heap, value))
                 .transpose()?
                 .flatten()
                 .map(|text| text.as_str().to_string())
@@ -1279,7 +1280,7 @@ impl<'s> Vm<'s> {
     /// exception instance, whose builtin classes also give instances a `__dict__`.
     pub(super) fn has_instance_dict(&self, value: Value<'s>) -> Result<bool, String> {
         Ok(self.instance_class(value)?.is_some()
-            || protocol::exception_base(self.state, value)?.is_some())
+            || exception_types::exception_base(self.state, value)?.is_some())
     }
 
     /// Whether `value` is an instance of a user class with the plain `object` layout and no
@@ -1380,7 +1381,7 @@ impl<'s> Vm<'s> {
             };
             self.allocate_string(format!("typing.List[{parameter}]"))?
         } else if matches!(owner.native_value(), Some(NativeValue::Environment)) {
-            let name = protocol::string_ref(&self.state.heap, index)?
+            let name = string::string_ref(&self.state.heap, index)?
                 .ok_or("environment key must be a string")?
                 .as_str()
                 .to_string();
@@ -1399,7 +1400,7 @@ impl<'s> Vm<'s> {
                     } else {
                         "tuple"
                     };
-                    let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                    let Some(index) = number::int_value(&self.state.heap, index) else {
                         let message = format!(
                             "{sequence} indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -1423,7 +1424,7 @@ impl<'s> Vm<'s> {
                 }
                 Object::Range { start, stop, step } => {
                     let length = range_length(*start, *stop, *step)?;
-                    let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                    let Some(index) = number::int_value(&self.state.heap, index) else {
                         let message = format!(
                             "range indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
@@ -1588,23 +1589,23 @@ impl<'s> Vm<'s> {
         index: &Value<'s>,
     ) -> Result<Option<char>, String> {
         // A non-ASCII string is indexed by code point, which scans the UTF-8 up to the index.
-        let non_ascii_bytes = protocol::string_ref(&self.state.heap, *owner)?
+        let non_ascii_bytes = string::string_ref(&self.state.heap, *owner)?
             .filter(|text| !text.is_ascii())
             .map(|text| text.byte_len());
         if let Some(bytes) = non_ascii_bytes {
             self.charge_cpu(scan_cost(bytes))?;
         }
-        match protocol::string_index(&self.state.heap, *owner, *index)? {
-            protocol::StringIndex::NotString => Ok(None),
-            protocol::StringIndex::Character(character) => Ok(Some(character)),
-            protocol::StringIndex::NotInteger => {
+        match string::string_index(&self.state.heap, *owner, *index)? {
+            string::StringIndex::NotString => Ok(None),
+            string::StringIndex::Character(character) => Ok(Some(character)),
+            string::StringIndex::NotInteger => {
                 let message = format!(
                     "string indices must be integers, not '{}'",
                     self.type_name_of(index)?
                 );
                 Err(self.raise_exception("TypeError", message))
             }
-            protocol::StringIndex::OutOfRange => {
+            string::StringIndex::OutOfRange => {
                 Err(self.raise_exception("IndexError", "string index out of range"))
             }
         }
@@ -1617,7 +1618,7 @@ impl<'s> Vm<'s> {
         stop: Option<i64>,
         step: Option<i64>,
     ) -> Result<Value<'s>, String> {
-        let non_ascii_bytes = protocol::string_ref(&self.state.heap, owner)?
+        let non_ascii_bytes = string::string_ref(&self.state.heap, owner)?
             .filter(|text| !text.is_ascii())
             .map(|text| text.byte_len());
         if let Some(bytes) = non_ascii_bytes {
@@ -1625,14 +1626,14 @@ impl<'s> Vm<'s> {
             self.charge_cpu(scan_cost(bytes))?;
             self.reserve_result(bytes.saturating_mul(std::mem::size_of::<char>()))?;
         }
-        let string_slice = protocol::string_ref(&self.state.heap, owner)?
+        let string_slice = string::string_ref(&self.state.heap, owner)?
             .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
             .transpose()?;
         if let Some((selected, units)) = string_slice {
             self.charge_cpu(units)?;
             return self.allocate_string(selected);
         }
-        if let Some(bytes) = protocol::bytes_value(&self.state.heap, owner)? {
+        if let Some(bytes) = string::bytes_value(&self.state.heap, owner)? {
             let plan = SlicePlan::new(bytes.len(), start, stop, step)?;
             self.charge_cpu(u64::try_from(plan.len()).unwrap_or(u64::MAX))?;
             let selected = plan.indices().map(|index| bytes[index]).collect();
@@ -1674,13 +1675,13 @@ impl<'s> Vm<'s> {
     /// sequence indices and slice bounds; NumPy integer scalars and 0-d integer arrays qualify.
     /// `None` means `value` is not an integer and its type defines no `__index__`.
     fn index_value(&mut self, value: &Value<'s>) -> Result<Option<i64>, String> {
-        if let Some(index) = protocol::int_value(&self.state.heap, *value) {
+        if let Some(index) = number::int_value(&self.state.heap, *value) {
             return Ok(Some(index));
         }
         let Some(result) = self.int_by_method(value, &["__index__"])? else {
             return Ok(None);
         };
-        match protocol::int_value(&self.state.heap, result) {
+        match number::int_value(&self.state.heap, result) {
             Some(index) => Ok(Some(index)),
             None => {
                 Err(self
@@ -1704,7 +1705,7 @@ impl<'s> Vm<'s> {
                 | Object::Bytes(_)
                 | Object::ByteArray(_)
         );
-        if !sequence || protocol::int_value(&self.state.heap, index).is_some() {
+        if !sequence || number::int_value(&self.state.heap, index).is_some() {
             return Ok(index);
         }
         Ok(match self.index_value(&index)? {
@@ -1737,8 +1738,8 @@ impl<'s> Vm<'s> {
     ) -> Result<Option<Value<'s>>, String> {
         let builtin = self.registered_kind(value).is_none()
             && (super::number::view(&self.state.heap, value).is_some()
-                || protocol::string_value(&self.state.heap, *value)?.is_some()
-                || protocol::bytes_value(&self.state.heap, *value)?.is_some());
+                || string::string_value(&self.state.heap, *value)?.is_some()
+                || string::bytes_value(&self.state.heap, *value)?.is_some());
         if builtin {
             return Ok(None);
         }
@@ -1779,9 +1780,7 @@ impl<'s> Vm<'s> {
             let Some(result) = self.conversion_method(value, method)? else {
                 continue;
             };
-            if protocol::int_value(&self.state.heap, result).is_none()
-                && !self.is_bigint(&result)?
-            {
+            if number::int_value(&self.state.heap, result).is_none() && !self.is_bigint(&result)? {
                 let message = format!(
                     "{method} returned non-int (type {})",
                     self.type_name_of(&result)?
@@ -1865,7 +1864,7 @@ impl<'s> Vm<'s> {
             return Ok(None);
         }
         let integer =
-            if protocol::int_value(&self.state.heap, *bound).is_some() || self.is_bigint(bound)? {
+            if number::int_value(&self.state.heap, *bound).is_some() || self.is_bigint(bound)? {
                 *bound
             } else {
                 match self.int_by_method(bound, &["__index__"])? {
@@ -1878,7 +1877,7 @@ impl<'s> Vm<'s> {
                     }
                 }
             };
-        if let Some(index) = protocol::int_value(&self.state.heap, integer) {
+        if let Some(index) = number::int_value(&self.state.heap, integer) {
             return Ok(Some(index));
         }
         let negative = matches!(
@@ -1931,7 +1930,7 @@ impl<'s> Vm<'s> {
         let index = self.sequence_index(&owner, index)?;
         match self.get(owner)? {
             Object::List(values) => {
-                let Some(index) = protocol::int_value(&self.state.heap, index) else {
+                let Some(index) = number::int_value(&self.state.heap, index) else {
                     let message = format!(
                         "list indices must be integers or slices, not {}",
                         self.type_name_of(&index)?
@@ -2242,7 +2241,7 @@ impl<'s> Vm<'s> {
                     .map(|(key, value)| (self.handle(key), self.handle(value)))
                     .collect::<Vec<_>>();
                 for (key, value) in entries {
-                    let Some(key) = protocol::string_value(&self.state.heap, key)? else {
+                    let Some(key) = string::string_value(&self.state.heap, key)? else {
                         return Err("metaclass namespace keys must be strings".into());
                     };
                     prepared_namespace.insert(key, value);
@@ -3327,7 +3326,7 @@ impl<'s> Vm<'s> {
                 .ok_or_else(|| "__bool__ should return bool".into());
         }
         if let Some(result) = self.invoke_slot(value, Slot::Length, "__len__", Vec::new())? {
-            let length = protocol::int_value(&self.state.heap, result)
+            let length = number::int_value(&self.state.heap, result)
                 .ok_or_else(|| "__len__ should return int".to_string())?;
             if length < 0 {
                 return Err("__len__ should return >= 0".into());
@@ -3348,7 +3347,7 @@ impl<'s> Vm<'s> {
             if let Object::Class(class_object) = self.get(class)? {
                 if let Some(module) = class_object.attributes.get("__module__") {
                     let module = self.handle(module);
-                    if let Some(module) = protocol::string_value(&self.state.heap, module)? {
+                    if let Some(module) = string::string_value(&self.state.heap, module)? {
                         if module != "builtins" {
                             name = format!("{module}.{name}");
                         }
@@ -3389,7 +3388,7 @@ impl<'s> Vm<'s> {
             Some(SlotValue::VmRepr)
         ) {
             if let Some(result) = self.invoke_slot(value, Slot::Repr, "__repr__", Vec::new())? {
-                return protocol::string_value(&self.state.heap, result)?
+                return string::string_value(&self.state.heap, result)?
                     .ok_or_else(|| "__repr__ should return str".into());
             }
         }
@@ -3543,7 +3542,7 @@ impl<'s> Vm<'s> {
         let mut parts = Vec::with_capacity(entries.len());
         for (name, value) in entries {
             let value = self.repr_nested(&value, active)?;
-            parts.push(format!("{}: {value}", protocol::quote_string(&name)));
+            parts.push(format!("{}: {value}", string::quote_string(&name)));
         }
         active.remove(&id);
         Ok(format!("{{{}}}", parts.join(", ")))
@@ -3599,10 +3598,10 @@ impl<'s> Vm<'s> {
 
     pub(super) fn display_value(&mut self, value: &Value<'s>) -> Result<String, String> {
         if let Some(result) = self.invoke_slot(value, Slot::String, "__str__", Vec::new())? {
-            return protocol::string_value(&self.state.heap, result)?
+            return string::string_value(&self.state.heap, result)?
                 .ok_or_else(|| "__str__ should return str".into());
         }
-        if let Some(text) = protocol::string_value(&self.state.heap, *value)? {
+        if let Some(text) = string::string_value(&self.state.heap, *value)? {
             return Ok(text);
         }
         if self
@@ -3882,7 +3881,7 @@ impl<'s> Vm<'s> {
             BuiltinType::Type => match arguments.as_slice() {
                 [value] => self.type_of(value)?,
                 [name, bases, namespace] => {
-                    let name = protocol::string_value(&self.state.heap, *name)?
+                    let name = string::string_value(&self.state.heap, *name)?
                         .ok_or("type name must be a string")?;
                     self.new_type(
                         Value::Native(NativeValue::BuiltinType(BuiltinType::Type)),
@@ -3968,18 +3967,17 @@ impl<'s> Vm<'s> {
             BuiltinType::Int => {
                 expect_arity(&arguments, 0, 2)?;
                 if let Some(base) = arguments.get(1) {
-                    let base = protocol::int_value(&self.state.heap, *base).ok_or_else(|| {
+                    let base = number::int_value(&self.state.heap, *base).ok_or_else(|| {
                         self.record_native_error(PyError::type_error(
                             "int() base must be an integer",
                         ))
                     })?;
-                    let text = protocol::string_value(&self.state.heap, arguments[0])?.ok_or_else(
-                        || {
+                    let text =
+                        string::string_value(&self.state.heap, arguments[0])?.ok_or_else(|| {
                             self.record_native_error(PyError::type_error(
                                 "int() can't convert non-string with explicit base",
                             ))
-                        },
-                    )?;
+                        })?;
                     self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
                     let integer = super::number::parse_integer_text(&text, base)
                         .map_err(|error| self.record_native_error(error))?;
@@ -3990,10 +3988,10 @@ impl<'s> Vm<'s> {
                         None => Value::Int(0),
                         Some(value) if self.is_bigint(value)? => *value,
                         Some(value)
-                            if protocol::string_value(&self.state.heap, *value)?.is_some() =>
+                            if string::string_value(&self.state.heap, *value)?.is_some() =>
                         {
                             let text =
-                                protocol::string_value(&self.state.heap, *value)?.expect("guarded");
+                                string::string_value(&self.state.heap, *value)?.expect("guarded");
                             self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
                             let integer = super::number::parse_integer_text(&text, 10)
                                 .map_err(|error| self.record_native_error(error))?;
@@ -4044,15 +4042,15 @@ impl<'s> Vm<'s> {
                         };
                         value
                     }
-                    Some(value) if protocol::string_value(&self.state.heap, *value)?.is_some() => {
+                    Some(value) if string::string_value(&self.state.heap, *value)?.is_some() => {
                         let text =
-                            protocol::string_value(&self.state.heap, *value)?.expect("guarded");
+                            string::string_value(&self.state.heap, *value)?.expect("guarded");
                         match text.trim().parse::<f64>() {
                             Ok(parsed) => parsed,
                             Err(_) => {
                                 let message = format!(
                                     "could not convert string to float: {}",
-                                    protocol::quote_string(&text)
+                                    string::quote_string(&text)
                                 );
                                 return Err(self.raise_exception("ValueError", message));
                             }
@@ -4089,12 +4087,12 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 0, 2)?;
                 let value = match arguments.as_slice() {
                     [] => Vec::new(),
-                    [value] if protocol::bytes_value(&self.state.heap, *value)?.is_some() => {
-                        protocol::bytes_value(&self.state.heap, *value)?.expect("guarded")
+                    [value] if string::bytes_value(&self.state.heap, *value)?.is_some() => {
+                        string::bytes_value(&self.state.heap, *value)?.expect("guarded")
                     }
-                    [value] if protocol::int_value(&self.state.heap, *value).is_some() => {
+                    [value] if number::int_value(&self.state.heap, *value).is_some() => {
                         let Ok(length) = usize::try_from(
-                            protocol::int_value(&self.state.heap, *value).expect("guarded"),
+                            number::int_value(&self.state.heap, *value).expect("guarded"),
                         ) else {
                             return Err(self.raise_exception("ValueError", "negative count"));
                         };
@@ -4108,7 +4106,7 @@ impl<'s> Vm<'s> {
                         let converted = self
                             .conversion_method(value, "__bytes__")?
                             .expect("special method found above");
-                        match protocol::bytes_value(&self.state.heap, converted)? {
+                        match string::bytes_value(&self.state.heap, converted)? {
                             Some(bytes) => bytes,
                             None => {
                                 let message = format!(
@@ -4146,9 +4144,9 @@ impl<'s> Vm<'s> {
                         bytes
                     }
                     [value, encoding] => {
-                        let text = protocol::string_value(&self.state.heap, *value)?
+                        let text = string::string_value(&self.state.heap, *value)?
                             .ok_or("encoding without a string argument")?;
-                        let encoding = protocol::string_value(&self.state.heap, *encoding)?
+                        let encoding = string::string_value(&self.state.heap, *encoding)?
                             .ok_or("bytes() encoding must be a string")?;
                         if !matches!(encoding.to_ascii_lowercase().as_str(), "utf-8" | "utf8") {
                             return Err("only UTF-8 encoding is supported".into());

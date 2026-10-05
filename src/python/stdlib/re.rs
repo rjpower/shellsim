@@ -22,7 +22,7 @@ use super::super::native::{
     PyValueCast, ValueDef,
 };
 use super::super::object_model::{BuiltinType, TypeId};
-use super::super::protocol::quote_string;
+use super::super::string::quote_string;
 
 pub(super) const IGNORECASE: u32 = 2;
 pub(super) const LOCALE: u32 = 4;

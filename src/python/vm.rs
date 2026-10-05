@@ -40,6 +40,7 @@ use super::number;
 use super::object_model::{BuiltinType, Slot, SlotValue, TypeId};
 use super::slice::SlicePlan;
 use super::source::Span;
+use super::string;
 use super::symbols::SymbolId;
 use super::{protocol, ExecResult, Out, ReplState, Value};
 
@@ -1478,12 +1479,12 @@ impl<'s> Vm<'s> {
             return self.materialize_through_bytecode(*value);
         }
         let mut result = Vec::new();
-        if let Some(value) = protocol::string_value(&self.state.heap, *value)? {
+        if let Some(value) = string::string_value(&self.state.heap, *value)? {
             for character in value.chars() {
                 let character = self.allocate_string(character.to_string())?;
                 self.push_materialized(&mut result, character)?;
             }
-        } else if let Some(value) = protocol::bytes_value(&self.state.heap, *value)? {
+        } else if let Some(value) = string::bytes_value(&self.state.heap, *value)? {
             for byte in value {
                 self.push_materialized(&mut result, Value::Int(i64::from(byte)))?;
             }
@@ -1653,7 +1654,7 @@ impl<'s> Vm<'s> {
                         return Err(error);
                     };
                     let exception_value = self.handle(&exception.value);
-                    let kind = protocol::exception_base(self.state, exception_value)?
+                    let kind = exception_types::exception_base(self.state, exception_value)?
                         .unwrap_or(exception.kind.as_str());
                     if !exception_types::exception_is_subclass(kind, "IndexError")
                         && !exception_types::exception_is_subclass(kind, "StopIteration")
@@ -1678,7 +1679,7 @@ impl<'s> Vm<'s> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
-        let payload = protocol::string_ref(&self.state.heap, value)?
+        let payload = string::string_ref(&self.state.heap, value)?
             .map_or(0, |text| text.byte_len().saturating_mul(2));
         self.reserve_result(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;

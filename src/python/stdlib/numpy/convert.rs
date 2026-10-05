@@ -11,7 +11,7 @@ use super::super::super::native::{
     CallArgs, PyArrayBuffer, PyArrayData, PyArrayDtype, PyError, PyKind, PyNativeKind, PyResult,
     PyRuntime, PyValue, PyValueCast,
 };
-use super::super::super::protocol::quote_string;
+use super::super::super::string::quote_string;
 use super::array::{
     buffer_with_capacity, contiguous_buffer, element_count, gather_into, new_array,
     reserve_elements, Array,

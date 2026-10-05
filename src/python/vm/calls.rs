@@ -4,7 +4,7 @@ use super::super::ast::{Program, Statement, StatementKind};
 use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
-    expect_arity, protocol, range_length, BigInt, BinaryOperator, Builtin, BuiltinType,
+    expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     BytecodeFrame, CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator,
     ExceptionType, Execution, FunctionInvocation, FunctionReturn, HashMap, NativeValue, Object,
     PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot,
@@ -26,7 +26,7 @@ impl<'s> Vm<'s> {
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
     pub(super) fn physical_length(&self, value: Value<'s>) -> Result<Option<usize>, String> {
         let subject = value;
-        if let Some(length) = protocol::string_length(&self.state.heap, subject)? {
+        if let Some(length) = string::string_length(&self.state.heap, subject)? {
             return Ok(Some(length));
         }
         if !subject.is_object() {
@@ -61,7 +61,7 @@ impl<'s> Vm<'s> {
         builtin: &str,
         source: &Value<'s>,
     ) -> Result<Program, String> {
-        let source = protocol::string_value(&self.state.heap, *source)?.ok_or_else(|| {
+        let source = string::string_value(&self.state.heap, *source)?.ok_or_else(|| {
             self.record_native_error(PyError::type_error(format!(
                 "{builtin}() arg 1 must be a string, bytes or code object"
             )))
@@ -118,7 +118,7 @@ impl<'s> Vm<'s> {
         let result = self.invoke_value(method, Vec::new())?;
         let mut names = Vec::new();
         for item in self.iterable_values(&result)? {
-            let Some(name) = protocol::string_value(&self.state.heap, item)? else {
+            let Some(name) = string::string_value(&self.state.heap, item)? else {
                 return Err(self.raise_exception("TypeError", "__dir__() must return strings"));
             };
             names.push((name, item));
@@ -240,7 +240,7 @@ impl<'s> Vm<'s> {
                     self.reserve_result(entries.len().saturating_mul(64))?;
                     let mut additions = Vec::with_capacity(entries.len());
                     for (key, value) in entries {
-                        let Some(name) = protocol::string_value(&self.state.heap, key)? else {
+                        let Some(name) = string::string_value(&self.state.heap, key)? else {
                             return Err(
                                 self.raise_exception("TypeError", "keywords must be strings")
                             );
@@ -524,14 +524,14 @@ impl<'s> Vm<'s> {
                             if value.is_none() {
                                 continue;
                             }
-                            separator = protocol::string_value(&self.state.heap, *value)?
+                            separator = string::string_value(&self.state.heap, *value)?
                                 .ok_or("sep must be None or a string")?;
                         }
                         "end" => {
                             if value.is_none() {
                                 continue;
                             }
-                            ending = protocol::string_value(&self.state.heap, *value)?
+                            ending = string::string_value(&self.state.heap, *value)?
                                 .ok_or("end must be None or a string")?;
                         }
                         "file" if !value.is_none() => target = Some(*value),
@@ -655,7 +655,7 @@ impl<'s> Vm<'s> {
             }
             Builtin::Character => {
                 expect_arity(&arguments, 1, 1)?;
-                let value = protocol::int_value(&self.state.heap, arguments[0])
+                let value = number::int_value(&self.state.heap, arguments[0])
                     .ok_or("an integer is required for chr()")?;
                 let Some(codepoint) = u32::try_from(value).ok().and_then(char::from_u32) else {
                     return Err(
@@ -669,7 +669,7 @@ impl<'s> Vm<'s> {
             Builtin::Ordinal => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = if let Some(text) =
-                    protocol::string_value(&self.state.heap, arguments[0])?
+                    string::string_value(&self.state.heap, arguments[0])?
                 {
                     let mut characters = text.chars();
                     let character = characters.next().ok_or("ord() expected a character")?;
@@ -740,7 +740,7 @@ impl<'s> Vm<'s> {
                 }
                 let spec = match arguments.get(1) {
                     Some(spec) => {
-                        protocol::string_value(&self.state.heap, *spec)?.ok_or_else(|| {
+                        string::string_value(&self.state.heap, *spec)?.ok_or_else(|| {
                             let message = format!(
                                 "format() argument 2 must be str, not {}",
                                 self.type_name_of(spec).unwrap_or_default()
@@ -816,7 +816,7 @@ impl<'s> Vm<'s> {
                 if let Some(value) =
                     self.invoke_slot(&arguments[0], Slot::Length, "__len__", Vec::new())?
                 {
-                    let length = protocol::int_value(&self.state.heap, value)
+                    let length = number::int_value(&self.state.heap, value)
                         .ok_or("__len__() should return an integer")?;
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
@@ -1043,7 +1043,7 @@ impl<'s> Vm<'s> {
                     let message = format!("setattr expected 3 arguments, got {}", arguments.len());
                     return Err(self.raise_exception("TypeError", message));
                 }
-                let Some(name) = protocol::string_value(&self.state.heap, arguments[1])? else {
+                let Some(name) = string::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
@@ -1060,7 +1060,7 @@ impl<'s> Vm<'s> {
                     let message = format!("delattr expected 2 arguments, got {}", arguments.len());
                     return Err(self.raise_exception("TypeError", message));
                 }
-                let Some(name) = protocol::string_value(&self.state.heap, arguments[1])? else {
+                let Some(name) = string::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
@@ -1337,7 +1337,7 @@ impl<'s> Vm<'s> {
         let mut names = names
             .iter()
             .filter_map(|value| {
-                protocol::string_value(&self.state.heap, *value)
+                string::string_value(&self.state.heap, *value)
                     .ok()
                     .flatten()
             })
@@ -1463,7 +1463,7 @@ impl<'s> Vm<'s> {
                     if !keyword_arguments.is_empty() || arguments.len() != 3 {
                         return Err("type construction expects name, bases, and namespace".into());
                     }
-                    let name = protocol::string_value(&self.state.heap, arguments[0])?
+                    let name = string::string_value(&self.state.heap, arguments[0])?
                         .ok_or("type name must be a string")?;
                     self.new_type(class, name, arguments[1], arguments[2])
                         .map_err(|error| error.to_string())?
