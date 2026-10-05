@@ -40,6 +40,7 @@ pub fn alloc_scope<'s>(
                 .into_iter()
                 .map(|value| builder.optional(value))
                 .collect(),
+            order: Vec::new(),
             values: builder.named(values),
         }))
     })
@@ -117,6 +118,12 @@ pub fn uses_repl_globals(heap: &Heap, start: Value<'_>) -> Result<bool, String> 
 
 pub fn parent<'s>(heap: &Heap, start: Value<'_>) -> Result<Option<Value<'s>>, String> {
     Ok(heap.handle_optional(scope(heap, start)?.parent.as_ref()))
+}
+
+/// The dynamic names bound in this scope in the order they were first bound, which a class
+/// body's namespace keeps for its fields and enum members.
+pub fn bound_names(heap: &Heap, start: Value<'_>) -> Result<Vec<String>, String> {
+    Ok(scope(heap, start)?.order.clone())
 }
 
 /// Every name bound directly in this scope, slots and dynamic names together.
@@ -210,10 +217,14 @@ pub fn insert(
     if let Some(slot) = object.local_names.iter().position(|local| local == &name) {
         return store_local(heap, start, slot, value);
     }
-    if !object.values.contains_key(&name) {
+    let new_name = !object.values.contains_key(&name);
+    if new_name {
         heap.reserve_object_growth(start, DYNAMIC_NAME_BYTES, roots, resources)?;
     }
     modify_scope(heap, start, |builder, scope| {
+        if new_name {
+            scope.order.push(name.clone());
+        }
         scope.values.insert(name, builder.store(value));
     })
 }
@@ -253,7 +264,10 @@ pub fn remove<'s>(
     let removed = modify_scope(heap, start, |_, scope| {
         match scope.local_names.iter().position(|local| local == name) {
             Some(slot) => scope.locals[slot].take(),
-            None => scope.values.remove(name),
+            None => {
+                scope.order.retain(|bound| bound != name);
+                scope.values.remove(name)
+            }
         }
     })?;
     Ok(heap.handle_optional(removed.as_ref()))

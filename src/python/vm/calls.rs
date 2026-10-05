@@ -6,8 +6,8 @@ use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
-    FunctionReturn, HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind,
-    PyRuntime, PyStreamRead, RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
+    HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead,
+    RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
 
@@ -17,7 +17,6 @@ struct FunctionParts<'s> {
     code: CodeRef,
     closure: Option<Value<'s>>,
     defaults: Vec<Value<'s>>,
-    defining_class: Option<Value<'s>>,
 }
 
 impl<'s> Vm<'s> {
@@ -283,7 +282,6 @@ impl<'s> Vm<'s> {
                 BoundMethod {
                     receiver: Value<'v>,
                     descriptor: Value<'v>,
-                    owner: Option<Value<'v>>,
                 },
                 GenericAlias(Value<'v>),
                 Instance(Value<'v>),
@@ -295,11 +293,10 @@ impl<'s> Vm<'s> {
                 Object::DescriptorBoundMethod {
                     receiver,
                     descriptor,
-                    owner,
+                    ..
                 } => Callee::BoundMethod {
                     receiver: self.handle(receiver),
                     descriptor: self.handle(descriptor),
-                    owner: self.handle_optional(owner.as_ref()),
                 },
                 Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.handle(origin)),
                 Object::Class(_) => Callee::Class,
@@ -309,24 +306,17 @@ impl<'s> Vm<'s> {
                 },
             };
             return match callee {
-                Callee::Function => self.call_python_general(
-                    function,
-                    None,
-                    None,
-                    arguments,
-                    keyword_arguments,
-                    mode,
-                ),
+                Callee::Function => {
+                    self.call_python_general(function, None, arguments, keyword_arguments, mode)
+                }
                 Callee::BoundMethod {
                     receiver,
                     descriptor,
-                    owner,
                 } => {
                     if descriptor.is_object() {
                         self.call_python_general(
                             descriptor,
                             Some(receiver),
-                            owner,
                             arguments,
                             keyword_arguments,
                             mode,
@@ -1147,9 +1137,7 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 0, 2)?;
                 let (start_class, receiver) = match arguments.as_slice() {
                     [] => self
-                        .method_frames
-                        .last()
-                        .map(|(class, receiver)| (self.handle(class), self.handle(receiver)))
+                        .method_context()?
                         .ok_or("super(): no current method context")?,
                     [start_class, receiver]
                         if start_class.is_object()
@@ -1242,7 +1230,6 @@ impl<'s> Vm<'s> {
             code: function_object.code.clone(),
             closure: self.handle_optional(function_object.closure.as_ref()),
             defaults: self.handles(&function_object.defaults),
-            defining_class: self.handle_optional(function_object.defining_class.as_ref()),
         }))
     }
 
@@ -1528,12 +1515,9 @@ impl<'s> Vm<'s> {
             if self.function_parts(initializer)?.is_none() {
                 return Err(format!("{name}.__init__ is not a function"));
             }
-            // Zero-argument `super()` in the initializer reads the method frame the call
-            // installs from the function's defining class.
             let flow = self.call_python_general(
                 initializer,
                 Some(instance),
-                None,
                 arguments,
                 keyword_arguments,
                 CallMode::Immediate,
@@ -1573,17 +1557,13 @@ impl<'s> Vm<'s> {
         if !callee.is_object() {
             return Ok(None);
         }
-        let (function, receiver, bound_owner) = match self.get(callee)? {
-            Object::Function(_) => (callee, None, None),
+        let (function, receiver) = match self.get(callee)? {
+            Object::Function(_) => (callee, None),
             Object::DescriptorBoundMethod {
                 receiver,
                 descriptor,
-                owner,
-            } if descriptor.is_object() => (
-                self.handle(descriptor),
-                Some(self.handle(receiver)),
-                self.handle_optional(owner.as_ref()),
-            ),
+                ..
+            } if descriptor.is_object() => (self.handle(descriptor), Some(self.handle(receiver))),
             _ => return Ok(None),
         };
         let Object::Function(function_object) = self.state.heap.get(function)? else {
@@ -1605,13 +1585,6 @@ impl<'s> Vm<'s> {
         }
         let code = function_object.code.clone();
         let closure = self.handle_optional(function_object.closure.as_ref());
-        let method_owner =
-            bound_owner.or(self.handle_optional(function_object.defining_class.as_ref()));
-        let first_argument = match receiver {
-            Some(receiver) => Some(receiver),
-            None if positional > 0 => Some(self.peek(positional - 1)?),
-            None => None,
-        };
         let locals_base = self.execution.locals.len();
         if let Some(receiver) = receiver {
             let receiver = self.store(receiver);
@@ -1635,24 +1608,18 @@ impl<'s> Vm<'s> {
                 *local = Some(default.dup());
             }
         }
-        let entry = FrameEntry {
-            scope: None,
-            enclosing: closure,
-            locals_base: Some(locals_base),
-        };
-        let method_frame = method_owner.zip(first_argument);
-        self.enter_python_function(function, &code, entry, method_frame, mode)
+        let entry = FrameEntry::with_locals(function, closure, locals_base);
+        self.enter_python_function(function, &code, entry, mode)
             .map(Some)
     }
 
     /// Call a Python function through full argument binding: keyword and starred arguments,
     /// variadic parameters, generators, heap-resident locals, and arity errors. `receiver`
-    /// becomes the first argument; `bound_owner` is the class a bound method was taken from.
+    /// becomes the first argument.
     fn call_python_general(
         &mut self,
         function: Value<'s>,
         receiver: Option<Value<'s>>,
-        bound_owner: Option<Value<'s>>,
         mut arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
         mode: CallMode,
@@ -1662,26 +1629,23 @@ impl<'s> Vm<'s> {
             code,
             closure,
             defaults,
-            defining_class,
         } = self
             .function_parts(function)?
             .ok_or("bound descriptor is not callable")?;
         if let Some(receiver) = receiver {
             arguments.insert(0, receiver);
         }
-        let method_frame = bound_owner
-            .or(defining_class)
-            .zip(arguments.first().copied());
         let locals =
             self.bind_function_locals(&name, &code, &defaults, arguments, keyword_arguments)?;
         if code.call_signature.is_generator || code.call_signature.is_coroutine {
-            return self.create_generator(name, &code, closure, locals);
+            return self.create_generator(function, &code, closure, locals);
         }
         if self.call_depth == Self::MAX_CALL_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
         let entry = if code.call_signature.heap_locals {
-            FrameEntry::scoped(self.function_scope(&code, closure, locals)?)
+            let scope = self.function_scope(&code, closure, locals)?;
+            FrameEntry::function(function, scope)
         } else {
             let locals_base = self.execution.locals.len();
             let stored = locals
@@ -1689,49 +1653,30 @@ impl<'s> Vm<'s> {
                 .map(|value| value.map(|value| self.store(value)))
                 .collect::<Vec<_>>();
             self.execution.locals.extend(stored);
-            FrameEntry {
-                scope: None,
-                enclosing: closure,
-                locals_base: Some(locals_base),
-            }
+            FrameEntry::with_locals(function, closure, locals_base)
         };
-        self.enter_python_function(function, &code, entry, method_frame, mode)
+        self.enter_python_function(function, &code, entry, mode)
     }
 
     /// Run `code` for `function` in a frame whose locals are already bound. A deferred call
     /// leaves the frame installed for the dispatch loop; an immediate call runs it to
-    /// completion here. `method_frame` is the `(class, receiver)` pair zero-argument
-    /// `super()` sees while the frame runs.
+    /// completion here.
     fn enter_python_function(
         &mut self,
         function: Value<'s>,
         code: &CodeRef,
         entry: FrameEntry<'_>,
-        method_frame: Option<(Value<'s>, Value<'s>)>,
         mode: CallMode,
     ) -> Result<Flow, String> {
-        let pop_method_frame = method_frame.is_some();
-        if let Some((owner, receiver)) = method_frame {
-            let frame = (self.store(owner), self.store(receiver));
-            self.method_frames.push(frame);
-        }
         self.call_depth += 1;
-        if let CallMode::Deferred(call_span) = mode {
+        if let CallMode::Deferred(_) = mode {
             let stack_base = self.stack.len();
-            let function_return = FunctionReturn {
-                function: self.store(function),
-                call_span,
-                pop_method_frame,
-            };
-            let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return))?;
+            let frame = self.enter_frame(code, 0, stack_base, entry, true)?;
             self.bytecode_frames.push(frame);
             return Ok(Flow::Refresh);
         }
         let result = self.execute_code(code, entry);
         self.call_depth -= 1;
-        if pop_method_frame {
-            self.method_frames.pop();
-        }
         match result {
             Ok(Flow::Return(value)) => {
                 self.execution.stack.push_ref(&value);
@@ -1763,7 +1708,7 @@ impl<'s> Vm<'s> {
 
     fn create_generator(
         &mut self,
-        name: String,
+        function: Value<'s>,
         code: &CodeRef,
         closure: Option<Value<'s>>,
         locals: Vec<Option<Value<'s>>>,
@@ -1771,11 +1716,12 @@ impl<'s> Vm<'s> {
         let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc_with(|builder| {
             Object::Generator(Box::new(GeneratorObject {
-                name,
+                function: builder.store(function),
                 code: code.clone(),
                 scope: builder.store(scope),
                 instruction_pointer: 0,
                 handlers: Vec::new(),
+                contexts: Vec::new(),
                 exceptions: Vec::new(),
                 stack: Vec::new(),
                 exhausted: false,
@@ -1794,23 +1740,15 @@ impl<'s> Vm<'s> {
         let Some((base, code)) = self
             .bytecode_frames
             .last()
-            .and_then(|frame| Some((frame.locals_base?, frame.code.clone())))
+            .and_then(|frame| Some((frame.locals_base()?, frame.code.clone())))
         else {
-            return Ok(FrameEntry {
-                scope: None,
-                enclosing,
-                locals_base: None,
-            });
+            return Ok(FrameEntry::dynamic(enclosing));
         };
         let locals = (0..code.local_names.len())
             .map(|slot| self.handle_optional(self.locals.get(base + slot)?.as_ref()))
             .collect();
         let snapshot = self.function_scope(&code, enclosing, locals)?;
-        Ok(FrameEntry {
-            scope: None,
-            enclosing: Some(snapshot),
-            locals_base: None,
-        })
+        Ok(FrameEntry::dynamic(Some(snapshot)))
     }
 
     /// Allocate the heap scope of an activation whose locals must outlive the frame or be

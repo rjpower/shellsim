@@ -953,9 +953,11 @@ impl<'s> Vm<'s> {
             return Err("object is not a generator".into());
         };
         let code = state.code.clone();
+        let function = self.handle(&state.function);
         let scope = self.handle(&state.scope);
         let mut instruction_pointer = state.instruction_pointer;
         let mut handlers = state.handlers.clone();
+        let contexts = state.contexts.iter().map(Ref::dup).collect();
         let exhausted = state.exhausted;
         let running = state.running;
         let subiterator = self.handle_optional(state.stack.last());
@@ -1068,12 +1070,15 @@ impl<'s> Vm<'s> {
         let mut resume = ResumePoint {
             instruction_pointer: start,
             handlers,
+            contexts,
         };
-        let result = self.execute_code_from(&code, &mut resume, 0, FrameEntry::scoped(scope));
+        let entry = FrameEntry::function(function, scope);
+        let result = self.execute_code_from(&code, &mut resume, 0, entry);
         self.call_depth -= 1;
         let ResumePoint {
             instruction_pointer: next_instruction,
             handlers,
+            contexts,
         } = resume;
         // Re-root the frame's result before anything below can allocate.
         let result = result.map(|flow| match flow {
@@ -1101,6 +1106,7 @@ impl<'s> Vm<'s> {
                     if let Object::Generator(state) = object {
                         state.instruction_pointer = next_instruction;
                         state.handlers = handlers;
+                        state.contexts = contexts;
                         state.exceptions = generator_exceptions
                             .into_iter()
                             .map(|(kind, value)| (kind, builder.store(value)))

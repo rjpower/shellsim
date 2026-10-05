@@ -158,13 +158,17 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         }
         Object::Generator(generator) => {
             let GeneratorObject {
+                function,
                 scope,
+                contexts,
                 exceptions,
                 stack,
                 return_value,
                 ..
             } = &mut **generator;
+            f(&mut function.0);
             f(&mut scope.0);
+            slots(contexts, f);
             for (_, slot) in exceptions {
                 f(&mut slot.0);
             }

@@ -66,7 +66,7 @@ impl<'s> Vm<'s> {
         self.handle_optional(
             self.bytecode_frames
                 .last()
-                .and_then(|frame| frame.scope.as_ref()),
+                .and_then(BytecodeFrame::active_scope),
         )
     }
 
@@ -76,8 +76,34 @@ impl<'s> Vm<'s> {
         self.handle_optional(
             self.bytecode_frames
                 .last()
-                .and_then(BytecodeFrame::lookup_scope),
+                .and_then(|frame| frame.scope.as_ref()),
         )
+    }
+
+    /// The class and receiver zero-argument `super()` and `__class__` refer to: the defining
+    /// class of the function the nearest method frame runs, and that frame's first local.
+    pub(super) fn method_context(&self) -> Result<Option<(Value<'s>, Value<'s>)>, String> {
+        for frame in self.bytecode_frames.iter().rev() {
+            let Some(callee) = &frame.callee else {
+                continue;
+            };
+            let Object::Function(function) = self.get(self.handle(callee))? else {
+                continue;
+            };
+            let Some(class) = self.handle_optional(function.defining_class.as_ref()) else {
+                continue;
+            };
+            let receiver = match (frame.locals_base(), frame.active_scope()) {
+                (Some(base), _) => {
+                    self.handle_optional(self.locals.get(base).and_then(Option::as_ref))
+                }
+                (None, Some(scope)) => scopes::local_ref(self.heap(), self.handle(scope), 0)?
+                    .map(|slot| self.handle(slot)),
+                (None, None) => None,
+            };
+            return Ok(receiver.map(|receiver| (class, receiver)));
+        }
+        Ok(None)
     }
 
     /// The scope `hops` lexical levels above the active frame's own level; `None` past the
@@ -87,10 +113,11 @@ impl<'s> Vm<'s> {
             .bytecode_frames
             .last()
             .ok_or("scope walk requires an active frame")?;
-        let (mut target, hops) = match (&frame.scope, hops) {
-            (Some(scope), hops) => (Some(self.handle(scope)), hops),
-            (None, 0) => return Err("invalid enclosing scope hop count".into()),
-            (None, hops) => (self.handle_optional(frame.enclosing.as_ref()), hops - 1),
+        let scope = self.handle_optional(frame.scope.as_ref());
+        let (mut target, hops) = match (frame.own_scope, hops) {
+            (true, hops) => (scope, hops),
+            (false, 0) => return Err("invalid enclosing scope hop count".into()),
+            (false, hops) => (scope, hops - 1),
         };
         for _ in 0..hops {
             target = target
@@ -103,10 +130,8 @@ impl<'s> Vm<'s> {
 
     pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         if name == "__class__" {
-            let class = self
-                .method_frames
-                .last()
-                .map(|(class, _)| self.handle(class))
+            let (class, _) = self
+                .method_context()?
                 .ok_or("__class__ is only defined inside a class method body")?;
             self.push(class);
             return Ok(());
@@ -241,21 +266,6 @@ impl<'s> Vm<'s> {
     pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
         let value = self.pop()?;
         if let Some(scope) = self.active_scope() {
-            let in_class_body = self
-                .class_scopes
-                .last()
-                .is_some_and(|class_scope| self.state.heap.identical_ref(scope, class_scope));
-            if in_class_body
-                && self
-                    .class_bindings
-                    .last()
-                    .is_some_and(|bindings| !bindings.iter().any(|binding| binding == name))
-            {
-                self.class_bindings
-                    .last_mut()
-                    .expect("class binding stack is present")
-                    .push(name.to_string());
-            }
             self.scope_insert(scope, name.to_string(), value)?;
         } else {
             self.state.globals.insert(
@@ -441,13 +451,13 @@ impl<'s> Vm<'s> {
             .bytecode_frames
             .iter()
             .rev()
-            .find(|frame| frame.scope.is_some() || frame.locals_base.is_some())
+            .find(|frame| frame.own_scope || frame.locals_base.is_some())
         else {
             return self.alloc(Object::NamespaceDict(NamespaceTarget::Repl));
         };
-        let Some(scope) = self.handle_optional(frame.scope.as_ref()) else {
+        let Some(scope) = self.handle_optional(frame.active_scope()) else {
             let base = frame
-                .locals_base
+                .locals_base()
                 .expect("frame without a scope was chosen for its slots");
             let names = frame.code.local_names.clone();
             let mut items = Vec::with_capacity(names.len());

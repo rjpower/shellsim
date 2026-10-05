@@ -240,12 +240,15 @@ pub struct FunctionObject {
 /// A suspended generator frame. Boxed inside [`Object::Generator`] to keep heap slots small.
 #[derive(Debug)]
 pub struct GeneratorObject {
-    pub name: String,
+    /// The generator function, for its name and for zero-argument `super()` in its body.
+    pub function: Ref,
     pub code: CodeRef,
     pub scope: Ref,
     pub instruction_pointer: usize,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     pub handlers: Vec<(usize, usize, usize)>,
+    /// Context managers entered and not yet exited at the suspension point.
+    pub contexts: Vec<Ref>,
     pub exceptions: Vec<(String, Ref)>,
     pub stack: Vec<Ref>,
     pub exhausted: bool,
@@ -264,6 +267,8 @@ pub struct ScopeObject {
     pub uses_repl_globals: bool,
     pub local_names: std::sync::Arc<[String]>,
     pub locals: Vec<Option<Ref>>,
+    /// Dynamic names in first-binding order; `values` holds their current bindings.
+    pub order: Vec<String>,
     pub values: HashMap<String, Ref>,
 }
 
@@ -1239,16 +1244,15 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         Object::StreamIterator { .. } => 1,
         Object::Generator(generator_object) => {
             let GeneratorObject {
-                name,
                 code,
                 handlers,
                 exceptions,
                 stack,
                 ..
             } = &**generator_object;
-            name.len()
-                .checked_add(code.instructions.len())
-                .and_then(|size| size.checked_add(handlers.len()))
+            code.instructions
+                .len()
+                .checked_add(handlers.len())
                 .and_then(|size| size.checked_add(exceptions.len()))
                 .and_then(|size| size.checked_add(stack.len()))
                 .ok_or("modeled object size overflow")?

@@ -2049,12 +2049,15 @@ impl<'s> Vm<'s> {
             .execution
             .stack
             .split_off(&self.state.heap, defaults_start);
+        // A function defined in a class body closes over the body's enclosing scope: class
+        // attributes are not visible as free names.
         let mut closure = self.lookup_scope();
-        let class_scope = self.handle_optional(self.class_scopes.last());
-        if let (Some(scope), Some(class_scope)) = (closure, class_scope) {
-            if self.identical(scope, class_scope) {
-                closure = scopes::parent(self.heap(), scope)?;
-            }
+        let in_class_body = self
+            .bytecode_frames
+            .last()
+            .is_some_and(|frame| frame.class_body);
+        if let (Some(scope), true) = (closure, in_class_body) {
+            closure = scopes::parent(self.heap(), scope)?;
         }
         let function = self.alloc_with(|b| {
             Object::Function(Box::new(FunctionObject {
@@ -2324,15 +2327,7 @@ impl<'s> Vm<'s> {
             .unwrap_or(true);
         let scope =
             self.alloc_scope_named(parent, uses_repl_globals, Arc::from([]), prepared_namespace)?;
-        let stored = self.store(scope);
-        self.class_scopes.push(stored);
-        self.class_bindings.push(Vec::new());
-        let execution = self.execute_code(code, FrameEntry::scoped(scope));
-        let bindings = self
-            .class_bindings
-            .pop()
-            .expect("class binding stack is present");
-        self.class_scopes.pop();
+        let execution = self.execute_code(code, FrameEntry::class_body(scope));
         match execution {
             Ok(Flow::Halt) => {}
             Ok(Flow::Return(_)) => return Err("'return' outside function".into()),
@@ -2348,6 +2343,7 @@ impl<'s> Vm<'s> {
                 ))
             }
         }
+        let bindings = scopes::bound_names(self.heap(), scope)?;
         let mut attributes = scopes::values(self.heap(), scope)?;
         if !attributes.contains_key("__doc__") {
             let docstring = match code.docstring.clone() {

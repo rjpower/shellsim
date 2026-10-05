@@ -3002,7 +3002,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         let Some(frame) = self.bytecode_frames.iter().rev().nth(depth) else {
             return Ok(None);
         };
-        let scope = self.handle_optional(frame.lookup_scope());
+        let scope = self.handle_optional(frame.scope.as_ref());
         self.module_name_of(scope).map_err(PyError::runtime_error)
     }
 

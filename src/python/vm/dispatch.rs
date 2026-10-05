@@ -1,18 +1,20 @@
 //! Bytecode dispatch, frame transitions, exception unwind, and scheduler suspension.
 
+use super::super::heap::Ref;
 use super::super::scopes;
 use super::{
-    dispatch_next, exception_types, protocol, string, BytecodeFrame, CallId, CallMode, CodeRef,
-    DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, FunctionReturn,
-    LocalsLocation, NativeValue, Opcode, PendingNativeCall, RaisedException, SequenceKind,
-    Suspension, TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
+    dispatch_next, exception_types, frame_index, protocol, string, BytecodeFrame, CallId, CallMode,
+    CodeRef, DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, LocalsLocation,
+    NativeValue, Opcode, PendingNativeCall, RaisedException, SequenceKind, Suspension,
+    TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
 };
 
-/// Where a frame that suspends at `yield` stops and which `try` regions it has open, so a
-/// generator can resume from exactly that point.
+/// Where a frame that suspends at `yield` stops, which `try` regions it has open and which
+/// context managers it has entered, so a generator can resume from exactly that point.
 pub(super) struct ResumePoint {
     pub(super) instruction_pointer: usize,
     pub(super) handlers: Vec<(usize, usize, usize)>,
+    pub(super) contexts: Vec<Ref>,
 }
 
 impl<'s> Vm<'s> {
@@ -25,6 +27,7 @@ impl<'s> Vm<'s> {
         let mut resume = ResumePoint {
             instruction_pointer: 0,
             handlers: Vec::new(),
+            contexts: Vec::new(),
         };
         let stack_base = self.stack.len();
         self.execute_code_from(code, &mut resume, stack_base, entry)
@@ -40,15 +43,12 @@ impl<'s> Vm<'s> {
         stack_base: usize,
         entry: FrameEntry<'_>,
     ) -> Result<Flow, (String, super::super::source::Span)> {
-        let exception_base = self.exception_stack.len();
         let frame = self
-            .enter_frame(code, resume.instruction_pointer, stack_base, entry, None)
+            .enter_frame(code, resume.instruction_pointer, stack_base, entry, false)
             .map_err(|error| (error, super::super::source::Span::default()))?;
-        self.bytecode_frames.push(BytecodeFrame {
-            handlers: std::mem::take(&mut resume.handlers),
-            exception_base,
-            ..frame
-        });
+        self.handlers.append(&mut resume.handlers);
+        self.with_contexts.append(&mut resume.contexts);
+        self.bytecode_frames.push(frame);
         self.synchronous_frames += 1;
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
@@ -61,42 +61,57 @@ impl<'s> Vm<'s> {
             .bytecode_frames
             .pop()
             .expect("active bytecode frame must remain installed");
-        if !matches!(result, Ok(Flow::Yield(_))) {
-            self.stack.truncate(frame.stack_base);
-            self.exception_stack.truncate(frame.exception_base);
-        }
-        if let Some(base) = frame.locals_base {
-            self.locals.truncate(base);
-        }
+        // A yielding frame leaves its operands and handled exceptions for the generator to
+        // save; everything else it owned is released here.
+        let yielded = matches!(result, Ok(Flow::Yield(_)));
         resume.instruction_pointer = frame.instruction_pointer;
-        resume.handlers = frame.handlers;
+        resume.handlers = self.handlers.split_off(frame.handler_base as usize);
+        resume.contexts = self.with_contexts.split_off(frame.context_base as usize);
+        self.leave_frame(&frame, yielded);
         result
     }
 
-    /// Build a frame for `code`. The frame owns the local slots above `entry.locals_base`;
-    /// popping it truncates the locals stack back there. `handlers` and `exception_base`
-    /// start empty and at the current depth.
+    /// Build a frame for `code` whose shared-stack bases are the current depths: it owns the
+    /// local slots above `entry.locals_base` and whatever the shared stacks gain while it
+    /// runs. `called` marks a frame a Python call entered, which returns to the frame below.
     pub(super) fn enter_frame(
         &mut self,
         code: &CodeRef,
         instruction_pointer: usize,
         stack_base: usize,
         entry: FrameEntry<'_>,
-        function_return: Option<FunctionReturn>,
+        called: bool,
     ) -> Result<BytecodeFrame, String> {
-        let code_cache = self.ensure_code_cache(code)?;
+        let code_cache = frame_index(self.ensure_code_cache(code)?)?;
         Ok(BytecodeFrame {
             code: code.clone(),
-            code_cache,
             instruction_pointer,
-            stack_base,
-            locals_base: entry.locals_base,
+            code_cache,
+            exception_base: frame_index(self.exception_stack.len())?,
+            stack_base: frame_index(stack_base)?,
+            handler_base: frame_index(self.handlers.len())?,
+            context_base: frame_index(self.with_contexts.len())?,
+            locals_base: entry.locals_base.map(frame_index).transpose()?,
             scope: entry.scope.map(|scope| self.store(scope)),
-            enclosing: entry.enclosing.map(|scope| self.store(scope)),
-            handlers: Vec::new(),
-            exception_base: self.exception_stack.len(),
-            function_return,
+            callee: entry.callee.map(|callee| self.store(callee)),
+            own_scope: entry.own_scope,
+            called,
+            class_body: entry.class_body,
         })
+    }
+
+    /// Release what a popped frame owned on the shared stacks. A yielding frame keeps its
+    /// operands and handled exceptions, which the generator saves.
+    fn leave_frame(&mut self, frame: &BytecodeFrame, yielded: bool) {
+        if !yielded {
+            self.stack.truncate(frame.stack_base());
+            self.exception_stack.truncate(frame.exception_base as usize);
+        }
+        if let Some(base) = frame.locals_base() {
+            self.locals.truncate(base);
+        }
+        self.handlers.truncate(frame.handler_base as usize);
+        self.with_contexts.truncate(frame.context_base as usize);
     }
 
     pub(super) fn execute_active_frame(
@@ -356,7 +371,7 @@ impl<'s> Vm<'s> {
                 }
                 Opcode::Return => {
                     let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    if vm.finish_deferred_frame(value) {
+                    if vm.finish_called_frame(value) {
                         Ok(Flow::Refresh)
                     } else {
                         Ok(Flow::Return(vm.store(value)))
@@ -387,15 +402,11 @@ impl<'s> Vm<'s> {
                 Opcode::TryBegin(target) => {
                     let depth = vm.stack.len();
                     let exception_depth = vm.exception_stack.len();
-                    vm.active_frame_mut()
-                        .handlers
-                        .push((target, depth, exception_depth));
+                    vm.handlers.push((target, depth, exception_depth));
                     Ok(Flow::Next)
                 }
                 Opcode::TryEnd => {
-                    vm.active_frame_mut()
-                        .handlers
-                        .pop()
+                    vm.pop_handler()
                         .ok_or("invalid bytecode exception handler")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
                     Ok(Flow::Next)
@@ -443,7 +454,7 @@ impl<'s> Vm<'s> {
                 Opcode::AsyncWithFinishException => vm.dispatch_async_with_finish_exception(),
                 Opcode::PopExpression => vm.dispatch_pop_expression(),
                 Opcode::Halt => {
-                    if vm.finish_deferred_frame(Value::None) {
+                    if vm.finish_called_frame(Value::None) {
                         Ok(Flow::Refresh)
                     } else {
                         Ok(Flow::Halt)
@@ -946,7 +957,7 @@ impl<'s> Vm<'s> {
                 return Ok(true);
             }
             let file = self.imported_module_file();
-            let Some(function_return) = self.unwind_deferred_frame() else {
+            let Some(callee) = self.unwind_called_frame() else {
                 frames.push(TracebackFrame {
                     name: "<module>".to_string(),
                     span,
@@ -956,7 +967,7 @@ impl<'s> Vm<'s> {
                 self.traceback_frames = frames;
                 return Err((error, span));
             };
-            let name = self.function_name(&function_return.function);
+            let name = self.function_name(&callee);
             frames.push(TracebackFrame {
                 name: name.clone(),
                 span,
@@ -966,20 +977,30 @@ impl<'s> Vm<'s> {
                 "{error} in {name} at line {}, column {}",
                 span.line, span.column
             );
-            span = function_return.call_span;
+            span = self.call_site_span();
         }
     }
 
-    fn finish_deferred_frame(&mut self, value: Value<'_>) -> bool {
-        let Some(_) = self
+    /// The span of the call the active frame is executing: its instruction pointer already
+    /// points past the call.
+    fn call_site_span(&self) -> super::super::source::Span {
+        let frame = self
             .bytecode_frames
             .last()
-            .and_then(|frame| frame.function_return.as_ref())
-        else {
+            .expect("a called frame has a caller");
+        frame
+            .instruction_pointer
+            .checked_sub(1)
+            .and_then(|site| frame.code.spans.get(site).copied())
+            .unwrap_or_default()
+    }
+
+    /// Return `value` from a called frame to its caller. `false` when the active frame was
+    /// entered synchronously by Rust code, which takes the value from the dispatch loop.
+    fn finish_called_frame(&mut self, value: Value<'_>) -> bool {
+        if self.unwind_called_frame().is_none() {
             return false;
-        };
-        self.unwind_deferred_frame()
-            .expect("deferred function frame was checked above");
+        }
         self.push(value);
         true
     }
@@ -994,36 +1015,35 @@ impl<'s> Vm<'s> {
         string::string_value(heap, file).ok().flatten()
     }
 
-    fn unwind_deferred_frame(&mut self) -> Option<FunctionReturn> {
-        self.bytecode_frames
-            .last()
-            .and_then(|frame| frame.function_return.as_ref())?;
+    /// Pop the active frame when a call entered it, returning the function it ran; `None`
+    /// leaves a frame Rust code entered in place.
+    fn unwind_called_frame(&mut self) -> Option<Ref> {
+        if !self.bytecode_frames.last()?.called {
+            return None;
+        }
         let frame = self
             .bytecode_frames
             .pop()
-            .expect("deferred function frame was checked above");
-        let function_return = frame
-            .function_return
-            .expect("deferred function frame must own return state");
+            .expect("called frame was checked above");
         self.call_depth = self.call_depth.saturating_sub(1);
-        if let Some(base) = frame.locals_base {
-            self.locals.truncate(base);
+        self.leave_frame(&frame, false);
+        frame.callee
+    }
+
+    /// Close the active frame's innermost open `try` region.
+    fn pop_handler(&mut self) -> Option<(usize, usize, usize)> {
+        let base = self.bytecode_frames.last()?.handler_base as usize;
+        if self.handlers.len() <= base {
+            return None;
         }
-        if function_return.pop_method_frame {
-            self.method_frames
-                .pop()
-                .expect("deferred method frame must remain installed");
-        }
-        self.stack.truncate(frame.stack_base);
-        self.exception_stack.truncate(frame.exception_base);
-        Some(function_return)
+        self.handlers.pop()
     }
 
     fn enter_exception_handler(&mut self) -> bool {
         let Some(exception) = self.pending_exception.take() else {
             return false;
         };
-        let Some((target, depth, exception_depth)) = self.active_frame_mut().handlers.pop() else {
+        let Some((target, depth, exception_depth)) = self.pop_handler() else {
             self.pending_exception = Some(exception);
             return false;
         };
