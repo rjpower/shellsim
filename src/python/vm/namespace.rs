@@ -9,7 +9,7 @@ use super::super::object_model::TypeId;
 use super::super::scopes;
 use super::{
     cpython_names, exception_types, string, Arc, BuiltinType, BytecodeFrame, CodeRef,
-    ExceptionType, Execution, FrameEntry, HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue,
+    ExceptionType, Flow, FrameEntry, HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue,
     Object, ProxyTarget, PyModuleLoader, PyRuntime, RaisedException, SymbolId, Value, Vm,
     BUILTIN_FUNCTIONS,
 };
@@ -820,21 +820,20 @@ impl<'s> Vm<'s> {
             self.state.temporary_import_paths.remove(0);
         }
         match execution {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
-            Ok(Execution::Halt) => self.finish_import(&name, module, bind_root),
-            Ok(Execution::Return(_)) => {
+            Ok(Flow::Halt) => self.finish_import(&name, module, bind_root),
+            Ok(Flow::Return(_)) => {
                 self.state.modules.remove(&name);
                 Err(format!("'return' outside function in module {name:?}"))
             }
-            Ok(Execution::Yield(_, _)) => {
+            Ok(Flow::Yield(_)) => {
                 self.state.modules.remove(&name);
                 Err(format!("'yield' outside function in module {name:?}"))
             }
-            Ok(Execution::Exit(status)) => {
+            Ok(Flow::Exit(status)) => {
                 self.state.modules.remove(&name);
                 Err(format!("module {name:?} exited with status {status}"))
             }
+            Ok(flow) => unreachable!("a module body cannot end with {flow:?}"),
             Err((error, span)) => {
                 self.state.modules.remove(&name);
                 Err(format!(

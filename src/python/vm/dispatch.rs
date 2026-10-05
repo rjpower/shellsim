@@ -2,11 +2,18 @@
 
 use super::super::scopes;
 use super::{
-    dispatch_next, exception_types, protocol, string, BytecodeFrame, CallId, CallMode, CallResult,
-    CodeRef, DispatchControl, DispatchCursor, ExceptionType, Execution, ForIterOutcome, FrameEntry,
-    FunctionReturn, LocalsLocation, NativeValue, Opcode, RaisedException, SequenceKind,
-    TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
+    dispatch_next, exception_types, protocol, string, BytecodeFrame, CallId, CallMode, CodeRef,
+    DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, FunctionReturn,
+    LocalsLocation, NativeValue, Opcode, PendingNativeCall, RaisedException, SequenceKind,
+    Suspension, TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
 };
+
+/// Where a frame that suspends at `yield` stops and which `try` regions it has open, so a
+/// generator can resume from exactly that point.
+pub(super) struct ResumePoint {
+    pub(super) instruction_pointer: usize,
+    pub(super) handlers: Vec<(usize, usize, usize)>,
+}
 
 impl<'s> Vm<'s> {
     /// Run `code` to completion in a new frame, synchronously.
@@ -14,35 +21,38 @@ impl<'s> Vm<'s> {
         &mut self,
         code: &CodeRef,
         entry: FrameEntry<'_>,
-    ) -> Result<Execution, (String, super::super::source::Span)> {
-        let mut handlers: Vec<(usize, usize, usize)> = Vec::new();
+    ) -> Result<Flow, (String, super::super::source::Span)> {
+        let mut resume = ResumePoint {
+            instruction_pointer: 0,
+            handlers: Vec::new(),
+        };
         let stack_base = self.stack.len();
-        self.execute_code_from(code, 0, &mut handlers, stack_base, entry)
+        self.execute_code_from(code, &mut resume, stack_base, entry)
     }
 
-    /// Run `code` from `instruction_pointer` in a new frame, synchronously, as `execute_code`
-    /// does for a fresh start and generator resumption does from a suspension point.
+    /// Run `code` from `resume` in a new frame, synchronously, as `execute_code` does for a
+    /// fresh start and generator resumption does from a suspension point. On return `resume`
+    /// holds where the frame stopped.
     pub(super) fn execute_code_from(
         &mut self,
         code: &CodeRef,
-        instruction_pointer: usize,
-        handlers: &mut Vec<(usize, usize, usize)>,
+        resume: &mut ResumePoint,
         stack_base: usize,
         entry: FrameEntry<'_>,
-    ) -> Result<Execution, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (String, super::super::source::Span)> {
         let exception_base = self.exception_stack.len();
         let frame = self
-            .enter_frame(code, instruction_pointer, stack_base, entry, None)
+            .enter_frame(code, resume.instruction_pointer, stack_base, entry, None)
             .map_err(|error| (error, super::super::source::Span::default()))?;
         self.bytecode_frames.push(BytecodeFrame {
-            handlers: std::mem::take(handlers),
+            handlers: std::mem::take(&mut resume.handlers),
             exception_base,
             ..frame
         });
         self.synchronous_frames += 1;
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
-                Ok(Execution::Pending) => {}
+                Ok(Flow::Pending) => {}
                 result => break result,
             }
         };
@@ -51,14 +61,15 @@ impl<'s> Vm<'s> {
             .bytecode_frames
             .pop()
             .expect("active bytecode frame must remain installed");
-        if !matches!(result, Ok(Execution::Yield(_, _))) {
+        if !matches!(result, Ok(Flow::Yield(_))) {
             self.stack.truncate(frame.stack_base);
             self.exception_stack.truncate(frame.exception_base);
         }
         if let Some(base) = frame.locals_base {
             self.locals.truncate(base);
         }
-        *handlers = frame.handlers;
+        resume.instruction_pointer = frame.instruction_pointer;
+        resume.handlers = frame.handlers;
         result
     }
 
@@ -85,24 +96,23 @@ impl<'s> Vm<'s> {
             handlers: Vec::new(),
             exception_base: self.exception_stack.len(),
             function_return,
-            pending_native_call: None,
         })
     }
 
     pub(super) fn execute_active_frame(
         &mut self,
         budget: usize,
-    ) -> Result<Execution, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (String, super::super::source::Span)> {
         // Handles made while executing live in this child scope and die with each instruction;
         // only stored references in the VM's roots carry values from one instruction to the next.
         let mut vm = self.scope();
         // The VM runs synchronously for one bounded quantum. Interrupt state can change only when
         // control returns to the scheduler, so one check defines the quantum's safe-point edge.
         if vm.interp.deadline_interrupt.is_some() {
-            return Ok(Execution::Exit(124));
+            return Ok(Flow::Exit(124));
         }
-        if let Some(execution) = vm.resume_pending_native_call()? {
-            return Ok(execution);
+        if let Some(flow) = vm.resume_suspension()? {
+            return Ok(flow);
         }
         let mut dispatch = DispatchCursor::for_active(&mut vm)
             .map_err(|error| (error, super::super::source::Span::default()))?;
@@ -121,7 +131,7 @@ impl<'s> Vm<'s> {
                 ));
             };
             if !vm.interp.resources.charge_cpu(1) {
-                return Ok(Execution::Exit(137));
+                return Ok(Flow::Exit(137));
             }
             if vm
                 .execution
@@ -138,13 +148,13 @@ impl<'s> Vm<'s> {
                 continue 'execution;
             }
             let opcode = instruction.opcode;
-            let result: Result<DispatchControl, String> = match opcode {
+            let result: Result<Flow, String> = match opcode {
                 Opcode::LoadConstant(constant) => vm
                     .value_from_constant(code.constant(constant))
                     .map(|value| {
                         vm.push(value);
                     })
-                    .map(|()| DispatchControl::Next),
+                    .map(|()| Flow::Next),
                 Opcode::LoadName(name) => {
                     let symbol = vm
                         .symbol_for(code, code_cache, name)
@@ -279,14 +289,14 @@ impl<'s> Vm<'s> {
                 }
                 Opcode::GetIterator => dispatch_next(vm.get_iterator()),
                 Opcode::ForIterator(target) => match vm.for_iterator() {
-                    Ok(ForIterOutcome::Yielded) => Ok(DispatchControl::Next),
-                    Ok(ForIterOutcome::Exhausted) => Ok(DispatchControl::Jump(target)),
+                    Ok(ForIterOutcome::Yielded) => Ok(Flow::Next),
+                    Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
                     Ok(ForIterOutcome::Blocked(reason)) => {
                         // The iterator is still on the stack, unconsumed; leaving the frame's
                         // instruction pointer at this same opcode makes the next quantum retry
                         // the identical advance instead of skipping or repeating a yielded value.
                         vm.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+                        Ok(vm.suspend(reason, None))
                     }
                     Err(error) => Err(error),
                 },
@@ -321,16 +331,16 @@ impl<'s> Vm<'s> {
                 ),
                 Opcode::Copy(depth) => dispatch_next(vm.copy(depth)),
                 Opcode::Swap(depth) => dispatch_next(vm.swap(depth)),
-                Opcode::PopTop => vm.pop().map(|_| DispatchControl::Next),
-                Opcode::Jump(target) => Ok(DispatchControl::Jump(target)),
+                Opcode::PopTop => vm.pop().map(|_| Flow::Next),
+                Opcode::Jump(target) => Ok(Flow::Jump(target)),
                 Opcode::JumpIfFalseOrPop(target) => match vm.jump_if_or_pop(false) {
-                    Ok(true) => Ok(DispatchControl::Jump(target)),
-                    Ok(false) => Ok(DispatchControl::Next),
+                    Ok(true) => Ok(Flow::Jump(target)),
+                    Ok(false) => Ok(Flow::Next),
                     Err(error) => Err(error),
                 },
                 Opcode::JumpIfTrueOrPop(target) => match vm.jump_if_or_pop(true) {
-                    Ok(true) => Ok(DispatchControl::Jump(target)),
-                    Ok(false) => Ok(DispatchControl::Next),
+                    Ok(true) => Ok(Flow::Jump(target)),
+                    Ok(false) => Ok(Flow::Next),
                     Err(error) => Err(error),
                 },
                 Opcode::PopJumpIfFalse(target) => {
@@ -339,41 +349,35 @@ impl<'s> Vm<'s> {
                         .truth_value(&value)
                         .map_err(|error| (error, dispatch.span()))?
                     {
-                        Ok(DispatchControl::Jump(target))
+                        Ok(Flow::Jump(target))
                     } else {
-                        Ok(DispatchControl::Next)
+                        Ok(Flow::Next)
                     }
                 }
                 Opcode::Return => {
                     let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
                     if vm.finish_deferred_frame(value) {
-                        Ok(DispatchControl::RefreshFrame)
+                        Ok(Flow::Refresh)
                     } else {
-                        Ok(DispatchControl::Complete(Execution::Return(
-                            vm.store(value),
-                        )))
+                        Ok(Flow::Return(vm.store(value)))
                     }
                 }
                 Opcode::Yield => {
                     let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                    Ok(DispatchControl::Complete(Execution::Yield(
-                        vm.store(value),
-                        instruction_pointer + 1,
-                    )))
+                    vm.active_frame_mut().instruction_pointer = instruction_pointer + 1;
+                    Ok(Flow::Yield(vm.store(value)))
                 }
                 Opcode::YieldFromSend(target) => match vm.yield_from_send() {
                     Ok(ForIterOutcome::Yielded) => {
                         // Suspend at this instruction so the next `send` repeats the step.
                         let value = vm.pop().map_err(|error| (error, dispatch.span()))?;
-                        Ok(DispatchControl::Complete(Execution::Yield(
-                            vm.store(value),
-                            instruction_pointer,
-                        )))
+                        vm.active_frame_mut().instruction_pointer = instruction_pointer;
+                        Ok(Flow::Yield(vm.store(value)))
                     }
-                    Ok(ForIterOutcome::Exhausted) => Ok(DispatchControl::Jump(target)),
+                    Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
                     Ok(ForIterOutcome::Blocked(reason)) => {
                         vm.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(DispatchControl::Complete(Execution::Blocked(reason)))
+                        Ok(vm.suspend(reason, None))
                     }
                     Err(error) => Err(error),
                 },
@@ -386,7 +390,7 @@ impl<'s> Vm<'s> {
                     vm.active_frame_mut()
                         .handlers
                         .push((target, depth, exception_depth));
-                    Ok(DispatchControl::Next)
+                    Ok(Flow::Next)
                 }
                 Opcode::TryEnd => {
                     vm.active_frame_mut()
@@ -394,7 +398,7 @@ impl<'s> Vm<'s> {
                         .pop()
                         .ok_or("invalid bytecode exception handler")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
-                    Ok(DispatchControl::Next)
+                    Ok(Flow::Next)
                 }
                 Opcode::MatchException { typed } => {
                     let actual = vm
@@ -411,14 +415,14 @@ impl<'s> Vm<'s> {
                         true
                     };
                     vm.push(Value::Bool(matches));
-                    Ok(DispatchControl::Next)
+                    Ok(Flow::Next)
                 }
                 Opcode::ClearException => {
                     vm.exception_stack
                         .pop()
                         .ok_or("no active exception")
                         .map_err(|e| (e.to_string(), dispatch.span()))?;
-                    Ok(DispatchControl::Next)
+                    Ok(Flow::Next)
                 }
                 Opcode::Reraise => {
                     let exception = vm
@@ -440,20 +444,20 @@ impl<'s> Vm<'s> {
                 Opcode::PopExpression => vm.dispatch_pop_expression(),
                 Opcode::Halt => {
                     if vm.finish_deferred_frame(Value::None) {
-                        Ok(DispatchControl::RefreshFrame)
+                        Ok(Flow::Refresh)
                     } else {
-                        Ok(DispatchControl::Complete(Execution::Halt))
+                        Ok(Flow::Halt)
                     }
                 }
             };
             match result {
-                Ok(DispatchControl::Next) => dispatch.op_index += 1,
-                Ok(DispatchControl::Jump(target)) => dispatch.op_index = target,
-                Ok(DispatchControl::RefreshFrame) => {
+                Ok(Flow::Next) => dispatch.op_index += 1,
+                Ok(Flow::Jump(target)) => dispatch.op_index = target,
+                Ok(Flow::Refresh) => {
                     let span = dispatch.span();
                     dispatch.refresh(&mut vm).map_err(|error| (error, span))?;
                 }
-                Ok(DispatchControl::Complete(execution)) => return Ok(execution),
+                Ok(flow) => return Ok(flow),
                 Err(error) => {
                     dispatch.sync(&mut vm);
                     if vm.propagate_error(error, dispatch.span())? {
@@ -466,7 +470,17 @@ impl<'s> Vm<'s> {
             }
         }
         dispatch.sync(&mut vm);
-        Ok(Execution::Pending)
+        Ok(Flow::Pending)
+    }
+
+    /// Leave the dispatch loop to wait for `reason`, retrying `retry` when the process wakes.
+    pub(super) fn suspend(
+        &mut self,
+        reason: crate::scheduler::WaitReason,
+        retry: Option<PendingNativeCall>,
+    ) -> Flow {
+        self.suspension = Some(Box::new(Suspension { reason, retry }));
+        Flow::Blocked
     }
 
     #[inline(never)]
@@ -476,7 +490,7 @@ impl<'s> Vm<'s> {
         call: CallId,
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<DispatchControl, String> {
+    ) -> Result<Flow, String> {
         let call = code.call(call);
         self.dispatch_call_spec(
             code,
@@ -497,7 +511,7 @@ impl<'s> Vm<'s> {
         call: CallId,
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<DispatchControl, String> {
+    ) -> Result<Flow, String> {
         let call = code.call(call);
         let count = call.positional + call.keywords.len();
         let receiver_depth = count - 1;
@@ -537,46 +551,37 @@ impl<'s> Vm<'s> {
         starred: &[bool],
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<DispatchControl, String> {
-        // Record the executing call so native code can attribute work to this line, as
-        // `warnings.warn` does for its caller.
+    ) -> Result<Flow, String> {
+        // The calling frame resumes past the call whether the callee runs in its own frame,
+        // suspends, or returns here; recording that first also lets native code attribute
+        // work to this line, as `warnings.warn` does for its caller.
         self.active_frame_mut().instruction_pointer = op_index + 1;
         let keywords = keyword_names
             .iter()
             .map(|name| name.map(|name| code.name(name).to_owned()))
             .collect::<Vec<_>>();
-        match self.call(positional, &keywords, starred, CallMode::Deferred(span)) {
-            Ok(CallResult::Value(value)) => {
-                self.push(value);
-                Ok(DispatchControl::Next)
-            }
-            Ok(CallResult::EnteredFrame) => {
-                let caller = self.bytecode_frames.len() - 2;
-                self.bytecode_frames[caller].instruction_pointer = op_index + 1;
-                Ok(DispatchControl::RefreshFrame)
-            }
-            Ok(CallResult::Blocked(reason, value)) => {
-                self.push(value);
-                self.active_frame_mut().instruction_pointer = op_index + 1;
-                Ok(DispatchControl::Complete(Execution::Blocked(reason)))
-            }
-            Ok(CallResult::Retry(reason, pending)) => {
-                let frame = self.active_frame_mut();
-                frame.instruction_pointer = op_index + 1;
-                frame.pending_native_call = Some(pending);
-                Ok(DispatchControl::Complete(Execution::Blocked(reason)))
-            }
-            Ok(CallResult::Exit(status)) => Ok(DispatchControl::Complete(Execution::Exit(status))),
-            Err(error) => Err(error),
+        self.call(positional, &keywords, starred, CallMode::Deferred(span))
+    }
+
+    /// The value of a call made in [`CallMode::Immediate`], which leaves it on the operand
+    /// stack; an exit request propagates as the flow to return from the current arm.
+    pub(super) fn immediate_value(
+        &mut self,
+        flow: Flow,
+    ) -> Result<Result<Value<'s>, Flow>, String> {
+        match flow {
+            Flow::Next => self.pop().map(Ok),
+            Flow::Exit(status) => Ok(Err(Flow::Exit(status))),
+            flow => unreachable!("an immediate call cannot end with {flow:?}"),
         }
     }
 
     #[inline(never)]
-    fn dispatch_assert(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_assert(&mut self) -> Result<Flow, String> {
         let message = self.pop()?;
         let condition = self.pop()?;
         if self.truth_value(&condition)? {
-            return Ok(DispatchControl::Next);
+            return Ok(Flow::Next);
         }
         let message = if message.is_none() {
             String::new()
@@ -591,7 +596,7 @@ impl<'s> Vm<'s> {
         Err("assertion failed".into())
     }
 
-    fn dispatch_await_result(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_await_result(&mut self) -> Result<Flow, String> {
         let outcome = self.pop()?;
         if !outcome.is_object() {
             return Err("invalid coroutine scheduler outcome".into());
@@ -604,7 +609,7 @@ impl<'s> Vm<'s> {
         };
         if self.truth_value(&success)? {
             self.push(value);
-            return Ok(DispatchControl::Next);
+            return Ok(Flow::Next);
         }
         let Some(kind) = exception_types::exception_type_name(self.state, value)? else {
             return Err("coroutine scheduler injected a non-exception".into());
@@ -618,7 +623,7 @@ impl<'s> Vm<'s> {
 
     #[cold]
     #[inline(never)]
-    fn dispatch_raise(&mut self, has_value: bool) -> Result<DispatchControl, String> {
+    fn dispatch_raise(&mut self, has_value: bool) -> Result<Flow, String> {
         let exception = if has_value {
             let value = self.pop()?;
             if let Some(kind) = exception_types::exception_type_name(self.state, value)? {
@@ -637,15 +642,10 @@ impl<'s> Vm<'s> {
             } else if self.exception_class_base(&value)?.is_some() {
                 // `raise Cls` raises `Cls()`, running any user `__init__`.
                 self.push(value);
-                let instance = match self.call(0, &[], &[], CallMode::Immediate)? {
-                    CallResult::Value(instance) => instance,
-                    CallResult::Exit(status) => {
-                        return Ok(DispatchControl::Complete(Execution::Exit(status)))
-                    }
-                    CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-                    CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                        unreachable!("immediate call cannot suspend")
-                    }
+                let flow = self.call(0, &[], &[], CallMode::Immediate)?;
+                let instance = match self.immediate_value(flow)? {
+                    Ok(instance) => instance,
+                    Err(flow) => return Ok(flow),
                 };
                 let kind = exception_types::exception_type_name(self.state, instance)?
                     .ok_or("exception class produced a non-exception instance")?;
@@ -671,7 +671,7 @@ impl<'s> Vm<'s> {
     /// dropped; an uncaught chained exception prints without its cause.
     #[cold]
     #[inline(never)]
-    fn dispatch_raise_from(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_raise_from(&mut self) -> Result<Flow, String> {
         let cause = self.pop()?;
         let valid = cause.is_none()
             || exception_types::exception_type_name(self.state, cause)?.is_some()
@@ -686,7 +686,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_with_enter(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_with_enter(&mut self) -> Result<Flow, String> {
         let context = self.pop()?;
         // CPython looks up `__exit__` first, then `__enter__`.
         for method in ["__exit__", "__enter__"] {
@@ -701,45 +701,37 @@ impl<'s> Vm<'s> {
         }
         self.push(context);
         self.load_attribute("__enter__")?;
-        match self.call(0, &[], &[], CallMode::Immediate)? {
-            // The context joins the cleanup stack only once `__enter__` has succeeded, so an
-            // exception from `__enter__` reaches the enclosing handler, not this `__exit__`.
-            CallResult::Value(value) => {
+        let flow = self.call(0, &[], &[], CallMode::Immediate)?;
+        // The context joins the cleanup stack only once `__enter__` has succeeded, so an
+        // exception from `__enter__` reaches the enclosing handler, not this `__exit__`.
+        match self.immediate_value(flow)? {
+            Ok(value) => {
                 let context = self.store(context);
                 self.with_contexts.push(context);
                 self.push(value);
+                Ok(Flow::Next)
             }
-            CallResult::Exit(status) => {
-                return Ok(DispatchControl::Complete(Execution::Exit(status)))
-            }
-            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+            Err(flow) => Ok(flow),
         }
-        Ok(DispatchControl::Next)
     }
 
     #[inline(never)]
-    fn dispatch_with_exit(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_with_exit(&mut self) -> Result<Flow, String> {
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
         self.execution.stack.push_ref(&context);
         self.load_attribute("__exit__")?;
         for _ in 0..3 {
             self.push(Value::None);
         }
-        match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
-            CallResult::Value(_) => Ok(DispatchControl::Next),
-            CallResult::Exit(status) => Ok(DispatchControl::Complete(Execution::Exit(status))),
-            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+        let flow = self.call(3, &[], &[false, false, false], CallMode::Immediate)?;
+        match self.immediate_value(flow)? {
+            Ok(_) => Ok(Flow::Next),
+            Err(flow) => Ok(flow),
         }
     }
 
     #[inline(never)]
-    fn dispatch_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_with_exit_exception(&mut self) -> Result<Flow, String> {
         // The handler pushed the exception; `__exit__` receives it from the exception stack.
         self.pop()?;
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
@@ -750,20 +742,15 @@ impl<'s> Vm<'s> {
         self.push(exception_kind);
         self.push(exception);
         self.push(Value::None);
-        let result = match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
-            CallResult::Value(value) => value,
-            CallResult::Exit(status) => {
-                return Ok(DispatchControl::Complete(Execution::Exit(status)))
-            }
-            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+        let flow = self.call(3, &[], &[false, false, false], CallMode::Immediate)?;
+        let result = match self.immediate_value(flow)? {
+            Ok(result) => result,
+            Err(flow) => return Ok(flow),
         };
         if self.truth_value(&result)? {
             self.pending_exception = None;
             self.exception_stack.pop();
-            Ok(DispatchControl::Next)
+            Ok(Flow::Next)
         } else {
             self.pending_exception = Some(RaisedException {
                 kind,
@@ -773,7 +760,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn dispatch_async_with_exit_exception(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_async_with_exit_exception(&mut self) -> Result<Flow, String> {
         let context = self.pop()?;
         self.pop()?;
         let (kind, exception) = self.active_exception()?;
@@ -783,17 +770,8 @@ impl<'s> Vm<'s> {
         self.push(exception_kind);
         self.push(exception);
         self.push(Value::None);
-        match self.call(3, &[], &[false, false, false], CallMode::Immediate)? {
-            CallResult::Value(value) => {
-                self.push(value);
-                Ok(DispatchControl::Next)
-            }
-            CallResult::Exit(status) => Ok(DispatchControl::Complete(Execution::Exit(status))),
-            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
-        }
+        // The awaited `__aexit__` result stays on the stack for the following await.
+        self.call(3, &[], &[false, false, false], CallMode::Immediate)
     }
 
     /// The innermost handled exception's kind and value, as a handle that stays valid while
@@ -818,13 +796,13 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn dispatch_async_with_finish_exception(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_async_with_finish_exception(&mut self) -> Result<Flow, String> {
         let suppress = self.pop()?;
         let exception = self.exception_stack.pop().ok_or("no active exception")?;
         let (kind, value) = (exception.kind, self.handle(&exception.value));
         if self.truth_value(&suppress)? {
             self.pending_exception = None;
-            Ok(DispatchControl::Next)
+            Ok(Flow::Next)
         } else {
             self.pending_exception = Some(RaisedException {
                 kind,
@@ -835,44 +813,32 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_pop_expression(&mut self) -> Result<DispatchControl, String> {
+    fn dispatch_pop_expression(&mut self) -> Result<Flow, String> {
         let value = self.pop()?;
         if self.mode.interactive && !value.is_none() {
             let rendered = self.repr_value(&value)?;
             self.out.extend_from_slice(rendered.as_bytes());
             self.out.push(b'\n');
         }
-        Ok(DispatchControl::Next)
+        Ok(Flow::Next)
     }
 
-    /// Resume work retained by a blocking native call before entering the opcode loop.
+    /// Finish the wait the previous quantum left, retrying its interrupted native call before
+    /// the opcode loop runs. `None` means the loop can proceed.
     ///
-    /// A pending call can only be installed while returning to the scheduler, so checking it once
-    /// at the next quantum boundary is sufficient. Ordinary opcodes never need to probe the frame.
-    fn resume_pending_native_call(
-        &mut self,
-    ) -> Result<Option<Execution>, (String, super::super::source::Span)> {
-        let Some(pending) = self.active_frame_mut().pending_native_call.take() else {
+    /// A suspension can only be installed while returning to the scheduler, so checking it
+    /// once at the next quantum boundary is sufficient.
+    fn resume_suspension(&mut self) -> Result<Option<Flow>, (String, super::super::source::Span)> {
+        let Some(suspension) = self.suspension.take() else {
+            return Ok(None);
+        };
+        let Some(pending) = suspension.retry else {
             return Ok(None);
         };
         let span = pending.call_span();
         match self.resume_native_call(pending) {
-            Ok(CallResult::Value(value)) => {
-                self.push(value);
-                Ok(None)
-            }
-            Ok(CallResult::Blocked(reason, value)) => {
-                self.push(value);
-                Ok(Some(Execution::Blocked(reason)))
-            }
-            Ok(CallResult::Retry(reason, pending)) => {
-                self.active_frame_mut().pending_native_call = Some(pending);
-                Ok(Some(Execution::Blocked(reason)))
-            }
-            Ok(CallResult::Exit(status)) => Ok(Some(Execution::Exit(status))),
-            Ok(CallResult::EnteredFrame) => {
-                unreachable!("a retained native call cannot enter a Python frame")
-            }
+            Ok(Flow::Next) => Ok(None),
+            Ok(flow) => Ok(Some(flow)),
             Err(error) => {
                 if self.propagate_error(error, span)? {
                     Ok(None)

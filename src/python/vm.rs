@@ -574,8 +574,14 @@ impl VmProgram {
             return VmPoll::Ready(ExecResult::Exit(137));
         }
         match &execution {
-            Ok(Execution::Pending) => return VmPoll::Runnable,
-            Ok(Execution::Blocked(reason)) => return VmPoll::Blocked(reason.clone()),
+            Ok(Flow::Pending) => return VmPoll::Runnable,
+            Ok(Flow::Blocked) => {
+                let suspension = vm
+                    .suspension
+                    .as_ref()
+                    .expect("a blocked frame records its suspension");
+                return VmPoll::Blocked(suspension.reason.clone());
+            }
             _ => {}
         }
         vm.bytecode_frames
@@ -635,6 +641,10 @@ struct VmState {
     /// stale. Consumed by `render_execution` when reporting an uncaught exception's traceback.
     traceback_frames: Vec<TracebackFrame>,
     pending_wait: Option<crate::scheduler::WaitReason>,
+    /// Why the process last left the dispatch loop to wait, and the native call to retry when
+    /// it resumes. At most one frame can be suspended, so this lives beside the frames rather
+    /// than in each of them.
+    suspension: Option<Box<Suspension>>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
     /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
@@ -684,6 +694,7 @@ impl Clone for VmState {
             compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
+            suspension: self.suspension.clone(),
             async_timer_deadlines: self.async_timer_deadlines.clone(),
             native_suspend_allowed: self.native_suspend_allowed,
             synchronous_frames: self.synchronous_frames,
@@ -750,7 +761,9 @@ impl Roots for VmState {
             if let Some(function_return) = &mut frame.function_return {
                 visitor(&mut function_return.function);
             }
-            match &mut frame.pending_native_call {
+        }
+        if let Some(suspension) = &mut self.suspension {
+            match &mut suspension.retry {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
                 }
@@ -927,7 +940,6 @@ struct BytecodeFrame {
     /// exception escaping a handler cannot leave its handled exception behind.
     exception_base: usize,
     function_return: Option<FunctionReturn>,
-    pending_native_call: Option<PendingNativeCall>,
 }
 
 impl Clone for BytecodeFrame {
@@ -943,7 +955,6 @@ impl Clone for BytecodeFrame {
             handlers: self.handlers.clone(),
             exception_base: self.exception_base,
             function_return: self.function_return.clone(),
-            pending_native_call: self.pending_native_call.clone(),
         }
     }
 }
@@ -1009,12 +1020,50 @@ struct DispatchCursor {
     locals: LocalsLocation,
 }
 
-/// Control-flow effect of one successfully decoded opcode.
-enum DispatchControl {
+/// Control leaving an opcode arm, a call, or a frame: the one type every routine that touches
+/// the dispatch loop returns.
+///
+/// A value a call or an arm produces is left on the operand stack, which roots it, so no
+/// variant carries a handle. `Return` and `Yield` carry stored references because they cross
+/// the handle scope of the frame that produced them; the receiver re-roots them with
+/// `Vm::handle` before anything can allocate. `Blocked` reports a wait whose reason, and the
+/// native call to retry, sit in [`VmState::suspension`].
+#[derive(Debug)]
+enum Flow {
+    /// Continue with the next instruction.
     Next,
     Jump(usize),
-    RefreshFrame,
-    Complete(Execution),
+    /// The active frame changed; the dispatch cursor reloads from it.
+    Refresh,
+    /// The active frame returned this value.
+    Return(Ref),
+    /// A generator frame yielded this value; its instruction pointer is already advanced to
+    /// the resumption point.
+    Yield(Ref),
+    /// The code object ran off its end: a module, class body or the main program finished.
+    Halt,
+    Exit(i32),
+    /// The quantum's budget ran out with work remaining.
+    Pending,
+    /// The process must wait; see [`VmState::suspension`].
+    Blocked,
+}
+
+/// Why the process is waiting and what to retry when it wakes.
+struct Suspension {
+    reason: crate::scheduler::WaitReason,
+    /// A native call interrupted by the wait, retried before the next instruction. `None`
+    /// when the native completed and only asked the scheduler to wait afterwards.
+    retry: Option<PendingNativeCall>,
+}
+
+impl Clone for Suspension {
+    fn clone(&self) -> Self {
+        Self {
+            reason: self.reason.clone(),
+            retry: self.retry.clone(),
+        }
+    }
 }
 
 /// Result of classifying one heap iterator at its mutation boundary.
@@ -1096,8 +1145,8 @@ impl HashedEntries<'_> {
 }
 
 #[inline(always)]
-fn dispatch_next(result: Result<(), String>) -> Result<DispatchControl, String> {
-    result.map(|()| DispatchControl::Next)
+fn dispatch_next(result: Result<(), String>) -> Result<Flow, String> {
+    result.map(|()| Flow::Next)
 }
 
 impl DispatchCursor {
@@ -1357,15 +1406,12 @@ impl<'s> Vm<'s> {
 
     fn render_execution(
         &mut self,
-        execution: Result<Execution, (String, super::source::Span)>,
+        execution: Result<Flow, (String, super::source::Span)>,
     ) -> ExecResult {
         match execution {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("synchronous Python cannot suspend"),
-            Ok(Execution::Halt) | Ok(Execution::Return(_)) | Ok(Execution::Yield(_, _)) => {
-                ExecResult::Continue
-            }
-            Ok(Execution::Exit(status)) => ExecResult::Exit(status),
+            Ok(Flow::Halt | Flow::Return(_) | Flow::Yield(_)) => ExecResult::Continue,
+            Ok(Flow::Exit(status)) => ExecResult::Exit(status),
+            Ok(flow) => unreachable!("a completed program cannot end with {flow:?}"),
             Err((error, span)) => {
                 if let Some(reason) = self.interp.resources.stop_reason() {
                     ExecResult::Exit(reason.exit_status())
@@ -2066,30 +2112,10 @@ impl<'s> Vm<'s> {
     }
 }
 
-enum CallResult<'s> {
-    Value(Value<'s>),
-    Exit(i32),
-    EnteredFrame,
-    Blocked(crate::scheduler::WaitReason, Value<'s>),
-    Retry(crate::scheduler::WaitReason, PendingNativeCall),
-}
-
 #[derive(Clone, Copy)]
 enum CallMode {
     Immediate,
     Deferred(super::source::Span),
-}
-
-/// Outcome of executing a frame. `Return` and `Yield` carry stored references because they
-/// cross the boundary of the scope that produced them; the receiver re-roots them with
-/// `Vm::handle` before anything can allocate.
-enum Execution {
-    Pending,
-    Blocked(crate::scheduler::WaitReason),
-    Halt,
-    Return(Ref),
-    Yield(Ref, usize),
-    Exit(i32),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2174,6 +2200,17 @@ fn expect_arity(arguments: &[Value<'_>], minimum: usize, maximum: usize) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control type every opcode arm returns is one stored reference plus a tag; a payload
+    /// that would grow it moves to `VmState` instead, as the suspension did.
+    #[test]
+    fn control_flow_stays_small() {
+        assert_eq!(
+            std::mem::size_of::<Flow>(),
+            std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
+        );
+        assert!(std::mem::size_of::<Result<Flow, String>>() <= 32);
+    }
 
     #[test]
     fn native_handles_round_trip_without_pointers() {

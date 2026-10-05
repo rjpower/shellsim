@@ -10,16 +10,15 @@ use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
 use super::{
     exception_types, number, protocol, string, Arc, BigInt, BuiltinType, CallArgs, CallMode,
-    CallResult, ClassDefinition, ClassLayout, ExceptionType, Execution, FrameEntry, HashMap,
-    NativeValue, Object, Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray,
-    PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader,
-    PyArrayRef, PyArrayView, PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment,
-    PyError, PyErrorKind, PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList,
-    PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessRunner,
-    PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet, PyStreamRead,
-    PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast, RaisedException,
-    Stream, ToPrimitive, Value, Vm, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
-    MODELED_VALUE_BYTES,
+    ClassDefinition, ClassLayout, ExceptionType, Flow, FrameEntry, HashMap, NativeValue, Object,
+    Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer,
+    PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader, PyArrayRef, PyArrayView,
+    PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError, PyErrorKind,
+    PyFilesystem, PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch,
+    PyMatchData, PyModule, PyNativeKind, PyOperator, PyProcessRunner, PyProperty, PyRaisesContext,
+    PyRegex, PyResult, PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple,
+    PyTypeObject, PyValueCast, RaisedException, Stream, ToPrimitive, Value, Vm,
+    MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::heap::DictViewKind;
@@ -1735,15 +1734,9 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         class: Value<'s>,
         args: CallArgs<'s>,
     ) -> PyResult<'s, Value<'s>> {
-        match Vm::call_type_default(self, class, args)
-            .map_err(|message| self.raised_or_runtime_error(message))?
-        {
-            CallResult::Value(value) => Ok(value),
-            CallResult::Exit(status) => Err(PyError::exit(status)),
-            CallResult::EnteredFrame | CallResult::Blocked(..) | CallResult::Retry(..) => {
-                Err(PyError::runtime_error("default type call did not finish"))
-            }
-        }
+        let flow = Vm::call_type_default(self, class, args)
+            .map_err(|message| self.raised_or_runtime_error(message))?;
+        self.callback_value(flow)
     }
 
     fn call_value(&mut self, callable: Value<'s>, args: CallArgs<'s>) -> PyResult<'s, Value<'s>> {
@@ -1764,22 +1757,15 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         for (_, value) in keywords {
             self.push(value);
         }
-        match self
+        let flow = self
             .call(
                 argument_count,
                 &keyword_names,
                 &unpacked,
                 CallMode::Immediate,
             )
-            .map_err(PyError::runtime_error)?
-        {
-            CallResult::Value(value) => Ok(value),
-            CallResult::Exit(status) => Err(PyError::exit(status)),
-            CallResult::EnteredFrame => unreachable!("runtime callback is immediate"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("runtime callback cannot suspend")
-            }
-        }
+            .map_err(PyError::runtime_error)?;
+        self.callback_value(flow)
     }
 
     fn is_callable(&self, value: &Value<'s>) -> PyResult<'s, bool> {
@@ -2842,16 +2828,15 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         let execution = self.execute_code(&code, FrameEntry::scoped(scope));
         self.state.temporary_import_paths.remove(0);
         match execution {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
-            Ok(Execution::Halt) => Ok(()),
-            Ok(Execution::Return(_)) => Err(PyError::runtime_error(format!(
+            Ok(Flow::Halt) => Ok(()),
+            Ok(Flow::Return(_)) => Err(PyError::runtime_error(format!(
                 "'return' outside function in module loaded from {path:?}"
             ))),
-            Ok(Execution::Yield(_, _)) => Err(PyError::runtime_error(format!(
+            Ok(Flow::Yield(_)) => Err(PyError::runtime_error(format!(
                 "'yield' outside function in module loaded from {path:?}"
             ))),
-            Ok(Execution::Exit(status)) => Err(PyError::exit(status)),
+            Ok(Flow::Exit(status)) => Err(PyError::exit(status)),
+            Ok(flow) => unreachable!("a module body cannot end with {flow:?}"),
             Err((error, span)) => Err(PyError::runtime_error(format!(
                 "{error} in {path} at line {}, column {}",
                 span.line, span.column
@@ -3149,5 +3134,17 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 PyError::runtime_error(error)
             }
         })
+    }
+}
+
+impl<'s> Vm<'s> {
+    /// The value of an immediate call a native made; an exit request propagates as the
+    /// native error that unwinds to the dispatch loop.
+    fn callback_value(&mut self, flow: Flow) -> PyResult<'s, Value<'s>> {
+        match self.immediate_value(flow).map_err(PyError::runtime_error)? {
+            Ok(value) => Ok(value),
+            Err(Flow::Exit(status)) => Err(PyError::exit(status)),
+            Err(flow) => unreachable!("a runtime callback cannot end with {flow:?}"),
+        }
     }
 }

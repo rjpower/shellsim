@@ -20,7 +20,7 @@ use super::super::object_model::{TypeId, TypeRegistry};
 use super::super::scopes;
 use super::super::symbols::SymbolId;
 use super::super::{GlobalBindings, ReplState};
-use super::{Vm, VmState};
+use super::{Flow, Vm, VmState};
 
 /// Every stored reference the VM keeps outside the heap.
 struct VmRoots<'a> {
@@ -231,6 +231,12 @@ impl<'s> Vm<'s> {
 
     pub(super) fn push(&mut self, value: Value<'_>) {
         self.execution.stack.push(&self.state.heap, value);
+    }
+
+    /// Leave a call's result on the operand stack, where the caller expects it.
+    pub(super) fn produce(&mut self, value: Value<'_>) -> Flow {
+        self.push(value);
+        Flow::Next
     }
 
     /// The value `depth` entries below the top of the stack (0 is the top).

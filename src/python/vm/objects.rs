@@ -8,11 +8,10 @@ use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
-    Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, CallResult, ClassDefinition,
-    ClassField, ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Execution,
-    FrameEntry, HashMap, LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime,
-    RaisedException, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm,
-    MODELED_MAPPING_ENTRY_BYTES,
+    Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, ClassDefinition, ClassField,
+    ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
+    LoadAttributeCache, NameId, NativeValue, Object, PyError, PyRuntime, RaisedException,
+    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
@@ -1582,18 +1581,8 @@ impl<'s> Vm<'s> {
                         }
                     } else if let Some(factory) = factory {
                         self.push(factory);
-                        let value = match self.call(0, &[], &[], CallMode::Immediate)? {
-                            CallResult::Value(value) => value,
-                            CallResult::Exit(status) => {
-                                return Err(format!("default factory exited with status {status}"))
-                            }
-                            CallResult::EnteredFrame => {
-                                unreachable!("immediate call entered a frame")
-                            }
-                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                unreachable!("immediate call cannot suspend")
-                            }
-                        };
+                        let result = self.call(0, &[], &[], CallMode::Immediate);
+                        let value = self.immediate_call_value(result, "default factory")?;
                         self.reserve_object_growth(owner, MODELED_MAPPING_ENTRY_BYTES)?;
                         self.modify(owner, |b, object| {
                             let Object::DefaultDict { entries, .. } = object else {
@@ -2345,14 +2334,13 @@ impl<'s> Vm<'s> {
             .expect("class binding stack is present");
         self.class_scopes.pop();
         match execution {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("immediate code cannot suspend"),
-            Ok(Execution::Halt) => {}
-            Ok(Execution::Return(_)) => return Err("'return' outside function".into()),
-            Ok(Execution::Yield(_, _)) => return Err("'yield' outside function".into()),
-            Ok(Execution::Exit(status)) => {
+            Ok(Flow::Halt) => {}
+            Ok(Flow::Return(_)) => return Err("'return' outside function".into()),
+            Ok(Flow::Yield(_)) => return Err("'yield' outside function".into()),
+            Ok(Flow::Exit(status)) => {
                 return Err(format!("class body exited with status {status}"))
             }
+            Ok(flow) => unreachable!("a class body cannot end with {flow:?}"),
             Err((error, span)) => {
                 return Err(format!(
                     "{error} in class {name} at line {}, column {}",
@@ -3156,14 +3144,8 @@ impl<'s> Vm<'s> {
         callable: Value<'s>,
         arguments: Vec<Value<'s>>,
     ) -> Result<Value<'s>, String> {
-        match self.invoke_call(callable, arguments, Vec::new())? {
-            CallResult::Value(value) => Ok(value),
-            CallResult::Exit(status) => Err(format!("callable exited with status {status}")),
-            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
-        }
+        let result = self.invoke_call(callable, arguments, Vec::new());
+        self.immediate_call_value(result, "callable")
     }
 
     pub(super) fn invoke_call(
@@ -3171,7 +3153,7 @@ impl<'s> Vm<'s> {
         callable: Value<'s>,
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let positional = arguments.len();
         let total = positional
             .checked_add(keyword_arguments.len())
@@ -3304,19 +3286,17 @@ impl<'s> Vm<'s> {
         self.invoke_value(callable, arguments).map(Some)
     }
 
-    /// The value of an immediate call, which cannot suspend or leave a frame behind.
+    /// The value of an immediate call made on behalf of Rust code, which has no frame to exit
+    /// from: an exit request becomes an error naming `what` asked for it.
     fn immediate_call_value(
         &mut self,
-        result: Result<CallResult<'s>, String>,
+        result: Result<Flow, String>,
         what: &str,
     ) -> Result<Value<'s>, String> {
-        match result? {
-            CallResult::Value(value) => Ok(value),
-            CallResult::Exit(status) => Err(format!("{what} exited with status {status}")),
-            CallResult::EnteredFrame => unreachable!("immediate call entered a frame"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+        match self.immediate_value(result?)? {
+            Ok(value) => Ok(value),
+            Err(Flow::Exit(status)) => Err(format!("{what} exited with status {status}")),
+            Err(flow) => unreachable!("an immediate call cannot end with {flow:?}"),
         }
     }
 
@@ -3942,17 +3922,17 @@ impl<'s> Vm<'s> {
         builtin_type: BuiltinType,
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         if builtin_type == BuiltinType::Dict {
             return self
                 .construct_dict(arguments, keyword_arguments)
-                .map(CallResult::Value);
+                .map(|value| self.produce(value));
         }
         if builtin_type == BuiltinType::Complex {
             let arguments = super::CallArgs::new(arguments, keyword_arguments);
             let value = super::super::complex::construct(self, arguments)
                 .map_err(|error| self.record_native_error(error))?;
-            return Ok(CallResult::Value(value));
+            return Ok(self.produce(value));
         }
         if matches!(builtin_type, BuiltinType::Int | BuiltinType::Float)
             && arguments
@@ -4120,7 +4100,7 @@ impl<'s> Vm<'s> {
                             );
                             return Err(self.raise_exception("TypeError", message));
                         }
-                        return Ok(CallResult::Value(converted));
+                        return Ok(self.produce(converted));
                     }
                     // CPython falls back to `__index__` and converts the int it returns.
                     if let Some(index) = self.int_by_method(&value, &["__index__"])? {
@@ -4333,7 +4313,7 @@ impl<'s> Vm<'s> {
             }
             BuiltinType::Complex => unreachable!("complex construction returned above"),
         };
-        Ok(CallResult::Value(value))
+        Ok(self.produce(value))
     }
 
     pub(super) fn class_type_id(&self, value: &Value<'s>) -> Result<Option<TypeId>, String> {

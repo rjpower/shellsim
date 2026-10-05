@@ -5,10 +5,9 @@ use super::super::heap::GeneratorObject;
 use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
-    CallArgs, CallMode, CallResult, ClassLayout, CodeRef, ComparisonOperator, ExceptionType,
-    Execution, FrameEntry, FunctionReturn, HashMap, NativeValue, Object, PendingNativeCall,
-    PyError, PyErrorKind, PyRuntime, PyStreamRead, RaisedException, Slot, StoredCallArgs, Stream,
-    Value, Vm,
+    CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
+    FunctionReturn, HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind,
+    PyRuntime, PyStreamRead, RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
 };
 use num_traits::{One, Signed, Zero};
 
@@ -194,7 +193,7 @@ impl<'s> Vm<'s> {
         keyword_names: &[Option<String>],
         starred: &[bool],
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let count = positional
             .checked_add(keyword_names.len())
             .ok_or("too many call arguments")?;
@@ -274,7 +273,7 @@ impl<'s> Vm<'s> {
         let function = self.pop()?;
         if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
             return call(self, function, CallArgs::new(arguments, keyword_arguments))
-                .map(CallResult::Value)
+                .map(|value| self.produce(value))
                 .map_err(|error| self.record_native_error(error));
         }
         if function.is_object() {
@@ -336,7 +335,7 @@ impl<'s> Vm<'s> {
                         descriptor.native_value()
                     {
                         self.call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
-                            .map(CallResult::Value)
+                            .map(|value| self.produce(value))
                     } else if let Some(NativeValue::NativeMethod(method)) =
                         descriptor.native_value()
                     {
@@ -376,7 +375,7 @@ impl<'s> Vm<'s> {
         if let Some(NativeValue::ValueKind(kind)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
             return (kind.construct)(self, call)
-                .map(CallResult::Value)
+                .map(|value| self.produce(value))
                 .map_err(|error| self.record_native_error(error));
         }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
@@ -392,9 +391,10 @@ impl<'s> Vm<'s> {
                 }
                 _ => exception_type.0,
             };
-            return Ok(CallResult::Value(
-                self.allocate_exception_object(kind, arguments)?,
-            ));
+            return {
+                let value = self.allocate_exception_object(kind, arguments)?;
+                Ok(self.produce(value))
+            };
         }
         if let Some(NativeValue::SlotWrapper { owner, slot }) = function.native_value() {
             if arguments.is_empty() {
@@ -403,7 +403,7 @@ impl<'s> Vm<'s> {
             let receiver = arguments.remove(0);
             return self
                 .call_slot_wrapper(owner, slot, receiver, arguments, keyword_arguments)
-                .map(CallResult::Value);
+                .map(|value| self.produce(value));
         }
         if let Some(NativeValue::NativeMethod(method)) = function.native_value() {
             if arguments.is_empty() {
@@ -427,26 +427,23 @@ impl<'s> Vm<'s> {
             let result = (function.call)(self, call);
             self.native_suspend_allowed = previous_suspend;
             return match result {
-                Ok(value) => match self.pending_wait.take() {
-                    Some(reason) => Ok(CallResult::Blocked(reason, value)),
-                    None => Ok(CallResult::Value(value)),
-                },
+                Ok(value) => Ok(self.native_result(value)),
                 Err(PyError {
                     kind: PyErrorKind::Exit(status),
                     ..
-                }) => Ok(CallResult::Exit(status)),
+                }) => Ok(Flow::Exit(status)),
                 Err(PyError {
                     kind: PyErrorKind::Suspend(reason),
                     ..
                 }) => match (mode, retry_arguments) {
-                    (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
-                        reason,
-                        PendingNativeCall::Function {
+                    (CallMode::Deferred(call_span), Some(arguments)) => {
+                        let retry = PendingNativeCall::Function {
                             function,
                             arguments: StoredCallArgs::store(self, &arguments),
                             call_span,
-                        },
-                    )),
+                        };
+                        Ok(self.suspend(reason, Some(retry)))
+                    }
                     _ => Err("native call suspended outside scheduler dispatch".into()),
                 },
                 Err(error) => Err(self.record_native_error(error)),
@@ -516,7 +513,7 @@ impl<'s> Vm<'s> {
                 if let Some(NativeValue::Stream(stream)) = target.native_value() {
                     self.write_output(stream, text.as_bytes());
                     self.write_output(stream, ending.as_bytes());
-                    return Ok(CallResult::Value(Value::None));
+                    return Ok(self.produce(Value::None));
                 }
                 let write = self
                     .resolve_attribute(target, "write")?
@@ -530,7 +527,7 @@ impl<'s> Vm<'s> {
                         self.invoke_value(flush, Vec::new())?;
                     }
                 }
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::Input => {
                 expect_arity(&arguments, 0, 1)?;
@@ -548,13 +545,17 @@ impl<'s> Vm<'s> {
                 let result = self.read_stream(&marker, None, true);
                 self.native_suspend_allowed = previous_suspend;
                 match result {
-                    Ok(read) => self.finish_input(read).map(CallResult::Value),
+                    Ok(read) => {
+                        let value = self.finish_input(read)?;
+                        Ok(self.produce(value))
+                    }
                     Err(PyError {
                         kind: PyErrorKind::Suspend(reason),
                         ..
-                    }) => retry
-                        .map(|pending| CallResult::Retry(reason, pending))
-                        .ok_or_else(|| "native call suspended outside scheduler dispatch".into()),
+                    }) => match retry {
+                        Some(pending) => Ok(self.suspend(reason, Some(pending))),
+                        None => Err("native call suspended outside scheduler dispatch".into()),
+                    },
                     Err(error) => Err(self.record_native_error(error)),
                 }
             }
@@ -564,14 +565,9 @@ impl<'s> Vm<'s> {
                 let code = super::super::compiler::compile(program);
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
-                    Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
-                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
-                    Ok(
-                        Execution::Pending
-                        | Execution::Blocked(_)
-                        | Execution::Return(_)
-                        | Execution::Yield(_, _),
-                    ) => Err("exec source did not finish normally".into()),
+                    Ok(Flow::Halt) => Ok(self.produce(Value::None)),
+                    Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+                    Ok(_) => Err("exec source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in exec source at line {}, column {}",
                         span.line, span.column
@@ -591,14 +587,12 @@ impl<'s> Vm<'s> {
                 let code = super::super::compiler::compile_expression(expression);
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
-                    Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
-                    Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
-                    Ok(
-                        Execution::Halt
-                        | Execution::Pending
-                        | Execution::Blocked(_)
-                        | Execution::Yield(_, _),
-                    ) => Err("eval source did not finish normally".into()),
+                    Ok(Flow::Return(value)) => {
+                        self.execution.stack.push_ref(&value);
+                        Ok(Flow::Next)
+                    }
+                    Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+                    Ok(_) => Err("eval source did not finish normally".into()),
                     Err((error, span)) => Err(format!(
                         "{error} in eval source at line {}, column {}",
                         span.line, span.column
@@ -611,7 +605,7 @@ impl<'s> Vm<'s> {
                     .first()
                     .and_then(|value| value.as_int())
                     .unwrap_or_default();
-                Ok(CallResult::Exit(status as i32))
+                Ok(Flow::Exit(status as i32))
             }
             Builtin::Character => {
                 expect_arity(&arguments, 1, 1)?;
@@ -622,9 +616,10 @@ impl<'s> Vm<'s> {
                         self.raise_exception("ValueError", "chr() arg not in range(0x110000)")
                     );
                 };
-                Ok(CallResult::Value(
-                    self.allocate_string(codepoint.to_string())?,
-                ))
+                {
+                    let value = self.allocate_string(codepoint.to_string())?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Ordinal => {
                 expect_arity(&arguments, 1, 1)?;
@@ -647,7 +642,7 @@ impl<'s> Vm<'s> {
                 } else {
                     return Err("ord() expected string of length 1".into());
                 };
-                Ok(CallResult::Value(Value::Int(value)))
+                Ok(self.produce(Value::Int(value)))
             }
             Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
                 expect_arity(&arguments, 1, 1)?;
@@ -677,12 +672,18 @@ impl<'s> Vm<'s> {
                 } else {
                     format!("{prefix}{digits}")
                 };
-                Ok(CallResult::Value(self.allocate_string(rendered)?))
+                {
+                    let value = self.allocate_string(rendered)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Repr => {
                 expect_arity(&arguments, 1, 1)?;
                 let value = self.repr_value(&arguments[0])?;
-                Ok(CallResult::Value(self.allocate_string(value)?))
+                {
+                    let value = self.allocate_string(value)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Format => {
                 if !keyword_arguments.is_empty() {
@@ -712,18 +713,21 @@ impl<'s> Vm<'s> {
                 };
                 self.reserve_format_spec(&spec)?;
                 let value = self.format_object(&arguments[0], &spec)?;
-                Ok(CallResult::Value(self.allocate_string(value)?))
+                {
+                    let value = self.allocate_string(value)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Hash => {
                 expect_arity(&arguments, 1, 1)?;
                 let hash = self.hash_value(&arguments[0])?;
-                Ok(CallResult::Value(Value::Int(hash)))
+                Ok(self.produce(Value::Int(hash)))
             }
             Builtin::Dir => {
                 expect_arity(&arguments, 0, 1)?;
                 if let Some(value) = arguments.first() {
                     if let Some(names) = self.custom_dir(value)? {
-                        return Ok(CallResult::Value(names));
+                        return Ok(self.produce(names));
                     }
                 }
                 let mut names = if let Some(value) = arguments.first() {
@@ -755,21 +759,24 @@ impl<'s> Vm<'s> {
                     .into_iter()
                     .map(|name| self.allocate_string(name))
                     .collect::<Result<Vec<_>, _>>()?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(values))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::IsInstance => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(Value::Bool(
-                    self.is_instance(&arguments[0], &arguments[1])?,
-                )))
+                {
+                    let value = Value::Bool(self.is_instance(&arguments[0], &arguments[1])?);
+                    Ok(self.produce(value))
+                }
             }
             Builtin::IsSubclass => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(Value::Bool(
-                    self.is_subclass(&arguments[0], &arguments[1])?,
-                )))
+                {
+                    let value = Value::Bool(self.is_subclass(&arguments[0], &arguments[1])?);
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Length => {
                 expect_arity(&arguments, 1, 1)?;
@@ -781,7 +788,7 @@ impl<'s> Vm<'s> {
                     if length < 0 {
                         return Err("__len__() should return >= 0".into());
                     }
-                    return Ok(CallResult::Value(Value::Int(length)));
+                    return Ok(self.produce(Value::Int(length)));
                 }
                 let Some(length) = self.physical_length(arguments[0])? else {
                     let message = format!(
@@ -792,7 +799,7 @@ impl<'s> Vm<'s> {
                 };
                 let length = i64::try_from(length)
                     .map_err(|_| self.raise_exception("OverflowError", "length is too large"))?;
-                Ok(CallResult::Value(Value::Int(length)))
+                Ok(self.produce(Value::Int(length)))
             }
             Builtin::Sorted => {
                 expect_arity(&arguments, 1, 1)?;
@@ -825,15 +832,10 @@ impl<'s> Vm<'s> {
                     let key = if let Some(function) = &key_function {
                         self.push(*function);
                         self.push(value);
-                        match self.call(1, &[], &[false], CallMode::Immediate)? {
-                            CallResult::Value(key) => key,
-                            CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                            CallResult::EnteredFrame => {
-                                unreachable!("immediate call entered a frame")
-                            }
-                            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                unreachable!("immediate call cannot suspend")
-                            }
+                        let flow = self.call(1, &[], &[false], CallMode::Immediate)?;
+                        match self.immediate_value(flow)? {
+                            Ok(key) => key,
+                            Err(flow) => return Ok(flow),
                         }
                     } else {
                         value
@@ -853,9 +855,10 @@ impl<'s> Vm<'s> {
                     self.compare_truth(ComparisonOperator::Less, &lesser, &greater)
                 })?;
                 let values = keyed.into_iter().map(|(_, value)| value);
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(values))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Minimum | Builtin::Maximum => {
                 let (name, operator) = match function {
@@ -899,15 +902,10 @@ impl<'s> Vm<'s> {
                         Some(function) => {
                             self.push(function);
                             self.push(value);
-                            match self.call(1, &[], &[false], CallMode::Immediate)? {
-                                CallResult::Value(key) => key,
-                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                                CallResult::EnteredFrame => {
-                                    unreachable!("immediate call entered a frame")
-                                }
-                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                    unreachable!("immediate call cannot suspend")
-                                }
+                            let flow = self.call(1, &[], &[false], CallMode::Immediate)?;
+                            match self.immediate_value(flow)? {
+                                Ok(key) => key,
+                                Err(flow) => return Ok(flow),
                             }
                         }
                         None => value,
@@ -923,8 +921,8 @@ impl<'s> Vm<'s> {
                     }
                 }
                 match (selected, default) {
-                    (Some((_, value)), _) => Ok(CallResult::Value(value)),
-                    (None, Some(default)) => Ok(CallResult::Value(default)),
+                    (Some((_, value)), _) => Ok(self.produce(value)),
+                    (None, Some(default)) => Ok(self.produce(default)),
                     (None, None) => {
                         let message = format!("{name}() iterable argument is empty");
                         Err(self.raise_exception("ValueError", message))
@@ -935,11 +933,17 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 1, 2)?;
                 let values = self.iterable_values(&arguments[0])?;
                 let start = arguments.get(1).copied().unwrap_or(Value::Int(0));
-                Ok(CallResult::Value(self.builtin_sum(values, start)?))
+                {
+                    let value = self.builtin_sum(values, start)?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Absolute => {
                 expect_arity(&arguments, 1, 1)?;
-                Ok(CallResult::Value(self.absolute(arguments[0])?))
+                {
+                    let value = self.absolute(arguments[0])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Power => {
                 expect_arity(&arguments, 2, 3)?;
@@ -984,19 +988,20 @@ impl<'s> Vm<'s> {
                     }
                     let result = <Self as PyRuntime>::new_bigint(self, result)
                         .map_err(|error| error.to_string())?;
-                    return Ok(CallResult::Value(result));
+                    return Ok(self.produce(result));
                 }
-                Ok(CallResult::Value(self.binary_value(
-                    BinaryOperator::Power,
-                    arguments[0],
-                    arguments[1],
-                )?))
+                {
+                    let value =
+                        self.binary_value(BinaryOperator::Power, arguments[0], arguments[1])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Divmod => {
                 expect_arity(&arguments, 2, 2)?;
-                Ok(CallResult::Value(
-                    self.divmod_value(arguments[0], arguments[1])?,
-                ))
+                {
+                    let value = self.divmod_value(arguments[0], arguments[1])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::SetAttribute => {
                 if arguments.len() != 3 {
@@ -1013,7 +1018,7 @@ impl<'s> Vm<'s> {
                 // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
                 let symbol = self.intern_symbol(&name)?;
                 self.store_attribute_by_symbol(arguments[0], symbol, &name, arguments[2])?;
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::DeleteAttribute => {
                 if arguments.len() != 2 {
@@ -1029,13 +1034,13 @@ impl<'s> Vm<'s> {
                 };
                 let symbol = self.intern_symbol(&name)?;
                 self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
-                Ok(CallResult::Value(Value::None))
+                Ok(self.produce(Value::None))
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
                 let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
                     .map_err(|error| error.to_string())?;
-                Ok(CallResult::Value(Value::Bool(callable)))
+                Ok(self.produce(Value::Bool(callable)))
             }
             Builtin::Iter => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1045,15 +1050,19 @@ impl<'s> Vm<'s> {
                     {
                         return Err("iter(v, w): v must be callable".into());
                     }
-                    return Ok(CallResult::Value(self.alloc_with(|builder| {
-                        Object::CallableIterator {
+                    return {
+                        let value = self.alloc_with(|builder| Object::CallableIterator {
                             callable: builder.store(arguments[0]),
                             sentinel: builder.store(arguments[1]),
                             exhausted: false,
-                        }
-                    })?));
+                        })?;
+                        Ok(self.produce(value))
+                    };
                 }
-                Ok(CallResult::Value(self.make_iterator(arguments[0])?))
+                {
+                    let value = self.make_iterator(arguments[0])?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Next => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1072,7 +1081,7 @@ impl<'s> Vm<'s> {
                         None => return Err(self.raise_stop_iteration(&arguments[0])),
                     },
                 };
-                Ok(CallResult::Value(value))
+                Ok(self.produce(value))
             }
             Builtin::Enumerate => {
                 expect_arity(&arguments, 1, 2)?;
@@ -1093,9 +1102,10 @@ impl<'s> Vm<'s> {
                         Object::Tuple(vec![builder.store(Value::Int(index)), builder.store(value)])
                     })?);
                 }
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(result))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Zip => {
                 let sequences = arguments
@@ -1110,9 +1120,10 @@ impl<'s> Vm<'s> {
                     let tuple = sequences.iter().map(|values| values[index]);
                     result.push(self.alloc_with(|builder| Object::Tuple(builder.refs(tuple)))?);
                 }
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::List(builder.refs(result))
-                })?))
+                {
+                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Any | Builtin::All => {
                 expect_arity(&arguments, 1, 1)?;
@@ -1130,7 +1141,7 @@ impl<'s> Vm<'s> {
                         break;
                     }
                 }
-                Ok(CallResult::Value(Value::Bool(result)))
+                Ok(self.produce(Value::Bool(result)))
             }
             Builtin::Super => {
                 expect_arity(&arguments, 0, 2)?;
@@ -1148,28 +1159,37 @@ impl<'s> Vm<'s> {
                     }
                     _ => return Err("super() expects a class and instance".into()),
                 };
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::Super {
+                {
+                    let value = self.alloc_with(|builder| Object::Super {
                         start_class: builder.store(start_class),
                         receiver: builder.store(receiver),
-                    }
-                })?))
+                    })?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Globals => {
                 expect_arity(&arguments, 0, 0)?;
                 let target = self.current_globals_target()?;
-                Ok(CallResult::Value(self.alloc_with(|builder| {
-                    Object::NamespaceDict(target.store(builder))
-                })?))
+                {
+                    let value =
+                        self.alloc_with(|builder| Object::NamespaceDict(target.store(builder)))?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Locals => {
                 expect_arity(&arguments, 0, 0)?;
-                Ok(CallResult::Value(self.current_locals()?))
+                {
+                    let value = self.current_locals()?;
+                    Ok(self.produce(value))
+                }
             }
             Builtin::Vars => {
                 expect_arity(&arguments, 0, 1)?;
                 let Some(owner) = arguments.first() else {
-                    return Ok(CallResult::Value(self.current_locals()?));
+                    return {
+                        let value = self.current_locals()?;
+                        Ok(self.produce(value))
+                    };
                 };
                 // `vars(obj)` is `obj.__dict__`: a namespace view, or a class's or native
                 // module's read-only proxy.
@@ -1179,7 +1199,7 @@ impl<'s> Vm<'s> {
                         "vars() argument must have __dict__ attribute",
                     ));
                 };
-                Ok(CallResult::Value(namespace))
+                Ok(self.produce(namespace))
             }
         }
     }
@@ -1190,7 +1210,7 @@ impl<'s> Vm<'s> {
         &mut self,
         class: Value<'s>,
         args: CallArgs<'s>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let (arguments, keyword_arguments) = args.into_parts();
         if class.is_object() && matches!(self.get(class)?, Object::Class { .. }) {
             return self.call_user_class(class, arguments, keyword_arguments, false);
@@ -1235,7 +1255,7 @@ impl<'s> Vm<'s> {
         native_receiver: Value<'s>,
         call: CallArgs<'s>,
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         // Kept as handles so a suspension can store them for the retry.
         let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
         let previous_suspend = self.native_suspend_allowed;
@@ -1243,24 +1263,24 @@ impl<'s> Vm<'s> {
         let result = (method.call)(self, native_receiver, call);
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(value) => Ok(CallResult::Value(value)),
+            Ok(value) => Ok(self.produce(value)),
             Err(PyError {
                 kind: PyErrorKind::Exit(status),
                 ..
-            }) => Ok(CallResult::Exit(status)),
+            }) => Ok(Flow::Exit(status)),
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
             }) => match (mode, retry_arguments) {
-                (CallMode::Deferred(call_span), Some(arguments)) => Ok(CallResult::Retry(
-                    reason,
-                    PendingNativeCall::Method {
+                (CallMode::Deferred(call_span), Some(arguments)) => {
+                    let retry = PendingNativeCall::Method {
                         method,
                         receiver: self.store(receiver),
                         arguments: StoredCallArgs::store(self, &arguments),
                         call_span,
-                    },
-                )),
+                    };
+                    Ok(self.suspend(reason, Some(retry)))
+                }
                 _ => Err("native call suspended outside scheduler dispatch".into()),
             },
             Err(error) => Err(self.record_native_error(error)),
@@ -1324,7 +1344,7 @@ impl<'s> Vm<'s> {
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
         dispatch_metaclass: bool,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("type.__call__ requires a class".into());
         };
@@ -1356,7 +1376,7 @@ impl<'s> Vm<'s> {
                     .attribute_by_symbol(member, value_symbol)?
                     .ok_or("enum member has no value")?;
                 if self.values_equal(&value, &arguments[0])? {
-                    return Ok(CallResult::Value(member));
+                    return Ok(self.produce(member));
                 }
             }
             let rendered = self.repr_value(&arguments[0])?;
@@ -1405,19 +1425,14 @@ impl<'s> Vm<'s> {
                 {
                     let constructor =
                         self.bind_descriptor(constructor, Some(class), class, owner)?;
-                    match self.invoke_call(
+                    let flow = self.invoke_call(
                         constructor,
                         arguments.clone(),
                         keyword_arguments.clone(),
-                    )? {
-                        CallResult::Value(value) => value,
-                        CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                        CallResult::EnteredFrame => {
-                            unreachable!("invoke_call is immediate")
-                        }
-                        CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                            unreachable!("immediate call cannot suspend")
-                        }
+                    )?;
+                    match self.immediate_value(flow)? {
+                        Ok(value) => value,
+                        Err(flow) => return Ok(flow),
                     }
                 } else {
                     if !keyword_arguments.is_empty() || arguments.len() != 3 {
@@ -1434,23 +1449,17 @@ impl<'s> Vm<'s> {
                     {
                         let initializer =
                             self.bind_descriptor(initializer, Some(created), class, owner)?;
-                        let result =
-                            match self.invoke_call(initializer, arguments, keyword_arguments)? {
-                                CallResult::Value(value) => value,
-                                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                                CallResult::EnteredFrame => {
-                                    unreachable!("invoke_call is immediate")
-                                }
-                                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                                    unreachable!("immediate call cannot suspend")
-                                }
-                            };
+                        let flow = self.invoke_call(initializer, arguments, keyword_arguments)?;
+                        let result = match self.immediate_value(flow)? {
+                            Ok(value) => value,
+                            Err(flow) => return Ok(flow),
+                        };
                         if !result.is_none() {
                             return Err("metaclass __init__() should return None".into());
                         }
                     }
                 }
-                return Ok(CallResult::Value(created));
+                return Ok(self.produce(created));
             }
         };
         let instance_type = self
@@ -1521,24 +1530,18 @@ impl<'s> Vm<'s> {
             }
             // Zero-argument `super()` in the initializer reads the method frame the call
             // installs from the function's defining class.
-            let result = self.call_python_general(
+            let flow = self.call_python_general(
                 initializer,
                 Some(instance),
                 None,
                 arguments,
                 keyword_arguments,
                 CallMode::Immediate,
-            );
-            match result? {
-                CallResult::Value(value) if value.is_none() => {}
-                CallResult::Value(_) => return Err("__init__() should return None".into()),
-                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                CallResult::EnteredFrame => {
-                    unreachable!("immediate initializer entered a frame")
-                }
-                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                    unreachable!("immediate initializer cannot suspend")
-                }
+            )?;
+            match self.immediate_value(flow)? {
+                Ok(value) if value.is_none() => {}
+                Ok(_) => return Err("__init__() should return None".into()),
+                Err(flow) => return Ok(flow),
             }
         } else if exception_base.is_some() && !keyword_arguments.is_empty() {
             return Err(format!("{name}() does not accept keyword arguments"));
@@ -1548,7 +1551,7 @@ impl<'s> Vm<'s> {
         {
             return Err(format!("{name}() takes no arguments"));
         }
-        Ok(CallResult::Value(instance))
+        Ok(self.produce(instance))
     }
 
     const MAX_CALL_DEPTH: usize = 256;
@@ -1565,7 +1568,7 @@ impl<'s> Vm<'s> {
         &mut self,
         positional: usize,
         mode: CallMode,
-    ) -> Result<Option<CallResult<'s>>, String> {
+    ) -> Result<Option<Flow>, String> {
         let callee = self.peek(positional)?;
         if !callee.is_object() {
             return Ok(None);
@@ -1653,7 +1656,7 @@ impl<'s> Vm<'s> {
         mut arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let FunctionParts {
             name,
             code,
@@ -1706,7 +1709,7 @@ impl<'s> Vm<'s> {
         entry: FrameEntry<'_>,
         method_frame: Option<(Value<'s>, Value<'s>)>,
         mode: CallMode,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let pop_method_frame = method_frame.is_some();
         if let Some((owner, receiver)) = method_frame {
             let frame = (self.store(owner), self.store(receiver));
@@ -1722,7 +1725,7 @@ impl<'s> Vm<'s> {
             };
             let frame = self.enter_frame(code, 0, stack_base, entry, Some(function_return))?;
             self.bytecode_frames.push(frame);
-            return Ok(CallResult::EnteredFrame);
+            return Ok(Flow::Refresh);
         }
         let result = self.execute_code(code, entry);
         self.call_depth -= 1;
@@ -1730,15 +1733,17 @@ impl<'s> Vm<'s> {
             self.method_frames.pop();
         }
         match result {
-            Ok(Execution::Pending) => unreachable!("execute_code drains pending quanta"),
-            Ok(Execution::Blocked(_)) => unreachable!("immediate call cannot suspend"),
-            Ok(Execution::Return(value)) => Ok(CallResult::Value(self.handle(&value))),
-            Ok(Execution::Halt) => Ok(CallResult::Value(Value::None)),
-            Ok(Execution::Yield(_, _)) => Err(format!(
+            Ok(Flow::Return(value)) => {
+                self.execution.stack.push_ref(&value);
+                Ok(Flow::Next)
+            }
+            Ok(Flow::Halt) => Ok(self.produce(Value::None)),
+            Ok(Flow::Yield(_)) => Err(format!(
                 "unexpected yield in ordinary function {}",
                 self.function_name(&self.store(function))
             )),
-            Ok(Execution::Exit(status)) => Ok(CallResult::Exit(status)),
+            Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
+            Ok(flow) => unreachable!("an immediate call cannot end with {flow:?}"),
             Err((error, span)) => Err(format!(
                 "{error} in {} at line {}, column {}",
                 self.function_name(&self.store(function)),
@@ -1762,7 +1767,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         closure: Option<Value<'s>>,
         locals: Vec<Option<Value<'s>>>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc_with(|builder| {
             Object::Generator(Box::new(GeneratorObject {
@@ -1778,7 +1783,7 @@ impl<'s> Vm<'s> {
                 return_value: builder.store(Value::None),
             }))
         })?;
-        Ok(CallResult::Value(generator))
+        Ok(self.produce(generator))
     }
 
     /// The frame entry for `exec`/`eval` code: no locals of its own, names resolved through the
@@ -1986,7 +1991,7 @@ impl<'s> Vm<'s> {
         constructor: Value<'s>,
         arguments: Vec<Value<'s>>,
         keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         // `__new__` is a static method that receives the class explicitly.
         let constructor = self
             .bind_type_attribute(constructor, None, class_type, owner)?
@@ -1994,17 +1999,13 @@ impl<'s> Vm<'s> {
         let mut new_arguments = Vec::with_capacity(arguments.len().saturating_add(1));
         new_arguments.push(class);
         new_arguments.extend(arguments.iter().copied());
-        let created =
-            match self.invoke_call(constructor, new_arguments, keyword_arguments.clone())? {
-                CallResult::Value(value) => value,
-                CallResult::Exit(status) => return Ok(CallResult::Exit(status)),
-                CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-                CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                    unreachable!("immediate call cannot suspend")
-                }
-            };
+        let flow = self.invoke_call(constructor, new_arguments, keyword_arguments.clone())?;
+        let created = match self.immediate_value(flow)? {
+            Ok(value) => value,
+            Err(flow) => return Ok(flow),
+        };
         if !self.is_instance(&created, &class)? {
-            return Ok(CallResult::Value(created));
+            return Ok(self.produce(created));
         }
         let layout = match self.get(class)? {
             Object::Class(class_object) => class_object.layout,
@@ -2027,25 +2028,22 @@ impl<'s> Vm<'s> {
                 .transpose()?
         };
         let Some((owner, initializer)) = initializer else {
-            return Ok(CallResult::Value(created));
+            return Ok(self.produce(created));
         };
         let initializer = self
             .bind_type_attribute(initializer, Some(created), class_type, owner)?
             .ok_or("__init__ descriptor has no value")?;
-        match self.invoke_call(initializer, arguments, keyword_arguments)? {
-            CallResult::Value(value) if value.is_none() => Ok(CallResult::Value(created)),
-            CallResult::Value(value) => {
+        let flow = self.invoke_call(initializer, arguments, keyword_arguments)?;
+        match self.immediate_value(flow)? {
+            Ok(value) if value.is_none() => Ok(self.produce(created)),
+            Ok(value) => {
                 let type_name = self.type_name_of(&value)?;
                 Err(self.raise_exception(
                     "TypeError",
                     format!("__init__() should return None, not '{type_name}'"),
                 ))
             }
-            CallResult::Exit(status) => Ok(CallResult::Exit(status)),
-            CallResult::EnteredFrame => unreachable!("invoke_call is immediate"),
-            CallResult::Blocked(_, _) | CallResult::Retry(_, _) => {
-                unreachable!("immediate call cannot suspend")
-            }
+            Err(flow) => Ok(flow),
         }
     }
 
@@ -2058,7 +2056,7 @@ impl<'s> Vm<'s> {
         keyword_arguments: Vec<(String, Value<'s>)>,
     ) -> Result<Value<'s>, String> {
         match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
-            CallResult::Value(value) => Ok(value),
+            Flow::Next => self.pop(),
             _ => Err(format!("{}() did not produce a value", builtin.name())),
         }
     }
@@ -2353,7 +2351,7 @@ impl<'s> Vm<'s> {
     pub(super) fn resume_native_call(
         &mut self,
         pending: PendingNativeCall,
-    ) -> Result<CallResult<'s>, String> {
+    ) -> Result<Flow, String> {
         /// The native a retried call invokes, with its receiver as a handle.
         #[derive(Clone, Copy)]
         enum Target<'v> {
@@ -2391,14 +2389,11 @@ impl<'s> Vm<'s> {
         };
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(value) => match self.pending_wait.take() {
-                Some(reason) => Ok(CallResult::Blocked(reason, value)),
-                None => Ok(CallResult::Value(value)),
-            },
+            Ok(value) => Ok(self.native_result(value)),
             Err(PyError {
                 kind: PyErrorKind::Exit(status),
                 ..
-            }) => Ok(CallResult::Exit(status)),
+            }) => Ok(Flow::Exit(status)),
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
@@ -2417,13 +2412,23 @@ impl<'s> Vm<'s> {
                         call_span,
                     },
                 };
-                Ok(CallResult::Retry(reason, retry))
+                Ok(self.suspend(reason, Some(retry)))
             }
             Err(error) => Err(self.record_native_error(error)),
         }
     }
 
-    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<CallResult<'s>, String> {
+    /// A native function's result goes on the stack; a wait it requested afterwards, through
+    /// `pending_wait`, blocks the process once the result is in place.
+    fn native_result(&mut self, value: Value<'s>) -> Flow {
+        self.push(value);
+        match self.pending_wait.take() {
+            Some(reason) => self.suspend(reason, None),
+            None => Flow::Next,
+        }
+    }
+
+    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<Flow, String> {
         let PendingNativeCall::Input { call_span } = pending else {
             unreachable!("caller checked the variant");
         };
@@ -2433,14 +2438,14 @@ impl<'s> Vm<'s> {
         let result = self.read_stream(&marker, None, true);
         self.native_suspend_allowed = previous_suspend;
         match result {
-            Ok(read) => self.finish_input(read).map(CallResult::Value),
+            Ok(read) => {
+                let value = self.finish_input(read)?;
+                Ok(self.produce(value))
+            }
             Err(PyError {
                 kind: PyErrorKind::Suspend(reason),
                 ..
-            }) => Ok(CallResult::Retry(
-                reason,
-                PendingNativeCall::Input { call_span },
-            )),
+            }) => Ok(self.suspend(reason, Some(PendingNativeCall::Input { call_span }))),
             Err(error) => Err(self.record_native_error(error)),
         }
     }
