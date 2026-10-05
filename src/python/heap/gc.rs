@@ -19,8 +19,8 @@ use crate::resources::Resources;
 
 use super::value::Raw;
 use super::{
-    ArrayStorage, ClassObject, FunctionObject, GeneratorObject, Heap, HeapObject,
-    InstanceAttributes, NamespaceTarget, Object, ObjectId, ProxyTarget, Ref, ScopeObject,
+    ClassObject, FunctionObject, GeneratorObject, Heap, HeapObject, InstanceAttributes,
+    NamespaceTarget, Object, ObjectId, ProxyTarget, Ref, ScopeObject,
 };
 
 /// Stored references held outside the heap, which the collector must trace and may rewrite.
@@ -85,7 +85,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
     match object {
         Object::List(items)
         | Object::Tuple(items)
-        | Object::ArrayStorage(ArrayStorage::Values(items))
         | Object::Iterator { values: items, .. }
         | Object::Exception(items) => slots(items, f),
         Object::Set(members) | Object::FrozenSet(members) => members.visit_refs(f),
@@ -197,10 +196,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         // The REPL/script global table is a VM root, so this view owns nothing further.
         Object::NamespaceDict(NamespaceTarget::Repl)
         | Object::MappingProxy(ProxyTarget::NativeModule(_) | ProxyTarget::RegisteredType(_)) => {}
-        Object::Array { storage, base, .. } => {
-            f(&mut storage.0);
-            optional(base, f);
-        }
         Object::Native(native) => native.visit_refs(&mut |slot| f(&mut slot.0)),
         Object::Property { getter, setter } => {
             f(&mut getter.0);
@@ -218,7 +213,6 @@ pub(super) fn for_each_ref(object: &mut Object, f: &mut dyn FnMut(&mut Raw)) {
         | Object::String(_)
         | Object::Bytes(_)
         | Object::ByteArray(_)
-        | Object::ArrayStorage(ArrayStorage::Bytes(_))
         | Object::WideValue { .. }
         | Object::BigInt(_)
         | Object::Float(_)

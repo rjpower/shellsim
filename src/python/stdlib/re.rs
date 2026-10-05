@@ -184,8 +184,8 @@ impl NativeObject for RegexObject {
         BuiltinType::Regex.id()
     }
 
-    fn modeled_slots(&self) -> Result<usize, String> {
-        Ok(self.pattern.len())
+    fn modeled_bytes(&self) -> Result<u64, String> {
+        u64::try_from(self.pattern.len()).map_err(|_| "modeled object size overflow".into())
     }
 
     fn dup(&self) -> Box<dyn NativeObject> {
@@ -227,7 +227,7 @@ impl NativeObject for MatchObject {
         BuiltinType::Match.id()
     }
 
-    fn modeled_slots(&self) -> Result<usize, String> {
+    fn modeled_bytes(&self) -> Result<u64, String> {
         let text = |values: &[Option<String>]| {
             values
                 .iter()
@@ -239,6 +239,7 @@ impl NativeObject for MatchObject {
             .checked_add(self.spans.len().saturating_mul(16))
             .and_then(|size| size.checked_add(text(&self.groups)))
             .and_then(|size| size.checked_add(text(&self.group_names)))
+            .and_then(|size| u64::try_from(size).ok())
             .ok_or_else(|| "modeled object size overflow".into())
     }
 

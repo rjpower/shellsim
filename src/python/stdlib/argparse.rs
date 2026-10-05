@@ -5,7 +5,7 @@
 //! level. Unsupported actions and nested subcommands fail explicitly rather than approximating a
 //! larger parser framework.
 
-use super::super::heap::{NativeObject, Ref};
+use super::super::heap::{NativeObject, Ref, MODELED_VALUE_BYTES};
 use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, ModuleDef, NativeTypeDef, OwnedPyString,
@@ -61,16 +61,20 @@ impl NativeObject for ArgumentParserObject {
         BuiltinType::ArgumentParser.id()
     }
 
-    fn modeled_slots(&self) -> Result<usize, String> {
+    fn modeled_bytes(&self) -> Result<u64, String> {
         let commands = self
             .subparsers
             .as_ref()
             .map_or(0, |subparsers| subparsers.commands.len());
+        let entries = self.arguments.len().checked_add(commands);
         self.prog
             .len()
             .checked_add(self.description.as_ref().map_or(0, String::len))
-            .and_then(|size| size.checked_add(self.arguments.len()))
-            .and_then(|size| size.checked_add(commands))
+            .and_then(|size| u64::try_from(size).ok())
+            .and_then(|size| {
+                let entries = u64::try_from(entries?).ok()?;
+                size.checked_add(entries.checked_mul(MODELED_VALUE_BYTES)?)
+            })
             .ok_or_else(|| "modeled object size overflow".into())
     }
 
@@ -142,8 +146,11 @@ impl NativeObject for NamespaceObject {
         BuiltinType::Native.id()
     }
 
-    fn modeled_slots(&self) -> Result<usize, String> {
-        Ok(self.values.len())
+    fn modeled_bytes(&self) -> Result<u64, String> {
+        u64::try_from(self.values.len())
+            .ok()
+            .and_then(|count| count.checked_mul(MODELED_VALUE_BYTES))
+            .ok_or_else(|| "modeled object size overflow".into())
     }
 
     fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {

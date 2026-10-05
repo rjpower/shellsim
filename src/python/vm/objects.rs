@@ -1481,8 +1481,6 @@ impl<'s> Vm<'s> {
                 | Object::Generator { .. }
                 | Object::Module { .. }
                 | Object::Scope(_)
-                | Object::ArrayStorage(_)
-                | Object::Array { .. }
                 | Object::WideValue { .. }
                 | Object::Native(_)
                 | Object::NamespaceDict(_)
@@ -1960,10 +1958,8 @@ impl<'s> Vm<'s> {
             Object::Dict(_) | Object::DefaultDict { .. } => {
                 self.dict_set_entry(owner, index, value)?
             }
-            // Item assignment on these would be a shellsim gap, not a CPython TypeError.
-            Object::ByteArray(_) | Object::ArrayStorage(_) | Object::Array { .. } => {
-                return Err("object does not support item assignment".into())
-            }
+            // Item assignment on a bytearray would be a shellsim gap, not a CPython TypeError.
+            Object::ByteArray(_) => return Err("object does not support item assignment".into()),
             _ => {
                 return Err(self.raise_object_type_error(&owner, "does not support item assignment"))
             }

@@ -361,9 +361,7 @@ fn render_inner(
                 Object::NamespaceDict(_) => "{...}",
                 Object::DictView { .. } => "<dict view ...>",
                 Object::MappingProxy(_) => "mappingproxy(...)",
-                Object::ArrayStorage(_) => "<array storage ...>",
                 Object::WideValue { .. } => "<value ...>",
-                Object::Array { .. } => "array(...)",
                 Object::Native(_) => "<native ...>",
                 Object::Property { .. } => "<property ...>",
                 Object::StaticMethod { .. } => "<staticmethod ...>",
@@ -504,9 +502,7 @@ fn render_inner(
             // heap alone cannot read every mapping they may view.
             Object::DictView { .. } => "<dict view>".to_string(),
             Object::MappingProxy(_) => "mappingproxy(...)".to_string(),
-            Object::ArrayStorage(_) => "<array storage>".into(),
             Object::WideValue { .. } => "<value>".into(),
-            Object::Array { view, .. } => format!("array(shape={:?})", view.shape),
             Object::Native(native) => {
                 native.repr(&mut |slot| render(state, heap.handle(slot), active))?
             }
@@ -587,8 +583,6 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
         | Object::CallableIterator { .. }
         | Object::Generator { .. }
         | Object::Module { .. }
-        | Object::ArrayStorage(_)
-        | Object::Array { .. }
         | Object::WideValue { .. }
         | Object::Native(_)
         | Object::NamespaceDict(_)
@@ -1102,8 +1096,6 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             | Object::CallableIterator { .. }
             | Object::Generator { .. }
             | Object::Module { .. }
-            | Object::ArrayStorage(_)
-            | Object::Array { .. }
             | Object::WideValue { .. }
             | Object::Native(_)
             | Object::NamespaceDict(_)

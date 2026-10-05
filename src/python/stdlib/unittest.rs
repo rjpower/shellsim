@@ -164,8 +164,8 @@ impl NativeObject for RaisesContextObject {
         BuiltinType::RaisesContext.id()
     }
 
-    fn modeled_slots(&self) -> Result<usize, String> {
-        Ok(self.expected.len())
+    fn modeled_bytes(&self) -> Result<u64, String> {
+        u64::try_from(self.expected.len()).map_err(|_| "modeled object size overflow".into())
     }
 
     fn dup(&self) -> Box<dyn NativeObject> {

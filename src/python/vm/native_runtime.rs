@@ -4,6 +4,7 @@ use super::super::heap::{self, Builder, FunctionObject, OrderedMap};
 use super::super::stdlib::argparse::{
     ArgumentParserObject, ArgumentSpec, NamespaceObject, SubcommandSpec, SubparsersSpec,
 };
+use super::super::stdlib::numpy::storage::{ArrayObject, ArrayStorage};
 use super::super::stdlib::re::{MatchObject, RegexObject};
 use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
@@ -192,16 +193,21 @@ impl<'s> Vm<'s> {
     }
 
     /// The heap view object behind a checked array handle.
-    fn array_object(&self, array: PyArray<'s>) -> PyResult<'s, &Object> {
-        let object = self
-            .state
+    fn array_object(&self, array: PyArray<'s>) -> PyResult<'s, &ArrayObject> {
+        self.state
             .heap
             .get(array.value())
-            .map_err(PyError::runtime_error)?;
-        match object {
-            Object::Array { .. } => Ok(object),
-            _ => Err(PyError::runtime_error("array handle changed object kind")),
-        }
+            .map_err(PyError::runtime_error)?
+            .native::<ArrayObject>()
+            .ok_or_else(|| PyError::runtime_error("array handle changed object kind"))
+    }
+
+    /// The element storage behind an array, borrowed for reading.
+    fn array_storage_object(&self, storage: Value<'s>) -> PyResult<'s, &ArrayStorage> {
+        self.get(storage)
+            .map_err(PyError::runtime_error)?
+            .native::<ArrayStorage>()
+            .ok_or_else(|| PyError::runtime_error("array storage changed object kind"))
     }
 
     /// Read `sys.stdin`/`sys.stdin.buffer` from the fully-supplied `ProcessInput::stdin` slice.
@@ -560,7 +566,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 return Ok(PyKind::Instance);
             }
         }
-        Ok(match self.get(*value).map_err(PyError::runtime_error)? {
+        let object = self.get(*value).map_err(PyError::runtime_error)?;
+        Ok(match object {
             Object::Bare => PyKind::Native,
             Object::Float(_) => PyKind::Float,
             Object::String(_) => PyKind::String,
@@ -589,8 +596,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::Module { .. } => PyKind::Module,
             Object::NamespaceDict(_) => PyKind::Dict,
             Object::DictView { .. } | Object::MappingProxy(_) => PyKind::Native,
-            Object::Array { .. } => PyKind::Array,
-            Object::ArrayStorage(_) | Object::WideValue { .. } => PyKind::Native,
+            Object::WideValue { .. } => PyKind::Native,
+            Object::Native(_) if object.native::<ArrayObject>().is_some() => PyKind::Array,
             Object::Native(_) => PyKind::Native,
             Object::Property { .. }
             | Object::StaticMethod { .. }
@@ -628,7 +635,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         let object = self.get(*value).map_err(PyError::runtime_error)?;
         Ok(match object {
             Object::Property { .. } => Some(PyNativeKind::Property),
-            Object::Array { .. } => Some(PyNativeKind::Array),
+            _ if object.native::<ArrayObject>().is_some() => Some(PyNativeKind::Array),
             _ if object.native::<RegexObject>().is_some() => Some(PyNativeKind::Regex),
             _ if object.native::<MatchObject>().is_some() => Some(PyNativeKind::Match),
             _ if object.native::<ArgumentParserObject>().is_some() => {
@@ -2261,67 +2268,58 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         validate_array_view(&view, values, buffer.byte_len())?;
         let storage = match buffer {
             PyArrayBuffer::Bytes(bytes) => {
-                self.alloc(Object::ArrayStorage(heap::ArrayStorage::Bytes(bytes)))
+                self.alloc(Object::Native(Box::new(ArrayStorage::Bytes(bytes))))
             }
             PyArrayBuffer::Values(values) => self.alloc_with(|builder| {
-                Object::ArrayStorage(heap::ArrayStorage::Values(builder.refs(values)))
+                Object::Native(Box::new(ArrayStorage::Values(builder.refs(values))))
             }),
         }
         .map_err(PyError::resource_error)?;
-        self.alloc_with(|builder| Object::Array {
-            storage: builder.store(storage),
-            view: Box::new(view),
-            base: None,
+        self.alloc_with(|builder| {
+            Object::Native(Box::new(ArrayObject {
+                storage: builder.store(storage),
+                view,
+                base: None,
+            }))
         })
         .map_err(PyError::resource_error)
     }
 
     fn new_array_view(&mut self, base: PyArray<'s>, view: PyArrayView) -> PyResult<'s, Value<'s>> {
-        let (storage, base_writeable, owner) = match self.array_object(base)? {
-            Object::Array {
-                storage,
-                view,
-                base: owner,
-            } => (
-                self.handle(storage),
-                view.writeable,
-                self.handle_optional(owner.as_ref()).unwrap_or(base.value()),
-            ),
-            _ => unreachable!("array_object checks the kind"),
-        };
+        let array = self.array_object(base)?;
+        let (storage, base_writeable, owner) = (
+            self.handle(&array.storage),
+            array.view.writeable,
+            self.handle_optional(array.base.as_ref())
+                .unwrap_or(base.value()),
+        );
         if view.writeable && !base_writeable {
             return Err(PyError::runtime_error(
                 "a view of a read-only array cannot be writeable",
             ));
         }
-        match self.get(storage).map_err(PyError::runtime_error)? {
-            Object::ArrayStorage(buffer) => validate_array_view(
-                &view,
-                matches!(buffer, heap::ArrayStorage::Values(_)),
-                buffer.byte_len(),
-            )?,
-            _ => return Err(PyError::runtime_error("array storage changed object kind")),
-        }
-        self.alloc_with(|builder| Object::Array {
-            storage: builder.store(storage),
-            view: Box::new(view),
-            base: Some(builder.store(owner)),
+        let buffer = self.array_storage_object(storage)?;
+        validate_array_view(
+            &view,
+            matches!(buffer, ArrayStorage::Values(_)),
+            buffer.byte_len(),
+        )?;
+        self.alloc_with(|builder| {
+            Object::Native(Box::new(ArrayObject {
+                storage: builder.store(storage),
+                view,
+                base: Some(builder.store(owner)),
+            }))
         })
         .map_err(PyError::resource_error)
     }
 
     fn array_view(&self, array: PyArray<'s>) -> PyResult<'s, PyArrayView> {
-        match self.array_object(array)? {
-            Object::Array { view, .. } => Ok((**view).clone()),
-            _ => unreachable!("array_object checks the kind"),
-        }
+        Ok(self.array_object(array)?.view.clone())
     }
 
     fn array_storage(&self, array: PyArray<'s>) -> PyResult<'s, PyIdentity> {
-        let storage = match self.array_object(array)? {
-            Object::Array { storage, .. } => self.handle(storage),
-            _ => unreachable!("array_object checks the kind"),
-        };
+        let storage = self.handle(&self.array_object(array)?.storage);
         Vm::identity(self, storage)
             .map_err(PyError::runtime_error)?
             .map(PyIdentity)
@@ -2329,23 +2327,17 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     }
 
     fn array_base(&self, array: PyArray<'s>) -> PyResult<'s, Option<Value<'s>>> {
-        match self.array_object(array)? {
-            Object::Array { base, .. } => Ok(self.handle_optional(base.as_ref())),
-            _ => unreachable!("array_object checks the kind"),
-        }
+        Ok(self.handle_optional(self.array_object(array)?.base.as_ref()))
     }
 
     fn set_array_writeable(&mut self, array: PyArray<'s>, writeable: bool) -> PyResult<'s, ()> {
-        match self
+        let array = self
             .get_mut(array.value())
             .map_err(PyError::runtime_error)?
-        {
-            Object::Array { view, .. } => {
-                view.writeable = writeable;
-                Ok(())
-            }
-            _ => Err(PyError::runtime_error("array handle changed object kind")),
-        }
+            .native_mut::<ArrayObject>()
+            .ok_or_else(|| PyError::runtime_error("array handle changed object kind"))?;
+        array.view.writeable = writeable;
+        Ok(())
     }
 
     fn read_arrays(
@@ -2355,18 +2347,10 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     ) -> PyResult<'s, ()> {
         let mut lent = Vec::with_capacity(arrays.len());
         for array in arrays {
-            let Object::Array { storage, view, .. } = self.array_object(*array)? else {
-                unreachable!("array_object checks the kind");
-            };
-            let data = match self
-                .get(self.handle(storage))
-                .map_err(PyError::runtime_error)?
-            {
-                Object::ArrayStorage(heap::ArrayStorage::Bytes(bytes)) => PyArrayData::Bytes(bytes),
-                Object::ArrayStorage(heap::ArrayStorage::Values(values)) => {
-                    PyArrayData::Values(values)
-                }
-                _ => return Err(PyError::runtime_error("array storage changed object kind")),
+            let ArrayObject { storage, view, .. } = self.array_object(*array)?;
+            let data = match self.array_storage_object(self.handle(storage))? {
+                ArrayStorage::Bytes(bytes) => PyArrayData::Bytes(bytes),
+                ArrayStorage::Values(values) => PyArrayData::Values(values),
             };
             lent.push(PyArrayRef { view, data });
         }
@@ -2378,22 +2362,16 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         array: PyArray<'s>,
         write: &mut dyn FnMut(&Builder<'_>, PyArrayMut<'_>) -> PyResult<'s, ()>,
     ) -> PyResult<'s, ()> {
-        let Object::Array { storage, view, .. } = self.array_object(array)? else {
-            unreachable!("array_object checks the kind");
-        };
+        let ArrayObject { storage, view, .. } = self.array_object(array)?;
         if !view.writeable {
             return Err(PyError::value_error("assignment destination is read-only"));
         }
         let storage = self.handle(storage);
         self.modify(storage, |builder, object| {
-            let data = match object {
-                Object::ArrayStorage(heap::ArrayStorage::Bytes(bytes)) => {
-                    PyArrayDataMut::Bytes(bytes)
-                }
-                Object::ArrayStorage(heap::ArrayStorage::Values(values)) => {
-                    PyArrayDataMut::Values(values)
-                }
-                _ => return Err(PyError::runtime_error("array storage changed object kind")),
+            let data = match object.native_mut::<ArrayStorage>() {
+                Some(ArrayStorage::Bytes(bytes)) => PyArrayDataMut::Bytes(bytes),
+                Some(ArrayStorage::Values(values)) => PyArrayDataMut::Values(values),
+                None => return Err(PyError::runtime_error("array storage changed object kind")),
             };
             write(builder, PyArrayMut { data })
         })

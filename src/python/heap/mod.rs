@@ -29,7 +29,6 @@ use num_bigint::BigInt;
 
 use super::attributes::ShapeId;
 use super::bytecode::CodeRef;
-use super::native::PyArrayView;
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
 
@@ -48,7 +47,7 @@ pub use value::{Ref, Value};
 
 use value::Raw;
 
-pub(super) const MODELED_VALUE_BYTES: u64 = 24;
+pub(crate) const MODELED_VALUE_BYTES: u64 = 24;
 /// A dict entry holds its key, value, and hash in a slot plus one hash-index entry.
 const MAPPING_ENTRY_VALUES: usize = 4;
 pub(super) const MODELED_MAPPING_ENTRY_BYTES: u64 =
@@ -285,24 +284,6 @@ fn modeled_scope_size(scope: &ScopeObject) -> Result<u64, String> {
         .ok_or_else(|| "modeled scope size overflow".into())
 }
 
-/// Flat element storage shared by one or more array views: packed bytes, or traced Python
-/// references for object arrays.
-#[derive(Debug)]
-pub enum ArrayStorage {
-    Bytes(Vec<u8>),
-    Values(Vec<Ref>),
-}
-
-impl ArrayStorage {
-    /// Length of the addressable storage in bytes.
-    pub fn byte_len(&self) -> usize {
-        match self {
-            Self::Bytes(bytes) => bytes.len(),
-            Self::Values(values) => values.len().saturating_mul(16),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub enum Object {
     /// A direct `object()` instance: identity only, with no attributes.
@@ -420,15 +401,6 @@ pub enum Object {
     },
     /// A read-only mapping over a [`ProxyTarget`], like CPython's `mappingproxy`.
     MappingProxy(ProxyTarget),
-    /// Flat element storage shared by one or more array views.
-    ArrayStorage(ArrayStorage),
-    /// An ndarray view. Byte strides and offset map indices into `ArrayStorage`.
-    Array {
-        storage: Ref,
-        view: Box<PyArrayView>,
-        /// The array that owns the storage, for `ndarray.base`; `None` for owners.
-        base: Option<Ref>,
-    },
     /// A registered value kind whose payload does not fit inline, such as a complex128 scalar.
     WideValue {
         type_id: TypeId,
@@ -1165,8 +1137,6 @@ impl Heap {
             },
             Object::MappingProxy(_) => BuiltinType::MappingProxy.id(),
             Object::GenericAlias { .. } => BuiltinType::GenericAlias.id(),
-            Object::ArrayStorage(_) => BuiltinType::Native.id(),
-            Object::Array { .. } => BuiltinType::Array.id(),
             Object::WideValue { type_id, .. } => *type_id,
             Object::Native(native) => native.python_type(),
             Object::Property { .. } => BuiltinType::Property.id(),
@@ -1288,15 +1258,11 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         // The namespace it views is charged where that namespace actually lives (the scope or
         // the REPL/script global table), so the view itself is a fixed, minimal handle.
         Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
-        Object::ArrayStorage(ArrayStorage::Bytes(bytes)) => return packed(bytes.len()),
-        Object::ArrayStorage(ArrayStorage::Values(values)) => values.len(),
-        Object::Array { view, .. } => view
-            .shape
-            .len()
-            .checked_add(view.strides.len())
-            .and_then(|size| size.checked_add(3))
-            .ok_or("modeled object size overflow")?,
-        Object::Native(native) => native.modeled_slots()?,
+        Object::Native(native) => {
+            return OBJECT_HEADER
+                .checked_add(native.modeled_bytes()?)
+                .ok_or_else(|| "modeled object size overflow".into())
+        }
         Object::Property { setter, .. } => 1 + usize::from(setter.is_some()),
         Object::StaticMethod { .. } | Object::ClassMethod { .. } => 1,
         Object::Super { .. } => 2,

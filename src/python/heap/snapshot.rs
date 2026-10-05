@@ -5,8 +5,8 @@
 //! together with the space it points into.
 
 use super::{
-    ArrayStorage, ClassObject, FunctionObject, GeneratorObject, InstanceAttributes,
-    NamespaceTarget, Object, ProxyTarget, Ref, ScopeObject,
+    ClassObject, FunctionObject, GeneratorObject, InstanceAttributes, NamespaceTarget, Object,
+    ProxyTarget, Ref, ScopeObject,
 };
 
 fn slots(slots: &[Ref]) -> Vec<Ref> {
@@ -185,21 +185,6 @@ pub(super) fn dup_object(object: &Object) -> Object {
             ProxyTarget::RegisteredType(type_id) => ProxyTarget::RegisteredType(*type_id),
             ProxyTarget::NativeModule(module) => ProxyTarget::NativeModule(module),
         }),
-        Object::ArrayStorage(ArrayStorage::Bytes(bytes)) => {
-            Object::ArrayStorage(ArrayStorage::Bytes(bytes.clone()))
-        }
-        Object::ArrayStorage(ArrayStorage::Values(values)) => {
-            Object::ArrayStorage(ArrayStorage::Values(slots(values)))
-        }
-        Object::Array {
-            storage,
-            view,
-            base,
-        } => Object::Array {
-            storage: storage.dup(),
-            view: view.clone(),
-            base: optional(base),
-        },
         Object::WideValue {
             type_id,
             kind,

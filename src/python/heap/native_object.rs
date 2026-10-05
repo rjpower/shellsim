@@ -27,9 +27,10 @@ pub trait NativeObject: Any + Debug + Send {
     /// The Python type of every object carrying this payload.
     fn python_type(&self) -> TypeId;
 
-    /// The payload's modeled size in value slots, excluding the object header. Text and other
-    /// byte-sized state count one slot per byte, which keeps the estimate conservative.
-    fn modeled_slots(&self) -> Result<usize, String>;
+    /// The payload's modeled size in bytes, excluding the object header. Text counts its length
+    /// and each stored reference counts `MODELED_VALUE_BYTES` (`super::MODELED_VALUE_BYTES`),
+    /// like the heap's own payloads.
+    fn modeled_bytes(&self) -> Result<u64, String>;
 
     /// Report every stored reference to the collector.
     fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
