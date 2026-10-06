@@ -62,7 +62,7 @@ fn pinned_values_survive_a_young_collection_in_place() {
     let kept = string(&mut heap, &(), &mut resources, "kept");
     let dropped = string(&mut heap, &(), &mut resources, "dropped");
     let dropped_slot = Ref::from(dropped);
-    heap.truncate_pins(1);
+    heap.truncate_pins(1, &mut resources);
     assert_eq!(heap.live_objects(), 2);
 
     heap.collect_young(&(), None, &mut resources).unwrap();
@@ -82,7 +82,7 @@ fn a_reused_slot_does_not_answer_for_its_previous_object() {
     let mut resources = unlimited();
     let first = string(&mut heap, &(), &mut resources, "first");
     let stale = Ref::from(first);
-    heap.truncate_pins(0);
+    heap.truncate_pins(0, &mut resources);
     heap.collect_young(&(), None, &mut resources).unwrap();
     let second = string(&mut heap, &(), &mut resources, "second");
     assert_eq!(
@@ -105,7 +105,7 @@ fn reported_roots_keep_their_targets() {
     let mut roots: Vec<Ref> = Vec::new();
     let value = string(&mut heap, &roots, &mut resources, "rooted");
     roots.push(Ref::from(value));
-    heap.truncate_pins(0);
+    heap.truncate_pins(0, &mut resources);
 
     heap.collect_young(&roots, None, &mut resources).unwrap();
     let value = heap.value(&roots[0]);
@@ -128,7 +128,7 @@ fn references_stored_into_old_objects_are_remembered() {
         items.push(Ref::from(young));
     })
     .unwrap();
-    heap.truncate_pins(1);
+    heap.truncate_pins(1, &mut resources);
 
     heap.collect_young(&(), None, &mut resources).unwrap();
     let Object::List(items) = heap.get(container).unwrap() else {
@@ -157,7 +157,7 @@ fn full_collection_reclaims_unreachable_cycles_and_releases_memory() {
     // Both are pinned.
     heap.collect_full(&(), None, &mut resources).unwrap();
     assert_eq!(heap.live_objects(), 2);
-    heap.truncate_pins(0);
+    heap.truncate_pins(0, &mut resources);
     let released = heap.collect_full(&(), None, &mut resources).unwrap();
     assert!(released > 0);
     assert_eq!(heap.live_objects(), 0);
@@ -185,7 +185,7 @@ fn the_object_under_construction_survives_the_collection_it_triggers() {
     while heap.young_bytes + garbage_cost <= gc::young_budget(limit) {
         heap.alloc(Object::Bytes(Vec::new()), &(), &mut resources)
             .unwrap();
-        heap.truncate_pins(0);
+        heap.truncate_pins(0, &mut resources);
     }
     let minor_before = heap.stats().minor_collections;
     // Only the pending list names `element` now.
@@ -215,7 +215,7 @@ fn allocation_collects_before_reporting_out_of_memory() {
     for _ in 0..100 {
         heap.alloc(Object::Bytes(vec![0; 1024]), &(), &mut resources)
             .unwrap();
-        heap.truncate_pins(0);
+        heap.truncate_pins(0, &mut resources);
     }
     assert!(heap.stats().major_collections > 0);
     // Live data beyond the limit is still an error.
@@ -225,7 +225,7 @@ fn allocation_collects_before_reporting_out_of_memory() {
             Ok(value) => roots.push(Ref::from(value)),
             Err(error) => break error,
         }
-        heap.truncate_pins(0);
+        heap.truncate_pins(0, &mut resources);
     };
     assert_eq!(error.kind(), Some(&PyErrorKind::Resource));
     assert!(roots.len() >= 8 && roots.len() < 16);
@@ -290,7 +290,7 @@ fn cloned_heaps_diverge_cleanly() {
     let mut roots: Vec<Ref> = Vec::new();
     let value = list(&mut heap, &roots, &mut resources, &[]);
     roots.push(Ref::from(value));
-    heap.truncate_pins(0);
+    heap.truncate_pins(0, &mut resources);
     let mut cloned = heap.clone();
     let cloned_roots = vec![roots[0].dup()];
     let original = heap.value(&roots[0]);
@@ -303,11 +303,36 @@ fn cloned_heaps_diverge_cleanly() {
     .unwrap();
     let copy = cloned.value(&cloned_roots[0]);
     assert!(matches!(cloned.get(copy).unwrap(), Object::List(items) if items.is_empty()));
-    cloned.truncate_pins(0);
+    cloned.truncate_pins(0, &mut resources);
     cloned
         .collect_full(&cloned_roots, None, &mut resources)
         .unwrap();
     assert_eq!(cloned.live_objects(), 1);
+}
+
+#[test]
+fn releasing_pins_releases_only_the_scratch_reserved_after_them() {
+    let mut heap = Heap::default();
+    let mut resources = Resources::new(Limits {
+        memory: 1000,
+        ..Limits::unlimited()
+    });
+    let kept = string(&mut heap, &(), &mut resources, "kept");
+    let kept_bytes = resources.memory_mark();
+    heap.reserve_scratch(100, &mut resources).unwrap();
+    // A nested scope opens here, after the outer reservation, and reserves its own.
+    let nested = heap.pin_count();
+    heap.reserve_scratch(200, &mut resources).unwrap();
+    assert_eq!(resources.memory_mark(), kept_bytes + 300);
+
+    // The markers name no object, so a collection keeps only the pinned string.
+    heap.collect_full(&(), None, &mut resources).unwrap();
+    assert_eq!(text(&heap, kept), "kept");
+    heap.truncate_pins(nested, &mut resources);
+    assert_eq!(resources.memory_mark(), kept_bytes + 100);
+    heap.truncate_pins(0, &mut resources);
+    heap.collect_full(&(), None, &mut resources).unwrap();
+    assert_eq!(resources.memory_mark(), 0);
 }
 
 /// Every heap slot is as large as the largest `Object` variant and every object is charged

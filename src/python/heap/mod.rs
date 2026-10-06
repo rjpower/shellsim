@@ -11,7 +11,8 @@
 //! Code outside this module tree sees three value types ([`value`]):
 //!
 //! - a [`Value`], an immediate or an object id, pinned on the heap's pin stack from the moment it
-//!   is made until the code that made it releases its pins;
+//!   is made until the code that made it releases its pins, which also releases the host scratch
+//!   that code reserved ([`Heap::reserve_scratch`]);
 //! - a [`Ref`], the stored reference inside an object or VM root, made from a pinned value;
 //! - immediates, which need no pin.
 //!
@@ -465,6 +466,7 @@ pub struct GcStats {
     pub promoted_objects: u64,
 }
 
+#[derive(Default)]
 pub struct Heap {
     /// Every object, by slot index; `None` marks a free slot.
     slots: Vec<Option<HeapObject>>,
@@ -478,29 +480,42 @@ pub struct Heap {
     major_threshold: u64,
     /// Old objects mutated since the last minor collection; their slots may name young objects.
     remembered: Vec<u32>,
-    /// Objects named by live [`Value`]s. Truncated by whoever released the values.
-    pins: RefCell<Vec<ObjectId>>,
+    /// Objects named by live [`Value`]s and the host scratch reserved beside them. Truncated by
+    /// whoever released the values.
+    pins: RefCell<Pins>,
     /// Modeled bytes of every live object.
     modeled_bytes: u64,
     stats: GcStats,
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self {
-            slots: Vec::new(),
-            free: Vec::new(),
-            young: Vec::new(),
-            young_bytes: 0,
-            old_bytes: 0,
-            major_threshold: 0,
-            remembered: Vec::new(),
-            pins: RefCell::new(Vec::new()),
-            modeled_bytes: 0,
-            stats: GcStats::default(),
+/// The pin stack. Host scratch that Rust code holds while it runs is reserved from the memory
+/// limit and recorded here under a marker pin, so releasing the pins made since some point also
+/// releases the scratch reserved since then, and nested code never releases its caller's.
+#[derive(Default)]
+struct Pins {
+    ids: Vec<ObjectId>,
+    /// Reserved bytes, each with the position of its marker in `ids`, in pin order.
+    scratch: Vec<(usize, u64)>,
+}
+
+impl Pins {
+    /// Release the scratch whose markers were at or above `len`.
+    #[cold]
+    #[inline(never)]
+    fn release_scratch(&mut self, len: usize, resources: &mut Resources) {
+        while let Some(&(position, bytes)) = self.scratch.last() {
+            if position < len {
+                break;
+            }
+            self.scratch.pop();
+            resources.release_memory(bytes);
         }
     }
 }
+
+/// The pin that holds a scratch reservation's place. No slot ever has this generation, so a
+/// collection skips it.
+const SCRATCH_MARKER: ObjectId = ObjectId::new(u32::MAX, u32::MAX);
 
 impl std::fmt::Debug for Heap {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -530,7 +545,7 @@ impl Clone for Heap {
             old_bytes: self.old_bytes,
             major_threshold: self.major_threshold,
             remembered: self.remembered.clone(),
-            pins: RefCell::new(Vec::new()),
+            pins: RefCell::default(),
             modeled_bytes: self.modeled_bytes,
             stats: self.stats,
         }
@@ -543,14 +558,37 @@ impl Heap {
     /// Number of pinned values; whoever releases a group of values records this first.
     #[inline(always)]
     pub fn pin_count(&self) -> usize {
-        self.pins.borrow().len()
+        self.pins.borrow().ids.len()
     }
 
-    /// Release every value pinned since the pin stack had `len` entries. The objects stay valid
-    /// until a collection finds them unreachable.
+    /// Release every value pinned since the pin stack had `len` entries, and the host scratch
+    /// reserved since then. The objects stay valid until a collection finds them unreachable.
     #[inline(always)]
-    pub fn truncate_pins(&self, len: usize) {
-        self.pins.borrow_mut().truncate(len);
+    pub fn truncate_pins(&self, len: usize, resources: &mut Resources) {
+        let mut pins = self.pins.borrow_mut();
+        pins.ids.truncate(len);
+        if pins
+            .scratch
+            .last()
+            .is_some_and(|&(position, _)| position >= len)
+        {
+            pins.release_scratch(len, resources);
+        }
+    }
+
+    /// Reserve `bytes` of host scratch for the code holding the current pins: memory that code
+    /// builds outside the heap and keeps while Python code may run, or that can outgrow the
+    /// heap values it is built from. The reservation lasts until those pins are released.
+    pub fn reserve_scratch(&self, bytes: u64, resources: &mut Resources) -> PyResult<()> {
+        charge_construction(bytes, resources)?;
+        if !resources.reserve_memory(bytes) {
+            return Err(PyError::resource_error("memory limit exceeded"));
+        }
+        let mut pins = self.pins.borrow_mut();
+        let position = pins.ids.len();
+        pins.ids.push(SCRATCH_MARKER);
+        pins.scratch.push((position, bytes));
+        Ok(())
     }
 
     /// The value a stored reference holds, pinned so it survives collection.
@@ -570,7 +608,7 @@ impl Heap {
     #[inline(always)]
     fn pin_raw(&self, raw: Raw) -> Value {
         if let Some(id) = raw.object_id() {
-            self.pins.borrow_mut().push(id);
+            self.pins.borrow_mut().ids.push(id);
         }
         Value::from_raw(raw)
     }

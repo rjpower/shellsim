@@ -1382,7 +1382,6 @@ impl<'s> Vm<'s> {
             _ => 1,
         };
         self.charge_cpu(u64::try_from(count).unwrap_or(u64::MAX))?;
-        self.reserve_result(count.saturating_mul(std::mem::size_of::<Value>()))?;
         let arguments = match item.is_object().then(|| self.get(item)).transpose()? {
             Some(Object::Tuple(arguments)) => self.values(arguments),
             _ => vec![item],
@@ -1664,7 +1663,7 @@ impl<'s> Vm<'s> {
         if let Some(bytes) = non_ascii_bytes {
             // Slicing by code point materializes the characters first.
             self.charge_cpu(scan_cost(bytes))?;
-            self.reserve_result(bytes.saturating_mul(std::mem::size_of::<char>()))?;
+            self.reserve_scratch(bytes.saturating_mul(std::mem::size_of::<char>()))?;
         }
         let string_slice = string::string_ref(&self.state.heap, owner)?
             .map(|text| select_string_slice(text.as_str(), text.is_ascii(), start, stop, step))
@@ -4072,7 +4071,7 @@ impl<'s> Vm<'s> {
                         ) else {
                             return Err(PyError::exception("ValueError", "negative count"));
                         };
-                        self.reserve_result(length)?;
+                        self.reserve_scratch(length)?;
                         vec![0; length]
                     }
                     [value]
@@ -4149,7 +4148,6 @@ impl<'s> Vm<'s> {
                     BuiltinType::Tuple => self.alloc(Object::Tuple(Ref::all(values)))?,
                     BuiltinType::Set | BuiltinType::FrozenSet => {
                         let unique = self.distinct_members(values)?;
-                        self.reserve_result(unique.len().saturating_mul(64))?;
                         self.alloc({
                             let unique = unique.into_set();
                             if builtin_type == BuiltinType::Set {

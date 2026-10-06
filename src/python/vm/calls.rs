@@ -64,7 +64,7 @@ impl<'s> Vm<'s> {
         let parse_memory = super::super::source::front_end_memory(source.len())
             .ok_or_else(|| format!("{builtin} source is too large"))?;
         self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
-        self.reserve_result(parse_memory)?;
+        self.reserve_scratch(parse_memory)?;
         // The front end rejects valid syntax it does not model with the same error as invalid
         // syntax, so neither is a catchable `SyntaxError`.
         let syntax_error = |message: &str, span: &super::super::source::Span| {
@@ -77,7 +77,7 @@ impl<'s> Vm<'s> {
             .map_err(|error| syntax_error(&error.message, &error.span))?;
         let token_memory = super::super::source::token_memory(tokens.len())
             .ok_or_else(|| format!("{builtin} source is too large"))?;
-        self.reserve_result(token_memory)?;
+        self.reserve_scratch(token_memory)?;
         super::super::parser::parse(tokens)
             .map_err(|error| syntax_error(&error.message, &error.span))
     }
@@ -286,7 +286,7 @@ impl<'s> Vm<'s> {
 
     /// Push one expanded positional argument, metering the stack growth.
     fn push_argument(&mut self, value: Value) -> PyResult<()> {
-        self.reserve_result(64)?;
+        self.reserve_scratch(64)?;
         self.charge_cpu(1)?;
         self.push(value);
         Ok(())
@@ -306,7 +306,7 @@ impl<'s> Vm<'s> {
             );
             return Err(PyError::exception("TypeError", message));
         }
-        self.reserve_result(64)?;
+        self.reserve_scratch(64)?;
         self.charge_cpu(1)?;
         self.push(value);
         names.push(Some(name));
@@ -344,7 +344,6 @@ impl<'s> Vm<'s> {
                 _ => {}
             }
         }
-        self.reserve_result(count.saturating_mul(64))?;
         self.charge_cpu(count as u64)?;
         let arguments_start = self.stack.len() - count;
         let mut arguments = self
@@ -795,12 +794,6 @@ impl<'s> Vm<'s> {
                         .map(|(name, _)| name)
                         .collect()
                 };
-                let name_bytes = names.iter().try_fold(0usize, |total, name| {
-                    total
-                        .checked_add(name.len())
-                        .ok_or("dir() result is too large")
-                })?;
-                self.reserve_result(name_bytes)?;
                 self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
                 names.sort();
                 names.dedup();
@@ -894,7 +887,7 @@ impl<'s> Vm<'s> {
                     } else {
                         value
                     };
-                    self.reserve_result(64)?;
+                    self.reserve_scratch(64)?;
                     keyed.push((key, value));
                 }
                 // Like CPython's sort this only asks `<`, and a reversed sort keeps equal items
@@ -1140,7 +1133,6 @@ impl<'s> Vm<'s> {
                 };
                 let mut result = Vec::new();
                 for (offset, value) in values.into_iter().enumerate() {
-                    self.reserve_result(64)?;
                     self.charge_cpu(1)?;
                     let offset = i64::try_from(offset).map_err(|_| "enumerate is too large")?;
                     let index = start
@@ -1163,7 +1155,6 @@ impl<'s> Vm<'s> {
                 let length = sequences.iter().map(Vec::len).min().unwrap_or(0);
                 let mut result = Vec::new();
                 for index in 0..length {
-                    self.reserve_result(64)?;
                     self.charge_cpu(1)?;
                     let tuple = sequences.iter().map(|values| values[index]);
                     result.push(self.alloc(Object::Tuple(Ref::all(tuple)))?);
@@ -1722,7 +1713,6 @@ impl<'s> Vm<'s> {
                 for index in first_extra..positional {
                     extras.push(self.peek(count - 1 - index)?);
                 }
-                self.reserve_result(extras.len().saturating_mul(64))?;
                 Some(self.alloc(Object::Tuple(Ref::all(extras)))?)
             }
             Some(_) => Some(self.alloc(Object::Tuple(Ref::all([])))?),
@@ -1735,7 +1725,6 @@ impl<'s> Vm<'s> {
                     let name = keyword.expect("keywords were validated above");
                     if !matches!(keyword_target(code, name), KeywordTarget::Slot(_)) {
                         let key = self.allocate_string(self.symbol_name(name).to_string())?;
-                        self.reserve_result(64)?;
                         entries.push((key, self.peek(keywords.len() - 1 - index)?));
                     }
                 }

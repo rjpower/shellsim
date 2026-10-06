@@ -62,7 +62,6 @@ impl<'s> Vm<'s> {
     /// parent's values stay pinned inside it.
     pub(super) fn scope(&mut self) -> Vm<'_> {
         let pin_base = self.state.heap.pin_count();
-        let transient_base = self.execution.transient_memory;
         Vm {
             interp: &mut *self.interp,
             argv: self.argv,
@@ -73,7 +72,6 @@ impl<'s> Vm<'s> {
             out: &mut *self.out,
             err: &mut *self.err,
             pin_base,
-            transient_base,
         }
     }
 
@@ -81,20 +79,18 @@ impl<'s> Vm<'s> {
     /// loop that owns its scope and keeps nothing across iterations, such as the bytecode
     /// dispatch loop; dropping the scope does the same.
     pub(super) fn reset_scope(&mut self) {
-        self.state.heap.truncate_pins(self.pin_base);
-        self.release_transient_memory();
+        self.state
+            .heap
+            .truncate_pins(self.pin_base, &mut self.interp.resources);
     }
 
     /// [`Self::reset_scope`] when the scope holds a pin or scratch; the dispatch loop calls
     /// this once per instruction, so an instruction that works in place on the operand stack
-    /// pays two comparisons.
+    /// pays one comparison.
     #[inline(always)]
     pub(super) fn reset_scope_if_used(&mut self) {
         if self.state.heap.pin_count() != self.pin_base {
-            self.state.heap.truncate_pins(self.pin_base);
-        }
-        if self.execution.transient_memory != self.transient_base {
-            self.release_transient_memory();
+            self.reset_scope();
         }
     }
 

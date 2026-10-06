@@ -508,7 +508,6 @@ impl VmProgram {
         err: Out,
     ) -> VmPoll {
         let mut vm = Vm::new(interp, input, state, &mut self.execution, mode, out, err);
-        vm.release_transient_memory();
         if !self.started {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
@@ -525,7 +524,6 @@ impl VmProgram {
             self.started = true;
         }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
-        vm.release_transient_memory();
         if !vm.state.sync_type_memory(&mut vm.interp.resources) {
             return VmPoll::Ready(ExecResult::Exit(137));
         }
@@ -559,12 +557,9 @@ struct Vm<'s> {
     mode: VmMode,
     out: Out<'s>,
     err: Out<'s>,
-    /// Pin-stack height when this scope opened; dropping the scope truncates back to it.
+    /// Pin-stack height when this scope opened; dropping the scope truncates back to it, which
+    /// also releases the host scratch reserved inside it.
     pin_base: usize,
-    /// Host scratch reserved before this scope opened. The scope owns everything reserved above
-    /// it and releases that on each instruction boundary and when it closes, so a nested
-    /// execution never refunds scratch an enclosing native call still holds.
-    transient_base: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -626,10 +621,6 @@ struct VmState {
     /// Whether fd 0 has reported end-of-file. Once set, further reads only drain
     /// `stdin_stream_pending` and never touch the descriptor again.
     stdin_stream_eof: bool,
-    /// Host scratch charged by `reserve_result` while a native helper builds a result. Each
-    /// `Vm` scope releases the part reserved above its own base at every instruction boundary
-    /// and when it closes.
-    transient_memory: u64,
     /// Host bytes held by the VM itself across quanta (stdin text, pipe buffers), released when
     /// the program completes.
     retained_memory: u64,
@@ -662,7 +653,6 @@ impl Clone for VmState {
             stdin_text: self.stdin_text.clone(),
             stdin_stream_pending: self.stdin_stream_pending.clone(),
             stdin_stream_eof: self.stdin_stream_eof,
-            transient_memory: self.transient_memory,
             retained_memory: self.retained_memory,
         }
     }
@@ -1514,7 +1504,6 @@ impl<'s> Vm<'s> {
         err: Out<'s>,
     ) -> Self {
         let pin_base = state.heap.pin_count();
-        let transient_base = execution.transient_memory;
         Self {
             interp,
             argv: input.argv,
@@ -1525,18 +1514,7 @@ impl<'s> Vm<'s> {
             out,
             err,
             pin_base,
-            transient_base,
         }
-    }
-
-    /// Release the host scratch reserved since this scope opened.
-    fn release_transient_memory(&mut self) {
-        let bytes = self.transient_memory.saturating_sub(self.transient_base);
-        if bytes == 0 {
-            return;
-        }
-        self.transient_memory = self.transient_base;
-        self.interp.resources.release_memory(bytes);
     }
 
     fn release_retained_memory(&mut self) {
@@ -1772,7 +1750,7 @@ impl<'s> Vm<'s> {
             Constant::Integer(value) => Value::Int(*value),
             Constant::BigInteger(value) => {
                 self.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-                self.reserve_result(value.len().saturating_mul(2))?;
+                self.reserve_scratch(value.len().saturating_mul(2))?;
                 let value = value
                     .parse::<BigInt>()
                     .map_err(|_| "invalid arbitrary-precision integer literal")?;
@@ -1790,7 +1768,7 @@ impl<'s> Vm<'s> {
         let start = i128::from(start);
         let step = i128::from(step);
         let bytes = count.checked_mul(24).ok_or("range result is too large")?;
-        self.reserve_result(bytes)?;
+        self.reserve_scratch(bytes)?;
         if !self
             .interp
             .resources
@@ -2003,7 +1981,7 @@ impl<'s> Vm<'s> {
         // payloads, so repeated materialization cannot grow outside the memory budget.
         let payload = string::string_ref(&self.state.heap, value)?
             .map_or(0, |text| text.byte_len().saturating_mul(2));
-        self.reserve_result(64usize.saturating_add(payload))?;
+        self.reserve_scratch(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;
         values.push(value);
         Ok(())
@@ -2203,18 +2181,13 @@ impl<'s> Vm<'s> {
         self.stack.len().saturating_sub(stack_base)
     }
 
-    fn reserve_result(&mut self, bytes: usize) -> PyResult<()> {
-        let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
-        super::heap::charge_construction(bytes, &mut self.interp.resources)?;
-        let next = self
-            .transient_memory
-            .checked_add(bytes)
-            .ok_or("modeled Python memory overflow")?;
-        if !self.interp.resources.reserve_memory(bytes) {
-            return Err(PyError::resource_error("memory limit exceeded"));
-        }
-        self.transient_memory = next;
-        Ok(())
+    /// Reserve host scratch until this scope's pins are released: see
+    /// [`Heap::reserve_scratch`](super::heap::Heap::reserve_scratch) for what needs it.
+    fn reserve_scratch(&mut self, bytes: usize) -> PyResult<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
+        self.state
+            .heap
+            .reserve_scratch(bytes, &mut self.interp.resources)
     }
 
     /// Append at most the output budget's remaining bytes. Charging happens before touching the

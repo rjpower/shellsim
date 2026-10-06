@@ -499,7 +499,7 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()> {
-        self.reserve_result(bytes)
+        self.reserve_scratch(bytes)
     }
 
     fn charge_cpu(&mut self, units: u64) -> PyResult<()> {
@@ -2061,7 +2061,7 @@ impl PyRuntime for Vm<'_> {
 
     fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {
         self.charge_cpu(u64::try_from(decimal.len()).unwrap_or(u64::MAX))?;
-        self.reserve_result(decimal.len().saturating_mul(2))?;
+        self.reserve_scratch(decimal.len().saturating_mul(2))?;
         let value = decimal
             .parse::<BigInt>()
             .map_err(|_| PyError::value_error("invalid integer"))?;

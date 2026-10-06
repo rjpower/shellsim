@@ -581,6 +581,9 @@ pub(super) type PyArrayReader<'a> = dyn FnMut(&dyn PyRefs, &[PyArrayRef<'_>]) ->
 
 /// Runtime value protocols and explicitly modeled services available to native modules.
 pub(super) trait PyRuntime {
+    /// Reserve `bytes` of host scratch that the native keeps while Python code may run, or that
+    /// can outgrow the values it is built from. The reservation is released with the pins of
+    /// the scope that made it: the current instruction, or the enclosing [`Self::nested`] call.
     fn reserve_memory(&mut self, bytes: usize) -> PyResult<()>;
     fn charge_cpu(&mut self, units: u64) -> PyResult<()>;
     /// Arm or clear the runner's per-item virtual-time limit; global resource limits still apply.

@@ -773,7 +773,7 @@ impl<'s> Vm<'s> {
             }
         }
         self.charge_cpu(u64::try_from(largest.max(spec.len())).unwrap_or(u64::MAX))?;
-        self.reserve_result(largest.saturating_add(spec.len()).saturating_mul(2))
+        self.reserve_scratch(largest.saturating_add(spec.len()).saturating_mul(2))
     }
 
     /// `format(value, text)` for a builtin value with a non-empty specification: ints, bools

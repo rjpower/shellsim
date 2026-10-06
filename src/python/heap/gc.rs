@@ -257,7 +257,7 @@ impl Heap {
                 }
             }
         };
-        for &id in self.pins.borrow().iter() {
+        for &id in &self.pins.borrow().ids {
             mark(&Raw::object(id), &mut work);
         }
         roots.visit_refs(&mut |slot| mark(&slot.0, &mut work));
@@ -316,7 +316,7 @@ impl Heap {
                 }
             }
         };
-        for &id in self.pins.borrow().iter() {
+        for &id in &self.pins.borrow().ids {
             mark(&Raw::object(id), &mut work);
         }
         roots.visit_refs(&mut |slot| mark(&slot.0, &mut work));

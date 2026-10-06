@@ -20,7 +20,7 @@ impl<'s> Vm<'s> {
                 _ => None,
             };
             if let Some(length) = length {
-                self.reserve_result(length.saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
+                self.reserve_scratch(length.saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
                 let (Object::Dict(entries) | Object::DefaultDict { entries, .. }) =
                     self.get(stored)?
                 else {
