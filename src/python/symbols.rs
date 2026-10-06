@@ -18,6 +18,10 @@ const SYMBOL_NAME_BYTES: u64 = 24;
 pub struct SymbolId(u32);
 
 impl SymbolId {
+    /// A symbol that names nothing. Code compiled after a failed charge carries it, and such
+    /// code is discarded without running.
+    pub(super) const UNBOUND: Self = Self(u32::MAX);
+
     pub(super) const fn index(self) -> usize {
         self.0 as usize
     }
@@ -43,6 +47,18 @@ impl Symbols {
     /// Resolve a symbol identity back to its interpreter-owned name.
     pub fn name(&self, symbol: SymbolId) -> Option<&str> {
         self.names.get(symbol.index()).map(AsRef::as_ref)
+    }
+
+    /// The name of a symbol this table issued. Compiled code and symbol-keyed tables hold
+    /// only symbols their own interpreter interned, so the name is always present.
+    pub fn issued(&self, symbol: SymbolId) -> &str {
+        &self.names[symbol.index()]
+    }
+
+    /// A shared handle to an issued symbol's name, for callers that need the name while they
+    /// mutate the interpreter.
+    pub fn shared(&self, symbol: SymbolId) -> Arc<str> {
+        self.names[symbol.index()].clone()
     }
 
     /// Intern one identifier, charging its process-lifetime storage before mutation.

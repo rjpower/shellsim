@@ -6,7 +6,7 @@ use super::ast::{
     StatementKind,
 };
 use super::bytecode::{
-    ClassField, CodeBuilder, CodeRef, DisplayKind, Instruction, Operation, Parameter,
+    ClassField, CodeBuilder, CodeRef, DisplayKind, Instruction, Linker, Operation, Parameter,
     ParameterKind as BytecodeParameterKind,
 };
 use super::source::Span;
@@ -17,8 +17,11 @@ use std::sync::Arc;
 /// name cannot collide with an identifier.
 const COMPREHENSION_ITERATOR: &str = ".0";
 
-pub fn compile(program: Program) -> CodeRef {
+/// Compile a module body into code bound to `link`'s interpreter. The caller checks
+/// [`Linker::finish`] before running the result.
+pub fn compile(program: Program, link: &mut Linker) -> CodeRef {
     let mut compiler = Compiler {
+        link,
         instructions: Vec::new(),
         loops: Vec::new(),
         finalizers: Vec::new(),
@@ -39,8 +42,9 @@ pub fn compile(program: Program) -> CodeRef {
 }
 
 /// Code that evaluates one module-level expression and returns its value, for `eval()`.
-pub fn compile_expression(expression: Expression) -> CodeRef {
+pub fn compile_expression(expression: Expression, link: &mut Linker) -> CodeRef {
     let mut compiler = Compiler {
+        link,
         instructions: Vec::new(),
         loops: Vec::new(),
         finalizers: Vec::new(),
@@ -73,7 +77,8 @@ enum NameResolution {
     Dynamic,
 }
 
-struct Compiler {
+struct Compiler<'l, 'a> {
+    link: &'l mut Linker<'a>,
     instructions: Vec<PendingInstruction>,
     loops: Vec<LoopContext>,
     /// Lexically active ``finally`` bodies.  Abrupt control flow is lowered by
@@ -93,6 +98,13 @@ struct Compiler {
     /// The body's leading string literal, recorded on the code object as `__doc__`.
     docstring: Option<Arc<str>>,
     structural_depth: usize,
+}
+
+/// A parameter as the compiler sees it, named by its source identifier.
+struct SourceParameter {
+    name: String,
+    has_default: bool,
+    kind: BytecodeParameterKind,
 }
 
 struct PendingInstruction {
@@ -171,8 +183,8 @@ fn docstring_of(body: &[Statement]) -> Option<Arc<str>> {
     }
 }
 
-impl Compiler {
-    fn finish(self, parameters: Vec<Parameter>) -> CodeRef {
+impl Compiler<'_, '_> {
+    fn finish(self, parameters: Vec<SourceParameter>) -> CodeRef {
         let resolution = if self.is_class_scope {
             NameResolution::Dynamic
         } else if self.in_function {
@@ -183,7 +195,11 @@ impl Compiler {
         self.finish_resolving(parameters, resolution)
     }
 
-    fn finish_resolving(self, parameters: Vec<Parameter>, resolution: NameResolution) -> CodeRef {
+    fn finish_resolving(
+        self,
+        parameters: Vec<SourceParameter>,
+        resolution: NameResolution,
+    ) -> CodeRef {
         let mut instructions = self.instructions;
         let mut local_names = parameters
             .iter()
@@ -240,7 +256,15 @@ impl Compiler {
                     };
             }
         }
-        let mut builder = CodeBuilder::default();
+        let parameters = parameters
+            .into_iter()
+            .map(|parameter| Parameter {
+                name: self.link.symbol(&parameter.name),
+                has_default: parameter.has_default,
+                kind: parameter.kind,
+            })
+            .collect();
+        let mut builder = CodeBuilder::new(self.link);
         let mut bytecode = Vec::with_capacity(instructions.len());
         let mut spans = Vec::with_capacity(instructions.len());
         for instruction in instructions {
@@ -481,6 +505,7 @@ impl Compiler {
                     self.expression(default.clone());
                 }
                 let mut nested = Compiler {
+                    link: &mut *self.link,
                     instructions: Vec::new(),
                     loops: Vec::new(),
                     finalizers: Vec::new(),
@@ -501,7 +526,7 @@ impl Compiler {
                 let code = nested.finish(
                     parameters
                         .iter()
-                        .map(|parameter| super::bytecode::Parameter {
+                        .map(|parameter| SourceParameter {
                             name: parameter.name.clone(),
                             has_default: parameter.default.is_some(),
                             kind: compile_parameter_kind(parameter.kind),
@@ -536,6 +561,7 @@ impl Compiler {
                     })
                     .collect::<Vec<_>>();
                 let mut nested = Compiler {
+                    link: &mut *self.link,
                     instructions: Vec::new(),
                     loops: Vec::new(),
                     finalizers: Vec::new(),
@@ -552,6 +578,7 @@ impl Compiler {
                 nested.docstring = docstring_of(&body);
                 nested.statements(body);
                 nested.emit(Operation::Halt, span);
+                let code = nested.finish(Vec::new());
                 for base in bases {
                     self.expression(base);
                 }
@@ -562,7 +589,7 @@ impl Compiler {
                 self.emit(
                     Operation::MakeClass {
                         name: name.clone(),
-                        code: nested.finish(Vec::new()),
+                        code,
                         bases: base_count,
                         has_metaclass,
                         fields,
@@ -1324,6 +1351,7 @@ impl Compiler {
                     self.expression(default.clone());
                 }
                 let mut nested = Compiler {
+                    link: &mut *self.link,
                     instructions: Vec::new(),
                     loops: Vec::new(),
                     finalizers: Vec::new(),
@@ -1339,19 +1367,20 @@ impl Compiler {
                 };
                 nested.expression(*body);
                 nested.emit(Operation::Return, span);
+                let code = nested.finish(
+                    parameters
+                        .iter()
+                        .map(|parameter| SourceParameter {
+                            name: parameter.name.clone(),
+                            has_default: parameter.default.is_some(),
+                            kind: compile_parameter_kind(parameter.kind),
+                        })
+                        .collect(),
+                );
                 self.emit(
                     Operation::MakeFunction {
                         name: "<lambda>".into(),
-                        code: nested.finish(
-                            parameters
-                                .iter()
-                                .map(|parameter| super::bytecode::Parameter {
-                                    name: parameter.name.clone(),
-                                    has_default: parameter.default.is_some(),
-                                    kind: compile_parameter_kind(parameter.kind),
-                                })
-                                .collect(),
-                        ),
+                        code,
                         defaults: defaults.len(),
                     },
                     span,
@@ -1502,6 +1531,7 @@ impl Compiler {
     ) {
         let named_expression = self.comprehension_named_expression_context();
         let mut nested = Compiler {
+            link: &mut *self.link,
             instructions: Vec::new(),
             loops: Vec::new(),
             finalizers: Vec::new(),
@@ -1527,29 +1557,35 @@ impl Compiler {
         nested.emit_comprehension_body(&clauses, 0, &element, kind, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
-        self.call_comprehension("<comprehension>", nested, &clauses[0].iterable, span);
+        let code = nested.finish_comprehension();
+        self.call_comprehension("<comprehension>", code, &clauses[0].iterable, span);
     }
 
-    /// Create a comprehension's function from `nested` and call it. As in CPython, the
-    /// outermost iterable is evaluated in the enclosing scope when the comprehension is
-    /// created, so `gen = (x for x in gen)` iterates the old `gen` and a class body's names are
-    /// visible to it. The function receives the iterator as its parameter `.0`.
-    fn call_comprehension(
-        &mut self,
-        name: &str,
-        nested: Compiler,
-        outermost: &Expression,
-        span: Span,
-    ) {
-        let parameter = Parameter {
+    /// Finish a comprehension body as a function of its outermost iterator, which it receives
+    /// as the parameter `.0`.
+    fn finish_comprehension(self) -> CodeRef {
+        self.finish(vec![SourceParameter {
             name: COMPREHENSION_ITERATOR.into(),
             has_default: false,
             kind: BytecodeParameterKind::PositionalOnly,
-        };
+        }])
+    }
+
+    /// Create a comprehension's function from its finished `code` and call it. As in CPython,
+    /// the outermost iterable is evaluated in the enclosing scope when the comprehension is
+    /// created, so `gen = (x for x in gen)` iterates the old `gen` and a class body's names are
+    /// visible to it.
+    fn call_comprehension(
+        &mut self,
+        name: &str,
+        code: CodeRef,
+        outermost: &Expression,
+        span: Span,
+    ) {
         self.emit(
             Operation::MakeFunction {
                 name: name.into(),
-                code: nested.finish(vec![parameter]),
+                code,
                 defaults: 0,
             },
             span,
@@ -1585,6 +1621,7 @@ impl Compiler {
     ) {
         let named_expression = self.comprehension_named_expression_context();
         let mut nested = Compiler {
+            link: &mut *self.link,
             instructions: Vec::new(),
             loops: Vec::new(),
             finalizers: Vec::new(),
@@ -1601,7 +1638,8 @@ impl Compiler {
         nested.emit_generator_comprehension_body(&clauses, 0, &element, span);
         nested.emit(Operation::LoadConstant(Constant::None), span);
         nested.emit(Operation::Return, span);
-        self.call_comprehension("<genexpr>", nested, &clauses[0].iterable, span);
+        let code = nested.finish_comprehension();
+        self.call_comprehension("<genexpr>", code, &clauses[0].iterable, span);
     }
 
     fn emit_dict_comprehension(
@@ -1613,6 +1651,7 @@ impl Compiler {
     ) {
         let named_expression = self.comprehension_named_expression_context();
         let mut nested = Compiler {
+            link: &mut *self.link,
             instructions: Vec::new(),
             loops: Vec::new(),
             finalizers: Vec::new(),
@@ -1632,7 +1671,8 @@ impl Compiler {
         nested.emit_dict_comprehension_body(&clauses, 0, &key, &value, &result_name, span);
         nested.emit(Operation::LoadName(result_name), span);
         nested.emit(Operation::Return, span);
-        self.call_comprehension("<dictcomp>", nested, &clauses[0].iterable, span);
+        let code = nested.finish_comprehension();
+        self.call_comprehension("<dictcomp>", code, &clauses[0].iterable, span);
     }
 
     fn emit_comprehension_body(
@@ -1768,18 +1808,37 @@ enum ComprehensionKind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::python::bytecode::{NameId, Opcode};
+    use crate::python::bytecode::Opcode;
     use crate::python::lexer::lex;
     use crate::python::parser::parse;
+    use crate::python::symbols::Symbols;
+    use crate::python::vm::CodeTable;
+    use crate::resources::Resources;
+
+    /// Compile `program` against fresh interpreter tables, returning its code and the symbol
+    /// table that names it.
+    fn compile_program(program: Program) -> (CodeRef, Symbols) {
+        let mut symbols = Symbols::default();
+        let mut codes = CodeTable::default();
+        let mut resources = Resources::default();
+        let mut link = Linker::new(&mut symbols, &mut codes, &mut resources);
+        let code = compile(program, &mut link);
+        link.finish().expect("test programs fit the default limits");
+        (code, symbols)
+    }
+
+    fn compile_source(source: &str) -> (CodeRef, Symbols) {
+        compile_program(parse(lex(source).unwrap()).unwrap())
+    }
 
     #[test]
     fn assignment_has_an_explicit_stack_contract() {
-        let code = compile(parse(lex("x = 40 + 2").unwrap()).unwrap());
+        let (code, symbols) = compile_source("x = 40 + 2");
         assert!(matches!(code.instructions[2].opcode, Opcode::Binary(_)));
         let Opcode::StoreGlobal(name) = code.instructions[3].opcode else {
             panic!("module assignment must end in a global store")
         };
-        assert_eq!(code.name(name), "x");
+        assert_eq!(symbols.issued(name), "x");
         assert_eq!(code.instructions.last().unwrap().opcode, Opcode::Halt);
     }
 
@@ -1791,7 +1850,7 @@ mod tests {
             let source = format!(
                 "def h():\n    for x in y:\n        try:\n            f()\n        except E:\n            {body}\n"
             );
-            let module = compile(parse(lex(&source).unwrap()).unwrap());
+            let (module, _) = compile_source(&source);
             let Opcode::MakeFunction(function) = module.instructions[0].opcode else {
                 panic!("function definition must create a code object")
             };
@@ -1813,24 +1872,30 @@ mod tests {
     }
 
     #[test]
-    fn executable_bytecode_is_compact_and_deduplicates_names() {
-        let code = compile(parse(lex("x = x + 1\nprint(x)\n").unwrap()).unwrap());
+    fn executable_bytecode_is_compact_and_names_carry_symbols() {
+        let (code, symbols) = compile_source("x = x + 1\nprint(x)\n");
         assert!(std::mem::size_of::<Opcode>() <= 24);
         assert_eq!(
             std::mem::size_of::<Instruction>(),
             std::mem::size_of::<Opcode>()
         );
-        assert_eq!(
-            (0..code.name_count())
-                .filter(|index| code.name(NameId::new(*index)) == "x")
-                .count(),
-            1
-        );
+        let x = symbols.id("x").expect("the compiler interned x");
+        let uses = code
+            .instructions
+            .iter()
+            .filter(|instruction| {
+                matches!(
+                    instruction.opcode,
+                    Opcode::LoadGlobal(symbol) | Opcode::StoreGlobal(symbol) if symbol == x
+                )
+            })
+            .count();
+        assert_eq!(uses, 3);
     }
 
     #[test]
     fn function_locals_are_lowered_to_stable_slots() {
-        let code = compile(
+        let (code, _) = compile_program(
             parse(
                 lex("def add(left, right):\n    total = left + right\n    return total\n").unwrap(),
             )
@@ -1853,7 +1918,7 @@ mod tests {
 
     #[test]
     fn call_shape_is_compiled_once_with_the_function() {
-        let code = compile(
+        let (code, _) = compile_program(
             parse(lex("def generate(first, second, *rest, **extras):\n    yield first\n").unwrap())
                 .unwrap(),
         );
@@ -1892,7 +1957,7 @@ mod tests {
                 span: Span::default(),
             }];
         }
-        let code = compile(Program { statements: body });
+        let (code, _) = compile_program(Program { statements: body });
         assert!(code.instructions.iter().any(|instruction| {
             matches!(
                 instruction.opcode,

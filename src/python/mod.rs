@@ -65,6 +65,8 @@ pub struct ReplState {
     globals: GlobalBindings,
     heap: heap::Heap,
     symbols: symbols::Symbols,
+    /// Every code object compiled for this interpreter, with its inline caches.
+    codes: vm::CodeTable,
     shapes: attributes::Shapes,
     types: object_model::TypeRegistry,
     modules: HashMap<String, heap::Ref>,
@@ -81,6 +83,7 @@ impl Clone for ReplState {
             globals: self.globals.clone(),
             heap: self.heap.clone(),
             symbols: self.symbols.clone(),
+            codes: self.codes.clone(),
             shapes: self.shapes.clone(),
             types: self.types.clone(),
             modules: self
@@ -226,6 +229,7 @@ impl ReplState {
         resources.release_memory(
             heap.saturating_add(self.globals.take_modeled_bytes())
                 .saturating_add(self.symbols.take_modeled_bytes())
+                .saturating_add(self.codes.take_modeled_bytes())
                 .saturating_add(self.shapes.take_modeled_bytes())
                 .saturating_add(std::mem::take(&mut self.type_memory)),
         );
@@ -409,18 +413,21 @@ pub(crate) fn start_python(
         return PythonCommandStart::Ready(137);
     }
 
-    let program = vm::VmProgram::compile(&source);
+    let mut state = ReplState::default();
+    let program = vm::VmProgram::compile(&source, &mut state, &mut interp.resources);
     interp.resources.release_memory(scratch);
     let program = match program {
         Ok(program) => program,
-        Err(ExecResult::Unsupported(feature)) => {
-            return PythonCommandStart::Ready(unsupported(interp, &feature, err))
+        Err(result) => {
+            state.release_owned_memory(&mut interp.resources);
+            return PythonCommandStart::Ready(match result {
+                ExecResult::Unsupported(feature) => unsupported(interp, &feature, err),
+                ExecResult::Exit(status) => status,
+                ExecResult::Continue => unreachable!("compilation cannot complete execution"),
+            });
         }
-        Err(ExecResult::Exit(status)) => return PythonCommandStart::Ready(status),
-        Err(ExecResult::Continue) => unreachable!("compilation cannot complete execution"),
     };
 
-    let mut state = ReplState::default();
     let import_root = match py_argv.first().map(String::as_str) {
         Some("-c" | "-" | "") | None => interp.cwd.clone(),
         Some(script) => {

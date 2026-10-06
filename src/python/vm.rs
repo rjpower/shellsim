@@ -5,6 +5,7 @@
 //! subsystem traits or independent state owners; resumable state remains centralized here.
 
 use crate::interp::Interp;
+use crate::resources::Resources;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -16,7 +17,7 @@ use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::attributes::ShapeId;
-use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
+use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, Linker, Opcode};
 use super::cpython_names;
 use super::definitions::DefinitionTable;
 use super::exception_types;
@@ -421,7 +422,7 @@ pub(super) fn execute(
     {
         return ExecResult::Exit(137);
     }
-    let mut program = match VmProgram::compile(source) {
+    let mut program = match VmProgram::compile(source, state, &mut interp.resources) {
         Ok(program) => program,
         Err(result) => return result,
     };
@@ -478,7 +479,12 @@ impl VmMode {
 }
 
 impl VmProgram {
-    pub(super) fn compile(source: &str) -> Result<Self, ExecResult> {
+    /// Compile a script or REPL entry against `state`'s symbol and code tables.
+    pub(super) fn compile(
+        source: &str,
+        state: &mut ReplState,
+        resources: &mut Resources,
+    ) -> Result<Self, ExecResult> {
         let tokens = super::lexer::lex(source).map_err(|error| {
             ExecResult::Unsupported(format!(
                 "{} at line {}, column {}",
@@ -491,8 +497,16 @@ impl VmProgram {
                 error.message, error.span.line, error.span.column
             ))
         })?;
+        let mut link = Linker::new(&mut state.symbols, &mut state.codes, resources);
+        let code = super::compiler::compile(program, &mut link);
+        if let Err(error) = link.finish() {
+            return Err(match error.kind() {
+                Some(PyErrorKind::Resource) => ExecResult::Exit(137),
+                _ => ExecResult::Unsupported(error.message().to_string()),
+            });
+        }
         Ok(Self {
-            code: super::compiler::compile(program),
+            code,
             execution: VmState::default(),
             started: false,
         })
@@ -650,7 +664,6 @@ struct VmState {
     exception_stack: Vec<Ref>,
     /// Context managers entered by every frame, each frame's above its `context_base`.
     with_contexts: Vec<Ref>,
-    code_caches: CodeCacheTable,
     stdin_position: usize,
     stdin_text: Option<String>,
     /// Bytes read from fd 0 but not yet consumed by a completed `read`/`readline`, kept across
@@ -694,7 +707,6 @@ impl Clone for VmState {
             synchronous_frames: self.synchronous_frames,
             exception_stack: self.exception_stack.iter().map(Ref::dup).collect(),
             with_contexts: self.with_contexts.iter().map(Ref::dup).collect(),
-            code_caches: self.code_caches.clone(),
             stdin_position: self.stdin_position,
             stdin_text: self.stdin_text.clone(),
             stdin_stream_pending: self.stdin_stream_pending.clone(),
@@ -746,9 +758,6 @@ impl Roots for VmState {
                 visitor(slot);
             }
         }
-        for caches in self.code_caches.iter() {
-            caches.visit_refs(visitor);
-        }
         if let Some(suspension) = &self.suspension {
             match &suspension.retry {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
@@ -768,9 +777,9 @@ impl Roots for VmState {
     }
 }
 
-struct CodeCaches {
+/// One code object's entry in the [`CodeTable`].
+pub(super) struct CodeCaches {
     code: CodeRef,
-    names: Vec<Option<SymbolId>>,
     /// One entry per instruction, filled for `LoadAttribute` and `LoadMethod` sites.
     sites: Option<Vec<Option<SiteCache>>>,
 }
@@ -790,113 +799,186 @@ impl CodeCaches {
     }
 }
 
-/// Per-code inline caches in stable slots.
+/// Every code object one interpreter has compiled, each with its inline caches.
 ///
-/// A slot index stays valid while its code object is alive, which lets the dispatch cursor
-/// hold one for a whole quantum. Code that only the table still references, such as a
-/// finished `eval` or `exec` expression, is dropped when the table is pruned, so a program that
-/// compiles source in a loop does not accumulate caches without bound or pay a linear lookup
-/// for each one.
+/// The compiler registers each code object it makes and records the slot in
+/// [`Code::cache_slot`](super::bytecode::Code::cache_slot), so a frame finds its caches by
+/// index. The table keeps a reference to each code object. Once the table has grown to twice
+/// the size that survived the last prune, registration first drops the code nothing else
+/// references, such as a finished `exec` string, and reuses its slot, so a program that
+/// compiles source in a loop does not accumulate entries. Entries and their site caches charge
+/// their storage to the guest.
 #[derive(Clone, Default)]
-struct CodeCacheTable {
+pub(super) struct CodeTable {
     slots: Vec<Option<CodeCaches>>,
-    /// Slot of each live code object, keyed by the `Arc` address.
-    by_code: HashMap<usize, usize>,
-    free: Vec<usize>,
-    /// Live slot count at which the next prune runs; doubles with the surviving set.
+    free: Vec<u32>,
+    live: usize,
+    /// Live entry count at which the next registration prunes; doubles with the survivors.
     prune_at: usize,
+    /// Slots whose code has site caches, which a class attribute store clears.
+    with_sites: Vec<u32>,
+    modeled_bytes: u64,
 }
 
-/// Fewest live caches kept before pruning is considered.
-const CODE_CACHE_PRUNE_FLOOR: usize = 64;
+/// Fewest live entries kept before pruning is considered.
+const CODE_TABLE_PRUNE_FLOOR: usize = 64;
 
-impl CodeCacheTable {
-    fn slot_of(&self, code: &CodeRef) -> Option<usize> {
-        self.by_code.get(&(Arc::as_ptr(code) as usize)).copied()
+impl CodeTable {
+    /// Charge a new entry and choose its slot; [`Self::install`] fills it with the code.
+    pub(super) fn reserve_slot(&mut self, resources: &mut Resources) -> PyResult<u32> {
+        if self.live >= self.prune_at.max(CODE_TABLE_PRUNE_FLOOR) {
+            self.prune(resources);
+        }
+        self.reserve(std::mem::size_of::<CodeCaches>(), resources)?;
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = u32::try_from(self.slots.len()).map_err(|_| "too many code objects")?;
+                self.slots.push(None);
+                slot
+            }
+        };
+        self.live += 1;
+        Ok(slot)
+    }
+
+    pub(super) fn install(&mut self, slot: u32, code: CodeRef) {
+        self.slots[slot as usize] = Some(CodeCaches { code, sites: None });
+    }
+
+    /// Drop every entry whose code only the table references and release its storage.
+    fn prune(&mut self, resources: &mut Resources) {
+        let mut released = 0usize;
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            let stale = entry
+                .as_ref()
+                .is_some_and(|caches| Arc::strong_count(&caches.code) == 1);
+            if stale {
+                let caches = entry.take().expect("stale slot holds caches");
+                released = released.saturating_add(code_cache_bytes(&caches));
+                self.free
+                    .push(u32::try_from(slot).expect("slots are numbered by u32"));
+                self.live -= 1;
+            }
+        }
+        let slots = &self.slots;
+        self.with_sites.retain(|&slot| {
+            slots[slot as usize]
+                .as_ref()
+                .is_some_and(|caches| caches.sites.is_some())
+        });
+        self.prune_at = self.live.saturating_mul(2);
+        self.release(released, resources);
     }
 
     fn get(&self, slot: usize) -> Option<&CodeCaches> {
         self.slots.get(slot)?.as_ref()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &CodeCaches> {
-        self.slots.iter().flatten()
-    }
-
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut CodeCaches> {
-        self.slots.iter_mut().flatten()
-    }
-
-    /// Install caches for `code` and return their slot. Before growing past the prune
-    /// threshold, release every cache whose code nothing else references; `release` receives
-    /// the modeled bytes each one held.
-    fn insert(&mut self, caches: CodeCaches, mut release: impl FnMut(usize)) -> usize {
-        if self.by_code.len() >= self.prune_at.max(CODE_CACHE_PRUNE_FLOOR) {
-            for (slot, entry) in self.slots.iter_mut().enumerate() {
-                let stale = entry
-                    .as_ref()
-                    .is_some_and(|caches| Arc::strong_count(&caches.code) == 1);
-                if stale {
-                    let caches = entry.take().expect("stale slot holds caches");
-                    self.by_code.remove(&(Arc::as_ptr(&caches.code) as usize));
-                    self.free.push(slot);
-                    release(code_cache_bytes(&caches));
-                }
-            }
-            self.prune_at = self.by_code.len().saturating_mul(2);
+    /// Give `slot` an empty site cache per instruction, charging it; `false` when the memory
+    /// limit leaves no room, in which case the code simply runs uncached.
+    fn allocate_sites(&mut self, slot: usize, resources: &mut Resources) -> PyResult<bool> {
+        let instructions = self[slot].code.instructions.len();
+        let bytes = instructions
+            .checked_mul(std::mem::size_of::<Option<SiteCache>>())
+            .ok_or("site cache size overflow")?;
+        if u64::try_from(bytes).unwrap_or(u64::MAX) > resources.memory_remaining() {
+            return Ok(false);
         }
-        let key = Arc::as_ptr(&caches.code) as usize;
-        let slot = match self.free.pop() {
-            Some(slot) => {
-                self.slots[slot] = Some(caches);
-                slot
+        self.reserve(bytes, resources)?;
+        self[slot].sites = Some(std::iter::repeat_with(|| None).take(instructions).collect());
+        self.with_sites
+            .push(u32::try_from(slot).expect("slots are numbered by u32"));
+        Ok(true)
+    }
+
+    /// Clear every site cache, after a class attribute store that any of them may depend on.
+    fn clear_sites(&mut self, resources: &mut Resources) {
+        let mut released = 0usize;
+        for slot in std::mem::take(&mut self.with_sites) {
+            if let Some(caches) = self.slots[slot as usize].as_mut() {
+                let before = code_cache_bytes(caches);
+                caches.sites = None;
+                released = released.saturating_add(before - code_cache_bytes(caches));
             }
-            None => {
-                self.slots.push(Some(caches));
-                self.slots.len() - 1
-            }
-        };
-        self.by_code.insert(key, slot);
-        slot
+        }
+        self.release(released, resources);
+    }
+
+    fn reserve(&mut self, bytes: usize, resources: &mut Resources) -> PyResult<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| "code table entry is too large")?;
+        let next = self
+            .modeled_bytes
+            .checked_add(bytes)
+            .ok_or("modeled code table size overflow")?;
+        if !resources.reserve_memory(bytes) {
+            return Err(PyError::resource_error("memory limit exceeded"));
+        }
+        self.modeled_bytes = next;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize, resources: &mut Resources) {
+        let bytes = u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .min(self.modeled_bytes);
+        self.modeled_bytes -= bytes;
+        resources.release_memory(bytes);
+    }
+
+    /// Transfer the table's accounting to the caller when an interpreter is discarded.
+    pub(super) fn take_modeled_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.modeled_bytes)
     }
 }
 
-impl std::ops::Index<usize> for CodeCacheTable {
+impl Roots for CodeTable {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for caches in self.slots.iter().flatten() {
+            caches.visit_refs(visitor);
+        }
+    }
+}
+
+impl std::fmt::Debug for CodeTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodeTable")
+            .field("live", &self.live)
+            .field("modeled_bytes", &self.modeled_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Index<usize> for CodeTable {
     type Output = CodeCaches;
 
     #[inline(always)]
     fn index(&self, slot: usize) -> &CodeCaches {
-        self.slots[slot].as_ref().expect("code cache slot is live")
+        self.slots[slot].as_ref().expect("code table slot is live")
     }
 }
 
-impl std::ops::IndexMut<usize> for CodeCacheTable {
+impl std::ops::IndexMut<usize> for CodeTable {
     fn index_mut(&mut self, slot: usize) -> &mut CodeCaches {
-        self.slots[slot].as_mut().expect("code cache slot is live")
+        self.slots[slot].as_mut().expect("code table slot is live")
     }
 }
 
-/// Modeled bytes retained by one code object's caches.
+/// Modeled bytes retained by one code object's entry.
 fn code_cache_bytes(caches: &CodeCaches) -> usize {
-    let names = caches
-        .names
-        .len()
-        .saturating_mul(std::mem::size_of::<Option<SymbolId>>());
     let sites = caches.sites.as_ref().map_or(0, |sites| {
         sites
             .len()
             .saturating_mul(std::mem::size_of::<Option<SiteCache>>())
     });
-    names
-        .saturating_add(sites)
-        .saturating_add(std::mem::size_of::<CodeCaches>())
+    sites.saturating_add(std::mem::size_of::<CodeCaches>())
 }
 
 impl Clone for CodeCaches {
     fn clone(&self) -> Self {
         Self {
             code: self.code.clone(),
-            names: self.names.clone(),
             sites: self.sites.as_ref().map(|sites| {
                 sites
                     .iter()
@@ -957,8 +1039,6 @@ enum Resolved {
 struct BytecodeFrame {
     code: CodeRef,
     instruction_pointer: usize,
-    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
-    code_cache: u32,
     /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
     /// route truncates the exception stack here, so a `return` inside an `except` body or an
     /// exception escaping a handler cannot leave its handled exception behind.
@@ -1013,7 +1093,6 @@ impl Clone for BytecodeFrame {
         Self {
             code: self.code.clone(),
             instruction_pointer: self.instruction_pointer,
-            code_cache: self.code_cache,
             exception_base: self.exception_base,
             stack_base: self.stack_base,
             handler_base: self.handler_base,
@@ -1143,7 +1222,6 @@ enum LocalsLocation {
 /// pointer after every opcode.
 struct DispatchCursor {
     code: CodeRef,
-    code_cache: usize,
     op_index: usize,
     locals: LocalsLocation,
 }
@@ -1287,7 +1365,6 @@ impl DispatchCursor {
             .last()
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
-        let code_cache = frame.code_cache as usize;
         let op_index = frame.instruction_pointer;
         let locals = match (frame.locals_base(), frame.own_scope) {
             (Some(base), _) => LocalsLocation::Stack(base),
@@ -1296,7 +1373,6 @@ impl DispatchCursor {
         };
         Ok(Self {
             code,
-            code_cache,
             op_index,
             locals,
         })
@@ -1514,14 +1590,6 @@ impl<'s> Vm<'s> {
     }
 
     /// Give back part of the retained reservation, for caches dropped before the run ends.
-    fn release_retained_memory_bytes(&mut self, bytes: usize) {
-        let bytes = u64::try_from(bytes)
-            .unwrap_or(u64::MAX)
-            .min(self.retained_memory);
-        self.retained_memory -= bytes;
-        self.interp.resources.release_memory(bytes);
-    }
-
     fn reserve_retained_memory(&mut self, bytes: usize) -> PyResult<()> {
         let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
         let next = self

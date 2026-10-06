@@ -1059,6 +1059,25 @@ fn repeated_eval_does_not_retain_code_caches() {
 }
 
 #[test]
+fn identifiers_are_charged_when_the_program_is_compiled() {
+    // 50,000 distinct names need about 1.5 MB of symbol storage, which a 1 MB limit cannot
+    // hold. The compiler interns them all, so the program stops before its first statement.
+    let mut source = String::from("print('started')\n");
+    for index in 0..50_000 {
+        source.push_str(&format!("a{index} = 0\n"));
+    }
+    let (status, stdout, _, _) = run_with_limits(
+        &source,
+        Limits {
+            memory: 1024 * 1024,
+            ..Limits::unlimited()
+        },
+    );
+    assert_eq!(status, 137);
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn string_scans_charge_cpu_proportional_to_their_length() {
     // Substring search, equality, ordering, strip and affix tests over a 10 MB string each scan
     // the whole value; a loop of them must run out of CPU rather than host time.

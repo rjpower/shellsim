@@ -10,9 +10,9 @@ use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, ClassDefinition, ClassField,
-    ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
-    NameId, NativeValue, Object, PyError, PyRuntime, Resolved, SiteCache, SlicePlan, Slot,
-    SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
+    NativeValue, Object, PyError, PyRuntime, Resolved, SiteCache, SlicePlan, Slot, SlotValue,
+    SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 use crate::python::error::PyResult;
 
@@ -156,16 +156,16 @@ impl<'s> Vm<'s> {
         PyError::exception("AttributeError", message)
     }
 
+    /// `LoadAttribute` at instruction `site` of `code`: answer from the site's cache when it
+    /// holds for the owner's type and shape, else look the attribute up and refill the cache.
     pub(super) fn load_attribute_at(
         &mut self,
         code: &CodeRef,
-        code_cache: usize,
         site: usize,
         symbol: SymbolId,
-        name: &str,
     ) -> PyResult<()> {
         let owner = self.pop()?;
-        match self.site_hit(code_cache, site, owner)? {
+        match self.site_hit(code.cache_slot as usize, site, owner)? {
             Some(SiteHit::Value(value)) => {
                 self.push(value);
                 return Ok(());
@@ -184,11 +184,12 @@ impl<'s> Vm<'s> {
             }
             None => {}
         }
-        let Some(value) = self.resolve_attribute_by_symbol(owner, symbol, name)? else {
-            return Err(self.missing_attribute(&owner, name));
+        let name = self.state.symbols.shared(symbol);
+        let Some(value) = self.resolve_attribute_by_symbol(owner, symbol, &name)? else {
+            return Err(self.missing_attribute(&owner, &name));
         };
-        if let Some(cache) = self.cacheable_site(owner, symbol, name, Some(value))? {
-            self.remember_site(code, code_cache, site, cache)?;
+        if let Some(cache) = self.cacheable_site(owner, symbol, &name, Some(value))? {
+            self.remember_site(code, site, cache)?;
         }
         self.push(value);
         Ok(())
@@ -202,14 +203,12 @@ impl<'s> Vm<'s> {
     pub(super) fn load_method_at(
         &mut self,
         code: &CodeRef,
-        code_cache: usize,
         site: usize,
         symbol: SymbolId,
-        name: &str,
     ) -> PyResult<()> {
         let owner = self.peek(0)?;
         let top = self.stack.len() - 1;
-        match self.site_hit(code_cache, site, owner)? {
+        match self.site_hit(code.cache_slot as usize, site, owner)? {
             Some(SiteHit::Method { descriptor, .. }) => {
                 self.execution.stack.set(top, descriptor);
                 self.push(owner);
@@ -222,16 +221,17 @@ impl<'s> Vm<'s> {
             }
             None => {}
         }
-        if let Some(cache) = self.cacheable_site(owner, symbol, name, None)? {
+        let name = self.state.symbols.shared(symbol);
+        if let Some(cache) = self.cacheable_site(owner, symbol, &name, None)? {
             if let Resolved::Method { descriptor, .. } = &cache.resolved {
                 let method = self.value(descriptor);
-                self.remember_site(code, code_cache, site, cache)?;
+                self.remember_site(code, site, cache)?;
                 self.execution.stack.set(top, method);
                 self.push(owner);
                 return Ok(());
             }
         }
-        self.load_attribute_at(code, code_cache, site, symbol, name)?;
+        self.load_attribute_at(code, site, symbol)?;
         self.push(Value::Native(NativeValue::NoReceiver));
         Ok(())
     }
@@ -365,8 +365,8 @@ impl<'s> Vm<'s> {
     }
 
     fn site(&self, code_cache: usize, site: usize) -> Option<&SiteCache> {
-        self.execution
-            .code_caches
+        self.state
+            .codes
             .get(code_cache)?
             .sites
             .as_ref()?
@@ -374,79 +374,22 @@ impl<'s> Vm<'s> {
             .as_ref()
     }
 
-    fn remember_site(
-        &mut self,
-        code: &CodeRef,
-        code_cache: usize,
-        site: usize,
-        cache: SiteCache,
-    ) -> PyResult<()> {
-        if let Some(sites) = &mut self.execution.code_caches[code_cache].sites {
-            sites[site] = Some(cache);
+    fn remember_site(&mut self, code: &CodeRef, site: usize, cache: SiteCache) -> PyResult<()> {
+        let slot = code.cache_slot as usize;
+        let state = &mut *self.state;
+        if state.codes[slot].sites.is_none()
+            && !state
+                .codes
+                .allocate_sites(slot, &mut self.interp.resources)?
+        {
             return Ok(());
         }
-        let bytes = code
-            .instructions
-            .len()
-            .checked_mul(std::mem::size_of::<Option<SiteCache>>())
-            .ok_or("site cache size overflow")?;
-        if u64::try_from(bytes).unwrap_or(u64::MAX) > self.interp.resources.memory_remaining() {
-            return Ok(());
-        }
-        self.reserve_retained_memory(bytes)?;
-        let mut sites: Vec<Option<SiteCache>> = std::iter::repeat_with(|| None)
-            .take(code.instructions.len())
-            .collect();
+        let sites = state.codes[slot]
+            .sites
+            .as_mut()
+            .expect("sites were allocated above");
         sites[site] = Some(cache);
-        self.execution.code_caches[code_cache].sites = Some(sites);
         Ok(())
-    }
-
-    #[inline(always)]
-    pub(super) fn symbol_for(
-        &mut self,
-        code: &CodeRef,
-        cache: usize,
-        name: NameId,
-    ) -> PyResult<SymbolId> {
-        if let Some(symbol) = self.execution.code_caches[cache].names[name.index()] {
-            return Ok(symbol);
-        }
-        self.resolve_symbol(code, cache, name)
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn resolve_symbol(&mut self, code: &CodeRef, cache: usize, name: NameId) -> PyResult<SymbolId> {
-        let symbol = self.intern_symbol(code.name(name))?;
-        self.execution.code_caches[cache].names[name.index()] = Some(symbol);
-        Ok(symbol)
-    }
-
-    pub(super) fn ensure_code_cache(&mut self, code: &CodeRef) -> PyResult<usize> {
-        if let Some(slot) = self.execution.code_caches.slot_of(code) {
-            return Ok(slot);
-        }
-        let bytes = code
-            .name_count()
-            .checked_mul(std::mem::size_of::<Option<SymbolId>>())
-            .and_then(|names| names.checked_add(std::mem::size_of::<CodeCaches>()))
-            .ok_or("code cache size overflow")?;
-        self.reserve_retained_memory(bytes)?;
-        let caches = CodeCaches {
-            code: code.clone(),
-            names: vec![None; code.name_count()],
-            sites: None,
-        };
-        let mut released = 0usize;
-        let slot = self
-            .execution
-            .code_caches
-            .insert(caches, |bytes| released = released.saturating_add(bytes));
-        if released > 0 {
-            self.release_retained_memory_bytes(released);
-        }
-        Ok(slot)
     }
 
     /// Resolve one attribute without involving the operand stack.
@@ -1361,9 +1304,7 @@ impl<'s> Vm<'s> {
                 .types
                 .replace_slots(type_id, &class_object.attributes)?;
         }
-        for cache in self.execution.code_caches.iter_mut() {
-            cache.sites = None;
-        }
+        self.state.codes.clear_sites(&mut self.interp.resources);
         Ok(())
     }
 
@@ -3174,7 +3115,7 @@ impl<'s> Vm<'s> {
         }
         let mut keyword_names = Vec::with_capacity(keyword_arguments.len());
         for (name, value) in keyword_arguments {
-            keyword_names.push(Some(std::sync::Arc::from(name)));
+            keyword_names.push(Some(self.intern_symbol(&name)?));
             self.push(value);
         }
         // Nothing here is starred; short calls borrow a constant flag slice.

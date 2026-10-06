@@ -20,12 +20,13 @@ use super::super::object_model::{TypeId, TypeRegistry};
 use super::super::scopes;
 use super::super::symbols::SymbolId;
 use super::super::{GlobalBindings, ReplState};
-use super::{Flow, Vm, VmState};
+use super::{CodeTable, Flow, Vm, VmState};
 use crate::python::error::PyResult;
 
 /// Every stored reference the VM keeps outside the heap.
 struct VmRoots<'a> {
     execution: &'a VmState,
+    codes: &'a CodeTable,
     globals: &'a GlobalBindings,
     types: &'a TypeRegistry,
     modules: &'a HashMap<String, Ref>,
@@ -35,6 +36,7 @@ struct VmRoots<'a> {
 impl Roots for VmRoots<'_> {
     fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
         self.execution.visit_refs(visitor);
+        self.codes.visit_refs(visitor);
         self.globals.visit_refs(visitor);
         self.types.visit_refs(visitor);
         for slot in self.modules.values() {
@@ -131,10 +133,12 @@ impl<'s> Vm<'s> {
             types,
             modules,
             sys_path,
+            codes,
             ..
         } = &mut *self.state;
         let roots = VmRoots {
             execution: &*self.execution,
+            codes,
             globals,
             types,
             modules,
@@ -275,8 +279,9 @@ impl<'s> Vm<'s> {
         self.state.symbols.id(name)
     }
 
-    pub(super) fn symbol_name(&self, symbol: SymbolId) -> Option<&str> {
-        self.state.symbols.name(symbol)
+    /// The name of a symbol this interpreter issued, such as one compiled code carries.
+    pub(super) fn symbol_name(&self, symbol: SymbolId) -> &str {
+        self.state.symbols.issued(symbol)
     }
 
     // ----- lexical scopes ------------------------------------------------------------------
@@ -343,10 +348,12 @@ impl<'s> Vm<'s> {
             sys_path,
             shapes,
             symbols,
+            codes,
             ..
         } = &mut *self.state;
         let roots = VmRoots {
             execution: &*self.execution,
+            codes,
             globals,
             types,
             modules,

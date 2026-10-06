@@ -1524,7 +1524,7 @@ impl PyRuntime for Vm<'_> {
         }
         let mut keyword_names = Vec::with_capacity(keywords.len());
         for (name, value) in keywords {
-            keyword_names.push(Some(std::sync::Arc::from(name)));
+            keyword_names.push(Some(self.intern_symbol(&name)?));
             self.push(value);
         }
         let flow = self.call(
@@ -2653,18 +2653,15 @@ impl PyRuntime for Vm<'_> {
             .parameters
             .iter()
             .map(|parameter| PyParameter {
-                name: parameter.name.clone(),
+                name: self.symbol_name(parameter.name).to_string(),
                 kind: parameter.kind,
                 default: None,
             })
             .collect::<Vec<_>>();
-        // Defaults fill local slots, which the compiler names after their parameters.
+        // Parameters occupy the first local slots, in order, so a default's slot is its
+        // parameter's index.
         for (&slot, default) in code.call_signature.default_slots.iter().zip(defaults) {
-            let name = code.local_names.get(slot).map(String::as_str);
-            if let Some(parameter) = parameters
-                .iter_mut()
-                .find(|parameter| Some(parameter.name.as_str()) == name)
-            {
+            if let Some(parameter) = parameters.get_mut(slot) {
                 parameter.default = Some(self.value(default));
             }
         }

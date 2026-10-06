@@ -1,4 +1,4 @@
-//! Name, scope, import, and per-code cache operations used by bytecode execution.
+//! Name, scope, and import operations used by bytecode execution.
 //!
 //! Lexical scopes are heap objects. The VM's scope stacks hold stored references to them, and
 //! every operation here pins a scope it reads from those roots before it touches the heap, so
@@ -8,9 +8,9 @@ use super::super::heap::Ref;
 use super::super::object_model::TypeId;
 use super::super::scopes;
 use super::{
-    cpython_names, exception_types, string, Arc, BuiltinType, BytecodeFrame, CodeRef,
-    ExceptionType, Flow, FrameEntry, HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue,
-    Object, ProxyTarget, PyModuleLoader, PyRuntime, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
+    cpython_names, exception_types, string, Arc, BuiltinType, BytecodeFrame, ExceptionType, Flow,
+    FrameEntry, HashMap, Linker, ModuleDef, NamespaceTarget, NativeValue, Object, ProxyTarget,
+    PyModuleLoader, PyRuntime, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
 use crate::python::error::{PyError, PyResult};
 
@@ -129,8 +129,8 @@ impl<'s> Vm<'s> {
         Ok(target)
     }
 
-    pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> PyResult<()> {
-        if name == "__class__" {
+    pub(super) fn load_name(&mut self, symbol: SymbolId) -> PyResult<()> {
+        if self.symbol_name(symbol) == "__class__" {
             let (class, _) = self
                 .method_context()?
                 .ok_or("__class__ is only defined inside a class method body")?;
@@ -139,7 +139,7 @@ impl<'s> Vm<'s> {
         }
         let local_scope = self.lookup_scope();
         let scoped = match local_scope {
-            Some(scope) => self.scope_get(scope, name)?,
+            Some(scope) => self.scope_get(scope, self.symbol_name(symbol))?,
             None => None,
         };
         let can_use_globals = local_scope
@@ -155,50 +155,42 @@ impl<'s> Vm<'s> {
             self.push(value);
             return Ok(());
         }
-        self.load_builtin(name)
+        self.load_builtin(symbol)
     }
 
     #[inline(always)]
-    pub(super) fn load_global(
-        &mut self,
-        symbol: SymbolId,
-        code: &CodeRef,
-        name: NameId,
-    ) -> PyResult<()> {
+    pub(super) fn load_global(&mut self, symbol: SymbolId) -> PyResult<()> {
         if self.lookup_scope().is_none() {
             if let Some(value) = self.state.globals.get_ref(symbol) {
                 self.execution.stack.push_ref(value);
                 return Ok(());
             }
-            return self.load_builtin(code.name(name));
+            return self.load_builtin(symbol);
         }
-        self.load_scoped_global(symbol, code, name)
+        self.load_scoped_global(symbol)
     }
 
     #[cold]
     #[inline(never)]
-    fn load_scoped_global(
-        &mut self,
-        symbol: SymbolId,
-        code: &CodeRef,
-        name: NameId,
-    ) -> PyResult<()> {
+    fn load_scoped_global(&mut self, symbol: SymbolId) -> PyResult<()> {
         let scope = self.lookup_scope().expect("checked by load_global");
         let root = scopes::root(self.heap(), scope)?;
         let value = if scopes::uses_repl_globals(self.heap(), root)? {
             self.state.globals.get(&self.state.heap, symbol)
         } else {
-            self.scope_get(root, code.name(name))?
+            self.scope_get(root, self.symbol_name(symbol))?
         };
         if let Some(value) = value {
             self.push(value);
             return Ok(());
         }
-        self.load_builtin(code.name(name))
+        self.load_builtin(symbol)
     }
 
-    fn load_builtin(&mut self, name: &str) -> PyResult<()> {
-        if let Some((module_name, attribute)) = super::super::stdlib::frozen_builtin(name) {
+    fn load_builtin(&mut self, symbol: SymbolId) -> PyResult<()> {
+        if let Some((module_name, attribute)) =
+            super::super::stdlib::frozen_builtin(self.symbol_name(symbol))
+        {
             self.import(module_name, false)?;
             let module = self.pop()?;
             let callable = self.resolve_attribute(module, attribute)?.ok_or_else(|| {
@@ -207,6 +199,7 @@ impl<'s> Vm<'s> {
             self.push(callable);
             return Ok(());
         }
+        let name = self.symbol_name(symbol);
         let value = (|| {
             let builtin_type = match name {
                 "type" => Some(BuiltinType::Type),
@@ -267,10 +260,10 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> PyResult<()> {
+    pub(super) fn store_name(&mut self, symbol: SymbolId) -> PyResult<()> {
         let value = self.pop()?;
         if let Some(scope) = self.active_scope() {
-            self.scope_insert(scope, name.to_string(), value)?;
+            self.scope_insert(scope, self.symbol_name(symbol).to_owned(), value)?;
         } else {
             self.state
                 .globals
@@ -279,15 +272,10 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn store_enclosing(
-        &mut self,
-        symbol: SymbolId,
-        name: &str,
-        scope_hops: usize,
-    ) -> PyResult<()> {
+    pub(super) fn store_enclosing(&mut self, symbol: SymbolId, scope_hops: usize) -> PyResult<()> {
         let value = self.pop()?;
         if let Some(scope) = self.enclosing_scope(scope_hops)? {
-            self.scope_insert(scope, name.to_string(), value)
+            self.scope_insert(scope, self.symbol_name(symbol).to_owned(), value)
         } else {
             self.state
                 .globals
@@ -296,12 +284,16 @@ impl<'s> Vm<'s> {
         }
     }
 
-    pub(super) fn store_nonlocal(&mut self, name: &str) -> PyResult<()> {
+    pub(super) fn store_nonlocal(&mut self, symbol: SymbolId) -> PyResult<()> {
         let value = self.pop()?;
-        let start = self
-            .enclosing_scope(1)?
-            .ok_or_else(|| format!("no binding for nonlocal {name:?} found"))?;
-        scopes::store_nonlocal(&mut self.state.heap, start, name, value)
+        let start = self.enclosing_scope(1)?.ok_or_else(|| {
+            format!(
+                "no binding for nonlocal {:?} found",
+                self.symbol_name(symbol)
+            )
+        })?;
+        let state = &mut *self.state;
+        scopes::store_nonlocal(&mut state.heap, start, state.symbols.issued(symbol), value)
     }
 
     pub(super) fn exception_type_matches(
@@ -358,20 +350,14 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(always)]
-    pub(super) fn store_global(
-        &mut self,
-        symbol: SymbolId,
-        code: &CodeRef,
-        name: NameId,
-        value: Value,
-    ) -> PyResult<()> {
+    pub(super) fn store_global(&mut self, symbol: SymbolId, value: Value) -> PyResult<()> {
         let Some(scope) = self.lookup_scope() else {
             self.state
                 .globals
                 .insert(symbol, value, &mut self.interp.resources)?;
             return Ok(());
         };
-        self.store_scoped_global(scope, symbol, code, name, value)
+        self.store_scoped_global(scope, symbol, value)
     }
 
     #[cold]
@@ -380,8 +366,6 @@ impl<'s> Vm<'s> {
         &mut self,
         scope: Value,
         symbol: SymbolId,
-        code: &CodeRef,
-        name: NameId,
         value: Value,
     ) -> PyResult<()> {
         let root = scopes::root(self.heap(), scope)?;
@@ -391,16 +375,11 @@ impl<'s> Vm<'s> {
                 .insert(symbol, value, &mut self.interp.resources)?;
             Ok(())
         } else {
-            self.scope_insert(root, code.name(name).to_owned(), value)
+            self.scope_insert(root, self.symbol_name(symbol).to_owned(), value)
         }
     }
 
-    pub(super) fn delete_global(
-        &mut self,
-        symbol: SymbolId,
-        code: &CodeRef,
-        name: NameId,
-    ) -> PyResult<()> {
+    pub(super) fn delete_global(&mut self, symbol: SymbolId) -> PyResult<()> {
         let Some(scope) = self.lookup_scope() else {
             self.state.globals.remove(&self.state.heap, symbol);
             return Ok(());
@@ -409,7 +388,8 @@ impl<'s> Vm<'s> {
         if scopes::uses_repl_globals(self.heap(), root)? {
             self.state.globals.remove(&self.state.heap, symbol);
         } else {
-            scopes::remove(&mut self.state.heap, root, code.name(name))?;
+            let state = &mut *self.state;
+            scopes::remove(&mut state.heap, root, state.symbols.issued(symbol))?;
         }
         Ok(())
     }
@@ -680,8 +660,8 @@ impl<'s> Vm<'s> {
     /// Lex, parse and compile a module's source. The front end's working memory (tokens, syntax
     /// tree, pending instructions) is reserved from the source length and token count before it
     /// is allocated and released once the code exists, so a large module counts against the
-    /// limit while it is compiled but not for the life of the program. The compiled code is
-    /// accounted separately when its caches are materialized.
+    /// limit while it is compiled but not for the life of the program. The names and code
+    /// objects the module keeps are charged to the symbol and code tables as they are compiled.
     pub(super) fn compile_module_source(
         &mut self,
         source: &str,
@@ -726,9 +706,23 @@ impl<'s> Vm<'s> {
         }
         let result = super::super::parser::parse(tokens)
             .map_err(|error| syntax_error(&error.message, &error.span))
-            .map(super::super::compiler::compile);
+            .and_then(|program| self.link(|link| super::super::compiler::compile(program, link)));
         self.interp.resources.release_memory(token_memory);
         result
+    }
+
+    /// Run `compile` against this interpreter's symbol and code tables. Fails when either
+    /// could not charge what the new code needs; the code must not run then.
+    pub(super) fn link<R>(&mut self, compile: impl FnOnce(&mut Linker) -> R) -> PyResult<R> {
+        let state = &mut *self.state;
+        let mut link = Linker::new(
+            &mut state.symbols,
+            &mut state.codes,
+            &mut self.interp.resources,
+        );
+        let compiled = compile(&mut link);
+        link.finish()?;
+        Ok(compiled)
     }
 
     pub(super) fn import(&mut self, name: &str, bind_root: bool) -> PyResult<()> {

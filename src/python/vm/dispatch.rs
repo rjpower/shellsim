@@ -80,11 +80,9 @@ impl<'s> Vm<'s> {
         entry: FrameEntry,
         kind: FrameKind,
     ) -> PyResult<BytecodeFrame> {
-        let code_cache = frame_index(self.ensure_code_cache(code)?)?;
         Ok(BytecodeFrame {
             code: code.clone(),
             instruction_pointer,
-            code_cache,
             exception_base: frame_index(self.exception_stack.len())?,
             stack_base: frame_index(stack_base)?,
             handler_base: frame_index(self.handlers.len())?,
@@ -176,7 +174,6 @@ impl<'s> Vm<'s> {
             self.reset_scope_if_used();
             let instruction_pointer = dispatch.op_index;
             let code = &dispatch.code;
-            let code_cache = dispatch.code_cache;
             let Some(instruction) = code.instructions.get(instruction_pointer) else {
                 return Err((
                     "instruction pointer left the code object".into(),
@@ -204,69 +201,36 @@ impl<'s> Vm<'s> {
                         self.push(value);
                     })
                     .map(|()| Flow::Next),
-                Opcode::LoadName(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.load_name(symbol, code.name(name)))
-                }
-                Opcode::LoadGlobal(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.load_global(symbol, code, name))
-                }
-                Opcode::StoreName(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.store_name(symbol, code.name(name)))
-                }
+                Opcode::LoadName(symbol) => dispatch_next(self.load_name(symbol)),
+                Opcode::LoadGlobal(symbol) => dispatch_next(self.load_global(symbol)),
+                Opcode::StoreName(symbol) => dispatch_next(self.store_name(symbol)),
                 Opcode::LoadLocal(slot) => dispatch_next(self.load_fast(dispatch.locals, slot)),
                 Opcode::StoreLocal(slot) => dispatch_next(self.store_fast(dispatch.locals, slot)),
                 Opcode::StoreEnclosing { name, scope_hops } => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.store_enclosing(symbol, code.name(name), scope_hops))
+                    dispatch_next(self.store_enclosing(name, scope_hops))
                 }
-                Opcode::StoreNonlocal(name) => dispatch_next(self.store_nonlocal(code.name(name))),
-                Opcode::StoreGlobal(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
+                Opcode::StoreNonlocal(symbol) => dispatch_next(self.store_nonlocal(symbol)),
+                Opcode::StoreGlobal(symbol) => {
                     let value = self.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.store_global(symbol, code, name, value))
+                    dispatch_next(self.store_global(symbol, value))
                 }
-                Opcode::StoreAttribute(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
+                Opcode::StoreAttribute(symbol) => {
                     let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
                     let value = self.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.store_attribute_by_symbol(
-                        owner,
-                        symbol,
-                        code.name(name),
-                        value,
-                    ))
+                    let name = self.state.symbols.shared(symbol);
+                    dispatch_next(self.store_attribute_by_symbol(owner, symbol, &name, value))
                 }
                 Opcode::StoreSubscript => dispatch_next(self.store_subscript()),
-                Opcode::DeleteAttribute(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
+                Opcode::DeleteAttribute(symbol) => {
                     let owner = self.pop().map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.delete_attribute_by_symbol(owner, symbol, code.name(name)))
+                    let name = self.state.symbols.shared(symbol);
+                    dispatch_next(self.delete_attribute_by_symbol(owner, symbol, &name))
                 }
-                Opcode::DeleteName(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    let name = code.name(name);
-                    let scope = self.active_scope();
-                    let result = if let Some(scope) = scope {
-                        scopes::remove(&mut self.state.heap, scope, name).map(|_| ())
+                Opcode::DeleteName(symbol) => {
+                    let result = if let Some(scope) = self.active_scope() {
+                        let state = &mut *self.state;
+                        scopes::remove(&mut state.heap, scope, state.symbols.issued(symbol))
+                            .map(|_| ())
                     } else {
                         self.state.globals.remove(&self.state.heap, symbol);
                         Ok(())
@@ -276,29 +240,19 @@ impl<'s> Vm<'s> {
                 Opcode::DeleteLocal(slot) => {
                     dispatch_next(self.delete_local(dispatch.locals, slot))
                 }
-                Opcode::DeleteGlobal(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.delete_global(symbol, code, name))
-                }
+                Opcode::DeleteGlobal(symbol) => dispatch_next(self.delete_global(symbol)),
                 Opcode::DeleteSubscript => dispatch_next(self.delete_subscript()),
                 Opcode::Import { name, bind_root } => {
-                    dispatch_next(self.import(code.name(name), bind_root))
+                    let name = self.state.symbols.shared(name);
+                    dispatch_next(self.import(&name, bind_root))
                 }
-                Opcode::ImportFrom(name) => dispatch_next(self.import_from(code.name(name))),
+                Opcode::ImportFrom(name) => {
+                    let name = self.state.symbols.shared(name);
+                    dispatch_next(self.import_from(&name))
+                }
                 Opcode::ImportStar => dispatch_next(self.import_star()),
-                Opcode::LoadAttribute(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.load_attribute_at(
-                        code,
-                        code_cache,
-                        instruction_pointer,
-                        symbol,
-                        code.name(name),
-                    ))
+                Opcode::LoadAttribute(symbol) => {
+                    dispatch_next(self.load_attribute_at(code, instruction_pointer, symbol))
                 }
                 Opcode::LoadSubscript => dispatch_next(self.load_subscript()),
                 Opcode::BuildSlice {
@@ -323,7 +277,7 @@ impl<'s> Vm<'s> {
                 Opcode::MakeFunction(function) => {
                     let function = code.function(function);
                     dispatch_next(self.make_function(
-                        code.name(function.name).to_owned(),
+                        self.symbol_name(function.name).to_owned(),
                         function.code.clone(),
                         function.defaults,
                     ))
@@ -331,7 +285,7 @@ impl<'s> Vm<'s> {
                 Opcode::MakeClass(class) => {
                     let class = code.class(class);
                     dispatch_next(self.make_class(
-                        code.name(class.name).to_owned(),
+                        self.symbol_name(class.name).to_owned(),
                         &class.code,
                         class.bases,
                         class.has_metaclass,
@@ -364,17 +318,8 @@ impl<'s> Vm<'s> {
                     self.flush_cpu(executed);
                     self.dispatch_call(&dispatch.code, call, instruction_pointer, dispatch.span())
                 }
-                Opcode::LoadMethod(name) => {
-                    let symbol = self
-                        .symbol_for(code, code_cache, name)
-                        .map_err(|error| (error, dispatch.span()))?;
-                    dispatch_next(self.load_method_at(
-                        code,
-                        code_cache,
-                        instruction_pointer,
-                        symbol,
-                        code.name(name),
-                    ))
+                Opcode::LoadMethod(symbol) => {
+                    dispatch_next(self.load_method_at(code, instruction_pointer, symbol))
                 }
                 Opcode::CallMethod(call) => {
                     self.flush_cpu(executed);

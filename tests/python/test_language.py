@@ -1096,6 +1096,28 @@ def test_argument_binding_fills_variadic_and_keyword_only_slots():
     ]
 
 
+def test_keywords_from_mappings_and_native_callers_bind_by_name():
+    import functools
+
+    def collect(**kwargs):
+        return kwargs
+
+    def named(a, *, b):
+        return a, b
+
+    # Names that are not identifiers, or that no parameter has, still reach `**kwargs`.
+    assert collect(**{"a-b": 1, "": 2}) == {"a-b": 1, "": 2}
+    assert named(**{"b": 2, "a": 1}) == (1, 2)
+    assert functools.partial(named, b=3)(1) == (1, 3)
+    for call in (lambda: named(1, **{"b c": 2}), lambda: named(1, b=2, **{"b": 3})):
+        try:
+            call()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("expected TypeError")
+
+
 def test_container_repr_uses_item_repr_and_marks_self_references():
     class Item:
         def __repr__(self):

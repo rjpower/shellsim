@@ -1,7 +1,5 @@
 //! Call preparation, callable dispatch, argument binding, and Python frame entry.
 
-use std::sync::Arc;
-
 use super::super::ast::{Program, Statement, StatementKind};
 use super::super::bytecode::{KeywordName, ParameterKind};
 use super::super::heap::{GeneratorObject, Ref};
@@ -10,7 +8,7 @@ use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
     FrameKind, HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
-    PyStreamRead, Slot, StoredCallArgs, Stream, Value, Vm,
+    PyStreamRead, Slot, StoredCallArgs, Stream, SymbolId, Value, Vm,
 };
 use crate::python::error::{Control, PyResult};
 use num_traits::{One, Signed, Zero};
@@ -243,7 +241,7 @@ impl<'s> Vm<'s> {
         {
             match (name, starred) {
                 (Some(name), false) => {
-                    self.push_keyword_argument(&mut names, name.clone(), value)?;
+                    self.push_keyword_argument(&mut names, *name, value)?;
                 }
                 (None, true) => {
                     let Some(entries) = self.mapping_items(value)? else {
@@ -254,13 +252,15 @@ impl<'s> Vm<'s> {
                         return Err(PyError::exception("TypeError", message));
                     };
                     for (key, value) in entries {
-                        let Some(name) = string::string_value(&self.state.heap, key)? else {
+                        let state = &mut *self.state;
+                        let Some(name) = string::string_value(&state.heap, key)? else {
                             return Err(PyError::exception(
                                 "TypeError",
                                 "keywords must be strings",
                             ));
                         };
-                        self.push_keyword_argument(&mut names, Arc::from(name), value)?;
+                        let symbol = state.symbols.intern(&name, &mut self.interp.resources)?;
+                        self.push_keyword_argument(&mut names, symbol, value)?;
                     }
                 }
                 _ => return Err("invalid keyword argument metadata".into()),
@@ -281,17 +281,17 @@ impl<'s> Vm<'s> {
     fn push_keyword_argument(
         &mut self,
         names: &mut Vec<KeywordName>,
-        name: Arc<str>,
+        name: SymbolId,
         value: Value,
     ) -> PyResult<()> {
-        if names
-            .iter()
-            .any(|existing| existing.as_deref() == Some(&*name))
-        {
-            let message = format!("got multiple values for keyword argument '{name}'");
+        if names.contains(&Some(name)) {
+            let message = format!(
+                "got multiple values for keyword argument '{}'",
+                self.symbol_name(name)
+            );
             return Err(PyError::exception("TypeError", message));
         }
-        self.reserve_result(64usize.saturating_add(name.len()))?;
+        self.reserve_result(64)?;
         self.charge_cpu(1)?;
         self.push(value);
         names.push(Some(name));
@@ -339,8 +339,8 @@ impl<'s> Vm<'s> {
         let keyword_values = arguments.split_off(positional);
         let mut keyword_arguments = Vec::with_capacity(keywords.len());
         for (name, value) in keywords.iter().zip(keyword_values) {
-            let name = name.as_ref().ok_or("invalid keyword argument metadata")?;
-            keyword_arguments.push((name.to_string(), value));
+            let name = name.ok_or("invalid keyword argument metadata")?;
+            keyword_arguments.push((self.symbol_name(name).to_string(), value));
         }
         let function = self.pop()?;
         if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
@@ -602,7 +602,7 @@ impl<'s> Vm<'s> {
             Builtin::Exec => {
                 expect_arity(&arguments, 1, 1)?;
                 let program = self.parse_dynamic_source("exec", &arguments[0])?;
-                let code = super::super::compiler::compile(program);
+                let code = self.link(|link| super::super::compiler::compile(program, link))?;
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
                     Ok(Flow::Halt) => Ok(self.produce(Value::None)),
@@ -626,7 +626,8 @@ impl<'s> Vm<'s> {
                     }) if program.statements.is_empty() => expression,
                     _ => return Err(PyError::exception("SyntaxError", "invalid syntax")),
                 };
-                let code = super::super::compiler::compile_expression(expression);
+                let code =
+                    self.link(|link| super::super::compiler::compile_expression(expression, link))?;
                 let entry = self.dynamic_code_entry()?;
                 match self.execute_code(&code, entry) {
                     Ok(Flow::Return(value)) => {
@@ -780,8 +781,8 @@ impl<'s> Vm<'s> {
                         .enumerate()
                         .filter_map(|(index, value)| {
                             value.as_ref().and_then(|_| {
-                                let symbol = super::super::symbols::SymbolId::from_index(index)?;
-                                self.symbol_name(symbol).map(str::to_string)
+                                let symbol = SymbolId::from_index(index)?;
+                                Some(self.symbol_name(symbol).to_string())
                             })
                         })
                         .collect()
@@ -1543,7 +1544,7 @@ impl<'s> Vm<'s> {
             }
             let mut keywords = Vec::with_capacity(keyword_arguments.len());
             for (keyword, value) in keyword_arguments {
-                keywords.push(Some(Arc::from(keyword)));
+                keywords.push(Some(self.intern_symbol(&keyword)?));
                 self.push(value);
             }
             let flow = self.call_python(
@@ -1649,13 +1650,10 @@ impl<'s> Vm<'s> {
         // Validate the keywords and the required parameters before touching the stack.
         let mut extra_keywords = 0usize;
         for (index, keyword) in keywords.iter().enumerate() {
-            let name = keyword
-                .as_deref()
-                .ok_or("invalid keyword argument metadata")?;
-            let repeated = keywords[..index]
-                .iter()
-                .any(|earlier| earlier.as_deref() == Some(name));
-            match keyword_target(code, name) {
+            let symbol = keyword.ok_or("invalid keyword argument metadata")?;
+            let name = self.symbol_name(symbol);
+            let repeated = keywords[..index].contains(keyword);
+            match keyword_target(code, symbol) {
                 KeywordTarget::Slot(slot) if slot < filled || repeated => {
                     let message = format!(
                         "{}() got multiple values for argument '{name}'",
@@ -1722,9 +1720,9 @@ impl<'s> Vm<'s> {
             Some(_) => {
                 let mut entries = Vec::with_capacity(extra_keywords);
                 for (index, keyword) in keywords.iter().enumerate() {
-                    let name = keyword.as_deref().expect("keywords were validated above");
+                    let name = keyword.expect("keywords were validated above");
                     if !matches!(keyword_target(code, name), KeywordTarget::Slot(_)) {
-                        let key = self.allocate_string(name.to_string())?;
+                        let key = self.allocate_string(self.symbol_name(name).to_string())?;
                         self.reserve_result(64)?;
                         entries.push((key, self.peek(keywords.len() - 1 - index)?));
                     }
@@ -1750,9 +1748,7 @@ impl<'s> Vm<'s> {
                     slots[slot] = Some(value);
                 }
             } else {
-                let name = keywords[index - positional]
-                    .as_deref()
-                    .expect("keywords were validated above");
+                let name = keywords[index - positional].expect("keywords were validated above");
                 if let KeywordTarget::Slot(slot) = keyword_target(code, name) {
                     slots[slot] = Some(value);
                 }
@@ -1814,7 +1810,7 @@ impl<'s> Vm<'s> {
             .iter()
             .filter(|keyword| {
                 code.parameters.iter().any(|parameter| {
-                    Some(parameter.name.as_str()) == keyword.as_deref()
+                    **keyword == Some(parameter.name)
                         && parameter.kind == ParameterKind::KeywordOnly
                 })
             })
@@ -1859,13 +1855,10 @@ impl<'s> Vm<'s> {
                         ParameterKind::KeywordOnly => keyword_only,
                         ParameterKind::Variadic | ParameterKind::KeywordVariadic => false,
                     };
-                    let supplied = *slot < filled
-                        || keywords
-                            .iter()
-                            .any(|keyword| keyword.as_deref() == Some(parameter.name.as_str()));
+                    let supplied = *slot < filled || keywords.contains(&Some(parameter.name));
                     kind_matches && !supplied && !parameter.has_default
                 })
-                .map(|(_, parameter)| format!("'{}'", parameter.name))
+                .map(|(_, parameter)| format!("'{}'", self.symbol_name(parameter.name)))
                 .collect::<Vec<_>>()
         };
         for (keyword_only, description) in [(false, "positional"), (true, "keyword-only")] {
@@ -2501,7 +2494,7 @@ enum KeywordTarget {
     Unknown,
 }
 
-fn keyword_target(code: &CodeRef, name: &str) -> KeywordTarget {
+fn keyword_target(code: &CodeRef, name: SymbolId) -> KeywordTarget {
     match code
         .parameters
         .iter()
