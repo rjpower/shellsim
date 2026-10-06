@@ -292,7 +292,10 @@ fn render_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> 
                 }
             }
             Object::Function(function) => format!("<function {}>", function.name),
-            Object::Class(class_object) => match class_object.attributes.get("__module__") {
+            Object::Class(class_object) => match class_object
+                .attributes
+                .get_name(&state.symbols, "__module__")
+            {
                 Some(module) => match string_value(heap, heap.value(module))? {
                     Some(module) if module != "builtins" => {
                         format!("<class '{module}.{}'>", class_object.name)
@@ -319,15 +322,12 @@ fn render_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> 
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
             Object::NamespaceDict(NamespaceTarget::Scope(scope)) => {
-                let mut entries = scopes::values(heap, heap.value(scope))?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let entries = scopes::entries(heap, heap.value(scope))?;
                 let mut rendered = Vec::with_capacity(entries.len());
-                for (name, value) in entries {
+                for (symbol, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
-                        quote_string(&name),
+                        quote_string(state.symbols.issued(symbol)),
                         render(state, value, active)?
                     ));
                 }
@@ -348,11 +348,6 @@ fn render_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> 
                 }
                 format!("{{{}}}", rendered.join(", "))
             }
-            // The REPL/script table isn't reachable from a bare `&Heap`. `Vm::repr_nested`
-            // (via `repr_namespace_dict`) covers every ordinary `repr()`, `str()`, or `print()`
-            // call, so this generic fallback is only reached by the interactive REPL auto-printing
-            // a bare expression, which already skips a user `__repr__` for every other type too.
-            Object::NamespaceDict(NamespaceTarget::Repl) => "<globals>".to_string(),
             // `Vm::repr_nested` renders views and proxies from their mapping's entries; the
             // heap alone cannot read every mapping they may view.
             Object::DictView { .. } => "<dict view>".to_string(),

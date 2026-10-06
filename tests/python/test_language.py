@@ -1588,6 +1588,34 @@ def test_sorted_over_globals_and_type_name_are_sensible():
     assert snapshot["_globals_test_marker"] == "module-level"
 
 
+_order_zeta = 1
+_order_alpha = 2
+
+
+def test_namespaces_keep_binding_order():
+    assert [name for name in globals() if name.startswith("_order_")] == [
+        "_order_zeta",
+        "_order_alpha",
+    ]
+
+    class Ordered:
+        zeta = 1
+        alpha = 2
+
+        def middle(self):
+            return self.zeta
+
+    assert [name for name in vars(Ordered) if not name.startswith("__")] == [
+        "zeta",
+        "alpha",
+        "middle",
+    ]
+    instance = Ordered()
+    instance.second = 2
+    instance.first = 1
+    assert list(vars(instance)) == ["second", "first"]
+
+
 def test_globals_treats_non_string_keys_as_absent():
     view = globals()
     assert 1 not in view

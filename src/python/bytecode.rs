@@ -53,8 +53,8 @@ pub struct Code {
     pub call_signature: CallSignature,
     /// The leading string literal of the body, exposed as `__doc__`.
     pub docstring: Option<Arc<str>>,
-    /// Stable slot names for locals owned by this code object.
-    pub local_names: Arc<[String]>,
+    /// The name of each local slot this code object owns, by slot index.
+    pub local_names: Arc<[SymbolId]>,
     /// This code's slot in its interpreter's [`CodeTable`], assigned when it is compiled.
     pub cache_slot: u32,
     constants: Box<[Constant]>,
@@ -679,7 +679,7 @@ impl<'l, 'a> CodeBuilder<'l, 'a> {
         instructions: Vec<Instruction>,
         spans: Vec<Span>,
         parameters: Vec<Parameter>,
-        local_names: Vec<String>,
+        local_names: Vec<SymbolId>,
         is_coroutine: bool,
         docstring: Option<Arc<str>>,
     ) -> CodeRef {

@@ -256,6 +256,10 @@ impl Compiler<'_, '_> {
                     };
             }
         }
+        let local_names = local_names
+            .iter()
+            .map(|name| self.link.symbol(name))
+            .collect::<Vec<_>>();
         let parameters = parameters
             .into_iter()
             .map(|parameter| Parameter {
@@ -1895,7 +1899,7 @@ mod tests {
 
     #[test]
     fn function_locals_are_lowered_to_stable_slots() {
-        let (code, _) = compile_program(
+        let (code, symbols) = compile_program(
             parse(
                 lex("def add(left, right):\n    total = left + right\n    return total\n").unwrap(),
             )
@@ -1905,7 +1909,12 @@ mod tests {
             panic!("function definition must create a code object")
         };
         let code = &code.function(function).code;
-        assert_eq!(&*code.local_names, ["left", "right", "total"]);
+        let names = code
+            .local_names
+            .iter()
+            .map(|symbol| symbols.issued(*symbol))
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["left", "right", "total"]);
         assert!(code
             .instructions
             .iter()

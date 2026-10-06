@@ -23,8 +23,9 @@ use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    ClassLayout, KeyHash, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget, Ref, Roots,
-    ValueStack, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
+    ClassLayout, KeyHash, Namespace, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget,
+    Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use super::native::{
     CallArgs, FunctionDef, ModuleDef, PyArgumentParser, PyArgumentParserData, PyArgumentSpec,
@@ -406,22 +407,6 @@ pub(super) fn execute(
     out: Out,
     err: Out,
 ) -> ExecResult {
-    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
-        Ok(symbol) => symbol,
-        Err(_) => return ExecResult::Exit(137),
-    };
-    if state.globals.get(&state.heap, name_symbol).is_none()
-        && state
-            .globals
-            .insert(
-                name_symbol,
-                Value::inline_string("__main__").expect("short builtin string"),
-                &mut interp.resources,
-            )
-            .is_err()
-    {
-        return ExecResult::Exit(137);
-    }
     let mut program = match VmProgram::compile(source, state, &mut interp.resources) {
         Ok(program) => program,
         Err(result) => return result,
@@ -528,49 +513,15 @@ impl VmProgram {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), FrameKind::Entry)
-            else {
+            let docstring = self.code.docstring.clone();
+            let Ok(main) = vm.main_scope(docstring.as_deref()) else {
+                return VmPoll::Ready(ExecResult::Exit(137));
+            };
+            let entry = FrameEntry::module(main);
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, entry, FrameKind::Entry) else {
                 return VmPoll::Ready(ExecResult::Exit(137));
             };
             vm.bytecode_frames.push(frame);
-            if let Some(docstring) = self.code.docstring.clone() {
-                // The script's leading string literal is `__doc__` in the main module, unless an
-                // interactive session already bound the name.
-                let Ok(symbol) = vm.state.symbols.intern("__doc__", &mut vm.interp.resources)
-                else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                if vm.state.globals.get(&vm.state.heap, symbol).is_none() {
-                    let Ok(value) = vm.allocate_string(docstring.to_string()) else {
-                        return VmPoll::Ready(ExecResult::Exit(137));
-                    };
-                    if vm
-                        .state
-                        .globals
-                        .insert(symbol, value, &mut vm.interp.resources)
-                        .is_err()
-                    {
-                        return VmPoll::Ready(ExecResult::Exit(137));
-                    }
-                }
-            }
-            if !vm.state.modules.contains_key("__main__") {
-                // `sys.modules["__main__"]` is a module object whose attributes are the
-                // script's globals, so `inspect.getmodule` and friends see the main script.
-                let Ok(scope) =
-                    vm.alloc_scope(None, true, Arc::from([]), Vec::new(), HashMap::new())
-                else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                let Ok(module) = vm.alloc(Object::Module {
-                    name: "__main__".to_string(),
-                    scope: Ref::from(scope),
-                }) else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                let stored = vm.store(module);
-                vm.state.modules.insert("__main__".to_string(), stored);
-            }
             self.started = true;
         }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
@@ -754,8 +705,10 @@ impl Roots for VmState {
             }
         }
         for frame in &self.bytecode_frames {
-            for slot in frame.scope.iter().chain(&frame.callee) {
-                visitor(slot);
+            visitor(&frame.scope);
+            visitor(&frame.globals);
+            if let Some(callee) = &frame.callee {
+                visitor(callee);
             }
         }
         if let Some(suspension) = &self.suspension {
@@ -1034,8 +987,9 @@ enum Resolved {
 /// holding its locals and dynamically bound names: module and class bodies, generators, and
 /// functions whose code sets [`CallSignature::heap_locals`](super::bytecode::CallSignature).
 /// Otherwise the frame keeps its local slots on the shared locals stack from `locals_base`
-/// and `scope` is where free-name lookup continues, the function's closure. The main program
-/// owns neither and falls through to the global table.
+/// and `scope` is where free-name lookup continues, the function's closure. `globals` is the
+/// scope of the module the code belongs to, the root of the `scope` chain, kept here so a
+/// global lookup does not walk the chain.
 struct BytecodeFrame {
     code: CodeRef,
     instruction_pointer: usize,
@@ -1050,7 +1004,8 @@ struct BytecodeFrame {
     /// First slot owned by this frame in the VM's shared locals stack, when its locals live
     /// there rather than in `scope`.
     locals_base: Option<u32>,
-    scope: Option<Ref>,
+    scope: Ref,
+    globals: Ref,
     /// The function this frame runs, for tracebacks and zero-argument `super()`; `None` for
     /// module, class and dynamic code.
     callee: Option<Ref>,
@@ -1098,7 +1053,8 @@ impl Clone for BytecodeFrame {
             handler_base: self.handler_base,
             context_base: self.context_base,
             locals_base: self.locals_base,
-            scope: self.scope.as_ref().map(Ref::dup),
+            scope: self.scope.dup(),
+            globals: self.globals.dup(),
             callee: self.callee.as_ref().map(Ref::dup),
             own_scope: self.own_scope,
             kind: self.kind,
@@ -1110,7 +1066,7 @@ impl Clone for BytecodeFrame {
 impl BytecodeFrame {
     /// The frame's own heap scope, when its names live in one.
     fn active_scope(&self) -> Option<&Ref> {
-        self.own_scope.then_some(self.scope.as_ref()).flatten()
+        self.own_scope.then_some(&self.scope)
     }
 
     fn stack_base(&self) -> usize {
@@ -1129,7 +1085,8 @@ fn frame_index(depth: usize) -> PyResult<u32> {
 
 /// The scopes and local slots a new frame starts with. See [`BytecodeFrame`].
 struct FrameEntry {
-    scope: Option<Value>,
+    scope: Value,
+    globals: Value,
     own_scope: bool,
     /// Base of the frame's already-bound local slots on the VM's locals stack, for a frame
     /// that keeps them there rather than in `scope`.
@@ -1139,23 +1096,12 @@ struct FrameEntry {
 }
 
 impl FrameEntry {
-    /// A frame for code that binds no locals of its own and resolves every name globally: the
-    /// main program.
-    fn bare() -> Self {
-        Self {
-            scope: None,
-            own_scope: false,
-            locals_base: None,
-            callee: None,
-            class_body: false,
-        }
-    }
-
-    /// A frame whose names all live in `scope`: module bodies, generators, and functions with
-    /// heap-resident locals.
-    fn scoped(scope: Value) -> FrameEntry {
+    /// A module body, the main script's included: its names are the module's globals, which
+    /// live in `scope`.
+    fn module(scope: Value) -> FrameEntry {
         FrameEntry {
-            scope: Some(scope),
+            scope,
+            globals: scope,
             own_scope: true,
             locals_base: None,
             callee: None,
@@ -1165,18 +1111,25 @@ impl FrameEntry {
 
     /// A class body: its own scope, whose bindings become the class namespace, and which
     /// functions defined inside skip when they close over names.
-    fn class_body(scope: Value) -> FrameEntry {
+    fn class_body(scope: Value, globals: Value) -> FrameEntry {
         FrameEntry {
+            globals,
             class_body: true,
-            ..Self::scoped(scope)
+            ..Self::module(scope)
         }
     }
 
     /// A function whose local slots are already bound on the locals stack from `locals_base`
     /// and whose free names resolve through `closure`.
-    fn with_locals(function: Value, closure: Option<Value>, locals_base: usize) -> FrameEntry {
+    fn with_locals(
+        function: Value,
+        closure: Value,
+        globals: Value,
+        locals_base: usize,
+    ) -> FrameEntry {
         FrameEntry {
             scope: closure,
+            globals,
             own_scope: false,
             locals_base: Some(locals_base),
             callee: Some(function),
@@ -1185,17 +1138,19 @@ impl FrameEntry {
     }
 
     /// A function whose locals live in `scope`, a heap scope of its own.
-    fn function(function: Value, scope: Value) -> FrameEntry {
+    fn function(function: Value, scope: Value, globals: Value) -> FrameEntry {
         FrameEntry {
+            globals,
             callee: Some(function),
-            ..Self::scoped(scope)
+            ..Self::module(scope)
         }
     }
 
     /// `exec`/`eval` code: no names of its own, free names resolved through `enclosing`.
-    fn dynamic(enclosing: Option<Value>) -> FrameEntry {
+    fn dynamic(enclosing: Value, globals: Value) -> FrameEntry {
         FrameEntry {
             scope: enclosing,
+            globals,
             own_scope: false,
             locals_base: None,
             callee: None,
@@ -2000,7 +1955,7 @@ impl<'s> Vm<'s> {
         };
         let scope = self.module_scope(MODULE, module)?;
         let helper = self
-            .scope_get(scope, "materialize")?
+            .scope_get_name(scope, "materialize")?
             .ok_or("frozen _iteration module lacks materialize")?;
         let items = <Self as PyRuntime>::call_value(
             self,
@@ -2316,9 +2271,10 @@ struct ClassDefinition {
     metaclass: Value,
     layout: ClassLayout,
     exception_base: Option<&'static str>,
-    attributes: HashMap<String, Value>,
+    /// The class namespace in definition order, holding pinned values.
+    attributes: Namespace,
     dataclass_fields: Vec<(String, Option<Value>)>,
-    enum_members: Vec<(String, Value)>,
+    enum_members: Vec<(SymbolId, Value)>,
 }
 
 fn select_string_slice(
@@ -2394,9 +2350,9 @@ mod tests {
             std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
         );
         assert!(std::mem::size_of::<PyResult<Flow>>() <= 32);
-        // Five words of indices, two optional references, two flags and the frame kind: pushed
-        // and popped by value on every call.
-        assert!(std::mem::size_of::<BytecodeFrame>() <= 80);
+        // Five words of indices, three references (scope, globals and the optional callee), two
+        // flags and the frame kind: pushed and popped by value on every call.
+        assert!(std::mem::size_of::<BytecodeFrame>() <= 96);
     }
 
     #[test]

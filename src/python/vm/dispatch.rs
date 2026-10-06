@@ -88,7 +88,8 @@ impl<'s> Vm<'s> {
             handler_base: frame_index(self.handlers.len())?,
             context_base: frame_index(self.with_contexts.len())?,
             locals_base: entry.locals_base.map(frame_index).transpose()?,
-            scope: entry.scope.map(|scope| self.store(scope)),
+            scope: self.store(entry.scope),
+            globals: self.store(entry.globals),
             callee: entry.callee.map(|callee| self.store(callee)),
             own_scope: entry.own_scope,
             kind,
@@ -227,14 +228,12 @@ impl<'s> Vm<'s> {
                     dispatch_next(self.delete_attribute_by_symbol(owner, symbol, &name))
                 }
                 Opcode::DeleteName(symbol) => {
-                    let result = if let Some(scope) = self.active_scope() {
-                        let state = &mut *self.state;
-                        scopes::remove(&mut state.heap, scope, state.symbols.issued(symbol))
-                            .map(|_| ())
-                    } else {
-                        self.state.globals.remove(&self.state.heap, symbol);
-                        Ok(())
-                    };
+                    let result = match self.active_scope() {
+                        Some(scope) => Ok(scope),
+                        None => self.current_globals(),
+                    }
+                    .and_then(|scope| scopes::remove(&mut self.state.heap, scope, symbol))
+                    .map(|_| ());
                     dispatch_next(result)
                 }
                 Opcode::DeleteLocal(slot) => {
@@ -1051,20 +1050,16 @@ impl<'s> Vm<'s> {
         self.leave_frame(&frame);
     }
 
-    /// The outermost scope of the active frame's code, recorded in a traceback frame so the
+    /// The globals of the active frame's module, recorded in a traceback frame so the
     /// module's `__file__` can be read if the traceback is printed.
     fn frame_module(&self) -> Option<Ref> {
-        let root = scopes::root(&self.state.heap, self.lookup_scope()?).ok()?;
-        Some(Ref::from(root))
+        Some(self.bytecode_frames.last()?.globals.dup())
     }
 
-    /// `__file__` of an imported module, given its scope from [`Self::frame_module`]. Imported
-    /// code runs under the module's scope; the main program keeps its globals outside the scope
-    /// chain, so its frames find no `__file__`.
+    /// `__file__` of a module, given its scope from [`Self::frame_module`].
     pub(super) fn module_file(&self, module: &Ref) -> Option<String> {
-        let heap = &self.state.heap;
-        let file = scopes::get(heap, self.value(module), "__file__").ok()??;
-        string::string_value(heap, file).ok().flatten()
+        let file = self.scope_get_name(self.value(module), "__file__").ok()??;
+        string::string_value(&self.state.heap, file).ok().flatten()
     }
 
     /// Pop the active frame as an exception leaves it, finishing a generator's frame for good.

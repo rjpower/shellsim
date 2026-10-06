@@ -26,6 +26,7 @@ impl SymbolId {
         self.0 as usize
     }
 
+    #[cfg(test)]
     pub(super) fn from_index(index: usize) -> Option<Self> {
         u32::try_from(index).ok().map(Self)
     }
@@ -59,6 +60,21 @@ impl Symbols {
     /// mutate the interpreter.
     pub fn shared(&self, symbol: SymbolId) -> Arc<str> {
         self.names[symbol.index()].clone()
+    }
+
+    /// Intern the name of a builtin type's attribute. The type registry charges each of its
+    /// attributes, name included, so the table does not charge the name again.
+    pub fn intern_builtin(&mut self, name: &str) -> SymbolId {
+        if let Some(symbol) = self.id(name) {
+            return symbol;
+        }
+        let symbol = SymbolId(
+            u32::try_from(self.names.len()).expect("builtin names are far fewer than 2^32"),
+        );
+        let name: Arc<str> = name.into();
+        self.ids.insert(name.clone(), symbol);
+        self.names.push(name);
+        symbol
     }
 
     /// Intern one identifier, charging its process-lifetime storage before mutation.

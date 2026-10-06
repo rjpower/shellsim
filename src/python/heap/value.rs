@@ -317,16 +317,6 @@ impl Ref {
         value.map(Ref::from)
     }
 
-    /// The stored form of each named value.
-    pub fn named(
-        values: impl IntoIterator<Item = (String, Value)>,
-    ) -> std::collections::HashMap<String, Ref> {
-        values
-            .into_iter()
-            .map(|(name, value)| (name, Ref::from(value)))
-            .collect()
-    }
-
     /// The stored form of each of `values`, sized exactly: collecting straight from a
     /// `Vec<Value>` would reuse its allocation, so a list cut down to a few items could keep the
     /// capacity of the snapshot it came from, while the modeled size counts items.

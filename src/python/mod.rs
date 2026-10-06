@@ -41,7 +41,7 @@ use std::collections::HashMap;
 
 use crate::interp::Interp;
 
-use crate::python::error::{PyError, PyResult};
+use crate::python::error::PyResult;
 use ast::StatementKind;
 use heap::{Ref, Value};
 
@@ -60,10 +60,11 @@ pub(crate) fn is_bundled_distribution(name: &str) -> bool {
 }
 
 /// Persistent locals for the deliberately-small foreground Python REPL.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ReplState {
-    globals: GlobalBindings,
     heap: heap::Heap,
+    /// The builtins code has used, recorded by symbol on first use.
+    builtins: heap::Namespace,
     symbols: symbols::Symbols,
     /// Every code object compiled for this interpreter, with its inline caches.
     codes: vm::CodeTable,
@@ -77,11 +78,33 @@ pub struct ReplState {
     type_memory: u64,
 }
 
+impl Default for ReplState {
+    fn default() -> Self {
+        // The builtin types name their attributes with this interpreter's symbols.
+        let mut symbols = symbols::Symbols::default();
+        let types = object_model::TypeRegistry::new(&mut symbols);
+        Self {
+            heap: heap::Heap::default(),
+            builtins: heap::Namespace::default(),
+            symbols,
+            codes: vm::CodeTable::default(),
+            shapes: attributes::Shapes::default(),
+            types,
+            modules: HashMap::new(),
+            import_paths: Vec::new(),
+            sys_path: None,
+            temporary_import_paths: Vec::new(),
+            original_cwd: None,
+            type_memory: 0,
+        }
+    }
+}
+
 impl Clone for ReplState {
     fn clone(&self) -> Self {
         Self {
-            globals: self.globals.clone(),
             heap: self.heap.clone(),
+            builtins: self.builtins.dup(),
             symbols: self.symbols.clone(),
             codes: self.codes.clone(),
             shapes: self.shapes.clone(),
@@ -97,115 +120,6 @@ impl Clone for ReplState {
             original_cwd: self.original_cwd.clone(),
             type_memory: self.type_memory,
         }
-    }
-}
-
-/// The flat global table of the entry-point script or REPL, indexed by symbol.
-#[derive(Default, Debug)]
-struct GlobalBindings {
-    values: Vec<Option<heap::Ref>>,
-    modeled_bytes: u64,
-}
-
-impl Clone for GlobalBindings {
-    fn clone(&self) -> Self {
-        Self {
-            values: self
-                .values
-                .iter()
-                .map(|value| value.as_ref().map(heap::Ref::dup))
-                .collect(),
-            modeled_bytes: self.modeled_bytes,
-        }
-    }
-}
-
-impl heap::Roots for GlobalBindings {
-    fn visit_refs(&self, visitor: &mut dyn FnMut(&heap::Ref)) {
-        for value in self.values.iter().flatten() {
-            visitor(value);
-        }
-    }
-}
-
-impl GlobalBindings {
-    #[inline(always)]
-    fn get(&self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value> {
-        heap.value_optional(self.values.get(symbol.index()).and_then(Option::as_ref))
-    }
-
-    /// The stored reference of a binding, for pushing onto the operand stack directly.
-    #[inline(always)]
-    fn get_ref(&self, symbol: symbols::SymbolId) -> Option<&heap::Ref> {
-        self.values.get(symbol.index()).and_then(Option::as_ref)
-    }
-
-    #[inline(always)]
-    fn insert(
-        &mut self,
-        symbol: symbols::SymbolId,
-        value: Value,
-        resources: &mut crate::resources::Resources,
-    ) -> PyResult<()> {
-        if self.values.len() <= symbol.index() {
-            self.grow(symbol, resources)?;
-        }
-        self.values[symbol.index()] = Some(Ref::from(value));
-        Ok(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow(
-        &mut self,
-        symbol: symbols::SymbolId,
-        resources: &mut crate::resources::Resources,
-    ) -> PyResult<()> {
-        let required_len = symbol
-            .index()
-            .checked_add(1)
-            .ok_or("global binding count overflow")?;
-        let added = required_len - self.values.len();
-        let bytes = u64::try_from(added)
-            .unwrap_or(u64::MAX)
-            .checked_mul(std::mem::size_of::<heap::Ref>() as u64)
-            .ok_or("global binding size overflow")?;
-        let modeled_bytes = self
-            .modeled_bytes
-            .checked_add(bytes)
-            .ok_or("modeled global binding size overflow")?;
-        if !resources.reserve_memory(bytes) {
-            return Err(PyError::resource_error("memory limit exceeded"));
-        }
-        self.values.resize_with(required_len, || None);
-        self.modeled_bytes = modeled_bytes;
-        Ok(())
-    }
-
-    fn remove(&mut self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value> {
-        let removed = self.values.get_mut(symbol.index()).and_then(Option::take);
-        heap.value_optional(removed.as_ref())
-    }
-
-    /// Every populated `(name, value)` binding, resolved through the heap's symbol table, for
-    /// `globals()` on the entry-point script or REPL. Slot order here just follows `SymbolId`
-    /// allocation order, not Python's per-dict insertion order; callers that need a stable order
-    /// sort the result themselves.
-    fn entries(&self, heap: &heap::Heap, symbols: &symbols::Symbols) -> Vec<(String, Value)> {
-        self.values
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| {
-                let value = value.as_ref()?;
-                let symbol = symbols::SymbolId::from_index(index)?;
-                let name = symbols.name(symbol)?.to_string();
-                Some((name, heap.value(value)))
-            })
-            .collect()
-    }
-
-    fn take_modeled_bytes(&mut self) -> u64 {
-        std::mem::take(&mut self.modeled_bytes)
     }
 }
 
@@ -227,8 +141,7 @@ impl ReplState {
     fn release_owned_memory(&mut self, resources: &mut crate::resources::Resources) {
         let heap = self.heap.take_modeled_bytes();
         resources.release_memory(
-            heap.saturating_add(self.globals.take_modeled_bytes())
-                .saturating_add(self.symbols.take_modeled_bytes())
+            heap.saturating_add(self.symbols.take_modeled_bytes())
                 .saturating_add(self.codes.take_modeled_bytes())
                 .saturating_add(self.shapes.take_modeled_bytes())
                 .saturating_add(std::mem::take(&mut self.type_memory)),
@@ -445,51 +358,6 @@ pub(crate) fn start_python(
         }
     };
     state.import_paths.push(import_root);
-    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
-        Ok(symbol) => symbol,
-        Err(_) => return PythonCommandStart::Ready(137),
-    };
-    if state
-        .globals
-        .insert(
-            name_symbol,
-            Value::inline_string("__main__").expect("short builtin string"),
-            &mut interp.resources,
-        )
-        .is_err()
-    {
-        return PythonCommandStart::Ready(137);
-    }
-    if let Some(script) = py_argv
-        .first()
-        .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
-    {
-        // No VM scope exists yet, so release the pin once the global table holds the value.
-        let pin_base = state.heap.pin_count();
-        let file = match Value::inline_string(script) {
-            Some(value) => value,
-            // The fresh state's only references are its globals.
-            None => match state.heap.alloc(
-                heap::Object::String(script.clone().into()),
-                &state.globals,
-                &mut interp.resources,
-            ) {
-                Ok(value) => value,
-                Err(_) => return PythonCommandStart::Ready(137),
-            },
-        };
-        let file_symbol = match state.symbols.intern("__file__", &mut interp.resources) {
-            Ok(symbol) => symbol,
-            Err(_) => return PythonCommandStart::Ready(137),
-        };
-        let inserted = state
-            .globals
-            .insert(file_symbol, file, &mut interp.resources);
-        state.heap.truncate_pins(pin_base);
-        if inserted.is_err() {
-            return PythonCommandStart::Ready(137);
-        }
-    }
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
         stdin: execution_stdin,
@@ -1432,7 +1300,6 @@ fn unsupported(interp: &mut Interp, feature: &str, err: Out) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{Limits, Resources};
 
     fn run(source: &str) -> (i32, String, String) {
         let mut env = Interp::new();
@@ -1600,27 +1467,5 @@ print(log)
         let stressed = run(source);
         heap::COLLECT_EVERY_ALLOCATION.with(|flag| flag.set(false));
         assert_eq!(stressed, expected);
-    }
-
-    #[test]
-    fn global_binding_growth_is_charged_before_mutation() {
-        let mut resources = Resources::new(Limits {
-            memory: 32,
-            ..Limits::unlimited()
-        });
-        let heap = heap::Heap::default();
-        let symbol = symbols::Symbols::default()
-            .intern("x", &mut resources)
-            .unwrap();
-        let mut globals = GlobalBindings::default();
-
-        assert_eq!(
-            globals
-                .insert(symbol, Value::Int(1), &mut resources)
-                .unwrap_err()
-                .kind(),
-            Some(&crate::python::error::PyErrorKind::Resource)
-        );
-        assert!(globals.get(&heap, symbol).is_none());
     }
 }

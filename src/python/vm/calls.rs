@@ -3,11 +3,10 @@
 use super::super::ast::{Program, Statement, StatementKind};
 use super::super::bytecode::{KeywordName, ParameterKind};
 use super::super::heap::{GeneratorObject, Ref};
-use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
-    FrameKind, HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
+    FrameKind, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
     PyStreamRead, Slot, StoredCallArgs, Stream, SymbolId, Value, Vm,
 };
 use crate::python::error::{Control, PyResult};
@@ -134,46 +133,62 @@ impl<'s> Vm<'s> {
         }
         if let Some(class) = self.instance_class(*value)? {
             let mut names = self.instance_attribute_names(*value)?;
-            if let Object::Class(class_object) = self.get(class)? {
-                names.extend(class_object.attributes.keys().cloned());
-                for ancestor in &class_object.mro {
-                    if let Object::Class(ancestor) = self.get(self.value(ancestor))? {
-                        names.extend(ancestor.attributes.keys().cloned());
-                    }
-                }
-            }
+            names.extend(self.class_attribute_names(class)?);
             return Ok(names);
         }
         match self.get(*value)? {
             Object::Module { scope, .. } => {
-                let namespace = self.module_namespace(self.value(scope))?;
+                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
                 Ok(self
                     .namespace_entries(namespace)?
                     .into_iter()
                     .map(|(name, _)| name)
                     .collect())
             }
-            Object::Class(class_object) => {
-                let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
-                for ancestor in &class_object.mro {
-                    if let Object::Class(ancestor) = self.get(self.value(ancestor))? {
-                        names.extend(ancestor.attributes.keys().cloned());
-                    }
-                }
-                Ok(names)
-            }
+            Object::Class(_) => self.class_attribute_names(*value),
             _ => self.type_attribute_names(value),
         }
+    }
+
+    /// The names a class and its ancestors define, for `dir()`.
+    fn class_attribute_names(&self, class: Value) -> PyResult<Vec<String>> {
+        let Object::Class(class_object) = self.get(class)? else {
+            return Ok(Vec::new());
+        };
+        let mut names = class_object
+            .attributes
+            .symbols()
+            .map(|symbol| self.symbol_name(symbol).to_string())
+            .collect::<Vec<_>>();
+        for ancestor in &class_object.mro {
+            if let Object::Class(ancestor) = self.get(self.value(ancestor))? {
+                names.extend(
+                    ancestor
+                        .attributes
+                        .symbols()
+                        .map(|symbol| self.symbol_name(symbol).to_string()),
+                );
+            }
+        }
+        Ok(names)
     }
 
     /// The names a builtin value's registered type and its ancestors publish, for `dir()`.
     fn type_attribute_names(&self, value: &Value) -> PyResult<Vec<String>> {
         let type_id = self.type_id(value)?;
         let ty = self.state.types.get(type_id)?;
-        let mut names = ty.attributes.keys().cloned().collect::<Vec<_>>();
-        let ancestors = ty.mro.clone();
-        for ancestor in ancestors {
-            names.extend(self.state.types.get(ancestor)?.attributes.keys().cloned());
+        let mut names = Vec::new();
+        for ty in std::iter::once(ty).chain(
+            ty.mro
+                .iter()
+                .map(|ancestor| self.state.types.get(*ancestor))
+                .collect::<PyResult<Vec<_>>>()?,
+        ) {
+            names.extend(
+                ty.attributes
+                    .symbols()
+                    .map(|symbol| self.symbol_name(symbol).to_string()),
+            );
         }
         Ok(names)
     }
@@ -774,17 +789,10 @@ impl<'s> Vm<'s> {
                 let mut names = if let Some(value) = arguments.first() {
                     self.dir_names(value)?
                 } else {
-                    self.state
-                        .globals
-                        .values
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, value)| {
-                            value.as_ref().and_then(|_| {
-                                let symbol = SymbolId::from_index(index)?;
-                                Some(self.symbol_name(symbol).to_string())
-                            })
-                        })
+                    let globals = self.current_globals()?;
+                    self.namespace_entries(super::namespace::NamespaceHandle::Scope(globals))?
+                        .into_iter()
+                        .map(|(name, _)| name)
                         .collect()
                 };
                 let name_bytes = names.iter().try_fold(0usize, |total, name| {
@@ -1310,7 +1318,10 @@ impl<'s> Vm<'s> {
         let Object::Class(class_object) = self.get(class)? else {
             return Ok(());
         };
-        let Some(abstract_methods) = class_object.attributes.get("__abstractmethods__") else {
+        let Some(abstract_methods) = class_object
+            .attributes
+            .get_name(&self.state.symbols, "__abstractmethods__")
+        else {
             return Ok(());
         };
         let abstract_methods = self.value(abstract_methods);
@@ -1591,7 +1602,8 @@ impl<'s> Vm<'s> {
             return Err("bound descriptor is not callable".into());
         };
         let code = function_object.code.clone();
-        let closure = self.value_optional(function_object.closure.as_ref());
+        let closure = self.value(&function_object.closure);
+        let globals = self.value(&function_object.globals);
         let signature = &code.call_signature;
         let suspends = signature.is_generator || signature.is_coroutine;
         if !suspends && self.call_depth == Self::MAX_CALL_DEPTH {
@@ -1614,13 +1626,13 @@ impl<'s> Vm<'s> {
                 .collect::<Vec<_>>();
             self.execution.locals.truncate(locals_base);
             if suspends {
-                return self.create_generator(function, &code, closure, locals);
+                return self.create_generator(function, &code, closure, globals, locals);
             }
             let scope = self.function_scope(&code, closure, locals)?;
-            let entry = FrameEntry::function(function, scope);
+            let entry = FrameEntry::function(function, scope, globals);
             return self.enter_python_function(function, &code, entry, mode);
         }
-        let entry = FrameEntry::with_locals(function, closure, locals_base);
+        let entry = FrameEntry::with_locals(function, closure, globals, locals_base);
         self.enter_python_function(function, &code, entry, mode)
     }
 
@@ -1933,7 +1945,8 @@ impl<'s> Vm<'s> {
         &mut self,
         function: Value,
         code: &CodeRef,
-        closure: Option<Value>,
+        closure: Value,
+        globals: Value,
         locals: Vec<Option<Value>>,
     ) -> PyResult<Flow> {
         let scope = self.function_scope(code, closure, locals)?;
@@ -1942,6 +1955,7 @@ impl<'s> Vm<'s> {
                 function: Ref::from(function),
                 code: code.clone(),
                 scope: Ref::from(scope),
+                globals: Ref::from(globals),
                 instruction_pointer: 0,
                 handlers: Vec::new(),
                 contexts: Vec::new(),
@@ -1959,19 +1973,19 @@ impl<'s> Vm<'s> {
     /// calling frame's scope. A caller that keeps its locals in the frame exposes a snapshot of
     /// them, which the dynamic code can read but, as in CPython, not rebind.
     fn dynamic_code_entry(&mut self) -> PyResult<FrameEntry> {
-        let enclosing = self.lookup_scope();
-        let Some((base, code)) = self
+        let frame = self
             .bytecode_frames
             .last()
-            .and_then(|frame| Some((frame.locals_base()?, frame.code.clone())))
-        else {
-            return Ok(FrameEntry::dynamic(enclosing));
+            .ok_or("exec and eval require running Python code")?;
+        let (enclosing, globals) = (self.value(&frame.scope), self.value(&frame.globals));
+        let Some((base, code)) = frame.locals_base().map(|base| (base, frame.code.clone())) else {
+            return Ok(FrameEntry::dynamic(enclosing, globals));
         };
         let locals = (0..code.local_names.len())
             .map(|slot| self.value_optional(self.locals.get(base + slot)?.as_ref()))
             .collect();
         let snapshot = self.function_scope(&code, enclosing, locals)?;
-        Ok(FrameEntry::dynamic(Some(snapshot)))
+        Ok(FrameEntry::dynamic(snapshot, globals))
     }
 
     /// Allocate the heap scope of an activation whose locals must outlive the frame or be
@@ -1979,20 +1993,10 @@ impl<'s> Vm<'s> {
     fn function_scope(
         &mut self,
         code: &CodeRef,
-        closure: Option<Value>,
+        closure: Value,
         locals: Vec<Option<Value>>,
     ) -> PyResult<Value> {
-        let uses_repl_globals = closure
-            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
-            .transpose()?
-            .unwrap_or(true);
-        self.alloc_scope(
-            closure,
-            uses_repl_globals,
-            code.local_names.clone(),
-            locals,
-            HashMap::new(),
-        )
+        self.alloc_scope(Some(closure), code.local_names.clone(), locals, Vec::new())
     }
 
     /// Instantiate a class whose MRO defines `__new__`, as `type.__call__` does: call `__new__`

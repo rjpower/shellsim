@@ -8,18 +8,19 @@
 //! or is read again in the outer scope.
 //!
 //! Allocation can collect, so every allocating method reports the VM's roots to the heap through
-//! [`VmRoots`]: the operand stack, frames, pending exceptions, globals, modules and type tables.
+//! [`VmRoots`]: the operand stack, frames, pending exceptions, builtins, modules and type tables.
 
 use std::collections::HashMap;
 
 use crate::resources::Resources;
 
 use super::super::attributes::{AttributeStore, InstanceAttributeSlot};
+use super::super::heap::Namespace;
 use super::super::heap::{Heap, Object, Ref, Roots, Value};
 use super::super::object_model::{TypeId, TypeRegistry};
 use super::super::scopes;
 use super::super::symbols::SymbolId;
-use super::super::{GlobalBindings, ReplState};
+use super::super::ReplState;
 use super::{CodeTable, Flow, Vm, VmState};
 use crate::python::error::PyResult;
 
@@ -27,7 +28,7 @@ use crate::python::error::PyResult;
 struct VmRoots<'a> {
     execution: &'a VmState,
     codes: &'a CodeTable,
-    globals: &'a GlobalBindings,
+    builtins: &'a Namespace,
     types: &'a TypeRegistry,
     modules: &'a HashMap<String, Ref>,
     sys_path: &'a Option<Ref>,
@@ -37,7 +38,9 @@ impl Roots for VmRoots<'_> {
     fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
         self.execution.visit_refs(visitor);
         self.codes.visit_refs(visitor);
-        self.globals.visit_refs(visitor);
+        for slot in self.builtins.refs() {
+            visitor(slot);
+        }
         self.types.visit_refs(visitor);
         for slot in self.modules.values() {
             visitor(slot);
@@ -129,7 +132,7 @@ impl<'s> Vm<'s> {
     ) -> R {
         let ReplState {
             heap,
-            globals,
+            builtins,
             types,
             modules,
             sys_path,
@@ -139,7 +142,7 @@ impl<'s> Vm<'s> {
         let roots = VmRoots {
             execution: &*self.execution,
             codes,
-            globals,
+            builtins,
             types,
             modules,
             sys_path,
@@ -286,54 +289,56 @@ impl<'s> Vm<'s> {
 
     // ----- lexical scopes ------------------------------------------------------------------
 
+    /// Allocate a scope enclosed by `parent` whose slots hold `locals` and which binds `names`
+    /// dynamically in that order.
     pub(super) fn alloc_scope(
         &mut self,
         parent: Option<Value>,
-        uses_repl_globals: bool,
-        local_names: std::sync::Arc<[String]>,
+        local_names: std::sync::Arc<[SymbolId]>,
         locals: Vec<Option<Value>>,
-        values: HashMap<String, Value>,
+        names: Vec<(SymbolId, Value)>,
     ) -> PyResult<Value> {
         let layout = scopes::ScopeLayout {
             parent,
-            uses_repl_globals,
             local_names,
         };
         self.with_heap(|heap, roots, resources| {
-            scopes::alloc_scope(heap, layout, locals, values, roots, resources)
+            scopes::alloc_scope(heap, layout, locals, names, roots, resources)
         })
     }
 
-    pub(super) fn alloc_scope_named(
-        &mut self,
-        parent: Option<Value>,
-        uses_repl_globals: bool,
-        local_names: std::sync::Arc<[String]>,
-        values: HashMap<String, Value>,
-    ) -> PyResult<Value> {
-        let layout = scopes::ScopeLayout {
-            parent,
-            uses_repl_globals,
-            local_names,
-        };
-        self.with_heap(|heap, roots, resources| {
-            scopes::alloc_scope_named(heap, layout, values, roots, resources)
-        })
+    pub(super) fn scope_get(&self, scope: Value, symbol: SymbolId) -> PyResult<Option<Value>> {
+        scopes::get(&self.state.heap, scope, symbol)
     }
 
-    pub(super) fn scope_get(&self, scope: Value, name: &str) -> PyResult<Option<Value>> {
-        scopes::get(&self.state.heap, scope, name)
+    /// [`Self::scope_get`] for a name native code holds as a string. A name the interpreter
+    /// never interned is bound in no scope.
+    pub(super) fn scope_get_name(&self, scope: Value, name: &str) -> PyResult<Option<Value>> {
+        match self.symbol_id(name) {
+            Some(symbol) => self.scope_get(scope, symbol),
+            None => Ok(None),
+        }
     }
 
     pub(super) fn scope_insert(
         &mut self,
         scope: Value,
-        name: String,
+        symbol: SymbolId,
         value: Value,
     ) -> PyResult<()> {
         self.with_heap(|heap, roots, resources| {
-            scopes::insert(heap, scope, name, value, roots, resources)
+            scopes::insert(heap, scope, symbol, value, roots, resources)
         })
+    }
+
+    pub(super) fn scope_insert_name(
+        &mut self,
+        scope: Value,
+        name: &str,
+        value: Value,
+    ) -> PyResult<()> {
+        let symbol = self.intern_symbol(name)?;
+        self.scope_insert(scope, symbol, value)
     }
 
     // ----- instance attributes -------------------------------------------------------------
@@ -342,7 +347,7 @@ impl<'s> Vm<'s> {
     pub(super) fn with_attributes<R>(&mut self, f: impl FnOnce(&mut AttributeStore<'_>) -> R) -> R {
         let ReplState {
             heap,
-            globals,
+            builtins,
             types,
             modules,
             sys_path,
@@ -354,7 +359,7 @@ impl<'s> Vm<'s> {
         let roots = VmRoots {
             execution: &*self.execution,
             codes,
-            globals,
+            builtins,
             types,
             modules,
             sys_path,

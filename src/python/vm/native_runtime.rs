@@ -1,6 +1,6 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
-use super::super::heap::{self, FunctionObject, OrderedMap, Ref};
+use super::super::heap::{self, FunctionObject, Namespace, OrderedMap, Ref};
 use super::super::stdlib::argparse::{
     ArgumentParserObject, ArgumentSpec, NamespaceObject, SubcommandSpec, SubparsersSpec,
 };
@@ -9,16 +9,16 @@ use super::super::stdlib::re::{MatchObject, RegexObject};
 use super::super::stdlib::unittest::RaisesContextObject;
 use super::namespace::NamespaceHandle;
 use super::{
-    exception_types, number, protocol, string, Arc, BigInt, BuiltinType, CallArgs, CallMode,
-    ClassDefinition, ClassLayout, ExceptionType, Flow, FrameEntry, HashMap, NativeValue, Object,
-    Ordering, PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer,
-    PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader, PyArrayRef, PyArrayView,
-    PyByteArray, PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError, PyFilesystem,
-    PyHttpClient, PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule,
-    PyNativeKind, PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult,
-    PyRuntime, PySet, PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject,
-    PyValueCast, Stream, ToPrimitive, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
-    MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES,
+    exception_types, number, protocol, string, BigInt, BuiltinType, CallArgs, CallMode,
+    ClassDefinition, ClassLayout, ExceptionType, Flow, FrameEntry, NativeValue, Object, Ordering,
+    PyArgumentParser, PyArgumentParserData, PyArgumentSpec, PyArray, PyArrayBuffer, PyArrayData,
+    PyArrayDataMut, PyArrayDtype, PyArrayMut, PyArrayReader, PyArrayRef, PyArrayView, PyByteArray,
+    PyCallable, PyClass, PyClock, PyDict, PyEnvironment, PyError, PyFilesystem, PyHttpClient,
+    PyIdentity, PyIterator, PyKind, PyList, PyMarker, PyMatch, PyMatchData, PyModule, PyNativeKind,
+    PyOperator, PyProcessRunner, PyProperty, PyRaisesContext, PyRegex, PyResult, PyRuntime, PySet,
+    PyStreamRead, PySubcommandSpec, PySubparsersSpec, PyTuple, PyTypeObject, PyValueCast, Stream,
+    ToPrimitive, Value, Vm, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
+    MODELED_VALUE_BYTES,
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::heap::DictViewKind;
@@ -1088,7 +1088,7 @@ impl PyRuntime for Vm<'_> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             let name = self.namespace_key(&key)?;
-            return self.namespace_store(target, name, value);
+            return self.namespace_store(target, &name, value);
         }
         let (hash, position) = self.lookup_mapping_entry(id, &key)?;
         if let Some(position) = position {
@@ -1171,7 +1171,7 @@ impl PyRuntime for Vm<'_> {
                 self.namespace_delete(target, &name)?;
             }
             for (name, value) in kept {
-                self.namespace_store(target, name, value)?;
+                self.namespace_store(target, &name, value)?;
             }
             return Ok(());
         }
@@ -1421,11 +1421,11 @@ impl PyRuntime for Vm<'_> {
                 ))
             }
         };
-        let mut attributes = HashMap::new();
+        let mut attributes = Namespace::default();
         for (key, value) in entries {
             let key = string::string_value(&self.state.heap, key)?
                 .ok_or_else(|| PyError::type_error("type.__new__() keys must be strings"))?;
-            attributes.insert(key, value);
+            attributes.insert(self.intern_symbol(&key)?, Ref::from(value));
         }
         let mut user_bases = Vec::new();
         let mut layout = ClassLayout::Object;
@@ -1557,11 +1557,12 @@ impl PyRuntime for Vm<'_> {
             } else if let Some(class) = self.instance_class(*value)? {
                 // An instance is callable when its class or an ancestor defines `__call__`.
                 let heap = &self.state.heap;
+                let call = self.state.symbols.id("__call__");
                 let defines_call = |class: &heap::Ref| {
                     matches!(
                         heap.get(heap.value(class)),
                         Ok(Object::Class(class_object))
-                            if class_object.attributes.contains_key("__call__")
+                            if call.is_some_and(|call| class_object.attributes.contains(call))
                     )
                 };
                 match heap.get(class)? {
@@ -2405,22 +2406,17 @@ impl PyRuntime for Vm<'_> {
             .map_or("", |(package, _)| package)
             .to_string();
         let package = self.allocate_string(package)?;
-        let scope = self.alloc_scope_named(
-            None,
-            false,
-            Arc::from([]),
-            HashMap::from([
-                ("__name__".into(), module_name),
-                ("__file__".into(), module_path),
-                ("__package__".into(), package),
-                ("__spec__".into(), spec),
-                ("__loader__".into(), loader),
-            ]),
-        )?;
-        self.alloc(Object::Module {
+        let (module, _) = self.allocate_module(
             name,
-            scope: Ref::from(scope),
-        })
+            vec![
+                ("__name__", module_name),
+                ("__package__", package),
+                ("__loader__", loader),
+                ("__spec__", spec),
+                ("__file__", module_path),
+            ],
+        )?;
+        Ok(module)
     }
 
     fn exec_module(&mut self, module: PyModule, path: &str) -> PyResult<()> {
@@ -2434,7 +2430,7 @@ impl PyRuntime for Vm<'_> {
             .rsplit_once('/')
             .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
         self.state.temporary_import_paths.insert(0, import_root);
-        let execution = self.execute_code(&code, FrameEntry::scoped(scope));
+        let execution = self.execute_code(&code, FrameEntry::module(scope));
         self.state.temporary_import_paths.remove(0);
         match execution {
             Ok(Flow::Halt) => Ok(()),
@@ -2601,13 +2597,11 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn frame_module_name(&mut self, depth: usize) -> PyResult<Option<Value>> {
-        // Each frame resolves names through a scope that roots in its module; the main script's
-        // frames root in the global namespace.
         let Some(frame) = self.bytecode_frames.iter().rev().nth(depth) else {
             return Ok(None);
         };
-        let scope = self.value_optional(frame.scope.as_ref());
-        self.module_name_of(scope)
+        let globals = self.value(&frame.globals);
+        self.scope_get_name(globals, "__name__")
     }
 
     fn function_flags(&self, value: &Value) -> PyResult<Option<(bool, bool)>> {

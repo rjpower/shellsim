@@ -70,7 +70,7 @@ pub(super) fn for_each_object_ref(object: &HeapObject, f: &mut dyn FnMut(&Raw)) 
         match &**attributes {
             InstanceAttributes::Shaped { values, .. } => slots(values, f),
             InstanceAttributes::Dictionary(values) => {
-                for slot in values.values() {
+                for slot in values.refs() {
                     f(&slot.0);
                 }
             }
@@ -100,15 +100,17 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
         Object::Function(function) => {
             let FunctionObject {
                 closure,
+                globals,
                 defaults,
                 defining_class,
                 attributes,
                 ..
             } = &**function;
-            optional(closure, f);
+            f(&closure.0);
+            f(&globals.0);
             slots(defaults, f);
             optional(defining_class, f);
-            for slot in attributes.values() {
+            for slot in attributes.refs() {
                 f(&slot.0);
             }
         }
@@ -125,7 +127,7 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             slots(bases, f);
             slots(mro, f);
             f(&metaclass.0);
-            for slot in attributes.values() {
+            for slot in attributes.refs() {
                 f(&slot.0);
             }
             for (_, slot) in dataclass_fields {
@@ -159,6 +161,7 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             let GeneratorObject {
                 function,
                 scope,
+                globals,
                 contexts,
                 exceptions,
                 stack,
@@ -167,6 +170,7 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             } = &**generator;
             f(&function.0);
             f(&scope.0);
+            f(&globals.0);
             slots(contexts, f);
             slots(exceptions, f);
             slots(stack, f);
@@ -177,14 +181,14 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             let ScopeObject {
                 parent,
                 locals,
-                values,
+                names,
                 ..
             } = &**scope;
             optional(parent, f);
             for slot in locals.iter().flatten() {
                 f(&slot.0);
             }
-            for slot in values.values() {
+            for slot in names.refs() {
                 f(&slot.0);
             }
         }
@@ -194,9 +198,7 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             mapping: target, ..
         }
         | Object::MappingProxy(ProxyTarget::Class(target)) => f(&target.0),
-        // The REPL/script global table is a VM root, so this view owns nothing further.
-        Object::NamespaceDict(NamespaceTarget::Repl)
-        | Object::MappingProxy(ProxyTarget::NativeModule(_) | ProxyTarget::RegisteredType(_)) => {}
+        Object::MappingProxy(ProxyTarget::NativeModule(_) | ProxyTarget::RegisteredType(_)) => {}
         Object::Native(native) => native.visit_refs(&mut |slot| f(&slot.0)),
         Object::Property { getter, setter } => {
             f(&getter.0);

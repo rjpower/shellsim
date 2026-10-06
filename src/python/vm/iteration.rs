@@ -992,7 +992,11 @@ impl<'s> Vm<'s> {
             ));
         }
         let code = state.code.clone();
-        let entry = FrameEntry::function(self.value(&state.function), self.value(&state.scope));
+        let entry = FrameEntry::function(
+            self.value(&state.function),
+            self.value(&state.scope),
+            self.value(&state.globals),
+        );
         let stack_base = self.execution.stack.len();
         let frame = self.enter_frame(
             &code,

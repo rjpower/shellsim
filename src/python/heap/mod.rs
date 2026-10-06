@@ -21,7 +21,6 @@
 //! into an old object is always found.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 use crate::resources::Resources;
 use num_bigint::BigInt;
@@ -30,10 +29,12 @@ use super::attributes::ShapeId;
 use super::bytecode::CodeRef;
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
+use super::symbols::SymbolId;
 use crate::python::error::{PyError, PyResult};
 
 mod gc;
 pub mod mapping;
+mod namespace;
 mod native_object;
 mod snapshot;
 mod stack;
@@ -41,6 +42,7 @@ pub mod value;
 
 pub use gc::Roots;
 pub use mapping::{KeyHash, OrderedMap, OrderedSet};
+pub use namespace::Namespace;
 pub use native_object::NativeObject;
 pub use stack::ValueStack;
 pub use value::{Ref, Value};
@@ -92,11 +94,8 @@ pub enum InstanceAttributes {
         shape: ShapeId,
         values: Vec<Ref>,
     },
-    /// Boxed so the common shaped representation sets the size of an instance. The map's
-    /// 48-byte header would otherwise widen every heap slot, which is the cost the
-    /// `box_collection` lint does not see.
-    #[allow(clippy::box_collection)]
-    Dictionary(Box<HashMap<super::symbols::SymbolId, Ref>>),
+    /// Boxed so the common shaped representation sets the size of an instance.
+    Dictionary(Box<Namespace>),
 }
 
 impl Default for InstanceAttributes {
@@ -159,17 +158,12 @@ impl ObjectId {
 /// return an [`Object::NamespaceDict`] over one of these, and every read and write through the
 /// view acts on this storage.
 ///
-/// An imported module's top-level code runs with its own lexical [`ScopeObject`]
-/// (`uses_repl_globals` false), so its namespace is that scope. The entry-point script or an
-/// interactive REPL line runs with no scope of its own; its names, and those of any function or
-/// class body defined at that top level, live in the flat REPL/script table instead (see
-/// `ReplState::globals` and `Vm::scope_uses_repl_globals`).
+/// Every module's top-level code, the main script's included, runs with its own lexical
+/// [`ScopeObject`], so a module's namespace is that scope.
 #[derive(Debug)]
 pub enum NamespaceTarget {
     /// A module's own scope.
     Scope(Ref),
-    /// The script and REPL global table.
-    Repl,
     /// One instance's own attributes, for `obj.__dict__` and `vars(obj)`.
     Instance(Ref),
 }
@@ -209,7 +203,8 @@ pub struct ClassObject {
     pub layout: ClassLayout,
     /// Closest native exception ancestor, when instances may be raised.
     pub exception_base: Option<&'static str>,
-    pub attributes: HashMap<String, Ref>,
+    /// The class's own namespace, its `__dict__`, in definition order.
+    pub attributes: Namespace,
     pub is_dataclass: bool,
     pub dataclass_fields: Vec<(String, Option<Ref>)>,
     pub enum_members: Vec<Ref>,
@@ -220,12 +215,15 @@ pub struct ClassObject {
 pub struct FunctionObject {
     pub name: String,
     pub code: CodeRef,
-    pub closure: Option<Ref>,
+    /// The scope the function was defined in, where its free names resolve.
+    pub closure: Ref,
+    /// The scope of the module the function was defined in: its globals.
+    pub globals: Ref,
     pub defaults: Vec<Ref>,
     /// Class captured when this function is installed by a class body.
     pub defining_class: Option<Ref>,
     /// Names assigned on the function object, its `__dict__`.
-    pub attributes: HashMap<String, Ref>,
+    pub attributes: Namespace,
 }
 
 /// A suspended generator frame. Boxed inside [`Object::Generator`] to keep heap slots small.
@@ -235,6 +233,8 @@ pub struct GeneratorObject {
     pub function: Ref,
     pub code: CodeRef,
     pub scope: Ref,
+    /// The function's globals, kept with the scope so resuming reads neither from the function.
+    pub globals: Ref,
     pub instruction_pointer: usize,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     pub handlers: Vec<(usize, usize, usize)>,
@@ -253,15 +253,12 @@ pub struct GeneratorObject {
 /// lives in [`scopes`](super::scopes); the heap only stores and traces the object.
 #[derive(Debug)]
 pub struct ScopeObject {
+    /// The enclosing scope; `None` for a module's scope, where every chain ends.
     pub parent: Option<Ref>,
-    /// Whether names that this scope does not bind resolve in the flat REPL/script table rather
-    /// than in a module scope.
-    pub uses_repl_globals: bool,
-    pub local_names: std::sync::Arc<[String]>,
+    pub local_names: std::sync::Arc<[SymbolId]>,
     pub locals: Vec<Option<Ref>>,
-    /// Dynamic names in first-binding order; `values` holds their current bindings.
-    pub order: Vec<String>,
-    pub values: HashMap<String, Ref>,
+    /// Names without a compiler-assigned slot, in first-binding order.
+    pub names: Namespace,
 }
 
 const LOCAL_SLOT_BYTES: u64 = 16;
@@ -270,7 +267,7 @@ pub const DYNAMIC_NAME_BYTES: u64 = 48;
 
 fn modeled_scope_size(scope: &ScopeObject) -> PyResult<u64> {
     let slots = u64::try_from(scope.locals.len()).map_err(|_| "modeled scope size overflow")?;
-    let dynamic = u64::try_from(scope.values.len()).map_err(|_| "modeled scope size overflow")?;
+    let dynamic = u64::try_from(scope.names.len()).map_err(|_| "modeled scope size overflow")?;
     OBJECT_HEADER
         .checked_add(
             slots
@@ -614,6 +611,14 @@ impl Heap {
         Ok(&self.object(Self::object_id(value)?)?.payload)
     }
 
+    /// The object a stored reference names, read without pinning it: whoever holds the
+    /// reference roots the object, and nothing can collect while the borrow lasts.
+    #[inline]
+    pub fn stored(&self, slot: &Ref) -> PyResult<&Object> {
+        let id = slot.0.object_id().ok_or("expected a heap object")?;
+        Ok(&self.object(id)?.payload)
+    }
+
     /// Mutable payload access. Old objects are remembered, so references may be stored through
     /// it.
     pub fn get_mut(&mut self, value: Value) -> PyResult<&mut Object> {
@@ -624,6 +629,18 @@ impl Heap {
     /// Mutate an object's payload.
     pub fn modify<R>(&mut self, value: Value, f: impl FnOnce(&mut Object) -> R) -> PyResult<R> {
         Ok(f(self.get_mut(value)?))
+    }
+
+    /// Mutate the payload of the object a stored reference names, without pinning it; see
+    /// [`Self::stored`].
+    #[inline]
+    pub fn modify_stored<R>(
+        &mut self,
+        slot: &Ref,
+        f: impl FnOnce(&mut Object) -> R,
+    ) -> PyResult<R> {
+        let id = slot.0.object_id().ok_or("expected a heap object")?;
+        Ok(f(&mut self.object_mut(id)?.payload))
     }
 
     /// The attributes stored on `value`, or `None` when none has been assigned (or `value` is
@@ -1113,8 +1130,8 @@ fn modeled_size(object: &Object) -> PyResult<u64> {
         }
         Object::Module { name, .. } => name.len(),
         Object::Scope(scope) => return modeled_scope_size(scope),
-        // The namespace it views is charged where that namespace actually lives (the scope or
-        // the REPL/script global table), so the view itself is a fixed, minimal handle.
+        // The namespace it views is charged where that namespace lives, so the view itself is
+        // a fixed, minimal handle.
         Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
         Object::Native(native) => {
             return OBJECT_HEADER

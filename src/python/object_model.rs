@@ -11,11 +11,12 @@
 
 use std::collections::HashMap;
 
-use super::heap::{self, Heap, Object, Ref};
+use super::heap::{self, Heap, Namespace, Object, Ref};
 use super::native::{
     BinarySlotFn, CompareSlotFn, MethodDef, PyError, PyResult, PyRuntime, TernarySlotFn,
     UnarySlotFn,
 };
+use super::symbols::{SymbolId, Symbols};
 use super::Value;
 
 /// Stable identity of a Python type within a [`ReplState`](super::ReplState).
@@ -467,10 +468,14 @@ pub(super) const SLOT_DEFS: [(Slot, &str, u8); SLOT_COUNT] = [
 ];
 
 impl TypeSlots {
-    fn from_attributes(owner: TypeId, attributes: &HashMap<String, Ref>) -> Self {
+    fn from_attributes(
+        owner: TypeId,
+        attributes: &Namespace,
+        slot_symbols: &[(Slot, SymbolId)],
+    ) -> Self {
         let mut slots = Self::default();
-        for (slot, name, _) in SLOT_DEFS {
-            if let Some(value) = attributes.get(name) {
+        for &(slot, symbol) in slot_symbols {
+            if let Some(value) = attributes.get(symbol) {
                 // The slot table lives in the registry root alongside the attributes, so the
                 // duplicate reference is traced and rewritten with them.
                 slots.set(
@@ -532,14 +537,6 @@ impl Clone for SlotValue {
     }
 }
 
-/// Duplicate the stored references of an attribute map that stays inside the registry root.
-fn dup_attributes(attributes: &HashMap<String, Ref>) -> HashMap<String, Ref> {
-    attributes
-        .iter()
-        .map(|(name, value)| (name.clone(), value.dup()))
-        .collect()
-}
-
 /// Metadata shared by builtin, native, and user-defined Python types.
 #[derive(Debug)]
 pub struct PyType {
@@ -547,7 +544,7 @@ pub struct PyType {
     pub kind: TypeKind,
     pub bases: Vec<TypeId>,
     pub mro: Vec<TypeId>,
-    pub attributes: HashMap<String, Ref>,
+    pub attributes: Namespace,
     /// Slots defined by this type, before MRO resolution.
     pub local_slots: TypeSlots,
     pub slots: TypeSlots,
@@ -561,7 +558,7 @@ impl Clone for PyType {
             kind: self.kind,
             bases: self.bases.clone(),
             mro: self.mro.clone(),
-            attributes: dup_attributes(&self.attributes),
+            attributes: self.attributes.dup(),
             local_slots: self.local_slots.clone(),
             slots: self.slots.clone(),
             value: self.value.as_ref().map(Ref::dup),
@@ -587,6 +584,8 @@ pub enum TypeKind {
 #[derive(Debug)]
 pub struct TypeRegistry {
     types: Vec<PyType>,
+    /// The symbol of each slot's dunder name, for deriving slots from a type's attributes.
+    slot_symbols: Box<[(Slot, SymbolId)]>,
     value_kinds: Vec<&'static super::native::ValueKindDef>,
     exception_types: HashMap<&'static str, TypeId>,
     /// The inverse of `exception_types`, for the builtin ancestor of an exception type.
@@ -599,6 +598,7 @@ impl Clone for TypeRegistry {
     fn clone(&self) -> Self {
         Self {
             types: self.types.clone(),
+            slot_symbols: self.slot_symbols.clone(),
             value_kinds: self.value_kinds.clone(),
             exception_types: self.exception_types.clone(),
             exception_names: self.exception_names.clone(),
@@ -614,7 +614,7 @@ impl Clone for TypeRegistry {
 impl heap::Roots for TypeRegistry {
     fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
         for ty in &self.types {
-            for value in ty.attributes.values() {
+            for value in ty.attributes.refs() {
                 visitor(value);
             }
             if let Some(value) = &ty.value {
@@ -638,8 +638,13 @@ fn modeled_type_bytes(ty: &PyType) -> u64 {
     u64::try_from(bytes).unwrap_or(u64::MAX)
 }
 
-impl Default for TypeRegistry {
-    fn default() -> Self {
+impl TypeRegistry {
+    /// Build the builtin types, interning their attribute names in `symbols`.
+    pub fn new(symbols: &mut Symbols) -> Self {
+        let slot_symbols = SLOT_DEFS
+            .iter()
+            .map(|(slot, name, _)| (*slot, symbols.intern_builtin(name)))
+            .collect::<Box<[_]>>();
         let mut types = Vec::with_capacity(BuiltinType::ALL.len());
         for builtin in BuiltinType::ALL {
             let (bases, mro) = builtin_metadata(builtin);
@@ -648,7 +653,7 @@ impl Default for TypeRegistry {
                 kind: TypeKind::Builtin,
                 bases,
                 mro,
-                attributes: HashMap::new(),
+                attributes: Namespace::default(),
                 local_slots: TypeSlots::default(),
                 slots: TypeSlots::default(),
                 value: Some(Ref::from_immediate(Value::Native(
@@ -657,140 +662,171 @@ impl Default for TypeRegistry {
             });
         }
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Object as usize],
             &super::stdlib::core::OBJECT_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Enum as usize],
             &super::stdlib::r#enum::ENUM_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Type as usize],
             &super::stdlib::core::TYPE_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Module as usize],
             &super::stdlib::core::MODULE_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Exception as usize],
             &super::stdlib::core::EXCEPTION_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Iterator as usize],
             &super::stdlib::core::ITERATOR_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::String as usize],
             &super::stdlib::core::STRING_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Bytes as usize],
             &super::stdlib::core::BYTES_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::ByteArray as usize],
             &super::stdlib::core::BYTEARRAY_TYPE,
         );
         install_native_class_methods(
+            symbols,
             &mut types[BuiltinType::Bytes as usize],
             super::stdlib::core::BYTES_CLASS_METHODS,
         );
         install_native_class_methods(
+            symbols,
             &mut types[BuiltinType::ByteArray as usize],
             super::stdlib::core::BYTEARRAY_CLASS_METHODS,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::List as usize],
             &super::stdlib::core::LIST_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Slice as usize],
             &super::stdlib::core::SLICE_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Tuple as usize],
             &super::stdlib::core::TUPLE_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Dict as usize],
             &super::stdlib::core::DICT_TYPE,
         );
         install_native_class_methods(
+            symbols,
             &mut types[BuiltinType::Dict as usize],
             super::stdlib::core::DICT_CLASS_METHODS,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::DictKeys as usize],
             &super::stdlib::mapping_views::DICT_KEYS_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::DictValues as usize],
             &super::stdlib::mapping_views::DICT_VALUES_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::DictItems as usize],
             &super::stdlib::mapping_views::DICT_ITEMS_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::MappingProxy as usize],
             &super::stdlib::mapping_views::MAPPING_PROXY_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Set as usize],
             &super::stdlib::core::SET_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::FrozenSet as usize],
             &super::stdlib::core::FROZENSET_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Generator as usize],
             &super::stdlib::core::GENERATOR_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Property as usize],
             &super::stdlib::core::PROPERTY_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Regex as usize],
             &super::stdlib::re::PATTERN_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Match as usize],
             &super::stdlib::re::MATCH_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Stream as usize],
             &super::stdlib::sys::STREAM_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::Environment as usize],
             &super::stdlib::os::ENVIRONMENT_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::ArgumentParser as usize],
             &super::stdlib::argparse::ARGUMENT_PARSER_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::RaisesContext as usize],
             &super::stdlib::unittest::RAISES_CONTEXT_TYPE,
         );
         install_native_attributes(
+            symbols,
             &mut types[BuiltinType::TestCase as usize],
             &super::stdlib::unittest::TEST_CASE_TYPE,
         );
         for definition in super::stdlib::numpy::array_types() {
-            install_native_attributes(&mut types[BuiltinType::Array as usize], definition);
+            install_native_attributes(symbols, &mut types[BuiltinType::Array as usize], definition);
         }
-        install_number_attributes(&mut types);
+        install_number_attributes(symbols, &mut types);
         // A namespace view is a `dict` whose storage is a module scope, the script table or an
         // instance's attributes. The runtime's dict accessors read and write that storage, so
         // `dict`'s own methods serve it unchanged.
         types[BuiltinType::NamespaceDict as usize].attributes =
-            dup_attributes(&types[BuiltinType::Dict as usize].attributes);
+            types[BuiltinType::Dict as usize].attributes.dup();
         for ty in &mut types {
-            install_native_method_slots(ty);
+            install_native_method_slots(ty, &slot_symbols);
         }
         install_builtin_slots(&mut types);
         for ty in &mut types {
@@ -815,7 +851,7 @@ impl Default for TypeRegistry {
         }
         types[BuiltinType::Bool as usize].local_slots = bool_local;
         resolve_builtin_slots(&mut types);
-        install_slot_wrappers(&mut types);
+        install_slot_wrappers(&mut types, &slot_symbols);
         // Mutable containers publish `__hash__ = None`, which is how `collections.abc.Hashable`
         // and user code detect that they are unhashable.
         for builtin in [
@@ -824,9 +860,10 @@ impl Default for TypeRegistry {
             BuiltinType::Set,
             BuiltinType::ByteArray,
         ] {
-            types[builtin as usize]
-                .attributes
-                .insert("__hash__".into(), Ref::from_immediate(Value::None));
+            types[builtin as usize].attributes.insert(
+                symbols.intern_builtin("__hash__"),
+                Ref::from_immediate(Value::None),
+            );
         }
         let builtin_bytes = types
             .iter()
@@ -834,23 +871,22 @@ impl Default for TypeRegistry {
             .fold(0u64, u64::saturating_add);
         let mut registry = Self {
             types,
+            slot_symbols,
             value_kinds: Vec::new(),
             exception_types: HashMap::new(),
             exception_names: HashMap::new(),
             modeled_bytes: builtin_bytes,
         };
         for kind in super::stdlib::value_kinds() {
-            registry.register_value_kind(kind);
+            registry.register_value_kind(symbols, kind);
         }
-        registry.register_exception_types();
+        registry.register_exception_types(symbols);
         registry
     }
-}
 
-impl TypeRegistry {
     /// Builtin exception classes keep their public values while sharing the registry's C3 MRO.
     /// Registering them after value kinds preserves the compact registered-value indices.
-    fn register_exception_types(&mut self) {
+    fn register_exception_types(&mut self, symbols: &mut Symbols) {
         use super::vm::{ExceptionType, NativeValue};
 
         let base = BuiltinType::Exception.id();
@@ -861,7 +897,7 @@ impl TypeRegistry {
         let base_type = &mut self.types[base.raw() as usize];
         let before = modeled_type_bytes(base_type);
         base_type.attributes.insert(
-            "__dict__".into(),
+            symbols.intern_builtin("__dict__"),
             Ref::from_immediate(Value::Native(NativeValue::NativeGetter(
                 &super::stdlib::core::INSTANCE_DICT_GETTER,
             ))),
@@ -891,13 +927,13 @@ impl TypeRegistry {
                 kind: TypeKind::Builtin,
                 bases,
                 mro: mro.clone(),
-                attributes: HashMap::new(),
+                attributes: Namespace::default(),
                 local_slots: TypeSlots::default(),
                 slots: self.inherit_slots(TypeSlots::default(), &mro),
                 value: Some(value),
             };
             if definition.name == super::stdlib::core::OS_ERROR_TYPE.name {
-                install_native_attributes(&mut ty, &super::stdlib::core::OS_ERROR_TYPE);
+                install_native_attributes(symbols, &mut ty, &super::stdlib::core::OS_ERROR_TYPE);
             }
             let id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
             self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
@@ -974,17 +1010,17 @@ impl TypeRegistry {
         name: String,
         bases: Vec<TypeId>,
         mro: Vec<TypeId>,
-        attributes: &HashMap<String, Ref>,
+        attributes: &Namespace,
     ) -> PyResult<TypeId> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
-        let local_slots = TypeSlots::from_attributes(TypeId(index), attributes);
+        let local_slots = TypeSlots::from_attributes(TypeId(index), attributes, &self.slot_symbols);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
         let ty = PyType {
             name,
             kind: TypeKind::Class,
             bases,
             mro,
-            attributes: HashMap::new(),
+            attributes: Namespace::default(),
             local_slots,
             slots,
             value: None,
@@ -1028,9 +1064,9 @@ impl TypeRegistry {
 
     /// Recompute a user type's slots from its class attributes after one of them changed,
     /// inheriting the rest through its MRO as [`TypeRegistry::register`] does.
-    pub fn replace_slots(&mut self, id: TypeId, attributes: &HashMap<String, Ref>) -> PyResult<()> {
+    pub fn replace_slots(&mut self, id: TypeId, attributes: &Namespace) -> PyResult<()> {
         let mro = self.get(id)?.mro.clone();
-        let local_slots = TypeSlots::from_attributes(id, attributes);
+        let local_slots = TypeSlots::from_attributes(id, attributes, &self.slot_symbols);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
         let ty = self
             .types
@@ -1096,7 +1132,11 @@ impl TypeRegistry {
     /// Register a module-owned value kind after its bases, linearizing them with C3 as a class
     /// statement would. Slots and attributes not defined by the kind are inherited through the
     /// MRO, so `np.float64` finds `float` methods.
-    fn register_value_kind(&mut self, kind: &'static super::native::ValueKindDef) {
+    fn register_value_kind(
+        &mut self,
+        symbols: &mut Symbols,
+        kind: &'static super::native::ValueKindDef,
+    ) {
         use super::native::KindBase;
         let object = BuiltinType::Object.id();
         let type_id = TypeId(u32::try_from(self.types.len()).expect("too many registered types"));
@@ -1145,15 +1185,15 @@ impl TypeRegistry {
             kind: TypeKind::ValueKind,
             bases,
             mro,
-            attributes: HashMap::new(),
+            attributes: Namespace::default(),
             local_slots,
             slots,
             value: Some(Ref::from_immediate(Value::Native(
                 super::vm::NativeValue::ValueKind(kind),
             ))),
         };
-        insert_native_attributes(&mut ty, kind.methods, kind.getters);
-        install_slot_wrappers_for_type(&mut ty, type_id);
+        insert_native_attributes(symbols, &mut ty, kind.methods, kind.getters);
+        install_slot_wrappers_for_type(&mut ty, type_id, &self.slot_symbols);
         self.modeled_bytes = self.modeled_bytes.saturating_add(modeled_type_bytes(&ty));
         self.types.push(ty);
         self.value_kinds.push(kind);
@@ -1357,7 +1397,11 @@ fn builtin_metadata(builtin: BuiltinType) -> (Vec<TypeId>, Vec<TypeId>) {
     }
 }
 
-fn install_native_attributes(ty: &mut PyType, definition: &'static super::native::NativeTypeDef) {
+fn install_native_attributes(
+    symbols: &mut Symbols,
+    ty: &mut PyType,
+    definition: &'static super::native::NativeTypeDef,
+) {
     debug_assert_eq!(ty.name, definition.name);
     debug_assert!(definition
         .methods
@@ -1367,23 +1411,24 @@ fn install_native_attributes(ty: &mut PyType, definition: &'static super::native
         .getters
         .iter()
         .all(|getter| getter.owner == definition.name));
-    insert_native_attributes(ty, definition.methods, definition.getters);
+    insert_native_attributes(symbols, ty, definition.methods, definition.getters);
 }
 
 fn insert_native_attributes(
+    symbols: &mut Symbols,
     ty: &mut PyType,
     methods: &'static [super::native::MethodDef],
     getters: &'static [super::native::GetterDef],
 ) {
     for method in methods {
         ty.attributes.insert(
-            method.name.into(),
+            symbols.intern_builtin(method.name),
             Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeMethod(method))),
         );
     }
     for getter in getters {
         ty.attributes.insert(
-            getter.name.into(),
+            symbols.intern_builtin(getter.name),
             Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeGetter(getter))),
         );
     }
@@ -1391,8 +1436,8 @@ fn insert_native_attributes(
 
 /// Native methods with protocol names participate in the same slot resolution as user methods.
 /// Specialized builtin slots installed later replace these when a direct implementation exists.
-fn install_native_method_slots(ty: &mut PyType) {
-    for (slot, name, _) in SLOT_DEFS {
+fn install_native_method_slots(ty: &mut PyType, slot_symbols: &[(Slot, SymbolId)]) {
+    for &(slot, symbol) in slot_symbols {
         if !matches!(
             slot,
             Slot::Call
@@ -1408,7 +1453,7 @@ fn install_native_method_slots(ty: &mut PyType) {
         }
         if let Some(method) =
             ty.attributes
-                .get(name)
+                .get(symbol)
                 .and_then(|value| match value.immediate()?.native_value() {
                     Some(super::vm::NativeValue::NativeMethod(method)) => Some(method),
                     _ => None,
@@ -1420,11 +1465,15 @@ fn install_native_method_slots(ty: &mut PyType) {
 }
 
 /// Install methods such as `dict.fromkeys` that receive the type rather than an instance.
-fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::native::MethodDef]) {
+fn install_native_class_methods(
+    symbols: &mut Symbols,
+    ty: &mut PyType,
+    methods: &'static [super::native::MethodDef],
+) {
     debug_assert!(methods.iter().all(|method| method.type_name == ty.name));
     for method in methods {
         ty.attributes.insert(
-            method.name.into(),
+            symbols.intern_builtin(method.name),
             Ref::from_immediate(Value::Native(super::vm::NativeValue::NativeClassMethod(
                 method,
             ))),
@@ -1438,24 +1487,29 @@ fn install_native_class_methods(ty: &mut PyType, methods: &'static [super::nativ
 ///
 /// The builtin namespace contains only methods defined by that type. Lookup walks the MRO,
 /// so `bool` inherits integer methods without copying their entries.
-fn install_number_attributes(types: &mut [PyType]) {
+fn install_number_attributes(symbols: &mut Symbols, types: &mut [PyType]) {
     install_native_attributes(
+        symbols,
         &mut types[BuiltinType::Int as usize],
         &super::number::INT_TYPE,
     );
     install_native_attributes(
+        symbols,
         &mut types[BuiltinType::Int as usize],
         &super::number::INT_CONSTRUCTOR,
     );
     install_native_class_methods(
+        symbols,
         &mut types[BuiltinType::Int as usize],
         super::number::INT_CLASS_METHODS,
     );
     install_native_attributes(
+        symbols,
         &mut types[BuiltinType::Float as usize],
         &super::number::FLOAT_TYPE,
     );
     install_native_attributes(
+        symbols,
         &mut types[BuiltinType::Complex as usize],
         &super::complex::COMPLEX_TYPE,
     );
@@ -2193,15 +2247,19 @@ fn resolve_builtin_slots(types: &mut [PyType]) {
     }
 }
 
-fn install_slot_wrappers(types: &mut [PyType]) {
+fn install_slot_wrappers(types: &mut [PyType], slot_symbols: &[(Slot, SymbolId)]) {
     for (index, ty) in types.iter_mut().enumerate() {
         let id = TypeId(u32::try_from(index).expect("too many builtin types"));
-        install_slot_wrappers_for_type(ty, id);
+        install_slot_wrappers_for_type(ty, id, slot_symbols);
     }
 }
 
-fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
-    for (slot, name, _) in SLOT_DEFS {
+fn install_slot_wrappers_for_type(
+    ty: &mut PyType,
+    owner: TypeId,
+    slot_symbols: &[(Slot, SymbolId)],
+) {
+    for &(slot, symbol) in slot_symbols {
         if matches!(
             ty.local_slots.get(slot),
             Some(
@@ -2212,13 +2270,15 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
                     | SlotValue::VmHash
                     | SlotValue::NativeCompare(_)
             )
-        ) {
-            ty.attributes.entry(name.into()).or_insert_with(|| {
+        ) && !ty.attributes.contains(symbol)
+        {
+            ty.attributes.insert(
+                symbol,
                 Ref::from_immediate(Value::Native(super::vm::NativeValue::SlotWrapper {
                     owner,
                     slot,
-                }))
-            });
+                })),
+            );
         }
     }
 }
@@ -2235,9 +2295,13 @@ fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Valu
 mod tests {
     use super::*;
 
+    fn registry() -> TypeRegistry {
+        TypeRegistry::new(&mut Symbols::default())
+    }
+
     #[test]
     fn bootstrap_builds_bool_int_hierarchy_and_slots() {
-        let registry = TypeRegistry::default();
+        let registry = registry();
         assert!(registry
             .is_subclass(BuiltinType::Bool.id(), BuiltinType::Int.id())
             .unwrap());
@@ -2261,7 +2325,7 @@ mod tests {
 
     #[test]
     fn registered_bases_use_c3_order_and_reject_conflicts() {
-        let registry = TypeRegistry::default();
+        let registry = registry();
         assert_eq!(
             registry
                 .linearize_bases(&[BuiltinType::Bool.id(), BuiltinType::Int.id()])
@@ -2282,7 +2346,7 @@ mod tests {
 
     #[test]
     fn exception_types_have_distinct_registry_ids_and_multiple_ancestors() {
-        let registry = TypeRegistry::default();
+        let registry = registry();
         let axis = registry.exception_type_id("AxisError").unwrap();
         let value = registry.exception_type_id("ValueError").unwrap();
         let index = registry.exception_type_id("IndexError").unwrap();
@@ -2294,7 +2358,8 @@ mod tests {
 
     #[test]
     fn modeled_memory_counts_builtin_and_registered_types() {
-        let mut registry = TypeRegistry::default();
+        let mut symbols = Symbols::default();
+        let mut registry = TypeRegistry::new(&mut symbols);
         let builtin_bytes = registry
             .types
             .iter()
@@ -2310,16 +2375,19 @@ mod tests {
         assert_eq!(registry.modeled_bytes(), builtin_bytes + value_kind_bytes);
 
         let before = registry.modeled_bytes();
+        let value = symbols.intern_builtin("value");
         let id = registry
             .register(
                 "Example".into(),
                 vec![BuiltinType::Object.id()],
                 vec![BuiltinType::Object.id()],
-                &HashMap::from([("value".into(), Ref::from_immediate(Value::Int(1)))]),
+                &[(value, Ref::from_immediate(Value::Int(1)))]
+                    .into_iter()
+                    .collect(),
             )
             .unwrap();
         let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
-        assert_eq!(registry.get(id).unwrap().attributes.get("value"), None);
+        assert_eq!(registry.get(id).unwrap().attributes.get(value), None);
         assert_eq!(
             registry.modeled_bytes(),
             before.saturating_add(registered_bytes)

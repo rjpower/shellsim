@@ -15,7 +15,7 @@ use std::collections::HashMap;
 
 use crate::resources::Resources;
 
-use super::heap::{Heap, InstanceAttributes, Ref, Roots, Value};
+use super::heap::{Heap, InstanceAttributes, Namespace, Ref, Roots, Value};
 use super::object_model::TypeId;
 use super::symbols::{SymbolId, Symbols};
 use crate::python::error::{PyError, PyResult};
@@ -75,7 +75,7 @@ impl Default for Shapes {
 /// The storage an instance's attributes live in, or the empty shape before its first write.
 enum Storage<'h> {
     Shaped { shape: ShapeId, len: usize },
-    Dictionary(&'h HashMap<SymbolId, Ref>),
+    Dictionary(&'h Namespace),
 }
 
 fn storage<'h>(heap: &'h Heap, instance: Value) -> PyResult<Storage<'h>> {
@@ -98,9 +98,8 @@ impl Shapes {
         std::mem::take(&mut self.modeled_bytes)
     }
 
-    /// Snapshot the names stored directly on an instance in either attribute representation.
-    /// Shaped instances list names in the order they were first assigned; dictionary instances
-    /// (after a deletion or many attributes) list them sorted, since their storage is unordered.
+    /// Snapshot the names stored directly on an instance in either attribute representation,
+    /// in the order they were first assigned.
     pub fn attribute_names(
         &self,
         heap: &Heap,
@@ -119,19 +118,10 @@ impl Shapes {
                         .ok_or_else(|| "invalid instance attribute symbol".into())
                 })
                 .collect(),
-            Storage::Dictionary(values) => {
-                let mut names = values
-                    .keys()
-                    .map(|symbol| {
-                        symbols
-                            .name(*symbol)
-                            .map(str::to_string)
-                            .ok_or_else(|| String::from("invalid instance attribute symbol"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                names.sort();
-                Ok(names)
-            }
+            Storage::Dictionary(values) => Ok(values
+                .symbols()
+                .map(|symbol| symbols.issued(symbol).to_string())
+                .collect()),
         }
     }
 
@@ -164,7 +154,7 @@ impl Shapes {
     ) -> PyResult<Option<Value>> {
         let slot = match heap.attributes(instance)? {
             None => None,
-            Some(InstanceAttributes::Dictionary(values)) => values.get(&symbol),
+            Some(InstanceAttributes::Dictionary(values)) => values.get(symbol),
             Some(InstanceAttributes::Shaped { shape, values }) => {
                 self.slot(*shape, symbol).and_then(|slot| values.get(slot))
             }
@@ -304,7 +294,7 @@ impl AttributeStore<'_> {
     ) -> PyResult<()> {
         match storage(self.heap, instance)? {
             Storage::Dictionary(values) => {
-                let growth = if values.contains_key(&symbol) {
+                let growth = if values.contains(symbol) {
                     0
                 } else {
                     INSTANCE_DICT_ENTRY_BYTES
@@ -383,7 +373,7 @@ impl AttributeStore<'_> {
             let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
                 unreachable!("instance was converted to dictionary storage")
             };
-            values.remove(&symbol)
+            values.remove(symbol)
         })?;
         Ok(self.heap.value_optional(removed.as_ref()))
     }
@@ -438,7 +428,7 @@ impl AttributeStore<'_> {
             let values = names
                 .into_iter()
                 .zip(std::mem::take(values))
-                .collect::<HashMap<_, _>>();
+                .collect::<Namespace>();
             **attributes = InstanceAttributes::Dictionary(Box::new(values));
         })?;
         Ok(true)

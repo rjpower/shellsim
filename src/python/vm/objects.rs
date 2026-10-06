@@ -4,15 +4,15 @@ use std::collections::BTreeSet;
 
 use super::super::attributes;
 use super::super::heap::{ClassObject, DictViewKind, FunctionObject, NamespaceTarget, ProxyTarget};
-use super::super::heap::{InstanceAttributes, Ref};
+use super::super::heap::{InstanceAttributes, Namespace, Ref};
 use super::super::scopes;
 use super::namespace::{NamespaceHandle, ProxyHandle};
 use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, ClassDefinition, ClassField,
-    ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
-    NativeValue, Object, PyError, PyRuntime, Resolved, SiteCache, SlicePlan, Slot, SlotValue,
-    SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, NativeValue, Object,
+    PyError, PyRuntime, Resolved, SiteCache, SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value,
+    Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
 use crate::python::error::PyResult;
 
@@ -28,7 +28,8 @@ enum ContainerItems {
     Dict(Vec<(Value, Value)>),
 }
 
-/// Modeled bytes for one class attribute added after the class statement, beyond its name.
+/// Modeled bytes for one class attribute added after the class statement; the symbol table
+/// charges its name.
 const CLASS_ATTRIBUTE_BYTES: u64 = 48;
 
 /// Container nesting bound for `repr()`, matching the VM's call-depth limit.
@@ -656,7 +657,7 @@ impl<'s> Vm<'s> {
         if owner.is_object() {
             match self.get(owner)? {
                 Object::Module { scope, .. } => {
-                    let namespace = self.module_namespace(self.value(scope))?;
+                    let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
                     if let Some(value) = self.namespace_lookup(namespace, name)? {
                         return Ok(Some(value));
                     }
@@ -673,7 +674,7 @@ impl<'s> Vm<'s> {
                 Object::Function(function_object) => {
                     let FunctionObject {
                         name: function_name,
-                        closure,
+                        globals,
                         attributes,
                         ..
                     } = &**function_object;
@@ -681,7 +682,7 @@ impl<'s> Vm<'s> {
                         let function_name = function_name.clone();
                         return Ok(Some(self.allocate_string(function_name)?));
                     }
-                    if let Some(value) = attributes.get(name) {
+                    if let Some(value) = attributes.get_name(&self.state.symbols, name) {
                         return Ok(Some(self.value(value)));
                     }
                     if name == "__doc__" {
@@ -691,8 +692,8 @@ impl<'s> Vm<'s> {
                         return Ok(Some(self.allocate_string(docstring.to_string())?));
                     }
                     if name == "__module__" {
-                        let closure = self.value_optional(closure.as_ref());
-                        return self.module_name_of(closure);
+                        let globals = self.value(globals);
+                        return self.scope_get_name(globals, "__name__");
                     }
                 }
                 Object::Class { .. } => {
@@ -847,7 +848,7 @@ impl<'s> Vm<'s> {
                         .alloc(Object::MappingProxy(ProxyTarget::Class(Ref::from(owner))))
                         .map(Some),
                     Object::Module { scope, .. } => {
-                        let namespace = self.module_namespace(self.value(scope))?;
+                        let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
                         self.alloc(Object::NamespaceDict(namespace.store()))
                             .map(Some)
                     }
@@ -876,9 +877,11 @@ impl<'s> Vm<'s> {
                         let name = class_object.name.clone();
                         self.allocate_string(name).map(Some)
                     }
-                    TypeMetadata::Module => {
-                        Ok(self.value_optional(class_object.attributes.get("__module__")))
-                    }
+                    TypeMetadata::Module => Ok(self.value_optional(
+                        class_object
+                            .attributes
+                            .get_name(&self.state.symbols, "__module__"),
+                    )),
                     TypeMetadata::Bases => self.class_metadata(owner, "__bases__"),
                     TypeMetadata::Mro => self.class_metadata(owner, "__mro__"),
                 };
@@ -954,14 +957,14 @@ impl<'s> Vm<'s> {
             if owner.is_object() {
                 match self.get(owner)? {
                     Object::Class { .. } => {
-                        return self.set_class_attribute(owner, name, Some(value))
+                        return self.set_class_attribute(owner, symbol, name, Some(value))
                     }
                     Object::Function { .. } => {
-                        return self.set_function_attribute(owner, name, Some(value))
+                        return self.set_function_attribute(owner, symbol, name, Some(value))
                     }
                     Object::Module { scope, .. } => {
-                        let namespace = self.module_namespace(self.value(scope))?;
-                        return self.namespace_store(namespace, name.to_string(), value);
+                        let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
+                        return self.namespace_store(namespace, name, value);
                     }
                     _ => {}
                 }
@@ -1076,7 +1079,7 @@ impl<'s> Vm<'s> {
             self.namespace_delete(NamespaceHandle::Instance(instance), &name)?;
         }
         for (name, value) in entries {
-            self.namespace_store(NamespaceHandle::Instance(instance), name, value)?;
+            self.namespace_store(NamespaceHandle::Instance(instance), &name, value)?;
         }
         Ok(())
     }
@@ -1124,10 +1127,12 @@ impl<'s> Vm<'s> {
                 }
                 return Ok(());
             }
-            Object::Class { .. } => return self.set_class_attribute(owner, name, None),
-            Object::Function { .. } => return self.set_function_attribute(owner, name, None),
+            Object::Class { .. } => return self.set_class_attribute(owner, symbol, name, None),
+            Object::Function { .. } => {
+                return self.set_function_attribute(owner, symbol, name, None)
+            }
             Object::Module { scope, .. } => {
-                let namespace = self.module_namespace(self.value(scope))?;
+                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
                 if self.namespace_delete(namespace, name)?.is_none() {
                     return Err(self.missing_attribute(&owner, name));
                 }
@@ -1184,15 +1189,12 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// Assign (`Some`) or delete (`None`) a class attribute after the class statement. The
-    /// slots derived from dunder methods are recomputed for the class and its subclasses, and
-    /// cached instance lookups are dropped, since a new data descriptor can shadow an instance
-    /// attribute.
     /// Assign (`Some`) or delete (`None`) an attribute of a function object. `__name__` renames
     /// the function; every other name lives in the function's own `__dict__`.
     fn set_function_attribute(
         &mut self,
         function: Value,
+        symbol: SymbolId,
         name: &str,
         value: Option<Value>,
     ) -> PyResult<()> {
@@ -1219,21 +1221,18 @@ impl<'s> Vm<'s> {
             return Err("function attribute store on a non-function".into());
         };
         let FunctionObject { attributes, .. } = &**function_object;
-        let exists = attributes.contains_key(name);
+        let exists = attributes.contains(symbol);
         match value {
             Some(value) => {
                 if !exists {
-                    let bytes = u64::try_from(name.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(MODELED_MAPPING_ENTRY_BYTES);
-                    self.reserve_object_growth(function, bytes)?;
+                    self.reserve_object_growth(function, MODELED_MAPPING_ENTRY_BYTES)?;
                 }
                 self.modify(function, |object| {
                     let Object::Function(function_object) = object else {
                         unreachable!("checked above")
                     };
                     let FunctionObject { attributes, .. } = &mut **function_object;
-                    attributes.insert(name.to_string(), Ref::from(value));
+                    attributes.insert(symbol, Ref::from(value));
                 })?;
             }
             None if exists => {
@@ -1241,7 +1240,7 @@ impl<'s> Vm<'s> {
                     unreachable!("checked above")
                 };
                 let FunctionObject { attributes, .. } = &mut **function_object;
-                attributes.remove(name);
+                attributes.remove(symbol);
             }
             None => {
                 let message = format!("'function' object has no attribute '{name}'");
@@ -1251,9 +1250,14 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
+    /// Assign (`Some`) or delete (`None`) a class attribute after the class statement. The
+    /// slots derived from dunder methods are recomputed for the class and its subclasses, and
+    /// cached instance lookups are dropped, since a new data descriptor can shadow an instance
+    /// attribute.
     fn set_class_attribute(
         &mut self,
         class: Value,
+        symbol: SymbolId,
         name: &str,
         value: Option<Value>,
     ) -> PyResult<()> {
@@ -1266,26 +1270,21 @@ impl<'s> Vm<'s> {
         let (attributes, instance_type) = (&class_object.attributes, class_object.instance_type);
         match value {
             Some(value) => {
-                if !attributes.contains_key(name) {
-                    let bytes = u64::try_from(name.len())
-                        .unwrap_or(u64::MAX)
-                        .saturating_add(CLASS_ATTRIBUTE_BYTES);
-                    self.reserve_object_growth(class, bytes)?;
+                if !attributes.contains(symbol) {
+                    self.reserve_object_growth(class, CLASS_ATTRIBUTE_BYTES)?;
                 }
                 self.modify(class, |object| {
                     let Object::Class(class_object) = object else {
                         unreachable!("checked above")
                     };
-                    class_object
-                        .attributes
-                        .insert(name.to_string(), Ref::from(value));
+                    class_object.attributes.insert(symbol, Ref::from(value));
                 })?;
             }
             None => {
                 let Object::Class(class_object) = self.get_mut(class)? else {
                     unreachable!("checked above")
                 };
-                if class_object.attributes.remove(name).is_none() {
+                if class_object.attributes.remove(symbol).is_none() {
                     return Err(self.missing_attribute(&class, name));
                 }
             }
@@ -2028,22 +2027,24 @@ impl<'s> Vm<'s> {
             .split_off(&self.state.heap, defaults_start);
         // A function defined in a class body closes over the body's enclosing scope: class
         // attributes are not visible as free names.
-        let mut closure = self.lookup_scope();
-        let in_class_body = self
+        let frame = self
             .bytecode_frames
             .last()
-            .is_some_and(|frame| frame.class_body);
-        if let (Some(scope), true) = (closure, in_class_body) {
-            closure = scopes::parent(self.heap(), scope)?;
-        }
+            .ok_or("functions are created by running Python code")?;
+        let (scope, globals) = (self.value(&frame.scope), self.value(&frame.globals));
+        let closure = match frame.class_body {
+            true => scopes::parent(self.heap(), scope)?.ok_or("a class body has a parent scope")?,
+            false => scope,
+        };
         let function = self.alloc({
             Object::Function(Box::new(FunctionObject {
                 name: name.clone(),
                 code,
-                closure: Ref::optional(closure),
+                closure: Ref::from(closure),
+                globals: Ref::from(globals),
                 defaults: Ref::all(defaults),
                 defining_class: None,
-                attributes: HashMap::new(),
+                attributes: Namespace::default(),
             }))
         })?;
         self.push(function);
@@ -2265,7 +2266,7 @@ impl<'s> Vm<'s> {
             return Err("metaclass must derive from type".into());
         }
         let mro = self.linearize_bases(&user_bases)?;
-        let mut prepared_namespace = HashMap::new();
+        let mut prepared = Vec::new();
         if metaclass.is_object() {
             if let Some((owner, prepare)) = self.class_attribute_entry(metaclass, "__prepare__")? {
                 let prepare = self.bind_descriptor(prepare, None, metaclass, owner)?;
@@ -2286,26 +2287,23 @@ impl<'s> Vm<'s> {
                     let Some(key) = string::string_value(&self.state.heap, key)? else {
                         return Err("metaclass namespace keys must be strings".into());
                     };
-                    prepared_namespace.insert(key, value);
+                    prepared.push((self.intern_symbol(&key)?, value));
                 }
             }
         }
         // The class body starts with `__module__` bound to the defining module's `__name__`, as
         // CPython's compiler arranges, so a metaclass `__new__` running in another module does
         // not relabel the class.
-        if !prepared_namespace.contains_key("__module__") {
+        let module_symbol = self.intern_symbol("__module__")?;
+        if !prepared.iter().any(|(symbol, _)| *symbol == module_symbol) {
             if let Some(module) = self.current_module_name()? {
-                prepared_namespace.insert("__module__".into(), module);
+                prepared.push((module_symbol, module));
             }
         }
         let parent = self.lookup_scope();
-        let uses_repl_globals = parent
-            .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
-            .transpose()?
-            .unwrap_or(true);
-        let scope =
-            self.alloc_scope_named(parent, uses_repl_globals, Arc::from([]), prepared_namespace)?;
-        let execution = self.execute_code(code, FrameEntry::class_body(scope));
+        let globals = self.current_globals()?;
+        let scope = self.alloc_scope(parent, Arc::from([]), Vec::new(), prepared)?;
+        let execution = self.execute_code(code, FrameEntry::class_body(scope, globals));
         match execution {
             Ok(Flow::Halt) => {}
             Ok(Flow::Return(_)) => return Err("'return' outside function".into()),
@@ -2323,55 +2321,65 @@ impl<'s> Vm<'s> {
                 }))
             }
         }
-        let bindings = scopes::bound_names(self.heap(), scope)?;
-        let mut attributes = scopes::values(self.heap(), scope)?;
-        if !attributes.contains_key("__doc__") {
+        // The class namespace is the body's scope, in binding order. Its values stay pinned
+        // until the class statement finishes.
+        let mut attributes = scopes::entries(self.heap(), scope)?
+            .into_iter()
+            .map(|(symbol, value)| (symbol, Ref::from(value)))
+            .collect::<Namespace>();
+        let doc_symbol = self.intern_symbol("__doc__")?;
+        if !attributes.contains(doc_symbol) {
             let docstring = match code.docstring.clone() {
                 Some(text) => self.allocate_string(text.to_string())?,
                 None => Value::None,
             };
-            attributes.insert("__doc__".into(), docstring);
+            attributes.insert(doc_symbol, Ref::from(docstring));
         }
         if is_named_tuple {
-            let class = self.named_tuple_class(&name, fields, &bindings, attributes)?;
+            let class = self.named_tuple_class(&name, fields, &attributes)?;
             self.push(class);
             return Ok(());
         }
         let dataclass_fields = fields
             .iter()
-            .map(|field| (field.name.clone(), attributes.get(&field.name).cloned()))
+            .map(|field| {
+                let value = self
+                    .symbol_id(&field.name)
+                    .and_then(|symbol| attributes.get(symbol));
+                (field.name.clone(), self.value_optional(value))
+            })
             .collect::<Vec<_>>();
         let mut enum_members = Vec::new();
         if is_enum {
-            for member_name in bindings {
-                if member_name.starts_with('_') {
+            for (symbol, value) in attributes.iter() {
+                if self.symbol_name(symbol).starts_with('_') {
                     continue;
                 }
-                let Some(value) = attributes.get(&member_name).cloned() else {
-                    continue;
-                };
+                let value = self.value(value);
                 if value.is_object() && matches!(self.get(value), Ok(Object::Function { .. })) {
                     continue;
                 }
-                enum_members.push((member_name, value));
+                enum_members.push((symbol, value));
             }
             // An enum that mixes in a data type keeps Enum's repr and str, which the data type
             // would otherwise shadow in the MRO. CPython's EnumType.__new__ makes the same
             // substitution for methods the class body does not define.
             if matches!(layout, ClassLayout::Builtin(_)) {
                 for (name, slot) in [("__repr__", Slot::Repr), ("__str__", Slot::String)] {
-                    attributes.entry(name.into()).or_insert(Value::Native(
-                        NativeValue::SlotWrapper {
+                    let symbol = self.intern_symbol(name)?;
+                    if !attributes.contains(symbol) {
+                        let wrapper = Value::Native(NativeValue::SlotWrapper {
                             owner: BuiltinType::Enum.id(),
                             slot,
-                        },
-                    ));
+                        });
+                        attributes.insert(symbol, Ref::from(wrapper));
+                    }
                 }
             }
         }
         let descriptor_candidates = attributes
             .iter()
-            .map(|(name, value)| (name.clone(), *value))
+            .map(|(symbol, value)| (symbol, self.value(value)))
             .collect::<Vec<_>>();
         let class = if metaclass.is_object() {
             if let Some((owner, constructor)) = self.class_attribute_entry(metaclass, "__new__")? {
@@ -2380,8 +2388,9 @@ impl<'s> Vm<'s> {
                 let class_name = self.allocate_string(name.clone())?;
                 let bases_value = self.alloc(Object::Tuple(Ref::all(bases.clone())))?;
                 let mut namespace_entries = Vec::with_capacity(descriptor_candidates.len());
-                for (attribute_name, value) in &descriptor_candidates {
-                    namespace_entries.push((self.allocate_string(attribute_name.clone())?, *value));
+                for (symbol, value) in &descriptor_candidates {
+                    let name = self.symbol_name(*symbol).to_string();
+                    namespace_entries.push((self.allocate_string(name)?, *value));
                 }
                 let namespace = self.allocate_dict(namespace_entries)?;
                 self.invoke_value(constructor, vec![class_name, bases_value, namespace])?
@@ -2438,7 +2447,8 @@ impl<'s> Vm<'s> {
                     self.bind_descriptor(initializer, Some(class), metaclass, owner)?;
                 let bases = self.alloc(Object::Tuple(Ref::all(bases)))?;
                 let mut entries = Vec::with_capacity(descriptor_candidates.len());
-                for (name, value) in descriptor_candidates {
+                for (symbol, value) in descriptor_candidates {
+                    let name = self.symbol_name(symbol).to_string();
                     entries.push((self.allocate_string(name)?, value));
                 }
                 let namespace = self.allocate_dict(entries)?;
@@ -2459,11 +2469,10 @@ impl<'s> Vm<'s> {
         &mut self,
         name: &str,
         fields: &[ClassField],
-        bindings: &[String],
-        mut attributes: HashMap<String, Value>,
+        attributes: &Namespace,
     ) -> PyResult<Value> {
-        let module = match attributes.get("__module__") {
-            Some(module) => *module,
+        let module = match attributes.get_name(&self.state.symbols, "__module__") {
+            Some(module) => self.value(module),
             None => self.current_module_name()?.unwrap_or(Value::None),
         };
         // A name annotated twice keeps its first position, as in `__annotations__`.
@@ -2477,18 +2486,11 @@ impl<'s> Vm<'s> {
         for name in names {
             field_names.push(self.allocate_string(name.to_string())?);
         }
-        // Names bound by the class body keep their order; any others follow sorted, so the
-        // namespace never depends on hash order.
         let mut entries = Vec::with_capacity(attributes.len());
-        for binding in bindings {
-            if let Some(value) = attributes.remove(binding) {
-                entries.push((self.allocate_string(binding.clone())?, value));
-            }
-        }
-        let mut rest = attributes.into_iter().collect::<Vec<_>>();
-        rest.sort_by(|left, right| left.0.cmp(&right.0));
-        for (key, value) in rest {
-            entries.push((self.allocate_string(key)?, value));
+        for (symbol, value) in attributes.iter() {
+            let value = self.value(value);
+            let key = self.allocate_string(self.symbol_name(symbol).to_string())?;
+            entries.push((key, value));
         }
         let class_name = self.allocate_string(name.to_string())?;
         let field_names = self.alloc(Object::Tuple(Ref::all(field_names)))?;
@@ -2625,36 +2627,13 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// The `__name__` global of the module whose code is running.
-    /// The namespace a module object's attributes live in. The `__main__` module's scope defers
-    /// to the script's global table, so its attributes are the script's globals.
-    pub(super) fn module_namespace(
-        &self,
-        scope: Value,
-    ) -> PyResult<super::namespace::NamespaceHandle> {
-        if scopes::uses_repl_globals(self.heap(), scope)? {
-            Ok(super::namespace::NamespaceHandle::Repl)
-        } else {
-            Ok(super::namespace::NamespaceHandle::Scope(scope))
-        }
-    }
-
+    /// The `__name__` global of the module whose code is running, if any code is.
     fn current_module_name(&mut self) -> PyResult<Option<Value>> {
-        let scope = self.lookup_scope();
-        self.module_name_of(scope)
-    }
-
-    /// The `__name__` global of the module that owns `scope`; `None` is the main script's
-    /// global namespace.
-    pub(super) fn module_name_of(&mut self, scope: Option<Value>) -> PyResult<Option<Value>> {
-        if let Some(scope) = scope {
-            let root = scopes::root(self.heap(), scope)?;
-            if !scopes::uses_repl_globals(self.heap(), root)? {
-                return self.scope_get(root, "__name__");
-            }
-        }
-        let symbol = self.intern_symbol("__name__")?;
-        Ok(self.state.globals.get(&self.state.heap, symbol))
+        let Some(frame) = self.bytecode_frames.last() else {
+            return Ok(None);
+        };
+        let globals = self.value(&frame.globals);
+        self.scope_get_name(globals, "__name__")
     }
 
     pub(super) fn allocate_class(&mut self, definition: ClassDefinition) -> PyResult<Value> {
@@ -2671,23 +2650,25 @@ impl<'s> Vm<'s> {
         } = definition;
         // A heap class introduces the instance-dictionary descriptor when no heap ancestor
         // already supplies it. Metaclasses inherit type's own descriptor instead.
-        if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains_key("__dict__") {
-            attributes.insert(
-                "__dict__".into(),
-                Value::Native(NativeValue::NativeGetter(
-                    &super::super::stdlib::core::INSTANCE_DICT_GETTER,
-                )),
-            );
+        let dict_symbol = self.intern_symbol("__dict__")?;
+        if mro.is_empty() && layout != ClassLayout::Type && !attributes.contains(dict_symbol) {
+            let getter = Value::Native(NativeValue::NativeGetter(
+                &super::super::stdlib::core::INSTANCE_DICT_GETTER,
+            ));
+            attributes.insert(dict_symbol, Ref::from(getter));
         }
         // As in CPython, a class records the defining module's `__name__` unless its namespace
         // already sets `__module__`.
-        if !attributes.contains_key("__module__") {
+        let module_symbol = self.intern_symbol("__module__")?;
+        if !attributes.contains(module_symbol) {
             if let Some(module) = self.current_module_name()? {
-                attributes.insert("__module__".into(), module);
+                attributes.insert(module_symbol, Ref::from(module));
             }
         }
-        if attributes.contains_key("__eq__") && !attributes.contains_key("__hash__") {
-            attributes.insert("__hash__".into(), Value::None);
+        let eq_symbol = self.intern_symbol("__eq__")?;
+        let hash_symbol = self.intern_symbol("__hash__")?;
+        if attributes.contains(eq_symbol) && !attributes.contains(hash_symbol) {
+            attributes.insert(hash_symbol, Ref::from(Value::None));
         }
         let mut type_bases = Vec::new();
         for base in &bases {
@@ -2712,7 +2693,7 @@ impl<'s> Vm<'s> {
             .ok_or("metaclass must be a type")?;
         let descriptors = attributes
             .iter()
-            .map(|(name, value)| (name.clone(), *value))
+            .map(|(symbol, value)| (symbol, self.value(value)))
             .collect::<Vec<_>>();
         // The type registry reads slot methods from the class's stored attributes, so the class
         // object exists first and learns its type once the registry has assigned one.
@@ -2725,7 +2706,7 @@ impl<'s> Vm<'s> {
                 metaclass: Ref::from(metaclass),
                 layout,
                 exception_base,
-                attributes: Ref::named(attributes),
+                attributes,
                 is_dataclass: false,
                 dataclass_fields: dataclass_fields
                     .into_iter()
@@ -2751,13 +2732,13 @@ impl<'s> Vm<'s> {
         // Members are instances of the class, so they exist once the class has its type. Their
         // name and value are instance attributes, as in CPython; a data mixin also gives the
         // member the value as its payload so the mixin's methods act on it.
-        for (member_name, value) in enum_members {
+        for (member_symbol, value) in enum_members {
             let payload = match layout {
                 ClassLayout::Builtin(_) => self.state.heap.copy_builtin_payload(value)?,
                 _ => Object::Bare,
             };
             let member = self.allocate_typed(instance_type, payload)?;
-            let name_value = self.allocate_string(member_name.clone())?;
+            let name_value = self.allocate_string(self.symbol_name(member_symbol).to_string())?;
             self.insert_attribute(member, "_name_", name_value)?;
             self.insert_attribute(member, "_value_", value)?;
             self.modify(class, |object| {
@@ -2766,7 +2747,7 @@ impl<'s> Vm<'s> {
                 };
                 class_object
                     .attributes
-                    .insert(member_name.clone(), Ref::from(member));
+                    .insert(member_symbol, Ref::from(member));
                 class_object.enum_members.push(Ref::from(member));
             })?;
         }
@@ -2795,7 +2776,8 @@ impl<'s> Vm<'s> {
             };
             let set_name =
                 self.bind_descriptor(set_name, Some(descriptor), descriptor_class, owner)?;
-            let attribute_name = self.allocate_string(attribute_name)?;
+            let attribute_name =
+                self.allocate_string(self.symbol_name(attribute_name).to_string())?;
             self.invoke_value(set_name, vec![class, attribute_name])?;
         }
         Ok(class)
@@ -2869,12 +2851,16 @@ impl<'s> Vm<'s> {
             return Err("instance has an invalid class".into());
         };
         let instance_type = class_object.instance_type;
+        // A name never interned is bound in no namespace.
+        let Some(symbol) = self.symbol_id(name) else {
+            return Ok(None);
+        };
         let ancestors = std::iter::once(instance_type)
             .chain(self.state.types.get(instance_type)?.mro.iter().copied())
             .collect::<Vec<_>>();
         for ancestor in ancestors {
             self.charge_cpu(1)?;
-            let Some(value) = self.type_namespace_attribute(ancestor, name)? else {
+            let Some(value) = self.type_namespace_attribute(ancestor, symbol)? else {
                 continue;
             };
             let owner = self.type_value(ancestor)?;
@@ -2895,6 +2881,10 @@ impl<'s> Vm<'s> {
         type_id: TypeId,
         name: &str,
     ) -> PyResult<Option<(TypeId, Value)>> {
+        // A name never interned is bound in no namespace.
+        let Some(symbol) = self.symbol_id(name) else {
+            return Ok(None);
+        };
         let mro_len = self.state.types.get(type_id)?.mro.len();
         for index in 0..=mro_len {
             let ancestor = if index == 0 {
@@ -2903,22 +2893,28 @@ impl<'s> Vm<'s> {
                 self.state.types.get(type_id)?.mro[index - 1]
             };
             self.charge_cpu(1)?;
-            if let Some(value) = self.type_namespace_attribute(ancestor, name)? {
+            if let Some(value) = self.type_namespace_attribute(ancestor, symbol)? {
                 return Ok(Some((ancestor, value)));
             }
         }
         Ok(None)
     }
 
-    fn type_namespace_attribute(&self, type_id: TypeId, name: &str) -> PyResult<Option<Value>> {
+    /// A type's own binding of `symbol`: a heap class's namespace, or the registry's for a
+    /// builtin type.
+    fn type_namespace_attribute(
+        &self,
+        type_id: TypeId,
+        symbol: SymbolId,
+    ) -> PyResult<Option<Value>> {
         let ty = self.state.types.get(type_id)?;
         let value = self.type_value(type_id)?;
         if value.is_object() {
             if let Object::Class(class_object) = self.get(value)? {
-                return Ok(self.value_optional(class_object.attributes.get(name)));
+                return Ok(self.value_optional(class_object.attributes.get(symbol)));
             }
         }
-        Ok(self.value_optional(ty.attributes.get(name)))
+        Ok(self.value_optional(ty.attributes.get(symbol)))
     }
 
     /// Bind a descriptor found by `type_lookup` to an instance or leave it unbound for class
@@ -3368,7 +3364,10 @@ impl<'s> Vm<'s> {
         let mut name = self.type_name_of(value)?;
         if let Some(class) = self.instance_class(*value)? {
             if let Object::Class(class_object) = self.get(class)? {
-                if let Some(module) = class_object.attributes.get("__module__") {
+                if let Some(module) = class_object
+                    .attributes
+                    .get_name(&self.state.symbols, "__module__")
+                {
                     let module = self.value(module);
                     if let Some(module) = string::string_value(&self.state.heap, module)? {
                         if module != "builtins" {
@@ -3686,10 +3685,14 @@ impl<'s> Vm<'s> {
                 .ok_or("super(type, obj): obj is not an instance or subtype of type")?
         };
         let mro_len = mro.len();
+        let symbol = self.symbol_id(name);
         for index in start..mro_len {
             let ancestor = self.state.types.get(accessed_type)?.mro[index];
             self.charge_cpu(1)?;
-            if let Some(descriptor) = self.type_namespace_attribute(ancestor, name)? {
+            let Some(symbol) = symbol else {
+                break;
+            };
+            if let Some(descriptor) = self.type_namespace_attribute(ancestor, symbol)? {
                 return Ok((ancestor, descriptor, accessed_type));
             }
         }
