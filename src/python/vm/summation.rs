@@ -11,6 +11,7 @@ use num_traits::ToPrimitive;
 use super::super::number::{self, NumberRef};
 use super::super::string;
 use super::{Object, Value, Vm};
+use crate::python::error::{PyError, PyResult};
 
 /// Neumaier's running sum: `high` is the ordinary float total and `low` the rounding error it
 /// has dropped so far.
@@ -65,11 +66,7 @@ enum Item {
 
 impl<'s> Vm<'s> {
     /// `sum(iterable, start=0)`.
-    pub(super) fn builtin_sum(
-        &mut self,
-        values: Vec<Value<'s>>,
-        start: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+    pub(super) fn builtin_sum(&mut self, values: Vec<Value>, start: Value) -> PyResult<Value> {
         self.reject_sequence_start(&start)?;
         let mut items = values.into_iter();
         let mut total = start;
@@ -139,7 +136,7 @@ impl<'s> Vm<'s> {
         Ok(total)
     }
 
-    fn reject_sequence_start(&mut self, start: &Value<'s>) -> Result<(), String> {
+    fn reject_sequence_start(&mut self, start: &Value) -> PyResult<()> {
         let kind = if string::string_ref(self.heap(), *start)?.is_some() {
             "strings [use ''.join(seq) instead]"
         } else {
@@ -149,12 +146,15 @@ impl<'s> Vm<'s> {
                 _ => return Ok(()),
             }
         };
-        Err(self.raise_exception("TypeError", format!("sum() can't sum {kind}")))
+        Err(PyError::exception(
+            "TypeError",
+            format!("sum() can't sum {kind}"),
+        ))
     }
 
     /// Classify `value` for the fast paths. Registered numbers such as NumPy scalars are not
     /// Python `int`, `float`, or `complex` objects, so they take the generic path.
-    fn sum_item(&self, value: &Value<'s>) -> Result<Item, String> {
+    fn sum_item(&self, value: &Value) -> PyResult<Item> {
         if number::registered_number(self.heap(), value).is_some() {
             return Ok(Item::Other);
         }
@@ -176,9 +176,8 @@ impl<'s> Vm<'s> {
         })
     }
 
-    fn integer_as_float(&mut self, value: Option<f64>) -> Result<f64, String> {
-        value.ok_or_else(|| {
-            self.raise_exception("OverflowError", "int too large to convert to float")
-        })
+    fn integer_as_float(&mut self, value: Option<f64>) -> PyResult<f64> {
+        value
+            .ok_or_else(|| PyError::exception("OverflowError", "int too large to convert to float"))
     }
 }

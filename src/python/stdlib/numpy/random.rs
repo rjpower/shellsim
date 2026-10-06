@@ -75,7 +75,7 @@ static FUNCTIONS: &[FunctionDef] = &[
 // both 128-bit integers threaded through as decimal strings (see `parse_u128`/`u128_to_value`).
 // ---------------------------------------------------------------------------------------------
 
-fn parse_u128<'s>(runtime: &mut dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, u128> {
+fn parse_u128(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<u128> {
     let integer = runtime
         .integer_bigint(value)?
         .ok_or_else(|| PyError::type_error("expected an integer"))?;
@@ -83,14 +83,11 @@ fn parse_u128<'s>(runtime: &mut dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyRes
         .ok_or_else(|| PyError::value_error("integer out of range for a bit generator state"))
 }
 
-fn u128_to_value<'s>(runtime: &mut dyn PyRuntime<'s>, value: u128) -> PyResult<'s, PyValue<'s>> {
+fn u128_to_value(runtime: &mut dyn PyRuntime, value: u128) -> PyResult<PyValue> {
     runtime.new_bigint(value.into())
 }
 
-fn bitgen_from_state<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
-) -> PyResult<'s, Pcg64> {
+fn bitgen_from_state(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Pcg64> {
     let list = value.cast(runtime)?;
     let items = runtime.list_items(list)?;
     if items.len() != 2 {
@@ -101,17 +98,13 @@ fn bitgen_from_state<'s>(
     Ok(Pcg64 { state, inc })
 }
 
-fn state_to_value<'s>(runtime: &mut dyn PyRuntime<'s>, bitgen: Pcg64) -> PyResult<'s, PyValue<'s>> {
+fn state_to_value(runtime: &mut dyn PyRuntime, bitgen: Pcg64) -> PyResult<PyValue> {
     let state_value = u128_to_value(runtime, bitgen.state)?;
     let inc_value = u128_to_value(runtime, bitgen.inc)?;
     runtime.new_list(vec![state_value, inc_value])
 }
 
-fn result_and_state<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    result: PyValue<'s>,
-    bitgen: Pcg64,
-) -> PyResult<'s> {
+fn result_and_state(runtime: &mut dyn PyRuntime, result: PyValue, bitgen: Pcg64) -> PyResult {
     let state = state_to_value(runtime, bitgen)?;
     runtime.new_tuple(vec![result, state])
 }
@@ -122,28 +115,21 @@ fn result_and_state<'s>(
 // building that buffer is itself the "real, unbounded host work" the reservation guards.
 // ---------------------------------------------------------------------------------------------
 
-fn reserve_and_charge<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
+fn reserve_and_charge(
+    runtime: &mut dyn PyRuntime,
     dtype: DType,
     count: usize,
     per_element: u64,
-) -> PyResult<'s, ()> {
+) -> PyResult<()> {
     array::reserve_elements(runtime, dtype, count)?;
     runtime.charge_cpu((count as u64).saturating_mul(per_element) + 1)
 }
 
-fn output_shape<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
-) -> PyResult<'s, Vec<usize>> {
+fn output_shape(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<usize>> {
     super::args::shape(runtime, value)
 }
 
-fn wrap_f64<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    shape: Vec<usize>,
-    values: &[f64],
-) -> PyResult<'s, PyValue<'s>> {
+fn wrap_f64(runtime: &mut dyn PyRuntime, shape: Vec<usize>, values: &[f64]) -> PyResult<PyValue> {
     let mut bytes = Vec::with_capacity(values.len() * 8);
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -151,11 +137,7 @@ fn wrap_f64<'s>(
     Ok(array::new_array(runtime, PyArrayBuffer::Bytes(bytes), DType::FLOAT64, shape)?.value())
 }
 
-fn wrap_f32<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    shape: Vec<usize>,
-    values: &[f32],
-) -> PyResult<'s, PyValue<'s>> {
+fn wrap_f32(runtime: &mut dyn PyRuntime, shape: Vec<usize>, values: &[f32]) -> PyResult<PyValue> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -163,11 +145,7 @@ fn wrap_f32<'s>(
     Ok(array::new_array(runtime, PyArrayBuffer::Bytes(bytes), DType::FLOAT32, shape)?.value())
 }
 
-fn wrap_i64<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    shape: Vec<usize>,
-    values: &[i64],
-) -> PyResult<'s, PyValue<'s>> {
+fn wrap_i64(runtime: &mut dyn PyRuntime, shape: Vec<usize>, values: &[i64]) -> PyResult<PyValue> {
     let mut bytes = Vec::with_capacity(values.len() * 8);
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -179,12 +157,12 @@ fn wrap_i64<'s>(
 /// own single-precision draws take narrower words per element, but shellsim does not need to
 /// match its stream, and generating in `f64` and casting is simpler (see `random.py`'s module
 /// docstring).
-fn wrap_float<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
+fn wrap_float(
+    runtime: &mut dyn PyRuntime,
     shape: Vec<usize>,
     values: Vec<f64>,
     single: bool,
-) -> PyResult<'s, PyValue<'s>> {
+) -> PyResult<PyValue> {
     if single {
         let narrow: Vec<f32> = values.iter().map(|value| *value as f32).collect();
         wrap_f32(runtime, shape, &narrow)
@@ -193,27 +171,21 @@ fn wrap_float<'s>(
     }
 }
 
-fn f64_params<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
-) -> PyResult<'s, (Vec<f64>, Vec<usize>)> {
+fn f64_params(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<(Vec<f64>, Vec<usize>)> {
     let array = Array::from_value(runtime, value)?;
     let values = array::read_elements::<f64>(runtime, &array)?;
     let shape = array.shape().to_vec();
     Ok((values, shape))
 }
 
-fn i64_params<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
-) -> PyResult<'s, (Vec<i64>, Vec<usize>)> {
+fn i64_params(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<(Vec<i64>, Vec<usize>)> {
     let array = Array::from_value(runtime, value)?;
     let values = array::read_elements::<i64>(runtime, &array)?;
     let shape = array.shape().to_vec();
     Ok((values, shape))
 }
 
-fn is_single<'s>(runtime: &mut dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyResult<'s, bool> {
+fn is_single(runtime: &mut dyn PyRuntime, value: &PyValue) -> PyResult<bool> {
     Ok(runtime.string_value(value)?.unwrap_or_default() == "float32")
 }
 
@@ -231,7 +203,7 @@ fn float_dtype(single: bool) -> DType {
 
 /// `_pcg_seed(words)`: seed a fresh `Pcg64` from the u64 words `random.py`'s `_seed_words`
 /// expands an int, sequence of ints, or `None` into.
-fn pcg_seed<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn pcg_seed(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_pcg_seed", 1, 1)?;
     let positional = args.positional().to_vec();
     let list = positional[0].cast(runtime)?;
@@ -248,7 +220,7 @@ fn pcg_seed<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult
 // Uniform and bounded-integer draws.
 // ---------------------------------------------------------------------------------------------
 
-fn uniform01_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn uniform01_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_uniform01_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -268,7 +240,7 @@ fn uniform01_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
 /// output shape by the Python caller. The result is always `int64`; the caller casts it down to
 /// the requested dtype, since every value is already known to fit (`integers`/`randint` check
 /// `low`/`high` against the dtype's bounds before calling).
-fn bounded_int_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn bounded_int_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_bounded_int_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -288,7 +260,7 @@ fn bounded_int_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> 
 // Normal and exponential.
 // ---------------------------------------------------------------------------------------------
 
-fn standard_normal_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn standard_normal_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_normal_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -304,10 +276,7 @@ fn standard_normal_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>)
     result_and_state(runtime, out, bitgen)
 }
 
-fn standard_exponential_fill<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn standard_exponential_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_exponential_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -327,7 +296,7 @@ fn standard_exponential_fill<'s>(
 // Gamma family.
 // ---------------------------------------------------------------------------------------------
 
-fn standard_gamma_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn standard_gamma_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_gamma_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -342,7 +311,7 @@ fn standard_gamma_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) 
     result_and_state(runtime, out, bitgen)
 }
 
-fn chisquare_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn chisquare_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_chisquare_fill", 2, 2)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -356,7 +325,7 @@ fn chisquare_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     result_and_state(runtime, out, bitgen)
 }
 
-fn f_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn f_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_f_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -372,7 +341,7 @@ fn f_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'
     result_and_state(runtime, out, bitgen)
 }
 
-fn standard_t_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn standard_t_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_standard_t_fill", 2, 2)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -390,7 +359,7 @@ fn standard_t_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> P
 // Discrete distributions.
 // ---------------------------------------------------------------------------------------------
 
-fn binomial_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn binomial_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_binomial_fill", 3, 3)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -406,7 +375,7 @@ fn binomial_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
     result_and_state(runtime, out, bitgen)
 }
 
-fn poisson_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn poisson_fill(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_poisson_fill", 2, 2)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -424,7 +393,7 @@ fn poisson_fill<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
 // Sequences.
 // ---------------------------------------------------------------------------------------------
 
-fn shuffle_indices_fn<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn shuffle_indices_fn(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shuffle_indices", 2, 2)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;
@@ -439,10 +408,7 @@ fn shuffle_indices_fn<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -
 /// `_choice_without_replacement(state, n, size, shuffle)`: `Generator.choice(..., replace=False,
 /// p=None)`'s own index draws (see `sequence::choice_without_replacement`'s doc). Floyd's
 /// algorithm runs in `O(size)`, so memory and CPU are reserved for `size`, not the population `n`.
-fn choice_without_replacement_fn<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn choice_without_replacement_fn(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_choice_without_replacement", 4, 4)?;
     let positional = args.positional().to_vec();
     let mut bitgen = bitgen_from_state(runtime, positional[0])?;

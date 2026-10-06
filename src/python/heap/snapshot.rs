@@ -17,14 +17,6 @@ fn optional(slot: &Option<Ref>) -> Option<Ref> {
     slot.as_ref().map(Ref::dup)
 }
 
-fn named<K: Clone + Eq + std::hash::Hash>(
-    map: &std::collections::HashMap<K, Ref>,
-) -> std::collections::HashMap<K, Ref> {
-    map.iter()
-        .map(|(key, slot)| (key.clone(), slot.dup()))
-        .collect()
-}
-
 pub(super) fn dup_attributes(attributes: &InstanceAttributes) -> InstanceAttributes {
     match attributes {
         InstanceAttributes::Shaped { shape, values } => InstanceAttributes::Shaped {
@@ -32,7 +24,7 @@ pub(super) fn dup_attributes(attributes: &InstanceAttributes) -> InstanceAttribu
             values: slots(values),
         },
         InstanceAttributes::Dictionary(values) => {
-            InstanceAttributes::Dictionary(Box::new(named(values)))
+            InstanceAttributes::Dictionary(Box::new(values.dup()))
         }
     }
 }
@@ -72,10 +64,11 @@ pub(super) fn dup_object(object: &Object) -> Object {
         Object::Function(function) => Object::Function(Box::new(FunctionObject {
             name: function.name.clone(),
             code: function.code.clone(),
-            closure: optional(&function.closure),
+            closure: function.closure.dup(),
+            globals: function.globals.dup(),
             defaults: slots(&function.defaults),
             defining_class: optional(&function.defining_class),
-            attributes: named(&function.attributes),
+            attributes: function.attributes.dup(),
         })),
         Object::Class(class) => Object::Class(Box::new(ClassObject {
             instance_type: class.instance_type,
@@ -85,7 +78,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
             metaclass: class.metaclass.dup(),
             layout: class.layout,
             exception_base: class.exception_base,
-            attributes: named(&class.attributes),
+            attributes: class.attributes.dup(),
             is_dataclass: class.is_dataclass,
             dataclass_fields: class
                 .dataclass_fields
@@ -148,14 +141,11 @@ pub(super) fn dup_object(object: &Object) -> Object {
             function: generator.function.dup(),
             code: generator.code.clone(),
             scope: generator.scope.dup(),
+            globals: generator.globals.dup(),
             instruction_pointer: generator.instruction_pointer,
             handlers: generator.handlers.clone(),
             contexts: slots(&generator.contexts),
-            exceptions: generator
-                .exceptions
-                .iter()
-                .map(|(kind, value)| (kind.clone(), value.dup()))
-                .collect(),
+            exceptions: slots(&generator.exceptions),
             stack: slots(&generator.stack),
             exhausted: generator.exhausted,
             running: generator.running,
@@ -167,15 +157,12 @@ pub(super) fn dup_object(object: &Object) -> Object {
         },
         Object::Scope(scope) => Object::Scope(Box::new(ScopeObject {
             parent: optional(&scope.parent),
-            uses_repl_globals: scope.uses_repl_globals,
             local_names: scope.local_names.clone(),
             locals: scope.locals.iter().map(optional).collect(),
-            order: scope.order.clone(),
-            values: named(&scope.values),
+            names: scope.names.dup(),
         })),
         Object::NamespaceDict(target) => Object::NamespaceDict(match target {
             NamespaceTarget::Scope(scope) => NamespaceTarget::Scope(scope.dup()),
-            NamespaceTarget::Repl => NamespaceTarget::Repl,
             NamespaceTarget::Instance(instance) => NamespaceTarget::Instance(instance.dup()),
         }),
         Object::DictView { kind, mapping } => Object::DictView {

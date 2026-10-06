@@ -1,28 +1,27 @@
-//! Generational, handle-rooted storage for Python objects.
+//! Generational, non-moving storage for Python objects.
 //!
-//! Every Python object lives in one of two spaces. New objects are bump-allocated into the young
-//! space; when it fills, a minor collection copies the survivors into the old space, which a
-//! mark-and-sweep major collection reclaims when it has doubled since the last one. Collection
-//! can therefore run inside any allocation, so a program is out of memory only when its live
-//! data exceeds the limit.
+//! Every Python object lives in one slot of an arena for its whole life, so its [`ObjectId`] (a
+//! slot index and the slot's generation) never changes and Rust code names objects directly.
+//! Collection is generational without moving anything: a new object is young until it survives
+//! a minor collection, which marks from the roots and the remembered old objects, follows only
+//! young objects, and frees the unmarked young ones. A mark-and-sweep major collection reclaims
+//! old objects when the old generation has doubled since the last one. Collection can run inside
+//! any allocation, so a program is out of memory only when its live data exceeds the limit.
 //!
-//! Moving objects is sound because no Rust code holds a raw object address. Code outside this
-//! module tree sees three value types ([`value`]):
+//! Code outside this module tree sees three value types ([`value`]):
 //!
-//! - a [`Value<'s>`] handle, bound to a scope and read through the heap's handle stack, which
-//!   the collector rewrites when an object moves;
-//! - a [`Ref`], the stored reference inside an object or VM root, readable only through a
-//!   handle and never copyable;
-//! - immediates, which need no scope at all.
+//! - a [`Value`], an immediate or an object id, pinned on the heap's pin stack from the moment it
+//!   is made until the code that made it releases its pins, which also releases the host scratch
+//!   that code reserved ([`Heap::reserve_scratch`]);
+//! - a [`Ref`], the stored reference inside an object or VM root, made from a pinned value;
+//! - immediates, which need no pin.
 //!
-//! The root set is the handle stack, the slots the VM reports through [`Roots`], and the old
-//! objects remembered since the last minor collection. [`Heap::get_mut`] remembers an old object
-//! whenever it is mutated, so a young reference stored into an old object is always found. The
-//! only way to create a stored reference is through a [`Builder`] inside an allocation or a
-//! mutation, or [`Heap::store`] for the VM's own root containers.
+//! The root set is the pin stack, the slots the VM reports through [`Roots`], and, for a minor
+//! collection, the old objects remembered since the last one. [`Heap::get_mut`] and
+//! [`Heap::modify`] remember an old object whenever it is mutated, so a young reference stored
+//! into an old object is always found.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
 
 use crate::resources::Resources;
 use num_bigint::BigInt;
@@ -31,9 +30,12 @@ use super::attributes::ShapeId;
 use super::bytecode::CodeRef;
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
+use super::symbols::SymbolId;
+use crate::python::error::{PyError, PyResult};
 
 mod gc;
 pub mod mapping;
+mod namespace;
 mod native_object;
 mod snapshot;
 mod stack;
@@ -41,6 +43,7 @@ pub mod value;
 
 pub use gc::Roots;
 pub use mapping::{KeyHash, OrderedMap, OrderedSet};
+pub use namespace::Namespace;
 pub use native_object::NativeObject;
 pub use stack::ValueStack;
 pub use value::{Ref, Value};
@@ -61,7 +64,7 @@ pub(super) const MODELED_SET_MEMBER_BYTES: u64 = MODELED_VALUE_BYTES * SET_MEMBE
 pub(super) const BYTES_PER_CPU_UNIT: u64 = 64;
 
 /// Charge the CPU cost of writing `bytes` of new object storage.
-pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Result<(), String> {
+pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> PyResult<()> {
     if resources.charge_cpu(bytes / BYTES_PER_CPU_UNIT) {
         Ok(())
     } else {
@@ -92,11 +95,8 @@ pub enum InstanceAttributes {
         shape: ShapeId,
         values: Vec<Ref>,
     },
-    /// Boxed so the common shaped representation sets the size of an instance. The map's
-    /// 48-byte header would otherwise widen every heap slot, which is the cost the
-    /// `box_collection` lint does not see.
-    #[allow(clippy::box_collection)]
-    Dictionary(Box<HashMap<super::symbols::SymbolId, Ref>>),
+    /// Boxed so the common shaped representation sets the size of an instance.
+    Dictionary(Box<Namespace>),
 }
 
 impl Default for InstanceAttributes {
@@ -108,12 +108,11 @@ impl Default for InstanceAttributes {
     }
 }
 
-/// The heap's address of one object. Young addresses carry the young space's epoch so a stale
-/// reference to a moved object fails loudly instead of aliasing a later allocation.
+/// The heap's address of one object: a slot index and that slot's generation. A slot's
+/// generation advances whenever its object is freed, so an id that outlives its object fails
+/// loudly instead of naming a later one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct ObjectId(u64);
-
-const YOUNG_FLAG: u64 = 1 << 63;
 
 impl Object {
     /// The module-owned payload behind [`Object::Native`] when it is a `T`; `None` for any other
@@ -135,12 +134,8 @@ impl Object {
 }
 
 impl ObjectId {
-    const fn young(epoch: u32, index: usize) -> Self {
-        Self(YOUNG_FLAG | ((epoch as u64) << 32) | index as u64)
-    }
-
-    const fn old(index: usize) -> Self {
-        Self(index as u64)
+    const fn new(index: u32, generation: u32) -> Self {
+        Self(((generation as u64) << 32) | index as u64)
     }
 
     pub(super) const fn bits(self) -> u64 {
@@ -151,16 +146,12 @@ impl ObjectId {
         Self(bits)
     }
 
-    const fn is_young(self) -> bool {
-        self.0 & YOUNG_FLAG != 0
-    }
-
     const fn index(self) -> usize {
         (self.0 & 0xffff_ffff) as usize
     }
 
-    const fn epoch(self) -> u32 {
-        ((self.0 >> 32) & 0x7fff_ffff) as u32
+    const fn generation(self) -> u32 {
+        (self.0 >> 32) as u32
     }
 }
 
@@ -168,17 +159,12 @@ impl ObjectId {
 /// return an [`Object::NamespaceDict`] over one of these, and every read and write through the
 /// view acts on this storage.
 ///
-/// An imported module's top-level code runs with its own lexical [`ScopeObject`]
-/// (`uses_repl_globals` false), so its namespace is that scope. The entry-point script or an
-/// interactive REPL line runs with no scope of its own; its names, and those of any function or
-/// class body defined at that top level, live in the flat REPL/script table instead (see
-/// `ReplState::globals` and `Vm::scope_uses_repl_globals`).
+/// Every module's top-level code, the main script's included, runs with its own lexical
+/// [`ScopeObject`], so a module's namespace is that scope.
 #[derive(Debug)]
 pub enum NamespaceTarget {
     /// A module's own scope.
     Scope(Ref),
-    /// The script and REPL global table.
-    Repl,
     /// One instance's own attributes, for `obj.__dict__` and `vars(obj)`.
     Instance(Ref),
 }
@@ -218,7 +204,8 @@ pub struct ClassObject {
     pub layout: ClassLayout,
     /// Closest native exception ancestor, when instances may be raised.
     pub exception_base: Option<&'static str>,
-    pub attributes: HashMap<String, Ref>,
+    /// The class's own namespace, its `__dict__`, in definition order.
+    pub attributes: Namespace,
     pub is_dataclass: bool,
     pub dataclass_fields: Vec<(String, Option<Ref>)>,
     pub enum_members: Vec<Ref>,
@@ -229,12 +216,15 @@ pub struct ClassObject {
 pub struct FunctionObject {
     pub name: String,
     pub code: CodeRef,
-    pub closure: Option<Ref>,
+    /// The scope the function was defined in, where its free names resolve.
+    pub closure: Ref,
+    /// The scope of the module the function was defined in: its globals.
+    pub globals: Ref,
     pub defaults: Vec<Ref>,
     /// Class captured when this function is installed by a class body.
     pub defining_class: Option<Ref>,
     /// Names assigned on the function object, its `__dict__`.
-    pub attributes: HashMap<String, Ref>,
+    pub attributes: Namespace,
 }
 
 /// A suspended generator frame. Boxed inside [`Object::Generator`] to keep heap slots small.
@@ -244,12 +234,15 @@ pub struct GeneratorObject {
     pub function: Ref,
     pub code: CodeRef,
     pub scope: Ref,
+    /// The function's globals, kept with the scope so resuming reads neither from the function.
+    pub globals: Ref,
     pub instruction_pointer: usize,
     /// Active `try` regions as `(handler target, operand stack depth, exception stack depth)`.
     pub handlers: Vec<(usize, usize, usize)>,
     /// Context managers entered and not yet exited at the suspension point.
     pub contexts: Vec<Ref>,
-    pub exceptions: Vec<(String, Ref)>,
+    /// The exceptions being handled at the suspension point, innermost last.
+    pub exceptions: Vec<Ref>,
     pub stack: Vec<Ref>,
     pub exhausted: bool,
     pub running: bool,
@@ -261,24 +254,21 @@ pub struct GeneratorObject {
 /// lives in [`scopes`](super::scopes); the heap only stores and traces the object.
 #[derive(Debug)]
 pub struct ScopeObject {
+    /// The enclosing scope; `None` for a module's scope, where every chain ends.
     pub parent: Option<Ref>,
-    /// Whether names that this scope does not bind resolve in the flat REPL/script table rather
-    /// than in a module scope.
-    pub uses_repl_globals: bool,
-    pub local_names: std::sync::Arc<[String]>,
+    pub local_names: std::sync::Arc<[SymbolId]>,
     pub locals: Vec<Option<Ref>>,
-    /// Dynamic names in first-binding order; `values` holds their current bindings.
-    pub order: Vec<String>,
-    pub values: HashMap<String, Ref>,
+    /// Names without a compiler-assigned slot, in first-binding order.
+    pub names: Namespace,
 }
 
 const LOCAL_SLOT_BYTES: u64 = 16;
 /// Modeled bytes of one dynamically bound scope name, charged when a scope gains one.
 pub const DYNAMIC_NAME_BYTES: u64 = 48;
 
-fn modeled_scope_size(scope: &ScopeObject) -> Result<u64, String> {
+fn modeled_scope_size(scope: &ScopeObject) -> PyResult<u64> {
     let slots = u64::try_from(scope.locals.len()).map_err(|_| "modeled scope size overflow")?;
-    let dynamic = u64::try_from(scope.values.len()).map_err(|_| "modeled scope size overflow")?;
+    let dynamic = u64::try_from(scope.names.len()).map_err(|_| "modeled scope size overflow")?;
     OBJECT_HEADER
         .checked_add(
             slots
@@ -435,8 +425,8 @@ pub enum Object {
 #[derive(Debug)]
 struct HeapObject {
     type_id: TypeId,
-    /// Bit 31: remembered since the last minor collection (old objects only). Bits 0..31: the
-    /// lazily assigned identity, 0 while unassigned. Packed so a header stays within the slot.
+    /// The slot's generation in the low bits, and the collector's young, marked and remembered
+    /// bits above it. Packed so the header stays within the slot.
     flags: Cell<u32>,
     payload: Object,
     /// Attributes assigned on an instance of a user class; `None` until the first write.
@@ -444,79 +434,27 @@ struct HeapObject {
     modeled_bytes: u64,
 }
 
-const DIRTY_FLAG: u32 = 1 << 31;
-const IDENTITY_MASK: u32 = DIRTY_FLAG - 1;
+/// Allocated since the last minor collection.
+const YOUNG_FLAG: u32 = 1 << 31;
+/// Reached by the collection in progress.
+const MARK_FLAG: u32 = 1 << 30;
+/// An old object mutated since the last minor collection, so its slots may name young objects.
+const DIRTY_FLAG: u32 = 1 << 29;
+const GENERATION_MASK: u32 = DIRTY_FLAG - 1;
 
 impl HeapObject {
-    fn is_dirty(&self) -> bool {
-        self.flags.get() & DIRTY_FLAG != 0
+    fn generation(&self) -> u32 {
+        self.flags.get() & GENERATION_MASK
     }
 
-    fn set_dirty(&self, dirty: bool) {
+    fn has(&self, flag: u32) -> bool {
+        self.flags.get() & flag != 0
+    }
+
+    fn set(&self, flag: u32, on: bool) {
         let flags = self.flags.get();
-        self.flags.set(if dirty {
-            flags | DIRTY_FLAG
-        } else {
-            flags & IDENTITY_MASK
-        });
-    }
-
-    fn identity(&self) -> u32 {
-        self.flags.get() & IDENTITY_MASK
-    }
-
-    fn set_identity(&self, identity: u32) {
         self.flags
-            .set((self.flags.get() & DIRTY_FLAG) | (identity & IDENTITY_MASK));
-    }
-}
-
-/// Converts scoped handles into stored references while an allocation or mutation is in
-/// progress. A builder exists only inside [`Heap::alloc_with`] and [`Heap::modify`], so the
-/// references it makes are stored before the next allocation can move anything.
-pub struct Builder<'h> {
-    handles: &'h RefCell<Vec<Raw>>,
-}
-
-impl Builder<'_> {
-    /// The stored reference for a handle.
-    pub fn store(&self, value: Value<'_>) -> Ref {
-        Ref(resolve(self.handles, value))
-    }
-
-    pub fn optional(&self, value: Option<Value<'_>>) -> Option<Ref> {
-        value.map(|value| self.store(value))
-    }
-
-    pub fn refs<'s>(&self, values: impl IntoIterator<Item = Value<'s>>) -> Vec<Ref> {
-        // Collecting straight from a `Vec<Value>` would reuse its allocation in place, so a
-        // list cut down to a few items could keep the capacity of the snapshot it came from.
-        // The modeled size counts items, so build exactly the storage the items need.
-        let values = values.into_iter();
-        let mut refs = Vec::with_capacity(values.size_hint().0);
-        refs.extend(values.map(|value| self.store(value)));
-        refs
-    }
-
-    pub fn named<'s>(
-        &self,
-        values: impl IntoIterator<Item = (String, Value<'s>)>,
-    ) -> HashMap<String, Ref> {
-        values
-            .into_iter()
-            .map(|(name, value)| (name, self.store(value)))
-            .collect()
-    }
-}
-
-#[inline(always)]
-fn resolve(handles: &RefCell<Vec<Raw>>, value: Value<'_>) -> Raw {
-    match value.raw().handle_index() {
-        Some(index) => *handles
-            .borrow()
-            .get(index)
-            .expect("a handle cannot outlive its scope"),
-        None => value.raw(),
+            .set(if on { flags | flag } else { flags & !flag });
     }
 }
 
@@ -528,49 +466,63 @@ pub struct GcStats {
     pub promoted_objects: u64,
 }
 
+#[derive(Default)]
 pub struct Heap {
-    young: Vec<Option<HeapObject>>,
-    young_epoch: u32,
+    /// Every object, by slot index; `None` marks a free slot.
+    slots: Vec<Option<HeapObject>>,
+    /// Free slots with the generation the next object there gets.
+    free: Vec<(u32, u32)>,
+    /// Slots allocated since the last minor collection.
+    young: Vec<u32>,
     young_bytes: u64,
-    old: Vec<Option<HeapObject>>,
-    free_old: Vec<usize>,
     old_bytes: u64,
-    /// Old-space size that triggers the next major collection.
+    /// Old-generation size that triggers the next major collection.
     major_threshold: u64,
     /// Old objects mutated since the last minor collection; their slots may name young objects.
-    remembered: Vec<usize>,
-    handles: RefCell<Vec<Raw>>,
-    next_identity: Cell<u32>,
-    /// Modeled bytes of every object in both spaces.
+    remembered: Vec<u32>,
+    /// Objects named by live [`Value`]s and the host scratch reserved beside them. Truncated by
+    /// whoever released the values.
+    pins: RefCell<Pins>,
+    /// Modeled bytes of every live object.
     modeled_bytes: u64,
     stats: GcStats,
 }
 
-impl Default for Heap {
-    fn default() -> Self {
-        Self {
-            young: Vec::new(),
-            young_epoch: 0,
-            young_bytes: 0,
-            old: Vec::new(),
-            free_old: Vec::new(),
-            old_bytes: 0,
-            major_threshold: 0,
-            remembered: Vec::new(),
-            handles: RefCell::new(Vec::new()),
-            next_identity: Cell::new(1),
-            modeled_bytes: 0,
-            stats: GcStats::default(),
+/// The pin stack. Host scratch that Rust code holds while it runs is reserved from the memory
+/// limit and recorded here under a marker pin, so releasing the pins made since some point also
+/// releases the scratch reserved since then, and nested code never releases its caller's.
+#[derive(Default)]
+struct Pins {
+    ids: Vec<ObjectId>,
+    /// Reserved bytes, each with the position of its marker in `ids`, in pin order.
+    scratch: Vec<(usize, u64)>,
+}
+
+impl Pins {
+    /// Release the scratch whose markers were at or above `len`.
+    #[cold]
+    #[inline(never)]
+    fn release_scratch(&mut self, len: usize, resources: &mut Resources) {
+        while let Some(&(position, bytes)) = self.scratch.last() {
+            if position < len {
+                break;
+            }
+            self.scratch.pop();
+            resources.release_memory(bytes);
         }
     }
 }
+
+/// The pin that holds a scratch reservation's place. No slot ever has this generation, so a
+/// collection skips it.
+const SCRATCH_MARKER: ObjectId = ObjectId::new(u32::MAX, u32::MAX);
 
 impl std::fmt::Debug for Heap {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("Heap")
+            .field("slots", &self.slots.len())
             .field("young", &self.young.len())
-            .field("old", &self.old.len())
             .field("modeled_bytes", &self.modeled_bytes)
             .field("stats", &self.stats)
             .finish_non_exhaustive()
@@ -578,27 +530,22 @@ impl std::fmt::Debug for Heap {
 }
 
 impl Clone for Heap {
-    /// A deep copy for process-state snapshots. Handles are scope-local and do not survive.
+    /// A deep copy for process-state snapshots. Pins belong to running Rust code and do not
+    /// survive.
     fn clone(&self) -> Self {
         Self {
-            young: self
-                .young
+            slots: self
+                .slots
                 .iter()
                 .map(|slot| slot.as_ref().map(HeapObject::dup))
                 .collect(),
-            young_epoch: self.young_epoch,
+            free: self.free.clone(),
+            young: self.young.clone(),
             young_bytes: self.young_bytes,
-            old: self
-                .old
-                .iter()
-                .map(|slot| slot.as_ref().map(HeapObject::dup))
-                .collect(),
-            free_old: self.free_old.clone(),
             old_bytes: self.old_bytes,
             major_threshold: self.major_threshold,
             remembered: self.remembered.clone(),
-            handles: RefCell::new(Vec::new()),
-            next_identity: self.next_identity.clone(),
+            pins: RefCell::default(),
             modeled_bytes: self.modeled_bytes,
             stats: self.stats,
         }
@@ -606,226 +553,178 @@ impl Clone for Heap {
 }
 
 impl Heap {
-    // ----- handles -------------------------------------------------------------------------
+    // ----- pins ----------------------------------------------------------------------------
 
-    /// Number of live handle-stack entries; a scope records this when it opens.
+    /// Number of pinned values; whoever releases a group of values records this first.
     #[inline(always)]
-    pub fn handle_count(&self) -> usize {
-        self.handles.borrow().len()
+    pub fn pin_count(&self) -> usize {
+        self.pins.borrow().ids.len()
     }
 
-    /// Drop every handle created since the stack had `len` entries; a scope does this when it
-    /// closes. The entries above `len` can no longer be named, so nothing dangles.
+    /// Release every value pinned since the pin stack had `len` entries, and the host scratch
+    /// reserved since then. The objects stay valid until a collection finds them unreachable.
     #[inline(always)]
-    pub fn truncate_handles(&self, len: usize) {
-        self.handles.borrow_mut().truncate(len);
-    }
-
-    /// A scoped handle for a stored reference. Immediates pass through without a stack entry.
-    #[inline(always)]
-    pub fn handle<'s>(&self, slot: &Ref) -> Value<'s> {
-        self.handle_raw(slot.0)
-    }
-
-    pub fn handle_optional<'s>(&self, slot: Option<&Ref>) -> Option<Value<'s>> {
-        slot.map(|slot| self.handle(slot))
-    }
-
-    pub fn handles<'a, 's>(&self, slots: impl IntoIterator<Item = &'a Ref>) -> Vec<Value<'s>> {
-        slots.into_iter().map(|slot| self.handle(slot)).collect()
-    }
-
-    #[inline(always)]
-    fn handle_raw<'s>(&self, raw: Raw) -> Value<'s> {
-        if raw.is_object() {
-            let mut handles = self.handles.borrow_mut();
-            handles.push(raw);
-            Value::from_raw(Raw::handle(handles.len() - 1))
-        } else {
-            Value::from_raw(raw)
+    pub fn truncate_pins(&self, len: usize, resources: &mut Resources) {
+        let mut pins = self.pins.borrow_mut();
+        pins.ids.truncate(len);
+        if pins
+            .scratch
+            .last()
+            .is_some_and(|&(position, _)| position >= len)
+        {
+            pins.release_scratch(len, resources);
         }
     }
 
-    /// The stored form of a handle, for the VM's own root containers. The result must be placed
-    /// in a root before the next allocation; it is not a handle and the collector cannot see it
-    /// in a Rust local.
-    #[inline(always)]
-    pub fn store(&self, value: Value<'_>) -> Ref {
-        Ref(self.resolve(value))
-    }
-
-    #[inline(always)]
-    fn resolve(&self, value: Value<'_>) -> Raw {
-        resolve(&self.handles, value)
-    }
-
-    fn builder(&self) -> Builder<'_> {
-        Builder {
-            handles: &self.handles,
+    /// Reserve `bytes` of host scratch for the code holding the current pins: memory that code
+    /// builds outside the heap and keeps while Python code may run, or that can outgrow the
+    /// heap values it is built from. The reservation lasts until those pins are released.
+    pub fn reserve_scratch(&self, bytes: u64, resources: &mut Resources) -> PyResult<()> {
+        charge_construction(bytes, resources)?;
+        if !resources.reserve_memory(bytes) {
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
+        let mut pins = self.pins.borrow_mut();
+        let position = pins.ids.len();
+        pins.ids.push(SCRATCH_MARKER);
+        pins.scratch.push((position, bytes));
+        Ok(())
     }
 
-    /// Whether two handles name the same object or the same immediate (`is`).
-    pub fn identical(&self, left: Value<'_>, right: Value<'_>) -> bool {
-        self.resolve(left) == self.resolve(right)
+    /// The value a stored reference holds, pinned so it survives collection.
+    #[inline(always)]
+    pub fn value(&self, slot: &Ref) -> Value {
+        self.pin_raw(slot.0)
     }
 
-    /// Whether a handle and a stored reference name the same object or immediate.
-    pub fn identical_ref(&self, value: Value<'_>, slot: &Ref) -> bool {
-        self.resolve(value) == slot.0
+    pub fn value_optional(&self, slot: Option<&Ref>) -> Option<Value> {
+        slot.map(|slot| self.value(slot))
+    }
+
+    pub fn values<'a>(&self, slots: impl IntoIterator<Item = &'a Ref>) -> Vec<Value> {
+        slots.into_iter().map(|slot| self.value(slot)).collect()
+    }
+
+    #[inline(always)]
+    fn pin_raw(&self, raw: Raw) -> Value {
+        if let Some(id) = raw.object_id() {
+            self.pins.borrow_mut().ids.push(id);
+        }
+        Value::from_raw(raw)
     }
 
     // ----- object access -------------------------------------------------------------------
 
-    fn object_id(&self, value: Value<'_>) -> Result<ObjectId, String> {
-        self.resolve(value)
+    #[inline(always)]
+    fn object_id(value: Value) -> PyResult<ObjectId> {
+        value
+            .raw()
             .object_id()
             .ok_or_else(|| "expected a heap object".into())
     }
 
-    fn object(&self, id: ObjectId) -> Result<&HeapObject, String> {
-        let slot = if id.is_young() {
-            if id.epoch() != self.young_epoch {
-                return Err("stale reference to a moved young object".into());
-            }
-            self.young.get(id.index())
-        } else {
-            self.old.get(id.index())
-        };
-        slot.and_then(Option::as_ref)
-            .ok_or_else(|| "invalid object reference".into())
+    #[inline(always)]
+    fn object(&self, id: ObjectId) -> PyResult<&HeapObject> {
+        match self.slots.get(id.index()) {
+            Some(Some(object)) if object.generation() == id.generation() => Ok(object),
+            _ => Err(stale_reference().into()),
+        }
     }
 
     /// Mutable access to an object header. Old objects are remembered so a minor collection
     /// finds any young reference the caller stores into them.
-    fn object_mut(&mut self, id: ObjectId) -> Result<&mut HeapObject, String> {
-        if id.is_young() {
-            if id.epoch() != self.young_epoch {
-                return Err("stale reference to a moved young object".into());
-            }
-            return self
-                .young
-                .get_mut(id.index())
-                .and_then(Option::as_mut)
-                .ok_or_else(|| "invalid object reference".into());
-        }
-        let object = self
-            .old
-            .get_mut(id.index())
-            .and_then(Option::as_mut)
-            .ok_or("invalid object reference")?;
-        if !object.is_dirty() {
-            object.set_dirty(true);
-            self.remembered.push(id.index());
+    fn object_mut(&mut self, id: ObjectId) -> PyResult<&mut HeapObject> {
+        let object = match self.slots.get_mut(id.index()) {
+            Some(Some(object)) if object.generation() == id.generation() => object,
+            _ => return Err(stale_reference().into()),
+        };
+        if !object.has(YOUNG_FLAG | DIRTY_FLAG) {
+            object.set(DIRTY_FLAG, true);
+            self.remembered.push(id.index() as u32);
         }
         Ok(object)
     }
 
-    pub fn get(&self, value: Value<'_>) -> Result<&Object, String> {
-        Ok(&self.object(self.object_id(value)?)?.payload)
+    pub fn get(&self, value: Value) -> PyResult<&Object> {
+        Ok(&self.object(Self::object_id(value)?)?.payload)
     }
 
-    /// Mutable payload access. Store references into the payload only through [`Self::modify`];
-    /// this entry point is for payload fields that hold no references, such as iterator
-    /// positions, byte buffers and generator control state.
-    pub fn get_mut(&mut self, value: Value<'_>) -> Result<&mut Object, String> {
-        let id = self.object_id(value)?;
+    /// The object a stored reference names, read without pinning it: whoever holds the
+    /// reference roots the object, and nothing can collect while the borrow lasts.
+    #[inline]
+    pub fn stored(&self, slot: &Ref) -> PyResult<&Object> {
+        let id = slot.0.object_id().ok_or("expected a heap object")?;
+        Ok(&self.object(id)?.payload)
+    }
+
+    /// Mutable payload access. Old objects are remembered, so references may be stored through
+    /// it.
+    pub fn get_mut(&mut self, value: Value) -> PyResult<&mut Object> {
+        let id = Self::object_id(value)?;
         Ok(&mut self.object_mut(id)?.payload)
     }
 
-    /// Mutate an object with a [`Builder`] for turning handles into stored references.
-    pub fn modify<R>(
+    /// Mutate an object's payload.
+    pub fn modify<R>(&mut self, value: Value, f: impl FnOnce(&mut Object) -> R) -> PyResult<R> {
+        Ok(f(self.get_mut(value)?))
+    }
+
+    /// Mutate the payload of the object a stored reference names, without pinning it; see
+    /// [`Self::stored`].
+    #[inline]
+    pub fn modify_stored<R>(
         &mut self,
-        value: Value<'_>,
-        f: impl FnOnce(&Builder<'_>, &mut Object) -> R,
-    ) -> Result<R, String> {
-        self.modify_object(value, |builder, object| f(builder, &mut object.payload))
+        slot: &Ref,
+        f: impl FnOnce(&mut Object) -> R,
+    ) -> PyResult<R> {
+        let id = slot.0.object_id().ok_or("expected a heap object")?;
+        Ok(f(&mut self.object_mut(id)?.payload))
     }
 
     /// The attributes stored on `value`, or `None` when none has been assigned (or `value` is
     /// not an instance of a user class).
-    pub fn attributes(&self, value: Value<'_>) -> Result<Option<&InstanceAttributes>, String> {
-        Ok(self.object(self.object_id(value)?)?.attributes.as_deref())
+    pub fn attributes(&self, value: Value) -> PyResult<Option<&InstanceAttributes>> {
+        Ok(self.object(Self::object_id(value)?)?.attributes.as_deref())
     }
 
     /// `value`'s type together with its attributes, for inline caches that guard on both.
     pub fn typed_attributes(
         &self,
-        value: Value<'_>,
-    ) -> Result<(TypeId, Option<&InstanceAttributes>), String> {
-        let object = self.object(self.object_id(value)?)?;
+        value: Value,
+    ) -> PyResult<(TypeId, Option<&InstanceAttributes>)> {
+        let object = self.object(Self::object_id(value)?)?;
         Ok((object.type_id, object.attributes.as_deref()))
     }
 
-    /// Mutate `value`'s attribute storage, creating or replacing it, with a [`Builder`] for
-    /// turning handles into stored references.
+    /// Mutate `value`'s attribute storage, creating or replacing it.
     pub fn modify_attributes<R>(
         &mut self,
-        value: Value<'_>,
-        f: impl FnOnce(&Builder<'_>, &mut Option<Box<InstanceAttributes>>) -> R,
-    ) -> Result<R, String> {
-        self.modify_object(value, |builder, object| f(builder, &mut object.attributes))
+        value: Value,
+        f: impl FnOnce(&mut Option<Box<InstanceAttributes>>) -> R,
+    ) -> PyResult<R> {
+        let id = Self::object_id(value)?;
+        Ok(f(&mut self.object_mut(id)?.attributes))
     }
 
-    fn modify_object<R>(
-        &mut self,
-        value: Value<'_>,
-        f: impl FnOnce(&Builder<'_>, &mut HeapObject) -> R,
-    ) -> Result<R, String> {
-        let id = self.object_id(value)?;
-        let builder = Builder {
-            handles: &self.handles,
-        };
-        let object = if id.is_young() {
-            if id.epoch() != self.young_epoch {
-                return Err("stale reference to a moved young object".into());
-            }
-            self.young
-                .get_mut(id.index())
-                .and_then(Option::as_mut)
-                .ok_or("invalid object reference")?
-        } else {
-            let object = self
-                .old
-                .get_mut(id.index())
-                .and_then(Option::as_mut)
-                .ok_or("invalid object reference")?;
-            if !object.is_dirty() {
-                object.set_dirty(true);
-                self.remembered.push(id.index());
-            }
-            object
-        };
-        Ok(f(&builder, object))
+    pub fn type_id(&self, value: Value) -> PyResult<TypeId> {
+        Ok(self.object(Self::object_id(value)?)?.type_id)
     }
 
-    pub fn type_id(&self, value: Value<'_>) -> Result<TypeId, String> {
-        Ok(self.object(self.object_id(value)?)?.type_id)
-    }
-
-    /// A stable identity for `id()` and identity hashing, assigned on first use and unchanged
-    /// when the object moves. Immediates have none.
-    pub fn identity(&self, value: Value<'_>) -> Result<Option<u32>, String> {
-        let Some(id) = self.resolve(value).object_id() else {
+    /// A stable identity for `id()` and identity hashing: one more than the object's slot index,
+    /// unique among live objects as CPython's addresses are. Immediates have none.
+    pub fn identity(&self, value: Value) -> PyResult<Option<u32>> {
+        let Some(id) = value.raw().object_id() else {
             return Ok(None);
         };
-        let object = self.object(id)?;
-        let identity = object.identity();
-        if identity != 0 {
-            return Ok(Some(identity));
-        }
-        let identity = self.next_identity.get();
-        if identity & IDENTITY_MASK == 0 {
-            return Err("too many Python object identities".into());
-        }
-        self.next_identity.set(identity.wrapping_add(1));
-        object.set_identity(identity);
-        Ok(Some(identity))
+        self.object(id)?;
+        u32::try_from(id.index() + 1)
+            .map(Some)
+            .map_err(|_| "too many Python object identities".into())
     }
 
     /// Modeled size of one object's storage, as charged against the memory limit.
-    pub fn object_bytes(&self, value: Value<'_>) -> Result<u64, String> {
-        Ok(self.object(self.object_id(value)?)?.modeled_bytes)
+    pub fn object_bytes(&self, value: Value) -> PyResult<u64> {
+        Ok(self.object(Self::object_id(value)?)?.modeled_bytes)
     }
 
     /// Collection counters, for tests that assert when collections happen.
@@ -842,15 +741,15 @@ impl Heap {
 
     // ----- allocation ----------------------------------------------------------------------
 
-    /// Allocate `object` in the young space, collecting first when the space is full or the
-    /// memory limit would be exceeded. `object`'s own references are rewritten if that
-    /// collection moves their targets. The object's type is the builtin type of its payload.
-    pub fn alloc<'s>(
+    /// Allocate `object`, collecting first when the young generation is full or the memory limit
+    /// would be exceeded. The object's references are roots of that collection. The object's
+    /// type is the builtin type of its payload.
+    pub fn alloc(
         &mut self,
         object: Object,
-        roots: &mut dyn Roots,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<Value<'s>, String> {
+    ) -> PyResult<Value> {
         let type_id = self.infer_type_id(&object)?;
         self.alloc_typed(type_id, object, roots, resources)
     }
@@ -858,59 +757,45 @@ impl Heap {
     /// Allocate `object` as an instance of `type_id`, which is how an instance of a user class
     /// comes to carry a builtin payload: a `list` subclass instance is an [`Object::List`]
     /// whose type is the subclass.
-    pub fn alloc_typed<'s>(
+    pub fn alloc_typed(
         &mut self,
         type_id: TypeId,
-        mut object: Object,
-        roots: &mut dyn Roots,
+        object: Object,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<Value<'s>, String> {
+    ) -> PyResult<Value> {
         let bytes = modeled_size(&object)?;
         charge_construction(bytes, resources)?;
-        self.make_room(bytes, Some(&mut object), roots, resources)?;
+        self.make_room(bytes, Some(&object), roots, resources)?;
         self.modeled_bytes = self
             .modeled_bytes
             .checked_add(bytes)
             .ok_or("modeled heap size overflow")?;
         self.young_bytes = self.young_bytes.saturating_add(bytes);
-        let id = ObjectId::young(self.young_epoch, self.young.len());
-        self.young.push(Some(HeapObject {
+        let (index, generation) = match self.free.pop() {
+            Some(free) => free,
+            None => {
+                let index =
+                    u32::try_from(self.slots.len()).map_err(|_| "too many Python objects")?;
+                self.slots.push(None);
+                (index, 0)
+            }
+        };
+        self.slots[index as usize] = Some(HeapObject {
             type_id,
-            flags: Cell::new(0),
+            flags: Cell::new(generation | YOUNG_FLAG),
             payload: object,
             attributes: None,
             modeled_bytes: bytes,
-        }));
-        Ok(self.handle_raw(Raw::object(id)))
-    }
-
-    /// Allocate an object whose payload holds references, built from handles by a [`Builder`].
-    pub fn alloc_with<'s>(
-        &mut self,
-        roots: &mut dyn Roots,
-        resources: &mut Resources,
-        build: impl FnOnce(&Builder<'_>) -> Object,
-    ) -> Result<Value<'s>, String> {
-        let object = build(&self.builder());
-        self.alloc(object, roots, resources)
-    }
-
-    /// [`Heap::alloc_with`] for an instance of `type_id`.
-    pub fn alloc_with_typed<'s>(
-        &mut self,
-        type_id: TypeId,
-        roots: &mut dyn Roots,
-        resources: &mut Resources,
-        build: impl FnOnce(&Builder<'_>) -> Object,
-    ) -> Result<Value<'s>, String> {
-        let object = build(&self.builder());
-        self.alloc_typed(type_id, object, roots, resources)
+        });
+        self.young.push(index);
+        Ok(self.pin_raw(Raw::object(ObjectId::new(index, generation))))
     }
 
     /// A fresh payload holding the same builtin value as `value`, for the instance of a builtin
     /// subclass that `Class(value)` creates. Immediates are boxed; heap payloads are copied, so
     /// the instance never aliases the object it was built from.
-    pub fn copy_builtin_payload(&self, value: Value<'_>) -> Result<Object, String> {
+    pub fn copy_builtin_payload(&self, value: Value) -> PyResult<Object> {
         if let Some(value) = value.inline_string_ref() {
             return Ok(Object::String(PyString::from(value.as_str())));
         }
@@ -942,22 +827,25 @@ impl Heap {
         }
     }
 
-    /// Make the young space and the memory limit accommodate `bytes` more, collecting as needed.
-    /// `pending` is an object under construction whose references must survive the collection.
+    /// Make the young generation and the memory limit accommodate `bytes` more, collecting as
+    /// needed. `pending` is an object under construction whose references must survive the
+    /// collection.
     fn make_room(
         &mut self,
         bytes: u64,
-        mut pending: Option<&mut Object>,
-        roots: &mut dyn Roots,
+        pending: Option<&Object>,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let limit = resources.limits().memory;
         let mut collected_fully = false;
         if self.old_bytes >= self.major_threshold.max(gc::major_floor(limit)) {
-            self.collect_full(roots, pending.as_deref_mut(), resources)?;
+            self.collect_full(roots, pending, resources)?;
             collected_fully = true;
-        } else if self.young_bytes.saturating_add(bytes) > gc::young_budget(limit) {
-            self.collect_young(roots, pending.as_deref_mut(), resources)?;
+        } else if self.young_bytes.saturating_add(bytes) > gc::young_budget(limit)
+            || collect_every_allocation()
+        {
+            self.collect_young(roots, pending, resources)?;
         }
         // A failed reservation stops the process for good, so only reserve once the headroom
         // is known to exist; otherwise collect everything first and let the final attempt fail.
@@ -970,40 +858,39 @@ impl Heap {
         if resources.reserve_memory(bytes) {
             return Ok(());
         }
-        Err("memory limit exceeded".into())
+        Err(PyError::resource_error("memory limit exceeded"))
     }
 
     /// Replace an object payload while charging growth before installing it and releasing shrink
     /// after the old payload is no longer live. The object's identity is preserved.
     pub fn replace_payload(
         &mut self,
-        value: Value<'_>,
+        value: Value,
         payload: Object,
-        roots: &mut dyn Roots,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let next_bytes = modeled_size(&payload)?;
         let current_bytes = modeled_size(self.get(value)?)?;
         charge_construction(next_bytes, resources)?;
-        let mut payload = payload;
         if next_bytes > current_bytes {
             self.reserve_object_growth_pending(
                 value,
                 next_bytes - current_bytes,
-                Some(&mut payload),
+                Some(&payload),
                 roots,
                 resources,
             )?;
         }
         let next_type = self.infer_type_id(&payload)?;
-        let id = self.object_id(value)?;
+        let id = Self::object_id(value)?;
         let object = self.object_mut(id)?;
         object.type_id = next_type;
         object.payload = payload;
         if current_bytes > next_bytes {
             let released = current_bytes - next_bytes;
             object.modeled_bytes = object.modeled_bytes.saturating_sub(released);
-            self.release_space_bytes(id, released);
+            self.release_generation_bytes(id, released);
             self.modeled_bytes = self.modeled_bytes.saturating_sub(released);
             resources.release_memory(released);
         }
@@ -1013,80 +900,72 @@ impl Heap {
     /// Reserve `bytes` more modeled storage for one live object, collecting if needed.
     pub fn reserve_object_growth(
         &mut self,
-        value: Value<'_>,
+        value: Value,
         bytes: u64,
-        roots: &mut dyn Roots,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         self.reserve_object_growth_pending(value, bytes, None, roots, resources)
     }
 
     fn reserve_object_growth_pending(
         &mut self,
-        value: Value<'_>,
+        value: Value,
         bytes: u64,
-        pending: Option<&mut Object>,
-        roots: &mut dyn Roots,
+        pending: Option<&Object>,
+        roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let next_heap_bytes = self
             .modeled_bytes
             .checked_add(bytes)
             .ok_or("modeled heap size overflow")?;
-        let id = self.object_id(value)?;
+        let id = Self::object_id(value)?;
         self.object(id)?
             .modeled_bytes
             .checked_add(bytes)
             .ok_or("modeled object size overflow")?;
         self.make_room(bytes, pending, roots, resources)?;
-        // The collection may have moved the object; look it up again through the handle.
-        let id = self.object_id(value)?;
         self.modeled_bytes = next_heap_bytes;
-        self.add_space_bytes(id, bytes);
-        let object = if id.is_young() {
-            self.young.get_mut(id.index()).and_then(Option::as_mut)
-        } else {
-            self.old.get_mut(id.index()).and_then(Option::as_mut)
-        }
-        .ok_or("invalid object reference")?;
+        // The object may have been promoted by the collection; charge the generation it is in.
+        let object = self.object(id)?;
+        let young = object.has(YOUNG_FLAG);
+        let object = self.slots[id.index()].as_mut().expect("checked live above");
         object.modeled_bytes = object.modeled_bytes.saturating_add(bytes);
+        if young {
+            self.young_bytes = self.young_bytes.saturating_add(bytes);
+        } else {
+            self.old_bytes = self.old_bytes.saturating_add(bytes);
+        }
         Ok(())
     }
 
     /// Release modeled storage removed from one live object's payload.
     pub fn release_object_shrink(
         &mut self,
-        value: Value<'_>,
+        value: Value,
         bytes: u64,
         resources: &mut Resources,
-    ) -> Result<(), String> {
-        let id = self.object_id(value)?;
-        let object = if id.is_young() {
-            self.young.get_mut(id.index()).and_then(Option::as_mut)
-        } else {
-            self.old.get_mut(id.index()).and_then(Option::as_mut)
-        }
-        .ok_or("invalid object reference")?;
+    ) -> PyResult<()> {
+        let id = Self::object_id(value)?;
+        let object = match self.slots.get_mut(id.index()) {
+            Some(Some(object)) if object.generation() == id.generation() => object,
+            _ => return Err(stale_reference().into()),
+        };
         if object.modeled_bytes < bytes || self.modeled_bytes < bytes {
             return Err("modeled object size underflow".into());
         }
         object.modeled_bytes -= bytes;
         self.modeled_bytes -= bytes;
-        self.release_space_bytes(id, bytes);
+        self.release_generation_bytes(id, bytes);
         resources.release_memory(bytes);
         Ok(())
     }
 
-    fn add_space_bytes(&mut self, id: ObjectId, bytes: u64) {
-        if id.is_young() {
-            self.young_bytes = self.young_bytes.saturating_add(bytes);
-        } else {
-            self.old_bytes = self.old_bytes.saturating_add(bytes);
-        }
-    }
-
-    fn release_space_bytes(&mut self, id: ObjectId, bytes: u64) {
-        if id.is_young() {
+    fn release_generation_bytes(&mut self, id: ObjectId, bytes: u64) {
+        let young =
+            matches!(self.slots.get(id.index()), Some(Some(object)) if object.has(YOUNG_FLAG));
+        if young {
             self.young_bytes = self.young_bytes.saturating_sub(bytes);
         } else {
             self.old_bytes = self.old_bytes.saturating_sub(bytes);
@@ -1098,7 +977,7 @@ impl Heap {
         std::mem::take(&mut self.modeled_bytes)
     }
 
-    fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
+    fn infer_type_id(&self, object: &Object) -> PyResult<TypeId> {
         Ok(match object {
             Object::Bare => BuiltinType::Object.id(),
             Object::String(_) => BuiltinType::String.id(),
@@ -1159,11 +1038,34 @@ impl Heap {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only stress mode: run a minor collection before every allocation, so a value that
+    /// Rust code holds without a pin is freed at the first chance and its use reports a stale
+    /// reference instead of passing by luck.
+    pub(crate) static COLLECT_EVERY_ALLOCATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[inline(always)]
+fn collect_every_allocation() -> bool {
+    #[cfg(test)]
+    return COLLECT_EVERY_ALLOCATION.with(std::cell::Cell::get);
+    #[cfg(not(test))]
+    false
+}
+
+/// The error for an id whose slot was freed (or reused) since the id was made: a value that was
+/// used after its pin was released, which is an interpreter bug.
+fn stale_reference() -> String {
+    "stale reference to a freed object".into()
+}
+
 /// Fixed charge for one heap slot: the host size of the slot itself, so that many small objects
 /// cost the guest what they cost the host.
 const OBJECT_HEADER: u64 = std::mem::size_of::<Option<HeapObject>>() as u64;
 
-fn modeled_size(object: &Object) -> Result<u64, String> {
+fn modeled_size(object: &Object) -> PyResult<u64> {
     const VALUE: u64 = MODELED_VALUE_BYTES;
     // Text, bytes, big-integer magnitudes, and packed array elements are charged at their byte
     // length rather than per value slot.
@@ -1171,7 +1073,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         u64::try_from(length)
             .ok()
             .and_then(|bytes| bytes.checked_add(OBJECT_HEADER))
-            .ok_or_else(|| String::from("modeled object size overflow"))
+            .ok_or_else(|| PyError::from("modeled object size overflow"))
     };
     let slots = match object {
         Object::String(value) => return packed(value.len()),
@@ -1266,8 +1168,8 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         }
         Object::Module { name, .. } => name.len(),
         Object::Scope(scope) => return modeled_scope_size(scope),
-        // The namespace it views is charged where that namespace actually lives (the scope or
-        // the REPL/script global table), so the view itself is a fixed, minimal handle.
+        // The namespace it views is charged where that namespace lives, so the view itself is
+        // a fixed, minimal handle.
         Object::NamespaceDict(_) | Object::DictView { .. } | Object::MappingProxy(_) => 1,
         Object::Native(native) => {
             return OBJECT_HEADER

@@ -40,7 +40,7 @@ fn kind_name(kind: ParameterKind) -> &'static str {
 }
 
 /// `flags(callable)`: `(is_generator, is_coroutine)` for a Python function, else `None`.
-fn flags<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn flags(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("flags", 1, 1)?;
     args.reject_keywords("flags")?;
     let Some((is_generator, is_coroutine)) = runtime.function_flags(&args.positional()[0])? else {
@@ -49,7 +49,7 @@ fn flags<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     runtime.new_tuple(vec![Value::Bool(is_generator), Value::Bool(is_coroutine)])
 }
 
-fn parameters<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn parameters(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("parameters", 1, 1)?;
     args.reject_keywords("parameters")?;
     let Some(parameters) = runtime.function_parameters(&args.positional()[0])? else {

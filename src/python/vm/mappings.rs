@@ -6,15 +6,13 @@
 //! subscription, so its own methods run.
 
 use super::{Object, Value, Vm};
+use crate::python::error::PyResult;
 
 impl<'s> Vm<'s> {
     /// The `(key, value)` entries of `value` if it is a mapping, or `None` when it has no `keys`
     /// method. A dict subclass is read from the dict it holds, as CPython's `dict_merge` reads a
     /// subclass that keeps `dict.__iter__`.
-    pub(super) fn mapping_items(
-        &mut self,
-        value: Value<'s>,
-    ) -> Result<Option<Vec<(Value<'s>, Value<'s>)>>, String> {
+    pub(super) fn mapping_items(&mut self, value: Value) -> PyResult<Option<Vec<(Value, Value)>>> {
         let stored = value;
         if stored.is_object() {
             let length = match self.get(stored)? {
@@ -22,9 +20,7 @@ impl<'s> Vm<'s> {
                 _ => None,
             };
             if let Some(length) = length {
-                self.reserve_result(
-                    length.saturating_mul(std::mem::size_of::<(Value<'s>, Value<'s>)>()),
-                )?;
+                self.reserve_scratch(length.saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
                 let (Object::Dict(entries) | Object::DefaultDict { entries, .. }) =
                     self.get(stored)?
                 else {
@@ -33,7 +29,7 @@ impl<'s> Vm<'s> {
                 return Ok(Some(
                     entries
                         .iter()
-                        .map(|(key, value)| (self.handle(key), self.handle(value)))
+                        .map(|(key, value)| (self.value(key), self.value(value)))
                         .collect(),
                 ));
             }

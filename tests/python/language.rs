@@ -416,11 +416,10 @@ print(cos(0), floor(2.5))
     );
 }
 
-/// `globals()` inside an imported module is backed by that module's own lexical scope (see
-/// `heap::NamespaceTarget::Scope`), distinct from the flat table backing the top-level script's
-/// own `globals()` (`NamespaceTarget::Repl`). `module.__dict__`, `vars(module)` and module-level
-/// `locals()` view the same scope. `tests/python/test_language.py` runs entirely inside one `-c`
-/// script, so it never exercises the scope-backed path; a real `import` is needed to reach it.
+/// `globals()` inside an imported module is that module's own scope, not the importing script's.
+/// `module.__dict__`, `vars(module)` and module-level `locals()` view the same scope.
+/// `tests/python/test_language.py` runs inside one `-c` script, so a real `import` is needed to
+/// show that each module's code reads its own globals.
 #[test]
 fn globals_of_an_imported_module_is_the_modules_own_live_scope() {
     let mut environment = Environment::new();
@@ -457,6 +456,38 @@ print(counter.extra, "bump" in vars(counter))
             "1\n2\n2\nTrue\nFalse True\nmodule 2 True\n5 True\n".into(),
             String::new()
         )
+    );
+}
+
+/// The main script is the `__main__` module: an imported module reads the script's globals
+/// through `sys.modules`, and they hold `__name__`, `__doc__` and the script's `__file__`.
+#[test]
+fn the_main_script_runs_as_the_main_module() {
+    let mut environment = Environment::new();
+    for (path, source) in [
+        (
+            "/peek.py",
+            "import sys\n\ndef main_value():\n    return sys.modules['__main__'].value\n",
+        ),
+        (
+            "/main.py",
+            "import peek\nvalue = 3\nprint(peek.main_value(), __name__, __doc__)\n\
+             value = 4\nprint(peek.main_value(), __file__.endswith('main.py'))\n",
+        ),
+    ] {
+        environment
+            .vfs
+            .put_file(path, source.as_bytes().to_vec(), 0o644)
+            .unwrap();
+    }
+    let (outcome, stdout, stderr) = environment.run_script_capture("python3.14 /main.py");
+    assert_eq!(
+        (
+            outcome.exit_status,
+            String::from_utf8_lossy(&stdout).into_owned(),
+            String::from_utf8_lossy(&stderr).into_owned()
+        ),
+        (0, "3 __main__ None\n4 True\n".into(), String::new())
     );
 }
 

@@ -11,6 +11,7 @@ mod compiler;
 mod complex;
 mod cpython_names;
 mod definitions;
+mod error;
 mod exception_types;
 mod filesystem;
 mod float_text;
@@ -40,8 +41,9 @@ use std::collections::HashMap;
 
 use crate::interp::Interp;
 
+use crate::python::error::PyResult;
 use ast::StatementKind;
-use heap::Value;
+use heap::{Ref, Value};
 
 type Out<'a> = &'a mut Vec<u8>;
 
@@ -58,11 +60,14 @@ pub(crate) fn is_bundled_distribution(name: &str) -> bool {
 }
 
 /// Persistent locals for the deliberately-small foreground Python REPL.
-#[derive(Default, Debug)]
+#[derive(Debug)]
 pub struct ReplState {
-    globals: GlobalBindings,
     heap: heap::Heap,
+    /// The builtins code has used, recorded by symbol on first use.
+    builtins: heap::Namespace,
     symbols: symbols::Symbols,
+    /// Every code object compiled for this interpreter, with its inline caches.
+    codes: vm::CodeTable,
     shapes: attributes::Shapes,
     types: object_model::TypeRegistry,
     modules: HashMap<String, heap::Ref>,
@@ -73,12 +78,35 @@ pub struct ReplState {
     type_memory: u64,
 }
 
+impl Default for ReplState {
+    fn default() -> Self {
+        // The builtin types name their attributes with this interpreter's symbols.
+        let mut symbols = symbols::Symbols::default();
+        let types = object_model::TypeRegistry::new(&mut symbols);
+        Self {
+            heap: heap::Heap::default(),
+            builtins: heap::Namespace::default(),
+            symbols,
+            codes: vm::CodeTable::default(),
+            shapes: attributes::Shapes::default(),
+            types,
+            modules: HashMap::new(),
+            import_paths: Vec::new(),
+            sys_path: None,
+            temporary_import_paths: Vec::new(),
+            original_cwd: None,
+            type_memory: 0,
+        }
+    }
+}
+
 impl Clone for ReplState {
     fn clone(&self) -> Self {
         Self {
-            globals: self.globals.clone(),
             heap: self.heap.clone(),
+            builtins: self.builtins.dup(),
             symbols: self.symbols.clone(),
+            codes: self.codes.clone(),
             shapes: self.shapes.clone(),
             types: self.types.clone(),
             modules: self
@@ -92,120 +120,6 @@ impl Clone for ReplState {
             original_cwd: self.original_cwd.clone(),
             type_memory: self.type_memory,
         }
-    }
-}
-
-/// The flat global table of the entry-point script or REPL, indexed by symbol.
-#[derive(Default, Debug)]
-struct GlobalBindings {
-    values: Vec<Option<heap::Ref>>,
-    modeled_bytes: u64,
-}
-
-impl Clone for GlobalBindings {
-    fn clone(&self) -> Self {
-        Self {
-            values: self
-                .values
-                .iter()
-                .map(|value| value.as_ref().map(heap::Ref::dup))
-                .collect(),
-            modeled_bytes: self.modeled_bytes,
-        }
-    }
-}
-
-impl heap::Roots for GlobalBindings {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut heap::Ref)) {
-        for value in self.values.iter_mut().flatten() {
-            visitor(value);
-        }
-    }
-}
-
-impl GlobalBindings {
-    #[inline(always)]
-    fn get<'s>(&self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
-        heap.handle_optional(self.values.get(symbol.index()).and_then(Option::as_ref))
-    }
-
-    /// The stored reference of a binding, for pushing onto the operand stack directly.
-    #[inline(always)]
-    fn get_ref(&self, symbol: symbols::SymbolId) -> Option<&heap::Ref> {
-        self.values.get(symbol.index()).and_then(Option::as_ref)
-    }
-
-    #[inline(always)]
-    fn insert(
-        &mut self,
-        heap: &heap::Heap,
-        symbol: symbols::SymbolId,
-        value: Value<'_>,
-        resources: &mut crate::resources::Resources,
-    ) -> Result<(), String> {
-        if self.values.len() <= symbol.index() {
-            self.grow(symbol, resources)?;
-        }
-        self.values[symbol.index()] = Some(heap.store(value));
-        Ok(())
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn grow(
-        &mut self,
-        symbol: symbols::SymbolId,
-        resources: &mut crate::resources::Resources,
-    ) -> Result<(), String> {
-        let required_len = symbol
-            .index()
-            .checked_add(1)
-            .ok_or("global binding count overflow")?;
-        let added = required_len - self.values.len();
-        let bytes = u64::try_from(added)
-            .unwrap_or(u64::MAX)
-            .checked_mul(std::mem::size_of::<heap::Ref>() as u64)
-            .ok_or("global binding size overflow")?;
-        let modeled_bytes = self
-            .modeled_bytes
-            .checked_add(bytes)
-            .ok_or("modeled global binding size overflow")?;
-        if !resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
-        }
-        self.values.resize_with(required_len, || None);
-        self.modeled_bytes = modeled_bytes;
-        Ok(())
-    }
-
-    fn remove<'s>(&mut self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
-        let removed = self.values.get_mut(symbol.index()).and_then(Option::take);
-        heap.handle_optional(removed.as_ref())
-    }
-
-    /// Every populated `(name, value)` binding, resolved through the heap's symbol table, for
-    /// `globals()` on the entry-point script or REPL. Slot order here just follows `SymbolId`
-    /// allocation order, not Python's per-dict insertion order; callers that need a stable order
-    /// sort the result themselves.
-    fn entries<'s>(
-        &self,
-        heap: &heap::Heap,
-        symbols: &symbols::Symbols,
-    ) -> Vec<(String, Value<'s>)> {
-        self.values
-            .iter()
-            .enumerate()
-            .filter_map(|(index, value)| {
-                let value = value.as_ref()?;
-                let symbol = symbols::SymbolId::from_index(index)?;
-                let name = symbols.name(symbol)?.to_string();
-                Some((name, heap.handle(value)))
-            })
-            .collect()
-    }
-
-    fn take_modeled_bytes(&mut self) -> u64 {
-        std::mem::take(&mut self.modeled_bytes)
     }
 }
 
@@ -227,8 +141,8 @@ impl ReplState {
     fn release_owned_memory(&mut self, resources: &mut crate::resources::Resources) {
         let heap = self.heap.take_modeled_bytes();
         resources.release_memory(
-            heap.saturating_add(self.globals.take_modeled_bytes())
-                .saturating_add(self.symbols.take_modeled_bytes())
+            heap.saturating_add(self.symbols.take_modeled_bytes())
+                .saturating_add(self.codes.take_modeled_bytes())
                 .saturating_add(self.shapes.take_modeled_bytes())
                 .saturating_add(std::mem::take(&mut self.type_memory)),
         );
@@ -252,6 +166,14 @@ pub(crate) struct PythonContinuation {
     stderr: Vec<u8>,
     original_cwd: String,
 }
+
+// A `Value` is pinned only until the quantum that made it ends, and it is not `Send`. Requiring
+// the state a process keeps between quanta to be `Send` keeps values out of it at compile time;
+// that state holds stored references instead.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<PythonContinuation>();
+};
 
 /// Result of parsing and starting a Python command.
 pub(crate) enum PythonCommandStart {
@@ -404,18 +326,21 @@ pub(crate) fn start_python(
         return PythonCommandStart::Ready(137);
     }
 
-    let program = vm::VmProgram::compile(&source);
+    let mut state = ReplState::default();
+    let program = vm::VmProgram::compile(&source, &mut state, &mut interp.resources);
     interp.resources.release_memory(scratch);
     let program = match program {
         Ok(program) => program,
-        Err(ExecResult::Unsupported(feature)) => {
-            return PythonCommandStart::Ready(unsupported(interp, &feature, err))
+        Err(result) => {
+            state.release_owned_memory(&mut interp.resources);
+            return PythonCommandStart::Ready(match result {
+                ExecResult::Unsupported(feature) => unsupported(interp, &feature, err),
+                ExecResult::Exit(status) => status,
+                ExecResult::Continue => unreachable!("compilation cannot complete execution"),
+            });
         }
-        Err(ExecResult::Exit(status)) => return PythonCommandStart::Ready(status),
-        Err(ExecResult::Continue) => unreachable!("compilation cannot complete execution"),
     };
 
-    let mut state = ReplState::default();
     let import_root = match py_argv.first().map(String::as_str) {
         Some("-c" | "-" | "") | None => interp.cwd.clone(),
         Some(script) => {
@@ -433,52 +358,6 @@ pub(crate) fn start_python(
         }
     };
     state.import_paths.push(import_root);
-    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
-        Ok(symbol) => symbol,
-        Err(_) => return PythonCommandStart::Ready(137),
-    };
-    if state
-        .globals
-        .insert(
-            &state.heap,
-            name_symbol,
-            Value::inline_string("__main__").expect("short builtin string"),
-            &mut interp.resources,
-        )
-        .is_err()
-    {
-        return PythonCommandStart::Ready(137);
-    }
-    if let Some(script) = py_argv
-        .first()
-        .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
-    {
-        // No VM scope exists yet, so release the handle once the global table holds the value.
-        let handle_base = state.heap.handle_count();
-        let file = match Value::inline_string(script) {
-            Some(value) => value,
-            // The fresh state's only references are its globals.
-            None => match state.heap.alloc(
-                heap::Object::String(script.clone().into()),
-                &mut state.globals,
-                &mut interp.resources,
-            ) {
-                Ok(value) => value,
-                Err(_) => return PythonCommandStart::Ready(137),
-            },
-        };
-        let file_symbol = match state.symbols.intern("__file__", &mut interp.resources) {
-            Ok(symbol) => symbol,
-            Err(_) => return PythonCommandStart::Ready(137),
-        };
-        let inserted = state
-            .globals
-            .insert(&state.heap, file_symbol, file, &mut interp.resources);
-        state.heap.truncate_handles(handle_base);
-        if inserted.is_err() {
-            return PythonCommandStart::Ready(137);
-        }
-    }
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
         stdin: execution_stdin,
@@ -968,7 +847,7 @@ fn append_failure(interp: &Interp, err: Out, runner: &str, failure: RunnerAppend
     }
 }
 
-fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> {
+fn collect_unittest_classes(source: &str) -> PyResult<Vec<UnitTestClass>> {
     let tokens = lexer::lex(source).map_err(|error| {
         format!(
             "{} at line {}, column {}",
@@ -1013,7 +892,7 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
             } = member.kind
             else {
                 if matches!(member.kind, StatementKind::Decorated { .. }) {
-                    return Err(format!("decorators are unsupported in test class {name:?}"));
+                    return Err(format!("decorators are unsupported in test class {name:?}").into());
                 }
                 continue;
             };
@@ -1021,9 +900,7 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
                 || member_name == "tearDownClass"
                 || member_name == "load_tests"
             {
-                return Err(format!(
-                    "unittest class hook {member_name:?} is unsupported"
-                ));
+                return Err(format!("unittest class hook {member_name:?} is unsupported").into());
             }
             if !member_name.starts_with("test_")
                 && member_name != "setUp"
@@ -1034,7 +911,8 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
             if parameters.len() != 1 || parameters[0].name != "self" {
                 return Err(format!(
                     "method {name}.{member_name} must accept only self; fixtures are unsupported"
-                ));
+                )
+                .into());
             }
             match member_name.as_str() {
                 "setUp" => setup = true,
@@ -1072,7 +950,7 @@ struct PytestCollection {
     fixtures: HashMap<String, PytestFixture>,
 }
 
-fn collect_pytest_functions(source: &str) -> Result<PytestCollection, String> {
+fn collect_pytest_functions(source: &str) -> PyResult<PytestCollection> {
     let tokens = lexer::lex(source).map_err(|error| {
         format!(
             "{} at line {}, column {}",
@@ -1165,7 +1043,7 @@ fn is_fixture_decorator(expression: &ast::Expression) -> bool {
 /// The argument names of a `@pytest.mark.parametrize` decorator, or `None` for other
 /// decorators. Only the names are read from source: the facade in `pytest.py` records the
 /// evaluated rows on the test function when its module runs, as pytest does.
-fn parametrize_names(expression: &ast::Expression) -> Result<Option<Vec<String>>, String> {
+fn parametrize_names(expression: &ast::Expression) -> PyResult<Option<Vec<String>>> {
     let ast::ExpressionKind::Call {
         function,
         arguments,
@@ -1207,7 +1085,7 @@ fn parametrize_names(expression: &ast::Expression) -> Result<Option<Vec<String>>
     Ok(Some(names))
 }
 
-fn parse_skip_marker(expression: &ast::Expression) -> Result<bool, String> {
+fn parse_skip_marker(expression: &ast::Expression) -> PyResult<bool> {
     let (target, arguments) = match &expression.kind {
         ast::ExpressionKind::Call {
             function,
@@ -1292,7 +1170,7 @@ fn build_pytest_item(
     test: &PytestFunction,
     fixtures: &HashMap<String, PytestFixture>,
     timeout: f64,
-) -> Result<String, String> {
+) -> PyResult<String> {
     let label = if test.parametrized.is_empty() {
         format!("{:?}", format!("{path}::{}", test.name))
     } else {
@@ -1365,7 +1243,7 @@ fn resolve_pytest_fixture(
     counter: &mut usize,
     setup: &mut String,
     teardown: &mut Vec<String>,
-) -> Result<String, String> {
+) -> PyResult<String> {
     if let Some(value) = cache.get(name) {
         return Ok(value.clone());
     }
@@ -1382,7 +1260,7 @@ fn resolve_pytest_fixture(
         .get(name)
         .ok_or_else(|| format!("fixture {name:?} not found"))?;
     if active.iter().any(|candidate| candidate == name) {
-        return Err(format!("recursive fixture dependency involving {name:?}"));
+        return Err(format!("recursive fixture dependency involving {name:?}").into());
     }
     active.push(name.into());
     let mut arguments = Vec::new();
@@ -1422,7 +1300,6 @@ fn unsupported(interp: &mut Interp, feature: &str, err: Out) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resources::{Limits, Resources};
 
     fn run(source: &str) -> (i32, String, String) {
         let mut env = Interp::new();
@@ -1493,24 +1370,102 @@ mod tests {
         );
     }
 
+    /// Collect before every allocation while running a program that exercises calls, classes,
+    /// generators (delegation, `send`, `throw`, `close`, and exceptions leaving them),
+    /// exceptions, sorting and containers. Any value Rust code holds without a pin
+    /// is freed at its first chance, so a missing pin shows up as a stale reference here.
     #[test]
-    fn global_binding_growth_is_charged_before_mutation() {
-        let mut resources = Resources::new(Limits {
-            memory: 32,
-            ..Limits::unlimited()
-        });
-        let heap = heap::Heap::default();
-        let symbol = symbols::Symbols::default()
-            .intern("x", &mut resources)
-            .unwrap();
-        let mut globals = GlobalBindings::default();
+    fn programs_survive_a_collection_at_every_allocation() {
+        let source = r#"
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def __repr__(self):
+        return f"Point({self.x}, {self.y})"
+    def __lt__(self, other):
+        return (self.x, self.y) < (other.x, other.y)
 
-        assert_eq!(
-            globals
-                .insert(&heap, symbol, Value::Int(1), &mut resources)
-                .unwrap_err(),
-            "memory limit exceeded"
-        );
-        assert!(globals.get(&heap, symbol).is_none());
+def numbers(limit):
+    for value in range(limit):
+        yield str(value) * 2
+
+def outer():
+    seen = []
+    def inner(value):
+        seen.append([value, {"key": value}])
+        return len(seen)
+    return inner, seen
+
+inner, seen = outer()
+for item in numbers(20):
+    inner(item)
+points = sorted(Point(i % 7, -i) for i in range(30))
+words = sorted({str(i): [i] * 3 for i in range(25)}, key=lambda word: (len(word), word[::-1]))
+try:
+    {}["missing" + str(len(words))]
+except KeyError as error:
+    caught = repr(error)
+merged = {**{"a": [1]}, **{"b": (2, "two")}}
+print(len(seen), seen[-1], points[:3], words[-3:], caught, merged)
+
+log = []
+
+def inner_steps():
+    received = yield "first"
+    try:
+        yield [received] * 2
+    finally:
+        log.append("inner closed")
+    return {"result": received}
+
+def delegate():
+    result = yield from inner_steps()
+    yield result
+
+steps = delegate()
+log.append(next(steps))
+log.append(steps.send("x"))
+log.append(next(steps))
+log.append(list(steps))
+
+def guarded():
+    while True:
+        try:
+            yield len(log)
+        except ValueError as error:
+            log.append(("caught", str(error)))
+
+guard = guarded()
+next(guard)
+log.append(guard.throw(ValueError("bad")))
+guard.close()
+
+def failing(limit):
+    for index in range(limit):
+        if index == 3:
+            raise KeyError("stop" + str(index))
+        yield [index]
+
+try:
+    for chunk in failing(10):
+        log.append(chunk)
+except KeyError as error:
+    log.append(repr(error))
+
+def depth(n):
+    if n:
+        yield from depth(n - 1)
+    yield n
+
+log.append(sum(depth(30)))
+print(log)
+"#;
+        let expected = run(source);
+        assert_eq!(expected.0, 0, "{}", expected.2);
+        heap::COLLECT_EVERY_ALLOCATION.with(|flag| flag.set(true));
+        let stressed = run(source);
+        heap::COLLECT_EVERY_ALLOCATION.with(|flag| flag.set(false));
+        assert_eq!(stressed, expected);
     }
 }

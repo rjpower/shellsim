@@ -2,67 +2,51 @@
 //!
 //! A scope ([`ScopeObject`]) is an ordinary heap object; this module implements the lookups and
 //! stores the interpreter performs on one: local slots assigned by the compiler, dynamically
-//! bound names, and the walk through enclosing scopes. Everything here goes through handles and
-//! [`Heap::modify`], so a store into an old scope is remembered for the collector.
+//! bound names, and the walk through enclosing scopes. Names are symbols. Every chain ends at a
+//! module's scope, whose dynamic names are that module's globals, so the main script is no
+//! different from an imported module. Stores go through [`Heap::modify`], so a store into an
+//! old scope is remembered for the collector.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::resources::Resources;
 
-use super::heap::{Heap, Object, Ref, Roots, ScopeObject, Value, DYNAMIC_NAME_BYTES};
+use super::heap::{Heap, Namespace, Object, Ref, Roots, ScopeObject, Value, DYNAMIC_NAME_BYTES};
+use super::symbols::SymbolId;
+use crate::python::error::{PyError, PyResult};
 
 /// The fixed part of a new scope: where name lookup continues and which names have slots.
-pub struct ScopeLayout<'a> {
-    pub parent: Option<Value<'a>>,
-    pub uses_repl_globals: bool,
-    pub local_names: Arc<[String]>,
+pub struct ScopeLayout {
+    pub parent: Option<Value>,
+    pub local_names: Arc<[SymbolId]>,
 }
 
-/// Allocate a scope whose compiler-assigned local slots are already populated.
-pub fn alloc_scope<'s>(
+/// Allocate a scope whose compiler-assigned local slots are already populated, with `names`
+/// bound dynamically in that order.
+pub fn alloc_scope(
     heap: &mut Heap,
-    layout: ScopeLayout<'_>,
-    locals: Vec<Option<Value<'_>>>,
-    values: HashMap<String, Value<'_>>,
-    roots: &mut dyn Roots,
+    layout: ScopeLayout,
+    locals: Vec<Option<Value>>,
+    names: Vec<(SymbolId, Value)>,
+    roots: &dyn Roots,
     resources: &mut Resources,
-) -> Result<Value<'s>, String> {
+) -> PyResult<Value> {
     if locals.len() != layout.local_names.len() {
         return Err("local slot metadata mismatch".into());
     }
-    heap.alloc_with(roots, resources, |builder| {
-        Object::Scope(Box::new(ScopeObject {
-            parent: builder.optional(layout.parent),
-            uses_repl_globals: layout.uses_repl_globals,
-            local_names: layout.local_names,
-            locals: locals
-                .into_iter()
-                .map(|value| builder.optional(value))
-                .collect(),
-            order: Vec::new(),
-            values: builder.named(values),
-        }))
-    })
+    let object = Object::Scope(Box::new(ScopeObject {
+        parent: Ref::optional(layout.parent),
+        local_names: layout.local_names,
+        locals: locals.into_iter().map(Ref::optional).collect(),
+        names: names
+            .into_iter()
+            .map(|(symbol, value)| (symbol, Ref::from(value)))
+            .collect(),
+    }));
+    heap.alloc(object, roots, resources)
 }
 
-/// Allocate a scope, placing each of `values` that names a local slot into that slot.
-pub fn alloc_scope_named<'s>(
-    heap: &mut Heap,
-    layout: ScopeLayout<'_>,
-    mut values: HashMap<String, Value<'_>>,
-    roots: &mut dyn Roots,
-    resources: &mut Resources,
-) -> Result<Value<'s>, String> {
-    let locals = layout
-        .local_names
-        .iter()
-        .map(|name| values.remove(name))
-        .collect::<Vec<_>>();
-    alloc_scope(heap, layout, locals, values, roots, resources)
-}
-
-fn scope<'h>(heap: &'h Heap, scope: Value<'_>) -> Result<&'h ScopeObject, String> {
+fn scope(heap: &Heap, scope: Value) -> PyResult<&ScopeObject> {
     match heap.get(scope)? {
         Object::Scope(scope) => Ok(scope),
         _ => Err("invalid scope reference".into()),
@@ -71,83 +55,95 @@ fn scope<'h>(heap: &'h Heap, scope: Value<'_>) -> Result<&'h ScopeObject, String
 
 fn modify_scope<R>(
     heap: &mut Heap,
-    scope: Value<'_>,
-    f: impl FnOnce(&super::heap::Builder<'_>, &mut ScopeObject) -> R,
-) -> Result<R, String> {
-    heap.modify(scope, |builder, object| match object {
-        Object::Scope(scope) => Ok(f(builder, scope)),
-        _ => Err(String::from("invalid scope reference")),
+    scope: Value,
+    f: impl FnOnce(&mut ScopeObject) -> R,
+) -> PyResult<R> {
+    heap.modify(scope, |object| match object {
+        Object::Scope(scope) => Ok(f(scope)),
+        _ => Err(PyError::from("invalid scope reference")),
     })?
 }
 
+fn slot(scope: &ScopeObject, symbol: SymbolId) -> Option<usize> {
+    scope.local_names.iter().position(|local| *local == symbol)
+}
+
+/// The binding of `symbol` in this one scope, slot or dynamic name.
+fn bound(scope: &ScopeObject, symbol: SymbolId) -> Option<&Ref> {
+    match slot(scope, symbol) {
+        Some(index) => scope.locals[index].as_ref(),
+        None => scope.names.get(symbol),
+    }
+}
+
 /// Look a name up through this scope and its ancestors.
-pub fn get<'s>(heap: &Heap, start: Value<'s>, name: &str) -> Result<Option<Value<'s>>, String> {
+pub fn get(heap: &Heap, start: Value, symbol: SymbolId) -> PyResult<Option<Value>> {
     let mut current = start;
     loop {
         let object = scope(heap, current)?;
-        if let Some(index) = object.local_names.iter().position(|local| local == name) {
-            if let Some(slot) = object.locals.get(index).and_then(Option::as_ref) {
-                return Ok(Some(heap.handle(slot)));
-            }
-        }
-        if let Some(slot) = object.values.get(name) {
-            return Ok(Some(heap.handle(slot)));
+        if let Some(value) = bound(object, symbol) {
+            return Ok(Some(heap.value(value)));
         }
         match &object.parent {
-            Some(parent) => current = heap.handle(parent),
+            Some(parent) => current = heap.value(parent),
             None => return Ok(None),
         }
     }
 }
 
-/// The outermost ancestor of `start`: a module scope, or a function scope created at the
-/// REPL/script top level.
-pub fn root<'s>(heap: &Heap, start: Value<'s>) -> Result<Value<'s>, String> {
-    let mut current = start;
-    loop {
-        match &scope(heap, current)?.parent {
-            Some(parent) => current = heap.handle(parent),
-            None => return Ok(current),
-        }
+/// The stored binding of a module global, read through the stored reference a frame keeps to
+/// its module's scope so that the hot path pins nothing.
+#[inline]
+pub fn global<'h>(heap: &'h Heap, globals: &Ref, symbol: SymbolId) -> PyResult<Option<&'h Ref>> {
+    match heap.stored(globals)? {
+        Object::Scope(scope) => Ok(scope.names.get(symbol)),
+        _ => Err("invalid scope reference".into()),
     }
 }
 
-pub fn uses_repl_globals(heap: &Heap, start: Value<'_>) -> Result<bool, String> {
-    Ok(scope(heap, root(heap, start)?)?.uses_repl_globals)
+/// Rebind a module global that is already bound, in place; returns `false` when the module
+/// does not bind `symbol` yet, so the caller charges the new entry through [`insert`].
+#[inline]
+pub fn replace_global(
+    heap: &mut Heap,
+    globals: &Ref,
+    symbol: SymbolId,
+    value: Value,
+) -> PyResult<bool> {
+    heap.modify_stored(globals, |object| match object {
+        Object::Scope(scope) => Ok(match scope.names.get_mut(symbol) {
+            Some(slot) => {
+                *slot = Ref::from(value);
+                true
+            }
+            None => false,
+        }),
+        _ => Err(PyError::from("invalid scope reference")),
+    })?
 }
 
-pub fn parent<'s>(heap: &Heap, start: Value<'_>) -> Result<Option<Value<'s>>, String> {
-    Ok(heap.handle_optional(scope(heap, start)?.parent.as_ref()))
+pub fn parent(heap: &Heap, start: Value) -> PyResult<Option<Value>> {
+    Ok(heap.value_optional(scope(heap, start)?.parent.as_ref()))
 }
 
-/// The dynamic names bound in this scope in the order they were first bound, which a class
-/// body's namespace keeps for its fields and enum members.
-pub fn bound_names(heap: &Heap, start: Value<'_>) -> Result<Vec<String>, String> {
-    Ok(scope(heap, start)?.order.clone())
-}
-
-/// Every name bound directly in this scope, slots and dynamic names together.
-pub fn values<'s>(heap: &Heap, start: Value<'_>) -> Result<HashMap<String, Value<'s>>, String> {
+/// Every name bound directly in this scope: bound slots in slot order, then dynamic names in
+/// the order they were first bound, which a class body keeps for its namespace.
+pub fn entries(heap: &Heap, start: Value) -> PyResult<Vec<(SymbolId, Value)>> {
     let object = scope(heap, start)?;
-    let mut values = object
-        .values
+    let slots = object
+        .local_names
         .iter()
-        .map(|(name, slot)| (name.clone(), heap.handle(slot)))
-        .collect::<HashMap<_, _>>();
-    for (name, slot) in object.local_names.iter().zip(&object.locals) {
-        if let Some(slot) = slot {
-            values.insert(name.clone(), heap.handle(slot));
-        }
-    }
-    Ok(values)
+        .zip(&object.locals)
+        .filter_map(|(symbol, slot)| Some((*symbol, heap.value(slot.as_ref()?))));
+    let names = object
+        .names
+        .iter()
+        .map(|(symbol, value)| (symbol, heap.value(value)));
+    Ok(slots.chain(names).collect())
 }
 
 /// The stored reference in one local slot, for pushing onto the operand stack directly.
-pub fn local_ref<'h>(
-    heap: &'h Heap,
-    start: Value<'_>,
-    slot: usize,
-) -> Result<Option<&'h Ref>, String> {
+pub fn local_ref(heap: &Heap, start: Value, slot: usize) -> PyResult<Option<&Ref>> {
     scope(heap, start)?
         .locals
         .get(slot)
@@ -155,120 +151,146 @@ pub fn local_ref<'h>(
         .ok_or_else(|| "invalid local slot".into())
 }
 
-pub fn store_local(
-    heap: &mut Heap,
-    start: Value<'_>,
-    slot: usize,
-    value: Value<'_>,
-) -> Result<(), String> {
-    modify_scope(heap, start, |builder, scope| {
-        match scope.locals.get_mut(slot) {
-            Some(local) => {
-                *local = Some(builder.store(value));
-                Ok(())
-            }
-            None => Err(String::from("invalid local slot")),
-        }
-    })?
+pub fn store_local(heap: &mut Heap, start: Value, slot: usize, value: Value) -> PyResult<()> {
+    store_local_ref(heap, start, slot, Ref::from(value))
 }
 
 /// Store a reference popped from the operand stack into a local slot.
-pub fn store_local_ref(
-    heap: &mut Heap,
-    start: Value<'_>,
-    slot: usize,
-    value: Ref,
-) -> Result<(), String> {
-    modify_scope(heap, start, |_, scope| match scope.locals.get_mut(slot) {
+pub fn store_local_ref(heap: &mut Heap, start: Value, slot: usize, value: Ref) -> PyResult<()> {
+    modify_scope(heap, start, |scope| match scope.locals.get_mut(slot) {
         Some(local) => {
             *local = Some(value);
             Ok(())
         }
-        None => Err(String::from("invalid local slot")),
+        None => Err(PyError::from("invalid local slot")),
     })?
 }
 
-pub fn remove_local<'s>(
-    heap: &mut Heap,
-    start: Value<'_>,
-    slot: usize,
-) -> Result<Option<Value<'s>>, String> {
-    let removed = modify_scope(heap, start, |_, scope| {
+pub fn remove_local(heap: &mut Heap, start: Value, slot: usize) -> PyResult<Option<Value>> {
+    let removed = modify_scope(heap, start, |scope| {
         scope
             .locals
             .get_mut(slot)
             .map(Option::take)
-            .ok_or_else(|| String::from("invalid local slot"))
+            .ok_or_else(|| PyError::from("invalid local slot"))
     })??;
-    Ok(heap.handle_optional(removed.as_ref()))
+    Ok(heap.value_optional(removed.as_ref()))
 }
 
-/// Bind `name` in this scope: in its local slot when the compiler assigned one, otherwise as a
-/// dynamic name, charging the new entry.
+/// Bind `symbol` in this scope: in its local slot when the compiler assigned one, otherwise as
+/// a dynamic name, charging the new entry.
 pub fn insert(
     heap: &mut Heap,
-    start: Value<'_>,
-    name: String,
-    value: Value<'_>,
-    roots: &mut dyn Roots,
+    start: Value,
+    symbol: SymbolId,
+    value: Value,
+    roots: &dyn Roots,
     resources: &mut Resources,
-) -> Result<(), String> {
+) -> PyResult<()> {
     let object = scope(heap, start)?;
-    if let Some(slot) = object.local_names.iter().position(|local| local == &name) {
+    if let Some(slot) = slot(object, symbol) {
         return store_local(heap, start, slot, value);
     }
-    let new_name = !object.values.contains_key(&name);
-    if new_name {
+    if !object.names.contains(symbol) {
         heap.reserve_object_growth(start, DYNAMIC_NAME_BYTES, roots, resources)?;
     }
-    modify_scope(heap, start, |builder, scope| {
-        if new_name {
-            scope.order.push(name.clone());
-        }
-        scope.values.insert(name, builder.store(value));
+    modify_scope(heap, start, |scope| {
+        scope.names.insert(symbol, Ref::from(value));
     })
 }
 
-/// Rebind `name` in the nearest scope, starting at `start`, that already binds it
-/// (`nonlocal`). `start` is the scope enclosing the one that declared the name.
+/// Rebind `symbol` in the nearest scope, starting at `start`, that already binds it
+/// (`nonlocal`). `start` is the scope enclosing the one that declared the name. Returns whether
+/// any scope bound it.
 pub fn store_nonlocal(
     heap: &mut Heap,
-    start: Value<'_>,
-    name: &str,
-    value: Value<'_>,
-) -> Result<(), String> {
-    let missing = || format!("no binding for nonlocal {name:?} found");
-    let mut current: Value<'_> = start;
+    start: Value,
+    symbol: SymbolId,
+    value: Value,
+) -> PyResult<bool> {
+    let mut current = start;
     loop {
         let candidate = scope(heap, current)?;
-        let next = heap.handle_optional(candidate.parent.as_ref());
-        if let Some(slot) = candidate.local_names.iter().position(|local| local == name) {
-            if candidate.locals[slot].is_some() {
-                return store_local(heap, current, slot, value);
-            }
+        if bound(candidate, symbol).is_some() {
+            modify_scope(heap, current, |scope| match slot(scope, symbol) {
+                Some(index) => scope.locals[index] = Some(Ref::from(value)),
+                None => {
+                    scope.names.insert(symbol, Ref::from(value));
+                }
+            })?;
+            return Ok(true);
         }
-        if candidate.values.contains_key(name) {
-            return modify_scope(heap, current, |builder, scope| {
-                scope.values.insert(name.to_string(), builder.store(value));
-            });
+        match heap.value_optional(candidate.parent.as_ref()) {
+            Some(parent) => current = parent,
+            None => return Ok(false),
         }
-        current = next.ok_or_else(missing)?;
     }
 }
 
-pub fn remove<'s>(
-    heap: &mut Heap,
-    start: Value<'_>,
-    name: &str,
-) -> Result<Option<Value<'s>>, String> {
-    let removed = modify_scope(heap, start, |_, scope| {
-        match scope.local_names.iter().position(|local| local == name) {
-            Some(slot) => scope.locals[slot].take(),
-            None => {
-                scope.order.retain(|bound| bound != name);
-                scope.values.remove(name)
-            }
-        }
+pub fn remove(heap: &mut Heap, start: Value, symbol: SymbolId) -> PyResult<Option<Value>> {
+    let removed = modify_scope(heap, start, |scope| match slot(scope, symbol) {
+        Some(index) => scope.locals[index].take(),
+        None => scope.names.remove(symbol),
     })?;
-    Ok(heap.handle_optional(removed.as_ref()))
+    Ok(heap.value_optional(removed.as_ref()))
+}
+
+/// The scope's dynamic names, for callers that read a module's globals in order.
+pub fn names(heap: &Heap, start: Value) -> PyResult<&Namespace> {
+    Ok(&scope(heap, start)?.names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::python::error::PyErrorKind;
+    use crate::python::symbols::Symbols;
+    use crate::resources::Limits;
+
+    #[test]
+    fn a_new_name_is_charged_before_the_scope_binds_it() {
+        let mut resources = Resources::new(Limits {
+            memory: 1 << 20,
+            ..Limits::unlimited()
+        });
+        let mut symbols = Symbols::default();
+        let (bound, unbound) = (
+            symbols.intern("bound", &mut resources).unwrap(),
+            symbols.intern("unbound", &mut resources).unwrap(),
+        );
+        let mut heap = Heap::default();
+        let layout = ScopeLayout {
+            parent: None,
+            local_names: Arc::from([]),
+        };
+        let scope = alloc_scope(
+            &mut heap,
+            layout,
+            Vec::new(),
+            vec![(bound, Value::Int(1))],
+            &(),
+            &mut resources,
+        )
+        .unwrap();
+        assert!(resources.reserve_memory(resources.memory_remaining() - (DYNAMIC_NAME_BYTES - 1)));
+
+        // Rebinding a name the scope already has needs no memory; a new name does.
+        insert(&mut heap, scope, bound, Value::Int(2), &(), &mut resources).unwrap();
+        let error = insert(
+            &mut heap,
+            scope,
+            unbound,
+            Value::Int(3),
+            &(),
+            &mut resources,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), Some(&PyErrorKind::Resource));
+        let entries = entries(&heap, scope)
+            .unwrap()
+            .into_iter()
+            .map(|(symbol, value)| (symbol, value.as_int()))
+            .collect::<Vec<_>>();
+        assert_eq!(entries, [(bound, Some(2))]);
+    }
 }

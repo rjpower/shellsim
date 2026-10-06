@@ -12,6 +12,7 @@
 use super::super::ast::ComparisonOperator;
 use super::super::heap::Object;
 use super::{number, string, Value, Vm};
+use crate::python::error::{PyError, PyResult};
 
 /// Builtin containers of matching kinds, which compare element by element.
 enum ContainerPair {
@@ -24,11 +25,7 @@ impl<'s> Vm<'s> {
     /// Charge the scan a structural comparison of two strings, byte strings or big integers
     /// performs. Their equality and ordering run at memory speed over the shorter operand, which
     /// is unbounded work the comparison itself does not otherwise account for.
-    pub(super) fn charge_scan_pair(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<(), String> {
+    pub(super) fn charge_scan_pair(&mut self, left: &Value, right: &Value) -> PyResult<()> {
         let heap = self.heap();
         let scanned = match (
             string::string_ref(heap, *left)?,
@@ -55,11 +52,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `left is right or left == right`, as containers compare elements.
-    pub(super) fn values_equal(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<bool, String> {
+    pub(super) fn values_equal(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
         if self.identical(*left, *right) {
             return Ok(true);
         }
@@ -68,11 +61,7 @@ impl<'s> Vm<'s> {
 
     /// `left == right` for two builtin containers of one kind, element by element. Containers
     /// of different kinds, such as a list and a tuple, are unequal.
-    pub(super) fn builtin_equality(
-        &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> Result<bool, String> {
+    pub(super) fn builtin_equality(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
         // A namespace view or mapping proxy compares as the dict of its current entries, so
         // `globals() == globals()`, `vars(a) == {"x": 1}` and `A.__dict__ == A.__dict__` hold
         // as they do in CPython.
@@ -105,7 +94,7 @@ impl<'s> Vm<'s> {
 
     /// A dict of the current entries when `value` is a namespace view or mapping proxy, whose
     /// entries live outside the object.
-    fn mapping_snapshot(&mut self, value: Value<'s>) -> Result<Option<Value<'s>>, String> {
+    fn mapping_snapshot(&mut self, value: Value) -> PyResult<Option<Value>> {
         let entries = match self.get(value)? {
             Object::NamespaceDict(target) => {
                 let target = self.namespace_handle(target);
@@ -122,7 +111,7 @@ impl<'s> Vm<'s> {
 
     /// Lists or tuples: equal lengths and pairwise-equal items. Items are read by index on each
     /// step because a user `__eq__` may mutate either list, as in CPython.
-    fn sequences_equal(&mut self, left: Value<'s>, right: Value<'s>) -> Result<bool, String> {
+    fn sequences_equal(&mut self, left: Value, right: Value) -> PyResult<bool> {
         if self.sequence_len(left)? != self.sequence_len(right)? {
             return Ok(false);
         }
@@ -141,11 +130,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `needle in sequence` for a list or tuple, reading each item as the scan reaches it.
-    pub(super) fn sequence_contains(
-        &mut self,
-        id: Value<'s>,
-        needle: &Value<'s>,
-    ) -> Result<bool, String> {
+    pub(super) fn sequence_contains(&mut self, id: Value, needle: &Value) -> PyResult<bool> {
         let mut index = 0;
         while let Some(item) = self.sequence_item(id, index)? {
             self.charge_cpu(1)?;
@@ -157,20 +142,14 @@ impl<'s> Vm<'s> {
         Ok(false)
     }
 
-    pub(super) fn sequence_item(
-        &self,
-        id: Value<'s>,
-        index: usize,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn sequence_item(&self, id: Value, index: usize) -> PyResult<Option<Value>> {
         match self.get(id)? {
-            Object::List(items) | Object::Tuple(items) => {
-                Ok(self.handle_optional(items.get(index)))
-            }
+            Object::List(items) | Object::Tuple(items) => Ok(self.value_optional(items.get(index))),
             _ => Err("sequence handle changed object kind".into()),
         }
     }
 
-    pub(super) fn sequence_len(&self, id: Value<'s>) -> Result<usize, String> {
+    pub(super) fn sequence_len(&self, id: Value) -> PyResult<usize> {
         match self.get(id)? {
             Object::List(items) | Object::Tuple(items) => Ok(items.len()),
             _ => Err("sequence handle changed object kind".into()),
@@ -179,7 +158,7 @@ impl<'s> Vm<'s> {
 
     /// Dicts: the same number of entries, and every key of `left` found in `right` with an equal
     /// value.
-    fn mappings_equal(&mut self, left: Value<'s>, right: Value<'s>) -> Result<bool, String> {
+    fn mappings_equal(&mut self, left: Value, right: Value) -> PyResult<bool> {
         if self.mapping_len(left)? != self.mapping_len(right)? {
             return Ok(false);
         }
@@ -199,20 +178,16 @@ impl<'s> Vm<'s> {
         Ok(true)
     }
 
-    fn mapping_entry(
-        &self,
-        id: Value<'s>,
-        index: usize,
-    ) -> Result<Option<(Value<'s>, Value<'s>)>, String> {
+    fn mapping_entry(&self, id: Value, index: usize) -> PyResult<Option<(Value, Value)>> {
         match self.get(id)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => Ok(entries
                 .get(index)
-                .map(|(key, value)| (self.handle(key), self.handle(value)))),
+                .map(|(key, value)| (self.value(key), self.value(value)))),
             _ => Err("dict handle changed object kind".into()),
         }
     }
 
-    fn mapping_len(&self, id: Value<'s>) -> Result<usize, String> {
+    fn mapping_len(&self, id: Value) -> PyResult<usize> {
         match self.get(id)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => Ok(entries.len()),
             _ => Err("dict handle changed object kind".into()),
@@ -220,10 +195,10 @@ impl<'s> Vm<'s> {
     }
 
     /// Sets and frozensets: the same size, and every element of `left` found in `right`.
-    fn sets_equal(&mut self, left: Value<'s>, right: Value<'s>) -> Result<bool, String> {
-        let size = |vm: &Self, id: Value<'s>| match vm.get(id)? {
+    fn sets_equal(&mut self, left: Value, right: Value) -> PyResult<bool> {
+        let size = |vm: &Self, id: Value| match vm.get(id)? {
             Object::Set(values) | Object::FrozenSet(values) => Ok(values.len()),
-            _ => Err(String::from("set handle changed object kind")),
+            _ => Err(PyError::from("set handle changed object kind")),
         };
         if size(self, left)? != size(self, right)? {
             return Ok(false);
@@ -232,7 +207,7 @@ impl<'s> Vm<'s> {
         loop {
             let element = match self.get(left)? {
                 Object::Set(values) | Object::FrozenSet(values) => {
-                    self.handle_optional(values.get(index))
+                    self.value_optional(values.get(index))
                 }
                 _ => return Err("set handle changed object kind".into()),
             };

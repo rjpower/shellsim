@@ -1,6 +1,7 @@
 //! Closed pytest CLI subset used by dataset verifiers. Accepted presentation switches match
 //! the runner's plain, header-free output; behavior switches are passed to the runner explicitly.
 
+use crate::python::error::{PyError, PyResult};
 #[derive(Default)]
 pub(super) struct Options {
     pub paths: Vec<String>,
@@ -10,7 +11,7 @@ pub(super) struct Options {
     pub warning_filters: Vec<String>,
 }
 
-pub(super) fn parse(args: &[String]) -> Result<Options, String> {
+pub(super) fn parse(args: &[String]) -> PyResult<Options> {
     let mut options = Options::default();
     let mut index = 0;
     while let Some(arg) = args.get(index) {
@@ -49,11 +50,13 @@ pub(super) fn parse(args: &[String]) -> Result<Options, String> {
                     "-W" => options.warning_filters.push(warning_filter(value)?),
                     "-p" if value == "no:cacheprovider" => {}
                     "--override-ini" | "-o" if value == "addopts=" => {}
-                    _ => return Err(format!("unsupported pytest option {key} {value}")),
+                    _ => return Err(format!("unsupported pytest option {key} {value}").into()),
                 }
             }
             _ if arg.starts_with("-W") => options.warning_filters.push(warning_filter(&arg[2..])?),
-            _ if arg.starts_with('-') => return Err(format!("unsupported pytest option {arg}")),
+            _ if arg.starts_with('-') => {
+                return Err(format!("unsupported pytest option {arg}").into())
+            }
             _ => options.paths.push(arg.clone()),
         }
         index += 1;
@@ -65,7 +68,7 @@ pub(super) fn parse(args: &[String]) -> Result<Options, String> {
 pub(super) fn discover(
     interp: &mut crate::interp::Interp,
     requested: &[String],
-) -> Result<Vec<String>, String> {
+) -> PyResult<Vec<String>> {
     let mut pending = if requested.is_empty() {
         vec![".".to_string()]
     } else {
@@ -87,7 +90,7 @@ pub(super) fn discover(
         if interp.vfs.is_dir(&interp.cwd, &path) {
             let mut entries = interp
                 .fs_list_dir(&interp.cwd, &path)
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| PyError::from(error.to_string()))?;
             entries.sort();
             if entries
                 .len()
@@ -123,14 +126,14 @@ pub(super) fn discover(
             }
             paths.push(path);
         } else {
-            return Err(format!("cannot read pytest input {path}"));
+            return Err(format!("cannot read pytest input {path}").into());
         }
     }
     Ok(paths)
 }
 
 /// Build a filter call from validated fields; arbitrary CLI text never becomes Python code.
-fn warning_filter(value: &str) -> Result<String, String> {
+fn warning_filter(value: &str) -> PyResult<String> {
     let fields = value.split(':').collect::<Vec<_>>();
     if fields.len() > 5 {
         return Err("invalid warning filter".into());

@@ -17,9 +17,10 @@ use super::number::{bigint_value, int_value};
 use super::scopes;
 use super::string::{bytes_ref, bytes_value, quote_bytes, quote_string, string_value};
 use super::{ReplState, Value};
+use crate::python::error::{PyError, PyResult};
 
 /// The object behind `value`, or `None` for an immediate.
-fn object<'h>(heap: &'h Heap, value: Value<'_>) -> Result<Option<&'h Object>, String> {
+fn object(heap: &Heap, value: Value) -> PyResult<Option<&Object>> {
     if value.is_object() {
         heap.get(value).map(Some)
     } else {
@@ -27,13 +28,9 @@ fn object<'h>(heap: &'h Heap, value: Value<'_>) -> Result<Option<&'h Object>, St
     }
 }
 
-fn alias_item_repr(
-    state: &ReplState,
-    value: &Ref,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn alias_item_repr(state: &ReplState, value: &Ref, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
-    let value = heap.handle(value);
+    let value = heap.value(value);
     if let Some(super::vm::NativeValue::BuiltinType(builtin)) = value.native_value() {
         return Ok(builtin.name().into());
     }
@@ -46,18 +43,14 @@ fn alias_item_repr(
 /// `str()` without user `__str__` dispatch. Rendering takes the interpreter state rather than
 /// the heap alone because a user exception's message comes from its `args` instance attribute,
 /// which the shape and symbol tables resolve.
-pub fn display(state: &ReplState, value: Value<'_>) -> Result<String, String> {
+pub fn display(state: &ReplState, value: Value) -> PyResult<String> {
     display_inner(state, value, &mut BTreeSet::new())
 }
 
 /// [`display`] with the exceptions whose message is being rendered on the current path. An
 /// exception whose `args` reach itself, directly or through another exception, would otherwise
 /// recurse without bound; CPython raises `RecursionError` there too.
-fn display_inner(
-    state: &ReplState,
-    value: Value<'_>,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn display_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
@@ -69,7 +62,7 @@ fn display_inner(
         .identity(value)?
         .ok_or("exception is not a heap object")?;
     if !active.insert(id) || active.len() >= MAX_RENDER_DEPTH {
-        return Err(RECURSION_IN_STR.into());
+        return Err(PyError::exception("RecursionError", RECURSION_IN_STR));
     }
     let message = exception_message(state, base, &args, active);
     active.remove(&id);
@@ -93,15 +86,12 @@ pub fn address_value(identity: u32) -> u64 {
     0x7f00_0000_0000_u64 + u64::from(identity) * 16
 }
 
-pub fn repr(state: &ReplState, value: Value<'_>) -> Result<String, String> {
+pub fn repr(state: &ReplState, value: Value) -> PyResult<String> {
     render(state, value, &mut BTreeSet::new())
 }
 
 /// The class name and `str()` of an exception instance, builtin or user-defined.
-pub fn exception_parts(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(String, String)>, String> {
+pub fn exception_parts(state: &ReplState, value: Value) -> PyResult<Option<(String, String)>> {
     let Some(name) = exception_type_name(state, value)? else {
         return Ok(None);
     };
@@ -123,9 +113,9 @@ pub fn exception_parts(
 fn exception_message(
     state: &ReplState,
     kind: &str,
-    args: &[Value<'_>],
+    args: &[Value],
     active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+) -> PyResult<String> {
     match args {
         [] => Ok(String::new()),
         [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
@@ -165,19 +155,11 @@ fn exception_message(
 const MAX_RENDER_DEPTH: usize = 256;
 
 /// `active` holds the identities of the objects on the current rendering path.
-fn render(
-    state: &ReplState,
-    value: Value<'_>,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn render(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     crate::stack::grow(|| render_inner(state, value, active))
 }
 
-fn render_inner(
-    state: &ReplState,
-    value: Value<'_>,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn render_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
     if let Some(value) = string_value(heap, value)? {
         return Ok(quote_string(&value));
@@ -200,9 +182,10 @@ fn render_inner(
     if let Some(id) = heap.identity(value)? {
         // `active` holds the objects on the current path, so its size is the nesting depth.
         if !active.contains(&id) && active.len() >= MAX_RENDER_DEPTH {
-            return Err(
-                "maximum recursion depth exceeded while getting the repr of an object".into(),
-            );
+            return Err(PyError::exception(
+                "RecursionError",
+                "maximum recursion depth exceeded while getting the repr of an object",
+            ));
         }
         if !active.insert(id) {
             return Ok(match heap.get(value)? {
@@ -284,8 +267,8 @@ fn render_inner(
                 for (key, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
-                        render(state, heap.handle(key), active)?,
-                        render(state, heap.handle(value), active)?
+                        render(state, heap.value(key), active)?,
+                        render(state, heap.value(value), active)?
                     ));
                 }
                 format!("{{{}}}", rendered.join(", "))
@@ -309,8 +292,11 @@ fn render_inner(
                 }
             }
             Object::Function(function) => format!("<function {}>", function.name),
-            Object::Class(class_object) => match class_object.attributes.get("__module__") {
-                Some(module) => match string_value(heap, heap.handle(module))? {
+            Object::Class(class_object) => match class_object
+                .attributes
+                .get_name(&state.symbols, "__module__")
+            {
+                Some(module) => match string_value(heap, heap.value(module))? {
                     Some(module) if module != "builtins" => {
                         format!("<class '{module}.{}'>", class_object.name)
                     }
@@ -336,15 +322,12 @@ fn render_inner(
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
             Object::NamespaceDict(NamespaceTarget::Scope(scope)) => {
-                let mut entries = scopes::values(heap, heap.handle(scope))?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                let entries = scopes::entries(heap, heap.value(scope))?;
                 let mut rendered = Vec::with_capacity(entries.len());
-                for (name, value) in entries {
+                for (symbol, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
-                        quote_string(&name),
+                        quote_string(state.symbols.issued(symbol)),
                         render(state, value, active)?
                     ));
                 }
@@ -355,7 +338,7 @@ fn render_inner(
                 let entries =
                     state
                         .shapes
-                        .attribute_values(heap, &state.symbols, heap.handle(instance))?;
+                        .attribute_values(heap, &state.symbols, heap.value(instance))?;
                 for (name, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
@@ -365,18 +348,13 @@ fn render_inner(
                 }
                 format!("{{{}}}", rendered.join(", "))
             }
-            // The REPL/script table isn't reachable from a bare `&Heap`. `Vm::repr_nested`
-            // (via `repr_namespace_dict`) covers every ordinary `repr()`, `str()`, or `print()`
-            // call, so this generic fallback is only reached by the interactive REPL auto-printing
-            // a bare expression, which already skips a user `__repr__` for every other type too.
-            Object::NamespaceDict(NamespaceTarget::Repl) => "<globals>".to_string(),
             // `Vm::repr_nested` renders views and proxies from their mapping's entries; the
             // heap alone cannot read every mapping they may view.
             Object::DictView { .. } => "<dict view>".to_string(),
             Object::MappingProxy(_) => "mappingproxy(...)".to_string(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Native(native) => {
-                native.repr(&mut |slot| render(state, heap.handle(slot), active))?
+                native.repr(&mut |slot| render(state, heap.value(slot), active))?
             }
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),
@@ -398,14 +376,14 @@ fn render_values<'a>(
     state: &ReplState,
     values: impl IntoIterator<Item = &'a Ref>,
     active: &mut BTreeSet<u32>,
-) -> Result<Vec<String>, String> {
+) -> PyResult<Vec<String>> {
     values
         .into_iter()
-        .map(|value| render(state, state.heap.handle(value), active))
+        .map(|value| render(state, state.heap.value(value), active))
         .collect()
 }
 
-pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
+pub fn truth(heap: &Heap, value: Value) -> PyResult<bool> {
     if value.is_none() {
         return Ok(false);
     }
@@ -469,7 +447,7 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
     })
 }
 
-pub fn equals(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<bool, String> {
+pub fn equals(heap: &Heap, left: Value, right: Value) -> PyResult<bool> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
         return Ok(equal);
     }
@@ -478,10 +456,10 @@ pub fn equals(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<bool, St
 
 fn equals_inner(
     heap: &Heap,
-    left: Value<'_>,
-    right: Value<'_>,
+    left: Value,
+    right: Value,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
+) -> PyResult<bool> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
         return Ok(equal);
     }
@@ -643,7 +621,7 @@ fn equals_inner(
     }
 }
 
-fn scalar_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Option<bool>, String> {
+fn scalar_equality(heap: &Heap, left: Value, right: Value) -> PyResult<Option<bool>> {
     use super::number;
     // Registered numbers such as NumPy scalars equal the Python number with the same value, so
     // `np.int64(1)` finds the key `1` in a dict or list.
@@ -721,7 +699,7 @@ fn scalar_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Opt
 /// Compare a builtin `complex` with any value. Real numbers compare equal only to a zero
 /// imaginary part and an exactly equal real part, as in CPython. Returns `None` when neither
 /// operand is complex.
-fn complex_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Option<bool> {
+fn complex_equality(heap: &Heap, left: Value, right: Value) -> Option<bool> {
     use super::number::{view, NumberRef};
     let (left, right) = (view(heap, &left), view(heap, &right));
     let ((real, imag), other) = match (left, right) {
@@ -752,7 +730,7 @@ fn sequence_equal<'a>(
     left: impl IntoIterator<Item = &'a Ref, IntoIter: ExactSizeIterator>,
     right: impl IntoIterator<Item = &'a Ref, IntoIter: ExactSizeIterator>,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
+) -> PyResult<bool> {
     let (left, right) = (left.into_iter(), right.into_iter());
     if left.len() != right.len() {
         return Ok(false);
@@ -771,8 +749,8 @@ fn refs_equal(
     left: &Ref,
     right: &Ref,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
-    Ok(left == right || equals_inner(heap, heap.handle(left), heap.handle(right), active)?)
+) -> PyResult<bool> {
+    Ok(left == right || equals_inner(heap, heap.value(left), heap.value(right), active)?)
 }
 
 /// How two values order under Python's rich comparisons.
@@ -794,19 +772,14 @@ impl Comparison {
     }
 }
 
-pub fn compare(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Comparison, String> {
+pub fn compare(heap: &Heap, left: Value, right: Value) -> PyResult<Comparison> {
     compare_at(heap, left, right, 0)
 }
 
 /// Nesting bound for sequence ordering outside the VM, matching [`MAX_RENDER_DEPTH`].
 const MAX_COMPARE_DEPTH: usize = 256;
 
-fn compare_at(
-    heap: &Heap,
-    left: Value<'_>,
-    right: Value<'_>,
-    depth: usize,
-) -> Result<Comparison, String> {
+fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> PyResult<Comparison> {
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
             return Ok(Comparison::Ordered(left.cmp(right)));
@@ -852,7 +825,10 @@ fn compare_at(
         (Some(Object::List(left)), Some(Object::List(right)))
         | (Some(Object::Tuple(left)), Some(Object::Tuple(right))) => {
             if depth >= MAX_COMPARE_DEPTH {
-                return Err("maximum recursion depth exceeded in comparison".into());
+                return Err(PyError::exception(
+                    "RecursionError",
+                    "maximum recursion depth exceeded in comparison",
+                ));
             }
             sequence_compare(heap, left, right, depth + 1)
         }
@@ -860,7 +836,7 @@ fn compare_at(
     }
 }
 
-fn compare_bigint_float(integer: &BigInt, float: f64) -> Result<Comparison, String> {
+fn compare_bigint_float(integer: &BigInt, float: f64) -> PyResult<Comparison> {
     if float.is_nan() {
         return Ok(Comparison::Unordered);
     }
@@ -887,10 +863,10 @@ fn sequence_compare(
     left: &[Ref],
     right: &[Ref],
     depth: usize,
-) -> Result<Comparison, String> {
+) -> PyResult<Comparison> {
     for (left, right) in left.iter().zip(right) {
-        let (left, right) = (heap.handle(left), heap.handle(right));
-        if heap.identical(left, right) || equals(heap, left, right)? {
+        let (left, right) = (heap.value(left), heap.value(right));
+        if left.is(right) || equals(heap, left, right)? {
             continue;
         }
         return compare_at(heap, left, right, depth);
@@ -898,7 +874,7 @@ fn sequence_compare(
     Ok(Comparison::Ordered(left.len().cmp(&right.len())))
 }
 
-pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<bool, String> {
+pub fn contains(heap: &Heap, container: Value, needle: Value) -> PyResult<bool> {
     if let Some(container) = string_value(heap, container)? {
         let Some(needle) = string_value(heap, needle)? else {
             return Err("string containment requires a string operand".into());
@@ -923,9 +899,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::List(values) | Object::Tuple(values) => {
                 for value in values {
-                    if heap.identical_ref(needle, value)
-                        || equals(heap, heap.handle(value), needle)?
-                    {
+                    if needle.is_ref(value) || equals(heap, heap.value(value), needle)? {
                         return Ok(true);
                     }
                 }
@@ -933,9 +907,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Set(values) | Object::FrozenSet(values) => {
                 for value in values {
-                    if heap.identical_ref(needle, value)
-                        || equals(heap, heap.handle(value), needle)?
-                    {
+                    if needle.is_ref(value) || equals(heap, heap.value(value), needle)? {
                         return Ok(true);
                     }
                 }
@@ -950,7 +922,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 for (key, _) in entries {
-                    if heap.identical_ref(needle, key) || equals(heap, heap.handle(key), needle)? {
+                    if needle.is_ref(key) || equals(heap, heap.value(key), needle)? {
                         return Ok(true);
                     }
                 }
@@ -995,18 +967,15 @@ mod tests {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
         let mut dict = |entries: [(&str, i64); 2]| {
-            heap.alloc_with(&mut (), &mut resources, |builder| {
-                let mut map = super::super::heap::OrderedMap::default();
-                for (key, value) in entries {
-                    let entry = (
-                        builder.store(Value::inline_string(key).unwrap()),
-                        builder.store(Value::Int(value)),
-                    );
-                    map.push(super::super::hash::string(key), entry);
-                }
-                Object::Dict(map)
-            })
-            .unwrap()
+            let mut map = super::super::heap::OrderedMap::default();
+            for (key, value) in entries {
+                let entry = (
+                    Ref::from(Value::inline_string(key).unwrap()),
+                    Ref::from(Value::Int(value)),
+                );
+                map.push(super::super::hash::string(key), entry);
+            }
+            heap.alloc(Object::Dict(map), &(), &mut resources).unwrap()
         };
         let first = dict([("a", 1), ("b", 2)]);
         let second = dict([("b", 2), ("a", 1)]);
@@ -1021,17 +990,13 @@ mod tests {
         let mut resources = Resources::new(Limits::unlimited());
         let nan = Value::Float(f64::NAN);
         let first = heap
-            .alloc_with(&mut (), &mut resources, |builder| {
-                Object::List(vec![builder.store(nan)])
-            })
+            .alloc(Object::List(vec![Ref::from(nan)]), &(), &mut resources)
             .unwrap();
         let second = heap
-            .alloc_with(&mut (), &mut resources, |builder| {
-                Object::List(vec![builder.store(nan)])
-            })
+            .alloc(Object::List(vec![Ref::from(nan)]), &(), &mut resources)
             .unwrap();
 
-        assert!(heap.identical(nan, nan));
+        assert!(nan.is(nan));
         assert!(!equals(&heap, nan, nan).unwrap());
         assert!(contains(&heap, first, nan).unwrap());
         assert!(equals(&heap, first, second).unwrap());

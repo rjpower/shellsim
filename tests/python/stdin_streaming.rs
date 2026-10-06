@@ -157,3 +157,34 @@ print(callable(os.getpid))
     assert_eq!(status, 0, "stderr: {stderr}");
     assert_eq!(stdout, "True\nTrue\n");
 }
+
+#[test]
+fn a_generator_reading_stdin_in_a_for_loop_waits_for_a_slow_producer() {
+    let mut environment = Environment::new();
+    let source = "{ echo a; sleep 1; echo b; } | python3 -c '\
+import sys
+def stripped(lines):
+    for line in lines:
+        yield line.strip()
+for line in stripped(sys.stdin):
+    print(line)
+'";
+    let (outcome, stdout, stderr) = environment.run_script_capture(source);
+    let stdout = String::from_utf8(stdout).expect("stdout is UTF-8");
+    let stderr = String::from_utf8(stderr).expect("stderr is UTF-8");
+    assert_eq!(outcome.exit_status, 0, "stderr: {stderr}");
+    assert_eq!(stdout, "a\nb\n");
+    assert_eq!(environment.clock.monotonic_ns(), 1_000_000_000);
+}
+
+#[test]
+fn waiting_for_input_inside_a_builtin_stops_instead_of_suspending() {
+    let source = "{ echo a; sleep 1; echo b; } | python3 -c '\
+import sys
+print(list(line.strip() for line in sys.stdin))
+'";
+    let (status, stdout, stderr) = run_shell(source);
+    assert_eq!(status, 2, "stderr: {stderr}");
+    assert!(stdout.is_empty());
+    assert!(stderr.contains("unsupported by minimal shim"), "{stderr}");
+}

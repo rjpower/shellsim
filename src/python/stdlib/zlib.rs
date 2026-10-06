@@ -29,7 +29,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn crc32<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn crc32(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("zlib.crc32", 1, 2)?;
     args.reject_keywords("zlib.crc32")?;
     let PyBytes(value) = args.positional()[0].cast(runtime)?;
@@ -53,7 +53,7 @@ fn crc32<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
 
 const MAX_ZLIB_OUTPUT: usize = 4 * 1024 * 1024;
 
-fn compress<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn compress(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("zlib.compress", 1, 2)?;
     args.reject_keywords("zlib.compress")?;
     let PyBytes(value) = args.positional()[0].cast(runtime)?;
@@ -94,7 +94,7 @@ fn compress<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult
     runtime.new_bytes(result)
 }
 
-fn decompress<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn decompress(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("zlib.decompress", 1, 1)?;
     args.reject_keywords("zlib.decompress")?;
     let PyBytes(value) = args.positional()[0].cast(runtime)?;

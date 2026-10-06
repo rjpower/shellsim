@@ -9,6 +9,7 @@
 
 use super::heap::Object;
 use super::{ReplState, Value};
+use crate::python::error::PyResult;
 
 /// One exception class: its name, its parent, whether `builtins` binds the name, and the
 /// `__module__` CPython reports for it.
@@ -191,10 +192,7 @@ pub(super) fn os_error_subclass(errno: i32) -> &'static str {
 
 /// The class name of an exception instance, or `None` when `value` is not one. Rendering the
 /// message can fail on self-referential arguments, so callers that only classify use this.
-pub(super) fn exception_type_name(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<String>, String> {
+pub(super) fn exception_type_name(state: &ReplState, value: Value) -> PyResult<Option<String>> {
     if !value.is_object() {
         return Ok(None);
     }
@@ -207,10 +205,7 @@ pub(super) fn exception_type_name(
 
 /// The closest builtin exception class an exception instance derives from, or `None` when
 /// `value` is not an exception.
-pub(super) fn exception_base(
-    state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<&'static str>, String> {
+pub(super) fn exception_base(state: &ReplState, value: Value) -> PyResult<Option<&'static str>> {
     if !value.is_object() {
         return Ok(None);
     }
@@ -219,10 +214,10 @@ pub(super) fn exception_base(
 
 /// The closest builtin exception class and the constructor arguments of an exception instance,
 /// which its payload holds as `BaseException.args`.
-pub(super) fn exception_args<'s>(
+pub(super) fn exception_args(
     state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
+    value: Value,
+) -> PyResult<Option<(&'static str, Vec<Value>)>> {
     let Some(base) = exception_base(state, value)? else {
         return Ok(None);
     };
@@ -230,7 +225,7 @@ pub(super) fn exception_args<'s>(
     let Object::Exception(args) = heap.get(value)? else {
         return Err("exception instance has a non-exception layout".into());
     };
-    Ok(Some((base, heap.handles(args))))
+    Ok(Some((base, heap.values(args))))
 }
 
 #[cfg(test)]

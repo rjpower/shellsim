@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::python::error::{PyError, PyResult};
 use crate::resources::Resources;
 
 const SYMBOL_NAME_BYTES: u64 = 24;
@@ -17,10 +18,15 @@ const SYMBOL_NAME_BYTES: u64 = 24;
 pub struct SymbolId(u32);
 
 impl SymbolId {
+    /// A symbol that names nothing. Code compiled after a failed charge carries it, and such
+    /// code is discarded without running.
+    pub(super) const UNBOUND: Self = Self(u32::MAX);
+
     pub(super) const fn index(self) -> usize {
         self.0 as usize
     }
 
+    #[cfg(test)]
     pub(super) fn from_index(index: usize) -> Option<Self> {
         u32::try_from(index).ok().map(Self)
     }
@@ -44,8 +50,35 @@ impl Symbols {
         self.names.get(symbol.index()).map(AsRef::as_ref)
     }
 
+    /// The name of a symbol this table issued. Compiled code and symbol-keyed tables hold
+    /// only symbols their own interpreter interned, so the name is always present.
+    pub fn issued(&self, symbol: SymbolId) -> &str {
+        &self.names[symbol.index()]
+    }
+
+    /// A shared handle to an issued symbol's name, for callers that need the name while they
+    /// mutate the interpreter.
+    pub fn shared(&self, symbol: SymbolId) -> Arc<str> {
+        self.names[symbol.index()].clone()
+    }
+
+    /// Intern the name of a builtin type's attribute. The type registry charges each of its
+    /// attributes, name included, so the table does not charge the name again.
+    pub fn intern_builtin(&mut self, name: &str) -> SymbolId {
+        if let Some(symbol) = self.id(name) {
+            return symbol;
+        }
+        let symbol = SymbolId(
+            u32::try_from(self.names.len()).expect("builtin names are far fewer than 2^32"),
+        );
+        let name: Arc<str> = name.into();
+        self.ids.insert(name.clone(), symbol);
+        self.names.push(name);
+        symbol
+    }
+
     /// Intern one identifier, charging its process-lifetime storage before mutation.
-    pub fn intern(&mut self, name: &str, resources: &mut Resources) -> Result<SymbolId, String> {
+    pub fn intern(&mut self, name: &str, resources: &mut Resources) -> PyResult<SymbolId> {
         if let Some(symbol) = self.id(name) {
             return Ok(symbol);
         }
@@ -59,7 +92,7 @@ impl Symbols {
             .checked_add(bytes)
             .ok_or("modeled symbol table size overflow")?;
         if !resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.modeled_bytes = modeled_bytes;
         let name: Arc<str> = name.into();

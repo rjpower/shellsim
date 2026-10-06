@@ -52,7 +52,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn step<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn step(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._step", 2, 2)?;
     args.reject_keywords("_asyncio._step")?;
     let coroutine = args.positional()[0];
@@ -65,7 +65,7 @@ fn step<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s>
     runtime.new_tuple(vec![Value::Int(i64::from(status)), value])
 }
 
-fn is_coroutine<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn is_coroutine(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._is_coroutine", 1, 1)?;
     args.reject_keywords("_asyncio._is_coroutine")?;
     Ok(Value::Bool(
@@ -73,13 +73,13 @@ fn is_coroutine<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     ))
 }
 
-fn monotonic_ns<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn monotonic_ns(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._monotonic_ns", 0, 0)?;
     args.reject_keywords("_asyncio._monotonic_ns")?;
     runtime.clock().monotonic_ns().map(Value::Int)
 }
 
-fn wait_resources<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn wait_resources(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._wait_resources", 1, 1)?;
     args.reject_keywords("_asyncio._wait_resources")?;
     let tokens = args.positional()[0].cast::<PyList>(runtime)?;
@@ -96,7 +96,7 @@ fn wait_resources<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     Ok(Value::None)
 }
 
-fn process_poll<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn process_poll(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._process_poll", 1, 1)?;
     args.reject_keywords("_asyncio._process_poll")?;
     let handle = process_handle(runtime, args.positional()[0])?;
@@ -106,7 +106,7 @@ fn process_poll<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
         .map_or(Value::None, |status| Value::Int(i64::from(status))))
 }
 
-fn process_read<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn process_read(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._process_read", 3, 3)?;
     args.reject_keywords("_asyncio._process_read")?;
     let values = args.positional();
@@ -134,7 +134,7 @@ fn process_read<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     }
 }
 
-fn process_write<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn process_write(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_asyncio._process_write", 2, 2)?;
     args.reject_keywords("_asyncio._process_write")?;
     let values = args.positional();
@@ -155,34 +155,26 @@ fn process_write<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
     }
 }
 
-fn poll_tuple<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    ready: bool,
-    value: Value<'s>,
-    token: Value<'s>,
-) -> PyResult<'s> {
+fn poll_tuple(runtime: &mut dyn PyRuntime, ready: bool, value: Value, token: Value) -> PyResult {
     runtime.new_tuple(vec![Value::Bool(ready), value, token])
 }
 
-fn process_handle<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    value: Value<'s>,
-) -> PyResult<'s, PyProcessHandle> {
+fn process_handle(runtime: &dyn PyRuntime, value: Value) -> PyResult<PyProcessHandle> {
     let pid = integer(runtime, value, "subprocess handle")?;
     let pid = u32::try_from(pid).map_err(|_| PyError::value_error("invalid subprocess handle"))?;
     Ok(PyProcessHandle { pid })
 }
 
-fn integer<'s>(runtime: &dyn PyRuntime<'s>, value: Value<'s>, name: &str) -> PyResult<'s, i64> {
+fn integer(runtime: &dyn PyRuntime, value: Value, name: &str) -> PyResult<i64> {
     runtime
         .int_value(&value)
         .ok_or_else(|| PyError::type_error(format!("{name} must be an integer")))
 }
 
-fn parse_wait_token<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    token: Value<'s>,
-) -> PyResult<'s, crate::scheduler::WaitReason> {
+fn parse_wait_token(
+    runtime: &mut dyn PyRuntime,
+    token: Value,
+) -> PyResult<crate::scheduler::WaitReason> {
     let token = token.cast::<PyTuple>(runtime)?;
     let parts = runtime.tuple_items(token)?;
     if parts.len() != 2 {
@@ -215,10 +207,7 @@ fn parse_wait_token<'s>(
     }
 }
 
-fn wait_token<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    reason: crate::scheduler::WaitReason,
-) -> PyResult<'s> {
+fn wait_token(runtime: &mut dyn PyRuntime, reason: crate::scheduler::WaitReason) -> PyResult {
     let (kind, value) = match reason {
         crate::scheduler::WaitReason::ShellSession(_)
         | crate::scheduler::WaitReason::HostHttp(_) => {
@@ -244,6 +233,6 @@ fn wait_token<'s>(
     runtime.new_tuple(vec![kind, Value::Int(value)])
 }
 
-fn u64_to_i64<'s>(value: u64) -> PyResult<'s, i64> {
+fn u64_to_i64(value: u64) -> PyResult<i64> {
     i64::try_from(value).map_err(|_| PyError::overflow_error("timer deadline is too large"))
 }

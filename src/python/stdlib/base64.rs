@@ -33,7 +33,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn b64encode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn b64encode(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     encode(
         runtime,
         args,
@@ -42,7 +42,7 @@ fn b64encode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResul
     )
 }
 
-fn urlsafe_b64encode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn urlsafe_b64encode(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     encode(
         runtime,
         args,
@@ -51,12 +51,12 @@ fn urlsafe_b64encode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) ->
     )
 }
 
-fn encode<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
+fn encode(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
     engine: &base64::engine::GeneralPurpose,
     name: &str,
-) -> PyResult<'s> {
+) -> PyResult {
     args.expect_positional(name, 1, 1)?;
     args.reject_keywords(name)?;
     let PyBytes(value) = args.positional()[0].cast(runtime)?;
@@ -71,7 +71,7 @@ fn encode<'s>(
     runtime.new_bytes(engine.encode(value).into_bytes())
 }
 
-fn b64decode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn b64decode(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     decode(
         runtime,
         args,
@@ -80,7 +80,7 @@ fn b64decode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResul
     )
 }
 
-fn urlsafe_b64decode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn urlsafe_b64decode(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     decode(
         runtime,
         args,
@@ -89,12 +89,12 @@ fn urlsafe_b64decode<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) ->
     )
 }
 
-fn decode<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
+fn decode(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
     engine: &base64::engine::GeneralPurpose,
     name: &str,
-) -> PyResult<'s> {
+) -> PyResult {
     args.expect_positional(name, 1, 1)?;
     args.reject_keywords(name)?;
     let PyBytes(value) = args.positional()[0].cast(runtime)?;

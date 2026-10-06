@@ -56,37 +56,37 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn no_args<'s>(args: &CallArgs<'s>, name: &str) -> PyResult<'s, ()> {
+fn no_args(args: &CallArgs, name: &str) -> PyResult<()> {
     args.expect_positional(name, 0, 0)?;
     args.reject_keywords(name)
 }
 
-fn time<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn time(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.time")?;
     runtime.clock().wall_time().map(Value::Float)
 }
-fn time_ns<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn time_ns(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.time_ns")?;
     runtime.clock().wall_time_ns().map(Value::Int)
 }
-fn monotonic<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn monotonic(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.monotonic")?;
     Ok(Value::Float(runtime.clock().monotonic()))
 }
-fn monotonic_ns<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn monotonic_ns(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.monotonic_ns")?;
     runtime.clock().monotonic_ns().map(Value::Int)
 }
-fn process_time<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn process_time(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.process_time")?;
     Ok(Value::Float(runtime.clock().process_time()))
 }
-fn process_time_ns<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn process_time_ns(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     no_args(&args, "time.process_time_ns")?;
     runtime.clock().process_time_ns().map(Value::Int)
 }
 
-fn sleep<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn sleep(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("time.sleep", 1, 1)?;
     args.reject_keywords("time.sleep")?;
     let seconds = args.positional()[0].cast::<PyNumber>(runtime)?.into_f64()?;

@@ -31,7 +31,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn loads<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn loads(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("loads", 1, 1)?;
     args.reject_keywords("loads")?;
     let source = args.positional()[0]
@@ -53,11 +53,7 @@ fn loads<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     from_json(runtime, parsed, 0)
 }
 
-fn from_json<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: serde_json::Value,
-    depth: usize,
-) -> PyResult<'s> {
+fn from_json(runtime: &mut dyn PyRuntime, value: serde_json::Value, depth: usize) -> PyResult {
     if depth >= MAX_JSON_DEPTH {
         return Err(PyError::value_error("maximum JSON nesting depth exceeded"));
     }
@@ -102,7 +98,7 @@ fn from_json<'s>(
     }
 }
 
-fn dumps<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn dumps(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("dumps", 1, 1)?;
     let mut item_separator = ", ".to_string();
     let mut key_separator = ": ".to_string();
@@ -184,13 +180,10 @@ fn dumps<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     runtime.new_string(rendered)
 }
 
-fn sequence_items<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
-) -> PyResult<'s, Vec<PyValue<'s>>> {
+fn sequence_items(runtime: &mut dyn PyRuntime, value: PyValue) -> PyResult<Vec<PyValue>> {
     match runtime.kind(&value)? {
-        PyKind::List => value.cast::<PyList<'s>>(runtime)?.items(runtime),
-        PyKind::Tuple => value.cast::<PyTuple<'s>>(runtime)?.items(runtime),
+        PyKind::List => value.cast::<PyList>(runtime)?.items(runtime),
+        PyKind::Tuple => value.cast::<PyTuple>(runtime)?.items(runtime),
         _ => Err(PyError::type_error("expected a list or tuple")),
     }
 }
@@ -204,7 +197,7 @@ struct EncodeOptions<'a> {
     indent: Option<usize>,
 }
 
-fn encode_string<'s>(value: &str, ensure_ascii: bool) -> PyResult<'s, String> {
+fn encode_string(value: &str, ensure_ascii: bool) -> PyResult<String> {
     let rendered =
         serde_json::to_string(value).map_err(|error| PyError::value_error(error.to_string()))?;
     if !ensure_ascii || rendered.is_ascii() {
@@ -227,7 +220,7 @@ fn encode_string<'s>(value: &str, ensure_ascii: bool) -> PyResult<'s, String> {
     Ok(ascii)
 }
 
-fn encode_float<'s>(number: f64) -> PyResult<'s, String> {
+fn encode_float(number: f64) -> PyResult<String> {
     if number.is_finite() {
         serde_json::to_string(&number).map_err(|error| PyError::value_error(error.to_string()))
     } else {
@@ -239,7 +232,7 @@ fn encode_float<'s>(number: f64) -> PyResult<'s, String> {
 
 /// The value of a registered `float` subclass such as NumPy's `float64`, which `json` encodes
 /// like any float, as CPython's encoder does through `float.__repr__`.
-fn float_subclass_value<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> Option<f64> {
+fn float_subclass_value(runtime: &dyn PyRuntime, value: &PyValue) -> Option<f64> {
     if !runtime.value_kind_of(value)?.is_float_subclass() {
         return None;
     }
@@ -250,7 +243,7 @@ fn float_subclass_value<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) ->
 }
 
 /// CPython's error for a value `json` cannot encode, naming the type as `__name__` does.
-fn not_serializable<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyError {
+fn not_serializable(runtime: &dyn PyRuntime, value: &PyValue) -> PyError {
     let name = runtime
         .type_name(value)
         .unwrap_or_else(|_| "object".to_string());
@@ -258,13 +251,13 @@ fn not_serializable<'s>(runtime: &dyn PyRuntime<'s>, value: &PyValue<'s>) -> PyE
     PyError::type_error(format!("Object of type {short} is not JSON serializable"))
 }
 
-fn dump_value<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
+fn dump_value(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
     options: EncodeOptions<'_>,
     depth: usize,
     active: &mut Vec<PyIdentity>,
-) -> PyResult<'s, String> {
+) -> PyResult<String> {
     if depth >= MAX_JSON_DEPTH {
         return Err(PyError::value_error("maximum JSON nesting depth exceeded"));
     }
@@ -331,7 +324,7 @@ fn dump_value<'s>(
             }
             PyKind::Dict => {
                 active.push(id);
-                let mut entries = value.cast::<PyDict<'s>>(runtime)?.items(runtime)?;
+                let mut entries = value.cast::<PyDict>(runtime)?.items(runtime)?;
                 if options.sort_keys {
                     for (key, _) in &entries {
                         if runtime.string_value(key)?.is_none() {
@@ -409,12 +402,12 @@ fn join_json_container(
     )
 }
 
-fn size_bound<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
+fn size_bound(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
     depth: usize,
     active: &mut Vec<PyIdentity>,
-) -> PyResult<'s, usize> {
+) -> PyResult<usize> {
     if depth >= MAX_JSON_DEPTH {
         return Err(PyError::value_error("maximum JSON nesting depth exceeded"));
     }
@@ -498,7 +491,7 @@ fn size_bound<'s>(
                 Ok(size)
             }
             PyKind::Dict => {
-                let entries = value.cast::<PyDict<'s>>(runtime)?.items(runtime)?;
+                let entries = value.cast::<PyDict>(runtime)?.items(runtime)?;
                 let mut size = 2usize;
                 for (index, (key, child)) in entries.into_iter().enumerate() {
                     let Some(key) = runtime.string_value(&key)? else {

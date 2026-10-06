@@ -9,6 +9,7 @@ use std::ops::Deref;
 
 use super::heap::{Heap, Object};
 use super::Value;
+use crate::python::error::PyResult;
 
 /// Heap storage for a Python string.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -121,7 +122,7 @@ impl PyStringRef<'_> {
 }
 
 /// Borrow a Python string without materializing an owned Rust string.
-pub fn string_ref<'a>(heap: &'a Heap, value: Value<'_>) -> Result<Option<PyStringRef<'a>>, String> {
+pub fn string_ref<'a>(heap: &'a Heap, value: Value) -> PyResult<Option<PyStringRef<'a>>> {
     if let Some(value) = value.inline_string_ref() {
         return Ok(Some(PyStringRef {
             storage: StringStorage::Inline(value),
@@ -139,7 +140,7 @@ pub fn string_ref<'a>(heap: &'a Heap, value: Value<'_>) -> Result<Option<PyStrin
 }
 
 /// Copy a Python string for an API that must outlive its heap borrow.
-pub fn string_value(heap: &Heap, value: Value<'_>) -> Result<Option<String>, String> {
+pub fn string_value(heap: &Heap, value: Value) -> PyResult<Option<String>> {
     Ok(string_ref(heap, value)?.map(|value| value.as_str().to_owned()))
 }
 
@@ -158,11 +159,7 @@ pub enum StringIndex {
 ///
 /// ASCII strings, including the large text buffers used by the frozen I/O layer, support direct
 /// byte indexing. Non-ASCII strings still index by Unicode code point to match Python semantics.
-pub fn string_index(
-    heap: &Heap,
-    owner: Value<'_>,
-    index: Value<'_>,
-) -> Result<StringIndex, String> {
+pub fn string_index(heap: &Heap, owner: Value, index: Value) -> PyResult<StringIndex> {
     let Some(text) = string_ref(heap, owner)? else {
         return Ok(StringIndex::NotString);
     };
@@ -174,7 +171,7 @@ pub fn string_index(
 }
 
 /// Return a string's Python length without cloning its arena payload.
-pub fn string_length(heap: &Heap, value: Value<'_>) -> Result<Option<usize>, String> {
+pub fn string_length(heap: &Heap, value: Value) -> PyResult<Option<usize>> {
     let Some(text) = string_ref(heap, value)? else {
         return Ok(None);
     };
@@ -205,15 +202,12 @@ fn normalize_index(length: usize, index: i64) -> Option<usize> {
 }
 
 /// Copy the contents of a `bytes` or `bytearray`, or `None` for any other value.
-pub fn bytes_value(heap: &Heap, value: Value<'_>) -> Result<Option<Vec<u8>>, String> {
+pub fn bytes_value(heap: &Heap, value: Value) -> PyResult<Option<Vec<u8>>> {
     Ok(bytes_ref(heap, value)?.map(<[u8]>::to_vec))
 }
 
 /// Borrow the contents of a `bytes` or `bytearray` without copying them.
-pub fn bytes_ref<'heap>(
-    heap: &'heap Heap,
-    value: Value<'_>,
-) -> Result<Option<&'heap [u8]>, String> {
+pub fn bytes_ref(heap: &Heap, value: Value) -> PyResult<Option<&[u8]>> {
     if !value.is_object() {
         return Ok(None);
     }
@@ -314,7 +308,7 @@ mod tests {
         let stored = heap
             .alloc(
                 Object::String(PyString::new("snowman: ☃".into())),
-                &mut (),
+                &(),
                 &mut resources,
             )
             .unwrap();
@@ -343,12 +337,12 @@ mod tests {
         let ascii = heap
             .alloc(
                 Object::String("a long ASCII string".into()),
-                &mut (),
+                &(),
                 &mut resources,
             )
             .unwrap();
         let unicode = heap
-            .alloc(Object::String("☃ snow".into()), &mut (), &mut resources)
+            .alloc(Object::String("☃ snow".into()), &(), &mut resources)
             .unwrap();
 
         let inline_ref = string_ref(&heap, inline).unwrap().unwrap();

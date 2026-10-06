@@ -3,7 +3,7 @@
 //! Python dictionaries preserve insertion order, while hashing and key equality belong to the
 //! runtime's object protocol. These types own ordering, mutation and a hash index; callers
 //! supply each key's hash and test the candidates that share it for equality. Members are stored
-//! references ([`Ref`]), so a mapping can only be filled through a heap [`Builder`](super::Builder).
+//! references ([`Ref`]), which the collector traces.
 
 use std::collections::hash_map::Entry;
 use std::collections::HashMap;
@@ -149,13 +149,6 @@ impl<T> Slots<T> {
         self.iter_hashed().map(|(_, member)| member)
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.slots[self.first..]
-            .iter_mut()
-            .filter_map(Option::as_mut)
-            .map(|(_, member)| member)
-    }
-
     fn iter_hashed(&self) -> impl DoubleEndedIterator<Item = (KeyHash, &T)> + Clone {
         self.slots[self.first..]
             .iter()
@@ -237,10 +230,10 @@ impl OrderedMap {
         self.entries.candidates(hash)
     }
 
-    pub(super) fn visit_refs(&mut self, f: &mut dyn FnMut(&mut Raw)) {
-        for (key, value) in self.entries.iter_mut() {
-            f(&mut key.0);
-            f(&mut value.0);
+    pub(super) fn visit_refs(&self, f: &mut dyn FnMut(&Raw)) {
+        for (key, value) in self.entries.iter() {
+            f(&key.0);
+            f(&value.0);
         }
     }
 
@@ -301,9 +294,9 @@ impl OrderedSet {
         self.values.candidates(hash)
     }
 
-    pub(super) fn visit_refs(&mut self, f: &mut dyn FnMut(&mut Raw)) {
-        for value in self.values.iter_mut() {
-            f(&mut value.0);
+    pub(super) fn visit_refs(&self, f: &mut dyn FnMut(&Raw)) {
+        for value in self.values.iter() {
+            f(&value.0);
         }
     }
 

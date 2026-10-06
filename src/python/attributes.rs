@@ -15,9 +15,10 @@ use std::collections::HashMap;
 
 use crate::resources::Resources;
 
-use super::heap::{Heap, InstanceAttributes, Ref, Roots, Value};
+use super::heap::{Heap, InstanceAttributes, Namespace, Ref, Roots, Value};
 use super::object_model::TypeId;
 use super::symbols::{SymbolId, Symbols};
+use crate::python::error::{PyError, PyResult};
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
@@ -74,10 +75,10 @@ impl Default for Shapes {
 /// The storage an instance's attributes live in, or the empty shape before its first write.
 enum Storage<'h> {
     Shaped { shape: ShapeId, len: usize },
-    Dictionary(&'h HashMap<SymbolId, Ref>),
+    Dictionary(&'h Namespace),
 }
 
-fn storage<'h>(heap: &'h Heap, instance: Value<'_>) -> Result<Storage<'h>, String> {
+fn storage<'h>(heap: &'h Heap, instance: Value) -> PyResult<Storage<'h>> {
     Ok(match heap.attributes(instance)? {
         None => Storage::Shaped {
             shape: ShapeId::ROOT,
@@ -97,15 +98,14 @@ impl Shapes {
         std::mem::take(&mut self.modeled_bytes)
     }
 
-    /// Snapshot the names stored directly on an instance in either attribute representation.
-    /// Shaped instances list names in the order they were first assigned; dictionary instances
-    /// (after a deletion or many attributes) list them sorted, since their storage is unordered.
+    /// Snapshot the names stored directly on an instance in either attribute representation,
+    /// in the order they were first assigned.
     pub fn attribute_names(
         &self,
         heap: &Heap,
         symbols: &Symbols,
-        instance: Value<'_>,
-    ) -> Result<Vec<String>, String> {
+        instance: Value,
+    ) -> PyResult<Vec<String>> {
         match storage(heap, instance)? {
             Storage::Shaped { shape, len } => (0..len)
                 .map(|slot| {
@@ -118,29 +118,20 @@ impl Shapes {
                         .ok_or_else(|| "invalid instance attribute symbol".into())
                 })
                 .collect(),
-            Storage::Dictionary(values) => {
-                let mut names = values
-                    .keys()
-                    .map(|symbol| {
-                        symbols
-                            .name(*symbol)
-                            .map(str::to_string)
-                            .ok_or_else(|| String::from("invalid instance attribute symbol"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                names.sort();
-                Ok(names)
-            }
+            Storage::Dictionary(values) => Ok(values
+                .symbols()
+                .map(|symbol| symbols.issued(symbol).to_string())
+                .collect()),
         }
     }
 
     /// Every attribute stored directly on an instance, as (name, value) pairs.
-    pub fn attribute_values<'s>(
+    pub fn attribute_values(
         &self,
         heap: &Heap,
         symbols: &Symbols,
-        instance: Value<'_>,
-    ) -> Result<Vec<(String, Value<'s>)>, String> {
+        instance: Value,
+    ) -> PyResult<Vec<(String, Value)>> {
         self.attribute_names(heap, symbols, instance)?
             .into_iter()
             .map(|name| {
@@ -155,20 +146,20 @@ impl Shapes {
             .collect()
     }
 
-    pub fn attribute_by_symbol<'s>(
+    pub fn attribute_by_symbol(
         &self,
         heap: &Heap,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> PyResult<Option<Value>> {
         let slot = match heap.attributes(instance)? {
             None => None,
-            Some(InstanceAttributes::Dictionary(values)) => values.get(&symbol),
+            Some(InstanceAttributes::Dictionary(values)) => values.get(symbol),
             Some(InstanceAttributes::Shaped { shape, values }) => {
                 self.slot(*shape, symbol).and_then(|slot| values.get(slot))
             }
         };
-        Ok(heap.handle_optional(slot))
+        Ok(heap.value_optional(slot))
     }
 
     /// The cacheable location of a shaped attribute, or `None` when the instance uses a
@@ -176,9 +167,9 @@ impl Shapes {
     pub fn slot_by_symbol(
         &self,
         heap: &Heap,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<InstanceAttributeSlot>, String> {
+    ) -> PyResult<Option<InstanceAttributeSlot>> {
         let Some(InstanceAttributes::Shaped { shape, values }) = heap.attributes(instance)? else {
             return Ok(None);
         };
@@ -219,7 +210,7 @@ impl Shapes {
         shape: ShapeId,
         symbol: SymbolId,
         resources: &mut Resources,
-    ) -> Result<ShapeId, String> {
+    ) -> PyResult<ShapeId> {
         if let Some(next) = self.transitions.get(&(shape, symbol)) {
             return Ok(*next);
         }
@@ -237,7 +228,7 @@ impl Shapes {
             .checked_add(SHAPE_BYTES)
             .ok_or("modeled shape table size overflow")?;
         if !resources.reserve_memory(SHAPE_BYTES) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.modeled_bytes = modeled_bytes;
         self.shapes.push(Shape {
@@ -259,10 +250,7 @@ impl InstanceAttributeSlot {
 /// What an inline cache keys a heap object's attribute lookups on: its type and the shape of
 /// its instance attributes, `None` when it has none. An object whose attributes live in a
 /// dictionary has no key, so no site caches it.
-pub fn site_key(
-    heap: &Heap,
-    instance: Value<'_>,
-) -> Result<Option<(TypeId, Option<ShapeId>)>, String> {
+pub fn site_key(heap: &Heap, instance: Value) -> PyResult<Option<(TypeId, Option<ShapeId>)>> {
     let (type_id, attributes) = heap.typed_attributes(instance)?;
     Ok(match attributes {
         None => Some((type_id, None)),
@@ -277,26 +265,21 @@ pub struct AttributeStore<'a> {
     pub heap: &'a mut Heap,
     pub shapes: &'a mut Shapes,
     pub symbols: &'a mut Symbols,
-    pub roots: &'a mut dyn Roots,
+    pub roots: &'a dyn Roots,
     pub resources: &'a mut Resources,
 }
 
 impl AttributeStore<'_> {
-    pub fn insert(
-        &mut self,
-        instance: Value<'_>,
-        name: &str,
-        value: Value<'_>,
-    ) -> Result<(), String> {
+    pub fn insert(&mut self, instance: Value, name: &str, value: Value) -> PyResult<()> {
         let symbol = self.symbols.intern(name, self.resources)?;
         self.insert_by_symbol(instance, symbol, value)
     }
 
-    pub fn extend<'v>(
+    pub fn extend(
         &mut self,
-        instance: Value<'_>,
-        values: impl IntoIterator<Item = (String, Value<'v>)>,
-    ) -> Result<(), String> {
+        instance: Value,
+        values: impl IntoIterator<Item = (String, Value)>,
+    ) -> PyResult<()> {
         for (name, value) in values {
             self.insert(instance, &name, value)?;
         }
@@ -305,41 +288,37 @@ impl AttributeStore<'_> {
 
     pub fn insert_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-        value: Value<'_>,
-    ) -> Result<(), String> {
+        value: Value,
+    ) -> PyResult<()> {
         match storage(self.heap, instance)? {
             Storage::Dictionary(values) => {
-                let growth = if values.contains_key(&symbol) {
+                let growth = if values.contains(symbol) {
                     0
                 } else {
                     INSTANCE_DICT_ENTRY_BYTES
                 };
                 self.heap
                     .reserve_object_growth(instance, growth, self.roots, self.resources)?;
-                self.heap
-                    .modify_attributes(instance, |builder, attributes| {
-                        let Some(InstanceAttributes::Dictionary(values)) =
+                self.heap.modify_attributes(instance, |attributes| {
+                    let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut()
+                    else {
+                        unreachable!("instance representation changed without yielding")
+                    };
+                    values.insert(symbol, Ref::from(value));
+                })
+            }
+            Storage::Shaped { shape, len } => {
+                if let Some(slot) = self.shapes.slot(shape, symbol) {
+                    return self.heap.modify_attributes(instance, |attributes| {
+                        let Some(InstanceAttributes::Shaped { values, .. }) =
                             attributes.as_deref_mut()
                         else {
                             unreachable!("instance representation changed without yielding")
                         };
-                        values.insert(symbol, builder.store(value));
-                    })
-            }
-            Storage::Shaped { shape, len } => {
-                if let Some(slot) = self.shapes.slot(shape, symbol) {
-                    return self
-                        .heap
-                        .modify_attributes(instance, |builder, attributes| {
-                            let Some(InstanceAttributes::Shaped { values, .. }) =
-                                attributes.as_deref_mut()
-                            else {
-                                unreachable!("instance representation changed without yielding")
-                            };
-                            values[slot] = builder.store(value);
-                        });
+                        values[slot] = Ref::from(value);
+                    });
                 }
                 if len >= MAX_SHAPED_ATTRIBUTES {
                     return self.insert_dictionary(instance, symbol, value);
@@ -351,11 +330,11 @@ impl AttributeStore<'_> {
 
     fn append_shaped(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         shape: ShapeId,
         symbol: SymbolId,
-        value: Value<'_>,
-    ) -> Result<(), String> {
+        value: Value,
+    ) -> PyResult<()> {
         // Grow the instance first: that reservation may collect, while the shape table's own
         // small charge cannot. The first attribute also pays for the storage box.
         let growth = if self.heap.attributes(instance)?.is_none() {
@@ -366,61 +345,59 @@ impl AttributeStore<'_> {
         self.heap
             .reserve_object_growth(instance, growth, self.roots, self.resources)?;
         let next_shape = self.shapes.transition(shape, symbol, self.resources)?;
-        self.heap
-            .modify_attributes(instance, |builder, attributes| {
-                let attributes = attributes.get_or_insert_with(Default::default);
-                let InstanceAttributes::Shaped { shape, values } = &mut **attributes else {
-                    unreachable!("instance representation changed without yielding")
-                };
-                *shape = next_shape;
-                values.push(builder.store(value));
-            })
+        self.heap.modify_attributes(instance, |attributes| {
+            let attributes = attributes.get_or_insert_with(Default::default);
+            let InstanceAttributes::Shaped { shape, values } = &mut **attributes else {
+                unreachable!("instance representation changed without yielding")
+            };
+            *shape = next_shape;
+            values.push(Ref::from(value));
+        })
     }
 
     /// Remove one instance attribute and return its value, or `None` when the instance does
     /// not have it. A shaped instance first converts to dictionary storage, because shapes only
     /// grow; attribute caches never match dictionary instances, so they stay valid.
-    pub fn remove_by_symbol<'s>(
+    pub fn remove_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> PyResult<Option<Value>> {
         if let Storage::Shaped { shape, .. } = storage(self.heap, instance)? {
             if self.shapes.slot(shape, symbol).is_none() {
                 return Ok(None);
             }
             self.convert_to_dictionary(instance, 0)?;
         }
-        let removed = self.heap.modify_attributes(instance, |_, attributes| {
+        let removed = self.heap.modify_attributes(instance, |attributes| {
             let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
                 unreachable!("instance was converted to dictionary storage")
             };
-            values.remove(&symbol)
+            values.remove(symbol)
         })?;
-        Ok(self.heap.handle_optional(removed.as_ref()))
+        Ok(self.heap.value_optional(removed.as_ref()))
     }
 
     fn insert_dictionary(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-        value: Value<'_>,
-    ) -> Result<(), String> {
+        value: Value,
+    ) -> PyResult<()> {
         if !self.convert_to_dictionary(instance, INSTANCE_DICT_ENTRY_BYTES)? {
             return self.insert_by_symbol(instance, symbol, value);
         }
-        self.heap
-            .modify_attributes(instance, |builder, attributes| {
-                let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
-                    unreachable!("instance was converted to dictionary storage")
-                };
-                values.insert(symbol, builder.store(value));
-            })
+        self.heap.modify_attributes(instance, |attributes| {
+            let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
+                unreachable!("instance was converted to dictionary storage")
+            };
+            values.insert(symbol, Ref::from(value));
+        })
     }
 
     /// Move a shaped instance's attributes into dictionary storage, reserving `extra` more
     /// bytes. Returns `false` when the instance already uses a dictionary.
-    fn convert_to_dictionary(&mut self, instance: Value<'_>, extra: u64) -> Result<bool, String> {
+    fn convert_to_dictionary(&mut self, instance: Value, extra: u64) -> PyResult<bool> {
         let (shape, shaped_len, boxed) = match self.heap.attributes(instance)? {
             None => (ShapeId::ROOT, 0, false),
             Some(InstanceAttributes::Shaped { shape, values }) => (*shape, values.len(), true),
@@ -443,7 +420,7 @@ impl AttributeStore<'_> {
                     .ok_or("invalid instance shape slot")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.heap.modify_attributes(instance, |_, attributes| {
+        self.heap.modify_attributes(instance, |attributes| {
             let attributes = attributes.get_or_insert_with(Default::default);
             let InstanceAttributes::Shaped { values, .. } = &mut **attributes else {
                 unreachable!("instance representation changed without yielding")
@@ -451,7 +428,7 @@ impl AttributeStore<'_> {
             let values = names
                 .into_iter()
                 .zip(std::mem::take(values))
-                .collect::<HashMap<_, _>>();
+                .collect::<Namespace>();
             **attributes = InstanceAttributes::Dictionary(Box::new(values));
         })?;
         Ok(true)

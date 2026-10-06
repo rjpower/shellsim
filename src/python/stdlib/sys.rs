@@ -105,7 +105,7 @@ pub(crate) static STREAM_TYPE: NativeTypeDef = NativeTypeDef {
 };
 
 /// The descriptor number of a standard stream: 0 for stdin, 1 for stdout, 2 for stderr.
-fn descriptor<'s>(runtime: &mut dyn PyRuntime<'s>, stream: &Value<'s>) -> i64 {
+fn descriptor(runtime: &mut dyn PyRuntime, stream: &Value) -> i64 {
     for (marker, number) in [
         (PyMarker::Stdin, 0),
         (PyMarker::StdinBuffer, 0),
@@ -121,63 +121,51 @@ fn descriptor<'s>(runtime: &mut dyn PyRuntime<'s>, stream: &Value<'s>) -> i64 {
 }
 
 /// Output is written through as it is produced, so `flush` has nothing left to do.
-fn flush<'s>(runtime: &mut dyn PyRuntime<'s>, _: Value<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn flush(runtime: &mut dyn PyRuntime, _: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.flush", 0, 0)?;
     args.reject_keywords("stream.flush")?;
     let _ = runtime;
     Ok(Value::None)
 }
 
-fn fileno<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn fileno(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.fileno", 0, 0)?;
     args.reject_keywords("stream.fileno")?;
     Ok(Value::Int(descriptor(runtime, &receiver)))
 }
 
 /// The modeled streams are pipes, never terminals.
-fn isatty<'s>(runtime: &mut dyn PyRuntime<'s>, _: Value<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn isatty(runtime: &mut dyn PyRuntime, _: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.isatty", 0, 0)?;
     args.reject_keywords("stream.isatty")?;
     let _ = runtime;
     Ok(Value::Bool(false))
 }
 
-fn readable<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn readable(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.readable", 0, 0)?;
     args.reject_keywords("stream.readable")?;
     Ok(Value::Bool(descriptor(runtime, &receiver) == 0))
 }
 
-fn writable<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn writable(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.writable", 0, 0)?;
     args.reject_keywords("stream.writable")?;
     Ok(Value::Bool(descriptor(runtime, &receiver) > 0))
 }
 
-fn seekable<'s>(runtime: &mut dyn PyRuntime<'s>, _: Value<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn seekable(runtime: &mut dyn PyRuntime, _: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.seekable", 0, 0)?;
     args.reject_keywords("stream.seekable")?;
     let _ = runtime;
     Ok(Value::Bool(false))
 }
 
-fn encoding<'s>(runtime: &mut dyn PyRuntime<'s>, _: Value<'s>) -> PyResult<'s> {
+fn encoding(runtime: &mut dyn PyRuntime, _: Value) -> PyResult {
     runtime.new_string("utf-8".to_string())
 }
 
-fn errors<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s> {
+fn errors(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult {
     // CPython's stderr uses backslashreplace so diagnostics never fail to encode.
     let errors = if descriptor(runtime, &receiver) == 2 {
         "backslashreplace"
@@ -187,11 +175,11 @@ fn errors<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<
     runtime.new_string(errors.to_string())
 }
 
-fn closed<'s>(_: &mut dyn PyRuntime<'s>, _: Value<'s>) -> PyResult<'s> {
+fn closed(_: &mut dyn PyRuntime, _: Value) -> PyResult {
     Ok(Value::Bool(false))
 }
 
-fn name<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s> {
+fn name(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult {
     let name = match descriptor(runtime, &receiver) {
         0 => "<stdin>",
         1 => "<stdout>",
@@ -200,7 +188,7 @@ fn name<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s
     runtime.new_string(name.to_string())
 }
 
-fn mode<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s> {
+fn mode(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult {
     let mode = if descriptor(runtime, &receiver) == 0 {
         "r"
     } else {
@@ -211,7 +199,7 @@ fn mode<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s
 
 /// `sys.stdin.buffer` reads the same descriptor as raw bytes instead of decoded text. Binary
 /// views of the output streams are not modeled.
-fn buffer<'s>(runtime: &mut dyn PyRuntime<'s>, stream: Value<'s>) -> PyResult<'s> {
+fn buffer(runtime: &mut dyn PyRuntime, stream: Value) -> PyResult {
     let stdin = runtime.marker(PyMarker::Stdin);
     if runtime.identical(&stream, &stdin) {
         return Ok(runtime.marker(PyMarker::StdinBuffer));
@@ -301,7 +289,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
-fn exit<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn exit(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("sys.exit", 0, 1)?;
     args.reject_keywords("sys.exit")?;
     let status = match args.positional().first() {
@@ -318,14 +306,14 @@ fn exit<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s>
 /// `sys._getframemodulename(depth=0)`: the module name of the caller `depth` frames up, which
 /// `collections.namedtuple` uses to set `__module__` on the classes it creates.
 /// `_sys.active_exception()`: the exception being handled, or None outside an `except` block.
-fn active_exception<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn active_exception(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("sys.exception", 0, 0)?;
     args.reject_keywords("sys.exception")?;
     Ok(runtime.active_exception().unwrap_or(Value::None))
 }
 
 /// `_sys.set_module(name, module)`: register `module` so `import name` returns it.
-fn set_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn set_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("sys.modules.__setitem__", 2, 2)?;
     args.reject_keywords("sys.modules.__setitem__")?;
     let name = runtime
@@ -336,7 +324,7 @@ fn set_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
 }
 
 /// `_sys.remove_module(name)`: forget a registered module; returns whether one was registered.
-fn remove_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn remove_module(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("sys.modules.__delitem__", 1, 1)?;
     args.reject_keywords("sys.modules.__delitem__")?;
     let name = runtime
@@ -346,13 +334,13 @@ fn remove_module<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
 }
 
 /// `_sys.modules()`: a dict snapshot of the modules loaded so far.
-fn modules<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn modules(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("sys.modules", 0, 0)?;
     args.reject_keywords("sys.modules")?;
     runtime.loaded_modules()
 }
 
-fn getframemodulename<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn getframemodulename(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     const NAME: &str = "_getframemodulename";
     if let Some((name, _)) = args.keywords().iter().find(|(name, _)| name != "depth") {
         return Err(PyError::type_error(format!(
@@ -382,31 +370,27 @@ fn getframemodulename<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -
     Ok(runtime.frame_module_name(depth)?.unwrap_or(Value::None))
 }
 
-fn argv<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn argv(runtime: &mut dyn PyRuntime) -> PyResult {
     runtime.new_argv()
 }
 
-fn path<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn path(runtime: &mut dyn PyRuntime) -> PyResult {
     runtime.new_import_path()
 }
 
-fn stdin<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn stdin(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::Stdin))
 }
 
-fn stdout<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn stdout(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::Stdout))
 }
 
-fn stderr<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn stderr(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::Stderr))
 }
 
-fn write<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn write(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.write", 1, 1)?;
     args.reject_keywords("stream.write")?;
     let text = runtime.display(&args.positional()[0])?;
@@ -414,29 +398,17 @@ fn write<'s>(
     Ok(Value::Int(i64::try_from(written).unwrap_or(i64::MAX)))
 }
 
-fn read<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn read(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     read_inner(runtime, receiver, args, false)
 }
 
-fn readline<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn readline(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     read_inner(runtime, receiver, args, true)
 }
 
 /// Read every remaining line eagerly. Bounded by the same memory accounting as `read()`, since a
 /// caller that wants line-by-line backpressure should iterate the stream instead.
-fn readlines<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn readlines(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.readlines", 0, 1)?;
     args.reject_keywords("stream.readlines")?;
     let mut lines = Vec::new();
@@ -450,37 +422,23 @@ fn readlines<'s>(
     runtime.new_list(lines)
 }
 
-fn iter<'s>(
-    _runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn iter(_runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.__iter__", 0, 0)?;
     args.reject_keywords("stream.__iter__")?;
     Ok(slot_iter(_runtime, receiver)?.expect("stream iteration always returns itself"))
 }
 
-fn next<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn next(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("stream.__next__", 0, 0)?;
     args.reject_keywords("stream.__next__")?;
     slot_next(runtime, receiver)?.ok_or_else(|| PyError::exception("StopIteration", ""))
 }
 
-pub(crate) fn slot_iter<'s>(
-    _runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+pub(crate) fn slot_iter(_runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Option<Value>> {
     Ok(Some(receiver))
 }
 
-pub(crate) fn slot_next<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+pub(crate) fn slot_next(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Option<Value>> {
     let read = runtime.read_stream(&receiver, None, true)?;
     if read.is_empty() {
         Err(PyError::exception("StopIteration", ""))
@@ -489,12 +447,12 @@ pub(crate) fn slot_next<'s>(
     }
 }
 
-fn read_inner<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
+fn read_inner(
+    runtime: &mut dyn PyRuntime,
+    receiver: Value,
+    args: CallArgs,
     line: bool,
-) -> PyResult<'s> {
+) -> PyResult {
     args.expect_positional("stream.read", 0, 1)?;
     args.reject_keywords("stream.read")?;
     let size = match args.positional().first() {
@@ -513,7 +471,7 @@ fn read_inner<'s>(
 }
 
 /// Package one stream read into its Python representation: `str` for text, `bytes` for `.buffer`.
-fn package_read<'s>(runtime: &mut dyn PyRuntime<'s>, read: PyStreamRead) -> PyResult<'s> {
+fn package_read(runtime: &mut dyn PyRuntime, read: PyStreamRead) -> PyResult {
     match read {
         PyStreamRead::Text(text) => runtime.new_string(text),
         PyStreamRead::Bytes(bytes) => runtime.new_bytes(bytes),

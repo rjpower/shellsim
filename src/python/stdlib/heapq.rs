@@ -28,7 +28,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn native_heapify<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_heapify(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("heapify", 1, 1)?;
     args.reject_keywords("heapify")?;
     let list = args.positional()[0].cast::<PyList>(runtime)?;
@@ -38,7 +38,7 @@ fn native_heapify<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     Ok(Value::None)
 }
 
-fn native_heappop<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_heappop(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("heappop", 1, 1)?;
     args.reject_keywords("heappop")?;
     let list = args.positional()[0].cast::<PyList>(runtime)?;
@@ -56,10 +56,7 @@ fn native_heappop<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     Ok(smallest)
 }
 
-fn dynamic_heapify<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    values: &mut [PyValue<'s>],
-) -> PyResult<'s, ()> {
+fn dynamic_heapify(runtime: &mut dyn PyRuntime, values: &mut [PyValue]) -> PyResult<()> {
     if values.len() < 2 {
         return Ok(());
     }
@@ -69,11 +66,11 @@ fn dynamic_heapify<'s>(
     Ok(())
 }
 
-fn dynamic_sift_down<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    values: &mut [PyValue<'s>],
+fn dynamic_sift_down(
+    runtime: &mut dyn PyRuntime,
+    values: &mut [PyValue],
     mut parent: usize,
-) -> PyResult<'s, ()> {
+) -> PyResult<()> {
     loop {
         let left = parent
             .checked_mul(2)

@@ -5,6 +5,7 @@
 //! subsystem traits or independent state owners; resumable state remains centralized here.
 
 use crate::interp::Interp;
+use crate::resources::Resources;
 
 use std::cmp::Ordering;
 use std::collections::{BTreeSet, HashMap};
@@ -16,13 +17,13 @@ use num_traits::ToPrimitive;
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
 use super::attributes::ShapeId;
-use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, NameId, Opcode};
+use super::bytecode::{CallId, ClassField, CodeRef, DisplayKind, Linker, Opcode};
 use super::cpython_names;
 use super::definitions::DefinitionTable;
 use super::exception_types;
 use super::filesystem::PyModuleLoader;
 use super::heap::{
-    Builder, ClassLayout, KeyHash, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget,
+    ClassLayout, KeyHash, Namespace, NamespaceTarget, Object, OrderedMap, OrderedSet, ProxyTarget,
     Ref, Roots, ValueStack, MODELED_MAPPING_ENTRY_BYTES, MODELED_SET_MEMBER_BYTES,
     MODELED_VALUE_BYTES,
 };
@@ -49,8 +50,8 @@ mod compare;
 mod dispatch;
 mod equality;
 mod format;
-mod handles;
 mod hashing;
+mod heap_access;
 mod host;
 mod iteration;
 mod mappings;
@@ -193,10 +194,6 @@ impl NativeValue {
     }
 }
 
-fn known_exception_type(name: &str) -> Option<&'static str> {
-    exception_types::exception_type(name).map(|definition| definition.name)
-}
-
 fn exception_type_code(name: &str) -> u64 {
     exception_types::EXCEPTION_TYPES
         .iter()
@@ -252,36 +249,32 @@ impl NativeValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExceptionType(pub &'static str);
 
-#[derive(Debug)]
-struct RaisedException {
-    kind: String,
-    value: Ref,
-}
-
-impl Clone for RaisedException {
-    fn clone(&self) -> Self {
-        Self {
-            kind: self.kind.clone(),
-            value: self.value.dup(),
-        }
-    }
-}
-
 /// One call-chain entry captured while an uncaught exception unwinds the frame stack, rendered
 /// as a CPython-style `File "...", line N, in <scope>` line.
 ///
 /// [`Vm::propagate_error`] rebuilds this list from scratch on every unwind attempt, so a nested
 /// unwind that is later discarded (for example inside a generator or `exec` sub-frame) never
-/// leaks into the traceback that is finally reported for the real, uncaught error.
-#[derive(Clone, Debug)]
+/// leaks into the traceback that is finally reported for the real, uncaught error. Recording a
+/// frame copies two references; names and files are read only when a traceback is printed.
+#[derive(Debug)]
 struct TracebackFrame {
-    /// Function name active at this call level, or `<module>` for the top-level frame.
-    name: String,
+    /// The function running at this call level, or `None` for the top-level frame.
+    function: Option<Ref>,
+    /// The outermost scope of the frame's code, whose `__file__` names an imported module's
+    /// source; `None` when the frame has no lexical scope.
+    module: Option<Ref>,
     /// Source location this frame was executing when the exception passed through it.
     span: Span,
-    /// `__file__` of the imported module that owns this frame's code, or `None` for the main
-    /// program, whose name depends on how it was started.
-    file: Option<String>,
+}
+
+impl Clone for TracebackFrame {
+    fn clone(&self) -> Self {
+        Self {
+            function: self.function.as_ref().map(Ref::dup),
+            module: self.module.as_ref().map(Ref::dup),
+            span: self.span,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -414,24 +407,7 @@ pub(super) fn execute(
     out: Out,
     err: Out,
 ) -> ExecResult {
-    let name_symbol = match state.symbols.intern("__name__", &mut interp.resources) {
-        Ok(symbol) => symbol,
-        Err(_) => return ExecResult::Exit(137),
-    };
-    if state.globals.get(&state.heap, name_symbol).is_none()
-        && state
-            .globals
-            .insert(
-                &state.heap,
-                name_symbol,
-                Value::inline_string("__main__").expect("short builtin string"),
-                &mut interp.resources,
-            )
-            .is_err()
-    {
-        return ExecResult::Exit(137);
-    }
-    let mut program = match VmProgram::compile(source) {
+    let mut program = match VmProgram::compile(source, state, &mut interp.resources) {
         Ok(program) => program,
         Err(result) => return result,
     };
@@ -488,7 +464,12 @@ impl VmMode {
 }
 
 impl VmProgram {
-    pub(super) fn compile(source: &str) -> Result<Self, ExecResult> {
+    /// Compile a script or REPL entry against `state`'s symbol and code tables.
+    pub(super) fn compile(
+        source: &str,
+        state: &mut ReplState,
+        resources: &mut Resources,
+    ) -> Result<Self, ExecResult> {
         let tokens = super::lexer::lex(source).map_err(|error| {
             ExecResult::Unsupported(format!(
                 "{} at line {}, column {}",
@@ -501,8 +482,16 @@ impl VmProgram {
                 error.message, error.span.line, error.span.column
             ))
         })?;
+        let mut link = Linker::new(&mut state.symbols, &mut state.codes, resources);
+        let code = super::compiler::compile(program, &mut link);
+        if let Err(error) = link.finish() {
+            return Err(match error.kind() {
+                Some(PyErrorKind::Resource) => ExecResult::Exit(137),
+                _ => ExecResult::Unsupported(error.message().to_string()),
+            });
+        }
         Ok(Self {
-            code: super::compiler::compile(program),
+            code,
             execution: VmState::default(),
             started: false,
         })
@@ -519,57 +508,22 @@ impl VmProgram {
         err: Out,
     ) -> VmPoll {
         let mut vm = Vm::new(interp, input, state, &mut self.execution, mode, out, err);
-        vm.release_transient_memory();
         if !self.started {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), false) else {
+            let docstring = self.code.docstring.clone();
+            let Ok(main) = vm.main_scope(docstring.as_deref()) else {
+                return VmPoll::Ready(ExecResult::Exit(137));
+            };
+            let entry = FrameEntry::module(main);
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, entry, FrameKind::Entry) else {
                 return VmPoll::Ready(ExecResult::Exit(137));
             };
             vm.bytecode_frames.push(frame);
-            if let Some(docstring) = self.code.docstring.clone() {
-                // The script's leading string literal is `__doc__` in the main module, unless an
-                // interactive session already bound the name.
-                let Ok(symbol) = vm.state.symbols.intern("__doc__", &mut vm.interp.resources)
-                else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                if vm.state.globals.get(&vm.state.heap, symbol).is_none() {
-                    let Ok(value) = vm.allocate_string(docstring.to_string()) else {
-                        return VmPoll::Ready(ExecResult::Exit(137));
-                    };
-                    if vm
-                        .state
-                        .globals
-                        .insert(&vm.state.heap, symbol, value, &mut vm.interp.resources)
-                        .is_err()
-                    {
-                        return VmPoll::Ready(ExecResult::Exit(137));
-                    }
-                }
-            }
-            if !vm.state.modules.contains_key("__main__") {
-                // `sys.modules["__main__"]` is a module object whose attributes are the
-                // script's globals, so `inspect.getmodule` and friends see the main script.
-                let Ok(scope) =
-                    vm.alloc_scope(None, true, Arc::from([]), Vec::new(), HashMap::new())
-                else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                let Ok(module) = vm.alloc_with(|builder| Object::Module {
-                    name: "__main__".to_string(),
-                    scope: builder.store(scope),
-                }) else {
-                    return VmPoll::Ready(ExecResult::Exit(137));
-                };
-                let stored = vm.store(module);
-                vm.state.modules.insert("__main__".to_string(), stored);
-            }
             self.started = true;
         }
         let execution = vm.execute_active_frame(VM_POLL_QUANTUM);
-        vm.release_transient_memory();
         if !vm.state.sync_type_memory(&mut vm.interp.resources) {
             return VmPoll::Ready(ExecResult::Exit(137));
         }
@@ -592,8 +546,8 @@ impl VmProgram {
     }
 }
 
-/// The interpreter for one scheduler quantum, and the handle scope for every value it touches.
-/// See [`handles`] for the scope discipline.
+/// The interpreter for one scheduler quantum, and the pin scope for every value it touches.
+/// See [`heap_access`] for the scope discipline.
 struct Vm<'s> {
     interp: &'s mut Interp,
     argv: &'s [String],
@@ -603,12 +557,9 @@ struct Vm<'s> {
     mode: VmMode,
     out: Out<'s>,
     err: Out<'s>,
-    /// Handle-stack height when this scope opened; dropping the scope truncates back to it.
-    handle_base: usize,
-    /// Host scratch reserved before this scope opened. The scope owns everything reserved above
-    /// it and releases that on each instruction boundary and when it closes, so a nested
-    /// execution never refunds scratch an enclosing native call still holds.
-    transient_base: u64,
+    /// Pin-stack height when this scope opened; dropping the scope truncates back to it, which
+    /// also releases the host scratch reserved inside it.
+    pin_base: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -635,7 +586,9 @@ struct VmState {
     /// stack depth)`, each frame's above its `handler_base`.
     handlers: Vec<(usize, usize, usize)>,
     call_depth: usize,
-    pending_exception: Option<RaisedException>,
+    /// The exception object being raised, between the operation that raised it and the handler
+    /// that takes it. Operations that raise return [`PyError::pending`] beside it.
+    pending_exception: Option<Ref>,
     /// Nesting of builtin sequence ordering in progress, bounded like other recursion.
     compare_depth: usize,
     /// Frames collected by the most recent [`Vm::propagate_error`] unwind, freshest overwrites
@@ -648,14 +601,15 @@ struct VmState {
     suspension: Option<Box<Suspension>>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
-    /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
-    /// from native code) now running. Their callers cannot resume a suspended frame, so while
-    /// any is active, natives finish blocking operations instead of suspending.
+    /// Frames Rust code is running with [`Vm::run_frame`] (imports, class bodies, `exec`,
+    /// generators resumed by natives, and Python calls made from native code). Their callers
+    /// cannot resume a suspended frame, so while any is active, natives finish blocking
+    /// operations instead of suspending.
     synchronous_frames: usize,
-    exception_stack: Vec<RaisedException>,
+    /// Exception objects being handled by `except` blocks, innermost last.
+    exception_stack: Vec<Ref>,
     /// Context managers entered by every frame, each frame's above its `context_base`.
     with_contexts: Vec<Ref>,
-    code_caches: CodeCacheTable,
     stdin_position: usize,
     stdin_text: Option<String>,
     /// Bytes read from fd 0 but not yet consumed by a completed `read`/`readline`, kept across
@@ -667,10 +621,6 @@ struct VmState {
     /// Whether fd 0 has reported end-of-file. Once set, further reads only drain
     /// `stdin_stream_pending` and never touch the descriptor again.
     stdin_stream_eof: bool,
-    /// Host scratch charged by `reserve_result` while a native helper builds a result. Each
-    /// `Vm` scope releases the part reserved above its own base at every instruction boundary
-    /// and when it closes.
-    transient_memory: u64,
     /// Host bytes held by the VM itself across quanta (stdin text, pipe buffers), released when
     /// the program completes.
     retained_memory: u64,
@@ -689,7 +639,7 @@ impl Clone for VmState {
                 .collect(),
             handlers: self.handlers.clone(),
             call_depth: self.call_depth,
-            pending_exception: self.pending_exception.clone(),
+            pending_exception: self.pending_exception.as_ref().map(Ref::dup),
             compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
@@ -697,14 +647,12 @@ impl Clone for VmState {
             async_timer_deadlines: self.async_timer_deadlines.clone(),
             native_suspend_allowed: self.native_suspend_allowed,
             synchronous_frames: self.synchronous_frames,
-            exception_stack: self.exception_stack.clone(),
+            exception_stack: self.exception_stack.iter().map(Ref::dup).collect(),
             with_contexts: self.with_contexts.iter().map(Ref::dup).collect(),
-            code_caches: self.code_caches.clone(),
             stdin_position: self.stdin_position,
             stdin_text: self.stdin_text.clone(),
             stdin_stream_pending: self.stdin_stream_pending.clone(),
             stdin_stream_eof: self.stdin_stream_eof,
-            transient_memory: self.transient_memory,
             retained_memory: self.retained_memory,
         }
     }
@@ -730,30 +678,31 @@ impl TestTimeout {
 }
 
 impl Roots for VmState {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
         self.stack.visit_refs(visitor);
-        for slot in self.locals.iter_mut().flatten() {
+        for slot in self.locals.iter().flatten() {
             visitor(slot);
         }
-        for slot in &mut self.with_contexts {
+        for slot in &self.with_contexts {
             visitor(slot);
         }
-        if let Some(exception) = &mut self.pending_exception {
-            visitor(&mut exception.value);
+        for exception in self.pending_exception.iter().chain(&self.exception_stack) {
+            visitor(exception);
         }
-        for exception in &mut self.exception_stack {
-            visitor(&mut exception.value);
-        }
-        for frame in &mut self.bytecode_frames {
-            for slot in frame.scope.iter_mut().chain(&mut frame.callee) {
+        for frame in &self.traceback_frames {
+            for slot in frame.function.iter().chain(&frame.module) {
                 visitor(slot);
             }
         }
-        for caches in self.code_caches.iter_mut() {
-            caches.visit_refs(visitor);
+        for frame in &self.bytecode_frames {
+            visitor(&frame.scope);
+            visitor(&frame.globals);
+            if let Some(callee) = &frame.callee {
+                visitor(callee);
+            }
         }
-        if let Some(suspension) = &mut self.suspension {
-            match &mut suspension.retry {
+        if let Some(suspension) = &self.suspension {
+            match &suspension.retry {
                 Some(PendingNativeCall::Function { arguments, .. }) => {
                     arguments.visit_refs(visitor);
                 }
@@ -771,17 +720,17 @@ impl Roots for VmState {
     }
 }
 
-struct CodeCaches {
+/// One code object's entry in the [`CodeTable`].
+pub(super) struct CodeCaches {
     code: CodeRef,
-    names: Vec<Option<SymbolId>>,
     /// One entry per instruction, filled for `LoadAttribute` and `LoadMethod` sites.
     sites: Option<Vec<Option<SiteCache>>>,
 }
 
 impl CodeCaches {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
-        for site in self.sites.iter_mut().flatten().flatten() {
-            match &mut site.resolved {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for site in self.sites.iter().flatten().flatten() {
+            match &site.resolved {
                 Resolved::InstanceSlot(_) => {}
                 Resolved::ClassValue(value) => visitor(value),
                 Resolved::Method { descriptor, owner } => {
@@ -793,109 +742,186 @@ impl CodeCaches {
     }
 }
 
-/// Per-code inline caches in stable slots.
+/// Every code object one interpreter has compiled, each with its inline caches.
 ///
-/// A slot index stays valid while its code object is alive, which lets the dispatch cursor
-/// hold one for a whole quantum. Code that only the table still references, such as a
-/// finished `eval` or `exec` expression, is dropped when the table is pruned, so a program that
-/// compiles source in a loop does not accumulate caches without bound or pay a linear lookup
-/// for each one.
+/// The compiler registers each code object it makes and records the slot in
+/// [`Code::cache_slot`](super::bytecode::Code::cache_slot), so a frame finds its caches by
+/// index. The table keeps a reference to each code object. Once the table has grown to twice
+/// the size that survived the last prune, registration first drops the code nothing else
+/// references, such as a finished `exec` string, and reuses its slot, so a program that
+/// compiles source in a loop does not accumulate entries. Entries and their site caches charge
+/// their storage to the guest.
 #[derive(Clone, Default)]
-struct CodeCacheTable {
+pub(super) struct CodeTable {
     slots: Vec<Option<CodeCaches>>,
-    /// Slot of each live code object, keyed by the `Arc` address.
-    by_code: HashMap<usize, usize>,
-    free: Vec<usize>,
-    /// Live slot count at which the next prune runs; doubles with the surviving set.
+    free: Vec<u32>,
+    live: usize,
+    /// Live entry count at which the next registration prunes; doubles with the survivors.
     prune_at: usize,
+    /// Slots whose code has site caches, which a class attribute store clears.
+    with_sites: Vec<u32>,
+    modeled_bytes: u64,
 }
 
-/// Fewest live caches kept before pruning is considered.
-const CODE_CACHE_PRUNE_FLOOR: usize = 64;
+/// Fewest live entries kept before pruning is considered.
+const CODE_TABLE_PRUNE_FLOOR: usize = 64;
 
-impl CodeCacheTable {
-    fn slot_of(&self, code: &CodeRef) -> Option<usize> {
-        self.by_code.get(&(Arc::as_ptr(code) as usize)).copied()
+impl CodeTable {
+    /// Charge a new entry and choose its slot; [`Self::install`] fills it with the code.
+    pub(super) fn reserve_slot(&mut self, resources: &mut Resources) -> PyResult<u32> {
+        if self.live >= self.prune_at.max(CODE_TABLE_PRUNE_FLOOR) {
+            self.prune(resources);
+        }
+        self.reserve(std::mem::size_of::<CodeCaches>(), resources)?;
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let slot = u32::try_from(self.slots.len()).map_err(|_| "too many code objects")?;
+                self.slots.push(None);
+                slot
+            }
+        };
+        self.live += 1;
+        Ok(slot)
+    }
+
+    pub(super) fn install(&mut self, slot: u32, code: CodeRef) {
+        self.slots[slot as usize] = Some(CodeCaches { code, sites: None });
+    }
+
+    /// Drop every entry whose code only the table references and release its storage.
+    fn prune(&mut self, resources: &mut Resources) {
+        let mut released = 0usize;
+        for (slot, entry) in self.slots.iter_mut().enumerate() {
+            let stale = entry
+                .as_ref()
+                .is_some_and(|caches| Arc::strong_count(&caches.code) == 1);
+            if stale {
+                let caches = entry.take().expect("stale slot holds caches");
+                released = released.saturating_add(code_cache_bytes(&caches));
+                self.free
+                    .push(u32::try_from(slot).expect("slots are numbered by u32"));
+                self.live -= 1;
+            }
+        }
+        let slots = &self.slots;
+        self.with_sites.retain(|&slot| {
+            slots[slot as usize]
+                .as_ref()
+                .is_some_and(|caches| caches.sites.is_some())
+        });
+        self.prune_at = self.live.saturating_mul(2);
+        self.release(released, resources);
     }
 
     fn get(&self, slot: usize) -> Option<&CodeCaches> {
         self.slots.get(slot)?.as_ref()
     }
 
-    fn iter_mut(&mut self) -> impl Iterator<Item = &mut CodeCaches> {
-        self.slots.iter_mut().flatten()
+    /// Give `slot` an empty site cache per instruction, charging it; `false` when the memory
+    /// limit leaves no room, in which case the code simply runs uncached.
+    fn allocate_sites(&mut self, slot: usize, resources: &mut Resources) -> PyResult<bool> {
+        let instructions = self[slot].code.instructions.len();
+        let bytes = instructions
+            .checked_mul(std::mem::size_of::<Option<SiteCache>>())
+            .ok_or("site cache size overflow")?;
+        if u64::try_from(bytes).unwrap_or(u64::MAX) > resources.memory_remaining() {
+            return Ok(false);
+        }
+        self.reserve(bytes, resources)?;
+        self[slot].sites = Some(std::iter::repeat_with(|| None).take(instructions).collect());
+        self.with_sites
+            .push(u32::try_from(slot).expect("slots are numbered by u32"));
+        Ok(true)
     }
 
-    /// Install caches for `code` and return their slot. Before growing past the prune
-    /// threshold, release every cache whose code nothing else references; `release` receives
-    /// the modeled bytes each one held.
-    fn insert(&mut self, caches: CodeCaches, mut release: impl FnMut(usize)) -> usize {
-        if self.by_code.len() >= self.prune_at.max(CODE_CACHE_PRUNE_FLOOR) {
-            for (slot, entry) in self.slots.iter_mut().enumerate() {
-                let stale = entry
-                    .as_ref()
-                    .is_some_and(|caches| Arc::strong_count(&caches.code) == 1);
-                if stale {
-                    let caches = entry.take().expect("stale slot holds caches");
-                    self.by_code.remove(&(Arc::as_ptr(&caches.code) as usize));
-                    self.free.push(slot);
-                    release(code_cache_bytes(&caches));
-                }
+    /// Clear every site cache, after a class attribute store that any of them may depend on.
+    fn clear_sites(&mut self, resources: &mut Resources) {
+        let mut released = 0usize;
+        for slot in std::mem::take(&mut self.with_sites) {
+            if let Some(caches) = self.slots[slot as usize].as_mut() {
+                let before = code_cache_bytes(caches);
+                caches.sites = None;
+                released = released.saturating_add(before - code_cache_bytes(caches));
             }
-            self.prune_at = self.by_code.len().saturating_mul(2);
         }
-        let key = Arc::as_ptr(&caches.code) as usize;
-        let slot = match self.free.pop() {
-            Some(slot) => {
-                self.slots[slot] = Some(caches);
-                slot
-            }
-            None => {
-                self.slots.push(Some(caches));
-                self.slots.len() - 1
-            }
-        };
-        self.by_code.insert(key, slot);
-        slot
+        self.release(released, resources);
+    }
+
+    fn reserve(&mut self, bytes: usize, resources: &mut Resources) -> PyResult<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| "code table entry is too large")?;
+        let next = self
+            .modeled_bytes
+            .checked_add(bytes)
+            .ok_or("modeled code table size overflow")?;
+        if !resources.reserve_memory(bytes) {
+            return Err(PyError::resource_error("memory limit exceeded"));
+        }
+        self.modeled_bytes = next;
+        Ok(())
+    }
+
+    fn release(&mut self, bytes: usize, resources: &mut Resources) {
+        let bytes = u64::try_from(bytes)
+            .unwrap_or(u64::MAX)
+            .min(self.modeled_bytes);
+        self.modeled_bytes -= bytes;
+        resources.release_memory(bytes);
+    }
+
+    /// Transfer the table's accounting to the caller when an interpreter is discarded.
+    pub(super) fn take_modeled_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.modeled_bytes)
     }
 }
 
-impl std::ops::Index<usize> for CodeCacheTable {
+impl Roots for CodeTable {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for caches in self.slots.iter().flatten() {
+            caches.visit_refs(visitor);
+        }
+    }
+}
+
+impl std::fmt::Debug for CodeTable {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CodeTable")
+            .field("live", &self.live)
+            .field("modeled_bytes", &self.modeled_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Index<usize> for CodeTable {
     type Output = CodeCaches;
 
     #[inline(always)]
     fn index(&self, slot: usize) -> &CodeCaches {
-        self.slots[slot].as_ref().expect("code cache slot is live")
+        self.slots[slot].as_ref().expect("code table slot is live")
     }
 }
 
-impl std::ops::IndexMut<usize> for CodeCacheTable {
+impl std::ops::IndexMut<usize> for CodeTable {
     fn index_mut(&mut self, slot: usize) -> &mut CodeCaches {
-        self.slots[slot].as_mut().expect("code cache slot is live")
+        self.slots[slot].as_mut().expect("code table slot is live")
     }
 }
 
-/// Modeled bytes retained by one code object's caches.
+/// Modeled bytes retained by one code object's entry.
 fn code_cache_bytes(caches: &CodeCaches) -> usize {
-    let names = caches
-        .names
-        .len()
-        .saturating_mul(std::mem::size_of::<Option<SymbolId>>());
     let sites = caches.sites.as_ref().map_or(0, |sites| {
         sites
             .len()
             .saturating_mul(std::mem::size_of::<Option<SiteCache>>())
     });
-    names
-        .saturating_add(sites)
-        .saturating_add(std::mem::size_of::<CodeCaches>())
+    sites.saturating_add(std::mem::size_of::<CodeCaches>())
 }
 
 impl Clone for CodeCaches {
     fn clone(&self) -> Self {
         Self {
             code: self.code.clone(),
-            names: self.names.clone(),
             sites: self.sites.as_ref().map(|sites| {
                 sites
                     .iter()
@@ -951,13 +977,12 @@ enum Resolved {
 /// holding its locals and dynamically bound names: module and class bodies, generators, and
 /// functions whose code sets [`CallSignature::heap_locals`](super::bytecode::CallSignature).
 /// Otherwise the frame keeps its local slots on the shared locals stack from `locals_base`
-/// and `scope` is where free-name lookup continues, the function's closure. The main program
-/// owns neither and falls through to the global table.
+/// and `scope` is where free-name lookup continues, the function's closure. `globals` is the
+/// scope of the module the code belongs to, the root of the `scope` chain, kept here so a
+/// global lookup does not walk the chain.
 struct BytecodeFrame {
     code: CodeRef,
     instruction_pointer: usize,
-    /// The code's slot in the VM's inline-cache table, valid while this frame holds `code`.
-    code_cache: u32,
     /// Handled exceptions below this depth belong to enclosing frames. Leaving the frame by any
     /// route truncates the exception stack here, so a `return` inside an `except` body or an
     /// exception escaping a handler cannot leave its handled exception behind.
@@ -969,16 +994,43 @@ struct BytecodeFrame {
     /// First slot owned by this frame in the VM's shared locals stack, when its locals live
     /// there rather than in `scope`.
     locals_base: Option<u32>,
-    scope: Option<Ref>,
+    scope: Ref,
+    globals: Ref,
     /// The function this frame runs, for tracebacks and zero-argument `super()`; `None` for
     /// module, class and dynamic code.
     callee: Option<Ref>,
     /// Whether `scope` is the frame's own rather than its closure.
     own_scope: bool,
-    /// Whether a call entered this frame from the frame below, which resumes when it returns.
-    /// Other frames are run synchronously by Rust code and return to it instead.
-    called: bool,
+    /// Who resumes when this frame returns or yields.
+    kind: FrameKind,
     class_body: bool,
+}
+
+/// How a frame hands back control. See [`BytecodeFrame::kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameKind {
+    /// Rust code runs the frame with [`Vm::run_frame`] and takes its result.
+    Entry,
+    /// A Python call entered the frame from the frame below, which resumes with the returned
+    /// value.
+    Call,
+    /// A generator's frame. Its generator object sits on the operand stack just below the
+    /// frame's operands; when the frame yields it saves its state into that object, and when
+    /// it returns or raises it marks the generator finished. Either way `Consumer` resumes.
+    Generator(Consumer),
+}
+
+/// What resumes when a generator frame yields or finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Consumer {
+    /// Rust code that resumed the generator (`next`, `send`, `throw`, or a native iterating
+    /// it) takes the result from [`Vm::run_frame`].
+    Rust,
+    /// The frame below, whose instruction just before its instruction pointer resumed the
+    /// generator. After a `ForIterator`, a yielded value goes to the loop body and finishing
+    /// leaves the loop. After a `YieldFromSend`, that frame yields a yielded value on to its own
+    /// consumer, and finishing completes the `yield from` with the returned value.
+    Frame,
 }
 
 impl Clone for BytecodeFrame {
@@ -986,16 +1038,16 @@ impl Clone for BytecodeFrame {
         Self {
             code: self.code.clone(),
             instruction_pointer: self.instruction_pointer,
-            code_cache: self.code_cache,
             exception_base: self.exception_base,
             stack_base: self.stack_base,
             handler_base: self.handler_base,
             context_base: self.context_base,
             locals_base: self.locals_base,
-            scope: self.scope.as_ref().map(Ref::dup),
+            scope: self.scope.dup(),
+            globals: self.globals.dup(),
             callee: self.callee.as_ref().map(Ref::dup),
             own_scope: self.own_scope,
-            called: self.called,
+            kind: self.kind,
             class_body: self.class_body,
         }
     }
@@ -1004,7 +1056,7 @@ impl Clone for BytecodeFrame {
 impl BytecodeFrame {
     /// The frame's own heap scope, when its names live in one.
     fn active_scope(&self) -> Option<&Ref> {
-        self.own_scope.then_some(self.scope.as_ref()).flatten()
+        self.own_scope.then_some(&self.scope)
     }
 
     fn stack_base(&self) -> usize {
@@ -1017,39 +1069,29 @@ impl BytecodeFrame {
 }
 
 /// A stack depth recorded in a frame.
-fn frame_index(depth: usize) -> Result<u32, String> {
+fn frame_index(depth: usize) -> PyResult<u32> {
     u32::try_from(depth).map_err(|_| "VM stack depth exceeds the frame index range".into())
 }
 
 /// The scopes and local slots a new frame starts with. See [`BytecodeFrame`].
-struct FrameEntry<'v> {
-    scope: Option<Value<'v>>,
+struct FrameEntry {
+    scope: Value,
+    globals: Value,
     own_scope: bool,
     /// Base of the frame's already-bound local slots on the VM's locals stack, for a frame
     /// that keeps them there rather than in `scope`.
     locals_base: Option<usize>,
-    callee: Option<Value<'v>>,
+    callee: Option<Value>,
     class_body: bool,
 }
 
-impl FrameEntry<'_> {
-    /// A frame for code that binds no locals of its own and resolves every name globally: the
-    /// main program.
-    fn bare() -> Self {
-        Self {
-            scope: None,
-            own_scope: false,
-            locals_base: None,
-            callee: None,
-            class_body: false,
-        }
-    }
-
-    /// A frame whose names all live in `scope`: module bodies, generators, and functions with
-    /// heap-resident locals.
-    fn scoped(scope: Value<'_>) -> FrameEntry<'_> {
+impl FrameEntry {
+    /// A module body, the main script's included: its names are the module's globals, which
+    /// live in `scope`.
+    fn module(scope: Value) -> FrameEntry {
         FrameEntry {
-            scope: Some(scope),
+            scope,
+            globals: scope,
             own_scope: true,
             locals_base: None,
             callee: None,
@@ -1059,22 +1101,25 @@ impl FrameEntry<'_> {
 
     /// A class body: its own scope, whose bindings become the class namespace, and which
     /// functions defined inside skip when they close over names.
-    fn class_body(scope: Value<'_>) -> FrameEntry<'_> {
+    fn class_body(scope: Value, globals: Value) -> FrameEntry {
         FrameEntry {
+            globals,
             class_body: true,
-            ..Self::scoped(scope)
+            ..Self::module(scope)
         }
     }
 
     /// A function whose local slots are already bound on the locals stack from `locals_base`
     /// and whose free names resolve through `closure`.
-    fn with_locals<'v>(
-        function: Value<'v>,
-        closure: Option<Value<'v>>,
+    fn with_locals(
+        function: Value,
+        closure: Value,
+        globals: Value,
         locals_base: usize,
-    ) -> FrameEntry<'v> {
+    ) -> FrameEntry {
         FrameEntry {
             scope: closure,
+            globals,
             own_scope: false,
             locals_base: Some(locals_base),
             callee: Some(function),
@@ -1083,17 +1128,19 @@ impl FrameEntry<'_> {
     }
 
     /// A function whose locals live in `scope`, a heap scope of its own.
-    fn function<'v>(function: Value<'v>, scope: Value<'v>) -> FrameEntry<'v> {
+    fn function(function: Value, scope: Value, globals: Value) -> FrameEntry {
         FrameEntry {
+            globals,
             callee: Some(function),
-            ..Self::scoped(scope)
+            ..Self::module(scope)
         }
     }
 
     /// `exec`/`eval` code: no names of its own, free names resolved through `enclosing`.
-    fn dynamic(enclosing: Option<Value<'_>>) -> FrameEntry<'_> {
+    fn dynamic(enclosing: Value, globals: Value) -> FrameEntry {
         FrameEntry {
             scope: enclosing,
+            globals,
             own_scope: false,
             locals_base: None,
             callee: None,
@@ -1120,7 +1167,6 @@ enum LocalsLocation {
 /// pointer after every opcode.
 struct DispatchCursor {
     code: CodeRef,
-    code_cache: usize,
     op_index: usize,
     locals: LocalsLocation,
 }
@@ -1129,9 +1175,9 @@ struct DispatchCursor {
 /// the dispatch loop returns.
 ///
 /// A value a call or an arm produces is left on the operand stack, which roots it, so no
-/// variant carries a handle. `Return` and `Yield` carry stored references because they cross
-/// the handle scope of the frame that produced them; the receiver re-roots them with
-/// `Vm::handle` before anything can allocate. `Blocked` reports a wait whose reason, and the
+/// variant carries a value. `Return` and `Yield` carry stored references because they cross
+/// the pin scope of the frame that produced them; the receiver pins them again with
+/// `Vm::value` before anything can allocate. `Blocked` reports a wait whose reason, and the
 /// native call to retry, sit in [`VmState::suspension`].
 #[derive(Debug)]
 enum Flow {
@@ -1142,8 +1188,8 @@ enum Flow {
     Refresh,
     /// The active frame returned this value.
     Return(Ref),
-    /// A generator frame yielded this value; its instruction pointer is already advanced to
-    /// the resumption point.
+    /// A generator frame run for Rust code yielded this value and saved itself into its
+    /// generator.
     Yield(Ref),
     /// The code object ran off its end: a module, class body or the main program finished.
     Halt,
@@ -1172,12 +1218,12 @@ impl Clone for Suspension {
 }
 
 /// Result of classifying one heap iterator at its mutation boundary.
-enum IteratorAdvance<'s> {
-    Yield(Value<'s>),
+enum IteratorAdvance {
+    Yield(Value),
     Exhausted,
     Callable {
-        callable: Value<'s>,
-        sentinel: Value<'s>,
+        callable: Value,
+        sentinel: Value,
     },
     Generator,
     /// An object of a class that defines `__next__`, advanced by calling it.
@@ -1187,23 +1233,26 @@ enum IteratorAdvance<'s> {
 }
 
 /// Outcome of one `ForIterator` opcode: advance and jump into the loop body, fall through past
-/// it, or suspend the whole process because the iterator's next value isn't available yet.
+/// it, enter a generator's frame that produces the next value, or suspend the whole process
+/// because the iterator's next value isn't available yet.
 pub(super) enum ForIterOutcome {
     Yielded,
     Exhausted,
+    /// A generator frame is now active; its consumer frame resumes when it yields or finishes.
+    Entered,
     Blocked(crate::scheduler::WaitReason),
 }
 
-enum BuiltinSubscript<'s> {
-    Value(Value<'s>),
-    Mapping { factory: Option<Value<'s>> },
+enum BuiltinSubscript {
+    Value(Value),
+    Mapping { factory: Option<Value> },
     Set,
     Unsupported,
 }
 
 /// What [`Vm::iterable_values`] read from a heap object before it starts running guest code.
-enum MaterializeSource<'s> {
-    Values(Vec<Value<'s>>),
+enum MaterializeSource {
+    Values(Vec<Value>),
     Range(i64, i64, i64),
     StoredIterator,
     Callable,
@@ -1213,55 +1262,54 @@ enum MaterializeSource<'s> {
 }
 
 /// Distinct set members in first-seen order with their hashes, from [`Vm::distinct_members`].
-/// Hashing and comparison run guest code that can allocate, so members stay handles until
-/// [`Self::into_set`] stores them inside an allocation or mutation builder.
-pub(super) struct HashedMembers<'s>(Vec<(KeyHash, Value<'s>)>);
+/// Hashing and comparison run guest code that can allocate, so members stay pinned values until
+/// [`Self::into_set`] turns them into stored references for the set that holds them.
+pub(super) struct HashedMembers(Vec<(KeyHash, Value)>);
 
-impl HashedMembers<'_> {
+impl HashedMembers {
     pub(super) fn len(&self) -> usize {
         self.0.len()
     }
 
-    pub(super) fn into_set(self, builder: &Builder<'_>) -> OrderedSet {
+    pub(super) fn into_set(self) -> OrderedSet {
         let mut set = OrderedSet::default();
         for (hash, member) in self.0 {
-            set.push(hash, builder.store(member));
+            set.push(hash, Ref::from(member));
         }
         set
     }
 }
 
 /// Deduplicated dict entries in first-seen key order with their key hashes, from
-/// [`Vm::ordered_map`]; [`Self::into_map`] stores them inside a builder.
-pub(super) struct HashedEntries<'s>(Vec<(KeyHash, Value<'s>, Value<'s>)>);
+/// [`Vm::ordered_map`]; [`Self::into_map`] turns them into stored references.
+pub(super) struct HashedEntries(Vec<(KeyHash, Value, Value)>);
 
-impl HashedEntries<'_> {
+impl HashedEntries {
     pub(super) fn len(&self) -> usize {
         self.0.len()
     }
 
-    pub(super) fn into_map(self, builder: &Builder<'_>) -> OrderedMap {
+    pub(super) fn into_map(self) -> OrderedMap {
         let mut map = OrderedMap::default();
         for (hash, key, value) in self.0 {
-            map.push(hash, (builder.store(key), builder.store(value)));
+            map.push(hash, (Ref::from(key), Ref::from(value)));
         }
         map
     }
 }
 
 #[inline(always)]
-fn dispatch_next(result: Result<(), String>) -> Result<Flow, String> {
+fn dispatch_next(result: PyResult<()>) -> PyResult<Flow> {
     result.map(|()| Flow::Next)
 }
 
 impl DispatchCursor {
-    fn for_active(vm: &mut Vm<'_>) -> Result<Self, String> {
+    fn for_active(vm: &mut Vm<'_>) -> PyResult<Self> {
         let frame = vm
             .bytecode_frames
             .last()
             .expect("bytecode execution requires an active frame");
         let code = frame.code.clone();
-        let code_cache = frame.code_cache as usize;
         let op_index = frame.instruction_pointer;
         let locals = match (frame.locals_base(), frame.own_scope) {
             (Some(base), _) => LocalsLocation::Stack(base),
@@ -1270,13 +1318,12 @@ impl DispatchCursor {
         };
         Ok(Self {
             code,
-            code_cache,
             op_index,
             locals,
         })
     }
 
-    fn refresh(&mut self, vm: &mut Vm<'_>) -> Result<(), String> {
+    fn refresh(&mut self, vm: &mut Vm<'_>) -> PyResult<()> {
         *self = Self::for_active(vm)?;
         Ok(())
     }
@@ -1296,9 +1343,9 @@ impl DispatchCursor {
                 .iter()
                 .map(|f| {
                     format!(
-                        "(code={:p} called={} ip={})",
+                        "(code={:p} kind={:?} ip={})",
                         Arc::as_ptr(&f.code),
-                        f.called,
+                        f.kind,
                         f.instruction_pointer
                     )
                 })
@@ -1374,7 +1421,7 @@ struct StoredCallArgs {
 }
 
 impl StoredCallArgs {
-    fn store(vm: &Vm<'_>, arguments: &CallArgs<'_>) -> Self {
+    fn store(vm: &Vm<'_>, arguments: &CallArgs) -> Self {
         Self {
             positional: arguments
                 .positional()
@@ -1389,21 +1436,21 @@ impl StoredCallArgs {
         }
     }
 
-    fn load<'s>(&self, vm: &Vm<'s>) -> CallArgs<'s> {
+    fn load(&self, vm: &Vm<'_>) -> CallArgs {
         CallArgs::new(
-            vm.handles(&self.positional),
+            vm.values(&self.positional),
             self.keywords
                 .iter()
-                .map(|(name, value)| (name.clone(), vm.handle(value)))
+                .map(|(name, value)| (name.clone(), vm.value(value)))
                 .collect(),
         )
     }
 
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
-        for slot in &mut self.positional {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for slot in &self.positional {
             visitor(slot);
         }
-        for (_, slot) in &mut self.keywords {
+        for (_, slot) in &self.keywords {
             visitor(slot);
         }
     }
@@ -1456,8 +1503,7 @@ impl<'s> Vm<'s> {
         out: Out<'s>,
         err: Out<'s>,
     ) -> Self {
-        let handle_base = state.heap.handle_count();
-        let transient_base = execution.transient_memory;
+        let pin_base = state.heap.pin_count();
         Self {
             interp,
             argv: input.argv,
@@ -1467,19 +1513,8 @@ impl<'s> Vm<'s> {
             mode,
             out,
             err,
-            handle_base,
-            transient_base,
+            pin_base,
         }
-    }
-
-    /// Release the host scratch reserved since this scope opened.
-    fn release_transient_memory(&mut self) {
-        let bytes = self.transient_memory.saturating_sub(self.transient_base);
-        if bytes == 0 {
-            return;
-        }
-        self.transient_memory = self.transient_base;
-        self.interp.resources.release_memory(bytes);
     }
 
     fn release_retained_memory(&mut self) {
@@ -1488,22 +1523,14 @@ impl<'s> Vm<'s> {
     }
 
     /// Give back part of the retained reservation, for caches dropped before the run ends.
-    fn release_retained_memory_bytes(&mut self, bytes: usize) {
-        let bytes = u64::try_from(bytes)
-            .unwrap_or(u64::MAX)
-            .min(self.retained_memory);
-        self.retained_memory -= bytes;
-        self.interp.resources.release_memory(bytes);
-    }
-
-    fn reserve_retained_memory(&mut self, bytes: usize) -> Result<(), String> {
+    fn reserve_retained_memory(&mut self, bytes: usize) -> PyResult<()> {
         let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
         let next = self
             .retained_memory
             .checked_add(bytes)
             .ok_or("modeled Python memory overflow")?;
         if !self.interp.resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.retained_memory = next;
         Ok(())
@@ -1511,7 +1538,7 @@ impl<'s> Vm<'s> {
 
     fn render_execution(
         &mut self,
-        execution: Result<Flow, (String, super::source::Span)>,
+        execution: Result<Flow, (PyError, super::source::Span)>,
     ) -> ExecResult {
         match execution {
             Ok(Flow::Halt | Flow::Return(_) | Flow::Yield(_)) => ExecResult::Continue,
@@ -1519,18 +1546,29 @@ impl<'s> Vm<'s> {
             Ok(flow) => unreachable!("a completed program cannot end with {flow:?}"),
             Err((error, span)) => {
                 if let Some(reason) = self.interp.resources.stop_reason() {
-                    ExecResult::Exit(reason.exit_status())
-                } else if self
-                    .pending_exception
-                    .as_ref()
-                    .is_some_and(|exception| exception.kind == "SystemExit")
-                {
-                    let exception = self
-                        .pending_exception
-                        .as_ref()
-                        .expect("SystemExit exception checked above");
-                    let value = self.handle(&exception.value);
-                    let rendered = protocol::display(self.state, value)
+                    return ExecResult::Exit(reason.exit_status());
+                }
+                // An error that reached the top without unwinding a frame may not be raised yet.
+                let error = self.raise_error(error);
+                if let Some(PyErrorKind::Exit(status)) = error.kind() {
+                    return ExecResult::Exit(*status);
+                }
+                let exception = match &self.pending_exception {
+                    Some(exception) if error.is_pending() => self.value(exception),
+                    _ => {
+                        let fault = if error.is_pending() {
+                            "exception unwound without a pending exception"
+                        } else {
+                            error.message()
+                        };
+                        return ExecResult::Unsupported(format!(
+                            "{fault} at line {}, column {}",
+                            span.line, span.column
+                        ));
+                    }
+                };
+                if self.pending_exception_is("SystemExit") {
+                    let rendered = protocol::display(self.state, exception)
                         .unwrap_or_else(|_| "SystemExit".to_string());
                     let status = rendered.parse::<i32>().unwrap_or_else(|_| {
                         self.err.extend_from_slice(rendered.as_bytes());
@@ -1538,13 +1576,8 @@ impl<'s> Vm<'s> {
                         1
                     });
                     ExecResult::Exit(status)
-                } else if let Some(exception) = self.pending_exception.clone() {
-                    ExecResult::Exit(self.render_uncaught_exception(&exception, span))
                 } else {
-                    ExecResult::Unsupported(format!(
-                        "{} at line {}, column {}",
-                        error, span.line, span.column
-                    ))
+                    ExecResult::Exit(self.render_uncaught_exception(exception, span))
                 }
             }
         }
@@ -1553,11 +1586,14 @@ impl<'s> Vm<'s> {
     /// Report an uncaught, genuine Python exception the way CPython does: a traceback on stderr
     /// and exit status 1. This is distinct from [`super::unsupported`], which stays reserved for
     /// syntax, modules, or builtins shellsim does not model at all.
-    fn render_uncaught_exception(&mut self, exception: &RaisedException, fallback: Span) -> i32 {
+    fn render_uncaught_exception(&mut self, value: Value, fallback: Span) -> i32 {
         // `protocol::display` renders a message-less builtin exception as its type name (to match
         // `print(exc)` elsewhere), which would duplicate the type name we print explicitly below.
         // Read the raw message instead so an empty `ValueError()` prints as bare `ValueError`.
-        let value = self.handle(&exception.value);
+        let kind = exception_types::exception_type_name(self.state, value)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "BaseException".into());
         let message = match protocol::exception_parts(self.state, value) {
             Ok(Some((_, message))) => message,
             _ => protocol::display(self.state, value).unwrap_or_else(|_| String::new()),
@@ -1578,20 +1614,27 @@ impl<'s> Vm<'s> {
             );
         }
         for frame in &frames {
+            let name = match &frame.function {
+                Some(function) => self.function_name(function),
+                None => "<module>".to_string(),
+            };
+            let file = frame
+                .module
+                .as_ref()
+                .and_then(|module| self.module_file(module));
             self.err.extend_from_slice(
                 format!(
-                    "  File \"{}\", line {}, in {}\n",
-                    frame.file.as_deref().unwrap_or(&filename),
+                    "  File \"{}\", line {}, in {name}\n",
+                    file.as_deref().unwrap_or(&filename),
                     frame.span.line,
-                    frame.name
                 )
                 .as_bytes(),
             );
         }
         let summary = if message.is_empty() {
-            format!("{}\n", exception.kind)
+            format!("{kind}\n")
         } else {
-            format!("{}: {message}\n", exception.kind)
+            format!("{kind}: {message}\n")
         };
         self.err.extend_from_slice(summary.as_bytes());
         1
@@ -1608,11 +1651,11 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn allocate_object(&mut self, object: Object) -> Result<Value<'s>, String> {
+    fn allocate_object(&mut self, object: Object) -> PyResult<Value> {
         self.alloc(object)
     }
 
-    fn allocate_string(&mut self, value: String) -> Result<Value<'s>, String> {
+    fn allocate_string(&mut self, value: String) -> PyResult<Value> {
         if let Some(value) = Value::inline_string(&value) {
             Ok(value)
         } else {
@@ -1620,80 +1663,86 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn allocate_bytes(&mut self, value: Vec<u8>) -> Result<Value<'s>, String> {
+    fn allocate_bytes(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_object(Object::Bytes(value))
     }
 
-    fn allocate_bytearray(&mut self, value: Vec<u8>) -> Result<Value<'s>, String> {
+    fn allocate_bytearray(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_object(Object::ByteArray(value))
     }
 
     /// A builtin exception whose only argument is `message`, or with no arguments when the
     /// message is empty, as the VM and native code raise them.
-    fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value<'s>, String> {
+    fn allocate_exception(&mut self, kind: &str, message: String) -> PyResult<Value> {
         let args = if message.is_empty() {
             Vec::new()
         } else {
             vec![self.allocate_string(message)?]
         };
-        self.allocate_exception_object(&kind, args)
+        self.allocate_exception_object(kind, args)
     }
 
     /// An instance of the builtin exception class `kind` with the constructor arguments `args`.
     /// The object header carries the class's type id, so `type()`, `isinstance` and slot
     /// lookups read it directly.
-    fn allocate_exception_object(
-        &mut self,
-        kind: &str,
-        args: Vec<Value<'s>>,
-    ) -> Result<Value<'s>, String> {
+    fn allocate_exception_object(&mut self, kind: &str, args: Vec<Value>) -> PyResult<Value> {
         let type_id = self
             .state
             .types
             .exception_type_id(kind)
             .ok_or_else(|| format!("exception type {kind:?} is not registered"))?;
-        self.alloc_with_typed(type_id, |builder| Object::Exception(builder.refs(args)))
+        self.allocate_typed(type_id, Object::Exception(Ref::all(args)))
+    }
+
+    /// Make the exception object `exception` the pending exception and return the marker that
+    /// unwinds to its handler.
+    fn raise_value(&mut self, exception: Value) -> PyError {
+        self.pending_exception = Some(Ref::from(exception));
+        PyError::pending()
     }
 
     /// Raise a builtin exception with the constructor arguments `args`.
-    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value<'s>>) -> String {
-        let value = match self.allocate_exception_object(kind, args) {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
-        let message = protocol::exception_parts(self.state, value)
-            .ok()
-            .flatten()
-            .map(|(_, message)| message)
-            .unwrap_or_default();
-        self.pending_exception = Some(RaisedException {
-            kind: kind.to_string(),
-            value: self.store(value),
-        });
-        message
-    }
-
-    /// Raise a builtin Python exception from VM code and return the error string that carries
-    /// it. The pending exception makes the error catchable by `except`; uncaught, it prints a
-    /// CPython traceback rather than an unsupported-feature report.
-    fn raise_exception(&mut self, kind: &'static str, message: impl Into<String>) -> String {
-        self.record_native_error(PyError::exception(kind, message))
-    }
-
-    /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
-    fn raise_object_type_error(&mut self, value: &Value<'s>, complaint: &str) -> String {
-        match self.type_name_of(value) {
-            Ok(name) => self.raise_exception("TypeError", format!("'{name}' object {complaint}")),
+    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> PyError {
+        match self.allocate_exception_object(kind, args) {
+            Ok(value) => self.raise_value(value),
             Err(error) => error,
         }
     }
 
+    /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
+    fn raise_object_type_error(&self, value: &Value, complaint: &str) -> PyError {
+        match self.type_name_of(value) {
+            Ok(name) => PyError::exception("TypeError", format!("'{name}' object {complaint}")),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether the exception object `exception` is an instance of the builtin exception class
+    /// `kind` or a subclass of it, as `except kind:` would decide.
+    fn exception_is(&self, exception: Value, kind: &str) -> PyResult<bool> {
+        let expected = self
+            .state
+            .types
+            .exception_type_id(kind)
+            .ok_or_else(|| format!("exception type {kind:?} is not registered"))?;
+        self.state
+            .types
+            .is_subclass(self.type_id(&exception)?, expected)
+    }
+
+    /// Whether the pending exception is an instance of the builtin exception class `kind`.
+    fn pending_exception_is(&self, kind: &str) -> bool {
+        self.pending_exception.as_ref().is_some_and(|exception| {
+            matches!(self.exception_is(self.value(exception), kind), Ok(true))
+        })
+    }
+
     /// The type name CPython prints in error messages, such as `int` or a user class name.
-    fn type_name_of(&self, value: &Value<'s>) -> Result<String, String> {
+    fn type_name_of(&self, value: &Value) -> PyResult<String> {
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
     }
 
-    fn value_from_constant(&mut self, value: &Constant) -> Result<Value<'s>, String> {
+    fn value_from_constant(&mut self, value: &Constant) -> PyResult<Value> {
         Ok(match value {
             Constant::None => Value::None,
             Constant::Ellipsis => Value::Native(NativeValue::Ellipsis),
@@ -1701,27 +1750,25 @@ impl<'s> Vm<'s> {
             Constant::Integer(value) => Value::Int(*value),
             Constant::BigInteger(value) => {
                 self.charge_cpu(u64::try_from(value.len()).unwrap_or(u64::MAX))?;
-                self.reserve_result(value.len().saturating_mul(2))?;
+                self.reserve_scratch(value.len().saturating_mul(2))?;
                 let value = value
                     .parse::<BigInt>()
                     .map_err(|_| "invalid arbitrary-precision integer literal")?;
                 self.allocate_object(Object::BigInt(value))?
             }
             Constant::Float(value) => Value::Float(*value),
-            Constant::Imaginary(value) => {
-                number::create_complex(self, 0.0, *value).map_err(|error| error.to_string())?
-            }
+            Constant::Imaginary(value) => number::create_complex(self, 0.0, *value)?,
             Constant::String(value) => self.allocate_string(value.clone())?,
             Constant::Bytes(value) => self.allocate_bytes(value.clone())?,
         })
     }
 
-    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value<'s>>, String> {
+    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> PyResult<Vec<Value>> {
         let count = range_length(start, stop, step)?;
         let start = i128::from(start);
         let step = i128::from(step);
         let bytes = count.checked_mul(24).ok_or("range result is too large")?;
-        self.reserve_result(bytes)?;
+        self.reserve_scratch(bytes)?;
         if !self
             .interp
             .resources
@@ -1740,14 +1787,14 @@ impl<'s> Vm<'s> {
         Ok(values)
     }
 
-    /// Every item of an iterable, as handles.
+    /// Every item of an iterable, as pinned values.
     ///
     /// Builtin containers, strings, bytes, ranges and the runtime's own iterators are copied
     /// natively, charging each item through `push_materialized`. Anything whose items come from
     /// Python code (generators, classes with `__iter__`, `iter(callable, sentinel)`) is drained by
     /// a bytecode loop in the frozen `_iteration` module instead, so the items accumulate in a
     /// metered heap list rather than in a host vector no accounting can see while guest frames run.
-    fn iterable_values(&mut self, value: &Value<'s>) -> Result<Vec<Value<'s>>, String> {
+    fn iterable_values(&mut self, value: &Value) -> PyResult<Vec<Value>> {
         if self.is_unbounded_iterator(value)? {
             return Err("cannot materialize infinite itertools.count without a bound".into());
         }
@@ -1767,13 +1814,13 @@ impl<'s> Vm<'s> {
         } else if value.is_object() {
             let source = match self.get(*value)? {
                 Object::List(values) | Object::Tuple(values) => {
-                    MaterializeSource::Values(self.handles(values))
+                    MaterializeSource::Values(self.values(values))
                 }
                 Object::Set(values) | Object::FrozenSet(values) => {
-                    MaterializeSource::Values(self.handles(values.iter()))
+                    MaterializeSource::Values(self.values(values.iter()))
                 }
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                    MaterializeSource::Values(self.handles(entries.iter().map(|(key, _)| key)))
+                    MaterializeSource::Values(self.values(entries.iter().map(|(key, _)| key)))
                 }
                 Object::Range { start, stop, step } => {
                     MaterializeSource::Range(*start, *stop, *step)
@@ -1790,7 +1837,7 @@ impl<'s> Vm<'s> {
                 Object::CallableIterator { .. } => MaterializeSource::Callable,
                 Object::Generator { .. } => MaterializeSource::Generator,
                 Object::Class(class_object) if !class_object.enum_members.is_empty() => {
-                    MaterializeSource::Values(self.handles(&class_object.enum_members))
+                    MaterializeSource::Values(self.values(&class_object.enum_members))
                 }
                 _ if self.instance_class(*value)?.is_some() => MaterializeSource::Instance,
                 _ => MaterializeSource::NotIterable,
@@ -1836,7 +1883,7 @@ impl<'s> Vm<'s> {
     /// Whether `value` iterates through an `__iter__` slot rather than one of the builtin kinds
     /// `iterable_values` copies natively. Native value kinds such as dict views count, since their
     /// `__iter__` is the only way to reach their items.
-    fn has_python_iter(&self, value: &Value<'s>) -> Result<bool, String> {
+    fn has_python_iter(&self, value: &Value) -> PyResult<bool> {
         if !value.is_object() {
             return Ok(false);
         }
@@ -1878,33 +1925,28 @@ impl<'s> Vm<'s> {
     /// Drain `iterable` with the frozen `_iteration.materialize` loop and return its items. The
     /// helper runs as ordinary bytecode: each item is one instruction, and the list it builds is
     /// charged by the heap as it grows.
-    fn materialize_through_bytecode(
-        &mut self,
-        iterable: Value<'s>,
-    ) -> Result<Vec<Value<'s>>, String> {
+    fn materialize_through_bytecode(&mut self, iterable: Value) -> PyResult<Vec<Value>> {
         const MODULE: &str = "_iteration";
         let module = match self.loaded_module(MODULE) {
             Some(module) => module,
-            None => <Self as PyRuntime>::import_module(self, MODULE)
-                .map_err(|error| error.to_string())?,
+            None => <Self as PyRuntime>::import_module(self, MODULE)?,
         };
         let scope = self.module_scope(MODULE, module)?;
         let helper = self
-            .scope_get(scope, "materialize")?
+            .scope_get_name(scope, "materialize")?
             .ok_or("frozen _iteration module lacks materialize")?;
         let items = <Self as PyRuntime>::call_value(
             self,
             helper,
             CallArgs::new(vec![iterable], Vec::new()),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let Object::List(items) = self.get(items)? else {
             return Err("_iteration.materialize did not return a list".into());
         };
-        Ok(self.handles(items))
+        Ok(self.values(items))
     }
 
-    fn is_unbounded_iterator(&self, value: &Value<'s>) -> Result<bool, String> {
+    fn is_unbounded_iterator(&self, value: &Value) -> PyResult<bool> {
         if !value.is_object() {
             return Ok(false);
         }
@@ -1915,30 +1957,16 @@ impl<'s> Vm<'s> {
     /// call `__getitem__(0)`, `__getitem__(1)`, ... until it raises `IndexError` or
     /// `StopIteration`. Any other exception propagates. Each item is metered, so a
     /// `__getitem__` that never raises exhausts the CPU budget instead of looping forever.
-    fn legacy_sequence_values(
-        &mut self,
-        value: &Value<'s>,
-        result: &mut Vec<Value<'s>>,
-    ) -> Result<(), String> {
+    fn legacy_sequence_values(&mut self, value: &Value, result: &mut Vec<Value>) -> PyResult<()> {
         let mut index: i64 = 0;
         loop {
             match self.invoke_slot(value, Slot::GetItem, "__getitem__", vec![Value::Int(index)]) {
                 Ok(Some(item)) => self.push_materialized(result, item)?,
                 Ok(None) => return Err("__getitem__ slot disappeared during iteration".into()),
                 Err(error) => {
-                    let Some(exception) = self.pending_exception.as_ref() else {
-                        return Err(error);
-                    };
-                    let exception_value = self.handle(&exception.value);
-                    let kind = exception_types::exception_base(self.state, exception_value)?
-                        .unwrap_or(exception.kind.as_str());
-                    if !exception_types::exception_is_subclass(kind, "IndexError")
-                        && !exception_types::exception_is_subclass(kind, "StopIteration")
-                    {
-                        return Err(error);
-                    }
-                    self.pending_exception = None;
-                    return Ok(());
+                    return self
+                        .catch(error, "IndexError")
+                        .or_else(|error| self.catch(error, "StopIteration"));
                 }
             }
             index = index
@@ -1947,17 +1975,13 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn push_materialized(
-        &mut self,
-        values: &mut Vec<Value<'s>>,
-        value: Value<'s>,
-    ) -> Result<(), String> {
+    fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> PyResult<()> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
         let payload = string::string_ref(&self.state.heap, value)?
             .map_or(0, |text| text.byte_len().saturating_mul(2));
-        self.reserve_result(64usize.saturating_add(payload))?;
+        self.reserve_scratch(64usize.saturating_add(payload))?;
         self.charge_cpu(1)?;
         values.push(value);
         Ok(())
@@ -1965,10 +1989,7 @@ impl<'s> Vm<'s> {
 
     /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
     /// keep them. Each candidate is hashed once and compared only with members of equal hash.
-    fn distinct_members(
-        &mut self,
-        candidates: Vec<Value<'s>>,
-    ) -> Result<HashedMembers<'s>, String> {
+    fn distinct_members(&mut self, candidates: Vec<Value>) -> PyResult<HashedMembers> {
         let mut members = Vec::new();
         let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for candidate in candidates {
@@ -1993,11 +2014,8 @@ impl<'s> Vm<'s> {
 
     /// Dict entries for `entries` in order. A repeated key keeps its first position and takes
     /// the last value, as a dict display does.
-    fn ordered_map(
-        &mut self,
-        entries: Vec<(Value<'s>, Value<'s>)>,
-    ) -> Result<HashedEntries<'s>, String> {
-        let mut map: Vec<(KeyHash, Value<'s>, Value<'s>)> = Vec::new();
+    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> PyResult<HashedEntries> {
+        let mut map: Vec<(KeyHash, Value, Value)> = Vec::new();
         let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for (key, value) in entries {
             let hash = self.hash_value(&key)?;
@@ -2022,17 +2040,13 @@ impl<'s> Vm<'s> {
     }
 
     /// Allocate a dict holding `entries`, deduplicated as [`Self::ordered_map`] does.
-    fn allocate_dict(&mut self, entries: Vec<(Value<'s>, Value<'s>)>) -> Result<Value<'s>, String> {
+    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> PyResult<Value> {
         let entries = self.ordered_map(entries)?;
-        self.alloc_with(|builder| Object::Dict(entries.into_map(builder)))
+        self.alloc(Object::Dict(entries.into_map()))
     }
 
     /// The position of the entry whose key equals `needle`.
-    fn find_mapping_entry(
-        &mut self,
-        mapping: Value<'s>,
-        needle: &Value<'s>,
-    ) -> Result<Option<usize>, String> {
+    fn find_mapping_entry(&mut self, mapping: Value, needle: &Value) -> PyResult<Option<usize>> {
         Ok(self.lookup_mapping_entry(mapping, needle)?.1)
     }
 
@@ -2041,9 +2055,9 @@ impl<'s> Vm<'s> {
     /// before it is compared.
     fn lookup_mapping_entry(
         &mut self,
-        mapping: Value<'s>,
-        needle: &Value<'s>,
-    ) -> Result<(KeyHash, Option<usize>), String> {
+        mapping: Value,
+        needle: &Value,
+    ) -> PyResult<(KeyHash, Option<usize>)> {
         let hash = self.hash_value(needle)?;
         let candidates = match self.get(mapping)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
@@ -2055,7 +2069,7 @@ impl<'s> Vm<'s> {
             self.charge_cpu(1)?;
             let candidate = match self.get(mapping)? {
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                    entries.get(position).map(|entry| self.handle(&entry.0))
+                    entries.get(position).map(|entry| self.value(&entry.0))
                 }
                 _ => return Err("dict handle changed object kind".into()),
             };
@@ -2070,11 +2084,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The position of the member equal to `needle`.
-    fn find_set_entry(
-        &mut self,
-        set: Value<'s>,
-        needle: &Value<'s>,
-    ) -> Result<Option<usize>, String> {
+    fn find_set_entry(&mut self, set: Value, needle: &Value) -> PyResult<Option<usize>> {
         Ok(self.lookup_set_entry(set, needle)?.1)
     }
 
@@ -2082,9 +2092,9 @@ impl<'s> Vm<'s> {
     /// because guest code may mutate the set during the comparison.
     fn lookup_set_entry(
         &mut self,
-        set: Value<'s>,
-        needle: &Value<'s>,
-    ) -> Result<(KeyHash, Option<usize>), String> {
+        set: Value,
+        needle: &Value,
+    ) -> PyResult<(KeyHash, Option<usize>)> {
         let hash = self.hash_value(needle)?;
         let candidates = match self.get(set)? {
             Object::Set(values) | Object::FrozenSet(values) => {
@@ -2095,7 +2105,7 @@ impl<'s> Vm<'s> {
         for position in candidates {
             let candidate = match self.get(set)? {
                 Object::Set(values) | Object::FrozenSet(values) => match values.get(position) {
-                    Some(value) => self.handle(value),
+                    Some(value) => self.value(value),
                     None => continue,
                 },
                 _ => return Err("set handle changed object kind".into()),
@@ -2109,7 +2119,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Result<Value<'s>, String> {
+    fn pop(&mut self) -> PyResult<Value> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -2119,14 +2129,14 @@ impl<'s> Vm<'s> {
             .ok_or_else(|| "invalid bytecode stack effect".into())
     }
 
-    fn take(&mut self, count: usize) -> Result<Vec<Value<'s>>, String> {
+    fn take(&mut self, count: usize) -> PyResult<Vec<Value>> {
         if self.frame_stack_len() < count {
             return Err("invalid bytecode stack effect".into());
         }
         self.pop_many(count)
     }
 
-    fn copy(&mut self, depth: usize) -> Result<(), String> {
+    fn copy(&mut self, depth: usize) -> PyResult<()> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
@@ -2135,7 +2145,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    fn jump_if_or_pop(&mut self, jump_when: bool) -> Result<bool, String> {
+    fn jump_if_or_pop(&mut self, jump_when: bool) -> PyResult<bool> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -2152,7 +2162,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn swap(&mut self, depth: usize) -> Result<(), String> {
+    fn swap(&mut self, depth: usize) -> PyResult<()> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode swap depth".into());
         }
@@ -2171,18 +2181,13 @@ impl<'s> Vm<'s> {
         self.stack.len().saturating_sub(stack_base)
     }
 
-    fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
-        let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
-        super::heap::charge_construction(bytes, &mut self.interp.resources)?;
-        let next = self
-            .transient_memory
-            .checked_add(bytes)
-            .ok_or("modeled Python memory overflow")?;
-        if !self.interp.resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
-        }
-        self.transient_memory = next;
-        Ok(())
+    /// Reserve host scratch until this scope's pins are released: see
+    /// [`Heap::reserve_scratch`](super::heap::Heap::reserve_scratch) for what needs it.
+    fn reserve_scratch(&mut self, bytes: usize) -> PyResult<()> {
+        let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
+        self.state
+            .heap
+            .reserve_scratch(bytes, &mut self.interp.resources)
     }
 
     /// Append at most the output budget's remaining bytes. Charging happens before touching the
@@ -2209,7 +2214,7 @@ impl<'s> Vm<'s> {
     /// Charge a unit of VM-native work and turn exhaustion into the same bounded failure used by
     /// bytecode instructions. Native loops must use this rather than relying on a later opcode;
     /// otherwise a large host-side operation could complete after the budget was exhausted.
-    fn charge_cpu(&mut self, units: u64) -> Result<(), String> {
+    fn charge_cpu(&mut self, units: u64) -> PyResult<()> {
         if self.interp.resources.charge_cpu(units) {
             Ok(())
         } else {
@@ -2232,16 +2237,17 @@ enum SequenceKind {
 
 /// Fully resolved inputs to the single class allocator shared by class statements and
 /// `type.__new__`.
-struct ClassDefinition<'s> {
+struct ClassDefinition {
     name: String,
-    bases: Vec<Value<'s>>,
-    mro: Vec<Value<'s>>,
-    metaclass: Value<'s>,
+    bases: Vec<Value>,
+    mro: Vec<Value>,
+    metaclass: Value,
     layout: ClassLayout,
     exception_base: Option<&'static str>,
-    attributes: HashMap<String, Value<'s>>,
-    dataclass_fields: Vec<(String, Option<Value<'s>>)>,
-    enum_members: Vec<(String, Value<'s>)>,
+    /// The class namespace in definition order, holding pinned values.
+    attributes: Namespace,
+    dataclass_fields: Vec<(String, Option<Value>)>,
+    enum_members: Vec<(SymbolId, Value)>,
 }
 
 fn select_string_slice(
@@ -2250,7 +2256,7 @@ fn select_string_slice(
     start: Option<i64>,
     stop: Option<i64>,
     step: Option<i64>,
-) -> Result<(String, u64), String> {
+) -> PyResult<(String, u64)> {
     debug_assert_eq!(value.is_ascii(), is_ascii);
     let characters = (!is_ascii).then(|| value.chars().collect::<Vec<_>>());
     let length = characters.as_ref().map_or(value.len(), Vec::len);
@@ -2275,7 +2281,7 @@ fn select_string_slice(
     Ok((selected, units))
 }
 
-fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
+fn range_length(start: i64, stop: i64, step: i64) -> PyResult<usize> {
     if step == 0 {
         return Err("range() arg 3 must not be zero".into());
     }
@@ -2292,14 +2298,15 @@ fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
     usize::try_from(count).map_err(|_| "range is too large".into())
 }
 
-fn expect_arity(arguments: &[Value<'_>], minimum: usize, maximum: usize) -> Result<(), String> {
+fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> PyResult<()> {
     if (minimum..=maximum).contains(&arguments.len()) {
         Ok(())
     } else {
         Err(format!(
             "expected {minimum}..={maximum} arguments, got {}",
             arguments.len()
-        ))
+        )
+        .into())
     }
 }
 
@@ -2315,10 +2322,10 @@ mod tests {
             std::mem::size_of::<Flow>(),
             std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
         );
-        assert!(std::mem::size_of::<Result<Flow, String>>() <= 32);
-        // Five words of indices, two optional references and three flags: pushed and popped
-        // by value on every call.
-        assert!(std::mem::size_of::<BytecodeFrame>() <= 80);
+        assert!(std::mem::size_of::<PyResult<Flow>>() <= 32);
+        // Five words of indices, three references (scope, globals and the optional callee), two
+        // flags and the frame kind: pushed and popped by value on every call.
+        assert!(std::mem::size_of::<BytecodeFrame>() <= 96);
     }
 
     #[test]

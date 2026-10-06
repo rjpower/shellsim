@@ -359,3 +359,62 @@ def test_stop_iteration_carries_a_generator_return_value_once():
         assert (stop.value, stop.args) == (None, ())
     assert StopIteration(5).value == 5 and StopIteration().value is None
     assert not hasattr(ValueError(1), "value")
+
+
+def test_builtins_that_absorb_an_exception_also_absorb_its_subclasses():
+    class Done(StopIteration):
+        pass
+
+    class Stops:
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            raise Done
+
+    assert next(Stops(), "default") == "default"
+    assert 1 not in Stops()
+    assert list(Stops()) == []
+
+    class Missing(AttributeError):
+        pass
+
+    class Lookups:
+        def __getattr__(self, name):
+            raise Missing(name)
+
+    assert getattr(Lookups(), "anything", "default") == "default"
+    assert not hasattr(Lookups(), "anything")
+
+
+def test_inconsistent_class_bases_raise_type_error():
+    class Base:
+        pass
+
+    class Derived(Base):
+        pass
+
+    assert raised(lambda: type("Mixed", (Base, Derived), {}))[0] is TypeError
+    assert raised(lambda: type("Twice", (Base, Base), {}))[0] is TypeError
+    try:
+
+        class Mixed(Base, Derived):
+            pass
+
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("class statement did not raise")
+
+
+def test_generator_misuse_raises_typed_errors():
+    def numbers():
+        yield 1
+
+    assert raised(lambda: numbers().send(5))[0] is TypeError
+
+    def reentrant():
+        yield next(running)
+
+    running = reentrant()
+    assert raised(lambda: next(running))[0] is ValueError

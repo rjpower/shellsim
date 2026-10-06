@@ -5,8 +5,11 @@
 //! cloning data-bearing operations or retaining borrows across runtime mutation.
 
 use super::ast::{BinaryOperator, ComparisonOperator, Constant, UnaryOperator};
+use super::error::{PyError, PyResult};
 use super::source::Span;
-use std::collections::HashMap;
+use super::symbols::{SymbolId, Symbols};
+use super::vm::CodeTable;
+use crate::resources::Resources;
 use std::sync::Arc;
 
 /// Shared immutable executable code.
@@ -33,7 +36,6 @@ macro_rules! side_table_id {
     };
 }
 
-side_table_id!(NameId);
 side_table_id!(ConstantId);
 side_table_id!(CallId);
 side_table_id!(FunctionId);
@@ -51,9 +53,10 @@ pub struct Code {
     pub call_signature: CallSignature,
     /// The leading string literal of the body, exposed as `__doc__`.
     pub docstring: Option<Arc<str>>,
-    /// Stable slot names for locals owned by this code object.
-    pub local_names: Arc<[String]>,
-    names: Box<[Arc<str>]>,
+    /// The name of each local slot this code object owns, by slot index.
+    pub local_names: Arc<[SymbolId]>,
+    /// This code's slot in its interpreter's [`CodeTable`], assigned when it is compiled.
+    pub cache_slot: u32,
     constants: Box<[Constant]>,
     calls: Box<[CallSpec]>,
     functions: Box<[FunctionSpec]>,
@@ -65,9 +68,8 @@ pub struct Code {
 }
 
 /// One keyword operand of a call: the parameter name, or `None` for a `**mapping` whose names
-/// arrive at run time. Names are shared with the code's name table so a call passes them to
-/// the binder without copying.
-pub type KeywordName = Option<Arc<str>>;
+/// arrive at run time. The binder matches it against parameter names by symbol.
+pub type KeywordName = Option<SymbolId>;
 
 /// Immutable argument-binding metadata for one code object.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -91,14 +93,6 @@ pub struct CallSignature {
 }
 
 impl Code {
-    pub fn name_count(&self) -> usize {
-        self.names.len()
-    }
-
-    pub fn name(&self, id: NameId) -> &str {
-        &self.names[id.index()]
-    }
-
     pub fn constant(&self, id: ConstantId) -> &Constant {
         &self.constants[id.index()]
     }
@@ -130,7 +124,7 @@ impl Code {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Parameter {
-    pub name: String,
+    pub name: SymbolId,
     pub has_default: bool,
     pub kind: ParameterKind,
 }
@@ -163,14 +157,14 @@ pub struct CallSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FunctionSpec {
-    pub name: NameId,
+    pub name: SymbolId,
     pub code: CodeRef,
     pub defaults: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClassSpec {
-    pub name: NameId,
+    pub name: SymbolId,
     pub code: CodeRef,
     pub bases: usize,
     pub has_metaclass: bool,
@@ -187,33 +181,33 @@ pub struct FormatSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Opcode {
     LoadConstant(ConstantId),
-    LoadName(NameId),
-    LoadGlobal(NameId),
-    StoreName(NameId),
+    LoadName(SymbolId),
+    LoadGlobal(SymbolId),
+    StoreName(SymbolId),
     LoadLocal(usize),
     StoreLocal(usize),
     StoreEnclosing {
-        name: NameId,
+        name: SymbolId,
         scope_hops: usize,
     },
-    StoreNonlocal(NameId),
-    StoreGlobal(NameId),
-    StoreAttribute(NameId),
+    StoreNonlocal(SymbolId),
+    StoreGlobal(SymbolId),
+    StoreAttribute(SymbolId),
     StoreSubscript,
-    DeleteAttribute(NameId),
-    DeleteName(NameId),
+    DeleteAttribute(SymbolId),
+    DeleteName(SymbolId),
     DeleteLocal(usize),
-    DeleteGlobal(NameId),
+    DeleteGlobal(SymbolId),
     DeleteSubscript,
     Import {
-        name: NameId,
+        name: SymbolId,
         bind_root: bool,
     },
     /// `from module import name`, with the module on top of the stack; it stays there.
-    ImportFrom(NameId),
+    ImportFrom(SymbolId),
     /// `from module import *`: pop the module and bind its public names in the current scope.
     ImportStar,
-    LoadAttribute(NameId),
+    LoadAttribute(SymbolId),
     LoadSubscript,
     BuildSlice {
         has_start: bool,
@@ -246,7 +240,7 @@ pub enum Opcode {
     Call(CallId),
     /// `obj.name` for an immediate call: pushes the callable and then the receiver when `name`
     /// is a plain method of `obj`'s type, else the bound attribute and a no-receiver marker.
-    LoadMethod(NameId),
+    LoadMethod(SymbolId),
     /// The call after `LoadMethod`. The spec counts the receiver slot as the first positional
     /// argument; a marker in that slot is removed before the call.
     CallMethod(CallId),
@@ -414,10 +408,68 @@ pub enum DisplayKind {
     Set,
 }
 
-#[derive(Default)]
-pub struct CodeBuilder {
-    names: Vec<Arc<str>>,
-    name_ids: HashMap<Arc<str>, NameId>,
+/// The interpreter tables that code is compiled into.
+///
+/// Every name the compiler emits becomes one of the interpreter's symbols, and every code
+/// object takes a slot in its [`CodeTable`], so compiled code is valid in that interpreter and
+/// in copies of its state, and nowhere else. Both tables charge their storage as it grows.
+pub struct Linker<'a> {
+    symbols: &'a mut Symbols,
+    codes: &'a mut CodeTable,
+    resources: &'a mut Resources,
+    /// The first charge that failed. The compiler finishes the program regardless and the
+    /// caller discards its code, so the compiler itself stays infallible.
+    error: Option<PyError>,
+}
+
+impl<'a> Linker<'a> {
+    pub fn new(
+        symbols: &'a mut Symbols,
+        codes: &'a mut CodeTable,
+        resources: &'a mut Resources,
+    ) -> Self {
+        Self {
+            symbols,
+            codes,
+            resources,
+            error: None,
+        }
+    }
+
+    /// The interpreter's symbol for `name`, interning it if it is new.
+    pub fn symbol(&mut self, name: &str) -> SymbolId {
+        match self.symbols.intern(name, self.resources) {
+            Ok(symbol) => symbol,
+            Err(error) => {
+                self.error.get_or_insert(error);
+                SymbolId::UNBOUND
+            }
+        }
+    }
+
+    /// Register a finished code object, giving it its cache slot.
+    fn register(&mut self, build: impl FnOnce(u32) -> Code) -> CodeRef {
+        match self.codes.reserve_slot(self.resources) {
+            Ok(slot) => {
+                let code = Arc::new(build(slot));
+                self.codes.install(slot, code.clone());
+                code
+            }
+            Err(error) => {
+                self.error.get_or_insert(error);
+                Arc::new(build(u32::MAX))
+            }
+        }
+    }
+
+    /// Whether every name and code object was charged; the compiled code is usable only then.
+    pub fn finish(self) -> PyResult<()> {
+        self.error.map_or(Ok(()), Err)
+    }
+}
+
+pub struct CodeBuilder<'l, 'a> {
+    link: &'l mut Linker<'a>,
     constants: Vec<Constant>,
     calls: Vec<CallSpec>,
     functions: Vec<FunctionSpec>,
@@ -427,22 +479,22 @@ pub struct CodeBuilder {
     errors: Vec<String>,
 }
 
-impl CodeBuilder {
-    /// The interned `Arc<str>` for `name`, shared with the name table.
-    fn shared_name(&mut self, name: String) -> Arc<str> {
-        let id = self.name(name);
-        self.names[id.index()].clone()
+impl<'l, 'a> CodeBuilder<'l, 'a> {
+    pub fn new(link: &'l mut Linker<'a>) -> Self {
+        Self {
+            link,
+            constants: Vec::new(),
+            calls: Vec::new(),
+            functions: Vec::new(),
+            classes: Vec::new(),
+            formats: Vec::new(),
+            unpack_flags: Vec::new(),
+            errors: Vec::new(),
+        }
     }
 
-    fn name(&mut self, name: String) -> NameId {
-        if let Some(id) = self.name_ids.get(name.as_str()) {
-            return *id;
-        }
-        let id = NameId::new(self.names.len());
-        let name: Arc<str> = name.into();
-        self.name_ids.insert(name.clone(), id);
-        self.names.push(name);
-        id
+    fn name(&mut self, name: String) -> SymbolId {
+        self.link.symbol(&name)
     }
 
     fn unpack_flags(&mut self, flags: Vec<bool>) -> UnpackId {
@@ -560,7 +612,7 @@ impl CodeBuilder {
             } => {
                 let keywords = keywords
                     .into_iter()
-                    .map(|keyword| keyword.map(|keyword| self.shared_name(keyword)))
+                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
                     .collect();
                 let id = CallId::new(self.calls.len());
                 self.calls.push(CallSpec {
@@ -578,7 +630,7 @@ impl CodeBuilder {
             } => {
                 let keywords = keywords
                     .into_iter()
-                    .map(|keyword| keyword.map(|keyword| self.shared_name(keyword)))
+                    .map(|keyword| keyword.map(|keyword| self.name(keyword)))
                     .collect();
                 let id = CallId::new(self.calls.len());
                 self.calls.push(CallSpec {
@@ -627,7 +679,7 @@ impl CodeBuilder {
         instructions: Vec<Instruction>,
         spans: Vec<Span>,
         parameters: Vec<Parameter>,
-        local_names: Vec<String>,
+        local_names: Vec<SymbolId>,
         is_coroutine: bool,
         docstring: Option<Arc<str>>,
     ) -> CodeRef {
@@ -674,21 +726,31 @@ impl CodeBuilder {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         };
-        Arc::new(Code {
+        let Self {
+            link,
+            constants,
+            calls,
+            functions,
+            classes,
+            formats,
+            unpack_flags,
+            errors,
+        } = self;
+        link.register(|cache_slot| Code {
             instructions: instructions.into_boxed_slice(),
             spans: spans.into_boxed_slice(),
             parameters: parameters.into_boxed_slice(),
             call_signature,
             docstring,
             local_names: local_names.into(),
-            names: self.names.into_boxed_slice(),
-            constants: self.constants.into_boxed_slice(),
-            calls: self.calls.into_boxed_slice(),
-            functions: self.functions.into_boxed_slice(),
-            classes: self.classes.into_boxed_slice(),
-            formats: self.formats.into_boxed_slice(),
-            unpack_flags: self.unpack_flags.into_boxed_slice(),
-            errors: self.errors.into_boxed_slice(),
+            cache_slot,
+            constants: constants.into_boxed_slice(),
+            calls: calls.into_boxed_slice(),
+            functions: functions.into_boxed_slice(),
+            classes: classes.into_boxed_slice(),
+            formats: formats.into_boxed_slice(),
+            unpack_flags: unpack_flags.into_boxed_slice(),
+            errors: errors.into_boxed_slice(),
         })
     }
 }

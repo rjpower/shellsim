@@ -3,8 +3,8 @@
 //! Arrays live in VM-owned storage ([`PyArrayBuffer`]); this module reads them only through
 //! the runtime's closure borrows, which cannot re-enter Python. Offsets and strides are always
 //! bytes. Object arrays store one heap reference per 8-byte slot, so `offset / 8` addresses
-//! them; read callbacks turn a reference into a handle through the lent `PyRefs`, and write
-//! callbacks store a handle through the lent `Builder`.
+//! them; read callbacks turn a reference into a value through the lent `PyRefs`, and write
+//! callbacks store a value's reference directly.
 //!
 //! Every function that allocates element storage reserves memory first and charges CPU in
 //! proportion to the elements it touches. Costs are deliberately coarse.
@@ -13,7 +13,7 @@ use super::super::super::native::{
     PyArray, PyArrayBuffer, PyArrayData, PyArrayDataMut, PyArrayDtype, PyArrayRef, PyArrayView,
     PyError, PyRefs, PyResult, PyRuntime, PyValue, PyValueCast,
 };
-use super::super::super::Value;
+use super::super::super::{Ref, Value};
 use super::dtype::{DType, Kind};
 
 /// Largest rank NumPy accepts.
@@ -24,26 +24,23 @@ const VALUE_SLOT_BYTES: usize = 24;
 
 /// A checked ndarray handle plus a snapshot of its view metadata.
 #[derive(Clone, Debug)]
-pub(in crate::python) struct Array<'s> {
-    pub handle: PyArray<'s>,
+pub(in crate::python) struct Array {
+    pub handle: PyArray,
     pub view: PyArrayView,
     pub dtype: DType,
 }
 
-impl<'s> Array<'s> {
+impl Array {
     /// Check that `value` is an ndarray and snapshot its metadata.
-    pub(in crate::python) fn from_value(
-        runtime: &dyn PyRuntime<'s>,
-        value: PyValue<'s>,
-    ) -> PyResult<'s, Self> {
-        let handle = value.cast::<PyArray<'s>>(runtime)?;
+    pub(in crate::python) fn from_value(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Self> {
+        let handle = value.cast::<PyArray>(runtime)?;
         Self::from_handle(runtime, handle)
     }
 
     pub(in crate::python) fn from_handle(
-        runtime: &dyn PyRuntime<'s>,
-        handle: PyArray<'s>,
-    ) -> PyResult<'s, Self> {
+        runtime: &dyn PyRuntime,
+        handle: PyArray,
+    ) -> PyResult<Self> {
         let view = runtime.array_view(handle)?;
         let dtype = DType::from_storage(view.dtype);
         Ok(Self {
@@ -54,7 +51,7 @@ impl<'s> Array<'s> {
     }
 
     /// The Python value for this array.
-    pub(in crate::python) fn value(&self) -> PyValue<'s> {
+    pub(in crate::python) fn value(&self) -> PyValue {
         self.handle.value()
     }
 
@@ -136,7 +133,7 @@ pub(in crate::python) fn element_offset(view: &PyArrayView, index: &[usize]) -> 
 }
 
 /// Element count of `shape`, checked against overflow and NumPy's rank limit.
-pub(in crate::python) fn element_count<'s>(shape: &[usize]) -> PyResult<'s, usize> {
+pub(in crate::python) fn element_count(shape: &[usize]) -> PyResult<usize> {
     if shape.len() > MAX_DIMS {
         return Err(PyError::value_error(format!(
             "maximum supported dimension for an ndarray is currently {MAX_DIMS}, found {}",
@@ -200,7 +197,7 @@ impl Iterator for Offsets {
 impl ExactSizeIterator for Offsets {}
 
 /// The broadcast shape of several operand shapes, or NumPy's error text.
-pub(in crate::python) fn broadcast_shapes<'s>(shapes: &[&[usize]]) -> PyResult<'s, Vec<usize>> {
+pub(in crate::python) fn broadcast_shapes(shapes: &[&[usize]]) -> PyResult<Vec<usize>> {
     let rank = shapes.iter().map(|shape| shape.len()).max().unwrap_or(0);
     let mut result = vec![1usize; rank];
     for shape in shapes {
@@ -224,10 +221,10 @@ pub(in crate::python) fn broadcast_shapes<'s>(shapes: &[&[usize]]) -> PyResult<'
 }
 
 /// Strides that read `view` as if it had `shape`, repeating broadcast axes with stride 0.
-pub(in crate::python) fn broadcast_strides<'s>(
+pub(in crate::python) fn broadcast_strides(
     view: &PyArrayView,
     shape: &[usize],
-) -> PyResult<'s, Vec<isize>> {
+) -> PyResult<Vec<isize>> {
     let extra = shape.len().checked_sub(view.shape.len()).ok_or_else(|| {
         PyError::value_error(format!(
             "could not broadcast input array from shape {} into shape {}",
@@ -267,11 +264,11 @@ pub(in crate::python) fn format_shape(shape: &[usize]) -> String {
 }
 
 /// Reserve memory for `count` elements of `dtype` before allocating them.
-pub(in crate::python) fn reserve_elements<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
+pub(in crate::python) fn reserve_elements(
+    runtime: &mut dyn PyRuntime,
     dtype: DType,
     count: usize,
-) -> PyResult<'s, usize> {
+) -> PyResult<usize> {
     let per_element = if dtype.kind() == Kind::Object {
         VALUE_SLOT_BYTES
     } else {
@@ -290,11 +287,11 @@ pub(in crate::python) fn reserve_elements<'s>(
 /// Allocate zero-filled storage for `count` elements, after reserving memory for it.
 ///
 /// Object storage is filled with `None`, as `np.empty(n, dtype=object)` is.
-pub(in crate::python) fn zeroed_buffer<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
+pub(in crate::python) fn zeroed_buffer(
+    runtime: &mut dyn PyRuntime,
     dtype: DType,
     count: usize,
-) -> PyResult<'s, PyArrayBuffer<'s>> {
+) -> PyResult<PyArrayBuffer> {
     let bytes = reserve_elements(runtime, dtype, count)?;
     runtime.charge_cpu(count as u64 / 8 + 1)?;
     Ok(if dtype.kind() == Kind::Object {
@@ -305,39 +302,39 @@ pub(in crate::python) fn zeroed_buffer<'s>(
 }
 
 /// Wrap owned storage, which holds the elements in C order, in a new C-contiguous array.
-pub(in crate::python) fn new_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    buffer: PyArrayBuffer<'s>,
+pub(in crate::python) fn new_array(
+    runtime: &mut dyn PyRuntime,
+    buffer: PyArrayBuffer,
     dtype: DType,
     shape: Vec<usize>,
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     let axes = (0..shape.len()).collect::<Vec<_>>();
     super::layout::new_array(runtime, buffer, dtype, shape, &axes)
 }
 
 /// Wrap owned storage in a new array whose elements sit at `strides`; see
 /// [`super::layout`] for building strides from a memory order.
-pub(in crate::python) fn new_array_with_strides<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    buffer: PyArrayBuffer<'s>,
+pub(in crate::python) fn new_array_with_strides(
+    runtime: &mut dyn PyRuntime,
+    buffer: PyArrayBuffer,
     dtype: DType,
     shape: Vec<usize>,
     strides: Vec<isize>,
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     element_count(&shape)?;
     let value = runtime.new_array(buffer, dtype.storage(), shape, strides)?;
     Array::from_value(runtime, value)
 }
 
 /// Create a view sharing `base`'s storage.
-pub(in crate::python) fn new_view<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    base: &Array<'s>,
+pub(in crate::python) fn new_view(
+    runtime: &mut dyn PyRuntime,
+    base: &Array,
     dtype: DType,
     shape: Vec<usize>,
     strides: Vec<isize>,
     offset: usize,
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     element_count(&shape)?;
     let view = PyArrayView {
         dtype: dtype.storage(),
@@ -351,12 +348,12 @@ pub(in crate::python) fn new_view<'s>(
 }
 
 /// Copy the elements at `offsets` of one borrowed array into `output`, which must have the
-/// same storage kind. Bytes are appended; object references become handles through `refs`.
-pub(in crate::python) fn gather_into<'s>(
-    refs: &dyn PyRefs<'s>,
+/// same storage kind. Bytes are appended; object references become values through `refs`.
+pub(in crate::python) fn gather_into(
+    refs: &dyn PyRefs,
     source: &PyArrayRef<'_>,
     offsets: impl Iterator<Item = usize>,
-    output: &mut PyArrayBuffer<'s>,
+    output: &mut PyArrayBuffer,
 ) {
     let itemsize = source.view.dtype.itemsize();
     match (&source.data, output) {
@@ -367,7 +364,7 @@ pub(in crate::python) fn gather_into<'s>(
         }
         (PyArrayData::Values(values), PyArrayBuffer::Values(output)) => {
             for offset in offsets {
-                output.push(refs.handle(&values[offset / PyArrayDtype::VALUE_ITEMSIZE]));
+                output.push(refs.value(&values[offset / PyArrayDtype::VALUE_ITEMSIZE]));
             }
         }
         _ => unreachable!("gather copies between storages of one element kind"),
@@ -375,7 +372,7 @@ pub(in crate::python) fn gather_into<'s>(
 }
 
 /// An empty buffer of the right storage kind with room for `count` elements.
-pub(in crate::python) fn buffer_with_capacity<'s>(dtype: DType, count: usize) -> PyArrayBuffer<'s> {
+pub(in crate::python) fn buffer_with_capacity(dtype: DType, count: usize) -> PyArrayBuffer {
     if dtype.kind() == Kind::Object {
         PyArrayBuffer::Values(Vec::with_capacity(count))
     } else {
@@ -384,10 +381,10 @@ pub(in crate::python) fn buffer_with_capacity<'s>(dtype: DType, count: usize) ->
 }
 
 /// Copy `array`'s elements, in C order, into new contiguous storage of the same dtype.
-pub(in crate::python) fn contiguous_buffer<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-) -> PyResult<'s, PyArrayBuffer<'s>> {
+pub(in crate::python) fn contiguous_buffer(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<PyArrayBuffer> {
     let count = array.size();
     reserve_elements(runtime, array.dtype, count)?;
     runtime.charge_cpu(count as u64 + 1)?;
@@ -400,19 +397,13 @@ pub(in crate::python) fn contiguous_buffer<'s>(
 }
 
 /// A C-contiguous copy of `array`.
-pub(in crate::python) fn copy_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-) -> PyResult<'s, Array<'s>> {
+pub(in crate::python) fn copy_array(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Array> {
     let buffer = contiguous_buffer(runtime, array)?;
     new_array(runtime, buffer, array.dtype, array.shape().to_vec())
 }
 
 /// `array` as one dimension in C order: a view when the layout allows, otherwise a copy.
-pub(in crate::python) fn ravel<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-) -> PyResult<'s, Array<'s>> {
+pub(in crate::python) fn ravel(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Array> {
     let size = array.size();
     if array.is_c_contiguous() {
         let stride = array.itemsize() as isize;
@@ -432,15 +423,15 @@ pub(in crate::python) fn ravel<'s>(
 /// Store `source`, a contiguous buffer of `destination.dtype` elements in C order, into the
 /// elements of `destination` at `offsets`. The source is fully materialized first, so aliasing
 /// between source and destination storage is harmless.
-pub(in crate::python) fn scatter<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    destination: &Array<'s>,
+pub(in crate::python) fn scatter(
+    runtime: &mut dyn PyRuntime,
+    destination: &Array,
     offsets: &[usize],
-    source: &PyArrayBuffer<'s>,
-) -> PyResult<'s, ()> {
+    source: &PyArrayBuffer,
+) -> PyResult<()> {
     runtime.charge_cpu(offsets.len() as u64 + 1)?;
     let itemsize = destination.itemsize();
-    runtime.write_array(destination.handle, &mut |builder, target| {
+    runtime.write_array(destination.handle, &mut |target| {
         match (target.data, source) {
             (PyArrayDataMut::Bytes(bytes), PyArrayBuffer::Bytes(source)) => {
                 for (index, offset) in offsets.iter().enumerate() {
@@ -450,7 +441,7 @@ pub(in crate::python) fn scatter<'s>(
             }
             (PyArrayDataMut::Values(values), PyArrayBuffer::Values(source)) => {
                 for (index, offset) in offsets.iter().enumerate() {
-                    values[*offset / PyArrayDtype::VALUE_ITEMSIZE] = builder.store(source[index]);
+                    values[*offset / PyArrayDtype::VALUE_ITEMSIZE] = Ref::from(source[index]);
                 }
             }
             _ => unreachable!("scatter copies between storages of one element kind"),
@@ -460,11 +451,11 @@ pub(in crate::python) fn scatter<'s>(
 }
 
 /// Store `source` into every element of `destination`, broadcasting `source`'s shape.
-pub(in crate::python) fn assign<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    destination: &Array<'s>,
-    source: &Array<'s>,
-) -> PyResult<'s, ()> {
+pub(in crate::python) fn assign(
+    runtime: &mut dyn PyRuntime,
+    destination: &Array,
+    source: &Array,
+) -> PyResult<()> {
     let buffer = broadcast_buffer(runtime, source, destination.dtype, destination.shape())?;
     let offsets = destination.offsets().collect::<Vec<_>>();
     scatter(runtime, destination, &offsets, &buffer)
@@ -494,12 +485,12 @@ pub(in crate::python) fn assignable(source: &[usize], target: &[usize]) -> bool 
 
 /// `source` cast to `dtype` and broadcast to `shape`, as a C-order buffer. Leading length-1
 /// axes beyond `shape`'s rank are dropped first, as NumPy does when assigning.
-pub(in crate::python) fn broadcast_buffer<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    source: &Array<'s>,
+pub(in crate::python) fn broadcast_buffer(
+    runtime: &mut dyn PyRuntime,
+    source: &Array,
     dtype: DType,
     shape: &[usize],
-) -> PyResult<'s, PyArrayBuffer<'s>> {
+) -> PyResult<PyArrayBuffer> {
     let mut source = if source.dtype == dtype {
         source.clone()
     } else {
@@ -522,10 +513,10 @@ pub(in crate::python) fn broadcast_buffer<'s>(
 }
 
 /// Read every element of a numeric array, in C order, as `T`.
-pub(in crate::python) fn read_elements<'s, T: super::element::Element>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-) -> PyResult<'s, Vec<T>> {
+pub(in crate::python) fn read_elements<T: super::element::Element>(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<Vec<T>> {
     debug_assert_eq!(T::SIZE, array.itemsize());
     let count = array.size();
     runtime.reserve_memory(count.saturating_mul(std::mem::size_of::<T>()))?;
@@ -544,10 +535,10 @@ pub(in crate::python) fn read_elements<'s, T: super::element::Element>(
 /// Snapshot the references of an object array in C order. Callers then run Python code per
 /// element without holding a storage borrow; later mutation of the array does not affect the
 /// snapshot, as in NumPy's buffered iteration.
-pub(in crate::python) fn read_objects<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-) -> PyResult<'s, Vec<PyValue<'s>>> {
+pub(in crate::python) fn read_objects(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+) -> PyResult<Vec<PyValue>> {
     let count = array.size();
     runtime.reserve_memory(count.saturating_mul(VALUE_SLOT_BYTES))?;
     runtime.charge_cpu(count as u64 + 1)?;
@@ -559,7 +550,7 @@ pub(in crate::python) fn read_objects<'s>(
         output.extend(
             array
                 .offsets()
-                .map(|offset| refs.handle(&values[offset / PyArrayDtype::VALUE_ITEMSIZE])),
+                .map(|offset| refs.value(&values[offset / PyArrayDtype::VALUE_ITEMSIZE])),
         );
         Ok(())
     })?;
@@ -577,12 +568,12 @@ pub(in crate::python) fn pack_elements<T: super::element::Element>(values: &[T])
 
 /// A new array from typed elements; memory must already be reserved by the caller's kernel
 /// or is reserved here.
-pub(in crate::python) fn array_from_elements<'s, T: super::element::Element>(
-    runtime: &mut dyn PyRuntime<'s>,
+pub(in crate::python) fn array_from_elements<T: super::element::Element>(
+    runtime: &mut dyn PyRuntime,
     dtype: DType,
     shape: Vec<usize>,
     values: &[T],
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     debug_assert_eq!(T::SIZE, dtype.itemsize());
     reserve_elements(runtime, dtype, values.len())?;
     new_array(
@@ -595,12 +586,12 @@ pub(in crate::python) fn array_from_elements<'s, T: super::element::Element>(
 
 /// A new Fortran-ordered array of `shape` holding `values` in column-major order, the layout a
 /// LAPACK-backed routine computes its result in.
-pub(in crate::python) fn fortran_array_from_elements<'s, T: super::element::Element>(
-    runtime: &mut dyn PyRuntime<'s>,
+pub(in crate::python) fn fortran_array_from_elements<T: super::element::Element>(
+    runtime: &mut dyn PyRuntime,
     dtype: DType,
     shape: Vec<usize>,
     values: &[T],
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     debug_assert_eq!(T::SIZE, dtype.itemsize());
     reserve_elements(runtime, dtype, values.len())?;
     let axes = (0..shape.len()).rev().collect::<Vec<_>>();
@@ -609,7 +600,7 @@ pub(in crate::python) fn fortran_array_from_elements<'s, T: super::element::Elem
 }
 
 /// Normalize a possibly negative axis for an array of rank `ndim`, with NumPy's `AxisError`.
-pub(in crate::python) fn normalize_axis<'s>(axis: i64, ndim: usize) -> PyResult<'s, usize> {
+pub(in crate::python) fn normalize_axis(axis: i64, ndim: usize) -> PyResult<usize> {
     let rank = ndim as i64;
     let normalized = if axis < 0 { axis + rank } else { axis };
     if (0..rank).contains(&normalized) {
@@ -644,7 +635,7 @@ mod tests {
         assert_eq!(broadcast_shapes(&[&[], &[2]]).unwrap(), [2]);
         let error = broadcast_shapes(&[&[3], &[4]]).unwrap_err();
         assert_eq!(
-            error.message,
+            error.message(),
             "operands could not be broadcast together with shapes (3,) (4,) "
         );
     }

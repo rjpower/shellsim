@@ -45,7 +45,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn native_chain<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_chain(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.reject_keywords("chain")?;
     let output = new_output_list(runtime)?;
     for iterable in args.positional() {
@@ -56,22 +56,18 @@ fn native_chain<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     runtime.new_iterator(output)
 }
 
-fn new_output_list<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s, PyList<'s>> {
+fn new_output_list(runtime: &mut dyn PyRuntime) -> PyResult<PyList> {
     runtime.new_list(Vec::new())?.cast::<PyList>(runtime)
 }
 
 /// Append the remaining items of `iterator` to `output`, charging each as a materialized element.
 ///
-/// Each step runs in its own handle scope so a long iterator does not accumulate temporary
-/// handles; the list keeps the collected items alive.
-fn drain_into<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    iterator: PyIterator<'s>,
-    output: PyList<'s>,
-) -> PyResult<'s, ()> {
+/// Each step runs in its own pin scope so a long iterator does not accumulate temporary
+/// pins; the list keeps the collected items alive.
+fn drain_into(runtime: &mut dyn PyRuntime, iterator: PyIterator, output: PyList) -> PyResult<()> {
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
@@ -83,7 +79,7 @@ fn drain_into<'s>(
     Ok(())
 }
 
-fn native_product<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_product(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.reject_unknown_keywords("product", &["repeat"])?;
     let repeat = args
         .keyword("product", "repeat")?
@@ -128,7 +124,7 @@ fn native_product<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     tuple_iterator(runtime, rows)
 }
 
-fn native_permutations<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_permutations(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("permutations", 1, 2)?;
     args.reject_keywords("permutations")?;
     let values = collect_iterable_bounded(runtime, args.positional()[0], 64)?;
@@ -155,14 +151,14 @@ fn native_permutations<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) 
     tuple_iterator(runtime, rows)
 }
 
-fn build_permutations<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    values: &[PyValue<'s>],
+fn build_permutations(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
     length: usize,
     used: &mut [bool],
-    row: &mut Vec<PyValue<'s>>,
-    output: &mut Vec<Vec<PyValue<'s>>>,
-) -> PyResult<'s, ()> {
+    row: &mut Vec<PyValue>,
+    output: &mut Vec<Vec<PyValue>>,
+) -> PyResult<()> {
     if row.len() == length {
         runtime.charge_cpu(1)?;
         output.push(row.clone());
@@ -181,7 +177,7 @@ fn build_permutations<'s>(
     Ok(())
 }
 
-fn native_combinations<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_combinations(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("combinations", 2, 2)?;
     args.reject_keywords("combinations")?;
     let values = collect_iterable_bounded(runtime, args.positional()[0], 64)?;
@@ -195,7 +191,7 @@ fn native_combinations<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) 
     tuple_iterator(runtime, rows)
 }
 
-fn combination_count<'s>(total: usize, selected: usize) -> PyResult<'s, usize> {
+fn combination_count(total: usize, selected: usize) -> PyResult<usize> {
     if selected > total {
         return Ok(0);
     }
@@ -210,14 +206,14 @@ fn combination_count<'s>(total: usize, selected: usize) -> PyResult<'s, usize> {
     Ok(result)
 }
 
-fn build_combinations<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    values: &[PyValue<'s>],
+fn build_combinations(
+    runtime: &mut dyn PyRuntime,
+    values: &[PyValue],
     length: usize,
     start: usize,
-    row: &mut Vec<PyValue<'s>>,
-    output: &mut Vec<Vec<PyValue<'s>>>,
-) -> PyResult<'s, ()> {
+    row: &mut Vec<PyValue>,
+    output: &mut Vec<Vec<PyValue>>,
+) -> PyResult<()> {
     if row.len() == length {
         runtime.charge_cpu(1)?;
         output.push(row.clone());
@@ -231,18 +227,18 @@ fn build_combinations<'s>(
     Ok(())
 }
 
-fn reserve_rows<'s>(runtime: &mut dyn PyRuntime<'s>, count: usize) -> PyResult<'s, ()> {
+fn reserve_rows(runtime: &mut dyn PyRuntime, count: usize) -> PyResult<()> {
     let bytes = count
         .checked_mul(64)
         .ok_or_else(|| PyError::resource_error("iterator result is too large"))?;
     runtime.reserve_memory(bytes)
 }
 
-fn collect_iterable_bounded<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    value: PyValue<'s>,
+fn collect_iterable_bounded(
+    runtime: &mut dyn PyRuntime,
+    value: PyValue,
     maximum: usize,
-) -> PyResult<'s, Vec<PyValue<'s>>> {
+) -> PyResult<Vec<PyValue>> {
     let iterator = runtime.iterator(value)?;
     let mut output = Vec::new();
     while let Some(value) = runtime.iterator_next(iterator)? {
@@ -256,21 +252,14 @@ fn collect_iterable_bounded<'s>(
     Ok(output)
 }
 
-fn optional_length<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
-    default: usize,
-) -> PyResult<'s, usize> {
+fn optional_length(runtime: &dyn PyRuntime, args: &CallArgs, default: usize) -> PyResult<usize> {
     args.positional().get(1).map_or(Ok(default), |value| {
         let value = (*value).cast::<PyIndex>(runtime)?.0;
         usize::try_from(value).map_err(|_| PyError::value_error("length cannot be negative"))
     })
 }
 
-fn tuple_iterator<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    rows: Vec<Vec<PyValue<'s>>>,
-) -> PyResult<'s> {
+fn tuple_iterator(runtime: &mut dyn PyRuntime, rows: Vec<Vec<PyValue>>) -> PyResult {
     let mut values = Vec::with_capacity(rows.len());
     for row in rows {
         values.push(runtime.new_tuple(row)?);
@@ -278,7 +267,7 @@ fn tuple_iterator<'s>(
     runtime.new_iterator(values)
 }
 
-fn native_count<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_count(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("count", 0, 2)?;
     args.reject_keywords("count")?;
     let start = args
@@ -298,12 +287,12 @@ fn native_count<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     runtime.new_count_iterator(start, step)
 }
 
-fn native_islice<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_islice(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("islice", 2, 4)?;
     args.reject_keywords("islice")?;
     let values = args.positional();
     let iterable = values[0];
-    let index = |value: &PyValue<'s>| (*value).cast::<PyIndex>(runtime).map(|value| value.0);
+    let index = |value: &PyValue| (*value).cast::<PyIndex>(runtime).map(|value| value.0);
     let (start, stop, step) = match values {
         [_, stop] => (0, index(stop)?, 1),
         [_, start, stop] => (index(start)?, index(stop)?, 1),
@@ -328,7 +317,7 @@ fn native_islice<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
     let output = new_output_list(runtime)?;
     for position in 0..stop {
         let mut exhausted = false;
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             runtime.charge_cpu(1)?;
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;

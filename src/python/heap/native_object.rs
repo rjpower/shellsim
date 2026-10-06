@@ -8,15 +8,15 @@
 //!
 //! The module that owns a payload type reaches it by downcasting through [`Object::native`]
 //! (`super::Object::native`), which fails for any other payload. Stored references inside a
-//! payload are [`Ref`]s like everywhere else: the owner creates them with the [`Builder`]
-//! (`super::Builder`) of the allocation or mutation that stores them, and the collector sees them
-//! through [`NativeObject::visit_refs`].
+//! payload are [`Ref`]s like everywhere else, and the collector sees them through
+//! [`NativeObject::visit_refs`].
 
 use std::any::Any;
 use std::fmt::Debug;
 
 use super::super::object_model::TypeId;
 use super::Ref;
+use crate::python::error::PyResult;
 
 /// Behaviour the heap needs from a module-owned payload.
 ///
@@ -30,10 +30,10 @@ pub trait NativeObject: Any + Debug + Send {
     /// The payload's modeled size in bytes, excluding the object header. Text counts its length
     /// and each stored reference counts `MODELED_VALUE_BYTES` (`super::MODELED_VALUE_BYTES`),
     /// like the heap's own payloads.
-    fn modeled_bytes(&self) -> Result<u64, String>;
+    fn modeled_bytes(&self) -> PyResult<u64>;
 
     /// Report every stored reference to the collector.
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
         let _ = visit;
     }
 
@@ -42,10 +42,7 @@ pub trait NativeObject: Any + Debug + Send {
 
     /// The builtin `repr()` text. `nested` renders a stored reference with the caller's cycle
     /// tracking.
-    fn repr(
-        &self,
-        nested: &mut dyn FnMut(&Ref) -> Result<String, String>,
-    ) -> Result<String, String>;
+    fn repr(&self, nested: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String>;
 
     /// A stored reference the object exposes as a read-only attribute, such as the fields of an
     /// `argparse.Namespace`. Types with no such attributes keep the default.

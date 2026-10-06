@@ -20,7 +20,7 @@ use super::super::index;
 /// size-1 array's) negative value reuses the "negative dimensions" message `reshape` and
 /// `empty` use, while a genuine per-position array both requires an exact length match (with a
 /// broadcast-shaped mismatch error) and has its own message for a negative entry.
-fn resolve_repeats<'s>(counts: Vec<i64>, n: usize) -> PyResult<'s, Vec<usize>> {
+fn resolve_repeats(counts: Vec<i64>, n: usize) -> PyResult<Vec<usize>> {
     if let [count] = counts[..] {
         if count < 0 {
             return Err(PyError::value_error("negative dimensions are not allowed"));
@@ -47,12 +47,12 @@ fn resolve_repeats<'s>(counts: Vec<i64>, n: usize) -> PyResult<'s, Vec<usize>> {
 /// the flattened array; otherwise the source position at `axis` index `i` becomes `repeats[i]`
 /// (or every position becomes the one scalar `repeats`) consecutive copies, keeping every other
 /// axis's order.
-fn repeat_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-    repeats: &PyValue<'s>,
-    axis: Option<PyValue<'s>>,
-) -> PyResult<'s, Array<'s>> {
+fn repeat_array(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
+    repeats: &PyValue,
+    axis: Option<PyValue>,
+) -> PyResult<Array> {
     let (source, axis) = match args::axis(runtime, axis, array.ndim())? {
         Some(axis) => (array.clone(), axis),
         None => (array::ravel(runtime, array)?, 0),
@@ -90,10 +90,7 @@ fn repeat_array<'s>(
     index::gather(runtime, &source, &offsets, shape)
 }
 
-pub(super) fn module_repeat<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(super) fn module_repeat(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("repeat", &["a", "repeats", "axis"], 2);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -101,11 +98,11 @@ pub(super) fn module_repeat<'s>(
     Ok(repeat_array(runtime, &array, &repeats, bound.value("axis"))?.value())
 }
 
-pub(super) fn method_repeat<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(super) fn method_repeat(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
+) -> PyResult {
     static SIGNATURE: Signature = Signature::new("repeat", &["repeats", "axis"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -122,15 +119,15 @@ mod tests {
         assert_eq!(resolve_repeats(vec![2], 3).unwrap(), [2, 2, 2]);
         assert_eq!(resolve_repeats(vec![1, 0, 2], 3).unwrap(), [1, 0, 2]);
         assert_eq!(
-            resolve_repeats(vec![-1], 3).unwrap_err().message,
+            resolve_repeats(vec![-1], 3).unwrap_err().message(),
             "negative dimensions are not allowed"
         );
         assert_eq!(
-            resolve_repeats(vec![1, -1, 2], 3).unwrap_err().message,
+            resolve_repeats(vec![1, -1, 2], 3).unwrap_err().message(),
             "repeats may not contain negative values."
         );
         assert_eq!(
-            resolve_repeats(vec![1, 2], 3).unwrap_err().message,
+            resolve_repeats(vec![1, 2], 3).unwrap_err().message(),
             "operands could not be broadcast together with shape (3,) (2,)"
         );
     }

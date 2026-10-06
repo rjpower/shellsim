@@ -10,6 +10,7 @@
 use super::super::super::heap::{NativeObject, Ref, MODELED_VALUE_BYTES};
 use super::super::super::native::PyArrayView;
 use super::super::super::object_model::{BuiltinType, TypeId};
+use crate::python::error::{PyError, PyResult};
 
 /// Flat element storage shared by one or more array views.
 #[derive(Debug)]
@@ -33,7 +34,7 @@ impl NativeObject for ArrayStorage {
         BuiltinType::Native.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         match self {
             Self::Bytes(bytes) => u64::try_from(bytes.len()).map_err(|_| overflow()),
             Self::Values(values) => u64::try_from(values.len())
@@ -43,7 +44,7 @@ impl NativeObject for ArrayStorage {
         }
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
         if let Self::Values(values) = self {
             for slot in values {
                 visit(slot);
@@ -58,7 +59,7 @@ impl NativeObject for ArrayStorage {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         Ok("<array storage>".into())
     }
 }
@@ -77,7 +78,7 @@ impl NativeObject for ArrayObject {
         BuiltinType::Array.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         let slots = self
             .view
             .shape
@@ -91,9 +92,9 @@ impl NativeObject for ArrayObject {
             .ok_or_else(overflow)
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
-        visit(&mut self.storage);
-        if let Some(base) = &mut self.base {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
+        visit(&self.storage);
+        if let Some(base) = &self.base {
             visit(base);
         }
     }
@@ -106,11 +107,11 @@ impl NativeObject for ArrayObject {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         Ok(format!("array(shape={:?})", self.view.shape))
     }
 }
 
-fn overflow() -> String {
+fn overflow() -> PyError {
     "modeled object size overflow".into()
 }

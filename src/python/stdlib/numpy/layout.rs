@@ -24,11 +24,11 @@ pub(super) enum Order {
 impl Order {
     /// Parse `order` as `PyArray_OrderConverter` does: one letter in either case, with a
     /// missing or `None` value leaving the caller's `default`.
-    pub(super) fn parse<'s>(
-        runtime: &mut dyn PyRuntime<'s>,
-        value: Option<PyValue<'s>>,
+    pub(super) fn parse(
+        runtime: &mut dyn PyRuntime,
+        value: Option<PyValue>,
         default: Order,
-    ) -> PyResult<'s, Order> {
+    ) -> PyResult<Order> {
         let Some(value) = value.filter(|value| !value.is_none()) else {
             return Ok(default);
         };
@@ -52,10 +52,10 @@ impl Order {
     }
 
     /// Parse the `order` of a constructor without a prototype, which permits only C and F.
-    pub(super) fn parse_new<'s>(
-        runtime: &mut dyn PyRuntime<'s>,
-        value: Option<PyValue<'s>>,
-    ) -> PyResult<'s, Order> {
+    pub(super) fn parse_new(
+        runtime: &mut dyn PyRuntime,
+        value: Option<PyValue>,
+    ) -> PyResult<Order> {
         match Order::parse(runtime, value, Order::C)? {
             Order::A | Order::K => Err(PyError::value_error("only 'C' or 'F' order is permitted")),
             order => Ok(order),
@@ -64,20 +64,20 @@ impl Order {
 }
 
 /// Whether `array` is Fortran-contiguous: C-contiguous with its axes reversed.
-pub(super) fn is_f_contiguous<'s>(array: &Array<'s>) -> bool {
+pub(super) fn is_f_contiguous(array: &Array) -> bool {
     let shape = array.shape().iter().rev().copied().collect::<Vec<_>>();
     let strides = array.strides().iter().rev().copied().collect::<Vec<_>>();
     array::is_c_contiguous(&shape, &strides, array.itemsize())
 }
 
 /// NumPy's `PyArray_ISFORTRAN`: Fortran-contiguous but not C-contiguous.
-pub(super) fn is_fortran<'s>(array: &Array<'s>) -> bool {
+pub(super) fn is_fortran(array: &Array) -> bool {
     is_f_contiguous(array) && !array.is_c_contiguous()
 }
 
 /// Whether `array` already has the layout `order` asks for, so a request that copies only
 /// when needed can return it unchanged (NumPy's `STRIDING_OK`).
-pub(super) fn satisfies<'s>(array: &Array<'s>, order: Order) -> bool {
+pub(super) fn satisfies(array: &Array, order: Order) -> bool {
     match order {
         Order::C => array.is_c_contiguous(),
         Order::F => is_f_contiguous(array),
@@ -97,7 +97,7 @@ pub(super) fn axes(order: Order, ndim: usize) -> Vec<usize> {
 /// `prototype`. `A` follows the prototype's Fortran order. `K` keeps a C- or Fortran-contiguous
 /// prototype's order and otherwise sorts its axes by decreasing absolute stride, ties in axis
 /// order; it means C order when the ranks differ.
-pub(super) fn axes_like<'s>(prototype: &Array<'s>, order: Order, ndim: usize) -> Vec<usize> {
+pub(super) fn axes_like(prototype: &Array, order: Order, ndim: usize) -> Vec<usize> {
     let order = match order {
         Order::A if is_fortran(prototype) => Order::F,
         Order::A => Order::C,
@@ -166,11 +166,11 @@ pub(super) fn iteration_axes(strides: &[Vec<isize>], shape: &[usize]) -> Vec<usi
 }
 
 /// `array` broadcast to `shape` and read in `axes` order; see [`reading_order`].
-pub(super) fn broadcast_reading_order<'s>(
-    array: &Array<'s>,
+pub(super) fn broadcast_reading_order(
+    array: &Array,
     shape: &[usize],
     axes: &[usize],
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     let mut broadcast = array.clone();
     broadcast.view.strides = array::broadcast_strides(&array.view, shape)?;
     broadcast.view.shape = shape.to_vec();
@@ -193,13 +193,13 @@ pub(super) fn strides(shape: &[usize], itemsize: usize, axes: &[usize]) -> Vec<i
 }
 
 /// Wrap `buffer`, which holds the elements in `axes` memory order, in a new array of `shape`.
-pub(super) fn new_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    buffer: PyArrayBuffer<'s>,
+pub(super) fn new_array(
+    runtime: &mut dyn PyRuntime,
+    buffer: PyArrayBuffer,
     dtype: DType,
     shape: Vec<usize>,
     axes: &[usize],
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     let strides = strides(&shape, dtype.itemsize(), axes);
     array::new_array_with_strides(runtime, buffer, dtype, shape, strides)
 }
@@ -207,7 +207,7 @@ pub(super) fn new_array<'s>(
 /// `array`'s storage read with its axes permuted to `axes`, so that gathering it in C order
 /// visits the elements in the memory order of a new array laid out in `axes`. The result
 /// shares `array`'s handle and serves only as a source to read from.
-pub(super) fn reading_order<'s>(array: &Array<'s>, axes: &[usize]) -> Array<'s> {
+pub(super) fn reading_order(array: &Array, axes: &[usize]) -> Array {
     let mut permuted = array.clone();
     permuted.view.shape = axes.iter().map(|axis| array.shape()[*axis]).collect();
     permuted.view.strides = axes.iter().map(|axis| array.strides()[*axis]).collect();
@@ -215,11 +215,7 @@ pub(super) fn reading_order<'s>(array: &Array<'s>, axes: &[usize]) -> Array<'s> 
 }
 
 /// A copy of `array` laid out in `axes` order.
-pub(super) fn copy<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-    axes: &[usize],
-) -> PyResult<'s, Array<'s>> {
+pub(super) fn copy(runtime: &mut dyn PyRuntime, array: &Array, axes: &[usize]) -> PyResult<Array> {
     let buffer = array::contiguous_buffer(runtime, &reading_order(array, axes))?;
     new_array(runtime, buffer, array.dtype, array.shape().to_vec(), axes)
 }

@@ -14,7 +14,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn native_reduce<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_reduce(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("reduce", 2, 3)?;
     args.reject_keywords("reduce")?;
     let function = args.positional()[0].cast::<PyCallable>(runtime)?;
@@ -25,12 +25,12 @@ fn native_reduce<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyR
             PyError::value_error("reduce() of empty sequence with no initial value")
         })?,
     };
-    // The accumulator lives in a one-element list so each step can run in its own handle scope;
-    // an unbounded iterator then holds a constant number of handles in this frame.
+    // The accumulator lives in a one-element list so each step can run in its own pin scope;
+    // an unbounded iterator then holds a constant number of pins in this frame.
     let accumulator = runtime.new_list(vec![initial])?.cast::<PyList>(runtime)?;
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             let Some(value) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
