@@ -514,7 +514,8 @@ impl VmProgram {
             if !vm.state.sync_type_memory(&mut vm.interp.resources) {
                 return VmPoll::Ready(ExecResult::Exit(137));
             }
-            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), false) else {
+            let Ok(frame) = vm.enter_frame(&self.code, 0, 0, FrameEntry::bare(), FrameKind::Entry)
+            else {
                 return VmPoll::Ready(ExecResult::Exit(137));
             };
             vm.bytecode_frames.push(frame);
@@ -640,9 +641,10 @@ struct VmState {
     suspension: Option<Box<Suspension>>,
     async_timer_deadlines: BTreeSet<u64>,
     native_suspend_allowed: bool,
-    /// Synchronous executions (imports, class bodies, generators, `exec`, and Python calls made
-    /// from native code) now running. Their callers cannot resume a suspended frame, so while
-    /// any is active, natives finish blocking operations instead of suspending.
+    /// Frames Rust code is running with [`Vm::run_frame`] (imports, class bodies, `exec`,
+    /// generators resumed by natives, and Python calls made from native code). Their callers
+    /// cannot resume a suspended frame, so while any is active, natives finish blocking
+    /// operations instead of suspending.
     synchronous_frames: usize,
     /// Exception objects being handled by `except` blocks, innermost last.
     exception_stack: Vec<Ref>,
@@ -974,10 +976,36 @@ struct BytecodeFrame {
     callee: Option<Ref>,
     /// Whether `scope` is the frame's own rather than its closure.
     own_scope: bool,
-    /// Whether a call entered this frame from the frame below, which resumes when it returns.
-    /// Other frames are run synchronously by Rust code and return to it instead.
-    called: bool,
+    /// Who resumes when this frame returns or yields.
+    kind: FrameKind,
     class_body: bool,
+}
+
+/// How a frame hands back control. See [`BytecodeFrame::kind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameKind {
+    /// Rust code runs the frame with [`Vm::run_frame`] and takes its result.
+    Entry,
+    /// A Python call entered the frame from the frame below, which resumes with the returned
+    /// value.
+    Call,
+    /// A generator's frame. Its generator object sits on the operand stack just below the
+    /// frame's operands; when the frame yields it saves its state into that object, and when
+    /// it returns or raises it marks the generator finished. Either way `Consumer` resumes.
+    Generator(Consumer),
+}
+
+/// What resumes when a generator frame yields or finishes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Consumer {
+    /// Rust code that resumed the generator (`next`, `send`, `throw`, or a native iterating
+    /// it) takes the result from [`Vm::run_frame`].
+    Rust,
+    /// The frame below, whose instruction just before its instruction pointer resumed the
+    /// generator. After a `ForIterator`, a yielded value goes to the loop body and finishing
+    /// leaves the loop. After a `YieldFromSend`, that frame yields a yielded value on to its own
+    /// consumer, and finishing completes the `yield from` with the returned value.
+    Frame,
 }
 
 impl Clone for BytecodeFrame {
@@ -994,7 +1022,7 @@ impl Clone for BytecodeFrame {
             scope: self.scope.as_ref().map(Ref::dup),
             callee: self.callee.as_ref().map(Ref::dup),
             own_scope: self.own_scope,
-            called: self.called,
+            kind: self.kind,
             class_body: self.class_body,
         }
     }
@@ -1137,8 +1165,8 @@ enum Flow {
     Refresh,
     /// The active frame returned this value.
     Return(Ref),
-    /// A generator frame yielded this value; its instruction pointer is already advanced to
-    /// the resumption point.
+    /// A generator frame run for Rust code yielded this value and saved itself into its
+    /// generator.
     Yield(Ref),
     /// The code object ran off its end: a module, class body or the main program finished.
     Halt,
@@ -1182,10 +1210,13 @@ enum IteratorAdvance {
 }
 
 /// Outcome of one `ForIterator` opcode: advance and jump into the loop body, fall through past
-/// it, or suspend the whole process because the iterator's next value isn't available yet.
+/// it, enter a generator's frame that produces the next value, or suspend the whole process
+/// because the iterator's next value isn't available yet.
 pub(super) enum ForIterOutcome {
     Yielded,
     Exhausted,
+    /// A generator frame is now active; its consumer frame resumes when it yields or finishes.
+    Entered,
     Blocked(crate::scheduler::WaitReason),
 }
 
@@ -1291,9 +1322,9 @@ impl DispatchCursor {
                 .iter()
                 .map(|f| {
                     format!(
-                        "(code={:p} called={} ip={})",
+                        "(code={:p} kind={:?} ip={})",
                         Arc::as_ptr(&f.code),
-                        f.called,
+                        f.kind,
                         f.instruction_pointer
                     )
                 })
@@ -2295,8 +2326,8 @@ mod tests {
             std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
         );
         assert!(std::mem::size_of::<PyResult<Flow>>() <= 32);
-        // Five words of indices, two optional references and three flags: pushed and popped
-        // by value on every call.
+        // Five words of indices, two optional references, two flags and the frame kind: pushed
+        // and popped by value on every call.
         assert!(std::mem::size_of::<BytecodeFrame>() <= 80);
     }
 

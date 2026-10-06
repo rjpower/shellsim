@@ -4,20 +4,12 @@ use super::super::heap::Ref;
 use super::super::scopes;
 use super::{
     dispatch_next, exception_types, frame_index, protocol, string, BytecodeFrame, CallId, CallMode,
-    CodeRef, DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, LocalsLocation,
-    NativeValue, Opcode, PendingNativeCall, SequenceKind, Suspension, TracebackFrame, Value, Vm,
-    VM_POLL_QUANTUM,
+    CodeRef, Consumer, DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, FrameKind,
+    LocalsLocation, NativeValue, Opcode, PendingNativeCall, SequenceKind, Suspension,
+    TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
 };
 use crate::python::error::PyError;
 use crate::python::error::PyResult;
-
-/// Where a frame that suspends at `yield` stops, which `try` regions it has open and which
-/// context managers it has entered, so a generator can resume from exactly that point.
-pub(super) struct ResumePoint {
-    pub(super) instruction_pointer: usize,
-    pub(super) handlers: Vec<(usize, usize, usize)>,
-    pub(super) contexts: Vec<Ref>,
-}
 
 impl<'s> Vm<'s> {
     /// Run `code` to completion in a new frame, synchronously.
@@ -26,67 +18,67 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         entry: FrameEntry,
     ) -> Result<Flow, (PyError, super::super::source::Span)> {
-        let mut resume = ResumePoint {
-            instruction_pointer: 0,
-            handlers: Vec::new(),
-            contexts: Vec::new(),
-        };
         let stack_base = self.stack.len();
-        self.execute_code_from(code, &mut resume, stack_base, entry)
+        let frame = self
+            .enter_frame(code, 0, stack_base, entry, FrameKind::Entry)
+            .map_err(|error| (error, super::super::source::Span::default()))?;
+        self.run_frame(frame)
     }
 
-    /// Run `code` from `resume` in a new frame, synchronously, as `execute_code` does for a
-    /// fresh start and generator resumption does from a suspension point. On return `resume`
-    /// holds where the frame stopped.
-    pub(super) fn execute_code_from(
+    /// Push `frame` and run the dispatch loop until it is gone, for Rust code that needs its
+    /// result. Calls it makes, and generators it advances, run on the same loop above it.
+    pub(super) fn run_frame(
         &mut self,
-        code: &CodeRef,
-        resume: &mut ResumePoint,
-        stack_base: usize,
-        entry: FrameEntry,
+        frame: BytecodeFrame,
     ) -> Result<Flow, (PyError, super::super::source::Span)> {
-        let frame = self
-            .enter_frame(code, resume.instruction_pointer, stack_base, entry, false)
-            .map_err(|error| (error, super::super::source::Span::default()))?;
-        self.handlers.append(&mut resume.handlers);
-        self.with_contexts.append(&mut resume.contexts);
         let depth = self.bytecode_frames.len();
         self.bytecode_frames.push(frame);
+        self.run_frames_above(depth)
+    }
+
+    /// Run the dispatch loop until the frame at `depth` returns, yields or raises, then pop
+    /// whatever is left above `depth`: an entry frame that finished, or, after a process exit,
+    /// every frame it called.
+    pub(super) fn run_frames_above(
+        &mut self,
+        depth: usize,
+    ) -> Result<Flow, (PyError, super::super::source::Span)> {
         self.synchronous_frames += 1;
         let result = loop {
             match self.execute_active_frame(VM_POLL_QUANTUM) {
                 Ok(Flow::Pending) => {}
+                // Rust code cannot resume a frame that suspends, so a wait here is a stop, as it
+                // is for a native call that would block.
+                Ok(Flow::Blocked) => {
+                    self.suspension = None;
+                    let span = self.active_span();
+                    let stop = PyError::unsupported("waiting for input inside a synchronous call");
+                    break Err((stop, span));
+                }
                 result => break result,
             }
         };
         self.synchronous_frames -= 1;
-        // A process exit leaves the frames this execution called installed above its own;
-        // they end with it.
-        self.bytecode_frames.truncate(depth + 1);
-        let frame = self
-            .bytecode_frames
-            .pop()
-            .expect("active bytecode frame must remain installed");
-        // A yielding frame leaves its operands and handled exceptions for the generator to
-        // save; everything else it owned is released here.
-        let yielded = matches!(result, Ok(Flow::Yield(_)));
-        resume.instruction_pointer = frame.instruction_pointer;
-        resume.handlers = self.handlers.split_off(frame.handler_base as usize);
-        resume.contexts = self.with_contexts.split_off(frame.context_base as usize);
-        self.leave_frame(&frame, yielded);
+        while self.bytecode_frames.len() > depth {
+            let frame = self
+                .bytecode_frames
+                .pop()
+                .expect("the length was checked above");
+            self.leave_frame(&frame);
+        }
         result
     }
 
     /// Build a frame for `code` whose shared-stack bases are the current depths: it owns the
     /// local slots above `entry.locals_base` and whatever the shared stacks gain while it
-    /// runs. `called` marks a frame a Python call entered, which returns to the frame below.
+    /// runs. `kind` says who resumes when it returns.
     pub(super) fn enter_frame(
         &mut self,
         code: &CodeRef,
         instruction_pointer: usize,
         stack_base: usize,
         entry: FrameEntry,
-        called: bool,
+        kind: FrameKind,
     ) -> PyResult<BytecodeFrame> {
         let code_cache = frame_index(self.ensure_code_cache(code)?)?;
         Ok(BytecodeFrame {
@@ -101,18 +93,15 @@ impl<'s> Vm<'s> {
             scope: entry.scope.map(|scope| self.store(scope)),
             callee: entry.callee.map(|callee| self.store(callee)),
             own_scope: entry.own_scope,
-            called,
+            kind,
             class_body: entry.class_body,
         })
     }
 
-    /// Release what a popped frame owned on the shared stacks. A yielding frame keeps its
-    /// operands and handled exceptions, which the generator saves.
-    fn leave_frame(&mut self, frame: &BytecodeFrame, yielded: bool) {
-        if !yielded {
-            self.stack.truncate(frame.stack_base());
-            self.exception_stack.truncate(frame.exception_base as usize);
-        }
+    /// Release what a popped frame owned on the shared stacks.
+    pub(super) fn leave_frame(&mut self, frame: &BytecodeFrame) {
+        self.stack.truncate(frame.stack_base());
+        self.exception_stack.truncate(frame.exception_base as usize);
         if let Some(base) = frame.locals_base() {
             self.locals.truncate(base);
         }
@@ -350,9 +339,10 @@ impl<'s> Vm<'s> {
                     ))
                 }
                 Opcode::GetIterator => dispatch_next(self.get_iterator()),
-                Opcode::ForIterator(target) => match self.for_iterator() {
+                Opcode::ForIterator(target) => match self.for_iterator(instruction_pointer) {
                     Ok(ForIterOutcome::Yielded) => Ok(Flow::Next),
                     Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
+                    Ok(ForIterOutcome::Entered) => Ok(Flow::Refresh),
                     Ok(ForIterOutcome::Blocked(reason)) => {
                         // The iterator is still on the stack, unconsumed; leaving the frame's
                         // instruction pointer at this same opcode makes the next quantum retry
@@ -420,32 +410,30 @@ impl<'s> Vm<'s> {
                         Ok(Flow::Next)
                     }
                 }
-                Opcode::Return => {
-                    let value = self.pop_ref().map_err(|error| (error, dispatch.span()))?;
-                    match self.finish_called_frame(value) {
-                        Ok(()) => Ok(Flow::Refresh),
-                        Err(value) => Ok(Flow::Return(value)),
-                    }
-                }
-                Opcode::Yield => {
-                    let value = self.pop_ref().map_err(|error| (error, dispatch.span()))?;
-                    self.active_frame_mut().instruction_pointer = instruction_pointer + 1;
-                    Ok(Flow::Yield(value))
-                }
-                Opcode::YieldFromSend(target) => match self.yield_from_send() {
-                    Ok(ForIterOutcome::Yielded) => {
-                        // Suspend at this instruction so the next `send` repeats the step.
-                        let value = self.pop().map_err(|error| (error, dispatch.span()))?;
-                        self.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(Flow::Yield(self.store(value)))
-                    }
-                    Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
-                    Ok(ForIterOutcome::Blocked(reason)) => {
-                        self.active_frame_mut().instruction_pointer = instruction_pointer;
-                        Ok(self.suspend(reason, None))
-                    }
+                Opcode::Return => match self.pop_ref() {
+                    Ok(value) => self.finish_frame(value, false),
                     Err(error) => Err(error),
                 },
+                Opcode::Yield => match self.pop_ref() {
+                    Ok(value) => self.yield_frame(value, instruction_pointer + 1),
+                    Err(error) => Err(error),
+                },
+                Opcode::YieldFromSend(target) => {
+                    match self.yield_from_send(instruction_pointer) {
+                        // Suspend at this instruction so the next `send` repeats the step.
+                        Ok(ForIterOutcome::Yielded) => match self.pop_ref() {
+                            Ok(value) => self.yield_frame(value, instruction_pointer),
+                            Err(error) => Err(error),
+                        },
+                        Ok(ForIterOutcome::Exhausted) => Ok(Flow::Jump(target)),
+                        Ok(ForIterOutcome::Entered) => Ok(Flow::Refresh),
+                        Ok(ForIterOutcome::Blocked(reason)) => {
+                            self.active_frame_mut().instruction_pointer = instruction_pointer;
+                            Ok(self.suspend(reason, None))
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 Opcode::AwaitResult => self.dispatch_await_result(),
                 Opcode::RuntimeError(error) => Err(code.error(error).to_owned().into()),
                 Opcode::Assert => self.dispatch_assert(),
@@ -481,10 +469,7 @@ impl<'s> Vm<'s> {
                 Opcode::AsyncWithExitException => self.dispatch_async_with_exit_exception(),
                 Opcode::AsyncWithFinishException => self.dispatch_async_with_finish_exception(),
                 Opcode::PopExpression => self.dispatch_pop_expression(),
-                Opcode::Halt => match self.finish_called_frame(Ref::from_immediate(Value::None)) {
-                    Ok(()) => Ok(Flow::Refresh),
-                    Err(_) => Ok(Flow::Halt),
-                },
+                Opcode::Halt => self.finish_frame(Ref::from_immediate(Value::None), true),
             };
             match result {
                 Ok(Flow::Next) => dispatch.op_index += 1,
@@ -935,17 +920,17 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
+    pub(super) fn active_frame_mut(&mut self) -> &mut BytecodeFrame {
         self.bytecode_frames
             .last_mut()
             .expect("bytecode execution requires an active frame")
     }
 
-    /// Raise `error` if it describes an exception, then unwind called frames until a `try`
-    /// handler takes the pending exception (`Ok(true)`) or a frame Rust code entered is reached,
-    /// which gets the error back. A fault is never handled; each frame it leaves adds its
-    /// location to the message.
-    fn propagate_error(
+    /// Raise `error` if it describes an exception, then unwind frames until a `try` handler
+    /// takes the pending exception (`Ok(true)`) or the error reaches Rust code: an entry frame,
+    /// or a generator frame Rust code resumed, which closes. A fault is never handled; each
+    /// frame it leaves adds its location to the message.
+    pub(super) fn propagate_error(
         &mut self,
         error: PyError,
         mut span: super::super::source::Span,
@@ -962,7 +947,11 @@ impl<'s> Vm<'s> {
                 return Ok(true);
             }
             let module = self.frame_module();
-            let Some(callee) = self.unwind_called_frame() else {
+            let unwound = match self.unwind_frame() {
+                Ok(unwound) => unwound,
+                Err(fault) => return Err((fault, span)),
+            };
+            let Some((callee, to_rust)) = unwound else {
                 frames.push(TracebackFrame {
                     function: None,
                     module,
@@ -985,8 +974,27 @@ impl<'s> Vm<'s> {
                 module,
                 span,
             });
+            if to_rust {
+                frames.reverse();
+                self.traceback_frames = frames;
+                return Err((error, span));
+            }
             span = self.call_site_span();
         }
+    }
+
+    /// The span of the instruction the active frame stopped at.
+    fn active_span(&self) -> super::super::source::Span {
+        let frame = self
+            .bytecode_frames
+            .last()
+            .expect("bytecode execution requires an active frame");
+        frame
+            .code
+            .spans
+            .get(frame.instruction_pointer)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// The span of the call the active frame is executing: its instruction pointer already
@@ -1003,16 +1011,99 @@ impl<'s> Vm<'s> {
             .unwrap_or_default()
     }
 
-    /// Return `value` from a called frame to its caller. `false` when the active frame was
-    /// entered synchronously by Rust code, which takes the value from the dispatch loop.
-    /// Pop the active frame when a call entered it and leave `value` on the caller's stack.
-    /// A frame Rust code entered stays in place and the value comes back for it to return.
-    fn finish_called_frame(&mut self, value: Ref) -> Result<(), Ref> {
-        if self.unwind_called_frame().is_none() {
-            return Err(value);
+    /// Finish the active frame with `value`, from `return` or, when `halted`, from running off
+    /// the end of its code. A called frame pops and leaves `value` on its caller's stack; a
+    /// generator's frame pops, finishes its generator and resumes its consumer; an entry frame
+    /// stays for [`Self::run_frame`] and the value goes back to it.
+    fn finish_frame(&mut self, value: Ref, halted: bool) -> PyResult<Flow> {
+        let kind = self
+            .bytecode_frames
+            .last()
+            .expect("bytecode execution requires an active frame")
+            .kind;
+        match kind {
+            FrameKind::Entry if halted => Ok(Flow::Halt),
+            FrameKind::Entry => Ok(Flow::Return(value)),
+            FrameKind::Call => {
+                self.pop_frame();
+                self.execution.stack.push_ref(&value);
+                Ok(Flow::Refresh)
+            }
+            FrameKind::Generator(consumer) => {
+                // Nothing below allocates before `value` is stored again.
+                self.close_generator_frame()?;
+                if consumer == Consumer::Rust {
+                    self.set_generator_return(&value)?;
+                    return Ok(Flow::Return(value));
+                }
+                // The generator leaves the consumer's stack; `yield from` evaluates to `value`.
+                self.execution.stack.pop_ref();
+                let target = match self.resuming_instruction()? {
+                    Opcode::ForIterator(exit) => exit,
+                    Opcode::YieldFromSend(finished) => {
+                        self.execution.stack.push_ref(&value);
+                        finished
+                    }
+                    _ => return Err("generator consumer is not iterating".into()),
+                };
+                self.active_frame_mut().instruction_pointer = target;
+                Ok(Flow::Refresh)
+            }
         }
-        self.execution.stack.push_ref(&value);
-        Ok(())
+    }
+
+    /// Suspend the active frame at `yield value`, to resume at instruction `resume`. A
+    /// generator's frame saves itself into its generator and hands `value` to its consumer: a
+    /// `for` loop's body, Rust code, or a delegating generator, which suspends at its
+    /// `yield from` and yields the value on in turn.
+    fn yield_frame(&mut self, value: Ref, resume: usize) -> PyResult<Flow> {
+        let mut resume = resume;
+        loop {
+            let frame = self.active_frame_mut();
+            frame.instruction_pointer = resume;
+            let FrameKind::Generator(consumer) = frame.kind else {
+                // Only a generator's code yields; Rust code running other code reports it.
+                return Ok(Flow::Yield(value));
+            };
+            // Nothing below allocates before `value` is stored again.
+            self.suspend_generator_frame()?;
+            if consumer == Consumer::Rust {
+                return Ok(Flow::Yield(value));
+            }
+            match self.resuming_instruction()? {
+                Opcode::ForIterator(_) => {
+                    self.execution.stack.push_ref(&value);
+                    return Ok(Flow::Refresh);
+                }
+                // The delegating frame suspends at its `YieldFromSend`.
+                Opcode::YieldFromSend(_) => {
+                    resume = self.active_frame_mut().instruction_pointer - 1;
+                }
+                _ => return Err("generator consumer is not iterating".into()),
+            }
+        }
+    }
+
+    /// The opcode with which the active frame resumed the generator frame just popped from
+    /// above it: the instruction before its instruction pointer.
+    fn resuming_instruction(&mut self) -> PyResult<Opcode> {
+        let frame = self.active_frame_mut();
+        frame
+            .instruction_pointer
+            .checked_sub(1)
+            .and_then(|site| frame.code.instructions.get(site))
+            .map(|instruction| instruction.opcode)
+            .ok_or_else(|| "generator consumer has no resuming instruction".into())
+    }
+
+    /// Pop the active frame and release what it owned on the shared stacks.
+    pub(super) fn pop_frame(&mut self) {
+        let frame = self
+            .bytecode_frames
+            .pop()
+            .expect("bytecode execution requires an active frame");
+        self.call_depth = self.call_depth.saturating_sub(1);
+        self.leave_frame(&frame);
     }
 
     /// The outermost scope of the active frame's code, recorded in a traceback frame so the
@@ -1031,19 +1122,31 @@ impl<'s> Vm<'s> {
         string::string_value(heap, file).ok().flatten()
     }
 
-    /// Pop the active frame when a call entered it, returning the function it ran; `None`
-    /// leaves a frame Rust code entered in place.
-    fn unwind_called_frame(&mut self) -> Option<Ref> {
-        if !self.bytecode_frames.last()?.called {
-            return None;
-        }
+    /// Pop the active frame as an exception leaves it, finishing a generator's frame for good.
+    /// Returns the function the frame ran and whether Rust code, rather than the frame below,
+    /// receives the exception next; `None` leaves an entry frame in place for
+    /// [`Self::run_frame`].
+    fn unwind_frame(&mut self) -> PyResult<Option<(Ref, bool)>> {
         let frame = self
             .bytecode_frames
-            .pop()
-            .expect("called frame was checked above");
-        self.call_depth = self.call_depth.saturating_sub(1);
-        self.leave_frame(&frame, false);
-        frame.callee
+            .last()
+            .expect("bytecode execution requires an active frame");
+        let to_rust = match frame.kind {
+            FrameKind::Entry => return Ok(None),
+            FrameKind::Call => false,
+            FrameKind::Generator(consumer) => consumer == Consumer::Rust,
+        };
+        let callee = frame
+            .callee
+            .as_ref()
+            .map(Ref::dup)
+            .ok_or("a called frame has no function")?;
+        if let FrameKind::Generator(_) = frame.kind {
+            self.close_generator_frame()?;
+        } else {
+            self.pop_frame();
+        }
+        Ok(Some((callee, to_rust)))
     }
 
     /// Close the active frame's innermost open `try` region.

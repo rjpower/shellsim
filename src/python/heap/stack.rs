@@ -102,9 +102,9 @@ impl ValueStack {
         self.values.swap(first, second);
     }
 
-    /// Append stored references, for restoring a generator's saved stack.
-    pub fn extend_refs<'a>(&mut self, slots: impl IntoIterator<Item = &'a Ref>) {
-        self.values.extend(slots.into_iter().map(Ref::dup));
+    /// Move stored references on top, for resuming a generator's saved operands.
+    pub fn extend_owned(&mut self, slots: Vec<Ref>) {
+        self.values.extend(slots);
     }
 }
 

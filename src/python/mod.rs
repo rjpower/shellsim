@@ -1497,7 +1497,8 @@ mod tests {
     }
 
     /// Collect before every allocation while running a program that exercises calls, classes,
-    /// generators, exceptions, sorting and containers. Any value Rust code holds without a pin
+    /// generators (delegation, `send`, `throw`, `close`, and exceptions leaving them),
+    /// exceptions, sorting and containers. Any value Rust code holds without a pin
     /// is freed at its first chance, so a missing pin shows up as a stale reference here.
     #[test]
     fn programs_survive_a_collection_at_every_allocation() {
@@ -1533,6 +1534,58 @@ except KeyError as error:
     caught = repr(error)
 merged = {**{"a": [1]}, **{"b": (2, "two")}}
 print(len(seen), seen[-1], points[:3], words[-3:], caught, merged)
+
+log = []
+
+def inner_steps():
+    received = yield "first"
+    try:
+        yield [received] * 2
+    finally:
+        log.append("inner closed")
+    return {"result": received}
+
+def delegate():
+    result = yield from inner_steps()
+    yield result
+
+steps = delegate()
+log.append(next(steps))
+log.append(steps.send("x"))
+log.append(next(steps))
+log.append(list(steps))
+
+def guarded():
+    while True:
+        try:
+            yield len(log)
+        except ValueError as error:
+            log.append(("caught", str(error)))
+
+guard = guarded()
+next(guard)
+log.append(guard.throw(ValueError("bad")))
+guard.close()
+
+def failing(limit):
+    for index in range(limit):
+        if index == 3:
+            raise KeyError("stop" + str(index))
+        yield [index]
+
+try:
+    for chunk in failing(10):
+        log.append(chunk)
+except KeyError as error:
+    log.append(repr(error))
+
+def depth(n):
+    if n:
+        yield from depth(n - 1)
+    yield n
+
+log.append(sum(depth(30)))
+print(log)
 "#;
         let expected = run(source);
         assert_eq!(expected.0, 0, "{}", expected.2);

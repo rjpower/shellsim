@@ -405,3 +405,16 @@ def test_inconsistent_class_bases_raise_type_error():
         pass
     else:
         raise AssertionError("class statement did not raise")
+
+
+def test_generator_misuse_raises_typed_errors():
+    def numbers():
+        yield 1
+
+    assert raised(lambda: numbers().send(5))[0] is TypeError
+
+    def reentrant():
+        yield next(running)
+
+    running = reentrant()
+    assert raised(lambda: next(running))[0] is ValueError

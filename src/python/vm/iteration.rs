@@ -1,23 +1,37 @@
 //! Iteration, generator suspension, and sequence unpacking.
 //!
-//! A suspended generator keeps its operand stack, exception stack and lexical scope as stored
-//! references inside its heap object. Resuming it moves the caller's operands aside as pinned
-//! values, installs the saved stack, and runs the frame in a child pin scope; suspending stores
-//! the frame's state back into the object before that scope ends.
+//! A suspended generator keeps its operands, open `try` regions, entered contexts and handled
+//! exceptions as stored references inside its heap object. Resuming it pushes its frame on the
+//! shared VM stacks above the generator object, as a call would, and moves that saved state on
+//! top; a `yield` moves it back. A `for` loop or `yield from` in Python code resumes a generator
+//! on the same dispatch loop, so no Rust frame sits between the generator and its consumer;
+//! natives, `next` and `send` run the frame with [`Vm::run_frames_above`].
 
 use super::super::heap::Ref;
 use super::{
-    dispatch::ResumePoint, exception_types, number, string, CallArgs, Flow, ForIterOutcome,
-    FrameEntry, IteratorAdvance, NativeValue, Object, Opcode, PyError, PyRuntime, PyStreamRead,
+    exception_types, number, string, CallArgs, Consumer, Flow, ForIterOutcome, FrameEntry,
+    FrameKind, IteratorAdvance, NativeValue, Object, Opcode, PyError, PyRuntime, PyStreamRead,
     Slot, SlotValue, Stream, Value, Vm,
 };
 use crate::python::error::{Control, PyResult};
 
-/// How a suspended generator resumes: with the value of its `yield` expression, or with an
-/// exception raised at that `yield`.
+/// How a suspended generator resumes: with the value of its `yield` expression, with an
+/// exception raised at that `yield`, or, after a thrown exception made the subiterator of its
+/// `yield from` return, with that `yield from` finished at instruction `finished`.
+#[derive(Clone, Copy)]
 enum GeneratorResume {
     Send(Value),
     Throw(Value),
+    SendFinished { value: Value, finished: usize },
+}
+
+/// What [`Vm::delegated_throw`] leaves to do after offering a thrown exception to the
+/// subiterator of a `yield from`.
+enum Delegated {
+    /// Resume the delegating generator this way.
+    Resume(GeneratorResume),
+    /// The subiterator yielded this value; the delegating generator stays suspended.
+    Yielded(Value),
 }
 
 /// What became of an exception thrown into a generator suspended in `yield from`, after
@@ -42,13 +56,6 @@ enum SlowPathAdvance {
     Reverse(usize),
     Callable,
     Stream(bool),
-}
-
-/// The end of one generator step, with any value re-rooted in the step's scope.
-enum GeneratorStep {
-    Yielded(Value, usize),
-    Returned(Value),
-    Finished,
 }
 
 impl<'s> Vm<'s> {
@@ -557,10 +564,14 @@ impl<'s> Vm<'s> {
     /// Advance the iterator kept at the top of the operand stack. The iterator remains below the
     /// yielded value until exhaustion, which gives `for` a small and explicit stack contract.
     ///
+    /// A generator is resumed on the dispatch loop: its frame becomes active with the loop's
+    /// frame, resuming after the `ForIterator` at `op_index`, as consumer
+    /// ([`ForIterOutcome::Entered`]).
+    ///
     /// A [`ForIterOutcome::Blocked`] result leaves the iterator on the stack untouched: retrying
     /// the same `ForIterator` opcode next quantum re-advances the same iterator object, which is
     /// safe because [`Vm::advance_stream_iterator`] only mutates position after a successful read.
-    pub(super) fn for_iterator(&mut self) -> PyResult<ForIterOutcome> {
+    pub(super) fn for_iterator(&mut self, op_index: usize) -> PyResult<ForIterOutcome> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -596,16 +607,14 @@ impl<'s> Vm<'s> {
                 self.push(value);
                 Ok(ForIterOutcome::Yielded)
             }
-            IteratorAdvance::Generator => match self.resume_generator(iterator)? {
-                Some(value) => {
-                    self.push(value);
-                    Ok(ForIterOutcome::Yielded)
+            IteratorAdvance::Generator => {
+                self.active_frame_mut().instruction_pointer = op_index + 1;
+                if self.enter_generator_frame(iterator, Value::None, Consumer::Frame)? {
+                    return Ok(ForIterOutcome::Entered);
                 }
-                None => {
-                    self.execution.stack.pop_ref();
-                    Ok(ForIterOutcome::Exhausted)
-                }
-            },
+                self.execution.stack.pop_ref();
+                Ok(ForIterOutcome::Exhausted)
+            }
             IteratorAdvance::Protocol => match self.next_until_stop(&iterator)? {
                 Some(value) => {
                     self.push(value);
@@ -628,8 +637,10 @@ impl<'s> Vm<'s> {
     /// `AttributeError`. [`ForIterOutcome::Yielded`] leaves the subiterator and its value on the
     /// stack; [`ForIterOutcome::Exhausted`] replaces the subiterator with its return value, which
     /// is `None` unless a generator returned one or a `send` method raised `StopIteration` with
-    /// one; [`ForIterOutcome::Blocked`] restores the stack for a retry.
-    pub(super) fn yield_from_send(&mut self) -> PyResult<ForIterOutcome> {
+    /// one; [`ForIterOutcome::Blocked`] restores the stack for a retry. A generator subiterator
+    /// resumes on the dispatch loop with the delegating frame, resuming after the
+    /// `YieldFromSend` at `op_index`, as consumer ([`ForIterOutcome::Entered`]).
+    pub(super) fn yield_from_send(&mut self, op_index: usize) -> PyResult<ForIterOutcome> {
         let sent = self.pop()?;
         let subiterator = self
             .execution
@@ -637,19 +648,13 @@ impl<'s> Vm<'s> {
             .peek(&self.state.heap, 0)
             .ok_or("invalid bytecode stack effect")?;
         if let Some(generator) = self.suspendable_generator(&subiterator)? {
-            let outcome = match self.resume_generator_with(generator, sent)? {
-                Some(value) => {
-                    self.push(value);
-                    ForIterOutcome::Yielded
-                }
-                None => {
-                    self.execution.stack.pop_ref();
-                    let returned = self.take_return_value(generator)?;
-                    self.push(returned);
-                    ForIterOutcome::Exhausted
-                }
-            };
-            return Ok(outcome);
+            self.active_frame_mut().instruction_pointer = op_index + 1;
+            if self.enter_generator_frame(generator, sent, Consumer::Frame)? {
+                return Ok(ForIterOutcome::Entered);
+            }
+            self.execution.stack.pop_ref();
+            self.push(Value::None);
+            return Ok(ForIterOutcome::Exhausted);
         }
         if !sent.is_none() {
             let Some(send) = self.resolve_attribute(subiterator, "send")? else {
@@ -672,9 +677,9 @@ impl<'s> Vm<'s> {
                 ForwardedThrow::Raise(exception) => return Err(self.raise_value(exception)),
             });
         }
-        let outcome = self.for_iterator()?;
+        let outcome = self.for_iterator(op_index)?;
         match outcome {
-            ForIterOutcome::Yielded => {}
+            ForIterOutcome::Yielded | ForIterOutcome::Entered => {}
             ForIterOutcome::Exhausted => self.push(Value::None),
             ForIterOutcome::Blocked(_) => self.push(sent),
         }
@@ -784,9 +789,8 @@ impl<'s> Vm<'s> {
         Ok(ForwardedThrow::Returned(value))
     }
 
-    /// Resume one generator frame until its next yield or terminal return. A generator's operand
-    /// stack is kept separate from its caller's stack, while its lexical scope remains in the
-    /// shared heap so closures and mutations preserve normal Python aliasing.
+    /// Resume `generator` for Rust code until its next yield, returning the value, or until it
+    /// returns (`None`).
     pub(super) fn resume_generator(&mut self, generator: Value) -> PyResult<Option<Value>> {
         self.resume_generator_with(generator, Value::None)
     }
@@ -842,8 +846,9 @@ impl<'s> Vm<'s> {
         self.resume_generator_frame(generator, GeneratorResume::Throw(exception))
     }
 
-    /// Run one generator step in a child pin scope, so the pins the step creates are
-    /// released when it suspends; the yielded value crosses back as a stored reference.
+    /// Run one generator step for Rust code in a child pin scope, so the pins the step
+    /// creates are released when it suspends; the yielded value crosses back as a stored
+    /// reference.
     fn resume_generator_frame(
         &mut self,
         generator: Value,
@@ -851,18 +856,120 @@ impl<'s> Vm<'s> {
     ) -> PyResult<Option<Value>> {
         let yielded = {
             let mut vm = self.scope();
-            vm.run_generator_step(generator, resume)?
+            vm.push(generator);
+            let step = vm.run_generator_step(generator, resume);
+            vm.execution.stack.pop_ref();
+            step?
         };
         Ok(yielded.map(|value| self.value(&value)))
     }
 
+    /// One generator step for Rust code, with `generator` on top of the operand stack: enter
+    /// its frame and run it until it yields, returns or raises.
     fn run_generator_step(
         &mut self,
         generator: Value,
         resume: GeneratorResume,
     ) -> PyResult<Option<Ref>> {
-        const MAX_GENERATOR_DEPTH: usize = 256;
-        if self.call_depth >= MAX_GENERATOR_DEPTH {
+        let resume = match resume {
+            GeneratorResume::Throw(exception) => {
+                match self.delegated_throw(generator, exception)? {
+                    Delegated::Resume(resume) => resume,
+                    Delegated::Yielded(value) => return Ok(Some(self.store(value))),
+                }
+            }
+            resume => resume,
+        };
+        let depth = self.bytecode_frames.len();
+        let sent = match resume {
+            GeneratorResume::Send(sent) | GeneratorResume::SendFinished { value: sent, .. } => sent,
+            GeneratorResume::Throw(_) => Value::None,
+        };
+        if !self.enter_generator_frame(generator, sent, Consumer::Rust)? {
+            return match resume {
+                // A finished generator raises a thrown exception at once.
+                GeneratorResume::Throw(exception) => Err(self.raise_value(exception)),
+                _ => Ok(None),
+            };
+        }
+        let result = match resume {
+            GeneratorResume::Send(_) => self.run_frames_above(depth),
+            GeneratorResume::SendFinished { finished, .. } => {
+                // The subiterator returned the sent value: `yield from` finishes with it.
+                self.execution.stack.remove(1);
+                self.active_frame_mut().instruction_pointer = finished;
+                self.run_frames_above(depth)
+            }
+            GeneratorResume::Throw(exception) => {
+                let error = self.raise_value(exception);
+                let span = self.suspension_span();
+                self.propagate_error(error, span)
+                    .and_then(|_| self.run_frames_above(depth))
+            }
+        };
+        match result {
+            Ok(Flow::Yield(value)) => Ok(Some(value)),
+            Ok(Flow::Return(_)) => Ok(None),
+            Ok(Flow::Exit(status)) => Err(PyError::exit(status)),
+            Ok(flow) => unreachable!("a generator step cannot end with {flow:?}"),
+            Err((error, _)) => Err(error),
+        }
+    }
+
+    /// The span of the `yield` the active generator frame is suspended after.
+    fn suspension_span(&mut self) -> super::super::source::Span {
+        let frame = self.active_frame_mut();
+        frame
+            .instruction_pointer
+            .checked_sub(1)
+            .and_then(|site| frame.code.spans.get(site).copied())
+            .unwrap_or_default()
+    }
+
+    /// For a generator suspended in `yield from`, pass a thrown exception to the subiterator
+    /// first; the result says how the generator itself resumes, or what the subiterator yielded.
+    fn delegated_throw(&mut self, generator: Value, exception: Value) -> PyResult<Delegated> {
+        let Object::Generator(state) = self.get(generator)? else {
+            return Err("object is not a generator".into());
+        };
+        // A frame suspended in `yield from` sits at its `YieldFromSend`; a plain `yield`
+        // resumes after its `Yield`, which is never followed by a `YieldFromSend`.
+        let finished = match state.code.instructions.get(state.instruction_pointer) {
+            Some(instruction) if !state.exhausted && !state.running => match instruction.opcode {
+                Opcode::YieldFromSend(finished) => finished,
+                _ => return Ok(Delegated::Resume(GeneratorResume::Throw(exception))),
+            },
+            _ => return Ok(Delegated::Resume(GeneratorResume::Throw(exception))),
+        };
+        let subiterator = self
+            .value_optional(state.stack.last())
+            .ok_or("yield from lost its subiterator")?;
+        self.set_generator_running(generator, true)?;
+        let forwarded = self.forward_throw(&subiterator, exception);
+        self.set_generator_running(generator, false)?;
+        Ok(match forwarded? {
+            ForwardedThrow::Yielded(value) => Delegated::Yielded(value),
+            ForwardedThrow::Returned(value) => {
+                Delegated::Resume(GeneratorResume::SendFinished { value, finished })
+            }
+            ForwardedThrow::Raise(exception) => {
+                Delegated::Resume(GeneratorResume::Throw(exception))
+            }
+        })
+    }
+
+    /// Push the frame of `generator`, which sits on top of the operand stack, so that it
+    /// resumes for `consumer` with `sent` as the value of the `yield` it stopped at. Its saved
+    /// operands, `try` regions, contexts and handled exceptions move onto the shared stacks
+    /// above the generator. `false` when the generator has finished; resuming it reports the
+    /// end once more and clears its return value.
+    pub(super) fn enter_generator_frame(
+        &mut self,
+        generator: Value,
+        sent: Value,
+        consumer: Consumer,
+    ) -> PyResult<bool> {
+        if self.call_depth >= Self::MAX_CALL_DEPTH {
             return Err(PyError::exception(
                 "RecursionError",
                 "maximum recursion depth exceeded",
@@ -871,177 +978,120 @@ impl<'s> Vm<'s> {
         let Object::Generator(state) = self.get(generator)? else {
             return Err("object is not a generator".into());
         };
+        if state.running {
+            return Err(PyError::value_error("generator already executing"));
+        }
+        if state.exhausted {
+            self.take_return_value(generator)?;
+            return Ok(false);
+        }
+        let instruction_pointer = state.instruction_pointer;
+        if instruction_pointer == 0 && !sent.is_none() {
+            return Err(PyError::type_error(
+                "can't send non-None value to a just-started generator",
+            ));
+        }
         let code = state.code.clone();
-        let function = self.value(&state.function);
-        let scope = self.value(&state.scope);
-        let mut instruction_pointer = state.instruction_pointer;
-        let mut handlers = state.handlers.clone();
-        let contexts = state.contexts.iter().map(Ref::dup).collect();
-        let exhausted = state.exhausted;
-        let running = state.running;
-        let subiterator = self.value_optional(state.stack.last());
-        if running {
-            return Err("generator already executing".into());
-        }
-        // A frame suspended in `yield from` sits at its `YieldFromSend`; a plain `yield` resumes
-        // after its `Yield`, which is never followed by a `YieldFromSend`.
-        let delegating = match code.instructions.get(instruction_pointer) {
-            Some(instruction) if !exhausted => match instruction.opcode {
-                Opcode::YieldFromSend(finished) => Some(finished),
-                _ => None,
+        let entry = FrameEntry::function(self.value(&state.function), self.value(&state.scope));
+        let stack_base = self.execution.stack.len();
+        let frame = self.enter_frame(
+            &code,
+            instruction_pointer,
+            stack_base,
+            entry,
+            FrameKind::Generator(consumer),
+        )?;
+        let Object::Generator(state) = self.state.heap.get_mut(generator)? else {
+            unreachable!("generator kind was checked above")
+        };
+        state.running = true;
+        let exception_base = frame.exception_base as usize;
+        self.execution
+            .stack
+            .extend_owned(std::mem::take(&mut state.stack));
+        self.execution.exception_stack.append(&mut state.exceptions);
+        self.execution.handlers.extend(state.handlers.drain(..).map(
+            |(target, depth, exception_depth)| {
+                (target, depth + stack_base, exception_depth + exception_base)
             },
-            _ => None,
-        };
-        // Whether the subiterator on top of the saved stack is dropped when the frame resumes.
-        let mut drop_subiterator = false;
-        let resume = match (resume, delegating) {
-            (GeneratorResume::Throw(exception), Some(finished)) => {
-                let subiterator = subiterator.ok_or("yield from lost its subiterator")?;
-                self.set_generator_running(generator, true)?;
-                let forwarded = self.forward_throw(&subiterator, exception);
-                self.set_generator_running(generator, false)?;
-                match forwarded? {
-                    ForwardedThrow::Yielded(value) => return Ok(Some(self.store(value))),
-                    ForwardedThrow::Returned(value) => {
-                        drop_subiterator = true;
-                        instruction_pointer = finished;
-                        GeneratorResume::Send(value)
-                    }
-                    ForwardedThrow::Raise(exception) => GeneratorResume::Throw(exception),
-                }
-            }
-            (resume, _) => resume,
-        };
-        let handler = match &resume {
-            GeneratorResume::Send(sent) => {
-                if exhausted {
-                    // A finished generator reports its return value only to the resume that
-                    // finished it.
-                    self.take_return_value(generator)?;
-                    return Ok(None);
-                }
-                if instruction_pointer == 0 && !sent.is_none() {
-                    return Err("can't send non-None value to a just-started generator".into());
-                }
-                None
-            }
-            GeneratorResume::Throw(_) if exhausted => None,
-            GeneratorResume::Throw(_) => handlers.pop(),
-        };
-        if let GeneratorResume::Throw(exception) = &resume {
-            if handler.is_none() {
-                // Nothing at the suspension point handles it, so it leaves the generator at once.
-                if let Object::Generator(state) = self.get_mut(generator)? {
-                    state.exhausted = true;
-                }
-                return Err(self.raise_value(*exception));
-            }
+        ));
+        self.execution.with_contexts.append(&mut state.contexts);
+        if instruction_pointer != 0 {
+            self.push(sent);
         }
-        self.set_generator_running(generator, true)?;
-        // Move the caller's operands and exceptions aside as pinned values, which keep them live,
-        // and install the generator's saved frame state in their place.
-        let outer_stack = self.execution.stack.split_off(&self.state.heap, 0);
-        let outer_exceptions = std::mem::take(&mut self.execution.exception_stack)
-            .iter()
-            .map(|exception| self.value(exception))
-            .collect::<Vec<_>>();
-        let generator_exceptions = {
-            let Object::Generator(state) = self.state.heap.get(generator)? else {
-                unreachable!("generator kind was checked above")
-            };
-            self.execution.stack.extend_refs(&state.stack);
-            state.exceptions.iter().map(Ref::dup).collect::<Vec<_>>()
-        };
-        if drop_subiterator {
-            self.execution.stack.pop_ref();
-        }
-        self.execution.exception_stack = generator_exceptions;
-        let start = match (resume, handler) {
-            (GeneratorResume::Send(sent), _) => {
-                if instruction_pointer != 0 {
-                    self.push(sent);
-                }
-                instruction_pointer
-            }
-            (GeneratorResume::Throw(exception), Some((target, depth, exception_depth))) => {
-                self.execution.stack.truncate(depth);
-                self.exception_stack.truncate(exception_depth);
-                self.push(exception);
-                let exception = self.store(exception);
-                self.exception_stack.push(exception);
-                target
-            }
-            (GeneratorResume::Throw(_), None) => unreachable!("an unhandled throw returned above"),
-        };
         self.call_depth += 1;
-        let mut resume = ResumePoint {
-            instruction_pointer: start,
-            handlers,
-            contexts,
-        };
-        let entry = FrameEntry::function(function, scope);
-        let result = self.execute_code_from(&code, &mut resume, 0, entry);
-        self.call_depth -= 1;
-        let ResumePoint {
-            instruction_pointer: next_instruction,
-            handlers,
-            contexts,
-        } = resume;
-        // Re-root the frame's result before anything below can allocate.
-        let result = result.map(|flow| match flow {
-            Flow::Yield(value) => GeneratorStep::Yielded(self.value(&value), next_instruction),
-            Flow::Return(value) => GeneratorStep::Returned(self.value(&value)),
-            Flow::Halt | Flow::Exit(_) => GeneratorStep::Finished,
-            flow => unreachable!("a generator step cannot end with {flow:?}"),
-        });
-        let generator_exceptions = std::mem::take(&mut self.execution.exception_stack);
-        for exception in outer_exceptions {
-            let exception = self.store(exception);
-            self.exception_stack.push(exception);
-        }
-        let frame_result_stack = self.execution.stack.split_off(&self.state.heap, 0);
-        for value in outer_stack {
-            self.push(value);
-        }
+        self.bytecode_frames.push(frame);
+        Ok(true)
+    }
 
-        match result {
-            Ok(GeneratorStep::Yielded(value, next_instruction)) => {
-                self.modify(generator, |object| {
-                    if let Object::Generator(state) = object {
-                        state.instruction_pointer = next_instruction;
-                        state.handlers = handlers;
-                        state.contexts = contexts;
-                        state.exceptions = generator_exceptions;
-                        state.stack = Ref::all(frame_result_stack);
-                        state.running = false;
-                    }
-                })?;
-                Ok(Some(self.store(value)))
+    /// Pop the active generator frame at a `yield`, saving its position, operands, open `try`
+    /// regions (relative to its bases), entered contexts and handled exceptions into its
+    /// generator, which is left on top of the operand stack. Allocates nothing.
+    pub(super) fn suspend_generator_frame(&mut self) -> PyResult<()> {
+        let frame = self
+            .bytecode_frames
+            .pop()
+            .expect("a generator frame is active");
+        self.call_depth = self.call_depth.saturating_sub(1);
+        let stack_base = frame.stack_base();
+        let exception_base = frame.exception_base as usize;
+        let operands = self
+            .execution
+            .stack
+            .drain_refs(stack_base)
+            .collect::<Vec<_>>();
+        let exceptions = self.execution.exception_stack.split_off(exception_base);
+        let handlers = self
+            .execution
+            .handlers
+            .split_off(frame.handler_base as usize)
+            .into_iter()
+            .map(|(target, depth, exception_depth)| {
+                (
+                    target,
+                    depth.saturating_sub(stack_base),
+                    exception_depth.saturating_sub(exception_base),
+                )
+            })
+            .collect();
+        let contexts = self
+            .execution
+            .with_contexts
+            .split_off(frame.context_base as usize);
+        let generator = self.peek(0)?;
+        self.modify(generator, |object| {
+            if let Object::Generator(state) = object {
+                state.instruction_pointer = frame.instruction_pointer;
+                state.stack = operands;
+                state.exceptions = exceptions;
+                state.handlers = handlers;
+                state.contexts = contexts;
+                state.running = false;
             }
-            Ok(GeneratorStep::Returned(value)) => {
-                self.modify(generator, |object| {
-                    if let Object::Generator(state) = object {
-                        state.exhausted = true;
-                        state.running = false;
-                        state.return_value = Ref::from(value);
-                    }
-                })?;
-                Ok(None)
-            }
-            Ok(GeneratorStep::Finished) => {
-                if let Object::Generator(state) = self.get_mut(generator)? {
-                    state.exhausted = true;
-                    state.running = false;
-                }
-                Ok(None)
-            }
-            Err((error, span)) => {
-                if let Object::Generator(state) = self.get_mut(generator)? {
-                    state.exhausted = true;
-                    state.running = false;
-                }
-                Err(error.located(|| format!(" at line {}, column {}", span.line, span.column)))
-            }
+        })
+    }
+
+    /// Pop the active generator frame for good, after it returned or raised: what it owned on
+    /// the shared stacks goes, and its generator, left on top of the operand stack, is finished.
+    pub(super) fn close_generator_frame(&mut self) -> PyResult<()> {
+        self.pop_frame();
+        let generator = self.peek(0)?;
+        if let Object::Generator(state) = self.get_mut(generator)? {
+            state.exhausted = true;
+            state.running = false;
         }
+        Ok(())
+    }
+
+    /// Record `value` as what a generator that Rust code resumed returned, for the
+    /// `StopIteration` that reports it. The generator is on top of the operand stack.
+    pub(super) fn set_generator_return(&mut self, value: &Ref) -> PyResult<()> {
+        let generator = self.peek(0)?;
+        let value = value.dup();
+        self.modify(generator, |object| {
+            if let Object::Generator(state) = object {
+                state.return_value = value;
+            }
+        })
     }
 }

@@ -9,8 +9,8 @@ use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
-    HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead,
-    Slot, StoredCallArgs, Stream, Value, Vm,
+    FrameKind, HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime,
+    PyStreamRead, Slot, StoredCallArgs, Stream, Value, Vm,
 };
 use crate::python::error::{Control, PyResult};
 use num_traits::{One, Signed, Zero};
@@ -1569,7 +1569,7 @@ impl<'s> Vm<'s> {
         Ok(self.produce(instance))
     }
 
-    const MAX_CALL_DEPTH: usize = 256;
+    pub(super) const MAX_CALL_DEPTH: usize = 256;
 
     /// Call the Python `function` whose arguments sit on top of the operand stack above the
     /// callee slot: `positional` values, then one value per `keywords` entry. `receiver`
@@ -1898,7 +1898,7 @@ impl<'s> Vm<'s> {
         self.call_depth += 1;
         if let CallMode::Deferred(_) = mode {
             let stack_base = self.stack.len();
-            let frame = self.enter_frame(code, 0, stack_base, entry, true)?;
+            let frame = self.enter_frame(code, 0, stack_base, entry, FrameKind::Call)?;
             self.bytecode_frames.push(frame);
             return Ok(Flow::Refresh);
         }
