@@ -912,13 +912,13 @@ impl TypeRegistry {
     }
 
     /// Whether instances of `id` are exceptions: `id` derives from `BaseException`.
-    pub fn is_exception_type(&self, id: TypeId) -> Result<bool, String> {
+    pub fn is_exception_type(&self, id: TypeId) -> PyResult<bool> {
         self.is_subclass(id, BuiltinType::Exception.id())
     }
 
     /// The closest builtin exception class that `id` is or derives from, which decides how its
     /// instances render and which native behavior they inherit. `None` for non-exception types.
-    pub fn exception_base(&self, id: TypeId) -> Result<Option<&'static str>, String> {
+    pub fn exception_base(&self, id: TypeId) -> PyResult<Option<&'static str>> {
         if let Some(name) = self.exception_names.get(&id) {
             return Ok(Some(name));
         }
@@ -934,14 +934,14 @@ impl TypeRegistry {
         self.modeled_bytes
     }
 
-    pub fn get(&self, id: TypeId) -> Result<&PyType, String> {
+    pub fn get(&self, id: TypeId) -> PyResult<&PyType> {
         self.types
             .get(id.0 as usize)
             .ok_or_else(|| "invalid type reference".into())
     }
 
     /// The stored reference to the type object registered for `id`.
-    pub fn value_ref(&self, id: TypeId) -> Result<&Ref, String> {
+    pub fn value_ref(&self, id: TypeId) -> PyResult<&Ref> {
         self.get(id)?
             .value
             .as_ref()
@@ -951,7 +951,7 @@ impl TypeRegistry {
     /// The class object of `value` when `value` is an instance of a user class, whatever payload
     /// the class's layout gave it. Class objects and enum members resolve through their own
     /// paths and return `None` here, as do builtin values.
-    pub fn instance_class(&self, heap: &Heap, value: Value) -> Result<Option<Value>, String> {
+    pub fn instance_class(&self, heap: &Heap, value: Value) -> PyResult<Option<Value>> {
         if !value.is_object() {
             return Ok(None);
         }
@@ -975,7 +975,7 @@ impl TypeRegistry {
         bases: Vec<TypeId>,
         mro: Vec<TypeId>,
         attributes: &HashMap<String, Ref>,
-    ) -> Result<TypeId, String> {
+    ) -> PyResult<TypeId> {
         let index = u32::try_from(self.types.len()).map_err(|_| "too many Python types")?;
         let local_slots = TypeSlots::from_attributes(TypeId(index), attributes);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
@@ -1028,11 +1028,7 @@ impl TypeRegistry {
 
     /// Recompute a user type's slots from its class attributes after one of them changed,
     /// inheriting the rest through its MRO as [`TypeRegistry::register`] does.
-    pub fn replace_slots(
-        &mut self,
-        id: TypeId,
-        attributes: &HashMap<String, Ref>,
-    ) -> Result<(), String> {
+    pub fn replace_slots(&mut self, id: TypeId, attributes: &HashMap<String, Ref>) -> PyResult<()> {
         let mro = self.get(id)?.mro.clone();
         let local_slots = TypeSlots::from_attributes(id, attributes);
         let slots = self.inherit_slots(local_slots.clone(), &mro);
@@ -1051,7 +1047,7 @@ impl TypeRegistry {
         Ok(())
     }
 
-    pub fn finish(&mut self, id: TypeId, value: Ref) -> Result<(), String> {
+    pub fn finish(&mut self, id: TypeId, value: Ref) -> PyResult<()> {
         let ty = self
             .types
             .get_mut(id.0 as usize)
@@ -1063,16 +1059,16 @@ impl TypeRegistry {
         Ok(())
     }
 
-    pub fn is_subclass(&self, class: TypeId, base: TypeId) -> Result<bool, String> {
+    pub fn is_subclass(&self, class: TypeId, base: TypeId) -> PyResult<bool> {
         Ok(class == base || self.get(class)?.mro.contains(&base))
     }
 
     /// Linearize every registered base, builtin or heap-owned, with the same C3 rule used to
     /// register native value kinds. The result excludes the class being created.
-    pub(super) fn linearize_bases(&self, bases: &[TypeId]) -> Result<Vec<TypeId>, String> {
+    pub(super) fn linearize_bases(&self, bases: &[TypeId]) -> PyResult<Vec<TypeId>> {
         for (index, base) in bases.iter().enumerate() {
             if bases[..index].contains(base) {
-                return Err("duplicate base class".into());
+                return Err(PyError::type_error("duplicate base class"));
             }
         }
         let mut sequences = Vec::with_capacity(bases.len().saturating_add(1));
@@ -1084,19 +1080,16 @@ impl TypeRegistry {
             sequences.push(sequence);
         }
         sequences.push(bases.to_vec());
-        c3_merge(sequences)
-            .ok_or_else(|| "cannot create a consistent method resolution order".into())
+        c3_merge(sequences).ok_or_else(|| {
+            PyError::type_error("cannot create a consistent method resolution order")
+        })
     }
 
-    pub fn slot(&self, type_id: TypeId, slot: Slot) -> Result<Option<SlotValue>, String> {
+    pub fn slot(&self, type_id: TypeId, slot: Slot) -> PyResult<Option<SlotValue>> {
         Ok(self.get(type_id)?.slots.get(slot).cloned())
     }
 
-    pub(super) fn local_slot(
-        &self,
-        type_id: TypeId,
-        slot: Slot,
-    ) -> Result<Option<SlotValue>, String> {
+    pub(super) fn local_slot(&self, type_id: TypeId, slot: Slot) -> PyResult<Option<SlotValue>> {
         Ok(self.get(type_id)?.local_slots.get(slot).cloned())
     }
 

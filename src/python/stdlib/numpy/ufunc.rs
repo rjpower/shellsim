@@ -22,8 +22,8 @@ use std::cmp::Ordering;
 
 use super::super::super::ast::{BinaryOperator, ComparisonOperator, UnaryOperator};
 use super::super::super::native::{
-    CallArgs, GetterDef, MethodDef, PyArray, PyArrayBuffer, PyArrayData, PyError, PyErrorKind,
-    PyKind, PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
+    CallArgs, GetterDef, MethodDef, PyArray, PyArrayBuffer, PyArrayData, PyError, PyKind,
+    PyNativeKind, PyOperator, PyResult, PyRuntime, PyValue, ValueKindDef, ValueKindSlots,
 };
 use super::super::super::number::NumberRef;
 use super::super::super::Value;
@@ -829,7 +829,7 @@ fn method_outer(runtime: &mut dyn PyRuntime, receiver_value: PyValue, args: Call
         return Err(PyError::value_error(
             "outer product only supported for binary functions",
         ))
-        .map_err(|error: PyError| PyError::value_error(format!("{name}: {}", error.message)));
+        .map_err(|error: PyError| PyError::value_error(format!("{name}: {}", error.message())));
     }
     args.expect_positional("outer", 2, 2)?;
     let left = convert::as_array(runtime, args.positional()[0])?;
@@ -2666,7 +2666,7 @@ fn equality(
     // `left` and `right` are already prepared operands (arrays or weak scalars) applied with
     // fixed, dtype-less options, so the only `TypeError` this call can raise is a missing
     // comparison loop or dtype-promotion failure, never an unrelated one.
-    if error.kind != PyErrorKind::Type {
+    if !error.is_exception("TypeError") {
         return Err(error);
     }
     let (left, right) = (

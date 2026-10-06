@@ -20,6 +20,7 @@ use super::{
     NamespaceTarget, Object, ObjectId, ProxyTarget, Ref, ScopeObject, DIRTY_FLAG, MARK_FLAG,
     YOUNG_FLAG,
 };
+use crate::python::error::PyResult;
 
 /// Stored references held outside the heap, which the collector must trace.
 ///
@@ -167,9 +168,7 @@ pub(super) fn for_each_ref(object: &Object, f: &mut dyn FnMut(&Raw)) {
             f(&function.0);
             f(&scope.0);
             slots(contexts, f);
-            for (_, slot) in exceptions {
-                f(&slot.0);
-            }
+            slots(exceptions, f);
             slots(stack, f);
             f(&return_value.0);
         }
@@ -245,7 +244,7 @@ impl Heap {
         roots: &dyn Roots,
         pending: Option<&Object>,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let young_count = self.young.len();
         charge_collection(young_count, resources)?;
         let mut work = Vec::new();
@@ -304,7 +303,7 @@ impl Heap {
         roots: &dyn Roots,
         pending: Option<&Object>,
         resources: &mut Resources,
-    ) -> Result<u64, String> {
+    ) -> PyResult<u64> {
         self.collect_young(roots, pending, resources)?;
         charge_collection(self.slots.len(), resources)?;
         let mut work = Vec::new();
@@ -360,7 +359,7 @@ impl Heap {
     }
 
     /// Mark everything reachable from the objects in `work`.
-    fn trace(&self, work: &mut Vec<ObjectId>, young_only: bool) -> Result<(), String> {
+    fn trace(&self, work: &mut Vec<ObjectId>, young_only: bool) -> PyResult<()> {
         while let Some(id) = work.pop() {
             let Some(Some(object)) = self.slots.get(id.index()) else {
                 return Err("invalid object reference during collection".into());
@@ -393,7 +392,7 @@ impl Heap {
     }
 }
 
-fn charge_collection(objects: usize, resources: &mut Resources) -> Result<(), String> {
+fn charge_collection(objects: usize, resources: &mut Resources) -> PyResult<()> {
     if resources.charge_cpu(u64::try_from(objects).unwrap_or(u64::MAX)) {
         Ok(())
     } else {

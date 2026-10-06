@@ -829,10 +829,7 @@ mod tests {
         for text in [
             "1+2", "1+2jj", "(1+2j", "1 + 2j", "", "()", "1__0", "_1", "j1", "nanjj", "1e", ".j",
         ] {
-            assert_eq!(
-                parse(text).unwrap_err().kind,
-                super::super::native::PyErrorKind::Value
-            );
+            assert!(parse(text).unwrap_err().is_exception("ValueError"));
         }
     }
 

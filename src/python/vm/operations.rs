@@ -7,6 +7,7 @@ use super::{
     number, protocol, string, BigInt, BinaryOperator, BuiltinType, ComparisonOperator, DisplayKind,
     HashedMembers, NativeValue, Object, SequenceKind, Slot, ToPrimitive, UnaryOperator, Value, Vm,
 };
+use crate::python::error::{PyError, PyResult};
 
 /// The new contents of a builtin container updated in place by an augmented assignment.
 enum Replacement {
@@ -16,13 +17,11 @@ enum Replacement {
 }
 
 impl<'s> Vm<'s> {
-    pub(super) fn unary(&mut self, operator: UnaryOperator) -> Result<(), String> {
+    pub(super) fn unary(&mut self, operator: UnaryOperator) -> PyResult<()> {
         // An exact number is rewritten in place on the stack; everything else pins it for the
         // slot protocol.
         let value = self.peek(0)?;
-        if let Some(result) = number::exact_unary(self, operator, value)
-            .map_err(|error| self.record_native_error(error))?
-        {
+        if let Some(result) = number::exact_unary(self, operator, value)? {
             let slot = self.stack.len() - 1;
             self.execution.stack.set(slot, result);
             return Ok(());
@@ -44,17 +43,13 @@ impl<'s> Vm<'s> {
                 "bad operand type for unary {symbol}: '{}'",
                 self.type_name_of(&value)?
             );
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         };
         self.push(result);
         Ok(())
     }
 
-    pub(super) fn build_sequence(
-        &mut self,
-        count: usize,
-        kind: SequenceKind,
-    ) -> Result<(), String> {
+    pub(super) fn build_sequence(&mut self, count: usize, kind: SequenceKind) -> PyResult<()> {
         let values = self.take(count)?;
         let value = self.alloc(match kind {
             SequenceKind::List => Object::List(Ref::all(values)),
@@ -64,7 +59,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn build_dict(&mut self, unpacked: &[bool]) -> Result<(), String> {
+    pub(super) fn build_dict(&mut self, unpacked: &[bool]) -> PyResult<()> {
         let value_count = unpacked
             .iter()
             .try_fold(0usize, |count, unpacked| {
@@ -82,7 +77,7 @@ impl<'s> Vm<'s> {
                     None => {
                         let message =
                             format!("'{}' object is not a mapping", self.type_name_of(&mapping)?);
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     }
                 }
             } else {
@@ -102,11 +97,7 @@ impl<'s> Vm<'s> {
 
     /// Build a display whose `true` operands are iterables expanded in place, as in
     /// `[first, *rest]`.
-    pub(super) fn build_unpacked(
-        &mut self,
-        kind: DisplayKind,
-        starred: &[bool],
-    ) -> Result<(), String> {
+    pub(super) fn build_unpacked(&mut self, kind: DisplayKind, starred: &[bool]) -> PyResult<()> {
         let operands = self.take(starred.len())?;
         let mut values = Vec::with_capacity(operands.len());
         for (operand, expanded) in operands.into_iter().zip(starred) {
@@ -127,14 +118,14 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn build_set(&mut self, count: usize) -> Result<(), String> {
+    pub(super) fn build_set(&mut self, count: usize) -> PyResult<()> {
         let candidates = self.take(count)?;
         self.push_set(candidates)
     }
 
     /// Push a set of the distinct `candidates`, metering each membership comparison as the `set`
     /// constructor does.
-    fn push_set(&mut self, candidates: Vec<Value>) -> Result<(), String> {
+    fn push_set(&mut self, candidates: Vec<Value>) -> PyResult<()> {
         let members = self.distinct_members(candidates)?;
         let value = self.alloc(Object::Set(members.into_set()))?;
         self.push(value);
@@ -143,7 +134,7 @@ impl<'s> Vm<'s> {
 
     /// `COMPARE`: pop two operands and push `left <operator> right`. Membership and identity
     /// are their own protocols; the six rich comparisons go through [`Self::rich_compare`].
-    pub(super) fn compare(&mut self, operator: ComparisonOperator) -> Result<(), String> {
+    pub(super) fn compare(&mut self, operator: ComparisonOperator) -> PyResult<()> {
         let right = self.pop()?;
         let left = self.pop()?;
         let result = match operator {
@@ -169,18 +160,14 @@ impl<'s> Vm<'s> {
     /// Answer `needle in container` once `__contains__` has declined. Builtin containers answer
     /// directly; any other iterable is searched item by item, stopping at the first match, as
     /// CPython does.
-    pub(super) fn contains_value(
-        &mut self,
-        container: &Value,
-        needle: &Value,
-    ) -> Result<bool, String> {
+    pub(super) fn contains_value(&mut self, container: &Value, needle: &Value) -> PyResult<bool> {
         if string::string_ref(self.heap(), *container)?.is_some() {
             let Some(needle_text) = string::string_ref(self.heap(), *needle)? else {
                 let message = format!(
                     "'in <string>' requires string as left operand, not {}",
                     self.type_name_of(needle)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             };
             let scanned = string::string_ref(self.heap(), *container)?
                 .map_or(0, |text| text.byte_len())
@@ -193,7 +180,7 @@ impl<'s> Vm<'s> {
                 "argument of type '{}' is not a container or iterable",
                 self.type_name_of(container)?
             );
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         }
         let direct = match self.get(*container)? {
             Object::Bytes(_)
@@ -216,16 +203,17 @@ impl<'s> Vm<'s> {
                     None => match number::int_value(self.heap(), *needle) {
                         Some(byte) if (0..256).contains(&byte) => 1,
                         Some(_) => {
-                            return Err(
-                                self.raise_exception("ValueError", "byte must be in range(0, 256)")
-                            );
+                            return Err(PyError::exception(
+                                "ValueError",
+                                "byte must be in range(0, 256)",
+                            ));
                         }
                         None => {
                             let message = format!(
                                 "a bytes-like object is required, not '{}'",
                                 self.type_name_of(needle)?
                             );
-                            return Err(self.raise_exception("TypeError", message));
+                            return Err(PyError::exception("TypeError", message));
                         }
                     },
                 };
@@ -253,11 +241,10 @@ impl<'s> Vm<'s> {
             let item = match vm.iterator_next(&iterator) {
                 Ok(Some(item)) => item,
                 Ok(None) => return Ok(false),
-                Err(_) if vm.pending_stop_iteration() => {
-                    vm.pending_exception = None;
+                Err(error) => {
+                    vm.catch(error, "StopIteration")?;
                     return Ok(false);
                 }
-                Err(error) => return Err(error),
             };
             if vm.values_equal(&item, &needle)? {
                 return Ok(true);
@@ -265,7 +252,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    pub(super) fn binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
+    pub(super) fn binary(&mut self, operator: BinaryOperator) -> PyResult<()> {
         if self.frame_stack_len() < 2 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -276,9 +263,7 @@ impl<'s> Vm<'s> {
             .expect("frame operand count was checked");
         let left = self.peek(1)?;
         let right = self.peek(0)?;
-        match number::exact_binary(self, operator, left, right)
-            .map_err(|error| self.record_native_error(error))
-        {
+        match number::exact_binary(self, operator, left, right) {
             Ok(Some(value)) => {
                 self.stack.truncate(result_slot + 1);
                 self.execution.stack.set(result_slot, value);
@@ -301,10 +286,8 @@ impl<'s> Vm<'s> {
         operator: BinaryOperator,
         left: Value,
         right: Value,
-    ) -> Result<Value, String> {
-        if let Some(value) = number::exact_binary(self, operator, left, right)
-            .map_err(|error| self.record_native_error(error))?
-        {
+    ) -> PyResult<Value> {
+        if let Some(value) = number::exact_binary(self, operator, left, right)? {
             return Ok(value);
         }
         self.binary_protocol(operator, left, right)
@@ -314,12 +297,10 @@ impl<'s> Vm<'s> {
     /// update the left operand in place, as `list.__iadd__` and `set.__ior__` do, and other
     /// operands use their in-place method, such as `__iadd__`, when they define one. Everything
     /// else falls back to the binary operator.
-    pub(super) fn inplace_binary(&mut self, operator: BinaryOperator) -> Result<(), String> {
+    pub(super) fn inplace_binary(&mut self, operator: BinaryOperator) -> PyResult<()> {
         let right = self.pop()?;
         let left = self.pop()?;
-        if let Some(value) = number::exact_binary(self, operator, left, right)
-            .map_err(|error| self.record_native_error(error))?
-        {
+        if let Some(value) = number::exact_binary(self, operator, left, right)? {
             self.push(value);
             return Ok(());
         }
@@ -339,7 +320,7 @@ impl<'s> Vm<'s> {
         operator: BinaryOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         if !left.is_object() {
             return Ok(None);
         }
@@ -398,7 +379,7 @@ impl<'s> Vm<'s> {
 
     /// Install `replacement` as the payload of the list, set or bytearray `target`, keeping its
     /// identity, and charge or release the change in its modeled size.
-    fn replace_contents(&mut self, target: Value, replacement: Replacement) -> Result<(), String> {
+    fn replace_contents(&mut self, target: Value, replacement: Replacement) -> PyResult<()> {
         let (old_len, new_len, unit) = match (self.get(target)?, &replacement) {
             (Object::List(items), Replacement::List(values)) => {
                 (items.len(), values.len(), MODELED_VALUE_BYTES)
@@ -437,7 +418,7 @@ impl<'s> Vm<'s> {
     /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
     /// Whether `|=` on object `value` is `dict.update`: a dict or namespace view, or a dict
     /// subclass instance whose class does not define `__ior__`.
-    fn updates_dict_in_place(&mut self, value: Value) -> Result<bool, String> {
+    fn updates_dict_in_place(&mut self, value: Value) -> PyResult<bool> {
         if let Some(class) = self.instance_class(value)? {
             let holds_dict = matches!(self.get(value)?, Object::Dict(_));
             return Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none());
@@ -453,7 +434,7 @@ impl<'s> Vm<'s> {
         operator: BinaryOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let slot = match operator {
             BinaryOperator::Add => Slot::InplaceAdd,
             BinaryOperator::Subtract => Slot::InplaceSubtract,
@@ -482,7 +463,7 @@ impl<'s> Vm<'s> {
         operator: BinaryOperator,
         left: Value,
         right: Value,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         self.binary_protocol_for(operator, left, right, false)
     }
 
@@ -493,7 +474,7 @@ impl<'s> Vm<'s> {
         left: Value,
         right: Value,
         inplace: bool,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let (slot, name, reflected_slot, reflected_name) = match operator {
             BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
             BinaryOperator::Subtract => (
@@ -578,7 +559,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `divmod(left, right)`: the binary protocol over `__divmod__` and `__rdivmod__`.
-    pub(super) fn divmod_value(&mut self, left: Value, right: Value) -> Result<Value, String> {
+    pub(super) fn divmod_value(&mut self, left: Value, right: Value) -> PyResult<Value> {
         self.binary_slot_protocol(
             left,
             right,
@@ -600,7 +581,7 @@ impl<'s> Vm<'s> {
         right: Value,
         (slot, name, reflected_slot, reflected_name): (Slot, &str, Slot, &str),
         symbol: &str,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         // As in CPython, a right operand whose type is a proper subclass of the left operand's
         // type gets its reflected method first, so `1.0 + np.float64(2)` stays a NumPy scalar.
         let left_type = self.type_id(&left)?;
@@ -633,7 +614,7 @@ impl<'s> Vm<'s> {
                 self.type_name_of(&right)?
             ),
         };
-        Err(self.raise_exception("TypeError", message))
+        Err(PyError::exception("TypeError", message))
     }
 
     /// CPython's message when `+` or `*` reaches a builtin sequence's concatenation or
@@ -643,7 +624,7 @@ impl<'s> Vm<'s> {
         left: &Value,
         right: &Value,
         symbol: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> PyResult<Option<String>> {
         let left_sequence = self.builtin_sequence(left)?;
         match symbol.trim_end_matches('=') {
             "+" => {
@@ -679,7 +660,7 @@ impl<'s> Vm<'s> {
 
     /// The builtin sequence type (`str`, `bytes`, `bytearray`, `list` or `tuple`) that
     /// `value`'s type derives from, if any.
-    fn builtin_sequence(&self, value: &Value) -> Result<Option<BuiltinType>, String> {
+    fn builtin_sequence(&self, value: &Value) -> PyResult<Option<BuiltinType>> {
         let type_id = self.type_id(value)?;
         for sequence in [
             BuiltinType::String,
@@ -699,7 +680,7 @@ impl<'s> Vm<'s> {
         &mut self,
         conversion: Option<char>,
         format_spec: &str,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let value = self.pop()?;
         let rendered = self.render_formatted_value(&value, conversion, format_spec)?;
         self.charge_cpu(u64::try_from(rendered.len()).unwrap_or(u64::MAX))?;
@@ -713,7 +694,7 @@ impl<'s> Vm<'s> {
         value: &Value,
         conversion: Option<char>,
         format_spec: &str,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         self.reserve_format_spec(format_spec)?;
         if format_spec.contains(['{', '}']) {
             return Err("nested f-string format specifications are not implemented".into());
@@ -721,7 +702,7 @@ impl<'s> Vm<'s> {
         let converted = match conversion {
             Some('r' | 'a') => self.repr_value(value)?,
             Some('s') => self.display_value(value)?,
-            Some(other) => return Err(format!("unsupported f-string conversion !{other}")),
+            Some(other) => return Err(format!("unsupported f-string conversion !{other}").into()),
             None => return self.format_object(value, format_spec),
         };
         if format_spec.is_empty() {
@@ -731,23 +712,19 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn raise_format_error(&mut self, error: FormatError) -> String {
-        self.raise_exception(error.kind, error.message)
+    fn raise_format_error(&mut self, error: FormatError) -> PyError {
+        PyError::exception(error.kind, error.message)
     }
 
     /// `format(value, spec)`, which CPython defines as `type(value).__format__(value, spec)`.
     /// A user class's `__format__` runs as written. Registered numbers such as NumPy scalars
     /// format as the Python number they stand for, as NumPy's `__format__` does. Other values
     /// accept only the empty spec, which gives `str(value)`.
-    pub(super) fn format_object(
-        &mut self,
-        value: &Value,
-        format_spec: &str,
-    ) -> Result<String, String> {
+    pub(super) fn format_object(&mut self, value: &Value, format_spec: &str) -> PyResult<String> {
         let spec = self.allocate_string(format_spec.to_string())?;
         if let Some(result) = self.invoke_slot(value, Slot::Format, "__format__", vec![spec])? {
             return string::string_value(self.heap(), result)?
-                .ok_or_else(|| self.raise_exception("TypeError", "__format__ must return a str"));
+                .ok_or_else(|| PyError::exception("TypeError", "__format__ must return a str"));
         }
         if let Some(rendered) = self.format_registered_number(value, format_spec)? {
             return Ok(rendered);
@@ -763,7 +740,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: &Value,
         format_spec: &str,
-    ) -> Result<Option<String>, String> {
+    ) -> PyResult<Option<String>> {
         let Some((_, number)) = super::number::registered_number(self.heap(), value) else {
             return Ok(None);
         };
@@ -780,7 +757,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Reserve the largest width or precision before formatting can allocate padding.
-    pub(super) fn reserve_format_spec(&mut self, spec: &str) -> Result<(), String> {
+    pub(super) fn reserve_format_spec(&mut self, spec: &str) -> PyResult<()> {
         let mut largest = 0_usize;
         let mut digits = None::<usize>;
         for byte in spec.bytes() {
@@ -806,7 +783,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: &Value,
         text: &str,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         let result = match super::number::view(self.heap(), value) {
             Some(number::NumberRef::Complex(real, imag)) => format_complex(real, imag, text),
             Some(number::NumberRef::Float(float)) => {
@@ -824,7 +801,7 @@ impl<'s> Vm<'s> {
                 Some(string) => format_text(&string, text),
                 None => {
                     let type_name = self.type_name_of(value)?;
-                    return Err(self.raise_exception(
+                    return Err(PyError::exception(
                         "TypeError",
                         format!("unsupported format string passed to {type_name}.__format__"),
                     ));
@@ -834,20 +811,20 @@ impl<'s> Vm<'s> {
         result.map_err(|error| self.raise_format_error(error))
     }
 
-    pub(super) fn is_bigint(&self, value: &Value) -> Result<bool, String> {
+    pub(super) fn is_bigint(&self, value: &Value) -> PyResult<bool> {
         Ok(matches!(
             super::number::view(self.heap(), value),
             Some(super::number::NumberRef::BigInt(_))
         ))
     }
 
-    fn bigint_operand(&self, value: &Value) -> Result<BigInt, String> {
+    fn bigint_operand(&self, value: &Value) -> PyResult<BigInt> {
         super::number::view(self.heap(), value)
             .and_then(super::number::NumberRef::to_bigint)
             .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
-    pub(super) fn numeric_float(&self, value: &Value) -> Result<f64, String> {
+    pub(super) fn numeric_float(&self, value: &Value) -> PyResult<f64> {
         if value.is_object() {
             if let Object::BigInt(value) = self.get(*value)? {
                 return value
@@ -860,7 +837,7 @@ impl<'s> Vm<'s> {
             .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
-    pub(super) fn add_numbers(&mut self, left: Value, right: Value) -> Result<Value, String> {
+    pub(super) fn add_numbers(&mut self, left: Value, right: Value) -> PyResult<Value> {
         self.binary_value(BinaryOperator::Add, left, right)
     }
 }

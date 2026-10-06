@@ -10,9 +10,9 @@ use super::super::scopes;
 use super::{
     cpython_names, exception_types, string, Arc, BuiltinType, BytecodeFrame, CodeRef,
     ExceptionType, Flow, FrameEntry, HashMap, ModuleDef, NameId, NamespaceTarget, NativeValue,
-    Object, ProxyTarget, PyModuleLoader, PyRuntime, RaisedException, SymbolId, Value, Vm,
-    BUILTIN_FUNCTIONS,
+    Object, ProxyTarget, PyModuleLoader, PyRuntime, SymbolId, Value, Vm, BUILTIN_FUNCTIONS,
 };
+use crate::python::error::{PyError, PyResult};
 
 /// A [`NamespaceTarget`] whose references are pinned values, so it can be held across
 /// allocation. Store it back into an object with [`NamespaceHandle::store`].
@@ -83,7 +83,7 @@ impl<'s> Vm<'s> {
 
     /// The class and receiver zero-argument `super()` and `__class__` refer to: the defining
     /// class of the function the nearest method frame runs, and that frame's first local.
-    pub(super) fn method_context(&self) -> Result<Option<(Value, Value)>, String> {
+    pub(super) fn method_context(&self) -> PyResult<Option<(Value, Value)>> {
         for frame in self.bytecode_frames.iter().rev() {
             let Some(callee) = &frame.callee else {
                 continue;
@@ -109,7 +109,7 @@ impl<'s> Vm<'s> {
 
     /// The scope `hops` lexical levels above the active frame's own level; `None` past the
     /// outermost scope. A frame without a scope of its own counts its closure as one hop.
-    fn enclosing_scope(&self, hops: usize) -> Result<Option<Value>, String> {
+    fn enclosing_scope(&self, hops: usize) -> PyResult<Option<Value>> {
         let frame = self
             .bytecode_frames
             .last()
@@ -129,7 +129,7 @@ impl<'s> Vm<'s> {
         Ok(target)
     }
 
-    pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
+    pub(super) fn load_name(&mut self, symbol: SymbolId, name: &str) -> PyResult<()> {
         if name == "__class__" {
             let (class, _) = self
                 .method_context()?
@@ -164,7 +164,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if self.lookup_scope().is_none() {
             if let Some(value) = self.state.globals.get_ref(symbol) {
                 self.execution.stack.push_ref(value);
@@ -182,7 +182,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let scope = self.lookup_scope().expect("checked by load_global");
         let root = scopes::root(self.heap(), scope)?;
         let value = if scopes::uses_repl_globals(self.heap(), root)? {
@@ -197,7 +197,7 @@ impl<'s> Vm<'s> {
         self.load_builtin(code.name(name))
     }
 
-    fn load_builtin(&mut self, name: &str) -> Result<(), String> {
+    fn load_builtin(&mut self, name: &str) -> PyResult<()> {
         if let Some((module_name, attribute)) = super::super::stdlib::frozen_builtin(name) {
             self.import(module_name, false)?;
             let module = self.pop()?;
@@ -256,15 +256,18 @@ impl<'s> Vm<'s> {
         })();
         let Some(value) = value else {
             if cpython_names::is_cpython_builtin(name) {
-                return Err(format!("builtin {name:?} is not implemented"));
+                return Err(format!("builtin {name:?} is not implemented").into());
             }
-            return Err(self.raise_exception("NameError", format!("name '{name}' is not defined")));
+            return Err(PyError::exception(
+                "NameError",
+                format!("name '{name}' is not defined"),
+            ));
         };
         self.push(value);
         Ok(())
     }
 
-    pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> Result<(), String> {
+    pub(super) fn store_name(&mut self, symbol: SymbolId, name: &str) -> PyResult<()> {
         let value = self.pop()?;
         if let Some(scope) = self.active_scope() {
             self.scope_insert(scope, name.to_string(), value)?;
@@ -281,7 +284,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         name: &str,
         scope_hops: usize,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let value = self.pop()?;
         if let Some(scope) = self.enclosing_scope(scope_hops)? {
             self.scope_insert(scope, name.to_string(), value)
@@ -293,7 +296,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    pub(super) fn store_nonlocal(&mut self, name: &str) -> Result<(), String> {
+    pub(super) fn store_nonlocal(&mut self, name: &str) -> PyResult<()> {
         let value = self.pop()?;
         let start = self
             .enclosing_scope(1)?
@@ -304,19 +307,18 @@ impl<'s> Vm<'s> {
     pub(super) fn exception_type_matches(
         &mut self,
         expected: Value,
-        actual: &RaisedException,
-    ) -> Result<bool, String> {
+        actual: Value,
+    ) -> PyResult<bool> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
             let expected_type = self
                 .state
                 .types
                 .exception_type_id(name)
                 .ok_or("exception type is not registered")?;
-            let actual_value = self.value(&actual.value);
             return self
                 .state
                 .types
-                .is_subclass(self.type_id(&actual_value)?, expected_type);
+                .is_subclass(self.type_id(&actual)?, expected_type);
         }
         if !expected.is_object() {
             return Err(
@@ -340,8 +342,7 @@ impl<'s> Vm<'s> {
         };
         match expected {
             Expected::Class(instance_type) => {
-                let actual_value = self.value(&actual.value);
-                let actual_type = self.type_id(&actual_value)?;
+                let actual_type = self.type_id(&actual)?;
                 self.state.types.is_subclass(actual_type, instance_type)
             }
             Expected::Tuple(types) => {
@@ -363,7 +364,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         name: NameId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let Some(scope) = self.lookup_scope() else {
             self.state
                 .globals
@@ -382,7 +383,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         name: NameId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let root = scopes::root(self.heap(), scope)?;
         if scopes::uses_repl_globals(self.heap(), root)? {
             self.state
@@ -399,7 +400,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let Some(scope) = self.lookup_scope() else {
             self.state.globals.remove(&self.state.heap, symbol);
             return Ok(());
@@ -418,7 +419,7 @@ impl<'s> Vm<'s> {
     /// (the entry-point program) or the root scope defers to it (a function or class body defined
     /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
     /// exactly, so `globals()` always names the same namespace a bare name lookup would.
-    pub(super) fn current_globals_target(&self) -> Result<NamespaceHandle, String> {
+    pub(super) fn current_globals_target(&self) -> PyResult<NamespaceHandle> {
         let Some(scope) = self.lookup_scope() else {
             return Ok(NamespaceHandle::Repl);
         };
@@ -434,7 +435,7 @@ impl<'s> Vm<'s> {
     /// is the same live view `globals()` returns, as `locals() is globals()` there in CPython.
     /// Inside a function it is a detached `dict` of that call's local variables: CPython's
     /// `locals()` there is a snapshot too, and writing to it never rebinds a local.
-    pub(super) fn current_locals(&mut self) -> Result<Value, String> {
+    pub(super) fn current_locals(&mut self) -> PyResult<Value> {
         // `exec`/`eval` code reports the locals of the frame that ran it.
         let Some(frame) = self
             .bytecode_frames
@@ -471,10 +472,7 @@ impl<'s> Vm<'s> {
     }
 
     /// A detached `dict` holding `target`'s current bindings.
-    pub(super) fn namespace_snapshot_dict(
-        &mut self,
-        target: NamespaceHandle,
-    ) -> Result<Value, String> {
+    pub(super) fn namespace_snapshot_dict(&mut self, target: NamespaceHandle) -> PyResult<Value> {
         let items = self.namespace_items(target)?;
         self.allocate_dict(items)
     }
@@ -484,7 +482,7 @@ impl<'s> Vm<'s> {
     pub(super) fn namespace_items(
         &mut self,
         target: NamespaceHandle,
-    ) -> Result<Vec<(Value, Value)>, String> {
+    ) -> PyResult<Vec<(Value, Value)>> {
         let entries = self.namespace_entries(target)?;
         let mut items = Vec::with_capacity(entries.len());
         for (name, value) in entries {
@@ -496,10 +494,7 @@ impl<'s> Vm<'s> {
     /// The entries of a class's or native module's read-only `__dict__`, sorted by name, with
     /// freshly allocated string keys. Class attributes live in a `HashMap` and native modules
     /// declare functions apart from values, so neither keeps CPython's definition order.
-    pub(super) fn proxy_items(
-        &mut self,
-        target: ProxyHandle,
-    ) -> Result<Vec<(Value, Value)>, String> {
+    pub(super) fn proxy_items(&mut self, target: ProxyHandle) -> PyResult<Vec<(Value, Value)>> {
         let mut entries: Vec<(String, Value)> = match target {
             ProxyHandle::Class(class) => {
                 let Object::Class(class_object) = self.get(class)? else {
@@ -526,7 +521,7 @@ impl<'s> Vm<'s> {
                     entries.push((function.name.to_string(), value));
                 }
                 for definition in module.values {
-                    let value = definition.get(self).map_err(|error| error.to_string())?;
+                    let value = definition.get(self)?;
                     entries.push((definition.name().to_string(), value));
                 }
                 entries
@@ -550,7 +545,7 @@ impl<'s> Vm<'s> {
     pub(super) fn namespace_entries(
         &self,
         target: NamespaceHandle,
-    ) -> Result<Vec<(String, Value)>, String> {
+    ) -> PyResult<Vec<(String, Value)>> {
         let mut entries: Vec<(String, Value)> = match target {
             NamespaceHandle::Scope(scope) => {
                 scopes::values(self.heap(), scope)?.into_iter().collect()
@@ -577,7 +572,7 @@ impl<'s> Vm<'s> {
         &self,
         target: NamespaceHandle,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         if let NamespaceHandle::Scope(scope) = target {
             return self.scope_get(scope, name);
         }
@@ -601,7 +596,7 @@ impl<'s> Vm<'s> {
         target: NamespaceHandle,
         name: String,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if let NamespaceHandle::Scope(scope) = target {
             return self.scope_insert(scope, name, value);
         }
@@ -623,7 +618,7 @@ impl<'s> Vm<'s> {
         &mut self,
         target: NamespaceHandle,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         if let NamespaceHandle::Scope(scope) = target {
             return scopes::remove(&mut self.state.heap, scope, name);
         }
@@ -639,7 +634,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn import_roots(&mut self) -> Result<Vec<String>, String> {
+    fn import_roots(&mut self) -> PyResult<Vec<String>> {
         let mut roots = self.state.temporary_import_paths.clone();
         if let Some(path) = self.value_optional(self.state.sys_path.as_ref()) {
             if !path.is_object() {
@@ -650,8 +645,7 @@ impl<'s> Vm<'s> {
             };
             for value in self.values(values) {
                 let path = self
-                    .string_value(&value)
-                    .map_err(|error| self.record_native_error(error))?
+                    .string_value(&value)?
                     .ok_or("sys.path entries must be strings")?;
                 roots.push(path);
             }
@@ -674,7 +668,7 @@ impl<'s> Vm<'s> {
         &mut self,
         name: String,
         values: HashMap<String, Value>,
-    ) -> Result<(Value, Value), String> {
+    ) -> PyResult<(Value, Value)> {
         let scope = self.alloc_scope(None, false, Arc::from([]), Vec::new(), values)?;
         let module = self.alloc(Object::Module {
             name,
@@ -692,14 +686,16 @@ impl<'s> Vm<'s> {
         &mut self,
         source: &str,
         path: &str,
-    ) -> Result<super::super::bytecode::CodeRef, String> {
+    ) -> PyResult<super::super::bytecode::CodeRef> {
         let parse_memory = super::super::source::front_end_memory(source.len())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or("module source is too large")?;
         if !self.interp.resources.reserve_memory(parse_memory)
             || !self.interp.resources.charge_cpu(source.len() as u64)
         {
-            return Err("resource limit exceeded while importing module".into());
+            return Err(PyError::resource_error(
+                "resource limit exceeded while importing module",
+            ));
         }
         let result = self.compile_module_tokens(source, path);
         self.interp.resources.release_memory(parse_memory);
@@ -710,29 +706,32 @@ impl<'s> Vm<'s> {
         &mut self,
         source: &str,
         path: &str,
-    ) -> Result<super::super::bytecode::CodeRef, String> {
-        let located = |message: &str, span: &super::super::source::Span| {
-            format!(
+    ) -> PyResult<super::super::bytecode::CodeRef> {
+        // As for `exec`, a front-end error stays a fault rather than a catchable `SyntaxError`.
+        let syntax_error = |message: &str, span: &super::super::source::Span| {
+            PyError::unsupported(format!(
                 "{message} in {path} at line {}, column {}",
                 span.line, span.column
-            )
+            ))
         };
         let tokens = super::super::lexer::lex(source)
-            .map_err(|error| located(&error.message, &error.span))?;
+            .map_err(|error| syntax_error(&error.message, &error.span))?;
         let token_memory = super::super::source::token_memory(tokens.len())
             .and_then(|bytes| u64::try_from(bytes).ok())
             .ok_or("module source is too large")?;
         if !self.interp.resources.reserve_memory(token_memory) {
-            return Err("resource limit exceeded while importing module".into());
+            return Err(PyError::resource_error(
+                "resource limit exceeded while importing module",
+            ));
         }
         let result = super::super::parser::parse(tokens)
-            .map_err(|error| located(&error.message, &error.span))
+            .map_err(|error| syntax_error(&error.message, &error.span))
             .map(super::super::compiler::compile);
         self.interp.resources.release_memory(token_memory);
         result
     }
 
-    pub(super) fn import(&mut self, name: &str, bind_root: bool) -> Result<(), String> {
+    pub(super) fn import(&mut self, name: &str, bind_root: bool) -> PyResult<()> {
         let name = self.resolve_import_name(name)?;
         if let Some(module) = super::super::stdlib::native_module(&name) {
             return self.finish_import(
@@ -757,9 +756,7 @@ impl<'s> Vm<'s> {
             Some((format!("<frozen {name}>"), frozen.source.to_string()))
         } else {
             let roots = self.import_roots()?;
-            self.interp
-                .load_module_source(&roots, &name)
-                .map_err(|error| self.record_native_error(error))?
+            self.interp.load_module_source(&roots, &name)?
         };
         let Some((path, source)) = source else {
             // A standard package that shellsim does not provide at all is unsupported. A missing
@@ -769,13 +766,12 @@ impl<'s> Vm<'s> {
                 || super::super::stdlib::frozen_module(top_level).is_some()
                 || self.state.modules.contains_key(top_level);
             if !provided && cpython_names::is_cpython_stdlib_module(top_level) {
-                return Err(format!(
-                    "standard-library module {name:?} is not implemented"
-                ));
+                return Err(format!("standard-library module {name:?} is not implemented").into());
             }
-            return Err(
-                self.raise_exception("ModuleNotFoundError", format!("No module named '{name}'"))
-            );
+            return Err(PyError::exception(
+                "ModuleNotFoundError",
+                format!("No module named '{name}'"),
+            ));
         };
         let code = self.compile_module_source(&source, &path)?;
         // A frozen module's path is a synthetic `<frozen name>` marker, so its package-ness comes
@@ -821,28 +817,27 @@ impl<'s> Vm<'s> {
             Ok(Flow::Halt) => self.finish_import(&name, module, bind_root),
             Ok(Flow::Return(_)) => {
                 self.state.modules.remove(&name);
-                Err(format!("'return' outside function in module {name:?}"))
+                Err(format!("'return' outside function in module {name:?}").into())
             }
             Ok(Flow::Yield(_)) => {
                 self.state.modules.remove(&name);
-                Err(format!("'yield' outside function in module {name:?}"))
+                Err(format!("'yield' outside function in module {name:?}").into())
             }
             Ok(Flow::Exit(status)) => {
                 self.state.modules.remove(&name);
-                Err(format!("module {name:?} exited with status {status}"))
+                Err(format!("module {name:?} exited with status {status}").into())
             }
             Ok(flow) => unreachable!("a module body cannot end with {flow:?}"),
             Err((error, span)) => {
                 self.state.modules.remove(&name);
-                Err(format!(
-                    "{error} in {path} at line {}, column {}",
-                    span.line, span.column
-                ))
+                Err(error.located(|| {
+                    format!(" in {path} at line {}, column {}", span.line, span.column)
+                }))
             }
         }
     }
 
-    fn resolve_import_name(&self, requested: &str) -> Result<String, String> {
+    fn resolve_import_name(&self, requested: &str) -> PyResult<String> {
         let level = requested
             .chars()
             .take_while(|character| *character == '.')
@@ -871,7 +866,7 @@ impl<'s> Vm<'s> {
         Ok(parts.join("."))
     }
 
-    fn ensure_package_parent(&mut self, name: &str) -> Result<(), String> {
+    fn ensure_package_parent(&mut self, name: &str) -> PyResult<()> {
         let Some((parent, _)) = name.rsplit_once('.') else {
             return Ok(());
         };
@@ -885,8 +880,7 @@ impl<'s> Vm<'s> {
         } else {
             let roots = self.import_roots()?;
             self.interp
-                .load_module_source(&roots, parent)
-                .map_err(|error| self.record_native_error(error))?
+                .load_module_source(&roots, parent)?
                 .is_some_and(|(path, _)| path.ends_with("/__init__.py"))
         };
         if standard || vfs_package {
@@ -901,7 +895,7 @@ impl<'s> Vm<'s> {
 
     /// `from module import name` with the module on top of the stack: push the module attribute,
     /// else the submodule `module.name`, else raise CPython's `ImportError`.
-    pub(super) fn import_from(&mut self, name: &str) -> Result<(), String> {
+    pub(super) fn import_from(&mut self, name: &str) -> PyResult<()> {
         let module = self
             .execution
             .stack
@@ -918,25 +912,18 @@ impl<'s> Vm<'s> {
                 _ => return Err(self.missing_attribute(&module, name)),
             },
         };
-        match self.import(&format!("{module_name}.{name}"), false) {
-            Err(_)
-                if self
-                    .pending_exception
-                    .as_ref()
-                    .is_some_and(|exception| exception.kind == "ModuleNotFoundError") =>
-            {
-                self.pending_exception = None;
-                let message =
-                    format!("cannot import name '{name}' from '{module_name}' (unknown location)");
-                Err(self.raise_exception("ImportError", message))
-            }
-            result => result,
-        }
+        let Err(error) = self.import(&format!("{module_name}.{name}"), false) else {
+            return Ok(());
+        };
+        self.catch(error, "ModuleNotFoundError")?;
+        let message =
+            format!("cannot import name '{name}' from '{module_name}' (unknown location)");
+        Err(PyError::exception("ImportError", message))
     }
 
     /// `from module import *` with the module on top of the stack: bind every name in the
     /// module's `__all__`, or else every name without a leading underscore, in the current scope.
-    pub(super) fn import_star(&mut self) -> Result<(), String> {
+    pub(super) fn import_star(&mut self) -> PyResult<()> {
         let module = self.pop()?;
         let names = match module.native_value() {
             Some(NativeValue::Module(definition)) => definition
@@ -964,7 +951,7 @@ impl<'s> Vm<'s> {
                                     "'{}' object does not support indexing",
                                     self.type_name_of(&all)?
                                 );
-                                return Err(self.raise_exception("TypeError", message));
+                                return Err(PyError::exception("TypeError", message));
                             }
                         };
                         let mut names = Vec::with_capacity(items.len());
@@ -974,7 +961,7 @@ impl<'s> Vm<'s> {
                                     "Item in {module_name}.__all__ must be str, not {}",
                                     self.type_name_of(&item)?
                                 );
-                                return Err(self.raise_exception("TypeError", message));
+                                return Err(PyError::exception("TypeError", message));
                             };
                             names.push(name);
                         }
@@ -1010,19 +997,19 @@ impl<'s> Vm<'s> {
     }
 
     /// The scope of the module imported as `name`, for binding a submodule into it.
-    pub(super) fn module_scope(&self, name: &str, module: Value) -> Result<Value, String> {
+    pub(super) fn module_scope(&self, name: &str, module: Value) -> PyResult<Value> {
         if !module.is_object() {
-            return Err(format!("module {name:?} cannot contain submodules"));
+            return Err(format!("module {name:?} cannot contain submodules").into());
         }
         let Object::Module { scope, .. } = self.get(module)? else {
-            return Err(format!("module {name:?} changed object kind"));
+            return Err(format!("module {name:?} changed object kind").into());
         };
         Ok(self.value(scope))
     }
 
     /// Install synthetic package parents for a dotted import and push the value selected by
     /// Python's ordinary import binding rule. Package objects contain only VM module references.
-    fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {
+    fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> PyResult<()> {
         if let Some((parent_name, child_name)) = name.rsplit_once('.') {
             if let Some(parent) = self.loaded_module(parent_name) {
                 let scope = self.module_scope(parent_name, parent)?;

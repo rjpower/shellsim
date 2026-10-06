@@ -18,6 +18,7 @@ use crate::resources::Resources;
 use super::heap::{Heap, InstanceAttributes, Ref, Roots, Value};
 use super::object_model::TypeId;
 use super::symbols::{SymbolId, Symbols};
+use crate::python::error::{PyError, PyResult};
 
 const MAX_SHAPED_ATTRIBUTES: usize = 32;
 const INSTANCE_SLOT_BYTES: u64 = 16;
@@ -77,7 +78,7 @@ enum Storage<'h> {
     Dictionary(&'h HashMap<SymbolId, Ref>),
 }
 
-fn storage<'h>(heap: &'h Heap, instance: Value) -> Result<Storage<'h>, String> {
+fn storage<'h>(heap: &'h Heap, instance: Value) -> PyResult<Storage<'h>> {
     Ok(match heap.attributes(instance)? {
         None => Storage::Shaped {
             shape: ShapeId::ROOT,
@@ -105,7 +106,7 @@ impl Shapes {
         heap: &Heap,
         symbols: &Symbols,
         instance: Value,
-    ) -> Result<Vec<String>, String> {
+    ) -> PyResult<Vec<String>> {
         match storage(heap, instance)? {
             Storage::Shaped { shape, len } => (0..len)
                 .map(|slot| {
@@ -140,7 +141,7 @@ impl Shapes {
         heap: &Heap,
         symbols: &Symbols,
         instance: Value,
-    ) -> Result<Vec<(String, Value)>, String> {
+    ) -> PyResult<Vec<(String, Value)>> {
         self.attribute_names(heap, symbols, instance)?
             .into_iter()
             .map(|name| {
@@ -160,7 +161,7 @@ impl Shapes {
         heap: &Heap,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let slot = match heap.attributes(instance)? {
             None => None,
             Some(InstanceAttributes::Dictionary(values)) => values.get(&symbol),
@@ -178,7 +179,7 @@ impl Shapes {
         heap: &Heap,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<InstanceAttributeSlot>, String> {
+    ) -> PyResult<Option<InstanceAttributeSlot>> {
         let Some(InstanceAttributes::Shaped { shape, values }) = heap.attributes(instance)? else {
             return Ok(None);
         };
@@ -219,7 +220,7 @@ impl Shapes {
         shape: ShapeId,
         symbol: SymbolId,
         resources: &mut Resources,
-    ) -> Result<ShapeId, String> {
+    ) -> PyResult<ShapeId> {
         if let Some(next) = self.transitions.get(&(shape, symbol)) {
             return Ok(*next);
         }
@@ -237,7 +238,7 @@ impl Shapes {
             .checked_add(SHAPE_BYTES)
             .ok_or("modeled shape table size overflow")?;
         if !resources.reserve_memory(SHAPE_BYTES) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.modeled_bytes = modeled_bytes;
         self.shapes.push(Shape {
@@ -259,7 +260,7 @@ impl InstanceAttributeSlot {
 /// What an inline cache keys a heap object's attribute lookups on: its type and the shape of
 /// its instance attributes, `None` when it has none. An object whose attributes live in a
 /// dictionary has no key, so no site caches it.
-pub fn site_key(heap: &Heap, instance: Value) -> Result<Option<(TypeId, Option<ShapeId>)>, String> {
+pub fn site_key(heap: &Heap, instance: Value) -> PyResult<Option<(TypeId, Option<ShapeId>)>> {
     let (type_id, attributes) = heap.typed_attributes(instance)?;
     Ok(match attributes {
         None => Some((type_id, None)),
@@ -279,7 +280,7 @@ pub struct AttributeStore<'a> {
 }
 
 impl AttributeStore<'_> {
-    pub fn insert(&mut self, instance: Value, name: &str, value: Value) -> Result<(), String> {
+    pub fn insert(&mut self, instance: Value, name: &str, value: Value) -> PyResult<()> {
         let symbol = self.symbols.intern(name, self.resources)?;
         self.insert_by_symbol(instance, symbol, value)
     }
@@ -288,7 +289,7 @@ impl AttributeStore<'_> {
         &mut self,
         instance: Value,
         values: impl IntoIterator<Item = (String, Value)>,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         for (name, value) in values {
             self.insert(instance, &name, value)?;
         }
@@ -300,7 +301,7 @@ impl AttributeStore<'_> {
         instance: Value,
         symbol: SymbolId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         match storage(self.heap, instance)? {
             Storage::Dictionary(values) => {
                 let growth = if values.contains_key(&symbol) {
@@ -343,7 +344,7 @@ impl AttributeStore<'_> {
         shape: ShapeId,
         symbol: SymbolId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         // Grow the instance first: that reservation may collect, while the shape table's own
         // small charge cannot. The first attribute also pays for the storage box.
         let growth = if self.heap.attributes(instance)?.is_none() {
@@ -371,7 +372,7 @@ impl AttributeStore<'_> {
         &mut self,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         if let Storage::Shaped { shape, .. } = storage(self.heap, instance)? {
             if self.shapes.slot(shape, symbol).is_none() {
                 return Ok(None);
@@ -392,7 +393,7 @@ impl AttributeStore<'_> {
         instance: Value,
         symbol: SymbolId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if !self.convert_to_dictionary(instance, INSTANCE_DICT_ENTRY_BYTES)? {
             return self.insert_by_symbol(instance, symbol, value);
         }
@@ -406,7 +407,7 @@ impl AttributeStore<'_> {
 
     /// Move a shaped instance's attributes into dictionary storage, reserving `extra` more
     /// bytes. Returns `false` when the instance already uses a dictionary.
-    fn convert_to_dictionary(&mut self, instance: Value, extra: u64) -> Result<bool, String> {
+    fn convert_to_dictionary(&mut self, instance: Value, extra: u64) -> PyResult<bool> {
         let (shape, shaped_len, boxed) = match self.heap.attributes(instance)? {
             None => (ShapeId::ROOT, 0, false),
             Some(InstanceAttributes::Shaped { shape, values }) => (*shape, values.len(), true),

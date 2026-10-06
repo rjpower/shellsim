@@ -4,6 +4,7 @@
 //! small plan. Keeping normalization here gives builtin containers and NumPy the same signed
 //! bounds and step behavior without giving the VM a second slicing protocol.
 
+use crate::python::error::{PyError, PyResult};
 use std::ops::Range;
 
 /// A slice's start, stop and step as indices, `None` where the bound is omitted or `None`.
@@ -18,10 +19,10 @@ pub(super) fn slice_indices(
     start: Option<i64>,
     stop: Option<i64>,
     step: Option<i64>,
-) -> Result<(i64, i64, i64), String> {
+) -> PyResult<(i64, i64, i64)> {
     let step = step.unwrap_or(1);
     if step == 0 {
-        return Err("slice step cannot be zero".into());
+        return Err(PyError::value_error("slice step cannot be zero"));
     }
     let (lower, upper) = if step > 0 {
         (0, length)
@@ -63,7 +64,7 @@ impl SlicePlan {
         start: Option<i64>,
         stop: Option<i64>,
         step: Option<i64>,
-    ) -> Result<Self, String> {
+    ) -> PyResult<Self> {
         isize::try_from(length).map_err(|_| "sequence is too large to slice")?;
         let length = i64::try_from(length).map_err(|_| "sequence is too large to slice")?;
         let (first, stop, step) = slice_indices(length, start, stop, step)?;
@@ -145,9 +146,8 @@ mod tests {
 
     #[test]
     fn rejects_zero_step() {
-        assert_eq!(
-            SlicePlan::new(3, None, None, Some(0)).unwrap_err(),
-            "slice step cannot be zero"
-        );
+        assert!(SlicePlan::new(3, None, None, Some(0))
+            .unwrap_err()
+            .is_exception("ValueError"));
     }
 }

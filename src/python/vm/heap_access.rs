@@ -21,6 +21,7 @@ use super::super::scopes;
 use super::super::symbols::SymbolId;
 use super::super::{GlobalBindings, ReplState};
 use super::{Flow, Vm, VmState};
+use crate::python::error::PyResult;
 
 /// Every stored reference the VM keeps outside the heap.
 struct VmRoots<'a> {
@@ -143,26 +144,22 @@ impl<'s> Vm<'s> {
     }
 
     /// Allocate an object whose payload holds no references.
-    pub(super) fn alloc(&mut self, object: Object) -> Result<Value, String> {
+    pub(super) fn alloc(&mut self, object: Object) -> PyResult<Value> {
         self.with_heap(|heap, roots, resources| heap.alloc(object, roots, resources))
     }
 
     /// Allocate `object` as an instance of the user class registered as `type_id`.
-    pub(super) fn allocate_typed(
-        &mut self,
-        type_id: TypeId,
-        object: Object,
-    ) -> Result<Value, String> {
+    pub(super) fn allocate_typed(&mut self, type_id: TypeId, object: Object) -> PyResult<Value> {
         self.with_heap(|heap, roots, resources| heap.alloc_typed(type_id, object, roots, resources))
     }
 
-    pub(super) fn get(&self, value: Value) -> Result<&Object, String> {
+    pub(super) fn get(&self, value: Value) -> PyResult<&Object> {
         self.state.heap.get(value)
     }
 
     /// Mutable payload access. The heap remembers a mutated old object, so references may be
     /// stored through it.
-    pub(super) fn get_mut(&mut self, value: Value) -> Result<&mut Object, String> {
+    pub(super) fn get_mut(&mut self, value: Value) -> PyResult<&mut Object> {
         self.state.heap.get_mut(value)
     }
 
@@ -170,23 +167,23 @@ impl<'s> Vm<'s> {
         &mut self,
         value: Value,
         f: impl FnOnce(&mut Object) -> R,
-    ) -> Result<R, String> {
+    ) -> PyResult<R> {
         self.state.heap.modify(value, f)
     }
 
-    pub(super) fn replace_payload(&mut self, value: Value, payload: Object) -> Result<(), String> {
+    pub(super) fn replace_payload(&mut self, value: Value, payload: Object) -> PyResult<()> {
         self.with_heap(|heap, roots, resources| {
             heap.replace_payload(value, payload, roots, resources)
         })
     }
 
-    pub(super) fn reserve_object_growth(&mut self, value: Value, bytes: u64) -> Result<(), String> {
+    pub(super) fn reserve_object_growth(&mut self, value: Value, bytes: u64) -> PyResult<()> {
         self.with_heap(|heap, roots, resources| {
             heap.reserve_object_growth(value, bytes, roots, resources)
         })
     }
 
-    pub(super) fn release_object_shrink(&mut self, value: Value, bytes: u64) -> Result<(), String> {
+    pub(super) fn release_object_shrink(&mut self, value: Value, bytes: u64) -> PyResult<()> {
         self.state
             .heap
             .release_object_shrink(value, bytes, &mut self.interp.resources)
@@ -198,16 +195,16 @@ impl<'s> Vm<'s> {
     }
 
     /// A stable identity for `id()` and identity hashing; `None` for immediates.
-    pub(super) fn identity(&self, value: Value) -> Result<Option<u32>, String> {
+    pub(super) fn identity(&self, value: Value) -> PyResult<Option<u32>> {
         self.state.heap.identity(value)
     }
 
-    pub(super) fn object_type_id(&self, value: Value) -> Result<TypeId, String> {
+    pub(super) fn object_type_id(&self, value: Value) -> PyResult<TypeId> {
         self.state.heap.type_id(value)
     }
 
     /// The type object registered for `id`.
-    pub(super) fn type_value(&self, id: TypeId) -> Result<Value, String> {
+    pub(super) fn type_value(&self, id: TypeId) -> PyResult<Value> {
         Ok(self.value(self.state.types.value_ref(id)?))
     }
 
@@ -221,7 +218,7 @@ impl<'s> Vm<'s> {
     /// Pop the top stored reference without pinning it, for moving a value between roots
     /// or discarding it.
     #[inline(always)]
-    pub(super) fn pop_ref(&mut self) -> Result<Ref, String> {
+    pub(super) fn pop_ref(&mut self) -> PyResult<Ref> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -235,7 +232,7 @@ impl<'s> Vm<'s> {
     /// The stored reference `depth` entries below the top of the stack (0 is the top), for
     /// instructions that work in place.
     #[inline(always)]
-    pub(super) fn peek_ref(&self, depth: usize) -> Result<&Ref, String> {
+    pub(super) fn peek_ref(&self, depth: usize) -> PyResult<&Ref> {
         if self.frame_stack_len() <= depth {
             return Err("stack underflow".into());
         }
@@ -253,7 +250,7 @@ impl<'s> Vm<'s> {
 
     /// The value `depth` entries below the top of the stack (0 is the top).
     #[inline(always)]
-    pub(super) fn peek(&self, depth: usize) -> Result<Value, String> {
+    pub(super) fn peek(&self, depth: usize) -> PyResult<Value> {
         self.execution
             .stack
             .peek(&self.state.heap, depth)
@@ -261,7 +258,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Pop `count` values, bottom-first.
-    pub(super) fn pop_many(&mut self, count: usize) -> Result<Vec<Value>, String> {
+    pub(super) fn pop_many(&mut self, count: usize) -> PyResult<Vec<Value>> {
         self.execution
             .stack
             .pop_many(&self.state.heap, count)
@@ -270,7 +267,7 @@ impl<'s> Vm<'s> {
 
     // ----- symbols -------------------------------------------------------------------------
 
-    pub(super) fn intern_symbol(&mut self, name: &str) -> Result<SymbolId, String> {
+    pub(super) fn intern_symbol(&mut self, name: &str) -> PyResult<SymbolId> {
         self.state.symbols.intern(name, &mut self.interp.resources)
     }
 
@@ -291,7 +288,7 @@ impl<'s> Vm<'s> {
         local_names: std::sync::Arc<[String]>,
         locals: Vec<Option<Value>>,
         values: HashMap<String, Value>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let layout = scopes::ScopeLayout {
             parent,
             uses_repl_globals,
@@ -308,7 +305,7 @@ impl<'s> Vm<'s> {
         uses_repl_globals: bool,
         local_names: std::sync::Arc<[String]>,
         values: HashMap<String, Value>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let layout = scopes::ScopeLayout {
             parent,
             uses_repl_globals,
@@ -319,7 +316,7 @@ impl<'s> Vm<'s> {
         })
     }
 
-    pub(super) fn scope_get(&self, scope: Value, name: &str) -> Result<Option<Value>, String> {
+    pub(super) fn scope_get(&self, scope: Value, name: &str) -> PyResult<Option<Value>> {
         scopes::get(&self.state.heap, scope, name)
     }
 
@@ -328,7 +325,7 @@ impl<'s> Vm<'s> {
         scope: Value,
         name: String,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         self.with_heap(|heap, roots, resources| {
             scopes::insert(heap, scope, name, value, roots, resources)
         })
@@ -370,7 +367,7 @@ impl<'s> Vm<'s> {
         instance: Value,
         name: &str,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         self.with_attributes(|store| store.insert(instance, name, value))
     }
 
@@ -379,7 +376,7 @@ impl<'s> Vm<'s> {
         instance: Value,
         symbol: SymbolId,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         self.with_attributes(|store| store.insert_by_symbol(instance, symbol, value))
     }
 
@@ -387,7 +384,7 @@ impl<'s> Vm<'s> {
         &mut self,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         self.with_attributes(|store| store.remove_by_symbol(instance, symbol))
     }
 
@@ -395,7 +392,7 @@ impl<'s> Vm<'s> {
         &self,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         self.state
             .shapes
             .attribute_by_symbol(&self.state.heap, instance, symbol)
@@ -405,13 +402,13 @@ impl<'s> Vm<'s> {
         &self,
         instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<InstanceAttributeSlot>, String> {
+    ) -> PyResult<Option<InstanceAttributeSlot>> {
         self.state
             .shapes
             .slot_by_symbol(&self.state.heap, instance, symbol)
     }
 
-    pub(super) fn instance_attribute_names(&self, instance: Value) -> Result<Vec<String>, String> {
+    pub(super) fn instance_attribute_names(&self, instance: Value) -> PyResult<Vec<String>> {
         self.state
             .shapes
             .attribute_names(&self.state.heap, &self.state.symbols, instance)

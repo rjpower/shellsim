@@ -17,6 +17,7 @@ use std::cmp::Ordering;
 use super::super::ast::ComparisonOperator;
 use super::super::heap::{Heap, Object};
 use super::{number, string, BuiltinType, Slot, Value, Vm};
+use crate::python::error::{PyError, PyResult};
 
 /// Nesting bound for ordering comparisons of builtin sequences, matching the equality bound.
 const MAX_COMPARE_DEPTH: usize = 256;
@@ -90,7 +91,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         if let Some(result) = self.fast_compare(operator, left, right)? {
             return Ok(Value::Bool(result));
         }
@@ -108,7 +109,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: &Value,
         right: &Value,
-    ) -> Result<bool, String> {
+    ) -> PyResult<bool> {
         if let Some(result) = self.fast_compare(operator, *left, *right)? {
             return Ok(result);
         }
@@ -122,7 +123,7 @@ impl<'s> Vm<'s> {
     /// Order `left` and `right` with `<` alone, as CPython's sorting, heap and bisection
     /// helpers do: `left < right` is `Less`, `right < left` is `Greater`, and anything else,
     /// such as a NaN, is `Equal`, so the earlier value stays in place.
-    pub(super) fn sort_order(&mut self, left: &Value, right: &Value) -> Result<Ordering, String> {
+    pub(super) fn sort_order(&mut self, left: &Value, right: &Value) -> PyResult<Ordering> {
         if self.compare_truth(ComparisonOperator::Less, left, right)? {
             Ok(Ordering::Less)
         } else if self.compare_truth(ComparisonOperator::Less, right, left)? {
@@ -138,7 +139,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<bool>, String> {
+    ) -> PyResult<Option<bool>> {
         if let Some(result) = number::exact_integer_comparison(operator, left, right)
             .or_else(|| number::exact_float_comparison(operator, left, right))
         {
@@ -154,10 +155,10 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<bool>, String> {
+    ) -> PyResult<Option<bool>> {
         // Only exact `str` values qualify: a `str` subclass holds the same payload but may define
         // its own comparison.
-        let is_plain = |heap: &Heap, value: Value| -> Result<bool, String> {
+        let is_plain = |heap: &Heap, value: Value| -> PyResult<bool> {
             Ok(value.inline_string_ref().is_some()
                 || (value.is_object() && heap.type_id(value)? == BuiltinType::String.id()))
         };
@@ -189,7 +190,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let Some(((left_slot, left_name), (right_slot, right_name))) = operator.slots() else {
             return Ok(None);
         };
@@ -232,7 +233,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<bool, String> {
+    ) -> PyResult<bool> {
         match operator {
             ComparisonOperator::Equal => Ok(self.identical(left, right)),
             ComparisonOperator::NotEqual => Ok(!self.identical(left, right)),
@@ -246,14 +247,14 @@ impl<'s> Vm<'s> {
         symbol: &str,
         left: &Value,
         right: &Value,
-    ) -> String {
+    ) -> PyError {
         let message = match (self.type_name_of(left), self.type_name_of(right)) {
             (Ok(left), Ok(right)) => {
                 format!("'{symbol}' not supported between instances of '{left}' and '{right}'")
             }
             (Err(error), _) | (_, Err(error)) => return error,
         };
-        self.raise_exception("TypeError", message)
+        PyError::exception("TypeError", message)
     }
 
     /// The comparison slot of the builtin containers: lists and tuples order element by
@@ -264,7 +265,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<bool>, String> {
+    ) -> PyResult<Option<bool>> {
         if !left.is_object() || !right.is_object() {
             return Ok(None);
         }
@@ -314,7 +315,7 @@ impl<'s> Vm<'s> {
         operator: ComparisonOperator,
         left: Value,
         right: Value,
-    ) -> Result<Option<bool>, String> {
+    ) -> PyResult<Option<bool>> {
         self.nested_comparison(|vm| {
             let mut index = 0;
             loop {
@@ -340,10 +341,10 @@ impl<'s> Vm<'s> {
     /// the host stack when containers nest past [`MAX_COMPARE_DEPTH`].
     pub(super) fn nested_comparison<T>(
         &mut self,
-        body: impl FnOnce(&mut Self) -> Result<T, String>,
-    ) -> Result<T, String> {
+        body: impl FnOnce(&mut Self) -> PyResult<T>,
+    ) -> PyResult<T> {
         if self.execution.compare_depth >= MAX_COMPARE_DEPTH {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "RecursionError",
                 "maximum recursion depth exceeded in comparison",
             ));

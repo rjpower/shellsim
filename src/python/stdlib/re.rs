@@ -184,7 +184,7 @@ impl NativeObject for RegexObject {
         BuiltinType::Regex.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         u64::try_from(self.pattern.len()).map_err(|_| "modeled object size overflow".into())
     }
 
@@ -195,7 +195,7 @@ impl NativeObject for RegexObject {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         let flags = flag_repr(self.flags);
         let pattern = quote_string(&self.pattern);
         Ok(if flags.is_empty() {
@@ -227,7 +227,7 @@ impl NativeObject for MatchObject {
         BuiltinType::Match.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         let text = |values: &[Option<String>]| {
             values
                 .iter()
@@ -261,7 +261,7 @@ impl NativeObject for MatchObject {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         let (start, end) = self.spans.first().copied().flatten().unwrap_or((0, 0));
         Ok(format!(
             "<re.Match object; span=({start}, {end}), match={}>",

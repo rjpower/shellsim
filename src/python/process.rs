@@ -11,6 +11,7 @@ use crate::process::{LiveChild, ProcessStatus, Signal};
 use crate::vfs::resolve_against;
 
 use super::native::{PyError, PyProcessHandle, PyProcessOutput, PyProcessStartRequest, PyStdio};
+use crate::python::error::PyResult;
 
 /// Start a modeled argv child and retain its parent-side pipe endpoints by logical PID.
 pub(super) fn start(
@@ -30,7 +31,7 @@ pub(super) fn start(
         .start_live_child(&command, true, request.start_new_session)
         .map_err(PyError::resource_error)?;
     let mut endpoints = FdTable::new();
-    let setup = (|| -> Result<(), String> {
+    let setup = (|| -> PyResult<()> {
         interp.configure_process(pid, cwd, request.environment)?;
         setup_stdin(interp, pid, request.stdin, &mut endpoints)?;
         setup_output(interp, pid, 1, request.stdout, &mut endpoints)?;
@@ -44,9 +45,7 @@ pub(super) fn start(
         } else {
             setup_output(interp, pid, 2, request.stderr, &mut endpoints)?;
         }
-        interp
-            .load_argv_program(pid, request.argv)
-            .map_err(|error| error.to_string())?;
+        interp.load_argv_program(pid, request.argv)?;
         Ok(())
     })();
     if let Err(error) = setup {
@@ -587,12 +586,12 @@ fn setup_stdin(
     pid: u32,
     mode: PyStdio,
     endpoints: &mut FdTable,
-) -> Result<(), String> {
+) -> PyResult<()> {
     match mode {
         PyStdio::Inherit => Ok(()),
         PyStdio::Pipe => install_pipe(interp, pid, 0, 0, endpoints, true),
         PyStdio::DevNull => install_null(interp, pid, 0),
-        PyStdio::MergeStdout => Err("stdin cannot merge stdout".to_string()),
+        PyStdio::MergeStdout => Err("stdin cannot merge stdout".to_string().into()),
     }
 }
 
@@ -602,12 +601,12 @@ fn setup_output(
     fd: i32,
     mode: PyStdio,
     endpoints: &mut FdTable,
-) -> Result<(), String> {
+) -> PyResult<()> {
     match mode {
         PyStdio::Inherit => install_pipe(interp, pid, fd, fd, endpoints, false),
         PyStdio::Pipe => install_pipe(interp, pid, fd, fd, endpoints, false),
         PyStdio::DevNull => install_null(interp, pid, fd),
-        PyStdio::MergeStdout => Err("only stderr may merge stdout".to_string()),
+        PyStdio::MergeStdout => Err("only stderr may merge stdout".to_string().into()),
     }
 }
 
@@ -618,7 +617,7 @@ fn install_pipe(
     parent_fd: i32,
     endpoints: &mut FdTable,
     child_reads: bool,
-) -> Result<(), String> {
+) -> PyResult<()> {
     let (reader, writer) = interp
         .descriptors
         .open_pipe(DEFAULT_PIPE_CAPACITY)
@@ -631,21 +630,21 @@ fn install_pipe(
     if let Err(error) = endpoints.install(parent_fd, parent, &mut interp.descriptors) {
         let _ = interp.descriptors.discard_unreferenced(reader);
         let _ = interp.descriptors.discard_unreferenced(writer);
-        return Err(descriptor_message(error));
+        return Err(descriptor_message(error).into());
     }
     if let Err(error) = interp.install_process_description(pid, child_fd, child) {
         let _ = endpoints.close(parent_fd, &mut interp.descriptors);
         let _ = interp.descriptors.discard_unreferenced(child);
-        return Err(descriptor_message(error));
+        return Err(descriptor_message(error).into());
     }
     Ok(())
 }
 
-fn install_null(interp: &mut Interp, pid: u32, fd: i32) -> Result<(), String> {
+fn install_null(interp: &mut Interp, pid: u32, fd: i32) -> PyResult<()> {
     let null = interp.descriptors.open_null().map_err(descriptor_message)?;
     if let Err(error) = interp.install_process_description(pid, fd, null) {
         let _ = interp.descriptors.discard_unreferenced(null);
-        return Err(descriptor_message(error));
+        return Err(descriptor_message(error).into());
     }
     Ok(())
 }

@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::python::error::{PyError, PyResult};
 use crate::resources::Resources;
 
 const SYMBOL_NAME_BYTES: u64 = 24;
@@ -45,7 +46,7 @@ impl Symbols {
     }
 
     /// Intern one identifier, charging its process-lifetime storage before mutation.
-    pub fn intern(&mut self, name: &str, resources: &mut Resources) -> Result<SymbolId, String> {
+    pub fn intern(&mut self, name: &str, resources: &mut Resources) -> PyResult<SymbolId> {
         if let Some(symbol) = self.id(name) {
             return Ok(symbol);
         }
@@ -59,7 +60,7 @@ impl Symbols {
             .checked_add(bytes)
             .ok_or("modeled symbol table size overflow")?;
         if !resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.modeled_bytes = modeled_bytes;
         let name: Arc<str> = name.into();

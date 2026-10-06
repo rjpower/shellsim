@@ -108,7 +108,7 @@ pub(in crate::python) fn axis_index(
     prefix: Option<&str>,
 ) -> PyResult<usize> {
     array::normalize_axis(axis, ndim).map_err(|error| match prefix {
-        Some(prefix) => PyError::exception("AxisError", format!("{prefix}: {}", error.message)),
+        Some(prefix) => PyError::exception("AxisError", format!("{prefix}: {}", error.message())),
         None => error,
     })
 }

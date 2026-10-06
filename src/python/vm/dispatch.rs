@@ -5,9 +5,11 @@ use super::super::scopes;
 use super::{
     dispatch_next, exception_types, frame_index, protocol, string, BytecodeFrame, CallId, CallMode,
     CodeRef, DispatchCursor, ExceptionType, Flow, ForIterOutcome, FrameEntry, LocalsLocation,
-    NativeValue, Opcode, PendingNativeCall, RaisedException, SequenceKind, Suspension,
-    TracebackFrame, Value, Vm, VM_POLL_QUANTUM,
+    NativeValue, Opcode, PendingNativeCall, SequenceKind, Suspension, TracebackFrame, Value, Vm,
+    VM_POLL_QUANTUM,
 };
+use crate::python::error::PyError;
+use crate::python::error::PyResult;
 
 /// Where a frame that suspends at `yield` stops, which `try` regions it has open and which
 /// context managers it has entered, so a generator can resume from exactly that point.
@@ -23,7 +25,7 @@ impl<'s> Vm<'s> {
         &mut self,
         code: &CodeRef,
         entry: FrameEntry,
-    ) -> Result<Flow, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (PyError, super::super::source::Span)> {
         let mut resume = ResumePoint {
             instruction_pointer: 0,
             handlers: Vec::new(),
@@ -42,7 +44,7 @@ impl<'s> Vm<'s> {
         resume: &mut ResumePoint,
         stack_base: usize,
         entry: FrameEntry,
-    ) -> Result<Flow, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (PyError, super::super::source::Span)> {
         let frame = self
             .enter_frame(code, resume.instruction_pointer, stack_base, entry, false)
             .map_err(|error| (error, super::super::source::Span::default()))?;
@@ -85,7 +87,7 @@ impl<'s> Vm<'s> {
         stack_base: usize,
         entry: FrameEntry,
         called: bool,
-    ) -> Result<BytecodeFrame, String> {
+    ) -> PyResult<BytecodeFrame> {
         let code_cache = frame_index(self.ensure_code_cache(code)?)?;
         Ok(BytecodeFrame {
             code: code.clone(),
@@ -121,7 +123,7 @@ impl<'s> Vm<'s> {
     pub(super) fn execute_active_frame(
         &mut self,
         budget: usize,
-    ) -> Result<Flow, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (PyError, super::super::source::Span)> {
         // Pins made while executing live in this child scope and die with each instruction;
         // only stored references in the VM's roots carry values from one instruction to the next.
         // An instruction that works in place on the operand stack pins nothing at all, so the
@@ -170,7 +172,7 @@ impl<'s> Vm<'s> {
         dispatch: &mut DispatchCursor,
         quantum: usize,
         executed: &mut u64,
-    ) -> Result<Flow, (String, super::super::source::Span)> {
+    ) -> Result<Flow, (PyError, super::super::source::Span)> {
         'execution: for _ in 0..quantum {
             // A resource limit a native or a nested execution hit stops the process before the
             // next instruction, as the per-instruction charge did; the quantum itself cannot
@@ -199,15 +201,14 @@ impl<'s> Vm<'s> {
             {
                 self.execution.test_timeout = None;
                 dispatch.sync(self);
-                let error =
-                    self.record_native_error(super::PyError::exception("Failed", "test timed out"));
+                let error = super::PyError::exception("Failed", "test timed out");
                 self.propagate_error(error, dispatch.span())?;
                 let span = dispatch.span();
                 dispatch.refresh(self).map_err(|error| (error, span))?;
                 continue 'execution;
             }
             let opcode = instruction.opcode;
-            let result: Result<Flow, String> = match opcode {
+            let result: PyResult<Flow> = match opcode {
                 Opcode::LoadConstant(constant) => self
                     .value_from_constant(code.constant(constant))
                     .map(|value| {
@@ -446,7 +447,7 @@ impl<'s> Vm<'s> {
                     Err(error) => Err(error),
                 },
                 Opcode::AwaitResult => self.dispatch_await_result(),
-                Opcode::RuntimeError(error) => Err(code.error(error).to_owned()),
+                Opcode::RuntimeError(error) => Err(code.error(error).to_owned().into()),
                 Opcode::Assert => self.dispatch_assert(),
                 Opcode::TryBegin(target) => {
                     let depth = self.stack.len();
@@ -457,43 +458,21 @@ impl<'s> Vm<'s> {
                 Opcode::TryEnd => {
                     self.pop_handler()
                         .ok_or("invalid bytecode exception handler")
-                        .map_err(|e| (e.to_string(), dispatch.span()))?;
+                        .map_err(|e| (PyError::from(e), dispatch.span()))?;
                     Ok(Flow::Next)
                 }
-                Opcode::MatchException { typed } => {
-                    let actual = self
-                        .exception_stack
-                        .last()
-                        .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), dispatch.span()))?
-                        .clone();
-                    let matches = if typed {
-                        let expected = self.pop().map_err(|error| (error, dispatch.span()))?;
-                        self.exception_type_matches(expected, &actual)
-                            .map_err(|error| (error, dispatch.span()))?
-                    } else {
-                        true
-                    };
-                    self.push(Value::Bool(matches));
-                    Ok(Flow::Next)
-                }
-                Opcode::ClearException => {
-                    self.exception_stack
-                        .pop()
-                        .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), dispatch.span()))?;
-                    Ok(Flow::Next)
-                }
-                Opcode::Reraise => {
-                    let exception = self
-                        .exception_stack
-                        .last()
-                        .cloned()
-                        .ok_or("no active exception")
-                        .map_err(|e| (e.to_string(), dispatch.span()))?;
-                    self.pending_exception = Some(exception);
-                    Err("exception raised".into())
-                }
+                Opcode::MatchException { typed } => self.dispatch_match_exception(typed),
+                Opcode::ClearException => match self.exception_stack.pop() {
+                    Some(_) => Ok(Flow::Next),
+                    None => Err("no active exception".into()),
+                },
+                Opcode::Reraise => match self.exception_stack.last() {
+                    Some(exception) => {
+                        let exception = self.value(exception);
+                        Err(self.raise_value(exception))
+                    }
+                    None => Err("no active exception".into()),
+                },
                 Opcode::Raise(has_value) => self.dispatch_raise(has_value),
                 Opcode::RaiseFrom => self.dispatch_raise_from(),
                 Opcode::WithEnter => self.dispatch_with_enter(),
@@ -547,7 +526,7 @@ impl<'s> Vm<'s> {
         call: CallId,
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let call = code.call(call);
         self.dispatch_call_spec(
             call.positional,
@@ -567,7 +546,7 @@ impl<'s> Vm<'s> {
         call: CallId,
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let call = code.call(call);
         let count = call.positional + call.keywords.len();
         let receiver_depth = count - 1;
@@ -604,7 +583,7 @@ impl<'s> Vm<'s> {
         starred: &[bool],
         op_index: usize,
         span: super::super::source::Span,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         // The calling frame resumes past the call whether the callee runs in its own frame,
         // suspends, or returns here; recording that first also lets native code attribute
         // work to this line, as `warnings.warn` does for its caller.
@@ -614,7 +593,7 @@ impl<'s> Vm<'s> {
 
     /// The value of a call made in [`CallMode::Immediate`], which leaves it on the operand
     /// stack; an exit request propagates as the flow to return from the current arm.
-    pub(super) fn immediate_value(&mut self, flow: Flow) -> Result<Result<Value, Flow>, String> {
+    pub(super) fn immediate_value(&mut self, flow: Flow) -> PyResult<Result<Value, Flow>> {
         match flow {
             Flow::Next => self.pop().map(Ok),
             Flow::Exit(status) => Ok(Err(Flow::Exit(status))),
@@ -623,7 +602,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_assert(&mut self) -> Result<Flow, String> {
+    fn dispatch_assert(&mut self) -> PyResult<Flow> {
         let message = self.pop()?;
         let condition = self.pop()?;
         if self.truth_value(&condition)? {
@@ -634,15 +613,25 @@ impl<'s> Vm<'s> {
         } else {
             protocol::display(self.state, message)?
         };
-        let value = self.allocate_exception("AssertionError".into(), message)?;
-        self.pending_exception = Some(RaisedException {
-            kind: "AssertionError".into(),
-            value: self.store(value),
-        });
-        Err("assertion failed".into())
+        let value = self.allocate_exception("AssertionError", message)?;
+        Err(self.raise_value(value))
     }
 
-    fn dispatch_await_result(&mut self) -> Result<Flow, String> {
+    /// `except` matching: push whether the innermost handled exception is an instance of the
+    /// class or tuple on the stack, or `True` for a bare `except:`.
+    fn dispatch_match_exception(&mut self, typed: bool) -> PyResult<Flow> {
+        let actual = self.value(self.exception_stack.last().ok_or("no active exception")?);
+        let matches = if typed {
+            let expected = self.pop()?;
+            self.exception_type_matches(expected, actual)?
+        } else {
+            true
+        };
+        self.push(Value::Bool(matches));
+        Ok(Flow::Next)
+    }
+
+    fn dispatch_await_result(&mut self) -> PyResult<Flow> {
         let outcome = self.pop()?;
         if !outcome.is_object() {
             return Err("invalid coroutine scheduler outcome".into());
@@ -657,34 +646,23 @@ impl<'s> Vm<'s> {
             self.push(value);
             return Ok(Flow::Next);
         }
-        let Some(kind) = exception_types::exception_type_name(self.state, value)? else {
+        if exception_types::exception_base(self.state, value)?.is_none() {
             return Err("coroutine scheduler injected a non-exception".into());
-        };
-        self.pending_exception = Some(RaisedException {
-            kind,
-            value: self.store(value),
-        });
-        Err("exception raised across await".into())
+        }
+        Err(self.raise_value(value))
     }
 
     #[cold]
     #[inline(never)]
-    fn dispatch_raise(&mut self, has_value: bool) -> Result<Flow, String> {
+    fn dispatch_raise(&mut self, has_value: bool) -> PyResult<Flow> {
         let exception = if has_value {
             let value = self.pop()?;
-            if let Some(kind) = exception_types::exception_type_name(self.state, value)? {
-                RaisedException {
-                    kind,
-                    value: self.store(value),
-                }
+            if exception_types::exception_base(self.state, value)?.is_some() {
+                value
             } else if let Some(NativeValue::ExceptionType(ExceptionType(kind))) =
                 value.native_value()
             {
-                let value = self.allocate_exception(kind.to_string(), String::new())?;
-                RaisedException {
-                    kind: kind.to_string(),
-                    value: self.store(value),
-                }
+                self.allocate_exception(kind, String::new())?
             } else if self.exception_class_base(&value)?.is_some() {
                 // `raise Cls` raises `Cls()`, running any user `__init__`.
                 self.push(value);
@@ -693,23 +671,21 @@ impl<'s> Vm<'s> {
                     Ok(instance) => instance,
                     Err(flow) => return Ok(flow),
                 };
-                let kind = exception_types::exception_type_name(self.state, instance)?
-                    .ok_or("exception class produced a non-exception instance")?;
-                RaisedException {
-                    kind,
-                    value: self.store(instance),
+                if exception_types::exception_base(self.state, instance)?.is_none() {
+                    return Err("exception class produced a non-exception instance".into());
                 }
+                instance
             } else {
                 return Err("exceptions must derive from BaseException".into());
             }
         } else {
-            self.exception_stack
-                .last()
-                .cloned()
-                .ok_or("No active exception to reraise")?
+            self.value(
+                self.exception_stack
+                    .last()
+                    .ok_or("No active exception to reraise")?,
+            )
         };
-        self.pending_exception = Some(exception);
-        Err("exception raised".into())
+        Err(self.raise_value(exception))
     }
 
     /// `raise exception from cause`. The cause must be an exception, an exception class, or
@@ -717,13 +693,13 @@ impl<'s> Vm<'s> {
     /// dropped; an uncaught chained exception prints without its cause.
     #[cold]
     #[inline(never)]
-    fn dispatch_raise_from(&mut self) -> Result<Flow, String> {
+    fn dispatch_raise_from(&mut self) -> PyResult<Flow> {
         let cause = self.pop()?;
         let valid = cause.is_none()
             || exception_types::exception_type_name(self.state, cause)?.is_some()
             || self.exception_class_base(&cause)?.is_some();
         if !valid {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 "exception causes must derive from BaseException",
             ));
@@ -732,7 +708,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_with_enter(&mut self) -> Result<Flow, String> {
+    fn dispatch_with_enter(&mut self) -> PyResult<Flow> {
         let context = self.pop()?;
         // CPython looks up `__exit__` first, then `__enter__`.
         for method in ["__exit__", "__enter__"] {
@@ -742,7 +718,7 @@ impl<'s> Vm<'s> {
                      method)",
                     self.type_name_of(&context)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
         }
         self.push(context);
@@ -762,7 +738,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_with_exit(&mut self) -> Result<Flow, String> {
+    fn dispatch_with_exit(&mut self) -> PyResult<Flow> {
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
         self.execution.stack.push_ref(&context);
         self.load_attribute("__exit__")?;
@@ -777,15 +753,15 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(never)]
-    fn dispatch_with_exit_exception(&mut self) -> Result<Flow, String> {
+    fn dispatch_with_exit_exception(&mut self) -> PyResult<Flow> {
         // The handler pushed the exception; `__exit__` receives it from the exception stack.
         self.pop()?;
         let context = self.with_contexts.pop().ok_or("with stack underflow")?;
         self.execution.stack.push_ref(&context);
-        let (kind, exception) = self.active_exception()?;
+        let exception = self.active_exception()?;
         self.load_attribute("__exit__")?;
-        let exception_kind = self.exception_class(&kind, &exception)?;
-        self.push(exception_kind);
+        let exception_class = self.exception_class(exception)?;
+        self.push(exception_class);
         self.push(exception);
         self.push(Value::None);
         let flow = self.call(3, &[], &[false, false, false], CallMode::Immediate)?;
@@ -798,68 +774,57 @@ impl<'s> Vm<'s> {
             self.exception_stack.pop();
             Ok(Flow::Next)
         } else {
-            self.pending_exception = Some(RaisedException {
-                kind,
-                value: self.store(exception),
-            });
-            Err("exception raised".into())
+            Err(self.raise_value(exception))
         }
     }
 
-    fn dispatch_async_with_exit_exception(&mut self) -> Result<Flow, String> {
+    fn dispatch_async_with_exit_exception(&mut self) -> PyResult<Flow> {
         let context = self.pop()?;
         self.pop()?;
-        let (kind, exception) = self.active_exception()?;
+        let exception = self.active_exception()?;
         self.push(context);
         self.load_attribute("__aexit__")?;
-        let exception_kind = self.exception_class(&kind, &exception)?;
-        self.push(exception_kind);
+        let exception_class = self.exception_class(exception)?;
+        self.push(exception_class);
         self.push(exception);
         self.push(Value::None);
         // The awaited `__aexit__` result stays on the stack for the following await.
         self.call(3, &[], &[false, false, false], CallMode::Immediate)
     }
 
-    /// The innermost handled exception's kind and value, pinned so it stays valid while
-    /// `__exit__` runs guest code.
-    fn active_exception(&self) -> Result<(String, Value), String> {
+    /// The innermost handled exception, pinned so it stays valid while `__exit__` runs guest
+    /// code.
+    fn active_exception(&self) -> PyResult<Value> {
         let exception = self.exception_stack.last().ok_or("no active exception")?;
-        Ok((exception.kind.clone(), self.value(&exception.value)))
+        Ok(self.value(exception))
     }
 
-    fn exception_class(&self, kind: &str, value: &Value) -> Result<Value, String> {
+    fn exception_class(&self, exception: Value) -> PyResult<Value> {
         // A builtin exception instance has no class object; its class is the registered type.
-        if exception_types::exception_base(self.state, *value)?.is_some()
-            && self.instance_class(*value)?.is_none()
-        {
-            let name = super::known_exception_type(kind)
-                .ok_or_else(|| format!("exception type metadata is not modeled for {kind:?}"))?;
-            Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
-                name,
-            ))))
-        } else {
-            self.type_of(value)
+        if self.instance_class(exception)?.is_none() {
+            if let Some(name) = exception_types::exception_base(self.state, exception)? {
+                return Ok(Value::Native(NativeValue::ExceptionType(ExceptionType(
+                    name,
+                ))));
+            }
         }
+        self.type_of(&exception)
     }
 
-    fn dispatch_async_with_finish_exception(&mut self) -> Result<Flow, String> {
+    fn dispatch_async_with_finish_exception(&mut self) -> PyResult<Flow> {
         let suppress = self.pop()?;
         let exception = self.exception_stack.pop().ok_or("no active exception")?;
-        let (kind, value) = (exception.kind, self.value(&exception.value));
+        let exception = self.value(&exception);
         if self.truth_value(&suppress)? {
             self.pending_exception = None;
             Ok(Flow::Next)
         } else {
-            self.pending_exception = Some(RaisedException {
-                kind,
-                value: self.store(value),
-            });
-            Err("exception raised".into())
+            Err(self.raise_value(exception))
         }
     }
 
     #[inline(never)]
-    fn dispatch_pop_expression(&mut self) -> Result<Flow, String> {
+    fn dispatch_pop_expression(&mut self) -> PyResult<Flow> {
         let value = self.pop()?;
         if self.mode.interactive && !value.is_none() {
             let rendered = self.repr_value(&value)?;
@@ -874,7 +839,7 @@ impl<'s> Vm<'s> {
     ///
     /// A suspension can only be installed while returning to the scheduler, so checking it
     /// once at the next quantum boundary is sufficient.
-    fn resume_suspension(&mut self) -> Result<Option<Flow>, (String, super::super::source::Span)> {
+    fn resume_suspension(&mut self) -> Result<Option<Flow>, (PyError, super::super::source::Span)> {
         let Some(suspension) = self.suspension.take() else {
             return Ok(None);
         };
@@ -898,7 +863,7 @@ impl<'s> Vm<'s> {
     /// `LoadLocal`: copy a local slot's stored reference onto the operand stack without pinning
     /// it.
     #[inline(always)]
-    fn load_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
+    fn load_fast(&mut self, locals: LocalsLocation, slot: usize) -> PyResult<()> {
         let value = match locals {
             LocalsLocation::Stack(base) => {
                 let value = self
@@ -925,7 +890,7 @@ impl<'s> Vm<'s> {
     /// `StoreLocal`: move the operand stack's top reference into a local slot without pinning
     /// it.
     #[inline(always)]
-    fn store_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
+    fn store_fast(&mut self, locals: LocalsLocation, slot: usize) -> PyResult<()> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -952,7 +917,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `DeleteLocal`: unbind a local slot.
-    fn delete_local(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
+    fn delete_local(&mut self, locals: LocalsLocation, slot: usize) -> PyResult<()> {
         match locals {
             LocalsLocation::Stack(base) => {
                 let local = self
@@ -976,42 +941,50 @@ impl<'s> Vm<'s> {
             .expect("bytecode execution requires an active frame")
     }
 
+    /// Raise `error` if it describes an exception, then unwind called frames until a `try`
+    /// handler takes the pending exception (`Ok(true)`) or a frame Rust code entered is reached,
+    /// which gets the error back. A fault is never handled; each frame it leaves adds its
+    /// location to the message.
     fn propagate_error(
         &mut self,
-        mut error: String,
+        error: PyError,
         mut span: super::super::source::Span,
-    ) -> Result<bool, (String, super::super::source::Span)> {
+    ) -> Result<bool, (PyError, super::super::source::Span)> {
         // Rebuilt from scratch on every call: a handler found partway through means the
         // in-progress frame list here is irrelevant, and a fully uncaught error overwrites
         // whatever an earlier, since-discarded unwind (e.g. inside a generator sub-frame) left
         // behind. `render_execution` only ever reads the list left by the unwind that actually
         // reaches the top of the program.
+        let mut error = self.raise_error(error);
         let mut frames = Vec::new();
         loop {
-            if self.enter_exception_handler() {
+            if error.is_pending() && self.enter_exception_handler() {
                 return Ok(true);
             }
-            let file = self.imported_module_file();
+            let module = self.frame_module();
             let Some(callee) = self.unwind_called_frame() else {
                 frames.push(TracebackFrame {
-                    name: "<module>".to_string(),
+                    function: None,
+                    module,
                     span,
-                    file,
                 });
                 frames.reverse();
                 self.traceback_frames = frames;
                 return Err((error, span));
             };
-            let name = self.function_name(&callee);
-            frames.push(TracebackFrame {
-                name: name.clone(),
-                span,
-                file,
+            error = error.located(|| {
+                format!(
+                    " in {} at line {}, column {}",
+                    self.function_name(&callee),
+                    span.line,
+                    span.column
+                )
             });
-            error = format!(
-                "{error} in {name} at line {}, column {}",
-                span.line, span.column
-            );
+            frames.push(TracebackFrame {
+                function: Some(callee),
+                module,
+                span,
+            });
             span = self.call_site_span();
         }
     }
@@ -1042,13 +1015,19 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// `__file__` of the module whose code the active frame runs, when that module was imported.
-    /// Imported code runs under the module's scope; the main program keeps its globals outside
-    /// the scope chain, so its frames find no `__file__` here.
-    fn imported_module_file(&self) -> Option<String> {
+    /// The outermost scope of the active frame's code, recorded in a traceback frame so the
+    /// module's `__file__` can be read if the traceback is printed.
+    fn frame_module(&self) -> Option<Ref> {
+        let root = scopes::root(&self.state.heap, self.lookup_scope()?).ok()?;
+        Some(Ref::from(root))
+    }
+
+    /// `__file__` of an imported module, given its scope from [`Self::frame_module`]. Imported
+    /// code runs under the module's scope; the main program keeps its globals outside the scope
+    /// chain, so its frames find no `__file__`.
+    pub(super) fn module_file(&self, module: &Ref) -> Option<String> {
         let heap = &self.state.heap;
-        let root = scopes::root(heap, self.lookup_scope()?).ok()?;
-        let file = scopes::get(heap, root, "__file__").ok()??;
+        let file = scopes::get(heap, self.value(module), "__file__").ok()??;
         string::string_value(heap, file).ok().flatten()
     }
 
@@ -1088,7 +1067,7 @@ impl<'s> Vm<'s> {
         // Exceptions handled inside the `try` body, including one a handler was processing when
         // this exception escaped it, end with the body.
         self.exception_stack.truncate(exception_depth);
-        self.execution.stack.push_ref(&exception.value);
+        self.execution.stack.push_ref(&exception);
         self.exception_stack.push(exception);
         self.active_frame_mut().instruction_pointer = target;
         true

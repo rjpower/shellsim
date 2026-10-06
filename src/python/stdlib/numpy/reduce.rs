@@ -722,7 +722,7 @@ fn reduce_numeric<T: Numeric + Element>(
             match seed {
                 Some(seed) => run.iter().try_fold(seed, |acc, &value| {
                     check_power_exponent(op, value)?;
-                    Ok(combine_numeric(op, acc, value, &mut flags))
+                    Ok::<_, PyError>(combine_numeric(op, acc, value, &mut flags))
                 })?,
                 None => {
                     let Some((&first, rest)) = run.split_first() else {
@@ -730,7 +730,7 @@ fn reduce_numeric<T: Numeric + Element>(
                     };
                     rest.iter().try_fold(first, |acc, &value| {
                         check_power_exponent(op, value)?;
-                        Ok(combine_numeric(op, acc, value, &mut flags))
+                        Ok::<_, PyError>(combine_numeric(op, acc, value, &mut flags))
                     })?
                 }
             }

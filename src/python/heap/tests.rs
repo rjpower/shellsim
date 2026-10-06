@@ -3,6 +3,7 @@
 //! accounting.
 
 use super::*;
+use crate::python::error::PyErrorKind;
 use crate::resources::{Limits, Resources};
 
 fn unlimited() -> Resources {
@@ -70,7 +71,7 @@ fn pinned_values_survive_a_young_collection_in_place() {
     assert_eq!(text(&heap, kept), "kept");
     assert_eq!(heap.stats().promoted_objects, 1);
     assert_eq!(
-        heap.get(heap.value(&dropped_slot)).unwrap_err(),
+        heap.get(heap.value(&dropped_slot)).unwrap_err().message(),
         "stale reference to a freed object"
     );
 }
@@ -91,7 +92,7 @@ fn a_reused_slot_does_not_answer_for_its_previous_object() {
     );
     assert!(!second.is_ref(&stale));
     assert_eq!(
-        heap.get(heap.value(&stale)).unwrap_err(),
+        heap.get(heap.value(&stale)).unwrap_err().message(),
         "stale reference to a freed object"
     );
     assert_eq!(text(&heap, second), "second");
@@ -226,7 +227,7 @@ fn allocation_collects_before_reporting_out_of_memory() {
         }
         heap.truncate_pins(0);
     };
-    assert_eq!(error, "memory limit exceeded");
+    assert_eq!(error.kind(), Some(&PyErrorKind::Resource));
     assert!(roots.len() >= 8 && roots.len() < 16);
 }
 

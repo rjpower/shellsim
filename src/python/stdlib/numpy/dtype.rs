@@ -710,13 +710,12 @@ mod tests {
     #[test]
     fn unknown_and_unsupported_names_fail_differently() {
         assert_eq!(
-            DType::parse("i3").unwrap_err().message,
+            DType::parse("i3").unwrap_err().message(),
             "data type 'i3' not understood"
         );
-        assert_eq!(
-            DType::parse("M8[ns]").unwrap_err().kind,
-            super::super::super::super::native::PyErrorKind::Exception("NotImplementedError")
-        );
+        assert!(DType::parse("M8[ns]")
+            .unwrap_err()
+            .is_exception("NotImplementedError"));
     }
 
     #[test]

@@ -10,14 +10,15 @@ use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
     CallArgs, CallMode, ClassLayout, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry,
     HashMap, NativeValue, Object, PendingNativeCall, PyError, PyErrorKind, PyRuntime, PyStreamRead,
-    RaisedException, Slot, StoredCallArgs, Stream, Value, Vm,
+    Slot, StoredCallArgs, Stream, Value, Vm,
 };
+use crate::python::error::{Control, PyResult};
 use num_traits::{One, Signed, Zero};
 
 impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
-    pub(super) fn physical_length(&self, value: Value) -> Result<Option<usize>, String> {
+    pub(super) fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
         let subject = value;
         if let Some(length) = string::string_length(&self.state.heap, subject)? {
             return Ok(Some(length));
@@ -35,7 +36,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The builtin `abs(value)`, through the `__abs__` slot.
-    pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
+    pub(super) fn absolute(&mut self, value: Value) -> PyResult<Value> {
         if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
             return Ok(result);
         }
@@ -43,17 +44,17 @@ impl<'s> Vm<'s> {
             "bad operand type for abs(): '{}'",
             self.type_name_of(&value)?
         );
-        Err(self.raise_exception("TypeError", message))
+        Err(PyError::exception("TypeError", message))
     }
 
     /// Parse the source string passed to `exec` or `eval` (`builtin`). Parsing is charged
     /// before it runs, and nesting is bounded so dynamic source cannot recurse without limit.
     /// `eval` ignores leading spaces and tabs, as CPython does.
-    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> Result<Program, String> {
+    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> PyResult<Program> {
         let source = string::string_value(&self.state.heap, *source)?.ok_or_else(|| {
-            self.record_native_error(PyError::type_error(format!(
+            PyError::type_error(format!(
                 "{builtin}() arg 1 must be a string, bytes or code object"
-            )))
+            ))
         })?;
         let source = if builtin == "eval" {
             source.trim_start_matches([' ', '\t'])
@@ -61,27 +62,27 @@ impl<'s> Vm<'s> {
             &source
         };
         if self.bytecode_frames.len() >= 256 {
-            return Err(format!("maximum {builtin} depth exceeded"));
+            return Err(format!("maximum {builtin} depth exceeded").into());
         }
         let parse_memory = super::super::source::front_end_memory(source.len())
             .ok_or_else(|| format!("{builtin} source is too large"))?;
         self.charge_cpu(u64::try_from(source.len()).unwrap_or(u64::MAX))?;
         self.reserve_result(parse_memory)?;
-        let tokens = super::super::lexer::lex(source).map_err(|error| {
-            format!(
-                "{} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            )
-        })?;
+        // The front end rejects valid syntax it does not model with the same error as invalid
+        // syntax, so neither is a catchable `SyntaxError`.
+        let syntax_error = |message: &str, span: &super::super::source::Span| {
+            PyError::unsupported(format!(
+                "{message} at line {}, column {}",
+                span.line, span.column
+            ))
+        };
+        let tokens = super::super::lexer::lex(source)
+            .map_err(|error| syntax_error(&error.message, &error.span))?;
         let token_memory = super::super::source::token_memory(tokens.len())
             .ok_or_else(|| format!("{builtin} source is too large"))?;
         self.reserve_result(token_memory)?;
-        super::super::parser::parse(tokens).map_err(|error| {
-            format!(
-                "{} at line {}, column {}",
-                error.message, error.span.line, error.span.column
-            )
-        })
+        super::super::parser::parse(tokens)
+            .map_err(|error| syntax_error(&error.message, &error.span))
     }
 
     fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
@@ -94,7 +95,7 @@ impl<'s> Vm<'s> {
 
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
     /// sorted, or `None` when the class defines none.
-    fn custom_dir(&mut self, value: &Value) -> Result<Option<Value>, String> {
+    fn custom_dir(&mut self, value: &Value) -> PyResult<Option<Value>> {
         let Some(class) = self.instance_class(*value)? else {
             return Ok(None);
         };
@@ -108,7 +109,10 @@ impl<'s> Vm<'s> {
         let mut names = Vec::new();
         for item in self.iterable_values(&result)? {
             let Some(name) = string::string_value(&self.state.heap, item)? else {
-                return Err(self.raise_exception("TypeError", "__dir__() must return strings"));
+                return Err(PyError::exception(
+                    "TypeError",
+                    "__dir__() must return strings",
+                ));
             };
             names.push((name, item));
         }
@@ -118,7 +122,7 @@ impl<'s> Vm<'s> {
         self.alloc(Object::List(Ref::all(values))).map(Some)
     }
 
-    fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
+    fn dir_names(&self, value: &Value) -> PyResult<Vec<String>> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
                 .functions
@@ -165,7 +169,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The names a builtin value's registered type and its ancestors publish, for `dir()`.
-    fn type_attribute_names(&self, value: &Value) -> Result<Vec<String>, String> {
+    fn type_attribute_names(&self, value: &Value) -> PyResult<Vec<String>> {
         let type_id = self.type_id(value)?;
         let ty = self.state.types.get(type_id)?;
         let mut names = ty.attributes.keys().cloned().collect::<Vec<_>>();
@@ -186,7 +190,7 @@ impl<'s> Vm<'s> {
         keywords: &[KeywordName],
         starred: &[bool],
         mode: CallMode,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let count = positional
             .checked_add(keywords.len())
             .ok_or("too many call arguments")?;
@@ -212,7 +216,7 @@ impl<'s> Vm<'s> {
         positional: usize,
         keywords: &[KeywordName],
         starred: &[bool],
-    ) -> Result<(usize, Vec<KeywordName>), String> {
+    ) -> PyResult<(usize, Vec<KeywordName>)> {
         let arguments_start = self.stack.len() - positional - keywords.len();
         let mut raw_arguments = self
             .execution
@@ -247,13 +251,14 @@ impl<'s> Vm<'s> {
                             "argument after ** must be a mapping, not {}",
                             self.type_name_of(&value)?
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     };
                     for (key, value) in entries {
                         let Some(name) = string::string_value(&self.state.heap, key)? else {
-                            return Err(
-                                self.raise_exception("TypeError", "keywords must be strings")
-                            );
+                            return Err(PyError::exception(
+                                "TypeError",
+                                "keywords must be strings",
+                            ));
                         };
                         self.push_keyword_argument(&mut names, Arc::from(name), value)?;
                     }
@@ -265,7 +270,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Push one expanded positional argument, metering the stack growth.
-    fn push_argument(&mut self, value: Value) -> Result<(), String> {
+    fn push_argument(&mut self, value: Value) -> PyResult<()> {
         self.reserve_result(64)?;
         self.charge_cpu(1)?;
         self.push(value);
@@ -278,13 +283,13 @@ impl<'s> Vm<'s> {
         names: &mut Vec<KeywordName>,
         name: Arc<str>,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if names
             .iter()
             .any(|existing| existing.as_deref() == Some(&*name))
         {
             let message = format!("got multiple values for keyword argument '{name}'");
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         }
         self.reserve_result(64usize.saturating_add(name.len()))?;
         self.charge_cpu(1)?;
@@ -299,7 +304,7 @@ impl<'s> Vm<'s> {
         positional: usize,
         keywords: &[KeywordName],
         mode: CallMode,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let count = positional + keywords.len();
         let callee = self.peek(count)?;
         if callee.is_object() {
@@ -340,8 +345,7 @@ impl<'s> Vm<'s> {
         let function = self.pop()?;
         if let Some(call) = self.registered_kind(&function).and_then(|kind| kind.call) {
             return call(self, function, CallArgs::new(arguments, keyword_arguments))
-                .map(|value| self.produce(value))
-                .map_err(|error| self.record_native_error(error));
+                .map(|value| self.produce(value));
         }
         if function.is_object() {
             /// What a heap callable is, with the values its call needs.
@@ -416,14 +420,12 @@ impl<'s> Vm<'s> {
         }
         if let Some(NativeValue::ValueKind(kind)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
-            return (kind.construct)(self, call)
-                .map(|value| self.produce(value))
-                .map_err(|error| self.record_native_error(error));
+            return (kind.construct)(self, call).map(|value| self.produce(value));
         }
         if let Some(NativeValue::ExceptionType(exception_type)) = function.native_value() {
             if !keyword_arguments.is_empty() {
                 let message = format!("{}() takes no keyword arguments", exception_type.0);
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
             // `OSError(errno, strerror, ...)` constructs the errno's subclass, as CPython does.
             let kind = match arguments.first().and_then(|value| value.immediate_int()) {
@@ -440,7 +442,10 @@ impl<'s> Vm<'s> {
         }
         if let Some(NativeValue::SlotWrapper { owner, slot }) = function.native_value() {
             if arguments.is_empty() {
-                return Err(self.raise_exception("TypeError", "slot wrapper requires a receiver"));
+                return Err(PyError::exception(
+                    "TypeError",
+                    "slot wrapper requires a receiver",
+                ));
             }
             let receiver = arguments.remove(0);
             return self
@@ -468,16 +473,10 @@ impl<'s> Vm<'s> {
             self.native_suspend_allowed = self.may_suspend(mode);
             let result = (function.call)(self, call);
             self.native_suspend_allowed = previous_suspend;
-            return match result {
+            return match result.map_err(PyError::into_control) {
                 Ok(value) => Ok(self.native_result(value)),
-                Err(PyError {
-                    kind: PyErrorKind::Exit(status),
-                    ..
-                }) => Ok(Flow::Exit(status)),
-                Err(PyError {
-                    kind: PyErrorKind::Suspend(reason),
-                    ..
-                }) => match (mode, retry_arguments) {
+                Err(Ok(Control::Exit(status))) => Ok(Flow::Exit(status)),
+                Err(Ok(Control::Suspend(reason))) => match (mode, retry_arguments) {
                     (CallMode::Deferred(call_span), Some(arguments)) => {
                         let retry = PendingNativeCall::Function {
                             function,
@@ -488,7 +487,7 @@ impl<'s> Vm<'s> {
                     }
                     _ => Err("native call suspended outside scheduler dispatch".into()),
                 },
-                Err(error) => Err(self.record_native_error(error)),
+                Err(Err(error)) => Err(error),
             };
         }
         let Some(NativeValue::Function(function)) = function.native_value() else {
@@ -537,7 +536,8 @@ impl<'s> Vm<'s> {
                         _ => {
                             return Err(format!(
                                 "print() got an unexpected keyword argument {name:?}"
-                            ))
+                            )
+                            .into())
                         }
                     }
                 }
@@ -586,19 +586,17 @@ impl<'s> Vm<'s> {
                 self.native_suspend_allowed = self.may_suspend(mode);
                 let result = self.read_stream(&marker, None, true);
                 self.native_suspend_allowed = previous_suspend;
-                match result {
+                match result.map_err(PyError::into_control) {
                     Ok(read) => {
                         let value = self.finish_input(read)?;
                         Ok(self.produce(value))
                     }
-                    Err(PyError {
-                        kind: PyErrorKind::Suspend(reason),
-                        ..
-                    }) => match retry {
+                    Err(Ok(Control::Exit(status))) => Ok(Flow::Exit(status)),
+                    Err(Ok(Control::Suspend(reason))) => match retry {
                         Some(pending) => Ok(self.suspend(reason, Some(pending))),
                         None => Err("native call suspended outside scheduler dispatch".into()),
                     },
-                    Err(error) => Err(self.record_native_error(error)),
+                    Err(Err(error)) => Err(error),
                 }
             }
             Builtin::Exec => {
@@ -610,10 +608,12 @@ impl<'s> Vm<'s> {
                     Ok(Flow::Halt) => Ok(self.produce(Value::None)),
                     Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
                     Ok(_) => Err("exec source did not finish normally".into()),
-                    Err((error, span)) => Err(format!(
-                        "{error} in exec source at line {}, column {}",
-                        span.line, span.column
-                    )),
+                    Err((error, span)) => Err(error.located(|| {
+                        format!(
+                            " in exec source at line {}, column {}",
+                            span.line, span.column
+                        )
+                    })),
                 }
             }
             Builtin::Eval => {
@@ -624,7 +624,7 @@ impl<'s> Vm<'s> {
                         kind: StatementKind::Expression(expression),
                         ..
                     }) if program.statements.is_empty() => expression,
-                    _ => return Err(self.raise_exception("SyntaxError", "invalid syntax")),
+                    _ => return Err(PyError::exception("SyntaxError", "invalid syntax")),
                 };
                 let code = super::super::compiler::compile_expression(expression);
                 let entry = self.dynamic_code_entry()?;
@@ -635,10 +635,12 @@ impl<'s> Vm<'s> {
                     }
                     Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
                     Ok(_) => Err("eval source did not finish normally".into()),
-                    Err((error, span)) => Err(format!(
-                        "{error} in eval source at line {}, column {}",
-                        span.line, span.column
-                    )),
+                    Err((error, span)) => Err(error.located(|| {
+                        format!(
+                            " in eval source at line {}, column {}",
+                            span.line, span.column
+                        )
+                    })),
                 }
             }
             Builtin::Exit => {
@@ -654,9 +656,10 @@ impl<'s> Vm<'s> {
                 let value = number::int_value(&self.state.heap, arguments[0])
                     .ok_or("an integer is required for chr()")?;
                 let Some(codepoint) = u32::try_from(value).ok().and_then(char::from_u32) else {
-                    return Err(
-                        self.raise_exception("ValueError", "chr() arg not in range(0x110000)")
-                    );
+                    return Err(PyError::exception(
+                        "ValueError",
+                        "chr() arg not in range(0x110000)",
+                    ));
                 };
                 {
                     let value = self.allocate_string(codepoint.to_string())?;
@@ -674,9 +677,7 @@ impl<'s> Vm<'s> {
                         return Err("ord() expected a character".into());
                     }
                     u32::from(character) as i64
-                } else if let Some(bytes) = <Self as PyRuntime>::bytes_value(self, &arguments[0])
-                    .map_err(|error| error.to_string())?
-                {
+                } else if let Some(bytes) = <Self as PyRuntime>::bytes_value(self, &arguments[0])? {
                     if bytes.len() != 1 {
                         return Err("ord() expected a character".into());
                     }
@@ -688,21 +689,18 @@ impl<'s> Vm<'s> {
             }
             Builtin::Binary | Builtin::Octal | Builtin::Hexadecimal => {
                 expect_arity(&arguments, 1, 1)?;
-                let integer = <Self as PyRuntime>::integer_bigint(self, &arguments[0])
-                    .map_err(|error| error.to_string())?
+                let integer = <Self as PyRuntime>::integer_bigint(self, &arguments[0])?
                     .ok_or("integer argument expected")?;
                 // Binary needs one digit per bit, the widest of the three spellings.
                 let output_bound = usize::try_from(integer.bits())
                     .ok()
                     .and_then(|length| length.checked_add(3))
                     .ok_or("integer representation is too large")?;
-                <Self as PyRuntime>::reserve_memory(self, output_bound)
-                    .map_err(|error| error.to_string())?;
+                <Self as PyRuntime>::reserve_memory(self, output_bound)?;
                 <Self as PyRuntime>::charge_cpu(
                     self,
                     u64::try_from(output_bound).unwrap_or(u64::MAX),
-                )
-                .map_err(|error| error.to_string())?;
+                )?;
                 let (prefix, digits) = match function {
                     Builtin::Binary => ("0b", format!("{integer:b}")),
                     Builtin::Octal => ("0o", format!("{integer:o}")),
@@ -730,7 +728,7 @@ impl<'s> Vm<'s> {
             Builtin::Format => {
                 if !keyword_arguments.is_empty() {
                     let message = "format() takes no keyword arguments".to_string();
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 if !(1..=2).contains(&arguments.len()) {
                     let (bound, count) = if arguments.is_empty() {
@@ -739,7 +737,7 @@ impl<'s> Vm<'s> {
                         ("most 2 arguments", arguments.len())
                     };
                     let message = format!("format expected at {bound}, got {count}");
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 let spec = match arguments.get(1) {
                     Some(spec) => {
@@ -748,7 +746,7 @@ impl<'s> Vm<'s> {
                                 "format() argument 2 must be str, not {}",
                                 self.type_name_of(spec).unwrap_or_default()
                             );
-                            self.raise_exception("TypeError", message)
+                            PyError::exception("TypeError", message)
                         })?
                     }
                     None => String::new(),
@@ -837,10 +835,10 @@ impl<'s> Vm<'s> {
                         "object of type '{}' has no len()",
                         self.type_name_of(&arguments[0])?
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 };
                 let length = i64::try_from(length)
-                    .map_err(|_| self.raise_exception("OverflowError", "length is too large"))?;
+                    .map_err(|_| PyError::exception("OverflowError", "length is too large"))?;
                 Ok(self.produce(Value::Int(length)))
             }
             Builtin::Sorted => {
@@ -864,9 +862,14 @@ impl<'s> Vm<'s> {
                         "key" | "reverse" => {
                             return Err(format!(
                                 "sorted() got multiple values for keyword {name:?}"
-                            ))
+                            )
+                            .into())
                         }
-                        _ => return Err(format!("sorted() got an unexpected keyword {name:?}")),
+                        _ => {
+                            return Err(
+                                format!("sorted() got an unexpected keyword {name:?}").into()
+                            )
+                        }
                     }
                 }
                 let mut keyed = Vec::new();
@@ -916,14 +919,14 @@ impl<'s> Vm<'s> {
                         _ => {
                             let message =
                                 format!("{name}() got an unexpected keyword argument '{keyword}'");
-                            return Err(self.raise_exception("TypeError", message));
+                            return Err(PyError::exception("TypeError", message));
                         }
                     }
                 }
                 let values = match arguments.len() {
                     0 => {
                         let message = format!("{name} expected at least 1 argument, got 0");
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     }
                     1 => self.iterable_values(&arguments[0])?,
                     _ if default.is_some() => {
@@ -931,7 +934,7 @@ impl<'s> Vm<'s> {
                             "Cannot specify a default for {name}() with multiple positional \
                              arguments"
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     }
                     _ => arguments,
                 };
@@ -967,7 +970,7 @@ impl<'s> Vm<'s> {
                     (None, Some(default)) => Ok(self.produce(default)),
                     (None, None) => {
                         let message = format!("{name}() iterable argument is empty");
-                        Err(self.raise_exception("ValueError", message))
+                        Err(PyError::exception("ValueError", message))
                     }
                 }
             }
@@ -991,17 +994,14 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 2, 3)?;
                 if arguments.len() == 3 && !arguments[2].is_none() {
                     let parsed = self.pow_integer_argument(&arguments[0]);
-                    let (base, base_len) =
-                        parsed.map_err(|error| self.record_native_error(error))?;
+                    let (base, base_len) = parsed?;
                     let parsed = self.pow_integer_argument(&arguments[1]);
-                    let (exponent, exponent_len) =
-                        parsed.map_err(|error| self.record_native_error(error))?;
+                    let (exponent, exponent_len) = parsed?;
                     let parsed = self.pow_integer_argument(&arguments[2]);
-                    let (modulus, modulus_len) =
-                        parsed.map_err(|error| self.record_native_error(error))?;
+                    let (modulus, modulus_len) = parsed?;
                     if modulus.is_zero() {
                         let error = PyError::zero_division_error("pow() 3rd argument cannot be 0");
-                        return Err(self.record_native_error(error));
+                        return Err(error);
                     }
                     let positive_modulus = modulus.abs();
                     // As in CPython, `pow(b, -e, m)` is `pow(inverse(b), e, m)`, and every
@@ -1013,23 +1013,23 @@ impl<'s> Vm<'s> {
                     } else {
                         let Some(inverse) = base.modinv(&positive_modulus) else {
                             let message = "base is not invertible for the given modulus";
-                            return Err(self.record_native_error(PyError::value_error(message)));
+                            return Err(PyError::value_error(message));
                         };
                         (inverse, -exponent)
                     };
                     let work = base_len
                         .saturating_add(modulus_len)
                         .saturating_mul(exponent_len.saturating_mul(4).max(1));
-                    <Self as PyRuntime>::charge_cpu(self, u64::try_from(work).unwrap_or(u64::MAX))
-                        .map_err(|error| error.to_string())?;
-                    <Self as PyRuntime>::reserve_memory(self, modulus_len.saturating_mul(4).max(1))
-                        .map_err(|error| error.to_string())?;
+                    <Self as PyRuntime>::charge_cpu(self, u64::try_from(work).unwrap_or(u64::MAX))?;
+                    <Self as PyRuntime>::reserve_memory(
+                        self,
+                        modulus_len.saturating_mul(4).max(1),
+                    )?;
                     let mut result = base.modpow(&exponent, &positive_modulus);
                     if modulus.is_negative() && !result.is_zero() {
                         result += modulus;
                     }
-                    let result = <Self as PyRuntime>::new_bigint(self, result)
-                        .map_err(|error| error.to_string())?;
+                    let result = <Self as PyRuntime>::new_bigint(self, result)?;
                     return Ok(self.produce(result));
                 }
                 {
@@ -1048,14 +1048,14 @@ impl<'s> Vm<'s> {
             Builtin::SetAttribute => {
                 if arguments.len() != 3 {
                     let message = format!("setattr expected 3 arguments, got {}", arguments.len());
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 let Some(name) = string::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 };
                 // `setattr(owner, name, value)` is `owner.name = value` with a computed name.
                 let symbol = self.intern_symbol(&name)?;
@@ -1065,14 +1065,14 @@ impl<'s> Vm<'s> {
             Builtin::DeleteAttribute => {
                 if arguments.len() != 2 {
                     let message = format!("delattr expected 2 arguments, got {}", arguments.len());
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 let Some(name) = string::string_value(&self.state.heap, arguments[1])? else {
                     let message = format!(
                         "attribute name must be string, not '{}'",
                         self.type_name_of(&arguments[1])?
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 };
                 let symbol = self.intern_symbol(&name)?;
                 self.delete_attribute_by_symbol(arguments[0], symbol, &name)?;
@@ -1080,16 +1080,13 @@ impl<'s> Vm<'s> {
             }
             Builtin::Callable => {
                 expect_arity(&arguments, 1, 1)?;
-                let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])
-                    .map_err(|error| error.to_string())?;
+                let callable = <Self as PyRuntime>::is_callable(self, &arguments[0])?;
                 Ok(self.produce(Value::Bool(callable)))
             }
             Builtin::Iter => {
                 expect_arity(&arguments, 1, 2)?;
                 if arguments.len() == 2 {
-                    if !<Self as PyRuntime>::is_callable(self, &arguments[0])
-                        .map_err(|error| error.to_string())?
-                    {
+                    if !<Self as PyRuntime>::is_callable(self, &arguments[0])? {
                         return Err("iter(v, w): v must be callable".into());
                     }
                     return {
@@ -1110,8 +1107,8 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 1, 2)?;
                 let value = match self.iterator_next(&arguments[0]) {
                     Ok(value) => value,
-                    Err(_) if arguments.len() == 2 && self.pending_stop_iteration() => {
-                        self.pending_exception = None;
+                    Err(error) if arguments.len() == 2 => {
+                        self.catch(error, "StopIteration")?;
                         None
                     }
                     Err(error) => return Err(error),
@@ -1233,7 +1230,7 @@ impl<'s> Vm<'s> {
                 // `vars(obj)` is `obj.__dict__`: a namespace view, or a class's or native
                 // module's read-only proxy.
                 let Some(namespace) = self.resolve_optional_attribute(*owner, "__dict__")? else {
-                    return Err(self.raise_exception(
+                    return Err(PyError::exception(
                         "TypeError",
                         "vars() argument must have __dict__ attribute",
                     ));
@@ -1245,11 +1242,7 @@ impl<'s> Vm<'s> {
 
     /// Explicit `type.__call__` skips the metaclass override while retaining ordinary class
     /// construction and the native type constructors.
-    pub(super) fn call_type_default(
-        &mut self,
-        class: Value,
-        args: CallArgs,
-    ) -> Result<Flow, String> {
+    pub(super) fn call_type_default(&mut self, class: Value, args: CallArgs) -> PyResult<Flow> {
         let (arguments, keyword_arguments) = args.into_parts();
         if class.is_object() && matches!(self.get(class)?, Object::Class { .. }) {
             return self.call_user_class(class, arguments, keyword_arguments, false);
@@ -1264,7 +1257,10 @@ impl<'s> Vm<'s> {
         ) {
             return self.invoke_call(class, arguments, keyword_arguments);
         }
-        Err(self.raise_exception("TypeError", "type.__call__ requires a class"))
+        Err(PyError::exception(
+            "TypeError",
+            "type.__call__ requires a class",
+        ))
     }
 
     /// The name, code, closure, defaults and defining class of a Python function object, or
@@ -1278,23 +1274,17 @@ impl<'s> Vm<'s> {
         native_receiver: Value,
         call: CallArgs,
         mode: CallMode,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         // Kept as pinned values so a suspension can store them for the retry.
         let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
         let previous_suspend = self.native_suspend_allowed;
         self.native_suspend_allowed = self.may_suspend(mode);
         let result = (method.call)(self, native_receiver, call);
         self.native_suspend_allowed = previous_suspend;
-        match result {
+        match result.map_err(PyError::into_control) {
             Ok(value) => Ok(self.produce(value)),
-            Err(PyError {
-                kind: PyErrorKind::Exit(status),
-                ..
-            }) => Ok(Flow::Exit(status)),
-            Err(PyError {
-                kind: PyErrorKind::Suspend(reason),
-                ..
-            }) => match (mode, retry_arguments) {
+            Err(Ok(Control::Exit(status))) => Ok(Flow::Exit(status)),
+            Err(Ok(Control::Suspend(reason))) => match (mode, retry_arguments) {
                 (CallMode::Deferred(call_span), Some(arguments)) => {
                     let retry = PendingNativeCall::Method {
                         method,
@@ -1306,7 +1296,7 @@ impl<'s> Vm<'s> {
                 }
                 _ => Err("native call suspended outside scheduler dispatch".into()),
             },
-            Err(error) => Err(self.record_native_error(error)),
+            Err(Err(error)) => Err(error),
         }
     }
 
@@ -1315,7 +1305,7 @@ impl<'s> Vm<'s> {
     /// `TypeError` when `class` carries a non-empty `__abstractmethods__`, which `abc.ABCMeta`
     /// sets on every class it creates. Only the class's own attribute is consulted, so ordinary
     /// instantiation costs one hash lookup.
-    fn reject_abstract_instantiation(&mut self, class: Value, name: &str) -> Result<(), String> {
+    fn reject_abstract_instantiation(&mut self, class: Value, name: &str) -> PyResult<()> {
         let Object::Class(class_object) = self.get(class)? else {
             return Ok(());
         };
@@ -1348,7 +1338,7 @@ impl<'s> Vm<'s> {
         } else {
             "methods"
         };
-        Err(self.raise_exception(
+        Err(PyError::exception(
             "TypeError",
             format!(
                 "Can't instantiate abstract class {name} without an implementation for abstract {plural} {}",
@@ -1363,7 +1353,7 @@ impl<'s> Vm<'s> {
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
         dispatch_metaclass: bool,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("type.__call__ requires a class".into());
         };
@@ -1387,7 +1377,7 @@ impl<'s> Vm<'s> {
         self.reject_abstract_instantiation(class, &name)?;
         if !enum_members.is_empty() {
             if !keyword_arguments.is_empty() || arguments.len() != 1 {
-                return Err(format!("{name}() expects one value"));
+                return Err(format!("{name}() expects one value").into());
             }
             let value_symbol = self.intern_symbol("_value_")?;
             for member in enum_members {
@@ -1399,9 +1389,10 @@ impl<'s> Vm<'s> {
                 }
             }
             let rendered = self.repr_value(&arguments[0])?;
-            return Err(
-                self.raise_exception("ValueError", format!("{rendered} is not a valid {name}"))
-            );
+            return Err(PyError::exception(
+                "ValueError",
+                format!("{rendered} is not a valid {name}"),
+            ));
         }
         if layout != ClassLayout::Type && exception_base.is_none() && !is_dataclass {
             let class_type = self
@@ -1459,8 +1450,7 @@ impl<'s> Vm<'s> {
                     }
                     let name = string::string_value(&self.state.heap, arguments[0])?
                         .ok_or("type name must be a string")?;
-                    self.new_type(class, name, arguments[1], arguments[2])
-                        .map_err(|error| error.to_string())?
+                    self.new_type(class, name, arguments[1], arguments[2])?
                 };
                 if created.is_object() && matches!(self.get(created), Ok(Object::Class { .. })) {
                     if let Some((owner, initializer)) =
@@ -1500,9 +1490,9 @@ impl<'s> Vm<'s> {
                 if index < arguments.len()
                     && keyword_arguments.iter().any(|(name, _)| name == field)
                 {
-                    return Err(format!(
-                        "{name}() got multiple values for argument {field:?}"
-                    ));
+                    return Err(
+                        format!("{name}() got multiple values for argument {field:?}").into(),
+                    );
                 }
                 let value = keyword_arguments
                     .iter()
@@ -1517,9 +1507,9 @@ impl<'s> Vm<'s> {
                     .count()
                     > 1
                 {
-                    return Err(format!(
-                        "{name}() got multiple values for argument {field:?}"
-                    ));
+                    return Err(
+                        format!("{name}() got multiple values for argument {field:?}").into(),
+                    );
                 }
                 values.push((field.clone(), value));
             }
@@ -1528,22 +1518,23 @@ impl<'s> Vm<'s> {
                     "{name}() takes {} positional arguments but {} were given",
                     dataclass_fields.len(),
                     arguments.len()
-                ));
+                )
+                .into());
             }
             for (field, _) in &keyword_arguments {
                 if !dataclass_fields.iter().any(|(name, _)| name == field) {
-                    return Err(format!(
-                        "{name}() got an unexpected keyword argument {field:?}"
-                    ));
+                    return Err(
+                        format!("{name}() got an unexpected keyword argument {field:?}").into(),
+                    );
                 }
             }
             self.with_attributes(|store| store.extend(instance, values))?;
         } else if let Some(initializer) = self.class_attribute(class, "__init__")? {
             if !initializer.is_object() {
-                return Err(format!("{name}.__init__ is not callable"));
+                return Err(format!("{name}.__init__ is not callable").into());
             }
             if !matches!(self.get(initializer)?, Object::Function(_)) {
-                return Err(format!("{name}.__init__ is not a function"));
+                return Err(format!("{name}.__init__ is not a function").into());
             }
             let positional = arguments.len();
             self.push(initializer);
@@ -1568,12 +1559,12 @@ impl<'s> Vm<'s> {
                 Err(flow) => return Ok(flow),
             }
         } else if exception_base.is_some() && !keyword_arguments.is_empty() {
-            return Err(format!("{name}() does not accept keyword arguments"));
+            return Err(format!("{name}() does not accept keyword arguments").into());
         } else if layout == ClassLayout::Object
             && exception_base.is_none()
             && (!arguments.is_empty() || !keyword_arguments.is_empty())
         {
-            return Err(format!("{name}() takes no arguments"));
+            return Err(format!("{name}() takes no arguments").into());
         }
         Ok(self.produce(instance))
     }
@@ -1594,7 +1585,7 @@ impl<'s> Vm<'s> {
         positional: usize,
         keywords: &[KeywordName],
         mode: CallMode,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let Object::Function(function_object) = self.get(function)? else {
             return Err("bound descriptor is not callable".into());
         };
@@ -1603,7 +1594,10 @@ impl<'s> Vm<'s> {
         let signature = &code.call_signature;
         let suspends = signature.is_generator || signature.is_coroutine;
         if !suspends && self.call_depth == Self::MAX_CALL_DEPTH {
-            return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
+            return Err(PyError::exception(
+                "RecursionError",
+                "maximum recursion depth exceeded",
+            ));
         }
         let locals_base = self.execution.locals.len();
         if let Err(error) =
@@ -1641,7 +1635,7 @@ impl<'s> Vm<'s> {
         positional: usize,
         keywords: &[KeywordName],
         locals_base: usize,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let signature = &code.call_signature;
         let receiver_offset = usize::from(receiver.is_some());
         let given = positional + receiver_offset;
@@ -1667,7 +1661,7 @@ impl<'s> Vm<'s> {
                         "{}() got multiple values for argument '{name}'",
                         self.function_name(&self.store(function))
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 KeywordTarget::Slot(_) => {}
                 // A name that binds no slot, including a positional-only parameter's, lands in
@@ -1680,7 +1674,7 @@ impl<'s> Vm<'s> {
                             "{}() got multiple values for argument '{name}'",
                             self.function_name(&self.store(function))
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     }
                     extra_keywords += 1;
                 }
@@ -1689,7 +1683,7 @@ impl<'s> Vm<'s> {
                         "{}() got an unexpected keyword argument '{name}'",
                         self.function_name(&self.store(function))
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 KeywordTarget::PositionalOnly => {
                     let message = format!(
@@ -1697,7 +1691,7 @@ impl<'s> Vm<'s> {
                          arguments: '{name}'",
                         self.function_name(&self.store(function))
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
             }
         }
@@ -1778,7 +1772,8 @@ impl<'s> Vm<'s> {
             return Err(format!(
                 "{}() has invalid default argument metadata",
                 function_object.name
-            ));
+            )
+            .into());
         }
         for (&slot, default) in signature
             .default_slots
@@ -1801,7 +1796,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         given: usize,
         keywords: &[KeywordName],
-    ) -> String {
+    ) -> PyError {
         let count = code.call_signature.positional_count;
         let required = code.parameters[..count]
             .iter()
@@ -1842,7 +1837,7 @@ impl<'s> Vm<'s> {
             "{}() takes {takes} but {given}{keyword_detail} {verb} given",
             self.function_name(&self.store(function))
         );
-        self.raise_exception("TypeError", message)
+        PyError::exception("TypeError", message)
     }
 
     /// Raise the `TypeError` for parameters without a default that neither the `filled`
@@ -1853,7 +1848,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         filled: usize,
         keywords: &[KeywordName],
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let missing = |keyword_only: bool| {
             code.parameters
                 .iter()
@@ -1885,7 +1880,7 @@ impl<'s> Vm<'s> {
                 names.len(),
                 english_list(&names)
             );
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         }
         Ok(())
     }
@@ -1899,7 +1894,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         entry: FrameEntry,
         mode: CallMode,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         self.call_depth += 1;
         if let CallMode::Deferred(_) = mode {
             let stack_base = self.stack.len();
@@ -1918,15 +1913,18 @@ impl<'s> Vm<'s> {
             Ok(Flow::Yield(_)) => Err(format!(
                 "unexpected yield in ordinary function {}",
                 self.function_name(&self.store(function))
-            )),
+            )
+            .into()),
             Ok(Flow::Exit(status)) => Ok(Flow::Exit(status)),
             Ok(flow) => unreachable!("an immediate call cannot end with {flow:?}"),
-            Err((error, span)) => Err(format!(
-                "{error} in {} at line {}, column {}",
-                self.function_name(&self.store(function)),
-                span.line,
-                span.column
-            )),
+            Err((error, span)) => Err(error.located(|| {
+                format!(
+                    " in {} at line {}, column {}",
+                    self.function_name(&self.store(function)),
+                    span.line,
+                    span.column
+                )
+            })),
         }
     }
 
@@ -1944,7 +1942,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         closure: Option<Value>,
         locals: Vec<Option<Value>>,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let scope = self.function_scope(code, closure, locals)?;
         let generator = self.alloc({
             Object::Generator(Box::new(GeneratorObject {
@@ -1967,7 +1965,7 @@ impl<'s> Vm<'s> {
     /// The frame entry for `exec`/`eval` code: no locals of its own, names resolved through the
     /// calling frame's scope. A caller that keeps its locals in the frame exposes a snapshot of
     /// them, which the dynamic code can read but, as in CPython, not rebind.
-    fn dynamic_code_entry(&mut self) -> Result<FrameEntry, String> {
+    fn dynamic_code_entry(&mut self) -> PyResult<FrameEntry> {
         let enclosing = self.lookup_scope();
         let Some((base, code)) = self
             .bytecode_frames
@@ -1990,7 +1988,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         closure: Option<Value>,
         locals: Vec<Option<Value>>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let uses_repl_globals = closure
             .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
@@ -2004,9 +2002,6 @@ impl<'s> Vm<'s> {
         )
     }
 
-    /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
-    /// A user iterator's `StopIteration` stays pending as an error, so callers that treat it as
-    /// exhaustion check [`Self::pending_stop_iteration`].
     /// Instantiate a class whose MRO defines `__new__`, as `type.__call__` does: call `__new__`
     /// with the class and the call's arguments, then run `__init__` with the same arguments
     /// when the result is an instance of the class. Any other result is returned as is.
@@ -2018,7 +2013,7 @@ impl<'s> Vm<'s> {
         constructor: Value,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         // `__new__` is a static method that receives the class explicitly.
         let constructor = self
             .bind_type_attribute(constructor, None, class_type, owner)?
@@ -2065,7 +2060,7 @@ impl<'s> Vm<'s> {
             Ok(value) if value.is_none() => Ok(self.produce(created)),
             Ok(value) => {
                 let type_name = self.type_name_of(&value)?;
-                Err(self.raise_exception(
+                Err(PyError::exception(
                     "TypeError",
                     format!("__init__() should return None, not '{type_name}'"),
                 ))
@@ -2081,10 +2076,10 @@ impl<'s> Vm<'s> {
         builtin: BuiltinType,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
             Flow::Next => self.pop(),
-            _ => Err(format!("{}() did not produce a value", builtin.name())),
+            _ => Err(format!("{}() did not produce a value", builtin.name()).into()),
         }
     }
 
@@ -2097,7 +2092,7 @@ impl<'s> Vm<'s> {
         class: Value,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let name = builtin.name();
         let subclass = match class.native_value() {
             Some(NativeValue::BuiltinType(class_type)) if class_type == builtin => None,
@@ -2118,7 +2113,7 @@ impl<'s> Vm<'s> {
                 let message = format!(
                     "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
             _ => match class.is_object().then(|| self.get(class)) {
                 Some(Ok(Object::Class(class_object)))
@@ -2131,13 +2126,13 @@ impl<'s> Vm<'s> {
                     let message = format!(
                         "{name}.__new__({class_name}): {class_name} is not a subtype of {name}"
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 _ => {
                     let type_name = self.type_name_of(&class)?;
                     let message =
                         format!("{name}.__new__(X): X is not a type object ({type_name})");
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
             },
         };
@@ -2158,17 +2153,16 @@ impl<'s> Vm<'s> {
     /// meant for it) or when it keeps `object.__init__` (nothing would accept them). A class whose
     /// instances have a builtin layout, such as an `int` or exception subclass, must be created
     /// by that builtin's `__new__`.
-    pub(super) fn new_instance(
-        &mut self,
-        class: Value,
-        has_arguments: bool,
-    ) -> Result<Value, String> {
+    pub(super) fn new_instance(&mut self, class: Value, has_arguments: bool) -> PyResult<Value> {
         if matches!(
             class.native_value(),
             Some(NativeValue::BuiltinType(BuiltinType::Object))
         ) {
             if has_arguments {
-                return Err(self.raise_exception("TypeError", "object() takes no arguments"));
+                return Err(PyError::exception(
+                    "TypeError",
+                    "object() takes no arguments",
+                ));
             }
             return self.alloc(Object::Bare);
         }
@@ -2178,7 +2172,7 @@ impl<'s> Vm<'s> {
             _ => None,
         };
         if let Some(name) = builtin {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 format!("object.__new__({name}) is not safe, use {name}.__new__()"),
             ));
@@ -2196,28 +2190,29 @@ impl<'s> Vm<'s> {
             .flatten()
         else {
             let type_name = self.type_name_of(&class)?;
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 format!("object.__new__(X): X is not a type object ({type_name})"),
             ));
         };
         if layout != ClassLayout::Object || exception_base.is_some() {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 format!("object.__new__({name}) is not safe, use {name}.__new__()"),
             ));
         }
         if has_arguments {
             if self.class_attribute_entry(class, "__new__")?.is_some() {
-                return Err(self.raise_exception(
+                return Err(PyError::exception(
                     "TypeError",
                     "object.__new__() takes exactly one argument (the type to instantiate)",
                 ));
             }
             if self.class_attribute_entry(class, "__init__")?.is_none() {
-                return Err(
-                    self.raise_exception("TypeError", format!("{name}() takes no arguments"))
-                );
+                return Err(PyError::exception(
+                    "TypeError",
+                    format!("{name}() takes no arguments"),
+                ));
             }
         }
         let instance_type = self
@@ -2226,7 +2221,10 @@ impl<'s> Vm<'s> {
         self.allocate_typed(instance_type, Object::Bare)
     }
 
-    pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
+    /// Advance any Python iterator by one item; `Ok(None)` means a builtin iterator is exhausted.
+    /// A user iterator's `StopIteration` stays an error, so callers that treat it as exhaustion
+    /// [`catch`](Self::catch) it.
+    pub(super) fn iterator_next(&mut self, iterator: &Value) -> PyResult<Option<Value>> {
         if !iterator.is_object() {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
         }
@@ -2281,8 +2279,7 @@ impl<'s> Vm<'s> {
                         self,
                         callable,
                         CallArgs::new(Vec::new(), Vec::new()),
-                    )
-                    .map_err(|error| error.to_string())?;
+                    )?;
                     if self.values_equal(&value, &sentinel)? {
                         if let Object::CallableIterator { exhausted, .. } =
                             self.get_mut(iterator)?
@@ -2314,56 +2311,63 @@ impl<'s> Vm<'s> {
         })
     }
 
-    /// Whether the error being propagated is a `StopIteration`.
-    pub(super) fn pending_stop_iteration(&self) -> bool {
-        self.pending_exception
-            .as_ref()
-            .is_some_and(|exception| exception.kind == "StopIteration")
-    }
-
-    pub(super) fn record_native_error(&mut self, error: PyError) -> String {
-        // Native code converts VM failures with `PyError::runtime_error`. When the VM already
-        // raised a Python exception for that failure, it is the one propagating; a generic
-        // RuntimeError must not replace it.
-        if matches!(error.kind, PyErrorKind::Runtime) && self.pending_exception.is_some() {
-            return error.message;
-        }
-        let kind = match error.kind {
-            PyErrorKind::Type => Some("TypeError"),
-            PyErrorKind::Value => Some("ValueError"),
-            PyErrorKind::ZeroDivision => Some("ZeroDivisionError"),
-            PyErrorKind::Overflow => Some("OverflowError"),
-            PyErrorKind::Runtime => Some("RuntimeError"),
-            PyErrorKind::Exception(kind) => Some(kind),
+    /// Make the exception `error` describes the pending exception, allocating its object, and
+    /// return the pending signal. A pending exception and a stop that is not an exception come
+    /// back unchanged.
+    pub(super) fn raise_error(&mut self, error: PyError) -> PyError {
+        let Some((kind, message)) = error.into_parts() else {
+            return PyError::pending();
+        };
+        let kind = match kind {
+            PyErrorKind::Exception(kind) => kind,
             PyErrorKind::OsError { errno, filename } => {
                 let kind = super::super::exception_types::os_error_subclass(errno);
                 let mut args = vec![Value::Int(i64::from(errno))];
-                let strerror = self.allocate_string(error.message.clone());
-                let filename = filename.map(|filename| self.allocate_string(filename));
-                if let (Ok(strerror), Ok(filename)) = (strerror, filename.transpose()) {
-                    args.push(strerror);
-                    args.extend(filename);
-                    let message = self.raise_exception_args(kind, args);
-                    return message;
+                for text in std::iter::once(message).chain(filename) {
+                    match self.allocate_string(text) {
+                        Ok(text) => args.push(text),
+                        Err(error) => return error,
+                    }
                 }
-                return error.message;
+                return self.raise_exception_args(kind, args);
             }
-            PyErrorKind::Resource
-            | PyErrorKind::Unsupported
-            | PyErrorKind::Raised
-            | PyErrorKind::Exit(_)
-            | PyErrorKind::Suspend(_) => None,
+            kind => return PyError::new(kind, message),
         };
-        if let Some(kind) = kind {
-            if let Ok(value) = self.allocate_exception(kind.to_string(), error.message.clone()) {
-                let value = self.store(value);
-                self.pending_exception = Some(RaisedException {
-                    kind: kind.to_string(),
-                    value,
-                });
-            }
+        match self.allocate_exception(kind, message) {
+            Ok(value) => self.raise_value(value),
+            Err(error) => error,
         }
-        error.message
+    }
+
+    /// Catch the exception `error` stands for: clear it and return its object. A stop that is
+    /// not a Python exception comes back as the error.
+    pub(super) fn take_exception(&mut self, error: PyError) -> PyResult<Value> {
+        let error = self.raise_error(error);
+        if !error.is_pending() {
+            return Err(error);
+        }
+        let exception = self
+            .pending_exception
+            .take()
+            .ok_or("exception unwound without a pending exception")?;
+        Ok(self.value(&exception))
+    }
+
+    /// Catch `error` if it is an exception of the builtin class `kind` or a subclass, as
+    /// `except kind:` would; any other error comes back. An exception not yet raised is matched
+    /// by its class name without allocating its object.
+    pub(super) fn catch(&mut self, error: PyError, kind: &str) -> PyResult<()> {
+        if let Some(PyErrorKind::Exception(name)) = error.kind() {
+            if super::super::exception_types::exception_is_subclass(name, kind) {
+                return Ok(());
+            }
+            return Err(error);
+        }
+        if error.is_pending() && self.pending_exception_is(kind) {
+            self.pending_exception = None;
+            return Ok(());
+        }
+        Err(error)
     }
 
     /// Whether a native called in `mode` may suspend its process: only a deferred call made
@@ -2372,10 +2376,7 @@ impl<'s> Vm<'s> {
         matches!(mode, CallMode::Deferred(_)) && self.synchronous_frames == 0
     }
 
-    pub(super) fn resume_native_call(
-        &mut self,
-        pending: PendingNativeCall,
-    ) -> Result<Flow, String> {
+    pub(super) fn resume_native_call(&mut self, pending: PendingNativeCall) -> PyResult<Flow> {
         /// The native a retried call invokes, with its receiver pinned.
         #[derive(Clone, Copy)]
         enum Target {
@@ -2412,16 +2413,10 @@ impl<'s> Vm<'s> {
             Target::Method(method, receiver) => (method.call)(self, receiver, arguments),
         };
         self.native_suspend_allowed = previous_suspend;
-        match result {
+        match result.map_err(PyError::into_control) {
             Ok(value) => Ok(self.native_result(value)),
-            Err(PyError {
-                kind: PyErrorKind::Exit(status),
-                ..
-            }) => Ok(Flow::Exit(status)),
-            Err(PyError {
-                kind: PyErrorKind::Suspend(reason),
-                ..
-            }) => {
+            Err(Ok(Control::Exit(status))) => Ok(Flow::Exit(status)),
+            Err(Ok(Control::Suspend(reason))) => {
                 let arguments = StoredCallArgs::store(self, &retry_arguments);
                 let retry = match target {
                     Target::Function(function) => PendingNativeCall::Function {
@@ -2438,7 +2433,7 @@ impl<'s> Vm<'s> {
                 };
                 Ok(self.suspend(reason, Some(retry)))
             }
-            Err(error) => Err(self.record_native_error(error)),
+            Err(Err(error)) => Err(error),
         }
     }
 
@@ -2452,7 +2447,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn resume_input(&mut self, pending: PendingNativeCall) -> Result<Flow, String> {
+    fn resume_input(&mut self, pending: PendingNativeCall) -> PyResult<Flow> {
         let PendingNativeCall::Input { call_span } = pending else {
             unreachable!("caller checked the variant");
         };
@@ -2461,21 +2456,21 @@ impl<'s> Vm<'s> {
         self.native_suspend_allowed = self.synchronous_frames == 0;
         let result = self.read_stream(&marker, None, true);
         self.native_suspend_allowed = previous_suspend;
-        match result {
+        match result.map_err(PyError::into_control) {
             Ok(read) => {
                 let value = self.finish_input(read)?;
                 Ok(self.produce(value))
             }
-            Err(PyError {
-                kind: PyErrorKind::Suspend(reason),
-                ..
-            }) => Ok(self.suspend(reason, Some(PendingNativeCall::Input { call_span }))),
-            Err(error) => Err(self.record_native_error(error)),
+            Err(Ok(Control::Exit(status))) => Ok(Flow::Exit(status)),
+            Err(Ok(Control::Suspend(reason))) => {
+                Ok(self.suspend(reason, Some(PendingNativeCall::Input { call_span })))
+            }
+            Err(Err(error)) => Err(error),
         }
     }
 
     /// Strip the trailing newline `input()` reads and raise `EOFError` on an empty read.
-    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value, String> {
+    fn finish_input(&mut self, read: PyStreamRead) -> PyResult<Value> {
         let mut text = match read {
             PyStreamRead::Text(text) => text,
             PyStreamRead::Bytes(_) => {
@@ -2483,9 +2478,7 @@ impl<'s> Vm<'s> {
             }
         };
         if text.is_empty() {
-            return Err(
-                self.record_native_error(PyError::exception("EOFError", "EOF when reading a line"))
-            );
+            return Err(PyError::exception("EOFError", "EOF when reading a line"));
         }
         if text.ends_with('\n') {
             text.pop();

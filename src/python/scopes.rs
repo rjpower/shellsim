@@ -11,6 +11,7 @@ use std::sync::Arc;
 use crate::resources::Resources;
 
 use super::heap::{Heap, Object, Ref, Roots, ScopeObject, Value, DYNAMIC_NAME_BYTES};
+use crate::python::error::{PyError, PyResult};
 
 /// The fixed part of a new scope: where name lookup continues and which names have slots.
 pub struct ScopeLayout {
@@ -27,7 +28,7 @@ pub fn alloc_scope(
     values: HashMap<String, Value>,
     roots: &dyn Roots,
     resources: &mut Resources,
-) -> Result<Value, String> {
+) -> PyResult<Value> {
     if locals.len() != layout.local_names.len() {
         return Err("local slot metadata mismatch".into());
     }
@@ -49,7 +50,7 @@ pub fn alloc_scope_named(
     mut values: HashMap<String, Value>,
     roots: &dyn Roots,
     resources: &mut Resources,
-) -> Result<Value, String> {
+) -> PyResult<Value> {
     let locals = layout
         .local_names
         .iter()
@@ -58,7 +59,7 @@ pub fn alloc_scope_named(
     alloc_scope(heap, layout, locals, values, roots, resources)
 }
 
-fn scope(heap: &Heap, scope: Value) -> Result<&ScopeObject, String> {
+fn scope(heap: &Heap, scope: Value) -> PyResult<&ScopeObject> {
     match heap.get(scope)? {
         Object::Scope(scope) => Ok(scope),
         _ => Err("invalid scope reference".into()),
@@ -69,15 +70,15 @@ fn modify_scope<R>(
     heap: &mut Heap,
     scope: Value,
     f: impl FnOnce(&mut ScopeObject) -> R,
-) -> Result<R, String> {
+) -> PyResult<R> {
     heap.modify(scope, |object| match object {
         Object::Scope(scope) => Ok(f(scope)),
-        _ => Err(String::from("invalid scope reference")),
+        _ => Err(PyError::from("invalid scope reference")),
     })?
 }
 
 /// Look a name up through this scope and its ancestors.
-pub fn get(heap: &Heap, start: Value, name: &str) -> Result<Option<Value>, String> {
+pub fn get(heap: &Heap, start: Value, name: &str) -> PyResult<Option<Value>> {
     let mut current = start;
     loop {
         let object = scope(heap, current)?;
@@ -98,7 +99,7 @@ pub fn get(heap: &Heap, start: Value, name: &str) -> Result<Option<Value>, Strin
 
 /// The outermost ancestor of `start`: a module scope, or a function scope created at the
 /// REPL/script top level.
-pub fn root(heap: &Heap, start: Value) -> Result<Value, String> {
+pub fn root(heap: &Heap, start: Value) -> PyResult<Value> {
     let mut current = start;
     loop {
         match &scope(heap, current)?.parent {
@@ -108,22 +109,22 @@ pub fn root(heap: &Heap, start: Value) -> Result<Value, String> {
     }
 }
 
-pub fn uses_repl_globals(heap: &Heap, start: Value) -> Result<bool, String> {
+pub fn uses_repl_globals(heap: &Heap, start: Value) -> PyResult<bool> {
     Ok(scope(heap, root(heap, start)?)?.uses_repl_globals)
 }
 
-pub fn parent(heap: &Heap, start: Value) -> Result<Option<Value>, String> {
+pub fn parent(heap: &Heap, start: Value) -> PyResult<Option<Value>> {
     Ok(heap.value_optional(scope(heap, start)?.parent.as_ref()))
 }
 
 /// The dynamic names bound in this scope in the order they were first bound, which a class
 /// body's namespace keeps for its fields and enum members.
-pub fn bound_names(heap: &Heap, start: Value) -> Result<Vec<String>, String> {
+pub fn bound_names(heap: &Heap, start: Value) -> PyResult<Vec<String>> {
     Ok(scope(heap, start)?.order.clone())
 }
 
 /// Every name bound directly in this scope, slots and dynamic names together.
-pub fn values(heap: &Heap, start: Value) -> Result<HashMap<String, Value>, String> {
+pub fn values(heap: &Heap, start: Value) -> PyResult<HashMap<String, Value>> {
     let object = scope(heap, start)?;
     let mut values = object
         .values
@@ -139,7 +140,7 @@ pub fn values(heap: &Heap, start: Value) -> Result<HashMap<String, Value>, Strin
 }
 
 /// The stored reference in one local slot, for pushing onto the operand stack directly.
-pub fn local_ref(heap: &Heap, start: Value, slot: usize) -> Result<Option<&Ref>, String> {
+pub fn local_ref(heap: &Heap, start: Value, slot: usize) -> PyResult<Option<&Ref>> {
     scope(heap, start)?
         .locals
         .get(slot)
@@ -147,33 +148,28 @@ pub fn local_ref(heap: &Heap, start: Value, slot: usize) -> Result<Option<&Ref>,
         .ok_or_else(|| "invalid local slot".into())
 }
 
-pub fn store_local(heap: &mut Heap, start: Value, slot: usize, value: Value) -> Result<(), String> {
+pub fn store_local(heap: &mut Heap, start: Value, slot: usize, value: Value) -> PyResult<()> {
     modify_scope(heap, start, |scope| match scope.locals.get_mut(slot) {
         Some(local) => {
             *local = Some(Ref::from(value));
             Ok(())
         }
-        None => Err(String::from("invalid local slot")),
+        None => Err(PyError::from("invalid local slot")),
     })?
 }
 
 /// Store a reference popped from the operand stack into a local slot.
-pub fn store_local_ref(
-    heap: &mut Heap,
-    start: Value,
-    slot: usize,
-    value: Ref,
-) -> Result<(), String> {
+pub fn store_local_ref(heap: &mut Heap, start: Value, slot: usize, value: Ref) -> PyResult<()> {
     modify_scope(heap, start, |scope| match scope.locals.get_mut(slot) {
         Some(local) => {
             *local = Some(value);
             Ok(())
         }
-        None => Err(String::from("invalid local slot")),
+        None => Err(PyError::from("invalid local slot")),
     })?
 }
 
-pub fn remove_local(heap: &mut Heap, start: Value, slot: usize) -> Result<Option<Value>, String> {
+pub fn remove_local(heap: &mut Heap, start: Value, slot: usize) -> PyResult<Option<Value>> {
     let removed = modify_scope(heap, start, |scope| {
         scope
             .locals
@@ -193,7 +189,7 @@ pub fn insert(
     value: Value,
     roots: &dyn Roots,
     resources: &mut Resources,
-) -> Result<(), String> {
+) -> PyResult<()> {
     let object = scope(heap, start)?;
     if let Some(slot) = object.local_names.iter().position(|local| local == &name) {
         return store_local(heap, start, slot, value);
@@ -212,12 +208,7 @@ pub fn insert(
 
 /// Rebind `name` in the nearest scope, starting at `start`, that already binds it
 /// (`nonlocal`). `start` is the scope enclosing the one that declared the name.
-pub fn store_nonlocal(
-    heap: &mut Heap,
-    start: Value,
-    name: &str,
-    value: Value,
-) -> Result<(), String> {
+pub fn store_nonlocal(heap: &mut Heap, start: Value, name: &str, value: Value) -> PyResult<()> {
     let missing = || format!("no binding for nonlocal {name:?} found");
     let mut current: Value = start;
     loop {
@@ -237,7 +228,7 @@ pub fn store_nonlocal(
     }
 }
 
-pub fn remove(heap: &mut Heap, start: Value, name: &str) -> Result<Option<Value>, String> {
+pub fn remove(heap: &mut Heap, start: Value, name: &str) -> PyResult<Option<Value>> {
     let removed = modify_scope(heap, start, |scope| {
         match scope.local_names.iter().position(|local| local == name) {
             Some(slot) => scope.locals[slot].take(),

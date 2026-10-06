@@ -192,10 +192,6 @@ impl NativeValue {
     }
 }
 
-fn known_exception_type(name: &str) -> Option<&'static str> {
-    exception_types::exception_type(name).map(|definition| definition.name)
-}
-
 fn exception_type_code(name: &str) -> u64 {
     exception_types::EXCEPTION_TYPES
         .iter()
@@ -251,36 +247,32 @@ impl NativeValue {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct ExceptionType(pub &'static str);
 
-#[derive(Debug)]
-struct RaisedException {
-    kind: String,
-    value: Ref,
-}
-
-impl Clone for RaisedException {
-    fn clone(&self) -> Self {
-        Self {
-            kind: self.kind.clone(),
-            value: self.value.dup(),
-        }
-    }
-}
-
 /// One call-chain entry captured while an uncaught exception unwinds the frame stack, rendered
 /// as a CPython-style `File "...", line N, in <scope>` line.
 ///
 /// [`Vm::propagate_error`] rebuilds this list from scratch on every unwind attempt, so a nested
 /// unwind that is later discarded (for example inside a generator or `exec` sub-frame) never
-/// leaks into the traceback that is finally reported for the real, uncaught error.
-#[derive(Clone, Debug)]
+/// leaks into the traceback that is finally reported for the real, uncaught error. Recording a
+/// frame copies two references; names and files are read only when a traceback is printed.
+#[derive(Debug)]
 struct TracebackFrame {
-    /// Function name active at this call level, or `<module>` for the top-level frame.
-    name: String,
+    /// The function running at this call level, or `None` for the top-level frame.
+    function: Option<Ref>,
+    /// The outermost scope of the frame's code, whose `__file__` names an imported module's
+    /// source; `None` when the frame has no lexical scope.
+    module: Option<Ref>,
     /// Source location this frame was executing when the exception passed through it.
     span: Span,
-    /// `__file__` of the imported module that owns this frame's code, or `None` for the main
-    /// program, whose name depends on how it was started.
-    file: Option<String>,
+}
+
+impl Clone for TracebackFrame {
+    fn clone(&self) -> Self {
+        Self {
+            function: self.function.as_ref().map(Ref::dup),
+            module: self.module.as_ref().map(Ref::dup),
+            span: self.span,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -633,7 +625,9 @@ struct VmState {
     /// stack depth)`, each frame's above its `handler_base`.
     handlers: Vec<(usize, usize, usize)>,
     call_depth: usize,
-    pending_exception: Option<RaisedException>,
+    /// The exception object being raised, between the operation that raised it and the handler
+    /// that takes it. Operations that raise return [`PyError::pending`] beside it.
+    pending_exception: Option<Ref>,
     /// Nesting of builtin sequence ordering in progress, bounded like other recursion.
     compare_depth: usize,
     /// Frames collected by the most recent [`Vm::propagate_error`] unwind, freshest overwrites
@@ -650,7 +644,8 @@ struct VmState {
     /// from native code) now running. Their callers cannot resume a suspended frame, so while
     /// any is active, natives finish blocking operations instead of suspending.
     synchronous_frames: usize,
-    exception_stack: Vec<RaisedException>,
+    /// Exception objects being handled by `except` blocks, innermost last.
+    exception_stack: Vec<Ref>,
     /// Context managers entered by every frame, each frame's above its `context_base`.
     with_contexts: Vec<Ref>,
     code_caches: CodeCacheTable,
@@ -687,7 +682,7 @@ impl Clone for VmState {
                 .collect(),
             handlers: self.handlers.clone(),
             call_depth: self.call_depth,
-            pending_exception: self.pending_exception.clone(),
+            pending_exception: self.pending_exception.as_ref().map(Ref::dup),
             compare_depth: self.compare_depth,
             traceback_frames: self.traceback_frames.clone(),
             pending_wait: self.pending_wait.clone(),
@@ -695,7 +690,7 @@ impl Clone for VmState {
             async_timer_deadlines: self.async_timer_deadlines.clone(),
             native_suspend_allowed: self.native_suspend_allowed,
             synchronous_frames: self.synchronous_frames,
-            exception_stack: self.exception_stack.clone(),
+            exception_stack: self.exception_stack.iter().map(Ref::dup).collect(),
             with_contexts: self.with_contexts.iter().map(Ref::dup).collect(),
             code_caches: self.code_caches.clone(),
             stdin_position: self.stdin_position,
@@ -736,11 +731,13 @@ impl Roots for VmState {
         for slot in &self.with_contexts {
             visitor(slot);
         }
-        if let Some(exception) = &self.pending_exception {
-            visitor(&exception.value);
+        for exception in self.pending_exception.iter().chain(&self.exception_stack) {
+            visitor(exception);
         }
-        for exception in &self.exception_stack {
-            visitor(&exception.value);
+        for frame in &self.traceback_frames {
+            for slot in frame.function.iter().chain(&frame.module) {
+                visitor(slot);
+            }
         }
         for frame in &self.bytecode_frames {
             for slot in frame.scope.iter().chain(&frame.callee) {
@@ -1019,7 +1016,7 @@ impl BytecodeFrame {
 }
 
 /// A stack depth recorded in a frame.
-fn frame_index(depth: usize) -> Result<u32, String> {
+fn frame_index(depth: usize) -> PyResult<u32> {
     u32::try_from(depth).map_err(|_| "VM stack depth exceeds the frame index range".into())
 }
 
@@ -1248,12 +1245,12 @@ impl HashedEntries {
 }
 
 #[inline(always)]
-fn dispatch_next(result: Result<(), String>) -> Result<Flow, String> {
+fn dispatch_next(result: PyResult<()>) -> PyResult<Flow> {
     result.map(|()| Flow::Next)
 }
 
 impl DispatchCursor {
-    fn for_active(vm: &mut Vm<'_>) -> Result<Self, String> {
+    fn for_active(vm: &mut Vm<'_>) -> PyResult<Self> {
         let frame = vm
             .bytecode_frames
             .last()
@@ -1274,7 +1271,7 @@ impl DispatchCursor {
         })
     }
 
-    fn refresh(&mut self, vm: &mut Vm<'_>) -> Result<(), String> {
+    fn refresh(&mut self, vm: &mut Vm<'_>) -> PyResult<()> {
         *self = Self::for_active(vm)?;
         Ok(())
     }
@@ -1494,14 +1491,14 @@ impl<'s> Vm<'s> {
         self.interp.resources.release_memory(bytes);
     }
 
-    fn reserve_retained_memory(&mut self, bytes: usize) -> Result<(), String> {
+    fn reserve_retained_memory(&mut self, bytes: usize) -> PyResult<()> {
         let bytes = u64::try_from(bytes).map_err(|_| "Python allocation is too large")?;
         let next = self
             .retained_memory
             .checked_add(bytes)
             .ok_or("modeled Python memory overflow")?;
         if !self.interp.resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.retained_memory = next;
         Ok(())
@@ -1509,7 +1506,7 @@ impl<'s> Vm<'s> {
 
     fn render_execution(
         &mut self,
-        execution: Result<Flow, (String, super::source::Span)>,
+        execution: Result<Flow, (PyError, super::source::Span)>,
     ) -> ExecResult {
         match execution {
             Ok(Flow::Halt | Flow::Return(_) | Flow::Yield(_)) => ExecResult::Continue,
@@ -1517,18 +1514,29 @@ impl<'s> Vm<'s> {
             Ok(flow) => unreachable!("a completed program cannot end with {flow:?}"),
             Err((error, span)) => {
                 if let Some(reason) = self.interp.resources.stop_reason() {
-                    ExecResult::Exit(reason.exit_status())
-                } else if self
-                    .pending_exception
-                    .as_ref()
-                    .is_some_and(|exception| exception.kind == "SystemExit")
-                {
-                    let exception = self
-                        .pending_exception
-                        .as_ref()
-                        .expect("SystemExit exception checked above");
-                    let value = self.value(&exception.value);
-                    let rendered = protocol::display(self.state, value)
+                    return ExecResult::Exit(reason.exit_status());
+                }
+                // An error that reached the top without unwinding a frame may not be raised yet.
+                let error = self.raise_error(error);
+                if let Some(PyErrorKind::Exit(status)) = error.kind() {
+                    return ExecResult::Exit(*status);
+                }
+                let exception = match &self.pending_exception {
+                    Some(exception) if error.is_pending() => self.value(exception),
+                    _ => {
+                        let fault = if error.is_pending() {
+                            "exception unwound without a pending exception"
+                        } else {
+                            error.message()
+                        };
+                        return ExecResult::Unsupported(format!(
+                            "{fault} at line {}, column {}",
+                            span.line, span.column
+                        ));
+                    }
+                };
+                if self.pending_exception_is("SystemExit") {
+                    let rendered = protocol::display(self.state, exception)
                         .unwrap_or_else(|_| "SystemExit".to_string());
                     let status = rendered.parse::<i32>().unwrap_or_else(|_| {
                         self.err.extend_from_slice(rendered.as_bytes());
@@ -1536,13 +1544,8 @@ impl<'s> Vm<'s> {
                         1
                     });
                     ExecResult::Exit(status)
-                } else if let Some(exception) = self.pending_exception.clone() {
-                    ExecResult::Exit(self.render_uncaught_exception(&exception, span))
                 } else {
-                    ExecResult::Unsupported(format!(
-                        "{} at line {}, column {}",
-                        error, span.line, span.column
-                    ))
+                    ExecResult::Exit(self.render_uncaught_exception(exception, span))
                 }
             }
         }
@@ -1551,11 +1554,14 @@ impl<'s> Vm<'s> {
     /// Report an uncaught, genuine Python exception the way CPython does: a traceback on stderr
     /// and exit status 1. This is distinct from [`super::unsupported`], which stays reserved for
     /// syntax, modules, or builtins shellsim does not model at all.
-    fn render_uncaught_exception(&mut self, exception: &RaisedException, fallback: Span) -> i32 {
+    fn render_uncaught_exception(&mut self, value: Value, fallback: Span) -> i32 {
         // `protocol::display` renders a message-less builtin exception as its type name (to match
         // `print(exc)` elsewhere), which would duplicate the type name we print explicitly below.
         // Read the raw message instead so an empty `ValueError()` prints as bare `ValueError`.
-        let value = self.value(&exception.value);
+        let kind = exception_types::exception_type_name(self.state, value)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "BaseException".into());
         let message = match protocol::exception_parts(self.state, value) {
             Ok(Some((_, message))) => message,
             _ => protocol::display(self.state, value).unwrap_or_else(|_| String::new()),
@@ -1576,20 +1582,27 @@ impl<'s> Vm<'s> {
             );
         }
         for frame in &frames {
+            let name = match &frame.function {
+                Some(function) => self.function_name(function),
+                None => "<module>".to_string(),
+            };
+            let file = frame
+                .module
+                .as_ref()
+                .and_then(|module| self.module_file(module));
             self.err.extend_from_slice(
                 format!(
-                    "  File \"{}\", line {}, in {}\n",
-                    frame.file.as_deref().unwrap_or(&filename),
+                    "  File \"{}\", line {}, in {name}\n",
+                    file.as_deref().unwrap_or(&filename),
                     frame.span.line,
-                    frame.name
                 )
                 .as_bytes(),
             );
         }
         let summary = if message.is_empty() {
-            format!("{}\n", exception.kind)
+            format!("{kind}\n")
         } else {
-            format!("{}: {message}\n", exception.kind)
+            format!("{kind}: {message}\n")
         };
         self.err.extend_from_slice(summary.as_bytes());
         1
@@ -1606,11 +1619,11 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn allocate_object(&mut self, object: Object) -> Result<Value, String> {
+    fn allocate_object(&mut self, object: Object) -> PyResult<Value> {
         self.alloc(object)
     }
 
-    fn allocate_string(&mut self, value: String) -> Result<Value, String> {
+    fn allocate_string(&mut self, value: String) -> PyResult<Value> {
         if let Some(value) = Value::inline_string(&value) {
             Ok(value)
         } else {
@@ -1618,29 +1631,29 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn allocate_bytes(&mut self, value: Vec<u8>) -> Result<Value, String> {
+    fn allocate_bytes(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_object(Object::Bytes(value))
     }
 
-    fn allocate_bytearray(&mut self, value: Vec<u8>) -> Result<Value, String> {
+    fn allocate_bytearray(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_object(Object::ByteArray(value))
     }
 
     /// A builtin exception whose only argument is `message`, or with no arguments when the
     /// message is empty, as the VM and native code raise them.
-    fn allocate_exception(&mut self, kind: String, message: String) -> Result<Value, String> {
+    fn allocate_exception(&mut self, kind: &str, message: String) -> PyResult<Value> {
         let args = if message.is_empty() {
             Vec::new()
         } else {
             vec![self.allocate_string(message)?]
         };
-        self.allocate_exception_object(&kind, args)
+        self.allocate_exception_object(kind, args)
     }
 
     /// An instance of the builtin exception class `kind` with the constructor arguments `args`.
     /// The object header carries the class's type id, so `type()`, `isinstance` and slot
     /// lookups read it directly.
-    fn allocate_exception_object(&mut self, kind: &str, args: Vec<Value>) -> Result<Value, String> {
+    fn allocate_exception_object(&mut self, kind: &str, args: Vec<Value>) -> PyResult<Value> {
         let type_id = self
             .state
             .types
@@ -1649,45 +1662,55 @@ impl<'s> Vm<'s> {
         self.allocate_typed(type_id, Object::Exception(Ref::all(args)))
     }
 
+    /// Make the exception object `exception` the pending exception and return the marker that
+    /// unwinds to its handler.
+    fn raise_value(&mut self, exception: Value) -> PyError {
+        self.pending_exception = Some(Ref::from(exception));
+        PyError::pending()
+    }
+
     /// Raise a builtin exception with the constructor arguments `args`.
-    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> String {
-        let value = match self.allocate_exception_object(kind, args) {
-            Ok(value) => value,
-            Err(error) => return error,
-        };
-        let message = protocol::exception_parts(self.state, value)
-            .ok()
-            .flatten()
-            .map(|(_, message)| message)
-            .unwrap_or_default();
-        self.pending_exception = Some(RaisedException {
-            kind: kind.to_string(),
-            value: self.store(value),
-        });
-        message
-    }
-
-    /// Raise a builtin Python exception from VM code and return the error string that carries
-    /// it. The pending exception makes the error catchable by `except`; uncaught, it prints a
-    /// CPython traceback rather than an unsupported-feature report.
-    fn raise_exception(&mut self, kind: &'static str, message: impl Into<String>) -> String {
-        self.record_native_error(PyError::exception(kind, message))
-    }
-
-    /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
-    fn raise_object_type_error(&mut self, value: &Value, complaint: &str) -> String {
-        match self.type_name_of(value) {
-            Ok(name) => self.raise_exception("TypeError", format!("'{name}' object {complaint}")),
+    fn raise_exception_args(&mut self, kind: &str, args: Vec<Value>) -> PyError {
+        match self.allocate_exception_object(kind, args) {
+            Ok(value) => self.raise_value(value),
             Err(error) => error,
         }
     }
 
+    /// Raise CPython's `TypeError: '<type>' object <complaint>`, as in "is not callable".
+    fn raise_object_type_error(&self, value: &Value, complaint: &str) -> PyError {
+        match self.type_name_of(value) {
+            Ok(name) => PyError::exception("TypeError", format!("'{name}' object {complaint}")),
+            Err(error) => error,
+        }
+    }
+
+    /// Whether the exception object `exception` is an instance of the builtin exception class
+    /// `kind` or a subclass of it, as `except kind:` would decide.
+    fn exception_is(&self, exception: Value, kind: &str) -> PyResult<bool> {
+        let expected = self
+            .state
+            .types
+            .exception_type_id(kind)
+            .ok_or_else(|| format!("exception type {kind:?} is not registered"))?;
+        self.state
+            .types
+            .is_subclass(self.type_id(&exception)?, expected)
+    }
+
+    /// Whether the pending exception is an instance of the builtin exception class `kind`.
+    fn pending_exception_is(&self, kind: &str) -> bool {
+        self.pending_exception.as_ref().is_some_and(|exception| {
+            matches!(self.exception_is(self.value(exception), kind), Ok(true))
+        })
+    }
+
     /// The type name CPython prints in error messages, such as `int` or a user class name.
-    fn type_name_of(&self, value: &Value) -> Result<String, String> {
+    fn type_name_of(&self, value: &Value) -> PyResult<String> {
         Ok(self.state.types.get(self.type_id(value)?)?.name.clone())
     }
 
-    fn value_from_constant(&mut self, value: &Constant) -> Result<Value, String> {
+    fn value_from_constant(&mut self, value: &Constant) -> PyResult<Value> {
         Ok(match value {
             Constant::None => Value::None,
             Constant::Ellipsis => Value::Native(NativeValue::Ellipsis),
@@ -1702,15 +1725,13 @@ impl<'s> Vm<'s> {
                 self.allocate_object(Object::BigInt(value))?
             }
             Constant::Float(value) => Value::Float(*value),
-            Constant::Imaginary(value) => {
-                number::create_complex(self, 0.0, *value).map_err(|error| error.to_string())?
-            }
+            Constant::Imaginary(value) => number::create_complex(self, 0.0, *value)?,
             Constant::String(value) => self.allocate_string(value.clone())?,
             Constant::Bytes(value) => self.allocate_bytes(value.clone())?,
         })
     }
 
-    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> Result<Vec<Value>, String> {
+    fn range_values(&mut self, start: i64, stop: i64, step: i64) -> PyResult<Vec<Value>> {
         let count = range_length(start, stop, step)?;
         let start = i128::from(start);
         let step = i128::from(step);
@@ -1741,7 +1762,7 @@ impl<'s> Vm<'s> {
     /// Python code (generators, classes with `__iter__`, `iter(callable, sentinel)`) is drained by
     /// a bytecode loop in the frozen `_iteration` module instead, so the items accumulate in a
     /// metered heap list rather than in a host vector no accounting can see while guest frames run.
-    fn iterable_values(&mut self, value: &Value) -> Result<Vec<Value>, String> {
+    fn iterable_values(&mut self, value: &Value) -> PyResult<Vec<Value>> {
         if self.is_unbounded_iterator(value)? {
             return Err("cannot materialize infinite itertools.count without a bound".into());
         }
@@ -1830,7 +1851,7 @@ impl<'s> Vm<'s> {
     /// Whether `value` iterates through an `__iter__` slot rather than one of the builtin kinds
     /// `iterable_values` copies natively. Native value kinds such as dict views count, since their
     /// `__iter__` is the only way to reach their items.
-    fn has_python_iter(&self, value: &Value) -> Result<bool, String> {
+    fn has_python_iter(&self, value: &Value) -> PyResult<bool> {
         if !value.is_object() {
             return Ok(false);
         }
@@ -1872,12 +1893,11 @@ impl<'s> Vm<'s> {
     /// Drain `iterable` with the frozen `_iteration.materialize` loop and return its items. The
     /// helper runs as ordinary bytecode: each item is one instruction, and the list it builds is
     /// charged by the heap as it grows.
-    fn materialize_through_bytecode(&mut self, iterable: Value) -> Result<Vec<Value>, String> {
+    fn materialize_through_bytecode(&mut self, iterable: Value) -> PyResult<Vec<Value>> {
         const MODULE: &str = "_iteration";
         let module = match self.loaded_module(MODULE) {
             Some(module) => module,
-            None => <Self as PyRuntime>::import_module(self, MODULE)
-                .map_err(|error| error.to_string())?,
+            None => <Self as PyRuntime>::import_module(self, MODULE)?,
         };
         let scope = self.module_scope(MODULE, module)?;
         let helper = self
@@ -1887,15 +1907,14 @@ impl<'s> Vm<'s> {
             self,
             helper,
             CallArgs::new(vec![iterable], Vec::new()),
-        )
-        .map_err(|error| error.to_string())?;
+        )?;
         let Object::List(items) = self.get(items)? else {
             return Err("_iteration.materialize did not return a list".into());
         };
         Ok(self.values(items))
     }
 
-    fn is_unbounded_iterator(&self, value: &Value) -> Result<bool, String> {
+    fn is_unbounded_iterator(&self, value: &Value) -> PyResult<bool> {
         if !value.is_object() {
             return Ok(false);
         }
@@ -1906,30 +1925,16 @@ impl<'s> Vm<'s> {
     /// call `__getitem__(0)`, `__getitem__(1)`, ... until it raises `IndexError` or
     /// `StopIteration`. Any other exception propagates. Each item is metered, so a
     /// `__getitem__` that never raises exhausts the CPU budget instead of looping forever.
-    fn legacy_sequence_values(
-        &mut self,
-        value: &Value,
-        result: &mut Vec<Value>,
-    ) -> Result<(), String> {
+    fn legacy_sequence_values(&mut self, value: &Value, result: &mut Vec<Value>) -> PyResult<()> {
         let mut index: i64 = 0;
         loop {
             match self.invoke_slot(value, Slot::GetItem, "__getitem__", vec![Value::Int(index)]) {
                 Ok(Some(item)) => self.push_materialized(result, item)?,
                 Ok(None) => return Err("__getitem__ slot disappeared during iteration".into()),
                 Err(error) => {
-                    let Some(exception) = self.pending_exception.as_ref() else {
-                        return Err(error);
-                    };
-                    let exception_value = self.value(&exception.value);
-                    let kind = exception_types::exception_base(self.state, exception_value)?
-                        .unwrap_or(exception.kind.as_str());
-                    if !exception_types::exception_is_subclass(kind, "IndexError")
-                        && !exception_types::exception_is_subclass(kind, "StopIteration")
-                    {
-                        return Err(error);
-                    }
-                    self.pending_exception = None;
-                    return Ok(());
+                    return self
+                        .catch(error, "IndexError")
+                        .or_else(|error| self.catch(error, "StopIteration"));
                 }
             }
             index = index
@@ -1938,7 +1943,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> Result<(), String> {
+    fn push_materialized(&mut self, values: &mut Vec<Value>, value: Value) -> PyResult<()> {
         // A host Vec has allocator/capacity overhead that is not represented in the Python heap.
         // Reserve a deliberately generous per-item amount before every push, including string
         // payloads, so repeated materialization cannot grow outside the memory budget.
@@ -1952,7 +1957,7 @@ impl<'s> Vm<'s> {
 
     /// The distinct `candidates` in first-seen order, as the `set` constructor and set displays
     /// keep them. Each candidate is hashed once and compared only with members of equal hash.
-    fn distinct_members(&mut self, candidates: Vec<Value>) -> Result<HashedMembers, String> {
+    fn distinct_members(&mut self, candidates: Vec<Value>) -> PyResult<HashedMembers> {
         let mut members = Vec::new();
         let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for candidate in candidates {
@@ -1977,7 +1982,7 @@ impl<'s> Vm<'s> {
 
     /// Dict entries for `entries` in order. A repeated key keeps its first position and takes
     /// the last value, as a dict display does.
-    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> Result<HashedEntries, String> {
+    fn ordered_map(&mut self, entries: Vec<(Value, Value)>) -> PyResult<HashedEntries> {
         let mut map: Vec<(KeyHash, Value, Value)> = Vec::new();
         let mut index = HashMap::<KeyHash, Vec<usize>>::new();
         for (key, value) in entries {
@@ -2003,17 +2008,13 @@ impl<'s> Vm<'s> {
     }
 
     /// Allocate a dict holding `entries`, deduplicated as [`Self::ordered_map`] does.
-    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> Result<Value, String> {
+    fn allocate_dict(&mut self, entries: Vec<(Value, Value)>) -> PyResult<Value> {
         let entries = self.ordered_map(entries)?;
         self.alloc(Object::Dict(entries.into_map()))
     }
 
     /// The position of the entry whose key equals `needle`.
-    fn find_mapping_entry(
-        &mut self,
-        mapping: Value,
-        needle: &Value,
-    ) -> Result<Option<usize>, String> {
+    fn find_mapping_entry(&mut self, mapping: Value, needle: &Value) -> PyResult<Option<usize>> {
         Ok(self.lookup_mapping_entry(mapping, needle)?.1)
     }
 
@@ -2024,7 +2025,7 @@ impl<'s> Vm<'s> {
         &mut self,
         mapping: Value,
         needle: &Value,
-    ) -> Result<(KeyHash, Option<usize>), String> {
+    ) -> PyResult<(KeyHash, Option<usize>)> {
         let hash = self.hash_value(needle)?;
         let candidates = match self.get(mapping)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
@@ -2051,7 +2052,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The position of the member equal to `needle`.
-    fn find_set_entry(&mut self, set: Value, needle: &Value) -> Result<Option<usize>, String> {
+    fn find_set_entry(&mut self, set: Value, needle: &Value) -> PyResult<Option<usize>> {
         Ok(self.lookup_set_entry(set, needle)?.1)
     }
 
@@ -2061,7 +2062,7 @@ impl<'s> Vm<'s> {
         &mut self,
         set: Value,
         needle: &Value,
-    ) -> Result<(KeyHash, Option<usize>), String> {
+    ) -> PyResult<(KeyHash, Option<usize>)> {
         let hash = self.hash_value(needle)?;
         let candidates = match self.get(set)? {
             Object::Set(values) | Object::FrozenSet(values) => {
@@ -2086,7 +2087,7 @@ impl<'s> Vm<'s> {
     }
 
     #[inline(always)]
-    fn pop(&mut self) -> Result<Value, String> {
+    fn pop(&mut self) -> PyResult<Value> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -2096,14 +2097,14 @@ impl<'s> Vm<'s> {
             .ok_or_else(|| "invalid bytecode stack effect".into())
     }
 
-    fn take(&mut self, count: usize) -> Result<Vec<Value>, String> {
+    fn take(&mut self, count: usize) -> PyResult<Vec<Value>> {
         if self.frame_stack_len() < count {
             return Err("invalid bytecode stack effect".into());
         }
         self.pop_many(count)
     }
 
-    fn copy(&mut self, depth: usize) -> Result<(), String> {
+    fn copy(&mut self, depth: usize) -> PyResult<()> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode copy depth".into());
         }
@@ -2112,7 +2113,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    fn jump_if_or_pop(&mut self, jump_when: bool) -> Result<bool, String> {
+    fn jump_if_or_pop(&mut self, jump_when: bool) -> PyResult<bool> {
         if self.frame_stack_len() == 0 {
             return Err("invalid bytecode stack effect".into());
         }
@@ -2129,7 +2130,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn swap(&mut self, depth: usize) -> Result<(), String> {
+    fn swap(&mut self, depth: usize) -> PyResult<()> {
         if depth == 0 || depth > self.frame_stack_len() {
             return Err("invalid bytecode swap depth".into());
         }
@@ -2148,7 +2149,7 @@ impl<'s> Vm<'s> {
         self.stack.len().saturating_sub(stack_base)
     }
 
-    fn reserve_result(&mut self, bytes: usize) -> Result<(), String> {
+    fn reserve_result(&mut self, bytes: usize) -> PyResult<()> {
         let bytes = u64::try_from(bytes).map_err(|_| "string result is too large")?;
         super::heap::charge_construction(bytes, &mut self.interp.resources)?;
         let next = self
@@ -2156,7 +2157,7 @@ impl<'s> Vm<'s> {
             .checked_add(bytes)
             .ok_or("modeled Python memory overflow")?;
         if !self.interp.resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.transient_memory = next;
         Ok(())
@@ -2186,7 +2187,7 @@ impl<'s> Vm<'s> {
     /// Charge a unit of VM-native work and turn exhaustion into the same bounded failure used by
     /// bytecode instructions. Native loops must use this rather than relying on a later opcode;
     /// otherwise a large host-side operation could complete after the budget was exhausted.
-    fn charge_cpu(&mut self, units: u64) -> Result<(), String> {
+    fn charge_cpu(&mut self, units: u64) -> PyResult<()> {
         if self.interp.resources.charge_cpu(units) {
             Ok(())
         } else {
@@ -2227,7 +2228,7 @@ fn select_string_slice(
     start: Option<i64>,
     stop: Option<i64>,
     step: Option<i64>,
-) -> Result<(String, u64), String> {
+) -> PyResult<(String, u64)> {
     debug_assert_eq!(value.is_ascii(), is_ascii);
     let characters = (!is_ascii).then(|| value.chars().collect::<Vec<_>>());
     let length = characters.as_ref().map_or(value.len(), Vec::len);
@@ -2252,7 +2253,7 @@ fn select_string_slice(
     Ok((selected, units))
 }
 
-fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
+fn range_length(start: i64, stop: i64, step: i64) -> PyResult<usize> {
     if step == 0 {
         return Err("range() arg 3 must not be zero".into());
     }
@@ -2269,14 +2270,15 @@ fn range_length(start: i64, stop: i64, step: i64) -> Result<usize, String> {
     usize::try_from(count).map_err(|_| "range is too large".into())
 }
 
-fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> Result<(), String> {
+fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> PyResult<()> {
     if (minimum..=maximum).contains(&arguments.len()) {
         Ok(())
     } else {
         Err(format!(
             "expected {minimum}..={maximum} arguments, got {}",
             arguments.len()
-        ))
+        )
+        .into())
     }
 }
 
@@ -2292,7 +2294,7 @@ mod tests {
             std::mem::size_of::<Flow>(),
             std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
         );
-        assert!(std::mem::size_of::<Result<Flow, String>>() <= 32);
+        assert!(std::mem::size_of::<PyResult<Flow>>() <= 32);
         // Five words of indices, two optional references and three flags: pushed and popped
         // by value on every call.
         assert!(std::mem::size_of::<BytecodeFrame>() <= 80);

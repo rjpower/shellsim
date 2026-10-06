@@ -144,7 +144,7 @@ impl NativeObject for RaisesContextObject {
         BuiltinType::RaisesContext.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         u64::try_from(self.expected.len()).map_err(|_| "modeled object size overflow".into())
     }
 
@@ -154,7 +154,7 @@ impl NativeObject for RaisesContextObject {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         Ok("<pytest.raises>".into())
     }
 }

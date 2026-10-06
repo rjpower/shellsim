@@ -17,9 +17,10 @@ use super::number::{bigint_value, int_value};
 use super::scopes;
 use super::string::{bytes_ref, bytes_value, quote_bytes, quote_string, string_value};
 use super::{ReplState, Value};
+use crate::python::error::{PyError, PyResult};
 
 /// The object behind `value`, or `None` for an immediate.
-fn object(heap: &Heap, value: Value) -> Result<Option<&Object>, String> {
+fn object(heap: &Heap, value: Value) -> PyResult<Option<&Object>> {
     if value.is_object() {
         heap.get(value).map(Some)
     } else {
@@ -27,11 +28,7 @@ fn object(heap: &Heap, value: Value) -> Result<Option<&Object>, String> {
     }
 }
 
-fn alias_item_repr(
-    state: &ReplState,
-    value: &Ref,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn alias_item_repr(state: &ReplState, value: &Ref, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
     let value = heap.value(value);
     if let Some(super::vm::NativeValue::BuiltinType(builtin)) = value.native_value() {
@@ -46,18 +43,14 @@ fn alias_item_repr(
 /// `str()` without user `__str__` dispatch. Rendering takes the interpreter state rather than
 /// the heap alone because a user exception's message comes from its `args` instance attribute,
 /// which the shape and symbol tables resolve.
-pub fn display(state: &ReplState, value: Value) -> Result<String, String> {
+pub fn display(state: &ReplState, value: Value) -> PyResult<String> {
     display_inner(state, value, &mut BTreeSet::new())
 }
 
 /// [`display`] with the exceptions whose message is being rendered on the current path. An
 /// exception whose `args` reach itself, directly or through another exception, would otherwise
 /// recurse without bound; CPython raises `RecursionError` there too.
-fn display_inner(
-    state: &ReplState,
-    value: Value,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn display_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
     if let Some(value) = string_value(heap, value)? {
         return Ok(value);
@@ -69,7 +62,7 @@ fn display_inner(
         .identity(value)?
         .ok_or("exception is not a heap object")?;
     if !active.insert(id) || active.len() >= MAX_RENDER_DEPTH {
-        return Err(RECURSION_IN_STR.into());
+        return Err(PyError::exception("RecursionError", RECURSION_IN_STR));
     }
     let message = exception_message(state, base, &args, active);
     active.remove(&id);
@@ -93,15 +86,12 @@ pub fn address_value(identity: u32) -> u64 {
     0x7f00_0000_0000_u64 + u64::from(identity) * 16
 }
 
-pub fn repr(state: &ReplState, value: Value) -> Result<String, String> {
+pub fn repr(state: &ReplState, value: Value) -> PyResult<String> {
     render(state, value, &mut BTreeSet::new())
 }
 
 /// The class name and `str()` of an exception instance, builtin or user-defined.
-pub fn exception_parts(
-    state: &ReplState,
-    value: Value,
-) -> Result<Option<(String, String)>, String> {
+pub fn exception_parts(state: &ReplState, value: Value) -> PyResult<Option<(String, String)>> {
     let Some(name) = exception_type_name(state, value)? else {
         return Ok(None);
     };
@@ -125,7 +115,7 @@ fn exception_message(
     kind: &str,
     args: &[Value],
     active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+) -> PyResult<String> {
     match args {
         [] => Ok(String::new()),
         [only] if super::exception_types::exception_is_subclass(kind, "KeyError") => {
@@ -165,15 +155,11 @@ fn exception_message(
 const MAX_RENDER_DEPTH: usize = 256;
 
 /// `active` holds the identities of the objects on the current rendering path.
-fn render(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> Result<String, String> {
+fn render(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     crate::stack::grow(|| render_inner(state, value, active))
 }
 
-fn render_inner(
-    state: &ReplState,
-    value: Value,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn render_inner(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
     let heap = &state.heap;
     if let Some(value) = string_value(heap, value)? {
         return Ok(quote_string(&value));
@@ -196,9 +182,10 @@ fn render_inner(
     if let Some(id) = heap.identity(value)? {
         // `active` holds the objects on the current path, so its size is the nesting depth.
         if !active.contains(&id) && active.len() >= MAX_RENDER_DEPTH {
-            return Err(
-                "maximum recursion depth exceeded while getting the repr of an object".into(),
-            );
+            return Err(PyError::exception(
+                "RecursionError",
+                "maximum recursion depth exceeded while getting the repr of an object",
+            ));
         }
         if !active.insert(id) {
             return Ok(match heap.get(value)? {
@@ -394,14 +381,14 @@ fn render_values<'a>(
     state: &ReplState,
     values: impl IntoIterator<Item = &'a Ref>,
     active: &mut BTreeSet<u32>,
-) -> Result<Vec<String>, String> {
+) -> PyResult<Vec<String>> {
     values
         .into_iter()
         .map(|value| render(state, state.heap.value(value), active))
         .collect()
 }
 
-pub fn truth(heap: &Heap, value: Value) -> Result<bool, String> {
+pub fn truth(heap: &Heap, value: Value) -> PyResult<bool> {
     if value.is_none() {
         return Ok(false);
     }
@@ -465,7 +452,7 @@ pub fn truth(heap: &Heap, value: Value) -> Result<bool, String> {
     })
 }
 
-pub fn equals(heap: &Heap, left: Value, right: Value) -> Result<bool, String> {
+pub fn equals(heap: &Heap, left: Value, right: Value) -> PyResult<bool> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
         return Ok(equal);
     }
@@ -477,7 +464,7 @@ fn equals_inner(
     left: Value,
     right: Value,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
+) -> PyResult<bool> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
         return Ok(equal);
     }
@@ -639,7 +626,7 @@ fn equals_inner(
     }
 }
 
-fn scalar_equality(heap: &Heap, left: Value, right: Value) -> Result<Option<bool>, String> {
+fn scalar_equality(heap: &Heap, left: Value, right: Value) -> PyResult<Option<bool>> {
     use super::number;
     // Registered numbers such as NumPy scalars equal the Python number with the same value, so
     // `np.int64(1)` finds the key `1` in a dict or list.
@@ -748,7 +735,7 @@ fn sequence_equal<'a>(
     left: impl IntoIterator<Item = &'a Ref, IntoIter: ExactSizeIterator>,
     right: impl IntoIterator<Item = &'a Ref, IntoIter: ExactSizeIterator>,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
+) -> PyResult<bool> {
     let (left, right) = (left.into_iter(), right.into_iter());
     if left.len() != right.len() {
         return Ok(false);
@@ -767,7 +754,7 @@ fn refs_equal(
     left: &Ref,
     right: &Ref,
     active: &mut BTreeSet<(u32, u32)>,
-) -> Result<bool, String> {
+) -> PyResult<bool> {
     Ok(left == right || equals_inner(heap, heap.value(left), heap.value(right), active)?)
 }
 
@@ -790,14 +777,14 @@ impl Comparison {
     }
 }
 
-pub fn compare(heap: &Heap, left: Value, right: Value) -> Result<Comparison, String> {
+pub fn compare(heap: &Heap, left: Value, right: Value) -> PyResult<Comparison> {
     compare_at(heap, left, right, 0)
 }
 
 /// Nesting bound for sequence ordering outside the VM, matching [`MAX_RENDER_DEPTH`].
 const MAX_COMPARE_DEPTH: usize = 256;
 
-fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> Result<Comparison, String> {
+fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> PyResult<Comparison> {
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
             return Ok(Comparison::Ordered(left.cmp(right)));
@@ -843,7 +830,10 @@ fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> Result<Co
         (Some(Object::List(left)), Some(Object::List(right)))
         | (Some(Object::Tuple(left)), Some(Object::Tuple(right))) => {
             if depth >= MAX_COMPARE_DEPTH {
-                return Err("maximum recursion depth exceeded in comparison".into());
+                return Err(PyError::exception(
+                    "RecursionError",
+                    "maximum recursion depth exceeded in comparison",
+                ));
             }
             sequence_compare(heap, left, right, depth + 1)
         }
@@ -851,7 +841,7 @@ fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> Result<Co
     }
 }
 
-fn compare_bigint_float(integer: &BigInt, float: f64) -> Result<Comparison, String> {
+fn compare_bigint_float(integer: &BigInt, float: f64) -> PyResult<Comparison> {
     if float.is_nan() {
         return Ok(Comparison::Unordered);
     }
@@ -878,7 +868,7 @@ fn sequence_compare(
     left: &[Ref],
     right: &[Ref],
     depth: usize,
-) -> Result<Comparison, String> {
+) -> PyResult<Comparison> {
     for (left, right) in left.iter().zip(right) {
         let (left, right) = (heap.value(left), heap.value(right));
         if left.is(right) || equals(heap, left, right)? {
@@ -889,7 +879,7 @@ fn sequence_compare(
     Ok(Comparison::Ordered(left.len().cmp(&right.len())))
 }
 
-pub fn contains(heap: &Heap, container: Value, needle: Value) -> Result<bool, String> {
+pub fn contains(heap: &Heap, container: Value, needle: Value) -> PyResult<bool> {
     if let Some(container) = string_value(heap, container)? {
         let Some(needle) = string_value(heap, needle)? else {
             return Err("string containment requires a string operand".into());

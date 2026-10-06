@@ -151,11 +151,7 @@ pub(super) fn dup_object(object: &Object) -> Object {
             instruction_pointer: generator.instruction_pointer,
             handlers: generator.handlers.clone(),
             contexts: slots(&generator.contexts),
-            exceptions: generator
-                .exceptions
-                .iter()
-                .map(|(kind, value)| (kind.clone(), value.dup()))
-                .collect(),
+            exceptions: slots(&generator.exceptions),
             stack: slots(&generator.stack),
             exhausted: generator.exhausted,
             running: generator.running,

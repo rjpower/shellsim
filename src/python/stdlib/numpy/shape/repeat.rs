@@ -119,15 +119,15 @@ mod tests {
         assert_eq!(resolve_repeats(vec![2], 3).unwrap(), [2, 2, 2]);
         assert_eq!(resolve_repeats(vec![1, 0, 2], 3).unwrap(), [1, 0, 2]);
         assert_eq!(
-            resolve_repeats(vec![-1], 3).unwrap_err().message,
+            resolve_repeats(vec![-1], 3).unwrap_err().message(),
             "negative dimensions are not allowed"
         );
         assert_eq!(
-            resolve_repeats(vec![1, -1, 2], 3).unwrap_err().message,
+            resolve_repeats(vec![1, -1, 2], 3).unwrap_err().message(),
             "repeats may not contain negative values."
         );
         assert_eq!(
-            resolve_repeats(vec![1, 2], 3).unwrap_err().message,
+            resolve_repeats(vec![1, 2], 3).unwrap_err().message(),
             "operands could not be broadcast together with shape (3,) (2,)"
         );
     }

@@ -518,13 +518,9 @@ fn slot_get_item(
     let array = super::convert::as_array(runtime, receiver)?;
     match super::index::get_item(runtime, &array, index) {
         Ok(value) => Ok(Some(value)),
-        Err(PyError {
-            kind: PyErrorKind::Type | PyErrorKind::Value | PyErrorKind::Exception(_),
-            ..
-        }) => Err(PyError::exception(
-            "IndexError",
-            "invalid index to scalar variable.",
-        )),
+        Err(error) if matches!(error.kind(), Some(PyErrorKind::Exception(_))) => Err(
+            PyError::exception("IndexError", "invalid index to scalar variable."),
+        ),
         Err(error) => Err(error),
     }
 }

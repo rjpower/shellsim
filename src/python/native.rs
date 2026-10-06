@@ -24,7 +24,7 @@ pub(super) struct PyIdentity(pub(super) u32);
 
 /// Result of a Python runtime operation. `'s` is the scope of any value it carries; results
 /// without values ignore it.
-pub(super) type PyResult<T = PyValue> = Result<T, PyError>;
+pub(super) use super::error::{PyError, PyErrorKind, PyResult};
 
 /// Native implementation of a type's six rich comparisons, stored in each comparison slot. The
 /// operands are the builtin values the receiver and argument stand for; `None` means the type
@@ -176,109 +176,6 @@ impl fmt::Debug for ValueKindDef {
             .debug_tuple("ValueKindDef")
             .field(&self.name)
             .finish()
-    }
-}
-
-/// Stable error categories produced by native Python operations.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum PyErrorKind {
-    Type,
-    Value,
-    ZeroDivision,
-    Overflow,
-    Runtime,
-    Resource,
-    /// A valid Python operation that shellsim does not model. It is not a Python exception:
-    /// the program stops with the minimal-shim diagnostic, as for an unmodeled builtin.
-    Unsupported,
-    Exception(&'static str),
-    /// An `OSError` carrying an errno and an optional operand path. The VM picks the subclass
-    /// from the errno as CPython does and stores `(errno, strerror, filename)` as the args; the
-    /// message holds the `strerror` text.
-    OsError {
-        errno: i32,
-        filename: Option<String>,
-    },
-    /// A nested VM operation already stored the concrete Python exception.
-    Raised,
-    Exit(i32),
-    /// Internal cooperative control flow. This must be consumed by the bytecode VM and never
-    /// materialized as a Python exception.
-    Suspend(crate::scheduler::WaitReason),
-}
-
-/// A structured Python error. Formatting is deferred to the VM boundary.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct PyError {
-    pub kind: PyErrorKind,
-    pub message: String,
-}
-
-impl PyError {
-    pub fn new(kind: PyErrorKind, message: impl Into<String>) -> Self {
-        Self {
-            kind,
-            message: message.into(),
-        }
-    }
-
-    pub fn type_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Type, message)
-    }
-
-    pub fn value_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Value, message)
-    }
-
-    pub fn overflow_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Overflow, message)
-    }
-
-    pub fn zero_division_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::ZeroDivision, message)
-    }
-
-    pub fn runtime_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Runtime, message)
-    }
-
-    pub fn resource_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Resource, message)
-    }
-
-    pub fn unsupported(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Unsupported, message)
-    }
-
-    /// A catchable `NotImplementedError` for a library feature outside shellsim's subset, such
-    /// as an unsupported dtype or option in NumPy or SciPy.
-    pub fn not_implemented_error(message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Exception("NotImplementedError"), message)
-    }
-
-    pub fn exception(kind: &'static str, message: impl Into<String>) -> Self {
-        Self::new(PyErrorKind::Exception(kind), message)
-    }
-
-    /// An `OSError` for `errno` with CPython's `[Errno N] strerror: 'filename'` form; the VM
-    /// raises the errno's subclass, such as `FileNotFoundError` for `ENOENT`.
-    pub fn os_error(errno: i32, strerror: impl Into<String>, filename: Option<String>) -> Self {
-        Self::new(PyErrorKind::OsError { errno, filename }, strerror)
-    }
-
-    pub fn exit(status: i32) -> Self {
-        Self::new(PyErrorKind::Exit(status), "Python callable requested exit")
-    }
-
-    /// Suspend a scheduler-owned native call until its modeled resource becomes ready.
-    pub fn suspend(reason: crate::scheduler::WaitReason) -> Self {
-        Self::new(PyErrorKind::Suspend(reason), "Python native call suspended")
-    }
-}
-
-impl fmt::Display for PyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
     }
 }
 

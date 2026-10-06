@@ -11,9 +11,10 @@ use super::{
     exception_types, expect_arity, number, protocol, range_length, select_string_slice, string,
     Arc, BuiltinSubscript, BuiltinType, CallArgs, CallMode, ClassDefinition, ClassField,
     ClassLayout, CodeCaches, CodeRef, ComparisonOperator, ExceptionType, Flow, FrameEntry, HashMap,
-    NameId, NativeValue, Object, PyError, PyRuntime, RaisedException, Resolved, SiteCache,
-    SlicePlan, Slot, SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
+    NameId, NativeValue, Object, PyError, PyRuntime, Resolved, SiteCache, SlicePlan, Slot,
+    SlotValue, SymbolId, TypeId, Value, Vm, MODELED_MAPPING_ENTRY_BYTES,
 };
+use crate::python::error::PyResult;
 
 /// Positional and keyword arguments of one call, as the call machinery passes them.
 type CallArguments = (Vec<Value>, Vec<(String, Value)>);
@@ -91,7 +92,7 @@ enum SiteHit {
 }
 
 impl<'s> Vm<'s> {
-    pub(super) fn load_attribute(&mut self, name: &str) -> Result<(), String> {
+    pub(super) fn load_attribute(&mut self, name: &str) -> PyResult<()> {
         let owner = self.pop()?;
         let Some(value) = self.resolve_attribute(owner, name)? else {
             return Err(self.missing_attribute(&owner, name));
@@ -108,10 +109,10 @@ impl<'s> Vm<'s> {
     /// missing special method (`__exit__`, `__bytes__`, ...) is the exception: programs probe
     /// those with `try`/`except AttributeError` to pick a protocol, and the set of special names
     /// a builtin type supports is a modeled decision rather than a gap.
-    pub(super) fn missing_attribute(&mut self, owner: &Value, name: &str) -> String {
+    pub(super) fn missing_attribute(&mut self, owner: &Value, name: &str) -> PyError {
         if let Some(NativeValue::Module(module)) = owner.native_value() {
             let message = format!("module '{}' has no attribute '{name}'", module.name);
-            return self.raise_exception("AttributeError", message);
+            return PyError::exception("AttributeError", message);
         }
         let is_special = name.len() > 4 && name.starts_with("__") && name.ends_with("__");
         if is_special && !owner.is_object() {
@@ -124,7 +125,7 @@ impl<'s> Vm<'s> {
                     Err(error) => return error,
                 },
             };
-            return self.raise_exception("AttributeError", message);
+            return PyError::exception("AttributeError", message);
         }
         match self.instance_class(*owner) {
             Ok(Some(_)) => {
@@ -132,7 +133,7 @@ impl<'s> Vm<'s> {
                     Ok(type_name) => format!("'{type_name}' object has no attribute '{name}'"),
                     Err(error) => return error,
                 };
-                return self.raise_exception("AttributeError", message);
+                return PyError::exception("AttributeError", message);
             }
             Ok(None) => {}
             Err(error) => return error,
@@ -150,9 +151,9 @@ impl<'s> Vm<'s> {
                 Err(error) => return error,
             },
             Some(Err(error)) => return error,
-            _ => return format!("attribute {name:?} is not implemented"),
+            _ => return format!("attribute {name:?} is not implemented").into(),
         };
-        self.raise_exception("AttributeError", message)
+        PyError::exception("AttributeError", message)
     }
 
     pub(super) fn load_attribute_at(
@@ -162,7 +163,7 @@ impl<'s> Vm<'s> {
         site: usize,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let owner = self.pop()?;
         match self.site_hit(code_cache, site, owner)? {
             Some(SiteHit::Value(value)) => {
@@ -205,7 +206,7 @@ impl<'s> Vm<'s> {
         site: usize,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let owner = self.peek(0)?;
         let top = self.stack.len() - 1;
         match self.site_hit(code_cache, site, owner)? {
@@ -237,12 +238,7 @@ impl<'s> Vm<'s> {
 
     /// What a site's cache gives for `owner`, when the cache is filled and the owner has the
     /// type and shape it was filled for. One heap lookup checks the key and reads a slot.
-    fn site_hit(
-        &self,
-        code_cache: usize,
-        site: usize,
-        owner: Value,
-    ) -> Result<Option<SiteHit>, String> {
+    fn site_hit(&self, code_cache: usize, site: usize, owner: Value) -> PyResult<Option<SiteHit>> {
         let Some(cache) = self.site(code_cache, site) else {
             return Ok(None);
         };
@@ -285,7 +281,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         name: &str,
         value: Option<Value>,
-    ) -> Result<Option<SiteCache>, String> {
+    ) -> PyResult<Option<SiteCache>> {
         // Only owners whose lookup is a plain walk of their type's MRO qualify: user instances
         // without an attribute hook, and builtin values. Classes, `super` proxies and native
         // module or type values resolve names their own way in `lookup_attribute`.
@@ -384,7 +380,7 @@ impl<'s> Vm<'s> {
         code_cache: usize,
         site: usize,
         cache: SiteCache,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if let Some(sites) = &mut self.execution.code_caches[code_cache].sites {
             sites[site] = Some(cache);
             return Ok(());
@@ -412,7 +408,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         cache: usize,
         name: NameId,
-    ) -> Result<SymbolId, String> {
+    ) -> PyResult<SymbolId> {
         if let Some(symbol) = self.execution.code_caches[cache].names[name.index()] {
             return Ok(symbol);
         }
@@ -421,18 +417,13 @@ impl<'s> Vm<'s> {
 
     #[cold]
     #[inline(never)]
-    fn resolve_symbol(
-        &mut self,
-        code: &CodeRef,
-        cache: usize,
-        name: NameId,
-    ) -> Result<SymbolId, String> {
+    fn resolve_symbol(&mut self, code: &CodeRef, cache: usize, name: NameId) -> PyResult<SymbolId> {
         let symbol = self.intern_symbol(code.name(name))?;
         self.execution.code_caches[cache].names[name.index()] = Some(symbol);
         Ok(symbol)
     }
 
-    pub(super) fn ensure_code_cache(&mut self, code: &CodeRef) -> Result<usize, String> {
+    pub(super) fn ensure_code_cache(&mut self, code: &CodeRef) -> PyResult<usize> {
         if let Some(slot) = self.execution.code_caches.slot_of(code) {
             return Ok(slot);
         }
@@ -466,7 +457,7 @@ impl<'s> Vm<'s> {
         &mut self,
         owner: Value,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let symbol = self.symbol_id(name);
         self.resolve_attribute_inner(owner, symbol, name)
     }
@@ -479,21 +470,11 @@ impl<'s> Vm<'s> {
         &mut self,
         owner: Value,
         name: &str,
-    ) -> Result<Option<Value>, String> {
-        let error = match self.resolve_attribute(owner, name) {
-            Ok(value) => return Ok(value),
-            Err(error) => error,
-        };
-        let Some(exception) = self.pending_exception.take() else {
-            return Err(error);
-        };
-        let attribute_error =
-            Value::Native(NativeValue::ExceptionType(ExceptionType("AttributeError")));
-        if self.exception_type_matches(attribute_error, &exception)? {
-            return Ok(None);
+    ) -> PyResult<Option<Value>> {
+        match self.resolve_attribute(owner, name) {
+            Ok(value) => Ok(value),
+            Err(error) => self.catch(error, "AttributeError").map(|()| None),
         }
-        self.pending_exception = Some(exception);
-        Err(error)
     }
 
     fn resolve_attribute_by_symbol(
@@ -501,7 +482,7 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         self.resolve_attribute_inner(owner, Some(symbol), name)
     }
 
@@ -510,8 +491,8 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: Option<SymbolId>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
-        let getattribute: Result<Option<Value>, String> = if owner.is_object()
+    ) -> PyResult<Option<Value>> {
+        let getattribute: PyResult<Option<Value>> = if owner.is_object()
             && (self.instance_class(owner)?.is_some()
                 || matches!(self.get(owner), Ok(Object::Class { .. })))
             && self
@@ -528,26 +509,15 @@ impl<'s> Vm<'s> {
         let found = match getattribute {
             Ok(found) => found,
             Err(error) => {
-                let Some(exception) = self.pending_exception.take() else {
-                    return Err(error);
-                };
-                let attribute_error =
-                    Value::Native(NativeValue::ExceptionType(ExceptionType("AttributeError")));
-                let matches = self.exception_type_matches(attribute_error, &exception)?;
-                // The hook runs guest code that may allocate, so pin the taken exception's value
-                // rather than holding only its stored reference.
-                let RaisedException { kind, value } = exception;
-                let value = self.value(&value);
-                if matches {
+                // Take the exception out while the hook runs guest code, and raise it again if
+                // there is no hook.
+                let exception = self.take_exception(error)?;
+                if self.exception_is(exception, "AttributeError")? {
                     if let Some(value) = self.call_type_getattr_hook(owner, name)? {
                         return Ok(Some(value));
                     }
                 }
-                self.pending_exception = Some(RaisedException {
-                    kind,
-                    value: self.store(value),
-                });
-                return Err(error);
+                return Err(self.raise_value(exception));
             }
         };
         match found {
@@ -564,7 +534,7 @@ impl<'s> Vm<'s> {
         class: Value,
         symbol: Option<SymbolId>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let class_type = self
             .class_type_id(&class)?
             .ok_or("instance has no registered class")?;
@@ -613,15 +583,11 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: Option<SymbolId>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         self.lookup_attribute(owner, symbol, name)
     }
 
-    fn call_type_getattr_hook(
-        &mut self,
-        owner: Value,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
+    fn call_type_getattr_hook(&mut self, owner: Value, name: &str) -> PyResult<Option<Value>> {
         let owner_type = self.type_id(&owner)?;
         let Some((defining_type, hook)) = self.type_lookup(owner_type, "__getattr__")? else {
             return Ok(None);
@@ -638,7 +604,7 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: Option<SymbolId>,
         name: &str,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         // A metatype data descriptor wins over a class's own MRO, for native and user classes.
         if self.class_type_id(&owner)?.is_some() {
             let metatype = self.type_id(&owner)?;
@@ -658,7 +624,7 @@ impl<'s> Vm<'s> {
                 return Ok(Some(Value::Native(NativeValue::NativeFunction(function))));
             }
             if let Some(value) = module.value(name) {
-                let value = value.get(self).map_err(|error| error.to_string())?;
+                let value = value.get(self)?;
                 return Ok(Some(value));
             }
         }
@@ -901,7 +867,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Materialize the live namespace selected by a `__dict__` data descriptor.
-    pub(super) fn dictionary_of(&mut self, owner: Value) -> Result<Option<Value>, String> {
+    pub(super) fn dictionary_of(&mut self, owner: Value) -> PyResult<Option<Value>> {
         let namespace = match owner.native_value() {
             Some(NativeValue::Module(module)) => {
                 Some(Object::MappingProxy(ProxyTarget::NativeModule(module)))
@@ -958,7 +924,7 @@ impl<'s> Vm<'s> {
         &mut self,
         owner: Value,
         field: super::super::native::TypeMetadata,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         use super::super::native::TypeMetadata;
         if owner.is_object() {
             if let Object::Class(class_object) = self.get(owner)? {
@@ -1000,7 +966,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         name: &str,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if let Some(class) = self.instance_class(owner)? {
             if let Some((defining_class, hook)) =
                 self.class_attribute_entry(class, "__setattr__")?
@@ -1022,7 +988,7 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         name: &str,
         value: Value,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         // `BaseException.args` is writable and stores any iterable as a tuple.
         if name == "args" && exception_types::exception_base(self.state, owner)?.is_some() {
             let current = match self.get(owner)? {
@@ -1086,7 +1052,7 @@ impl<'s> Vm<'s> {
                             "property '{name}' of '{}' object has no setter",
                             self.type_name_of(&owner)?
                         );
-                        return Err(self.raise_exception("AttributeError", message));
+                        return Err(PyError::exception("AttributeError", message));
                     }
                     _ if descriptor_class.is_some() => {
                         let descriptor_class = descriptor_class.expect("checked above");
@@ -1115,7 +1081,7 @@ impl<'s> Vm<'s> {
             ) && exception_types::exception_base(self.state, owner)?.is_some())
             {
                 let type_name = self.type_name_of(&owner)?;
-                return Err(self.raise_exception(
+                return Err(PyError::exception(
                     "AttributeError",
                     format!("attribute '{name}' of '{type_name}' objects is not writable"),
                 ));
@@ -1128,11 +1094,7 @@ impl<'s> Vm<'s> {
     /// `obj.__dict__ = mapping`: replace every attribute of instance `id` with `mapping`'s
     /// entries. The entries are copied, so later changes to `mapping` do not reach the instance;
     /// CPython instead makes the instance adopt the dict itself.
-    fn replace_instance_attributes(
-        &mut self,
-        instance: Value,
-        mapping: Value,
-    ) -> Result<(), String> {
+    fn replace_instance_attributes(&mut self, instance: Value, mapping: Value) -> PyResult<()> {
         let source = mapping.is_object().then(|| self.get(mapping)).transpose()?;
         let entries = match source {
             Some(Object::Dict(entries) | Object::DefaultDict { entries, .. }) => {
@@ -1147,7 +1109,7 @@ impl<'s> Vm<'s> {
                             "namespace keys must be str, not {}",
                             self.type_name_of(&key)?
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     };
                     named.push((name, value));
                 }
@@ -1162,7 +1124,7 @@ impl<'s> Vm<'s> {
                     "__dict__ must be set to a dictionary, not a '{}'",
                     self.type_name_of(&mapping)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
         };
         let current = self.instance_attribute_names(instance)?;
@@ -1183,7 +1145,7 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if self
             .state
             .types
@@ -1205,7 +1167,7 @@ impl<'s> Vm<'s> {
         owner: Value,
         symbol: SymbolId,
         name: &str,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if !owner.is_object() {
             return Err(self.reject_builtin_attribute_store(owner, name));
         }
@@ -1242,7 +1204,7 @@ impl<'s> Vm<'s> {
                             "property '{name}' of '{}' object has no deleter",
                             self.type_name_of(&owner)?
                         );
-                        return Err(self.raise_exception("AttributeError", message));
+                        return Err(PyError::exception("AttributeError", message));
                     }
                     _ if descriptor_class.is_some() => {
                         let descriptor_class = descriptor_class.expect("checked above");
@@ -1267,7 +1229,7 @@ impl<'s> Vm<'s> {
                 Some(NativeValue::NativeGetter(_))
             ) {
                 let type_name = self.type_name_of(&owner)?;
-                return Err(self.raise_exception(
+                return Err(PyError::exception(
                     "AttributeError",
                     format!("attribute '{name}' of '{type_name}' objects is not deletable"),
                 ));
@@ -1290,7 +1252,7 @@ impl<'s> Vm<'s> {
         function: Value,
         name: &str,
         value: Option<Value>,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if name == "__name__" {
             let Some(text) = value
                 .map(|value| string::string_ref(&self.state.heap, value))
@@ -1298,9 +1260,10 @@ impl<'s> Vm<'s> {
                 .flatten()
                 .map(|text| text.as_str().to_string())
             else {
-                return Err(
-                    self.raise_exception("TypeError", "__name__ must be set to a string object")
-                );
+                return Err(PyError::exception(
+                    "TypeError",
+                    "__name__ must be set to a string object",
+                ));
             };
             let Object::Function(function_object) = self.get_mut(function)? else {
                 unreachable!("checked by the caller")
@@ -1339,7 +1302,7 @@ impl<'s> Vm<'s> {
             }
             None => {
                 let message = format!("'function' object has no attribute '{name}'");
-                return Err(self.raise_exception("AttributeError", message));
+                return Err(PyError::exception("AttributeError", message));
             }
         }
         Ok(())
@@ -1350,11 +1313,9 @@ impl<'s> Vm<'s> {
         class: Value,
         name: &str,
         value: Option<Value>,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if matches!(name, "__dict__" | "__name__" | "__bases__" | "__mro__") {
-            return Err(format!(
-                "assigning or deleting a class's {name} is not supported"
-            ));
+            return Err(format!("assigning or deleting a class's {name} is not supported").into());
         }
         let Object::Class(class_object) = self.get(class)? else {
             return Err("class attribute store on a non-class".into());
@@ -1409,7 +1370,7 @@ impl<'s> Vm<'s> {
     /// Raise CPython's `AttributeError` for a store on a receiver without an instance
     /// dictionary: data descriptors are not writable, other type attributes are read-only, and
     /// new names have nowhere to go.
-    fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> String {
+    fn reject_builtin_attribute_store(&mut self, owner: Value, name: &str) -> PyError {
         let attribute = self
             .type_id(&owner)
             .and_then(|owner_type| self.type_lookup(owner_type, name))
@@ -1435,25 +1396,25 @@ impl<'s> Vm<'s> {
                  attributes"
             ),
         };
-        self.raise_exception("AttributeError", message)
+        PyError::exception("AttributeError", message)
     }
 
     /// The class object of `value` when it is an instance of a user class, whatever payload the
     /// class's layout gave it; `None` for builtin values and class objects.
-    pub(super) fn instance_class(&self, value: Value) -> Result<Option<Value>, String> {
+    pub(super) fn instance_class(&self, value: Value) -> PyResult<Option<Value>> {
         self.state.types.instance_class(&self.state.heap, value)
     }
 
     /// Whether `value` keeps its own attribute dictionary: an instance of a user class, or an
     /// exception instance, whose builtin classes also give instances a `__dict__`.
-    pub(super) fn has_instance_dict(&self, value: Value) -> Result<bool, String> {
+    pub(super) fn has_instance_dict(&self, value: Value) -> PyResult<bool> {
         Ok(self.instance_class(value)?.is_some()
             || exception_types::exception_base(self.state, value)?.is_some())
     }
 
     /// Whether `value` is an instance of a user class with the plain `object` layout and no
     /// exception base: the objects whose default `repr()` and `str()` are `<Name object at ...>`.
-    fn is_plain_instance(&self, value: &Value) -> Result<bool, String> {
+    fn is_plain_instance(&self, value: &Value) -> PyResult<bool> {
         let Some(class) = self.instance_class(*value)? else {
             return Ok(false);
         };
@@ -1466,7 +1427,7 @@ impl<'s> Vm<'s> {
         ))
     }
 
-    pub(super) fn load_subscript(&mut self) -> Result<(), String> {
+    pub(super) fn load_subscript(&mut self) -> PyResult<()> {
         let index = self.pop()?;
         let owner = self.pop()?;
         let value = self.subscript_value(owner, index)?;
@@ -1475,11 +1436,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Build an alias after the class-subscription slot has selected a builtin container.
-    pub(super) fn new_generic_alias(
-        &mut self,
-        origin: Value,
-        item: Value,
-    ) -> Result<Value, String> {
+    pub(super) fn new_generic_alias(&mut self, origin: Value, item: Value) -> PyResult<Value> {
         let count = match item.is_object().then(|| self.get(item)).transpose()? {
             Some(Object::Tuple(arguments)) => arguments.len(),
             _ => 1,
@@ -1497,7 +1454,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `owner[index]`: the owner's `__getitem__` or its builtin subscript.
-    pub(super) fn subscript_value(&mut self, owner: Value, index: Value) -> Result<Value, String> {
+    pub(super) fn subscript_value(&mut self, owner: Value, index: Value) -> PyResult<Value> {
         if let Some(value) = self.invoke_slot(&owner, Slot::GetItem, "__getitem__", vec![index])? {
             return Ok(value);
         }
@@ -1516,11 +1473,7 @@ impl<'s> Vm<'s> {
 
     /// Index a builtin payload directly. A native `__getitem__` slot calls this after type-slot
     /// dispatch, so the implementation cannot redispatch into its own wrapper.
-    pub(super) fn subscript_builtin(
-        &mut self,
-        owner: Value,
-        index: Value,
-    ) -> Result<Value, String> {
+    pub(super) fn subscript_builtin(&mut self, owner: Value, index: Value) -> PyResult<Value> {
         let subject = owner;
         // A slice is an ordinary key to a mapping; only sequences slice with it.
         let mapping = match owner.is_object() {
@@ -1569,7 +1522,7 @@ impl<'s> Vm<'s> {
                             "{sequence} indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     };
                     let len = values.len() as i64;
                     let index = if index < 0 { len + index } else { index };
@@ -1579,7 +1532,7 @@ impl<'s> Vm<'s> {
                     {
                         Some(value) => BuiltinSubscript::Value(self.value(value)),
                         None => {
-                            return Err(self.raise_exception(
+                            return Err(PyError::exception(
                                 "IndexError",
                                 format!("{sequence} index out of range"),
                             ))
@@ -1593,7 +1546,7 @@ impl<'s> Vm<'s> {
                             "range indices must be integers or slices, not {}",
                             self.type_name_of(&index)?
                         );
-                        return Err(self.raise_exception("TypeError", message));
+                        return Err(PyError::exception("TypeError", message));
                     };
                     let index = if index < 0 {
                         i128::try_from(length).map_err(|_| "range is too large")?
@@ -1602,9 +1555,10 @@ impl<'s> Vm<'s> {
                         i128::from(index)
                     };
                     if index < 0 || index >= i128::try_from(length).unwrap_or(i128::MAX) {
-                        return Err(
-                            self.raise_exception("IndexError", "range object index out of range")
-                        );
+                        return Err(PyError::exception(
+                            "IndexError",
+                            "range object index out of range",
+                        ));
                     }
                     let value = i128::from(*start)
                         .checked_add(
@@ -1703,8 +1657,7 @@ impl<'s> Vm<'s> {
                     let Some(method) = native_method else {
                         return Err(self.raise_object_type_error(&owner, "is not subscriptable"));
                     };
-                    (method.call)(self, owner, CallArgs::new(vec![index], Vec::new()))
-                        .map_err(|error| self.record_native_error(error))?
+                    (method.call)(self, owner, CallArgs::new(vec![index], Vec::new()))?
                 }
                 BuiltinSubscript::Set => {
                     return Err(self.raise_object_type_error(&owner, "is not subscriptable"))
@@ -1718,7 +1671,7 @@ impl<'s> Vm<'s> {
 
     /// The value a dict subclass's `__missing__(key)` supplies for an absent key, or `None` when
     /// `subject` is not an instance whose class defines `__missing__`.
-    fn missing_key(&mut self, subject: &Value, key: Value) -> Result<Option<Value>, String> {
+    fn missing_key(&mut self, subject: &Value, key: Value) -> PyResult<Option<Value>> {
         let Some(class) = self.instance_class(*subject)? else {
             return Ok(None);
         };
@@ -1733,7 +1686,7 @@ impl<'s> Vm<'s> {
 
     /// Index a string, raising CPython's errors for a bad index. `None` means `owner` is not a
     /// string.
-    fn string_subscript(&mut self, owner: &Value, index: &Value) -> Result<Option<char>, String> {
+    fn string_subscript(&mut self, owner: &Value, index: &Value) -> PyResult<Option<char>> {
         // A non-ASCII string is indexed by code point, which scans the UTF-8 up to the index.
         let non_ascii_bytes = string::string_ref(&self.state.heap, *owner)?
             .filter(|text| !text.is_ascii())
@@ -1749,11 +1702,12 @@ impl<'s> Vm<'s> {
                     "string indices must be integers, not '{}'",
                     self.type_name_of(index)?
                 );
-                Err(self.raise_exception("TypeError", message))
+                Err(PyError::exception("TypeError", message))
             }
-            string::StringIndex::OutOfRange => {
-                Err(self.raise_exception("IndexError", "string index out of range"))
-            }
+            string::StringIndex::OutOfRange => Err(PyError::exception(
+                "IndexError",
+                "string index out of range",
+            )),
         }
     }
 
@@ -1763,7 +1717,7 @@ impl<'s> Vm<'s> {
         start: Option<i64>,
         stop: Option<i64>,
         step: Option<i64>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let non_ascii_bytes = string::string_ref(&self.state.heap, owner)?
             .filter(|text| !text.is_ascii())
             .map(|text| text.byte_len());
@@ -1820,7 +1774,7 @@ impl<'s> Vm<'s> {
     /// `value` as a machine integer, read through `__index__` as CPython's `PyNumber_Index` reads
     /// sequence indices and slice bounds; NumPy integer scalars and 0-d integer arrays qualify.
     /// `None` means `value` is not an integer and its type defines no `__index__`.
-    fn index_value(&mut self, value: &Value) -> Result<Option<i64>, String> {
+    fn index_value(&mut self, value: &Value) -> PyResult<Option<i64>> {
         if let Some(index) = number::int_value(&self.state.heap, *value) {
             return Ok(Some(index));
         }
@@ -1829,16 +1783,16 @@ impl<'s> Vm<'s> {
         };
         match number::int_value(&self.state.heap, result) {
             Some(index) => Ok(Some(index)),
-            None => {
-                Err(self
-                    .raise_exception("IndexError", "cannot fit 'int' into an index-sized integer"))
-            }
+            None => Err(PyError::exception(
+                "IndexError",
+                "cannot fit 'int' into an index-sized integer",
+            )),
         }
     }
 
     /// A builtin sequence's subscript with a non-int index, such as a NumPy integer, replaced by
     /// the int its `__index__` returns. Other owners and indices are returned unchanged.
-    fn sequence_index(&mut self, owner: &Value, index: Value) -> Result<Value, String> {
+    fn sequence_index(&mut self, owner: &Value, index: Value) -> PyResult<Value> {
         if !owner.is_object() {
             return Ok(index);
         }
@@ -1862,7 +1816,7 @@ impl<'s> Vm<'s> {
 
     /// An integer argument read through `__index__`, such as a `range()` bound. Anything else
     /// raises CPython's `TypeError`.
-    pub(super) fn index_argument(&mut self, value: &Value) -> Result<i64, String> {
+    pub(super) fn index_argument(&mut self, value: &Value) -> PyResult<i64> {
         if let Some(index) = self.index_value(value)? {
             return Ok(index);
         }
@@ -1870,14 +1824,14 @@ impl<'s> Vm<'s> {
             "'{}' object cannot be interpreted as an integer",
             self.type_name_of(value)?
         );
-        Err(self.raise_exception("TypeError", message))
+        Err(PyError::exception("TypeError", message))
     }
 
     /// Call `value`'s conversion method `method` (`__int__`, `__float__`, or `__index__`), as
     /// CPython's `int()` and `float()` do for values that are not builtin numbers or strings:
     /// NumPy scalars and arrays, and instances of classes. `None` means the value is a builtin
     /// number, string, or bytes, or its type does not define `method`.
-    fn conversion_method(&mut self, value: &Value, method: &str) -> Result<Option<Value>, String> {
+    fn conversion_method(&mut self, value: &Value, method: &str) -> PyResult<Option<Value>> {
         let builtin = self.registered_kind(value).is_none()
             && (super::number::view(&self.state.heap, value).is_some()
                 || string::string_value(&self.state.heap, *value)?.is_some()
@@ -1895,11 +1849,7 @@ impl<'s> Vm<'s> {
     /// the type, so an instance attribute of the same name does not replace the class's method.
     /// Native kinds have no instance dictionary, so ordinary attribute lookup finds the same
     /// method for them.
-    pub(super) fn special_method(
-        &mut self,
-        value: &Value,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
+    pub(super) fn special_method(&mut self, value: &Value, name: &str) -> PyResult<Option<Value>> {
         let Some(class) = self.instance_class(*value)? else {
             return self.resolve_attribute(*value, name);
         };
@@ -1917,7 +1867,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: &Value,
         methods: &[&'static str],
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         for &method in methods {
             let Some(result) = self.conversion_method(value, method)? else {
                 continue;
@@ -1927,7 +1877,7 @@ impl<'s> Vm<'s> {
                     "{method} returned non-int (type {})",
                     self.type_name_of(&result)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
             return Ok(Some(result));
         }
@@ -1936,22 +1886,20 @@ impl<'s> Vm<'s> {
 
     /// `int(value)` for a number: integers stay exact and floats truncate toward zero, as
     /// `int.__new__` does through `__index__` and `__trunc__`.
-    fn truncate_to_int(&mut self, value: &Value) -> Result<Value, String> {
+    fn truncate_to_int(&mut self, value: &Value) -> PyResult<Value> {
         use super::number::NumberRef;
         let number = super::number::view(&self.state.heap, value);
         let float = match number {
             Some(NumberRef::Float(float)) => float,
             Some(number @ (NumberRef::Int(_) | NumberRef::BigInt(_) | NumberRef::UInt(_))) => {
-                return self
-                    .new_bigint(number.to_bigint().expect("integer view"))
-                    .map_err(|error| self.record_native_error(error));
+                return self.new_bigint(number.to_bigint().expect("integer view"));
             }
             Some(NumberRef::Complex(..)) => {
                 let message = format!(
                     "int() argument must be a string, a bytes-like object or a real number, not '{}'",
                     self.type_name_of(value)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
             None => {
                 let message = format!(
@@ -1959,21 +1907,24 @@ impl<'s> Vm<'s> {
                      '{}'",
                     self.type_name_of(value)?
                 );
-                return Err(self.raise_exception("TypeError", message));
+                return Err(PyError::exception("TypeError", message));
             }
         };
         if float.is_nan() {
-            return Err(self.raise_exception("ValueError", "cannot convert float NaN to integer"));
+            return Err(PyError::exception(
+                "ValueError",
+                "cannot convert float NaN to integer",
+            ));
         }
         if float.is_infinite() {
-            return Err(
-                self.raise_exception("OverflowError", "cannot convert float infinity to integer")
-            );
+            return Err(PyError::exception(
+                "OverflowError",
+                "cannot convert float infinity to integer",
+            ));
         }
         let integer = <num_bigint::BigInt as num_traits::FromPrimitive>::from_f64(float.trunc())
             .ok_or("float is not finite")?;
         self.new_bigint(integer)
-            .map_err(|error| self.record_native_error(error))
     }
 
     /// The indices a slice selects with, when `value` is a slice: each bound goes through
@@ -1982,7 +1933,7 @@ impl<'s> Vm<'s> {
     pub(super) fn slice_bounds(
         &mut self,
         value: &Value,
-    ) -> Result<Option<super::super::slice::SliceBounds>, String> {
+    ) -> PyResult<Option<super::super::slice::SliceBounds>> {
         if !value.is_object() {
             return Ok(None);
         }
@@ -1996,12 +1947,15 @@ impl<'s> Vm<'s> {
             self.slice_index(&step)?,
         );
         if bounds.2 == Some(0) {
-            return Err(self.raise_exception("ValueError", "slice step cannot be zero"));
+            return Err(PyError::exception(
+                "ValueError",
+                "slice step cannot be zero",
+            ));
         }
         Ok(Some(bounds))
     }
 
-    fn slice_index(&mut self, bound: &Value) -> Result<Option<i64>, String> {
+    fn slice_index(&mut self, bound: &Value) -> PyResult<Option<i64>> {
         if bound.is_none() {
             return Ok(None);
         }
@@ -2012,7 +1966,7 @@ impl<'s> Vm<'s> {
                 match self.int_by_method(bound, &["__index__"])? {
                     Some(integer) => integer,
                     None => {
-                        return Err(self.raise_exception(
+                        return Err(PyError::exception(
                             "TypeError",
                             "slice indices must be integers or None or have an __index__ method",
                         ))
@@ -2030,7 +1984,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Pop one slice bound; an omitted bound is `None`.
-    fn pop_slice_bound(&mut self, present: bool) -> Result<Value, String> {
+    fn pop_slice_bound(&mut self, present: bool) -> PyResult<Value> {
         if present {
             self.pop()
         } else {
@@ -2043,7 +1997,7 @@ impl<'s> Vm<'s> {
         has_start: bool,
         has_stop: bool,
         has_step: bool,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let step = self.pop_slice_bound(has_step)?;
         let stop = self.pop_slice_bound(has_stop)?;
         let start = self.pop_slice_bound(has_start)?;
@@ -2056,7 +2010,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn store_subscript(&mut self) -> Result<(), String> {
+    pub(super) fn store_subscript(&mut self) -> PyResult<()> {
         let index = self.pop()?;
         let owner = self.pop()?;
         let value = self.pop()?;
@@ -2077,7 +2031,7 @@ impl<'s> Vm<'s> {
                         "list indices must be integers or slices, not {}",
                         self.type_name_of(&index)?
                     );
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 };
                 let len = values.len() as i64;
                 let index = if index < 0 { len + index } else { index };
@@ -2085,9 +2039,10 @@ impl<'s> Vm<'s> {
                     .ok()
                     .filter(|index| *index < values.len())
                 else {
-                    return Err(
-                        self.raise_exception("IndexError", "list assignment index out of range")
-                    );
+                    return Err(PyError::exception(
+                        "IndexError",
+                        "list assignment index out of range",
+                    ));
                 };
                 self.modify(owner, |object| {
                     let Object::List(values) = object else {
@@ -2108,7 +2063,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn delete_subscript(&mut self) -> Result<(), String> {
+    pub(super) fn delete_subscript(&mut self) -> PyResult<()> {
         let index = self.pop()?;
         let owner = self.pop()?;
         self.invoke_slot(&owner, Slot::DeleteItem, "__delitem__", vec![index])?
@@ -2121,7 +2076,7 @@ impl<'s> Vm<'s> {
         name: String,
         code: CodeRef,
         default_count: usize,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if self.frame_stack_len() < default_count {
             return Err("invalid bytecode stack effect while creating function".into());
         }
@@ -2161,7 +2116,7 @@ impl<'s> Vm<'s> {
         base_count: usize,
         has_metaclass: bool,
         fields: &[ClassField],
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let stack_values = base_count
             .checked_add(usize::from(has_metaclass))
             .ok_or("too many class construction values")?;
@@ -2201,7 +2156,7 @@ impl<'s> Vm<'s> {
             })
             .count();
         if named_tuple_bases > 0 && bases.len() > 1 {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 "can only inherit from a NamedTuple type and Generic",
             ));
@@ -2261,7 +2216,7 @@ impl<'s> Vm<'s> {
                     }
                 })
                 .collect::<Result<Vec<_>, _>>()
-                .map_err(|message| self.raise_exception("TypeError", message))?
+                .map_err(|message| PyError::exception("TypeError", message))?
         };
         // Direct builtin bases such as `tuple` and those inherited through user classes must agree
         // on one instance layout, as in CPython.
@@ -2283,9 +2238,10 @@ impl<'s> Vm<'s> {
         }
         builtin_layouts.dedup();
         if builtin_layouts.len() > 1 {
-            return Err(
-                self.raise_exception("TypeError", "multiple bases have instance lay-out conflict")
-            );
+            return Err(PyError::exception(
+                "TypeError",
+                "multiple bases have instance lay-out conflict",
+            ));
         }
         let builtin_layout = builtin_layouts.first().copied();
         let inherited_exception_bases = user_bases
@@ -2414,14 +2370,16 @@ impl<'s> Vm<'s> {
             Ok(Flow::Return(_)) => return Err("'return' outside function".into()),
             Ok(Flow::Yield(_)) => return Err("'yield' outside function".into()),
             Ok(Flow::Exit(status)) => {
-                return Err(format!("class body exited with status {status}"))
+                return Err(format!("class body exited with status {status}").into())
             }
             Ok(flow) => unreachable!("a class body cannot end with {flow:?}"),
             Err((error, span)) => {
-                return Err(format!(
-                    "{error} in class {name} at line {}, column {}",
-                    span.line, span.column
-                ))
+                return Err(error.located(|| {
+                    format!(
+                        " in class {name} at line {}, column {}",
+                        span.line, span.column
+                    )
+                }))
             }
         }
         let bindings = scopes::bound_names(self.heap(), scope)?;
@@ -2562,7 +2520,7 @@ impl<'s> Vm<'s> {
         fields: &[ClassField],
         bindings: &[String],
         mut attributes: HashMap<String, Value>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let module = match attributes.get("__module__") {
             Some(module) => *module,
             None => self.current_module_name()?.unwrap_or(Value::None),
@@ -2594,10 +2552,8 @@ impl<'s> Vm<'s> {
         let class_name = self.allocate_string(name.to_string())?;
         let field_names = self.alloc(Object::Tuple(Ref::all(field_names)))?;
         let namespace = self.allocate_dict(entries)?;
-        let collections = PyRuntime::import_module(self, "collections")
-            .map_err(|error| self.record_native_error(error))?;
-        let build = PyRuntime::get_attribute(self, collections, "_namedtuple_from_class")
-            .map_err(|error| self.record_native_error(error))?
+        let collections = PyRuntime::import_module(self, "collections")?;
+        let build = PyRuntime::get_attribute(self, collections, "_namedtuple_from_class")?
             .ok_or("collections._namedtuple_from_class is missing")?;
         self.invoke_value(build, vec![class_name, field_names, namespace, module])
     }
@@ -2606,7 +2562,7 @@ impl<'s> Vm<'s> {
     /// Both ordinary class statements and `type.__new__` use this path.
     /// `__bases__`, `__mro__` and `mro` of a user class, which CPython's `type` provides as
     /// data descriptors and a method ahead of the class's own attributes.
-    fn class_metadata(&mut self, class: Value, name: &str) -> Result<Option<Value>, String> {
+    fn class_metadata(&mut self, class: Value, name: &str) -> PyResult<Option<Value>> {
         let items = match name {
             "__bases__" => {
                 let Object::Class(class_object) = self.get(class)? else {
@@ -2627,7 +2583,7 @@ impl<'s> Vm<'s> {
 
     /// A user class's method resolution order: the class and its C3-linearized user ancestors,
     /// then the native types their bases derive from, ending with `object`.
-    fn class_mro(&self, class: Value) -> Result<Vec<Value>, String> {
+    fn class_mro(&self, class: Value) -> PyResult<Vec<Value>> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("class metadata requested for a non-class".into());
         };
@@ -2640,7 +2596,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The MRO of a native type, starting with the type itself.
-    fn native_mro(&self, native: Value) -> Result<Vec<Value>, String> {
+    fn native_mro(&self, native: Value) -> PyResult<Vec<Value>> {
         let registered = match native.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
@@ -2667,7 +2623,7 @@ impl<'s> Vm<'s> {
 
     /// Fixed namespace and type metadata of builtin types, native value kinds and exception
     /// classes, plus the defining module of builtin and native functions.
-    fn native_type_metadata(&mut self, owner: Value, name: &str) -> Result<Option<Value>, String> {
+    fn native_type_metadata(&mut self, owner: Value, name: &str) -> PyResult<Option<Value>> {
         let Some(native) = owner.native_value() else {
             return Ok(None);
         };
@@ -2734,7 +2690,7 @@ impl<'s> Vm<'s> {
     pub(super) fn module_namespace(
         &self,
         scope: Value,
-    ) -> Result<super::namespace::NamespaceHandle, String> {
+    ) -> PyResult<super::namespace::NamespaceHandle> {
         if scopes::uses_repl_globals(self.heap(), scope)? {
             Ok(super::namespace::NamespaceHandle::Repl)
         } else {
@@ -2742,14 +2698,14 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn current_module_name(&mut self) -> Result<Option<Value>, String> {
+    fn current_module_name(&mut self) -> PyResult<Option<Value>> {
         let scope = self.lookup_scope();
         self.module_name_of(scope)
     }
 
     /// The `__name__` global of the module that owns `scope`; `None` is the main script's
     /// global namespace.
-    pub(super) fn module_name_of(&mut self, scope: Option<Value>) -> Result<Option<Value>, String> {
+    pub(super) fn module_name_of(&mut self, scope: Option<Value>) -> PyResult<Option<Value>> {
         if let Some(scope) = scope {
             let root = scopes::root(self.heap(), scope)?;
             if !scopes::uses_repl_globals(self.heap(), root)? {
@@ -2760,7 +2716,7 @@ impl<'s> Vm<'s> {
         Ok(self.state.globals.get(&self.state.heap, symbol))
     }
 
-    pub(super) fn allocate_class(&mut self, definition: ClassDefinition) -> Result<Value, String> {
+    pub(super) fn allocate_class(&mut self, definition: ClassDefinition) -> PyResult<Value> {
         let ClassDefinition {
             name,
             bases,
@@ -2805,7 +2761,7 @@ impl<'s> Vm<'s> {
         let entries = type_bases.iter().try_fold(0usize, |total, base| {
             total
                 .checked_add(self.state.types.get(*base)?.mro.len().saturating_add(1))
-                .ok_or_else(|| "class MRO is too large".to_string())
+                .ok_or_else(|| PyError::from("class MRO is too large"))
         })?;
         self.charge_cpu(
             u64::try_from(entries.saturating_mul(type_bases.len())).unwrap_or(u64::MAX),
@@ -2904,13 +2860,13 @@ impl<'s> Vm<'s> {
         Ok(class)
     }
 
-    pub(super) fn linearize_bases(&mut self, bases: &[Value]) -> Result<Vec<Value>, String> {
+    pub(super) fn linearize_bases(&mut self, bases: &[Value]) -> PyResult<Vec<Value>> {
         for (index, base) in bases.iter().enumerate() {
             if bases[..index]
                 .iter()
                 .any(|earlier| self.identical(*earlier, *base))
             {
-                return Err("duplicate base class".into());
+                return Err(PyError::type_error("duplicate base class"));
             }
         }
         let mut sequences = Vec::with_capacity(bases.len().saturating_add(1));
@@ -2940,7 +2896,9 @@ impl<'s> Vm<'s> {
                 .then_some(head)
             });
             let Some(candidate) = candidate else {
-                return Err("cannot create a consistent method resolution order".into());
+                return Err(PyError::type_error(
+                    "cannot create a consistent method resolution order",
+                ));
             };
             self.charge_cpu(u64::try_from(sequences.len()).unwrap_or(u64::MAX))?;
             result.push(candidate);
@@ -2955,11 +2913,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    pub(super) fn class_attribute(
-        &mut self,
-        class: Value,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
+    pub(super) fn class_attribute(&mut self, class: Value, name: &str) -> PyResult<Option<Value>> {
         Ok(self
             .class_attribute_entry(class, name)?
             .map(|(_, value)| value))
@@ -2969,7 +2923,7 @@ impl<'s> Vm<'s> {
         &mut self,
         class: Value,
         name: &str,
-    ) -> Result<Option<(Value, Value)>, String> {
+    ) -> PyResult<Option<(Value, Value)>> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("instance has an invalid class".into());
         };
@@ -2999,7 +2953,7 @@ impl<'s> Vm<'s> {
         &mut self,
         type_id: TypeId,
         name: &str,
-    ) -> Result<Option<(TypeId, Value)>, String> {
+    ) -> PyResult<Option<(TypeId, Value)>> {
         let mro_len = self.state.types.get(type_id)?.mro.len();
         for index in 0..=mro_len {
             let ancestor = if index == 0 {
@@ -3015,11 +2969,7 @@ impl<'s> Vm<'s> {
         Ok(None)
     }
 
-    fn type_namespace_attribute(
-        &self,
-        type_id: TypeId,
-        name: &str,
-    ) -> Result<Option<Value>, String> {
+    fn type_namespace_attribute(&self, type_id: TypeId, name: &str) -> PyResult<Option<Value>> {
         let ty = self.state.types.get(type_id)?;
         let value = self.type_value(type_id)?;
         if value.is_object() {
@@ -3038,7 +2988,7 @@ impl<'s> Vm<'s> {
         receiver: Option<Value>,
         accessed_type: TypeId,
         defining_type: TypeId,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         match descriptor.native_value() {
             Some(NativeValue::NativeGetter(getter)) => {
                 return match receiver {
@@ -3095,14 +3045,14 @@ impl<'s> Vm<'s> {
         &mut self,
         getter: &'static super::super::native::GetterDef,
         receiver: Value,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         match (getter.get)(self, receiver) {
             Ok(value) => Ok(Some(value)),
-            Err(error) => Err(self.record_native_error(error)),
+            Err(error) => Err(error),
         }
     }
 
-    fn is_data_descriptor(&mut self, value: &Value) -> Result<bool, String> {
+    fn is_data_descriptor(&mut self, value: &Value) -> PyResult<bool> {
         if matches!(value.native_value(), Some(NativeValue::NativeGetter(_))) {
             return Ok(true);
         }
@@ -3121,7 +3071,7 @@ impl<'s> Vm<'s> {
         &mut self,
         class: Value,
         method: &'static super::super::native::MethodDef,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         self.alloc(Object::DescriptorBoundMethod {
             receiver: Ref::from(class),
             descriptor: Ref::from(Value::Native(NativeValue::NativeMethod(method))),
@@ -3135,7 +3085,7 @@ impl<'s> Vm<'s> {
         receiver: Option<Value>,
         accessed_class: Value,
         defining_class: Value,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         if matches!(
             descriptor.native_value(),
             Some(NativeValue::NativeMethod(method)) if method.name == "__new__"
@@ -3203,7 +3153,7 @@ impl<'s> Vm<'s> {
         &mut self,
         callable: Value,
         arguments: Vec<Value>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let result = self.invoke_call(callable, arguments, Vec::new());
         self.immediate_call_value(result, "callable")
     }
@@ -3213,7 +3163,7 @@ impl<'s> Vm<'s> {
         callable: Value,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         let positional = arguments.len();
         let total = positional
             .checked_add(keyword_arguments.len())
@@ -3245,7 +3195,7 @@ impl<'s> Vm<'s> {
         slot: Slot,
         method_name: &str,
         arguments: Vec<Value>,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         let type_id = self.type_id(receiver)?;
         let Some(slot_value) = self.state.types.slot(type_id, slot)? else {
             return Ok(None);
@@ -3261,8 +3211,7 @@ impl<'s> Vm<'s> {
                     .ok_or("comparison slot invoked for a non-comparison operator")?;
                 let (receiver, argument) = (*receiver, *argument);
                 return call(self, receiver, argument, operator)
-                    .map(|result| result.map(Value::Bool))
-                    .map_err(|error| self.record_native_error(error));
+                    .map(|result| result.map(Value::Bool));
             }
             SlotValue::VmHash => {
                 if !arguments.is_empty() {
@@ -3282,8 +3231,7 @@ impl<'s> Vm<'s> {
             SlotValue::NativeMethod(method) => {
                 let receiver = *receiver;
                 return (method.call)(self, receiver, CallArgs::new(arguments, Vec::new()))
-                    .map(Some)
-                    .map_err(|error| self.record_native_error(error));
+                    .map(Some);
             }
             SlotValue::NativeBinary(call) => {
                 let [argument] = arguments.as_slice() else {
@@ -3292,8 +3240,7 @@ impl<'s> Vm<'s> {
                     );
                 };
                 let (receiver, argument) = (*receiver, *argument);
-                return call(self, receiver, argument)
-                    .map_err(|error| self.record_native_error(error));
+                return call(self, receiver, argument);
             }
             SlotValue::NativeTernary(call) => {
                 let [first, second] = arguments.as_slice() else {
@@ -3303,15 +3250,14 @@ impl<'s> Vm<'s> {
                 };
                 let receiver = *receiver;
                 let (first, second) = (*first, *second);
-                return call(self, receiver, first, second)
-                    .map_err(|error| self.record_native_error(error));
+                return call(self, receiver, first, second);
             }
             SlotValue::NativeUnary(call) => {
                 if !arguments.is_empty() {
                     return Err("unary protocol slot received arguments".into());
                 }
                 let receiver = *receiver;
-                return call(self, receiver).map_err(|error| self.record_native_error(error));
+                return call(self, receiver);
             }
             SlotValue::Descriptor { value, owner } => (self.value(&value), owner),
         };
@@ -3350,14 +3296,10 @@ impl<'s> Vm<'s> {
 
     /// The value of an immediate call made on behalf of Rust code, which has no frame to exit
     /// from: an exit request becomes an error naming `what` asked for it.
-    fn immediate_call_value(
-        &mut self,
-        result: Result<Flow, String>,
-        what: &str,
-    ) -> Result<Value, String> {
+    fn immediate_call_value(&mut self, result: PyResult<Flow>, what: &str) -> PyResult<Value> {
         match self.immediate_value(result?)? {
             Ok(value) => Ok(value),
-            Err(Flow::Exit(status)) => Err(format!("{what} exited with status {status}")),
+            Err(Flow::Exit(status)) => Err(format!("{what} exited with status {status}").into()),
             Err(flow) => unreachable!("an immediate call cannot end with {flow:?}"),
         }
     }
@@ -3371,13 +3313,14 @@ impl<'s> Vm<'s> {
         receiver: Value,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let (_, name, arity) = super::super::object_model::SLOT_DEFS[slot as usize];
         if arity != 255 && (!keyword_arguments.is_empty() || arguments.len() != usize::from(arity))
         {
-            return Err(
-                self.raise_exception("TypeError", format!("{name}() received invalid arguments"))
-            );
+            return Err(PyError::exception(
+                "TypeError",
+                format!("{name}() received invalid arguments"),
+            ));
         }
         let receiver_type = if slot == Slot::ClassGetItem {
             self.class_type_id(&receiver)?
@@ -3387,7 +3330,7 @@ impl<'s> Vm<'s> {
         };
         if !self.state.types.is_subclass(receiver_type, owner)? {
             let owner_name = self.state.types.get(owner)?.name.clone();
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "TypeError",
                 format!("descriptor {name} requires a '{owner_name}' object"),
             ));
@@ -3417,8 +3360,7 @@ impl<'s> Vm<'s> {
                 call(self, receiver, argument, operator).map(|result| result.map(Value::Bool))
             }
             SlotValue::NativeMethod(method) => {
-                return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments))
-                    .map_err(|error| self.record_native_error(error));
+                return (method.call)(self, receiver, CallArgs::new(arguments, keyword_arguments));
             }
             SlotValue::NativeUnary(call) => call(self, receiver),
             SlotValue::NativeBinary(call) => {
@@ -3432,9 +3374,7 @@ impl<'s> Vm<'s> {
             }
             SlotValue::Descriptor { .. } => return Err("slot wrapper is not native".into()),
         };
-        result
-            .map(|result| result.unwrap_or(Value::Native(NativeValue::NotImplemented)))
-            .map_err(|error| self.record_native_error(error))
+        result.map(|result| result.unwrap_or(Value::Native(NativeValue::NotImplemented)))
     }
 
     /// Invoke a binary-operator or rich-comparison slot. A method that returns `NotImplemented`
@@ -3446,13 +3386,13 @@ impl<'s> Vm<'s> {
         slot: Slot,
         method_name: &str,
         arguments: Vec<Value>,
-    ) -> Result<Option<Value>, String> {
+    ) -> PyResult<Option<Value>> {
         Ok(self
             .invoke_slot(receiver, slot, method_name, arguments)?
             .filter(|value| value.native_value() != Some(NativeValue::NotImplemented)))
     }
 
-    pub(super) fn truth_value(&mut self, value: &Value) -> Result<bool, String> {
+    pub(super) fn truth_value(&mut self, value: &Value) -> PyResult<bool> {
         // Immediate bools, ints, floats and None have no slots to consult; every comparison
         // result passes through here, so the slot lookups would dominate a sort.
         if value.bool_value().is_some()
@@ -3478,12 +3418,12 @@ impl<'s> Vm<'s> {
         protocol::truth(&self.state.heap, *value)
     }
 
-    pub(super) fn repr_value(&mut self, value: &Value) -> Result<String, String> {
+    pub(super) fn repr_value(&mut self, value: &Value) -> PyResult<String> {
         self.repr_nested(value, &mut BTreeSet::new())
     }
 
     /// Render the base object's identity without consulting the value's `__repr__` slot.
-    pub(super) fn default_object_repr(&self, value: &Value) -> Result<String, String> {
+    pub(super) fn default_object_repr(&self, value: &Value) -> PyResult<String> {
         let mut name = self.type_name_of(value)?;
         if let Some(class) = self.instance_class(*value)? {
             if let Object::Class(class_object) = self.get(class)? {
@@ -3512,15 +3452,11 @@ impl<'s> Vm<'s> {
     /// `repr()` that renders container items through their own `__repr__` and protocol slots,
     /// as CPython does. `active` holds the containers being rendered, so a container that
     /// contains itself prints as `[...]`.
-    fn repr_nested(&mut self, value: &Value, active: &mut BTreeSet<u32>) -> Result<String, String> {
+    fn repr_nested(&mut self, value: &Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
         crate::stack::grow(|| self.repr_nested_inner(value, active))
     }
 
-    fn repr_nested_inner(
-        &mut self,
-        value: &Value,
-        active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    fn repr_nested_inner(&mut self, value: &Value, active: &mut BTreeSet<u32>) -> PyResult<String> {
         if !matches!(
             self.state.types.slot(self.type_id(value)?, Slot::Repr)?,
             Some(SlotValue::VmRepr)
@@ -3539,7 +3475,7 @@ impl<'s> Vm<'s> {
         &mut self,
         value: &Value,
         active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         if let Some(id) = self.identity(*value)? {
             if self.is_plain_instance(value)? {
                 return self.default_object_repr(value);
@@ -3562,14 +3498,14 @@ impl<'s> Vm<'s> {
         }
         let Some((id, container)) = self.container_items(value)? else {
             self.check_int_str_digits(value)?;
-            return protocol::repr(self.state, *value).map_err(|error| self.render_error(error));
+            return protocol::repr(self.state, *value);
         };
         if active.contains(&id) {
             return Ok(container.placeholder().into());
         }
         // `active` holds the containers on the current path, so its size is the nesting depth.
         if active.len() >= MAX_REPR_DEPTH {
-            return Err(self.raise_exception(
+            return Err(PyError::exception(
                 "RecursionError",
                 "maximum recursion depth exceeded while getting the repr of an object",
             ));
@@ -3599,7 +3535,7 @@ impl<'s> Vm<'s> {
         &mut self,
         entries: &[(Value, Value)],
         active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         let mut parts = Vec::with_capacity(entries.len());
         for (key, item) in entries {
             let key = self.repr_nested(key, active)?;
@@ -3618,7 +3554,7 @@ impl<'s> Vm<'s> {
         kind: DictViewKind,
         mapping: Value,
         active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         if !active.insert(id) {
             return Ok("...".into());
         }
@@ -3653,7 +3589,7 @@ impl<'s> Vm<'s> {
         id: u32,
         target: ProxyHandle,
         active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         if !active.insert(id) {
             return Ok("...".into());
         }
@@ -3671,7 +3607,7 @@ impl<'s> Vm<'s> {
         id: u32,
         target: NamespaceHandle,
         active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    ) -> PyResult<String> {
         if !active.insert(id) {
             return Ok("{...}".into());
         }
@@ -3686,11 +3622,7 @@ impl<'s> Vm<'s> {
         Ok(format!("{{{}}}", parts.join(", ")))
     }
 
-    fn repr_items(
-        &mut self,
-        items: &[Value],
-        active: &mut BTreeSet<u32>,
-    ) -> Result<String, String> {
+    fn repr_items(&mut self, items: &[Value], active: &mut BTreeSet<u32>) -> PyResult<String> {
         let mut parts = Vec::with_capacity(items.len());
         for item in items {
             parts.push(self.repr_nested(item, active)?);
@@ -3699,7 +3631,7 @@ impl<'s> Vm<'s> {
     }
 
     /// A snapshot of a builtin container's items, for rendering them through the VM.
-    fn container_items(&self, value: &Value) -> Result<Option<(u32, ContainerItems)>, String> {
+    fn container_items(&self, value: &Value) -> PyResult<Option<(u32, ContainerItems)>> {
         let Some(id) = self.identity(*value)? else {
             return Ok(None);
         };
@@ -3721,7 +3653,7 @@ impl<'s> Vm<'s> {
 
     /// Whether `value` is a namespace view, dict view or mapping proxy, which `repr_nested`
     /// renders through the VM because their entries live outside the object.
-    fn is_mapping_view(&self, value: &Value) -> Result<bool, String> {
+    fn is_mapping_view(&self, value: &Value) -> PyResult<bool> {
         if !value.is_object() {
             return Ok(false);
         }
@@ -3731,7 +3663,7 @@ impl<'s> Vm<'s> {
         ))
     }
 
-    pub(super) fn display_value(&mut self, value: &Value) -> Result<String, String> {
+    pub(super) fn display_value(&mut self, value: &Value) -> PyResult<String> {
         if let Some(result) = self.invoke_slot(value, Slot::String, "__str__", Vec::new())? {
             return string::string_value(&self.state.heap, result)?
                 .ok_or_else(|| "__str__ should return str".into());
@@ -3744,7 +3676,7 @@ impl<'s> Vm<'s> {
             .types
             .is_subclass(self.type_id(value)?, BuiltinType::Exception.id())?
         {
-            return protocol::display(self.state, *value).map_err(|error| self.render_error(error));
+            return protocol::display(self.state, *value);
         }
         let plain_instance = self.is_plain_instance(value)?;
         if self
@@ -3759,27 +3691,17 @@ impl<'s> Vm<'s> {
             return self.repr_value(value);
         }
         self.check_int_str_digits(value)?;
-        protocol::display(self.state, *value).map_err(|error| self.render_error(error))
-    }
-
-    /// Turn a rendering failure into the Python exception CPython raises for it: nesting past
-    /// the render bound is `RecursionError`; anything else stays an internal error.
-    fn render_error(&mut self, error: String) -> String {
-        if error.starts_with("maximum recursion depth exceeded") {
-            self.raise_exception("RecursionError", error)
-        } else {
-            error
-        }
+        protocol::display(self.state, *value)
     }
 
     /// Raise `ValueError` before rendering an int with more decimal digits than CPython's
     /// default `sys.int_max_str_digits` allows.
-    fn check_int_str_digits(&mut self, value: &Value) -> Result<(), String> {
+    fn check_int_str_digits(&mut self, value: &Value) -> PyResult<()> {
         if let Some(super::number::NumberRef::BigInt(integer)) =
             super::number::view(&self.state.heap, value)
         {
             if super::number::exceeds_str_digits(integer) {
-                return Err(self.record_native_error(super::number::int_str_digits_error()));
+                return Err(super::number::int_str_digits_error());
             }
         }
         Ok(())
@@ -3790,7 +3712,7 @@ impl<'s> Vm<'s> {
         start_class: Value,
         receiver: &Value,
         name: &str,
-    ) -> Result<(TypeId, Value, TypeId), String> {
+    ) -> PyResult<(TypeId, Value, TypeId)> {
         let start_type = self
             .class_type_id(&start_class)?
             .ok_or("super() start has an invalid class")?;
@@ -3830,7 +3752,7 @@ impl<'s> Vm<'s> {
                 return Ok((ancestor, descriptor, accessed_type));
             }
         }
-        Err(format!("super object has no attribute {name:?}"))
+        Err(format!("super object has no attribute {name:?}").into())
     }
 
     /// Invoke a canonical builtin type object.
@@ -3839,7 +3761,7 @@ impl<'s> Vm<'s> {
     /// depend on the unrelated builtin-function dispatch table. Collection construction remains
     /// metered through the normal iterator and allocation paths.
     /// `d[key] = value` for the dict `id`: replace the value of an equal key, or append the pair.
-    fn dict_set_entry(&mut self, dict: Value, key: Value, value: Value) -> Result<(), String> {
+    fn dict_set_entry(&mut self, dict: Value, key: Value, value: Value) -> PyResult<()> {
         let (hash, position) = self.lookup_mapping_entry(dict, &key)?;
         if let Some(position) = position {
             return self.modify(dict, |object| {
@@ -3866,10 +3788,10 @@ impl<'s> Vm<'s> {
         &mut self,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         if arguments.len() > 1 {
             let message = format!("dict expected at most 1 argument, got {}", arguments.len());
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         }
         let dict = self.allocate_object(Object::Dict(Default::default()))?;
         if let Some(source) = arguments.first() {
@@ -3885,7 +3807,7 @@ impl<'s> Vm<'s> {
         Ok(dict)
     }
 
-    fn dict_source_entries(&mut self, source: &Value) -> Result<Vec<(Value, Value)>, String> {
+    fn dict_source_entries(&mut self, source: &Value) -> PyResult<Vec<(Value, Value)>> {
         // A dict subclass contributes the entries it holds, as CPython's dict merge does.
         let view = *source;
         if view.is_object() {
@@ -3901,8 +3823,7 @@ impl<'s> Vm<'s> {
                 self,
                 keys,
                 super::CallArgs::new(Vec::new(), Vec::new()),
-            )
-            .map_err(|error| self.record_native_error(error))?;
+            )?;
             let mut entries = Vec::new();
             for key in self.iterable_values(&keys)? {
                 let Some(value) =
@@ -3918,26 +3839,19 @@ impl<'s> Vm<'s> {
         for (index, item) in self.iterable_values(source)?.into_iter().enumerate() {
             let pair = match self.iterable_values(&item) {
                 Ok(pair) => pair,
-                // CPython 3.14 replaces the "'int' object is not iterable" of a non-iterable
-                // element with a message that omits the type name.
-                Err(message)
-                    if message.ends_with("object is not iterable")
-                        && self
-                            .pending_exception
-                            .as_ref()
-                            .is_some_and(|exception| exception.kind == "TypeError") =>
-                {
-                    self.pending_exception = None;
-                    return Err(self.raise_exception("TypeError", "object is not iterable"));
+                // CPython 3.14 replaces the `TypeError` of a non-iterable element with one whose
+                // message omits the type name.
+                Err(error) => {
+                    self.catch(error, "TypeError")?;
+                    return Err(PyError::exception("TypeError", "object is not iterable"));
                 }
-                Err(error) => return Err(error),
             };
             let [key, value] = pair.as_slice() else {
                 let message = format!(
                     "dictionary update sequence element #{index} has length {}; 2 is required",
                     pair.len()
                 );
-                return Err(self.raise_exception("ValueError", message));
+                return Err(PyError::exception("ValueError", message));
             };
             entries.push((*key, *value));
         }
@@ -3949,7 +3863,7 @@ impl<'s> Vm<'s> {
         &mut self,
         mut arguments: Vec<Value>,
         mut keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<CallArguments, String> {
+    ) -> PyResult<CallArguments> {
         let Some(position) = keyword_arguments
             .iter()
             .position(|(name, _)| name == "base")
@@ -3958,7 +3872,7 @@ impl<'s> Vm<'s> {
         };
         if arguments.len() != 1 {
             let message = "int() missing string argument";
-            return Err(self.raise_exception("TypeError", message));
+            return Err(PyError::exception("TypeError", message));
         }
         arguments.push(keyword_arguments.remove(position).1);
         Ok((arguments, keyword_arguments))
@@ -3969,7 +3883,7 @@ impl<'s> Vm<'s> {
         builtin_type: BuiltinType,
         arguments: Vec<Value>,
         keyword_arguments: Vec<(String, Value)>,
-    ) -> Result<Flow, String> {
+    ) -> PyResult<Flow> {
         if builtin_type == BuiltinType::Dict {
             return self
                 .construct_dict(arguments, keyword_arguments)
@@ -3977,8 +3891,7 @@ impl<'s> Vm<'s> {
         }
         if builtin_type == BuiltinType::Complex {
             let arguments = super::CallArgs::new(arguments, keyword_arguments);
-            let value = super::super::complex::construct(self, arguments)
-                .map_err(|error| self.record_native_error(error))?;
+            let value = super::super::complex::construct(self, arguments)?;
             return Ok(self.produce(value));
         }
         if matches!(builtin_type, BuiltinType::Int | BuiltinType::Float)
@@ -3991,7 +3904,7 @@ impl<'s> Vm<'s> {
             } else {
                 "float() argument must be a string or a real number, not 'complex'"
             });
-            return Err(self.record_native_error(error));
+            return Err(error);
         }
         let (arguments, keyword_arguments) = if builtin_type == BuiltinType::Int {
             self.int_base_keyword(arguments, keyword_arguments)?
@@ -4002,7 +3915,8 @@ impl<'s> Vm<'s> {
             return Err(format!(
                 "{}() does not accept keyword arguments in this slice",
                 builtin_type.name()
-            ));
+            )
+            .into());
         }
         let value = match builtin_type {
             BuiltinType::Type => match arguments.as_slice() {
@@ -4015,8 +3929,7 @@ impl<'s> Vm<'s> {
                         name,
                         *bases,
                         *namespace,
-                    )
-                    .map_err(|error| error.to_string())?
+                    )?
                 }
                 _ => return Err("type() expects one or three arguments".into()),
             },
@@ -4026,7 +3939,7 @@ impl<'s> Vm<'s> {
             }
             BuiltinType::Slice => {
                 if arguments.is_empty() || arguments.len() > 3 {
-                    return Err(self.raise_exception(
+                    return Err(PyError::exception(
                         "TypeError",
                         format!(
                             "slice expected at least 1 argument, got {}",
@@ -4053,7 +3966,7 @@ impl<'s> Vm<'s> {
                 };
                 if let Some(bound) = bound {
                     let message = format!("range expected at {bound}, got {}", arguments.len());
-                    return Err(self.raise_exception("TypeError", message));
+                    return Err(PyError::exception("TypeError", message));
                 }
                 let mut integers = Vec::with_capacity(arguments.len());
                 for value in &arguments {
@@ -4066,9 +3979,10 @@ impl<'s> Vm<'s> {
                     _ => unreachable!(),
                 };
                 if step == 0 {
-                    return Err(
-                        self.raise_exception("ValueError", "range() arg 3 must not be zero")
-                    );
+                    return Err(PyError::exception(
+                        "ValueError",
+                        "range() arg 3 must not be zero",
+                    ));
                 }
                 self.allocate_object(Object::Range { start, stop, step })?
             }
@@ -4094,22 +4008,15 @@ impl<'s> Vm<'s> {
             BuiltinType::Int => {
                 expect_arity(&arguments, 0, 2)?;
                 if let Some(base) = arguments.get(1) {
-                    let base = number::int_value(&self.state.heap, *base).ok_or_else(|| {
-                        self.record_native_error(PyError::type_error(
-                            "int() base must be an integer",
-                        ))
-                    })?;
+                    let base = number::int_value(&self.state.heap, *base)
+                        .ok_or_else(|| PyError::type_error("int() base must be an integer"))?;
                     let text =
                         string::string_value(&self.state.heap, arguments[0])?.ok_or_else(|| {
-                            self.record_native_error(PyError::type_error(
-                                "int() can't convert non-string with explicit base",
-                            ))
+                            PyError::type_error("int() can't convert non-string with explicit base")
                         })?;
                     self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-                    let integer = super::number::parse_integer_text(&text, base)
-                        .map_err(|error| self.record_native_error(error))?;
-                    self.new_bigint(integer)
-                        .map_err(|error| self.record_native_error(error))?
+                    let integer = super::number::parse_integer_text(&text, base)?;
+                    self.new_bigint(integer)?
                 } else {
                     match arguments.first() {
                         None => Value::Int(0),
@@ -4120,10 +4027,8 @@ impl<'s> Vm<'s> {
                             let text =
                                 string::string_value(&self.state.heap, *value)?.expect("guarded");
                             self.charge_cpu(u64::try_from(text.len()).unwrap_or(u64::MAX))?;
-                            let integer = super::number::parse_integer_text(&text, 10)
-                                .map_err(|error| self.record_native_error(error))?;
-                            self.new_bigint(integer)
-                                .map_err(|error| self.record_native_error(error))?
+                            let integer = super::number::parse_integer_text(&text, 10)?;
+                            self.new_bigint(integer)?
                         }
                         Some(value) => {
                             match self.int_by_method(value, &["__int__", "__index__"])? {
@@ -4145,7 +4050,7 @@ impl<'s> Vm<'s> {
                                 self.type_name_of(&value)?,
                                 self.type_name_of(&converted)?
                             );
-                            return Err(self.raise_exception("TypeError", message));
+                            return Err(PyError::exception("TypeError", message));
                         }
                         return Ok(self.produce(converted));
                     }
@@ -4179,14 +4084,14 @@ impl<'s> Vm<'s> {
                                     "could not convert string to float: {}",
                                     string::quote_string(&text)
                                 );
-                                return Err(self.raise_exception("ValueError", message));
+                                return Err(PyError::exception("ValueError", message));
                             }
                         }
                     }
                     Some(value) => match self.numeric_float(value) {
                         Ok(converted) => converted,
                         Err(_) if self.is_bigint(value)? => {
-                            return Err(self.raise_exception(
+                            return Err(PyError::exception(
                                 "OverflowError",
                                 "int too large to convert to float",
                             ))
@@ -4196,7 +4101,7 @@ impl<'s> Vm<'s> {
                                 "float() argument must be a string or a real number, not '{}'",
                                 self.type_name_of(value)?
                             );
-                            return Err(self.raise_exception("TypeError", message));
+                            return Err(PyError::exception("TypeError", message));
                         }
                     },
                 };
@@ -4221,7 +4126,7 @@ impl<'s> Vm<'s> {
                         let Ok(length) = usize::try_from(
                             number::int_value(&self.state.heap, *value).expect("guarded"),
                         ) else {
-                            return Err(self.raise_exception("ValueError", "negative count"));
+                            return Err(PyError::exception("ValueError", "negative count"));
                         };
                         self.reserve_result(length)?;
                         vec![0; length]
@@ -4240,7 +4145,7 @@ impl<'s> Vm<'s> {
                                     "__bytes__ returned non-bytes (type {})",
                                     self.type_name_of(&converted)?
                                 );
-                                return Err(self.raise_exception("TypeError", message));
+                                return Err(PyError::exception("TypeError", message));
                             }
                         }
                     }
@@ -4261,7 +4166,7 @@ impl<'s> Vm<'s> {
                                 }
                             };
                             let Some(byte) = byte else {
-                                return Err(self.raise_exception(
+                                return Err(PyError::exception(
                                     "ValueError",
                                     "bytes must be in range(0, 256)",
                                 ));
@@ -4356,14 +4261,14 @@ impl<'s> Vm<'s> {
             | BuiltinType::GenericAlias
             | BuiltinType::Enum
             | BuiltinType::TestCase => {
-                return Err(format!("cannot create '{}' instances", builtin_type.name()));
+                return Err(format!("cannot create '{}' instances", builtin_type.name()).into());
             }
             BuiltinType::Complex => unreachable!("complex construction returned above"),
         };
         Ok(self.produce(value))
     }
 
-    pub(super) fn class_type_id(&self, value: &Value) -> Result<Option<TypeId>, String> {
+    pub(super) fn class_type_id(&self, value: &Value) -> PyResult<Option<TypeId>> {
         Ok(match value.native_value() {
             Some(NativeValue::BuiltinType(builtin)) => Some(builtin.id()),
             Some(NativeValue::ValueKind(kind)) => self.state.types.value_kind_type_id(kind),
@@ -4383,7 +4288,7 @@ impl<'s> Vm<'s> {
     /// heap object. The header is set when the object is allocated and re-typed only by
     /// [`Heap::set_type_id`](super::super::heap::Heap::set_type_id) for a builtin exception
     /// instance or an enum member whose class is known only later.
-    pub(super) fn type_id(&self, value: &Value) -> Result<TypeId, String> {
+    pub(super) fn type_id(&self, value: &Value) -> PyResult<TypeId> {
         if value.inline_string_len().is_some() {
             return Ok(BuiltinType::String.id());
         }
@@ -4431,11 +4336,11 @@ impl<'s> Vm<'s> {
         )
     }
 
-    pub(super) fn type_of(&self, value: &Value) -> Result<Value, String> {
+    pub(super) fn type_of(&self, value: &Value) -> PyResult<Value> {
         self.type_value(self.type_id(value)?)
     }
 
-    pub(super) fn is_instance(&mut self, value: &Value, class: &Value) -> Result<bool, String> {
+    pub(super) fn is_instance(&mut self, value: &Value, class: &Value) -> PyResult<bool> {
         if class.is_object() {
             if let Object::Tuple(classes) = self.get(*class)? {
                 let classes = self.values(classes);
@@ -4465,7 +4370,7 @@ impl<'s> Vm<'s> {
         class: &Value,
         hook: &str,
         subject: &Value,
-    ) -> Result<Option<bool>, String> {
+    ) -> PyResult<Option<bool>> {
         if !class.is_object() {
             return Ok(None);
         }
@@ -4484,7 +4389,7 @@ impl<'s> Vm<'s> {
         self.truth_value(&answer).map(Some)
     }
 
-    pub(super) fn is_subclass(&mut self, class: &Value, base: &Value) -> Result<bool, String> {
+    pub(super) fn is_subclass(&mut self, class: &Value, base: &Value) -> PyResult<bool> {
         if base.is_object() {
             if let Object::Tuple(bases) = self.get(*base)? {
                 let bases = self.values(bases);
@@ -4512,10 +4417,7 @@ impl<'s> Vm<'s> {
     /// The modeled exception class that `class` is or derives from: the class itself for a
     /// builtin exception type, the recorded exception base for a user exception class, and
     /// `None` for anything else.
-    pub(super) fn exception_class_base(
-        &self,
-        class: &Value,
-    ) -> Result<Option<&'static str>, String> {
+    pub(super) fn exception_class_base(&self, class: &Value) -> PyResult<Option<&'static str>> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = class.native_value() {
             return Ok(Some(name));
         }

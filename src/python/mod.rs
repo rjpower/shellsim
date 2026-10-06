@@ -11,6 +11,7 @@ mod compiler;
 mod complex;
 mod cpython_names;
 mod definitions;
+mod error;
 mod exception_types;
 mod filesystem;
 mod float_text;
@@ -40,6 +41,7 @@ use std::collections::HashMap;
 
 use crate::interp::Interp;
 
+use crate::python::error::{PyError, PyResult};
 use ast::StatementKind;
 use heap::{Ref, Value};
 
@@ -141,7 +143,7 @@ impl GlobalBindings {
         symbol: symbols::SymbolId,
         value: Value,
         resources: &mut crate::resources::Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         if self.values.len() <= symbol.index() {
             self.grow(symbol, resources)?;
         }
@@ -155,7 +157,7 @@ impl GlobalBindings {
         &mut self,
         symbol: symbols::SymbolId,
         resources: &mut crate::resources::Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let required_len = symbol
             .index()
             .checked_add(1)
@@ -170,7 +172,7 @@ impl GlobalBindings {
             .checked_add(bytes)
             .ok_or("modeled global binding size overflow")?;
         if !resources.reserve_memory(bytes) {
-            return Err("memory limit exceeded".into());
+            return Err(PyError::resource_error("memory limit exceeded"));
         }
         self.values.resize_with(required_len, || None);
         self.modeled_bytes = modeled_bytes;
@@ -970,7 +972,7 @@ fn append_failure(interp: &Interp, err: Out, runner: &str, failure: RunnerAppend
     }
 }
 
-fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> {
+fn collect_unittest_classes(source: &str) -> PyResult<Vec<UnitTestClass>> {
     let tokens = lexer::lex(source).map_err(|error| {
         format!(
             "{} at line {}, column {}",
@@ -1015,7 +1017,7 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
             } = member.kind
             else {
                 if matches!(member.kind, StatementKind::Decorated { .. }) {
-                    return Err(format!("decorators are unsupported in test class {name:?}"));
+                    return Err(format!("decorators are unsupported in test class {name:?}").into());
                 }
                 continue;
             };
@@ -1023,9 +1025,7 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
                 || member_name == "tearDownClass"
                 || member_name == "load_tests"
             {
-                return Err(format!(
-                    "unittest class hook {member_name:?} is unsupported"
-                ));
+                return Err(format!("unittest class hook {member_name:?} is unsupported").into());
             }
             if !member_name.starts_with("test_")
                 && member_name != "setUp"
@@ -1036,7 +1036,8 @@ fn collect_unittest_classes(source: &str) -> Result<Vec<UnitTestClass>, String> 
             if parameters.len() != 1 || parameters[0].name != "self" {
                 return Err(format!(
                     "method {name}.{member_name} must accept only self; fixtures are unsupported"
-                ));
+                )
+                .into());
             }
             match member_name.as_str() {
                 "setUp" => setup = true,
@@ -1074,7 +1075,7 @@ struct PytestCollection {
     fixtures: HashMap<String, PytestFixture>,
 }
 
-fn collect_pytest_functions(source: &str) -> Result<PytestCollection, String> {
+fn collect_pytest_functions(source: &str) -> PyResult<PytestCollection> {
     let tokens = lexer::lex(source).map_err(|error| {
         format!(
             "{} at line {}, column {}",
@@ -1167,7 +1168,7 @@ fn is_fixture_decorator(expression: &ast::Expression) -> bool {
 /// The argument names of a `@pytest.mark.parametrize` decorator, or `None` for other
 /// decorators. Only the names are read from source: the facade in `pytest.py` records the
 /// evaluated rows on the test function when its module runs, as pytest does.
-fn parametrize_names(expression: &ast::Expression) -> Result<Option<Vec<String>>, String> {
+fn parametrize_names(expression: &ast::Expression) -> PyResult<Option<Vec<String>>> {
     let ast::ExpressionKind::Call {
         function,
         arguments,
@@ -1209,7 +1210,7 @@ fn parametrize_names(expression: &ast::Expression) -> Result<Option<Vec<String>>
     Ok(Some(names))
 }
 
-fn parse_skip_marker(expression: &ast::Expression) -> Result<bool, String> {
+fn parse_skip_marker(expression: &ast::Expression) -> PyResult<bool> {
     let (target, arguments) = match &expression.kind {
         ast::ExpressionKind::Call {
             function,
@@ -1294,7 +1295,7 @@ fn build_pytest_item(
     test: &PytestFunction,
     fixtures: &HashMap<String, PytestFixture>,
     timeout: f64,
-) -> Result<String, String> {
+) -> PyResult<String> {
     let label = if test.parametrized.is_empty() {
         format!("{:?}", format!("{path}::{}", test.name))
     } else {
@@ -1367,7 +1368,7 @@ fn resolve_pytest_fixture(
     counter: &mut usize,
     setup: &mut String,
     teardown: &mut Vec<String>,
-) -> Result<String, String> {
+) -> PyResult<String> {
     if let Some(value) = cache.get(name) {
         return Ok(value.clone());
     }
@@ -1384,7 +1385,7 @@ fn resolve_pytest_fixture(
         .get(name)
         .ok_or_else(|| format!("fixture {name:?} not found"))?;
     if active.iter().any(|candidate| candidate == name) {
-        return Err(format!("recursive fixture dependency involving {name:?}"));
+        return Err(format!("recursive fixture dependency involving {name:?}").into());
     }
     active.push(name.into());
     let mut arguments = Vec::new();
@@ -1556,8 +1557,9 @@ print(len(seen), seen[-1], points[:3], words[-3:], caught, merged)
         assert_eq!(
             globals
                 .insert(symbol, Value::Int(1), &mut resources)
-                .unwrap_err(),
-            "memory limit exceeded"
+                .unwrap_err()
+                .kind(),
+            Some(&crate::python::error::PyErrorKind::Resource)
         );
         assert!(globals.get(&heap, symbol).is_none());
     }

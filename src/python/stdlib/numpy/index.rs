@@ -246,8 +246,7 @@ pub(in crate::python) fn select(
             Item::Slice(start, stop, step) => {
                 let length = array.shape()[source_axis];
                 let stride = array.strides()[source_axis];
-                let plan =
-                    SlicePlan::new(length, start, stop, step).map_err(PyError::value_error)?;
+                let plan = SlicePlan::new(length, start, stop, step)?;
                 if plan.len() > 0 {
                     offset += plan.first() * stride;
                 }

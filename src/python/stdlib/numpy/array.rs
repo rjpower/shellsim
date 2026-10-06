@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(broadcast_shapes(&[&[], &[2]]).unwrap(), [2]);
         let error = broadcast_shapes(&[&[3], &[4]]).unwrap_err();
         assert_eq!(
-            error.message,
+            error.message(),
             "operands could not be broadcast together with shapes (3,) (4,) "
         );
     }

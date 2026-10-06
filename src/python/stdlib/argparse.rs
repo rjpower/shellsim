@@ -61,7 +61,7 @@ impl NativeObject for ArgumentParserObject {
         BuiltinType::ArgumentParser.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         let commands = self
             .subparsers
             .as_ref()
@@ -130,7 +130,7 @@ impl NativeObject for ArgumentParserObject {
         })
     }
 
-    fn repr(&self, _: &mut dyn FnMut(&Ref) -> Result<String, String>) -> Result<String, String> {
+    fn repr(&self, _: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         Ok("<argparse.ArgumentParser>".into())
     }
 }
@@ -146,7 +146,7 @@ impl NativeObject for NamespaceObject {
         BuiltinType::Native.id()
     }
 
-    fn modeled_bytes(&self) -> Result<u64, String> {
+    fn modeled_bytes(&self) -> PyResult<u64> {
         u64::try_from(self.values.len())
             .ok()
             .and_then(|count| count.checked_mul(MODELED_VALUE_BYTES))
@@ -169,15 +169,12 @@ impl NativeObject for NamespaceObject {
         })
     }
 
-    fn repr(
-        &self,
-        nested: &mut dyn FnMut(&Ref) -> Result<String, String>,
-    ) -> Result<String, String> {
+    fn repr(&self, nested: &mut dyn FnMut(&Ref) -> PyResult<String>) -> PyResult<String> {
         let rendered = self
             .values
             .iter()
             .map(|(name, slot)| Ok(format!("{name}={}", nested(slot)?)))
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<PyResult<Vec<_>>>()?;
         Ok(format!("Namespace({})", rendered.join(", ")))
     }
 

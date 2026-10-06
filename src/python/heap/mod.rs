@@ -30,6 +30,7 @@ use super::attributes::ShapeId;
 use super::bytecode::CodeRef;
 use super::object_model::{BuiltinType, TypeId};
 use super::string::PyString;
+use crate::python::error::{PyError, PyResult};
 
 mod gc;
 pub mod mapping;
@@ -60,7 +61,7 @@ pub(super) const MODELED_SET_MEMBER_BYTES: u64 = MODELED_VALUE_BYTES * SET_MEMBE
 pub(super) const BYTES_PER_CPU_UNIT: u64 = 64;
 
 /// Charge the CPU cost of writing `bytes` of new object storage.
-pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> Result<(), String> {
+pub(super) fn charge_construction(bytes: u64, resources: &mut Resources) -> PyResult<()> {
     if resources.charge_cpu(bytes / BYTES_PER_CPU_UNIT) {
         Ok(())
     } else {
@@ -239,7 +240,8 @@ pub struct GeneratorObject {
     pub handlers: Vec<(usize, usize, usize)>,
     /// Context managers entered and not yet exited at the suspension point.
     pub contexts: Vec<Ref>,
-    pub exceptions: Vec<(String, Ref)>,
+    /// The exceptions being handled at the suspension point, innermost last.
+    pub exceptions: Vec<Ref>,
     pub stack: Vec<Ref>,
     pub exhausted: bool,
     pub running: bool,
@@ -266,7 +268,7 @@ const LOCAL_SLOT_BYTES: u64 = 16;
 /// Modeled bytes of one dynamically bound scope name, charged when a scope gains one.
 pub const DYNAMIC_NAME_BYTES: u64 = 48;
 
-fn modeled_scope_size(scope: &ScopeObject) -> Result<u64, String> {
+fn modeled_scope_size(scope: &ScopeObject) -> PyResult<u64> {
     let slots = u64::try_from(scope.locals.len()).map_err(|_| "modeled scope size overflow")?;
     let dynamic = u64::try_from(scope.values.len()).map_err(|_| "modeled scope size overflow")?;
     OBJECT_HEADER
@@ -579,7 +581,7 @@ impl Heap {
     // ----- object access -------------------------------------------------------------------
 
     #[inline(always)]
-    fn object_id(value: Value) -> Result<ObjectId, String> {
+    fn object_id(value: Value) -> PyResult<ObjectId> {
         value
             .raw()
             .object_id()
@@ -587,19 +589,19 @@ impl Heap {
     }
 
     #[inline(always)]
-    fn object(&self, id: ObjectId) -> Result<&HeapObject, String> {
+    fn object(&self, id: ObjectId) -> PyResult<&HeapObject> {
         match self.slots.get(id.index()) {
             Some(Some(object)) if object.generation() == id.generation() => Ok(object),
-            _ => Err(stale_reference()),
+            _ => Err(stale_reference().into()),
         }
     }
 
     /// Mutable access to an object header. Old objects are remembered so a minor collection
     /// finds any young reference the caller stores into them.
-    fn object_mut(&mut self, id: ObjectId) -> Result<&mut HeapObject, String> {
+    fn object_mut(&mut self, id: ObjectId) -> PyResult<&mut HeapObject> {
         let object = match self.slots.get_mut(id.index()) {
             Some(Some(object)) if object.generation() == id.generation() => object,
-            _ => return Err(stale_reference()),
+            _ => return Err(stale_reference().into()),
         };
         if !object.has(YOUNG_FLAG | DIRTY_FLAG) {
             object.set(DIRTY_FLAG, true);
@@ -608,29 +610,25 @@ impl Heap {
         Ok(object)
     }
 
-    pub fn get(&self, value: Value) -> Result<&Object, String> {
+    pub fn get(&self, value: Value) -> PyResult<&Object> {
         Ok(&self.object(Self::object_id(value)?)?.payload)
     }
 
     /// Mutable payload access. Old objects are remembered, so references may be stored through
     /// it.
-    pub fn get_mut(&mut self, value: Value) -> Result<&mut Object, String> {
+    pub fn get_mut(&mut self, value: Value) -> PyResult<&mut Object> {
         let id = Self::object_id(value)?;
         Ok(&mut self.object_mut(id)?.payload)
     }
 
     /// Mutate an object's payload.
-    pub fn modify<R>(
-        &mut self,
-        value: Value,
-        f: impl FnOnce(&mut Object) -> R,
-    ) -> Result<R, String> {
+    pub fn modify<R>(&mut self, value: Value, f: impl FnOnce(&mut Object) -> R) -> PyResult<R> {
         Ok(f(self.get_mut(value)?))
     }
 
     /// The attributes stored on `value`, or `None` when none has been assigned (or `value` is
     /// not an instance of a user class).
-    pub fn attributes(&self, value: Value) -> Result<Option<&InstanceAttributes>, String> {
+    pub fn attributes(&self, value: Value) -> PyResult<Option<&InstanceAttributes>> {
         Ok(self.object(Self::object_id(value)?)?.attributes.as_deref())
     }
 
@@ -638,7 +636,7 @@ impl Heap {
     pub fn typed_attributes(
         &self,
         value: Value,
-    ) -> Result<(TypeId, Option<&InstanceAttributes>), String> {
+    ) -> PyResult<(TypeId, Option<&InstanceAttributes>)> {
         let object = self.object(Self::object_id(value)?)?;
         Ok((object.type_id, object.attributes.as_deref()))
     }
@@ -648,18 +646,18 @@ impl Heap {
         &mut self,
         value: Value,
         f: impl FnOnce(&mut Option<Box<InstanceAttributes>>) -> R,
-    ) -> Result<R, String> {
+    ) -> PyResult<R> {
         let id = Self::object_id(value)?;
         Ok(f(&mut self.object_mut(id)?.attributes))
     }
 
-    pub fn type_id(&self, value: Value) -> Result<TypeId, String> {
+    pub fn type_id(&self, value: Value) -> PyResult<TypeId> {
         Ok(self.object(Self::object_id(value)?)?.type_id)
     }
 
     /// A stable identity for `id()` and identity hashing: one more than the object's slot index,
     /// unique among live objects as CPython's addresses are. Immediates have none.
-    pub fn identity(&self, value: Value) -> Result<Option<u32>, String> {
+    pub fn identity(&self, value: Value) -> PyResult<Option<u32>> {
         let Some(id) = value.raw().object_id() else {
             return Ok(None);
         };
@@ -670,7 +668,7 @@ impl Heap {
     }
 
     /// Modeled size of one object's storage, as charged against the memory limit.
-    pub fn object_bytes(&self, value: Value) -> Result<u64, String> {
+    pub fn object_bytes(&self, value: Value) -> PyResult<u64> {
         Ok(self.object(Self::object_id(value)?)?.modeled_bytes)
     }
 
@@ -696,7 +694,7 @@ impl Heap {
         object: Object,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let type_id = self.infer_type_id(&object)?;
         self.alloc_typed(type_id, object, roots, resources)
     }
@@ -710,7 +708,7 @@ impl Heap {
         object: Object,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<Value, String> {
+    ) -> PyResult<Value> {
         let bytes = modeled_size(&object)?;
         charge_construction(bytes, resources)?;
         self.make_room(bytes, Some(&object), roots, resources)?;
@@ -742,7 +740,7 @@ impl Heap {
     /// A fresh payload holding the same builtin value as `value`, for the instance of a builtin
     /// subclass that `Class(value)` creates. Immediates are boxed; heap payloads are copied, so
     /// the instance never aliases the object it was built from.
-    pub fn copy_builtin_payload(&self, value: Value) -> Result<Object, String> {
+    pub fn copy_builtin_payload(&self, value: Value) -> PyResult<Object> {
         if let Some(value) = value.inline_string_ref() {
             return Ok(Object::String(PyString::from(value.as_str())));
         }
@@ -783,7 +781,7 @@ impl Heap {
         pending: Option<&Object>,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let limit = resources.limits().memory;
         let mut collected_fully = false;
         if self.old_bytes >= self.major_threshold.max(gc::major_floor(limit)) {
@@ -805,7 +803,7 @@ impl Heap {
         if resources.reserve_memory(bytes) {
             return Ok(());
         }
-        Err("memory limit exceeded".into())
+        Err(PyError::resource_error("memory limit exceeded"))
     }
 
     /// Replace an object payload while charging growth before installing it and releasing shrink
@@ -816,7 +814,7 @@ impl Heap {
         payload: Object,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let next_bytes = modeled_size(&payload)?;
         let current_bytes = modeled_size(self.get(value)?)?;
         charge_construction(next_bytes, resources)?;
@@ -851,7 +849,7 @@ impl Heap {
         bytes: u64,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         self.reserve_object_growth_pending(value, bytes, None, roots, resources)
     }
 
@@ -862,7 +860,7 @@ impl Heap {
         pending: Option<&Object>,
         roots: &dyn Roots,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let next_heap_bytes = self
             .modeled_bytes
             .checked_add(bytes)
@@ -893,11 +891,11 @@ impl Heap {
         value: Value,
         bytes: u64,
         resources: &mut Resources,
-    ) -> Result<(), String> {
+    ) -> PyResult<()> {
         let id = Self::object_id(value)?;
         let object = match self.slots.get_mut(id.index()) {
             Some(Some(object)) if object.generation() == id.generation() => object,
-            _ => return Err(stale_reference()),
+            _ => return Err(stale_reference().into()),
         };
         if object.modeled_bytes < bytes || self.modeled_bytes < bytes {
             return Err("modeled object size underflow".into());
@@ -924,7 +922,7 @@ impl Heap {
         std::mem::take(&mut self.modeled_bytes)
     }
 
-    fn infer_type_id(&self, object: &Object) -> Result<TypeId, String> {
+    fn infer_type_id(&self, object: &Object) -> PyResult<TypeId> {
         Ok(match object {
             Object::Bare => BuiltinType::Object.id(),
             Object::String(_) => BuiltinType::String.id(),
@@ -1012,7 +1010,7 @@ fn stale_reference() -> String {
 /// cost the guest what they cost the host.
 const OBJECT_HEADER: u64 = std::mem::size_of::<Option<HeapObject>>() as u64;
 
-fn modeled_size(object: &Object) -> Result<u64, String> {
+fn modeled_size(object: &Object) -> PyResult<u64> {
     const VALUE: u64 = MODELED_VALUE_BYTES;
     // Text, bytes, big-integer magnitudes, and packed array elements are charged at their byte
     // length rather than per value slot.
@@ -1020,7 +1018,7 @@ fn modeled_size(object: &Object) -> Result<u64, String> {
         u64::try_from(length)
             .ok()
             .and_then(|bytes| bytes.checked_add(OBJECT_HEADER))
-            .ok_or_else(|| String::from("modeled object size overflow"))
+            .ok_or_else(|| PyError::from("modeled object size overflow"))
     };
     let slots = match object {
         Object::String(value) => return packed(value.len()),
