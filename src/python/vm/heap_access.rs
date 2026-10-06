@@ -1,11 +1,11 @@
-//! The VM as a handle scope: every heap access the interpreter and native runtime perform goes
-//! through these methods, which bind the resulting handles to the VM's scope lifetime `'s`.
+//! Heap access for the interpreter and native runtime.
 //!
-//! A `Vm<'s>` owns the handle-stack entries created since it opened. Nested work that allocates
-//! many temporaries runs inside [`Vm::scope`] or [`Vm::nested`], a child `Vm<'c>` whose handles
-//! are released when it ends; a `Value<'c>` cannot be used after that because the parent is
-//! mutably borrowed for exactly `'c`. Values move out of a child scope either as a stored
-//! reference in a root ([`Vm::store`]) or through [`Vm::nested_value`].
+//! Every value these methods return is pinned on the heap's pin stack. A `Vm` records the pin
+//! count when it opens and releases everything pinned since then when it is reset or dropped:
+//! the dispatch loop resets after each instruction, and nested work that makes many temporaries
+//! runs inside [`Vm::scope`], a child `Vm` whose pins are released when it ends. A value that
+//! must outlive the scope that made it moves out as a stored reference in a root ([`Vm::store`])
+//! or is read again in the outer scope.
 //!
 //! Allocation can collect, so every allocating method reports the VM's roots to the heap through
 //! [`VmRoots`]: the operand stack, frames, pending exceptions, globals, modules and type tables.
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use crate::resources::Resources;
 
 use super::super::attributes::{AttributeStore, InstanceAttributeSlot};
-use super::super::heap::{Builder, Heap, Object, Ref, Roots, Value};
+use super::super::heap::{Heap, Object, Ref, Roots, Value};
 use super::super::object_model::{TypeId, TypeRegistry};
 use super::super::scopes;
 use super::super::symbols::SymbolId;
@@ -24,19 +24,19 @@ use super::{Flow, Vm, VmState};
 
 /// Every stored reference the VM keeps outside the heap.
 struct VmRoots<'a> {
-    execution: &'a mut VmState,
-    globals: &'a mut GlobalBindings,
-    types: &'a mut TypeRegistry,
-    modules: &'a mut HashMap<String, Ref>,
-    sys_path: &'a mut Option<Ref>,
+    execution: &'a VmState,
+    globals: &'a GlobalBindings,
+    types: &'a TypeRegistry,
+    modules: &'a HashMap<String, Ref>,
+    sys_path: &'a Option<Ref>,
 }
 
 impl Roots for VmRoots<'_> {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
         self.execution.visit_refs(visitor);
         self.globals.visit_refs(visitor);
         self.types.visit_refs(visitor);
-        for slot in self.modules.values_mut() {
+        for slot in self.modules.values() {
             visitor(slot);
         }
         self.sys_path.visit_refs(visitor);
@@ -52,10 +52,10 @@ impl Drop for Vm<'_> {
 impl<'s> Vm<'s> {
     // ----- scopes --------------------------------------------------------------------------
 
-    /// Open a child scope. Handles created through it are released when it is dropped; the
-    /// parent's handles stay usable inside it.
+    /// Open a child scope. Values pinned through it are released when it is dropped; the
+    /// parent's values stay pinned inside it.
     pub(super) fn scope(&mut self) -> Vm<'_> {
-        let handle_base = self.state.heap.handle_count();
+        let pin_base = self.state.heap.pin_count();
         let transient_base = self.execution.transient_memory;
         Vm {
             interp: &mut *self.interp,
@@ -66,26 +66,26 @@ impl<'s> Vm<'s> {
             mode: self.mode,
             out: &mut *self.out,
             err: &mut *self.err,
-            handle_base,
+            pin_base,
             transient_base,
         }
     }
 
-    /// Release every handle and every byte of host scratch this scope created so far. Only for a
+    /// Release every pin and every byte of host scratch this scope created so far. Only for a
     /// loop that owns its scope and keeps nothing across iterations, such as the bytecode
     /// dispatch loop; dropping the scope does the same.
     pub(super) fn reset_scope(&mut self) {
-        self.state.heap.truncate_handles(self.handle_base);
+        self.state.heap.truncate_pins(self.pin_base);
         self.release_transient_memory();
     }
 
-    /// [`Self::reset_scope`] when the scope holds a handle or scratch; the dispatch loop calls
+    /// [`Self::reset_scope`] when the scope holds a pin or scratch; the dispatch loop calls
     /// this once per instruction, so an instruction that works in place on the operand stack
     /// pays two comparisons.
     #[inline(always)]
     pub(super) fn reset_scope_if_used(&mut self) {
-        if self.state.heap.handle_count() != self.handle_base {
-            self.state.heap.truncate_handles(self.handle_base);
+        if self.state.heap.pin_count() != self.pin_base {
+            self.state.heap.truncate_pins(self.pin_base);
         }
         if self.execution.transient_memory != self.transient_base {
             self.release_transient_memory();
@@ -98,31 +98,31 @@ impl<'s> Vm<'s> {
         &self.state.heap
     }
 
-    /// A handle for a stored reference.
+    /// The pinned value of a stored reference.
     #[inline(always)]
-    pub(super) fn handle(&self, slot: &Ref) -> Value<'s> {
-        self.state.heap.handle(slot)
+    pub(super) fn value(&self, slot: &Ref) -> Value {
+        self.state.heap.value(slot)
     }
 
-    pub(super) fn handle_optional(&self, slot: Option<&Ref>) -> Option<Value<'s>> {
-        self.state.heap.handle_optional(slot)
+    pub(super) fn value_optional(&self, slot: Option<&Ref>) -> Option<Value> {
+        self.state.heap.value_optional(slot)
     }
 
-    pub(super) fn handles<'a>(&self, slots: impl IntoIterator<Item = &'a Ref>) -> Vec<Value<'s>> {
-        self.state.heap.handles(slots)
+    pub(super) fn values<'a>(&self, slots: impl IntoIterator<Item = &'a Ref>) -> Vec<Value> {
+        self.state.heap.values(slots)
     }
 
-    /// The stored form of a handle, for the VM's root containers. Place it in a root before the
-    /// next allocation.
+    /// The stored form of a value, for the VM's root containers. Place it in a root before the
+    /// value's pin is released.
     #[inline(always)]
-    pub(super) fn store(&self, value: Value<'_>) -> Ref {
-        self.state.heap.store(value)
+    pub(super) fn store(&self, value: Value) -> Ref {
+        Ref::from(value)
     }
 
     /// Run `f` with the heap, the VM's complete root set, and the resource meter.
     pub(super) fn with_heap<R>(
         &mut self,
-        f: impl FnOnce(&mut Heap, &mut dyn Roots, &mut Resources) -> R,
+        f: impl FnOnce(&mut Heap, &dyn Roots, &mut Resources) -> R,
     ) -> R {
         let ReplState {
             heap,
@@ -132,30 +132,19 @@ impl<'s> Vm<'s> {
             sys_path,
             ..
         } = &mut *self.state;
-        let mut roots = VmRoots {
-            execution: &mut *self.execution,
+        let roots = VmRoots {
+            execution: &*self.execution,
             globals,
             types,
             modules,
             sys_path,
         };
-        f(heap, &mut roots, &mut self.interp.resources)
+        f(heap, &roots, &mut self.interp.resources)
     }
 
     /// Allocate an object whose payload holds no references.
-    pub(super) fn alloc(&mut self, object: Object) -> Result<Value<'s>, String> {
+    pub(super) fn alloc(&mut self, object: Object) -> Result<Value, String> {
         self.with_heap(|heap, roots, resources| heap.alloc(object, roots, resources))
-    }
-
-    /// Allocate an object with references as an instance of the class registered as `type_id`.
-    pub(super) fn alloc_with_typed(
-        &mut self,
-        type_id: TypeId,
-        build: impl FnOnce(&Builder<'_>) -> Object,
-    ) -> Result<Value<'s>, String> {
-        self.with_heap(|heap, roots, resources| {
-            heap.alloc_with_typed(type_id, roots, resources, build)
-        })
     }
 
     /// Allocate `object` as an instance of the user class registered as `type_id`.
@@ -163,93 +152,73 @@ impl<'s> Vm<'s> {
         &mut self,
         type_id: TypeId,
         object: Object,
-    ) -> Result<Value<'s>, String> {
+    ) -> Result<Value, String> {
         self.with_heap(|heap, roots, resources| heap.alloc_typed(type_id, object, roots, resources))
     }
 
-    /// Allocate an object, turning handles into stored references with the builder.
-    pub(super) fn alloc_with(
-        &mut self,
-        build: impl FnOnce(&Builder<'_>) -> Object,
-    ) -> Result<Value<'s>, String> {
-        self.with_heap(|heap, roots, resources| heap.alloc_with(roots, resources, build))
-    }
-
-    pub(super) fn get(&self, value: Value<'_>) -> Result<&Object, String> {
+    pub(super) fn get(&self, value: Value) -> Result<&Object, String> {
         self.state.heap.get(value)
     }
 
-    /// Mutable payload access for fields that hold no references; use [`Self::modify`] to store
-    /// one.
-    pub(super) fn get_mut(&mut self, value: Value<'_>) -> Result<&mut Object, String> {
+    /// Mutable payload access. The heap remembers a mutated old object, so references may be
+    /// stored through it.
+    pub(super) fn get_mut(&mut self, value: Value) -> Result<&mut Object, String> {
         self.state.heap.get_mut(value)
     }
 
     pub(super) fn modify<R>(
         &mut self,
-        value: Value<'_>,
-        f: impl FnOnce(&Builder<'_>, &mut Object) -> R,
+        value: Value,
+        f: impl FnOnce(&mut Object) -> R,
     ) -> Result<R, String> {
         self.state.heap.modify(value, f)
     }
 
-    pub(super) fn replace_payload(
-        &mut self,
-        value: Value<'_>,
-        payload: Object,
-    ) -> Result<(), String> {
+    pub(super) fn replace_payload(&mut self, value: Value, payload: Object) -> Result<(), String> {
         self.with_heap(|heap, roots, resources| {
             heap.replace_payload(value, payload, roots, resources)
         })
     }
 
-    pub(super) fn reserve_object_growth(
-        &mut self,
-        value: Value<'_>,
-        bytes: u64,
-    ) -> Result<(), String> {
+    pub(super) fn reserve_object_growth(&mut self, value: Value, bytes: u64) -> Result<(), String> {
         self.with_heap(|heap, roots, resources| {
             heap.reserve_object_growth(value, bytes, roots, resources)
         })
     }
 
-    pub(super) fn release_object_shrink(
-        &mut self,
-        value: Value<'_>,
-        bytes: u64,
-    ) -> Result<(), String> {
+    pub(super) fn release_object_shrink(&mut self, value: Value, bytes: u64) -> Result<(), String> {
         self.state
             .heap
             .release_object_shrink(value, bytes, &mut self.interp.resources)
     }
 
     /// Whether two values are the same object or the same immediate (`is`).
-    pub(super) fn identical(&self, left: Value<'_>, right: Value<'_>) -> bool {
-        self.state.heap.identical(left, right)
+    pub(super) fn identical(&self, left: Value, right: Value) -> bool {
+        left.is(right)
     }
 
     /// A stable identity for `id()` and identity hashing; `None` for immediates.
-    pub(super) fn identity(&self, value: Value<'_>) -> Result<Option<u32>, String> {
+    pub(super) fn identity(&self, value: Value) -> Result<Option<u32>, String> {
         self.state.heap.identity(value)
     }
 
-    pub(super) fn object_type_id(&self, value: Value<'_>) -> Result<TypeId, String> {
+    pub(super) fn object_type_id(&self, value: Value) -> Result<TypeId, String> {
         self.state.heap.type_id(value)
     }
 
     /// The type object registered for `id`.
-    pub(super) fn type_value(&self, id: TypeId) -> Result<Value<'s>, String> {
-        Ok(self.handle(self.state.types.value_ref(id)?))
+    pub(super) fn type_value(&self, id: TypeId) -> Result<Value, String> {
+        Ok(self.value(self.state.types.value_ref(id)?))
     }
 
     // ----- operand stack -------------------------------------------------------------------
 
     #[inline(always)]
-    pub(super) fn push(&mut self, value: Value<'_>) {
-        self.execution.stack.push(&self.state.heap, value);
+    pub(super) fn push(&mut self, value: Value) {
+        self.execution.stack.push(value);
     }
 
-    /// Pop the top stored reference without making a handle, for moving a value between roots
+    /// Pop the top stored reference without pinning it, for moving a value between roots
     /// or discarding it.
     #[inline(always)]
     pub(super) fn pop_ref(&mut self) -> Result<Ref, String> {
@@ -277,14 +246,14 @@ impl<'s> Vm<'s> {
     }
 
     /// Leave a call's result on the operand stack, where the caller expects it.
-    pub(super) fn produce(&mut self, value: Value<'_>) -> Flow {
+    pub(super) fn produce(&mut self, value: Value) -> Flow {
         self.push(value);
         Flow::Next
     }
 
     /// The value `depth` entries below the top of the stack (0 is the top).
     #[inline(always)]
-    pub(super) fn peek(&self, depth: usize) -> Result<Value<'s>, String> {
+    pub(super) fn peek(&self, depth: usize) -> Result<Value, String> {
         self.execution
             .stack
             .peek(&self.state.heap, depth)
@@ -292,7 +261,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Pop `count` values, bottom-first.
-    pub(super) fn pop_many(&mut self, count: usize) -> Result<Vec<Value<'s>>, String> {
+    pub(super) fn pop_many(&mut self, count: usize) -> Result<Vec<Value>, String> {
         self.execution
             .stack
             .pop_many(&self.state.heap, count)
@@ -317,12 +286,12 @@ impl<'s> Vm<'s> {
 
     pub(super) fn alloc_scope(
         &mut self,
-        parent: Option<Value<'_>>,
+        parent: Option<Value>,
         uses_repl_globals: bool,
         local_names: std::sync::Arc<[String]>,
-        locals: Vec<Option<Value<'_>>>,
-        values: HashMap<String, Value<'_>>,
-    ) -> Result<Value<'s>, String> {
+        locals: Vec<Option<Value>>,
+        values: HashMap<String, Value>,
+    ) -> Result<Value, String> {
         let layout = scopes::ScopeLayout {
             parent,
             uses_repl_globals,
@@ -335,11 +304,11 @@ impl<'s> Vm<'s> {
 
     pub(super) fn alloc_scope_named(
         &mut self,
-        parent: Option<Value<'_>>,
+        parent: Option<Value>,
         uses_repl_globals: bool,
         local_names: std::sync::Arc<[String]>,
-        values: HashMap<String, Value<'_>>,
-    ) -> Result<Value<'s>, String> {
+        values: HashMap<String, Value>,
+    ) -> Result<Value, String> {
         let layout = scopes::ScopeLayout {
             parent,
             uses_repl_globals,
@@ -350,19 +319,15 @@ impl<'s> Vm<'s> {
         })
     }
 
-    pub(super) fn scope_get(
-        &self,
-        scope: Value<'s>,
-        name: &str,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn scope_get(&self, scope: Value, name: &str) -> Result<Option<Value>, String> {
         scopes::get(&self.state.heap, scope, name)
     }
 
     pub(super) fn scope_insert(
         &mut self,
-        scope: Value<'_>,
+        scope: Value,
         name: String,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         self.with_heap(|heap, roots, resources| {
             scopes::insert(heap, scope, name, value, roots, resources)
@@ -383,8 +348,8 @@ impl<'s> Vm<'s> {
             symbols,
             ..
         } = &mut *self.state;
-        let mut roots = VmRoots {
-            execution: &mut *self.execution,
+        let roots = VmRoots {
+            execution: &*self.execution,
             globals,
             types,
             modules,
@@ -394,7 +359,7 @@ impl<'s> Vm<'s> {
             heap,
             shapes,
             symbols,
-            roots: &mut roots,
+            roots: &roots,
             resources: &mut self.interp.resources,
         };
         f(&mut store)
@@ -402,35 +367,35 @@ impl<'s> Vm<'s> {
 
     pub(super) fn insert_attribute(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         name: &str,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         self.with_attributes(|store| store.insert(instance, name, value))
     }
 
     pub(super) fn insert_attribute_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         self.with_attributes(|store| store.insert_by_symbol(instance, symbol, value))
     }
 
     pub(super) fn remove_attribute_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         self.with_attributes(|store| store.remove_by_symbol(instance, symbol))
     }
 
     pub(super) fn attribute_by_symbol(
         &self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         self.state
             .shapes
             .attribute_by_symbol(&self.state.heap, instance, symbol)
@@ -438,7 +403,7 @@ impl<'s> Vm<'s> {
 
     pub(super) fn instance_attribute_slot_by_symbol(
         &self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
     ) -> Result<Option<InstanceAttributeSlot>, String> {
         self.state
@@ -446,10 +411,7 @@ impl<'s> Vm<'s> {
             .slot_by_symbol(&self.state.heap, instance, symbol)
     }
 
-    pub(super) fn instance_attribute_names(
-        &self,
-        instance: Value<'_>,
-    ) -> Result<Vec<String>, String> {
+    pub(super) fn instance_attribute_names(&self, instance: Value) -> Result<Vec<String>, String> {
         self.state
             .shapes
             .attribute_names(&self.state.heap, &self.state.symbols, instance)

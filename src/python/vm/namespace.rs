@@ -1,10 +1,10 @@
 //! Name, scope, import, and per-code cache operations used by bytecode execution.
 //!
 //! Lexical scopes are heap objects. The VM's scope stacks hold stored references to them, and
-//! every operation here takes a handle from those roots before it touches the heap, so a scope
-//! stays valid while a lookup or store allocates.
+//! every operation here pins a scope it reads from those roots before it touches the heap, so
+//! the scope stays live while a lookup or store allocates.
 
-use super::super::heap::Builder;
+use super::super::heap::Ref;
 use super::super::object_model::TypeId;
 use super::super::scopes;
 use super::{
@@ -14,56 +14,56 @@ use super::{
     BUILTIN_FUNCTIONS,
 };
 
-/// A [`NamespaceTarget`] whose references are handles in the current scope, so it can be held
-/// across allocation. Store it back into an object with [`NamespaceHandle::store`].
+/// A [`NamespaceTarget`] whose references are pinned values, so it can be held across
+/// allocation. Store it back into an object with [`NamespaceHandle::store`].
 #[derive(Clone, Copy)]
-pub(super) enum NamespaceHandle<'s> {
-    Scope(Value<'s>),
+pub(super) enum NamespaceHandle {
+    Scope(Value),
     Repl,
-    Instance(Value<'s>),
+    Instance(Value),
 }
 
-impl NamespaceHandle<'_> {
-    /// The stored form, for an `Object::NamespaceDict` built with `alloc_with` or `modify`.
-    pub(super) fn store(self, builder: &Builder<'_>) -> NamespaceTarget {
+impl NamespaceHandle {
+    /// The stored form, for an `Object::NamespaceDict` payload.
+    pub(super) fn store(self) -> NamespaceTarget {
         match self {
-            Self::Scope(scope) => NamespaceTarget::Scope(builder.store(scope)),
+            Self::Scope(scope) => NamespaceTarget::Scope(Ref::from(scope)),
             Self::Repl => NamespaceTarget::Repl,
-            Self::Instance(instance) => NamespaceTarget::Instance(builder.store(instance)),
+            Self::Instance(instance) => NamespaceTarget::Instance(Ref::from(instance)),
         }
     }
 }
 
-/// A [`ProxyTarget`] whose references are handles in the current scope.
+/// A [`ProxyTarget`] whose references are pinned values.
 #[derive(Clone, Copy)]
-pub(super) enum ProxyHandle<'s> {
-    Class(Value<'s>),
+pub(super) enum ProxyHandle {
+    Class(Value),
     RegisteredType(TypeId),
     NativeModule(&'static ModuleDef),
 }
 
 impl<'s> Vm<'s> {
-    /// Handles for a namespace view's target, read while the view object is borrowed.
-    pub(super) fn namespace_handle(&self, target: &NamespaceTarget) -> NamespaceHandle<'s> {
+    /// Pinned values for a namespace view's target, read while the view object is borrowed.
+    pub(super) fn namespace_handle(&self, target: &NamespaceTarget) -> NamespaceHandle {
         match target {
-            NamespaceTarget::Scope(scope) => NamespaceHandle::Scope(self.handle(scope)),
+            NamespaceTarget::Scope(scope) => NamespaceHandle::Scope(self.value(scope)),
             NamespaceTarget::Repl => NamespaceHandle::Repl,
-            NamespaceTarget::Instance(instance) => NamespaceHandle::Instance(self.handle(instance)),
+            NamespaceTarget::Instance(instance) => NamespaceHandle::Instance(self.value(instance)),
         }
     }
 
-    /// Handles for a mapping proxy's target, read while the proxy object is borrowed.
-    pub(super) fn proxy_handle(&self, target: &ProxyTarget) -> ProxyHandle<'s> {
+    /// Pinned values for a mapping proxy's target, read while the proxy object is borrowed.
+    pub(super) fn proxy_handle(&self, target: &ProxyTarget) -> ProxyHandle {
         match target {
-            ProxyTarget::Class(class) => ProxyHandle::Class(self.handle(class)),
+            ProxyTarget::Class(class) => ProxyHandle::Class(self.value(class)),
             ProxyTarget::RegisteredType(type_id) => ProxyHandle::RegisteredType(*type_id),
             ProxyTarget::NativeModule(module) => ProxyHandle::NativeModule(module),
         }
     }
 
     /// The active frame's own heap scope, when its names live in one.
-    pub(super) fn active_scope(&self) -> Option<Value<'s>> {
-        self.handle_optional(
+    pub(super) fn active_scope(&self) -> Option<Value> {
+        self.value_optional(
             self.bytecode_frames
                 .last()
                 .and_then(BytecodeFrame::active_scope),
@@ -73,8 +73,8 @@ impl<'s> Vm<'s> {
     /// The scope the active frame resolves free names through: its own scope, else the
     /// closure of the function it runs. `None` means the main program's global table.
     #[inline(always)]
-    pub(super) fn lookup_scope(&self) -> Option<Value<'s>> {
-        self.handle_optional(
+    pub(super) fn lookup_scope(&self) -> Option<Value> {
+        self.value_optional(
             self.bytecode_frames
                 .last()
                 .and_then(|frame| frame.scope.as_ref()),
@@ -83,23 +83,23 @@ impl<'s> Vm<'s> {
 
     /// The class and receiver zero-argument `super()` and `__class__` refer to: the defining
     /// class of the function the nearest method frame runs, and that frame's first local.
-    pub(super) fn method_context(&self) -> Result<Option<(Value<'s>, Value<'s>)>, String> {
+    pub(super) fn method_context(&self) -> Result<Option<(Value, Value)>, String> {
         for frame in self.bytecode_frames.iter().rev() {
             let Some(callee) = &frame.callee else {
                 continue;
             };
-            let Object::Function(function) = self.get(self.handle(callee))? else {
+            let Object::Function(function) = self.get(self.value(callee))? else {
                 continue;
             };
-            let Some(class) = self.handle_optional(function.defining_class.as_ref()) else {
+            let Some(class) = self.value_optional(function.defining_class.as_ref()) else {
                 continue;
             };
             let receiver = match (frame.locals_base(), frame.active_scope()) {
                 (Some(base), _) => {
-                    self.handle_optional(self.locals.get(base).and_then(Option::as_ref))
+                    self.value_optional(self.locals.get(base).and_then(Option::as_ref))
                 }
-                (None, Some(scope)) => scopes::local_ref(self.heap(), self.handle(scope), 0)?
-                    .map(|slot| self.handle(slot)),
+                (None, Some(scope)) => scopes::local_ref(self.heap(), self.value(scope), 0)?
+                    .map(|slot| self.value(slot)),
                 (None, None) => None,
             };
             return Ok(receiver.map(|receiver| (class, receiver)));
@@ -109,12 +109,12 @@ impl<'s> Vm<'s> {
 
     /// The scope `hops` lexical levels above the active frame's own level; `None` past the
     /// outermost scope. A frame without a scope of its own counts its closure as one hop.
-    fn enclosing_scope(&self, hops: usize) -> Result<Option<Value<'s>>, String> {
+    fn enclosing_scope(&self, hops: usize) -> Result<Option<Value>, String> {
         let frame = self
             .bytecode_frames
             .last()
             .ok_or("scope walk requires an active frame")?;
-        let scope = self.handle_optional(frame.scope.as_ref());
+        let scope = self.value_optional(frame.scope.as_ref());
         let (mut target, hops) = match (frame.own_scope, hops) {
             (true, hops) => (scope, hops),
             (false, 0) => return Err("invalid enclosing scope hop count".into()),
@@ -269,12 +269,9 @@ impl<'s> Vm<'s> {
         if let Some(scope) = self.active_scope() {
             self.scope_insert(scope, name.to_string(), value)?;
         } else {
-            self.state.globals.insert(
-                &self.state.heap,
-                symbol,
-                value,
-                &mut self.interp.resources,
-            )?;
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
         }
         Ok(())
     }
@@ -289,12 +286,9 @@ impl<'s> Vm<'s> {
         if let Some(scope) = self.enclosing_scope(scope_hops)? {
             self.scope_insert(scope, name.to_string(), value)
         } else {
-            self.state.globals.insert(
-                &self.state.heap,
-                symbol,
-                value,
-                &mut self.interp.resources,
-            )?;
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             Ok(())
         }
     }
@@ -309,7 +303,7 @@ impl<'s> Vm<'s> {
 
     pub(super) fn exception_type_matches(
         &mut self,
-        expected: Value<'s>,
+        expected: Value,
         actual: &RaisedException,
     ) -> Result<bool, String> {
         if let Some(NativeValue::ExceptionType(ExceptionType(name))) = expected.native_value() {
@@ -318,7 +312,7 @@ impl<'s> Vm<'s> {
                 .types
                 .exception_type_id(name)
                 .ok_or("exception type is not registered")?;
-            let actual_value = self.handle(&actual.value);
+            let actual_value = self.value(&actual.value);
             return self
                 .state
                 .types
@@ -329,15 +323,15 @@ impl<'s> Vm<'s> {
                 "catching classes that do not inherit from BaseException is not allowed".into(),
             );
         }
-        enum Expected<'v> {
+        enum Expected {
             Class(TypeId),
-            Tuple(Vec<Value<'v>>),
+            Tuple(Vec<Value>),
         }
         let expected = match self.get(expected)? {
             Object::Class(class_object) if class_object.exception_base.is_some() => {
                 Expected::Class(class_object.instance_type)
             }
-            Object::Tuple(types) => Expected::Tuple(self.handles(types)),
+            Object::Tuple(types) => Expected::Tuple(self.values(types)),
             _ => {
                 return Err(
                     "catching classes that do not inherit from BaseException is not allowed".into(),
@@ -346,7 +340,7 @@ impl<'s> Vm<'s> {
         };
         match expected {
             Expected::Class(instance_type) => {
-                let actual_value = self.handle(&actual.value);
+                let actual_value = self.value(&actual.value);
                 let actual_type = self.type_id(&actual_value)?;
                 self.state.types.is_subclass(actual_type, instance_type)
             }
@@ -368,15 +362,12 @@ impl<'s> Vm<'s> {
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-        value: Value<'s>,
+        value: Value,
     ) -> Result<(), String> {
         let Some(scope) = self.lookup_scope() else {
-            self.state.globals.insert(
-                &self.state.heap,
-                symbol,
-                value,
-                &mut self.interp.resources,
-            )?;
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             return Ok(());
         };
         self.store_scoped_global(scope, symbol, code, name, value)
@@ -386,20 +377,17 @@ impl<'s> Vm<'s> {
     #[inline(never)]
     fn store_scoped_global(
         &mut self,
-        scope: Value<'s>,
+        scope: Value,
         symbol: SymbolId,
         code: &CodeRef,
         name: NameId,
-        value: Value<'s>,
+        value: Value,
     ) -> Result<(), String> {
         let root = scopes::root(self.heap(), scope)?;
         if scopes::uses_repl_globals(self.heap(), root)? {
-            self.state.globals.insert(
-                &self.state.heap,
-                symbol,
-                value,
-                &mut self.interp.resources,
-            )?;
+            self.state
+                .globals
+                .insert(symbol, value, &mut self.interp.resources)?;
             Ok(())
         } else {
             self.scope_insert(root, code.name(name).to_owned(), value)
@@ -430,7 +418,7 @@ impl<'s> Vm<'s> {
     /// (the entry-point program) or the root scope defers to it (a function or class body defined
     /// at that program's top level). Mirrors `load_global`'s and `store_global`'s resolution
     /// exactly, so `globals()` always names the same namespace a bare name lookup would.
-    pub(super) fn current_globals_target(&self) -> Result<NamespaceHandle<'s>, String> {
+    pub(super) fn current_globals_target(&self) -> Result<NamespaceHandle, String> {
         let Some(scope) = self.lookup_scope() else {
             return Ok(NamespaceHandle::Repl);
         };
@@ -446,7 +434,7 @@ impl<'s> Vm<'s> {
     /// is the same live view `globals()` returns, as `locals() is globals()` there in CPython.
     /// Inside a function it is a detached `dict` of that call's local variables: CPython's
     /// `locals()` there is a snapshot too, and writing to it never rebinds a local.
-    pub(super) fn current_locals(&mut self) -> Result<Value<'s>, String> {
+    pub(super) fn current_locals(&mut self) -> Result<Value, String> {
         // `exec`/`eval` code reports the locals of the frame that ran it.
         let Some(frame) = self
             .bytecode_frames
@@ -456,7 +444,7 @@ impl<'s> Vm<'s> {
         else {
             return self.alloc(Object::NamespaceDict(NamespaceTarget::Repl));
         };
-        let Some(scope) = self.handle_optional(frame.active_scope()) else {
+        let Some(scope) = self.value_optional(frame.active_scope()) else {
             let base = frame
                 .locals_base()
                 .expect("frame without a scope was chosen for its slots");
@@ -464,7 +452,7 @@ impl<'s> Vm<'s> {
             let mut items = Vec::with_capacity(names.len());
             for (slot, name) in names.iter().enumerate() {
                 if let Some(value) = self.locals.get(base + slot).and_then(Option::as_ref) {
-                    let value = self.handle(value);
+                    let value = self.value(value);
                     items.push((self.allocate_string(name.clone())?, value));
                 }
             }
@@ -475,9 +463,9 @@ impl<'s> Vm<'s> {
         let is_module_scope = !scopes::uses_repl_globals(self.heap(), scope)?
             && scopes::parent(self.heap(), scope)?.is_none();
         if is_module_scope {
-            return self.alloc_with(|builder| {
-                Object::NamespaceDict(NamespaceTarget::Scope(builder.store(scope)))
-            });
+            return self.alloc(Object::NamespaceDict(NamespaceTarget::Scope(Ref::from(
+                scope,
+            ))));
         }
         self.namespace_snapshot_dict(NamespaceHandle::Scope(scope))
     }
@@ -485,8 +473,8 @@ impl<'s> Vm<'s> {
     /// A detached `dict` holding `target`'s current bindings.
     pub(super) fn namespace_snapshot_dict(
         &mut self,
-        target: NamespaceHandle<'s>,
-    ) -> Result<Value<'s>, String> {
+        target: NamespaceHandle,
+    ) -> Result<Value, String> {
         let items = self.namespace_items(target)?;
         self.allocate_dict(items)
     }
@@ -495,8 +483,8 @@ impl<'s> Vm<'s> {
     /// order [`Self::namespace_entries`] gives.
     pub(super) fn namespace_items(
         &mut self,
-        target: NamespaceHandle<'s>,
-    ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
+        target: NamespaceHandle,
+    ) -> Result<Vec<(Value, Value)>, String> {
         let entries = self.namespace_entries(target)?;
         let mut items = Vec::with_capacity(entries.len());
         for (name, value) in entries {
@@ -510,9 +498,9 @@ impl<'s> Vm<'s> {
     /// declare functions apart from values, so neither keeps CPython's definition order.
     pub(super) fn proxy_items(
         &mut self,
-        target: ProxyHandle<'s>,
-    ) -> Result<Vec<(Value<'s>, Value<'s>)>, String> {
-        let mut entries: Vec<(String, Value<'s>)> = match target {
+        target: ProxyHandle,
+    ) -> Result<Vec<(Value, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = match target {
             ProxyHandle::Class(class) => {
                 let Object::Class(class_object) = self.get(class)? else {
                     return Err("mappingproxy target is not a class".into());
@@ -520,7 +508,7 @@ impl<'s> Vm<'s> {
                 class_object
                     .attributes
                     .iter()
-                    .map(|(name, value)| (name.clone(), self.handle(value)))
+                    .map(|(name, value)| (name.clone(), self.value(value)))
                     .collect()
             }
             ProxyHandle::RegisteredType(type_id) => self
@@ -529,7 +517,7 @@ impl<'s> Vm<'s> {
                 .get(type_id)?
                 .attributes
                 .iter()
-                .map(|(name, value)| (name.clone(), self.handle(value)))
+                .map(|(name, value)| (name.clone(), self.value(value)))
                 .collect(),
             ProxyHandle::NativeModule(module) => {
                 let mut entries = Vec::with_capacity(module.functions.len() + module.values.len());
@@ -561,9 +549,9 @@ impl<'s> Vm<'s> {
     /// come in the order [`Vm::instance_attribute_names`] gives.
     pub(super) fn namespace_entries(
         &self,
-        target: NamespaceHandle<'s>,
-    ) -> Result<Vec<(String, Value<'s>)>, String> {
-        let mut entries: Vec<(String, Value<'s>)> = match target {
+        target: NamespaceHandle,
+    ) -> Result<Vec<(String, Value)>, String> {
+        let mut entries: Vec<(String, Value)> = match target {
             NamespaceHandle::Scope(scope) => {
                 scopes::values(self.heap(), scope)?.into_iter().collect()
             }
@@ -587,9 +575,9 @@ impl<'s> Vm<'s> {
 
     pub(super) fn namespace_lookup(
         &self,
-        target: NamespaceHandle<'s>,
+        target: NamespaceHandle,
         name: &str,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         if let NamespaceHandle::Scope(scope) = target {
             return self.scope_get(scope, name);
         }
@@ -610,21 +598,20 @@ impl<'s> Vm<'s> {
     /// `obj.__dict__` does.
     pub(super) fn namespace_store(
         &mut self,
-        target: NamespaceHandle<'s>,
+        target: NamespaceHandle,
         name: String,
-        value: Value<'s>,
+        value: Value,
     ) -> Result<(), String> {
         if let NamespaceHandle::Scope(scope) = target {
             return self.scope_insert(scope, name, value);
         }
         let symbol = self.intern_symbol(&name)?;
         match target {
-            NamespaceHandle::Repl => self.state.globals.insert(
-                &self.state.heap,
-                symbol,
-                value,
-                &mut self.interp.resources,
-            ),
+            NamespaceHandle::Repl => {
+                self.state
+                    .globals
+                    .insert(symbol, value, &mut self.interp.resources)
+            }
             NamespaceHandle::Instance(instance) => {
                 self.insert_attribute_by_symbol(instance, symbol, value)
             }
@@ -634,9 +621,9 @@ impl<'s> Vm<'s> {
 
     pub(super) fn namespace_delete(
         &mut self,
-        target: NamespaceHandle<'s>,
+        target: NamespaceHandle,
         name: &str,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         if let NamespaceHandle::Scope(scope) = target {
             return scopes::remove(&mut self.state.heap, scope, name);
         }
@@ -654,14 +641,14 @@ impl<'s> Vm<'s> {
 
     fn import_roots(&mut self) -> Result<Vec<String>, String> {
         let mut roots = self.state.temporary_import_paths.clone();
-        if let Some(path) = self.handle_optional(self.state.sys_path.as_ref()) {
+        if let Some(path) = self.value_optional(self.state.sys_path.as_ref()) {
             if !path.is_object() {
                 return Err("sys.path lost list identity".into());
             }
             let Object::List(values) = self.get(path)? else {
                 return Err("sys.path must remain a list".into());
             };
-            for value in self.handles(values) {
+            for value in self.values(values) {
                 let path = self
                     .string_value(&value)
                     .map_err(|error| self.record_native_error(error))?
@@ -678,20 +665,20 @@ impl<'s> Vm<'s> {
     }
 
     /// The module object imported under `name`, if any.
-    pub(super) fn loaded_module(&self, name: &str) -> Option<Value<'s>> {
-        self.handle_optional(self.state.modules.get(name))
+    pub(super) fn loaded_module(&self, name: &str) -> Option<Value> {
+        self.value_optional(self.state.modules.get(name))
     }
 
     /// Allocate a module object over a fresh module scope binding `values`.
     fn allocate_module(
         &mut self,
         name: String,
-        values: HashMap<String, Value<'s>>,
-    ) -> Result<(Value<'s>, Value<'s>), String> {
+        values: HashMap<String, Value>,
+    ) -> Result<(Value, Value), String> {
         let scope = self.alloc_scope(None, false, Arc::from([]), Vec::new(), values)?;
-        let module = self.alloc_with(|builder| Object::Module {
+        let module = self.alloc(Object::Module {
             name,
-            scope: builder.store(scope),
+            scope: Ref::from(scope),
         })?;
         Ok((module, scope))
     }
@@ -966,11 +953,11 @@ impl<'s> Vm<'s> {
                 else {
                     return Err(self.missing_attribute(&module, "__all__"));
                 };
-                let (scope, module_name) = (self.handle(scope), name.clone());
+                let (scope, module_name) = (self.value(scope), name.clone());
                 match self.scope_get(scope, "__all__")? {
                     Some(all) => {
                         let items = match all.is_object().then(|| self.get(all)).transpose()? {
-                            Some(Object::List(items) | Object::Tuple(items)) => self.handles(items),
+                            Some(Object::List(items) | Object::Tuple(items)) => self.values(items),
                             // CPython indexes `__all__`; lists and tuples are what modules use.
                             _ => {
                                 let message = format!(
@@ -1014,36 +1001,28 @@ impl<'s> Vm<'s> {
                 self.scope_insert(scope, name, value)?;
             } else {
                 let symbol = self.intern_symbol(&name)?;
-                self.state.globals.insert(
-                    &self.state.heap,
-                    symbol,
-                    value,
-                    &mut self.interp.resources,
-                )?;
+                self.state
+                    .globals
+                    .insert(symbol, value, &mut self.interp.resources)?;
             }
         }
         Ok(())
     }
 
     /// The scope of the module imported as `name`, for binding a submodule into it.
-    pub(super) fn module_scope(&self, name: &str, module: Value<'s>) -> Result<Value<'s>, String> {
+    pub(super) fn module_scope(&self, name: &str, module: Value) -> Result<Value, String> {
         if !module.is_object() {
             return Err(format!("module {name:?} cannot contain submodules"));
         }
         let Object::Module { scope, .. } = self.get(module)? else {
             return Err(format!("module {name:?} changed object kind"));
         };
-        Ok(self.handle(scope))
+        Ok(self.value(scope))
     }
 
     /// Install synthetic package parents for a dotted import and push the value selected by
     /// Python's ordinary import binding rule. Package objects contain only VM module references.
-    fn finish_import(
-        &mut self,
-        name: &str,
-        leaf: Value<'s>,
-        bind_root: bool,
-    ) -> Result<(), String> {
+    fn finish_import(&mut self, name: &str, leaf: Value, bind_root: bool) -> Result<(), String> {
         if let Some((parent_name, child_name)) = name.rsplit_once('.') {
             if let Some(parent) = self.loaded_module(parent_name) {
                 let scope = self.module_scope(parent_name, parent)?;

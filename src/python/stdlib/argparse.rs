@@ -78,16 +78,16 @@ impl NativeObject for ArgumentParserObject {
             .ok_or_else(|| "modeled object size overflow".into())
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
-        for argument in &mut self.arguments {
-            visit(&mut argument.default);
-            for choice in &mut argument.choices {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
+        for argument in &self.arguments {
+            visit(&argument.default);
+            for choice in &argument.choices {
                 visit(choice);
             }
         }
-        if let Some(subparsers) = &mut self.subparsers {
-            for command in &mut subparsers.commands {
-                visit(&mut command.parser);
+        if let Some(subparsers) = &self.subparsers {
+            for command in &subparsers.commands {
+                visit(&command.parser);
             }
         }
     }
@@ -153,8 +153,8 @@ impl NativeObject for NamespaceObject {
             .ok_or_else(|| "modeled object size overflow".into())
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
-        for (_, slot) in &mut self.values {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
+        for (_, slot) in &self.values {
             visit(slot);
         }
     }
@@ -189,8 +189,8 @@ impl NativeObject for NamespaceObject {
     }
 }
 
-type NamespaceValues<'s> = Vec<(String, Value<'s>)>;
-type ParsedArguments<'s> = Result<(NamespaceValues<'s>, Vec<String>), PyError>;
+type NamespaceValues = Vec<(String, Value)>;
+type ParsedArguments = Result<(NamespaceValues, Vec<String>), PyError>;
 
 pub(crate) static ARGUMENT_PARSER_TYPE: NativeTypeDef = NativeTypeDef {
     name: "argparse.ArgumentParser",
@@ -238,7 +238,7 @@ pub(crate) static ARGUMENT_PARSER_TYPE: NativeTypeDef = NativeTypeDef {
     }],
 };
 
-fn parser_prog<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: Value<'s>) -> PyResult<'s> {
+fn parser_prog(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult {
     let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let prog = runtime.argument_parser_parts(parser)?.prog;
     runtime.new_string(prog)
@@ -261,7 +261,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn argument_parser<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn argument_parser(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("ArgumentParser", 0, 0)?;
     args.reject_unknown_keywords("ArgumentParser", &["prog", "description", "add_help"])?;
     let program = optional_string(runtime, &args, "ArgumentParser", "prog")?
@@ -271,16 +271,12 @@ fn argument_parser<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> P
     runtime.new_argument_parser(program, description, add_help, false)
 }
 
-fn namespace<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn namespace(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("Namespace", 0, 0)?;
     runtime.new_namespace(args.into_parts().1)
 }
 
-fn add_argument<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn add_argument(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     if args.positional().is_empty() {
         return Err(PyError::type_error(
             "add_argument() requires at least one name",
@@ -292,13 +288,13 @@ fn add_argument<'s>(
             "dest", "required", "action", "type", "default", "help", "choices",
         ],
     )?;
-    let parser = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let names = args
         .positional()
         .iter()
         .copied()
         .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
-        .collect::<PyResult<'s, Vec<_>>>()?;
+        .collect::<PyResult<Vec<_>>>()?;
     let optional = names.iter().any(|name| name.starts_with('-'));
     let dest = optional_string(runtime, &args, "add_argument", "dest")?.unwrap_or_else(|| {
         names
@@ -343,12 +339,12 @@ fn add_argument<'s>(
     let mut choices = Vec::new();
     if let Some(value) = args.keyword("add_argument", "choices")? {
         let iterator = runtime.iterator(*value)?;
-        // The iterable is unbounded, so each step runs in its own handle scope and collects
+        // The iterable is unbounded, so each step runs in its own pin scope and collects
         // into a Python list that outlives it.
-        let collected = runtime.new_list(Vec::new())?.cast::<PyList<'s>>(runtime)?;
+        let collected = runtime.new_list(Vec::new())?.cast::<PyList>(runtime)?;
         let mut exhausted = false;
         while !exhausted {
-            runtime.nested(&mut |runtime, _| {
+            runtime.nested(&mut |runtime| {
                 match runtime.iterator_next(iterator)? {
                     Some(value) => runtime.list_append(collected, value)?,
                     None => exhausted = true,
@@ -376,14 +372,10 @@ fn add_argument<'s>(
     Ok(Value::None)
 }
 
-fn add_subparsers<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn add_subparsers(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("add_subparsers", 0, 0)?;
     args.reject_unknown_keywords("add_subparsers", &["dest", "required", "help"])?;
-    let parser = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let dest = optional_string(runtime, &args, "add_subparsers", "dest")?;
     let required = boolean_keyword(runtime, &args, "add_subparsers", "required", false)?;
     let help = optional_string(runtime, &args, "add_subparsers", "help")?;
@@ -401,14 +393,10 @@ fn add_subparsers<'s>(
     Ok(receiver)
 }
 
-fn add_parser<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn add_parser(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("add_parser", 1, 1)?;
     args.reject_unknown_keywords("add_parser", &["help", "description", "add_help"])?;
-    let parent = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parent = receiver.cast::<PyArgumentParser>(runtime)?;
     let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
     let help = optional_string(runtime, &args, "add_parser", "help")?;
     let description = optional_string(runtime, &args, "add_parser", "description")?;
@@ -420,7 +408,7 @@ fn add_parser<'s>(
         add_help,
         true,
     )?;
-    let child_parser = child.cast::<PyArgumentParser<'s>>(runtime)?;
+    let child_parser = child.cast::<PyArgumentParser>(runtime)?;
     runtime.append_subcommand(
         parent,
         PySubcommandSpec {
@@ -432,21 +420,13 @@ fn add_parser<'s>(
     Ok(child)
 }
 
-fn parse_args<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn parse_args(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     let (values, unknown) = parse(runtime, receiver, args, false)?;
     debug_assert!(unknown.is_empty());
     runtime.new_namespace(values)
 }
 
-fn parse_known_args<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn parse_known_args(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     let (values, unknown) = parse(runtime, receiver, args, true)?;
     let namespace = runtime.new_namespace(values)?;
     let mut unknown_values = Vec::with_capacity(unknown.len());
@@ -457,12 +437,12 @@ fn parse_known_args<'s>(
     runtime.new_tuple(vec![namespace, unknown])
 }
 
-fn parse<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
+fn parse(
+    runtime: &mut dyn PyRuntime,
+    receiver: Value,
+    args: CallArgs,
     allow_unknown: bool,
-) -> ParsedArguments<'s> {
+) -> ParsedArguments {
     let operation = if allow_unknown {
         "parse_known_args"
     } else {
@@ -470,16 +450,13 @@ fn parse<'s>(
     };
     args.expect_positional(operation, 0, 1)?;
     args.reject_keywords(operation)?;
-    let parser = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let data = runtime.argument_parser_parts(parser)?;
     let input = input_arguments(runtime, &args)?;
     parse_values(runtime, &data, &input, allow_unknown)
 }
 
-fn input_arguments<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
-) -> PyResult<'s, Vec<String>> {
+fn input_arguments(runtime: &mut dyn PyRuntime, args: &CallArgs) -> PyResult<Vec<String>> {
     let Some(value) = args.positional().first() else {
         return Ok(runtime.command_arguments());
     };
@@ -488,10 +465,10 @@ fn input_arguments<'s>(
     }
     let iterator = runtime.iterator(*value)?;
     let mut input = Vec::new();
-    // The iterable is unbounded, so each step runs in its own handle scope.
+    // The iterable is unbounded, so each step runs in its own pin scope.
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             match runtime.iterator_next(iterator)? {
                 Some(value) => input.push(value.cast::<OwnedPyString>(runtime)?.0),
                 None => exhausted = true,
@@ -502,12 +479,12 @@ fn input_arguments<'s>(
     Ok(input)
 }
 
-fn parse_values<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyArgumentParserData<'s>,
+fn parse_values(
+    runtime: &mut dyn PyRuntime,
+    data: &PyArgumentParserData,
     input: &[String],
     allow_unknown: bool,
-) -> ParsedArguments<'s> {
+) -> ParsedArguments {
     let mut values = data
         .arguments
         .iter()
@@ -629,12 +606,12 @@ fn parse_values<'s>(
     Ok((values, unknown))
 }
 
-fn argument_value<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    spec: &PyArgumentSpec<'s>,
+fn argument_value(
+    runtime: &mut dyn PyRuntime,
+    spec: &PyArgumentSpec,
     name: &str,
     raw: String,
-) -> PyResult<'s, Value<'s>> {
+) -> PyResult<Value> {
     let value = if spec.integer {
         runtime
             .new_integer(&raw)
@@ -659,11 +636,11 @@ fn argument_value<'s>(
     Ok(value)
 }
 
-fn validate_required<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyArgumentParserData<'s>,
-    values: &[(String, Value<'s>)],
-) -> PyResult<'s, ()> {
+fn validate_required(
+    runtime: &mut dyn PyRuntime,
+    data: &PyArgumentParserData,
+    values: &[(String, Value)],
+) -> PyResult<()> {
     for spec in &data.arguments {
         runtime.charge_cpu(1)?;
         if spec.required
@@ -685,35 +662,27 @@ fn validate_required<'s>(
     Ok(())
 }
 
-fn format_help_method<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn format_help_method(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("format_help", 0, 0)?;
     args.reject_keywords("format_help")?;
-    let parser = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let data = runtime.argument_parser_parts(parser)?;
     let help = format_help(runtime, &data)?;
     runtime.new_string(help)
 }
 
-fn print_help<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn print_help(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("print_help", 0, 0)?;
     args.reject_keywords("print_help")?;
-    let parser = receiver.cast::<PyArgumentParser<'s>>(runtime)?;
+    let parser = receiver.cast::<PyArgumentParser>(runtime)?;
     let data = runtime.argument_parser_parts(parser)?;
     write_help(runtime, &data, PyMarker::Stdout)?;
     Ok(Value::None)
 }
 
-fn parser_error<'s, T>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyArgumentParserData<'s>,
+fn parser_error<T>(
+    runtime: &mut dyn PyRuntime,
+    data: &PyArgumentParserData,
     message: String,
 ) -> Result<T, PyError> {
     let usage = format_usage(data);
@@ -726,21 +695,18 @@ fn parser_error<'s, T>(
     Err(PyError::exit(2))
 }
 
-fn write_help<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyArgumentParserData<'s>,
+fn write_help(
+    runtime: &mut dyn PyRuntime,
+    data: &PyArgumentParserData,
     stream: PyMarker,
-) -> PyResult<'s, ()> {
+) -> PyResult<()> {
     let help = format_help(runtime, data)?;
     let stream = runtime.marker(stream);
     runtime.write_stream(&stream, &help)?;
     Ok(())
 }
 
-fn format_help<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyArgumentParserData<'s>,
-) -> PyResult<'s, String> {
+fn format_help(runtime: &mut dyn PyRuntime, data: &PyArgumentParserData) -> PyResult<String> {
     let estimate = data
         .arguments
         .len()
@@ -816,7 +782,7 @@ fn format_help<'s>(
     Ok(output)
 }
 
-fn format_usage<'s>(data: &PyArgumentParserData<'s>) -> String {
+fn format_usage(data: &PyArgumentParserData) -> String {
     let mut usage = format!("usage: {}", data.prog);
     if data.add_help {
         usage.push_str(" [-h]");
@@ -866,25 +832,25 @@ fn help_line(output: &mut String, label: &str, help: Option<&str>) {
     output.push('\n');
 }
 
-fn optional_string<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
+fn optional_string(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
     operation: &str,
     keyword: &str,
-) -> PyResult<'s, Option<String>> {
+) -> PyResult<Option<String>> {
     args.keyword(operation, keyword)?
         .copied()
         .map(|value| value.cast::<OwnedPyString>(runtime).map(|value| value.0))
         .transpose()
 }
 
-fn boolean_keyword<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
+fn boolean_keyword(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
     operation: &str,
     keyword: &str,
     default: bool,
-) -> PyResult<'s, bool> {
+) -> PyResult<bool> {
     args.keyword(operation, keyword)?
         .map(|value| {
             if matches!(runtime.kind(value)?, PyKind::Bool | PyKind::Int) {
@@ -897,11 +863,7 @@ fn boolean_keyword<'s>(
         .map(|value| value.unwrap_or(default))
 }
 
-fn set_value<'s>(
-    values: &mut [(String, Value<'s>)],
-    dest: &str,
-    value: Value<'s>,
-) -> PyResult<'s, ()> {
+fn set_value(values: &mut [(String, Value)], dest: &str, value: Value) -> PyResult<()> {
     let slot = values
         .iter_mut()
         .find(|(name, _)| name == dest)
@@ -910,7 +872,7 @@ fn set_value<'s>(
     Ok(())
 }
 
-fn set_or_push<'s>(values: &mut Vec<(String, Value<'s>)>, name: String, value: Value<'s>) {
+fn set_or_push(values: &mut Vec<(String, Value)>, name: String, value: Value) {
     if let Some((_, slot)) = values.iter_mut().find(|(candidate, _)| candidate == &name) {
         *slot = value;
     } else {

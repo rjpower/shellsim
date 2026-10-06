@@ -1,6 +1,6 @@
 //! VM adapters for unary, binary, comparison, construction, and formatting operations.
 
-use super::super::heap::{Builder, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
+use super::super::heap::{Ref, MODELED_SET_MEMBER_BYTES, MODELED_VALUE_BYTES};
 use super::super::native::KindNumber;
 use super::format::{format_complex, format_float, format_integer, format_text, FormatError};
 use super::{
@@ -9,22 +9,22 @@ use super::{
 };
 
 /// The new contents of a builtin container updated in place by an augmented assignment.
-enum Replacement<'s> {
-    List(Vec<Value<'s>>),
-    Set(HashedMembers<'s>),
+enum Replacement {
+    List(Vec<Value>),
+    Set(HashedMembers),
     ByteArray(Vec<u8>),
 }
 
 impl<'s> Vm<'s> {
     pub(super) fn unary(&mut self, operator: UnaryOperator) -> Result<(), String> {
-        // An exact number is rewritten in place on the stack; everything else leaves it as a
-        // handle for the slot protocol.
+        // An exact number is rewritten in place on the stack; everything else pins it for the
+        // slot protocol.
         let value = self.peek(0)?;
         if let Some(result) = number::exact_unary(self, operator, value)
             .map_err(|error| self.record_native_error(error))?
         {
             let slot = self.stack.len() - 1;
-            self.execution.stack.set(&self.state.heap, slot, result);
+            self.execution.stack.set(slot, result);
             return Ok(());
         }
         let value = self.pop()?;
@@ -56,9 +56,9 @@ impl<'s> Vm<'s> {
         kind: SequenceKind,
     ) -> Result<(), String> {
         let values = self.take(count)?;
-        let value = self.alloc_with(|builder| match kind {
-            SequenceKind::List => Object::List(builder.refs(values)),
-            SequenceKind::Tuple => Object::Tuple(builder.refs(values)),
+        let value = self.alloc(match kind {
+            SequenceKind::List => Object::List(Ref::all(values)),
+            SequenceKind::Tuple => Object::Tuple(Ref::all(values)),
         })?;
         self.push(value);
         Ok(())
@@ -73,7 +73,7 @@ impl<'s> Vm<'s> {
             .ok_or("dictionary is too large")?;
         let values = self.take(value_count)?;
         let mut values = values.into_iter();
-        let mut entries: Vec<(Value<'s>, Value<'s>)> = Vec::with_capacity(unpacked.len());
+        let mut entries: Vec<(Value, Value)> = Vec::with_capacity(unpacked.len());
         for unpacked in unpacked {
             let additions = if *unpacked {
                 let mapping = values.next().expect("dictionary stack contract");
@@ -95,7 +95,7 @@ impl<'s> Vm<'s> {
         }
         // A repeated key keeps its first position and takes the last value.
         let entries = self.ordered_map(entries)?;
-        let value = self.alloc_with(|builder| Object::Dict(entries.into_map(builder)))?;
+        let value = self.alloc(Object::Dict(entries.into_map()))?;
         self.push(value);
         Ok(())
     }
@@ -119,8 +119,8 @@ impl<'s> Vm<'s> {
             }
         }
         let value = match kind {
-            DisplayKind::List => self.alloc_with(|builder| Object::List(builder.refs(values)))?,
-            DisplayKind::Tuple => self.alloc_with(|builder| Object::Tuple(builder.refs(values)))?,
+            DisplayKind::List => self.alloc(Object::List(Ref::all(values)))?,
+            DisplayKind::Tuple => self.alloc(Object::Tuple(Ref::all(values)))?,
             DisplayKind::Set => return self.push_set(values),
         };
         self.push(value);
@@ -134,9 +134,9 @@ impl<'s> Vm<'s> {
 
     /// Push a set of the distinct `candidates`, metering each membership comparison as the `set`
     /// constructor does.
-    fn push_set(&mut self, candidates: Vec<Value<'s>>) -> Result<(), String> {
+    fn push_set(&mut self, candidates: Vec<Value>) -> Result<(), String> {
         let members = self.distinct_members(candidates)?;
-        let value = self.alloc_with(|builder| Object::Set(members.into_set(builder)))?;
+        let value = self.alloc(Object::Set(members.into_set()))?;
         self.push(value);
         Ok(())
     }
@@ -171,8 +171,8 @@ impl<'s> Vm<'s> {
     /// CPython does.
     pub(super) fn contains_value(
         &mut self,
-        container: &Value<'s>,
-        needle: &Value<'s>,
+        container: &Value,
+        needle: &Value,
     ) -> Result<bool, String> {
         if string::string_ref(self.heap(), *container)?.is_some() {
             let Some(needle_text) = string::string_ref(self.heap(), *needle)? else {
@@ -246,7 +246,7 @@ impl<'s> Vm<'s> {
         }
         let iterator = self.make_iterator(*container)?;
         let needle = *needle;
-        // The iterator may be unbounded, so each step's handles are released with its scope.
+        // The iterator may be unbounded, so each step's pins are released with its scope.
         loop {
             let mut vm = self.scope();
             vm.charge_cpu(1)?;
@@ -281,9 +281,7 @@ impl<'s> Vm<'s> {
         {
             Ok(Some(value)) => {
                 self.stack.truncate(result_slot + 1);
-                self.execution
-                    .stack
-                    .set(&self.state.heap, result_slot, value);
+                self.execution.stack.set(result_slot, value);
                 return Ok(());
             }
             Ok(None) => {}
@@ -301,9 +299,9 @@ impl<'s> Vm<'s> {
     pub(super) fn binary_value(
         &mut self,
         operator: BinaryOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
         if let Some(value) = number::exact_binary(self, operator, left, right)
             .map_err(|error| self.record_native_error(error))?
         {
@@ -339,9 +337,9 @@ impl<'s> Vm<'s> {
     fn builtin_inplace(
         &mut self,
         operator: BinaryOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+        left: Value,
+        right: Value,
+    ) -> Result<Option<Value>, String> {
         if !left.is_object() {
             return Ok(None);
         }
@@ -357,7 +355,7 @@ impl<'s> Vm<'s> {
         let replacement = match (self.get(left)?, operator) {
             // `list += iterable` extends with any iterable, unlike `list + list`.
             (Object::List(items), BinaryOperator::Add) => {
-                let mut items = self.handles(items);
+                let mut items = self.values(items);
                 for value in self.iterable_values(&right)? {
                     self.push_materialized(&mut items, value)?;
                 }
@@ -377,11 +375,11 @@ impl<'s> Vm<'s> {
                     return Err("in-place container operation produced a non-object".into());
                 }
                 match self.get(result)? {
-                    Object::List(items) => Replacement::List(self.handles(items)),
+                    Object::List(items) => Replacement::List(self.values(items)),
                     Object::Set(members) => Replacement::Set(HashedMembers(
                         members
                             .iter_hashed()
-                            .map(|(hash, member)| (hash, self.handle(member)))
+                            .map(|(hash, member)| (hash, self.value(member)))
                             .collect(),
                     )),
                     Object::ByteArray(bytes) => Replacement::ByteArray(bytes.clone()),
@@ -400,11 +398,7 @@ impl<'s> Vm<'s> {
 
     /// Install `replacement` as the payload of the list, set or bytearray `target`, keeping its
     /// identity, and charge or release the change in its modeled size.
-    fn replace_contents(
-        &mut self,
-        target: Value<'s>,
-        replacement: Replacement<'s>,
-    ) -> Result<(), String> {
+    fn replace_contents(&mut self, target: Value, replacement: Replacement) -> Result<(), String> {
         let (old_len, new_len, unit) = match (self.get(target)?, &replacement) {
             (Object::List(items), Replacement::List(values)) => {
                 (items.len(), values.len(), MODELED_VALUE_BYTES)
@@ -426,10 +420,10 @@ impl<'s> Vm<'s> {
         if new_len > old_len {
             self.reserve_object_growth(target, bytes(new_len - old_len)?)?;
         }
-        self.modify(target, |builder: &Builder<'_>, object| {
+        self.modify(target, |object| {
             *object = match replacement {
-                Replacement::List(values) => Object::List(builder.refs(values)),
-                Replacement::Set(members) => Object::Set(members.into_set(builder)),
+                Replacement::List(values) => Object::List(Ref::all(values)),
+                Replacement::Set(members) => Object::Set(members.into_set()),
                 Replacement::ByteArray(_) => unreachable!("bytearrays are replaced above"),
             };
         })?;
@@ -443,7 +437,7 @@ impl<'s> Vm<'s> {
     /// that returns `NotImplemented` declines, and the caller falls back to the binary operator.
     /// Whether `|=` on object `value` is `dict.update`: a dict or namespace view, or a dict
     /// subclass instance whose class does not define `__ior__`.
-    fn updates_dict_in_place(&mut self, value: Value<'s>) -> Result<bool, String> {
+    fn updates_dict_in_place(&mut self, value: Value) -> Result<bool, String> {
         if let Some(class) = self.instance_class(value)? {
             let holds_dict = matches!(self.get(value)?, Object::Dict(_));
             return Ok(holds_dict && self.class_attribute(class, "__ior__")?.is_none());
@@ -457,9 +451,9 @@ impl<'s> Vm<'s> {
     fn inplace_method(
         &mut self,
         operator: BinaryOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+        left: Value,
+        right: Value,
+    ) -> Result<Option<Value>, String> {
         let slot = match operator {
             BinaryOperator::Add => Slot::InplaceAdd,
             BinaryOperator::Subtract => Slot::InplaceSubtract,
@@ -486,9 +480,9 @@ impl<'s> Vm<'s> {
     fn binary_protocol(
         &mut self,
         operator: BinaryOperator,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+        left: Value,
+        right: Value,
+    ) -> Result<Value, String> {
         self.binary_protocol_for(operator, left, right, false)
     }
 
@@ -496,10 +490,10 @@ impl<'s> Vm<'s> {
     fn binary_protocol_for(
         &mut self,
         operator: BinaryOperator,
-        left: Value<'s>,
-        right: Value<'s>,
+        left: Value,
+        right: Value,
         inplace: bool,
-    ) -> Result<Value<'s>, String> {
+    ) -> Result<Value, String> {
         let (slot, name, reflected_slot, reflected_name) = match operator {
             BinaryOperator::Add => (Slot::Add, "__add__", Slot::ReflectedAdd, "__radd__"),
             BinaryOperator::Subtract => (
@@ -584,11 +578,7 @@ impl<'s> Vm<'s> {
     }
 
     /// `divmod(left, right)`: the binary protocol over `__divmod__` and `__rdivmod__`.
-    pub(super) fn divmod_value(
-        &mut self,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+    pub(super) fn divmod_value(&mut self, left: Value, right: Value) -> Result<Value, String> {
         self.binary_slot_protocol(
             left,
             right,
@@ -606,11 +596,11 @@ impl<'s> Vm<'s> {
     /// reflected method, and raise `TypeError` naming `symbol` when both decline.
     fn binary_slot_protocol(
         &mut self,
-        left: Value<'s>,
-        right: Value<'s>,
+        left: Value,
+        right: Value,
         (slot, name, reflected_slot, reflected_name): (Slot, &str, Slot, &str),
         symbol: &str,
-    ) -> Result<Value<'s>, String> {
+    ) -> Result<Value, String> {
         // As in CPython, a right operand whose type is a proper subclass of the left operand's
         // type gets its reflected method first, so `1.0 + np.float64(2)` stays a NumPy scalar.
         let left_type = self.type_id(&left)?;
@@ -650,8 +640,8 @@ impl<'s> Vm<'s> {
     /// repetition with an operand it cannot combine, such as `"a" + 1`.
     fn sequence_operator_message(
         &mut self,
-        left: &Value<'s>,
-        right: &Value<'s>,
+        left: &Value,
+        right: &Value,
         symbol: &str,
     ) -> Result<Option<String>, String> {
         let left_sequence = self.builtin_sequence(left)?;
@@ -689,7 +679,7 @@ impl<'s> Vm<'s> {
 
     /// The builtin sequence type (`str`, `bytes`, `bytearray`, `list` or `tuple`) that
     /// `value`'s type derives from, if any.
-    fn builtin_sequence(&self, value: &Value<'s>) -> Result<Option<BuiltinType>, String> {
+    fn builtin_sequence(&self, value: &Value) -> Result<Option<BuiltinType>, String> {
         let type_id = self.type_id(value)?;
         for sequence in [
             BuiltinType::String,
@@ -720,7 +710,7 @@ impl<'s> Vm<'s> {
 
     pub(super) fn render_formatted_value(
         &mut self,
-        value: &Value<'s>,
+        value: &Value,
         conversion: Option<char>,
         format_spec: &str,
     ) -> Result<String, String> {
@@ -751,7 +741,7 @@ impl<'s> Vm<'s> {
     /// accept only the empty spec, which gives `str(value)`.
     pub(super) fn format_object(
         &mut self,
-        value: &Value<'s>,
+        value: &Value,
         format_spec: &str,
     ) -> Result<String, String> {
         let spec = self.allocate_string(format_spec.to_string())?;
@@ -771,7 +761,7 @@ impl<'s> Vm<'s> {
     /// Registered scalar formats use their Python numeric value, including when the spec is empty.
     pub(super) fn format_registered_number(
         &mut self,
-        value: &Value<'s>,
+        value: &Value,
         format_spec: &str,
     ) -> Result<Option<String>, String> {
         let Some((_, number)) = super::number::registered_number(self.heap(), value) else {
@@ -814,7 +804,7 @@ impl<'s> Vm<'s> {
     /// anything else with the `TypeError` of `object.__format__`.
     pub(super) fn format_unconverted_value(
         &mut self,
-        value: &Value<'s>,
+        value: &Value,
         text: &str,
     ) -> Result<String, String> {
         let result = match super::number::view(self.heap(), value) {
@@ -844,20 +834,20 @@ impl<'s> Vm<'s> {
         result.map_err(|error| self.raise_format_error(error))
     }
 
-    pub(super) fn is_bigint(&self, value: &Value<'s>) -> Result<bool, String> {
+    pub(super) fn is_bigint(&self, value: &Value) -> Result<bool, String> {
         Ok(matches!(
             super::number::view(self.heap(), value),
             Some(super::number::NumberRef::BigInt(_))
         ))
     }
 
-    fn bigint_operand(&self, value: &Value<'s>) -> Result<BigInt, String> {
+    fn bigint_operand(&self, value: &Value) -> Result<BigInt, String> {
         super::number::view(self.heap(), value)
             .and_then(super::number::NumberRef::to_bigint)
             .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
-    pub(super) fn numeric_float(&self, value: &Value<'s>) -> Result<f64, String> {
+    pub(super) fn numeric_float(&self, value: &Value) -> Result<f64, String> {
         if value.is_object() {
             if let Object::BigInt(value) = self.get(*value)? {
                 return value
@@ -870,11 +860,7 @@ impl<'s> Vm<'s> {
             .ok_or_else(|| "unsupported arithmetic operands".into())
     }
 
-    pub(super) fn add_numbers(
-        &mut self,
-        left: Value<'s>,
-        right: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+    pub(super) fn add_numbers(&mut self, left: Value, right: Value) -> Result<Value, String> {
         self.binary_value(BinaryOperator::Add, left, right)
     }
 }

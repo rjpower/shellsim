@@ -19,11 +19,11 @@ const MAX_HASH_DEPTH: usize = 256;
 
 impl<'s> Vm<'s> {
     /// `hash(value)` with CPython's results for builtin values.
-    pub(super) fn hash_value(&mut self, value: &Value<'s>) -> Result<i64, String> {
+    pub(super) fn hash_value(&mut self, value: &Value) -> Result<i64, String> {
         self.hash_nested(value, 0)
     }
 
-    fn hash_nested(&mut self, value: &Value<'s>, depth: usize) -> Result<i64, String> {
+    fn hash_nested(&mut self, value: &Value, depth: usize) -> Result<i64, String> {
         if depth == MAX_HASH_DEPTH {
             return Err(self.raise_exception("RecursionError", "maximum recursion depth exceeded"));
         }
@@ -41,7 +41,7 @@ impl<'s> Vm<'s> {
 
     /// The hash of a builtin value or payload, ignoring any user class the object belongs to.
     /// This is what `tuple.__hash__(instance)` and the other builtin hash slots compute.
-    pub(super) fn payload_hash(&mut self, value: &Value<'s>, depth: usize) -> Result<i64, String> {
+    pub(super) fn payload_hash(&mut self, value: &Value, depth: usize) -> Result<i64, String> {
         if let Some(number) = number::view(self.heap(), value) {
             return Ok(number::number_hash(number));
         }
@@ -61,23 +61,23 @@ impl<'s> Vm<'s> {
             return Err(format!("hash() does not support {value:?}"));
         }
         let object = self.get(*value)?;
-        let (items, combine): (Vec<Value<'s>>, Combine) = match object {
+        let (items, combine): (Vec<Value>, Combine) = match object {
             Object::Bytes(bytes) => {
                 let bytes = bytes.clone();
                 self.charge_cpu(u64::try_from(bytes.len() / 32).unwrap_or(u64::MAX))?;
                 return Ok(hash::bytes(&bytes));
             }
-            Object::Tuple(items) => (self.handles(items), hash::tuple),
+            Object::Tuple(items) => (self.values(items), hash::tuple),
             Object::GenericAlias { origin, arguments } => (
-                self.handles(std::iter::once(origin).chain(arguments)),
+                self.values(std::iter::once(origin).chain(arguments)),
                 hash::tuple,
             ),
-            Object::FrozenSet(items) => (self.handles(items.iter()), hash::frozenset),
+            Object::FrozenSet(items) => (self.values(items.iter()), hash::frozenset),
             Object::Range { start, stop, step } => {
                 let (start, stop, step) = (*start, *stop, *step);
                 return range_hash(start, stop, step);
             }
-            Object::Slice { start, stop, step } => (self.handles([start, stop, step]), hash::slice),
+            Object::Slice { start, stop, step } => (self.values([start, stop, step]), hash::slice),
             Object::WideValue { payload, .. } => {
                 return Ok(hash::identity(payload[0] ^ payload[1].rotate_left(32)))
             }
@@ -104,12 +104,7 @@ impl<'s> Vm<'s> {
     /// `hash()` of an instance of a user class, resolved through the class's hash slot. A class
     /// that defines `__eq__` without `__hash__` carries `__hash__ = None` and is unhashable, as
     /// is a `@dataclass` with the default `eq=True`.
-    fn instance_hash(
-        &mut self,
-        value: &Value<'s>,
-        class: Value<'s>,
-        depth: usize,
-    ) -> Result<i64, String> {
+    fn instance_hash(&mut self, value: &Value, class: Value, depth: usize) -> Result<i64, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("instance has an invalid class".into());
         };
@@ -117,7 +112,7 @@ impl<'s> Vm<'s> {
         match self.state.types.slot(self.type_id(value)?, Slot::Hash)? {
             Some(SlotValue::Descriptor {
                 value: descriptor, ..
-            }) if self.handle(&descriptor).is_none() => {
+            }) if self.value(&descriptor).is_none() => {
                 return Err(self.unhashable(value));
             }
             Some(SlotValue::Descriptor { .. } | SlotValue::NativeUnary(_)) => {
@@ -138,7 +133,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The stable identity of a heap object, as identity hashing consumes it.
-    fn identity_bits(&self, value: &Value<'s>) -> Result<u64, String> {
+    fn identity_bits(&self, value: &Value) -> Result<u64, String> {
         self.identity(*value)?
             .map(u64::from)
             .ok_or_else(|| "identity hash of an immediate value".into())
@@ -146,7 +141,7 @@ impl<'s> Vm<'s> {
 
     /// Convert a `__hash__` result as CPython's `slot_tp_hash` does: machine-sized integers are
     /// kept, larger ones are reduced with the integer hash, and `-1` becomes `-2`.
-    fn hash_result(&mut self, result: &Value<'s>) -> Result<i64, String> {
+    fn hash_result(&mut self, result: &Value) -> Result<i64, String> {
         match number::index(self.heap(), result) {
             Some(NumberRef::Int(-1)) => Ok(-2),
             Some(NumberRef::Int(value)) => Ok(value),
@@ -157,7 +152,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn unhashable(&mut self, value: &Value<'s>) -> String {
+    fn unhashable(&mut self, value: &Value) -> String {
         let message = match self.type_name_of(value) {
             Ok(name) => format!("unhashable type: '{name}'"),
             Err(error) => return error,

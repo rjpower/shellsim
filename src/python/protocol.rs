@@ -19,7 +19,7 @@ use super::string::{bytes_ref, bytes_value, quote_bytes, quote_string, string_va
 use super::{ReplState, Value};
 
 /// The object behind `value`, or `None` for an immediate.
-fn object<'h>(heap: &'h Heap, value: Value<'_>) -> Result<Option<&'h Object>, String> {
+fn object(heap: &Heap, value: Value) -> Result<Option<&Object>, String> {
     if value.is_object() {
         heap.get(value).map(Some)
     } else {
@@ -33,7 +33,7 @@ fn alias_item_repr(
     active: &mut BTreeSet<u32>,
 ) -> Result<String, String> {
     let heap = &state.heap;
-    let value = heap.handle(value);
+    let value = heap.value(value);
     if let Some(super::vm::NativeValue::BuiltinType(builtin)) = value.native_value() {
         return Ok(builtin.name().into());
     }
@@ -46,7 +46,7 @@ fn alias_item_repr(
 /// `str()` without user `__str__` dispatch. Rendering takes the interpreter state rather than
 /// the heap alone because a user exception's message comes from its `args` instance attribute,
 /// which the shape and symbol tables resolve.
-pub fn display(state: &ReplState, value: Value<'_>) -> Result<String, String> {
+pub fn display(state: &ReplState, value: Value) -> Result<String, String> {
     display_inner(state, value, &mut BTreeSet::new())
 }
 
@@ -55,7 +55,7 @@ pub fn display(state: &ReplState, value: Value<'_>) -> Result<String, String> {
 /// recurse without bound; CPython raises `RecursionError` there too.
 fn display_inner(
     state: &ReplState,
-    value: Value<'_>,
+    value: Value,
     active: &mut BTreeSet<u32>,
 ) -> Result<String, String> {
     let heap = &state.heap;
@@ -93,14 +93,14 @@ pub fn address_value(identity: u32) -> u64 {
     0x7f00_0000_0000_u64 + u64::from(identity) * 16
 }
 
-pub fn repr(state: &ReplState, value: Value<'_>) -> Result<String, String> {
+pub fn repr(state: &ReplState, value: Value) -> Result<String, String> {
     render(state, value, &mut BTreeSet::new())
 }
 
 /// The class name and `str()` of an exception instance, builtin or user-defined.
 pub fn exception_parts(
     state: &ReplState,
-    value: Value<'_>,
+    value: Value,
 ) -> Result<Option<(String, String)>, String> {
     let Some(name) = exception_type_name(state, value)? else {
         return Ok(None);
@@ -123,7 +123,7 @@ pub fn exception_parts(
 fn exception_message(
     state: &ReplState,
     kind: &str,
-    args: &[Value<'_>],
+    args: &[Value],
     active: &mut BTreeSet<u32>,
 ) -> Result<String, String> {
     match args {
@@ -165,17 +165,13 @@ fn exception_message(
 const MAX_RENDER_DEPTH: usize = 256;
 
 /// `active` holds the identities of the objects on the current rendering path.
-fn render(
-    state: &ReplState,
-    value: Value<'_>,
-    active: &mut BTreeSet<u32>,
-) -> Result<String, String> {
+fn render(state: &ReplState, value: Value, active: &mut BTreeSet<u32>) -> Result<String, String> {
     crate::stack::grow(|| render_inner(state, value, active))
 }
 
 fn render_inner(
     state: &ReplState,
-    value: Value<'_>,
+    value: Value,
     active: &mut BTreeSet<u32>,
 ) -> Result<String, String> {
     let heap = &state.heap;
@@ -284,8 +280,8 @@ fn render_inner(
                 for (key, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
-                        render(state, heap.handle(key), active)?,
-                        render(state, heap.handle(value), active)?
+                        render(state, heap.value(key), active)?,
+                        render(state, heap.value(value), active)?
                     ));
                 }
                 format!("{{{}}}", rendered.join(", "))
@@ -310,7 +306,7 @@ fn render_inner(
             }
             Object::Function(function) => format!("<function {}>", function.name),
             Object::Class(class_object) => match class_object.attributes.get("__module__") {
-                Some(module) => match string_value(heap, heap.handle(module))? {
+                Some(module) => match string_value(heap, heap.value(module))? {
                     Some(module) if module != "builtins" => {
                         format!("<class '{module}.{}'>", class_object.name)
                     }
@@ -336,7 +332,7 @@ fn render_inner(
             Object::Generator { .. } => "<generator>".into(),
             Object::Module { name, .. } => format!("<module '{name}'>"),
             Object::NamespaceDict(NamespaceTarget::Scope(scope)) => {
-                let mut entries = scopes::values(heap, heap.handle(scope))?
+                let mut entries = scopes::values(heap, heap.value(scope))?
                     .into_iter()
                     .collect::<Vec<_>>();
                 entries.sort_by(|(left, _), (right, _)| left.cmp(right));
@@ -355,7 +351,7 @@ fn render_inner(
                 let entries =
                     state
                         .shapes
-                        .attribute_values(heap, &state.symbols, heap.handle(instance))?;
+                        .attribute_values(heap, &state.symbols, heap.value(instance))?;
                 for (name, value) in entries {
                     rendered.push(format!(
                         "{}: {}",
@@ -376,7 +372,7 @@ fn render_inner(
             Object::MappingProxy(_) => "mappingproxy(...)".to_string(),
             Object::WideValue { .. } => "<value>".into(),
             Object::Native(native) => {
-                native.repr(&mut |slot| render(state, heap.handle(slot), active))?
+                native.repr(&mut |slot| render(state, heap.value(slot), active))?
             }
             Object::Property { .. } => "<property>".into(),
             Object::StaticMethod { .. } => "<staticmethod>".into(),
@@ -401,11 +397,11 @@ fn render_values<'a>(
 ) -> Result<Vec<String>, String> {
     values
         .into_iter()
-        .map(|value| render(state, state.heap.handle(value), active))
+        .map(|value| render(state, state.heap.value(value), active))
         .collect()
 }
 
-pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
+pub fn truth(heap: &Heap, value: Value) -> Result<bool, String> {
     if value.is_none() {
         return Ok(false);
     }
@@ -469,7 +465,7 @@ pub fn truth(heap: &Heap, value: Value<'_>) -> Result<bool, String> {
     })
 }
 
-pub fn equals(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<bool, String> {
+pub fn equals(heap: &Heap, left: Value, right: Value) -> Result<bool, String> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
         return Ok(equal);
     }
@@ -478,8 +474,8 @@ pub fn equals(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<bool, St
 
 fn equals_inner(
     heap: &Heap,
-    left: Value<'_>,
-    right: Value<'_>,
+    left: Value,
+    right: Value,
     active: &mut BTreeSet<(u32, u32)>,
 ) -> Result<bool, String> {
     if let Some(equal) = scalar_equality(heap, left, right)? {
@@ -643,7 +639,7 @@ fn equals_inner(
     }
 }
 
-fn scalar_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Option<bool>, String> {
+fn scalar_equality(heap: &Heap, left: Value, right: Value) -> Result<Option<bool>, String> {
     use super::number;
     // Registered numbers such as NumPy scalars equal the Python number with the same value, so
     // `np.int64(1)` finds the key `1` in a dict or list.
@@ -721,7 +717,7 @@ fn scalar_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Opt
 /// Compare a builtin `complex` with any value. Real numbers compare equal only to a zero
 /// imaginary part and an exactly equal real part, as in CPython. Returns `None` when neither
 /// operand is complex.
-fn complex_equality(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Option<bool> {
+fn complex_equality(heap: &Heap, left: Value, right: Value) -> Option<bool> {
     use super::number::{view, NumberRef};
     let (left, right) = (view(heap, &left), view(heap, &right));
     let ((real, imag), other) = match (left, right) {
@@ -772,7 +768,7 @@ fn refs_equal(
     right: &Ref,
     active: &mut BTreeSet<(u32, u32)>,
 ) -> Result<bool, String> {
-    Ok(left == right || equals_inner(heap, heap.handle(left), heap.handle(right), active)?)
+    Ok(left == right || equals_inner(heap, heap.value(left), heap.value(right), active)?)
 }
 
 /// How two values order under Python's rich comparisons.
@@ -794,19 +790,14 @@ impl Comparison {
     }
 }
 
-pub fn compare(heap: &Heap, left: Value<'_>, right: Value<'_>) -> Result<Comparison, String> {
+pub fn compare(heap: &Heap, left: Value, right: Value) -> Result<Comparison, String> {
     compare_at(heap, left, right, 0)
 }
 
 /// Nesting bound for sequence ordering outside the VM, matching [`MAX_RENDER_DEPTH`].
 const MAX_COMPARE_DEPTH: usize = 256;
 
-fn compare_at(
-    heap: &Heap,
-    left: Value<'_>,
-    right: Value<'_>,
-    depth: usize,
-) -> Result<Comparison, String> {
+fn compare_at(heap: &Heap, left: Value, right: Value, depth: usize) -> Result<Comparison, String> {
     if let Some(left) = bigint_value(heap, left) {
         if let Some(right) = bigint_value(heap, right) {
             return Ok(Comparison::Ordered(left.cmp(right)));
@@ -889,8 +880,8 @@ fn sequence_compare(
     depth: usize,
 ) -> Result<Comparison, String> {
     for (left, right) in left.iter().zip(right) {
-        let (left, right) = (heap.handle(left), heap.handle(right));
-        if heap.identical(left, right) || equals(heap, left, right)? {
+        let (left, right) = (heap.value(left), heap.value(right));
+        if left.is(right) || equals(heap, left, right)? {
             continue;
         }
         return compare_at(heap, left, right, depth);
@@ -898,7 +889,7 @@ fn sequence_compare(
     Ok(Comparison::Ordered(left.len().cmp(&right.len())))
 }
 
-pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<bool, String> {
+pub fn contains(heap: &Heap, container: Value, needle: Value) -> Result<bool, String> {
     if let Some(container) = string_value(heap, container)? {
         let Some(needle) = string_value(heap, needle)? else {
             return Err("string containment requires a string operand".into());
@@ -923,9 +914,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::List(values) | Object::Tuple(values) => {
                 for value in values {
-                    if heap.identical_ref(needle, value)
-                        || equals(heap, heap.handle(value), needle)?
-                    {
+                    if needle.is_ref(value) || equals(heap, heap.value(value), needle)? {
                         return Ok(true);
                     }
                 }
@@ -933,9 +922,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Set(values) | Object::FrozenSet(values) => {
                 for value in values {
-                    if heap.identical_ref(needle, value)
-                        || equals(heap, heap.handle(value), needle)?
-                    {
+                    if needle.is_ref(value) || equals(heap, heap.value(value), needle)? {
                         return Ok(true);
                     }
                 }
@@ -950,7 +937,7 @@ pub fn contains(heap: &Heap, container: Value<'_>, needle: Value<'_>) -> Result<
             }
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 for (key, _) in entries {
-                    if heap.identical_ref(needle, key) || equals(heap, heap.handle(key), needle)? {
+                    if needle.is_ref(key) || equals(heap, heap.value(key), needle)? {
                         return Ok(true);
                     }
                 }
@@ -995,18 +982,15 @@ mod tests {
         let mut heap = Heap::default();
         let mut resources = Resources::new(Limits::unlimited());
         let mut dict = |entries: [(&str, i64); 2]| {
-            heap.alloc_with(&mut (), &mut resources, |builder| {
-                let mut map = super::super::heap::OrderedMap::default();
-                for (key, value) in entries {
-                    let entry = (
-                        builder.store(Value::inline_string(key).unwrap()),
-                        builder.store(Value::Int(value)),
-                    );
-                    map.push(super::super::hash::string(key), entry);
-                }
-                Object::Dict(map)
-            })
-            .unwrap()
+            let mut map = super::super::heap::OrderedMap::default();
+            for (key, value) in entries {
+                let entry = (
+                    Ref::from(Value::inline_string(key).unwrap()),
+                    Ref::from(Value::Int(value)),
+                );
+                map.push(super::super::hash::string(key), entry);
+            }
+            heap.alloc(Object::Dict(map), &(), &mut resources).unwrap()
         };
         let first = dict([("a", 1), ("b", 2)]);
         let second = dict([("b", 2), ("a", 1)]);
@@ -1021,17 +1005,13 @@ mod tests {
         let mut resources = Resources::new(Limits::unlimited());
         let nan = Value::Float(f64::NAN);
         let first = heap
-            .alloc_with(&mut (), &mut resources, |builder| {
-                Object::List(vec![builder.store(nan)])
-            })
+            .alloc(Object::List(vec![Ref::from(nan)]), &(), &mut resources)
             .unwrap();
         let second = heap
-            .alloc_with(&mut (), &mut resources, |builder| {
-                Object::List(vec![builder.store(nan)])
-            })
+            .alloc(Object::List(vec![Ref::from(nan)]), &(), &mut resources)
             .unwrap();
 
-        assert!(heap.identical(nan, nan));
+        assert!(nan.is(nan));
         assert!(!equals(&heap, nan, nan).unwrap());
         assert!(contains(&heap, first, nan).unwrap());
         assert!(equals(&heap, first, second).unwrap());

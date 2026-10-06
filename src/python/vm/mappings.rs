@@ -13,8 +13,8 @@ impl<'s> Vm<'s> {
     /// subclass that keeps `dict.__iter__`.
     pub(super) fn mapping_items(
         &mut self,
-        value: Value<'s>,
-    ) -> Result<Option<Vec<(Value<'s>, Value<'s>)>>, String> {
+        value: Value,
+    ) -> Result<Option<Vec<(Value, Value)>>, String> {
         let stored = value;
         if stored.is_object() {
             let length = match self.get(stored)? {
@@ -22,9 +22,7 @@ impl<'s> Vm<'s> {
                 _ => None,
             };
             if let Some(length) = length {
-                self.reserve_result(
-                    length.saturating_mul(std::mem::size_of::<(Value<'s>, Value<'s>)>()),
-                )?;
+                self.reserve_result(length.saturating_mul(std::mem::size_of::<(Value, Value)>()))?;
                 let (Object::Dict(entries) | Object::DefaultDict { entries, .. }) =
                     self.get(stored)?
                 else {
@@ -33,7 +31,7 @@ impl<'s> Vm<'s> {
                 return Ok(Some(
                     entries
                         .iter()
-                        .map(|(key, value)| (self.handle(key), self.handle(value)))
+                        .map(|(key, value)| (self.value(key), self.value(value)))
                         .collect(),
                 ));
             }

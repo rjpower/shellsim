@@ -1,6 +1,6 @@
 //! Native-module runtime bridge backed by the metered Python VM.
 
-use super::super::heap::{self, Builder, FunctionObject, OrderedMap};
+use super::super::heap::{self, FunctionObject, OrderedMap, Ref};
 use super::super::stdlib::argparse::{
     ArgumentParserObject, ArgumentSpec, NamespaceObject, SubcommandSpec, SubparsersSpec,
 };
@@ -22,8 +22,7 @@ use super::{
 };
 use crate::python::bytecode::ParameterKind;
 use crate::python::heap::DictViewKind;
-use crate::python::native::{PyParameter, PyRefs, PyScope};
-use std::marker::PhantomData;
+use crate::python::native::{PyParameter, PyRefs};
 
 /// Check that every element `view` addresses lies inside storage of `byte_len` bytes and suits
 /// its element kind (`values` storage holds object references).
@@ -116,7 +115,7 @@ fn stdin_wait_reason(wait: crate::descriptors::IoWait) -> crate::scheduler::Wait
 
 impl<'s> Vm<'s> {
     /// Charge for moving `count` list slots, as inserting or removing before the end does.
-    fn charge_shift(&mut self, count: usize) -> PyResult<'s, ()> {
+    fn charge_shift(&mut self, count: usize) -> PyResult<()> {
         let bytes = (count as u64).saturating_mul(MODELED_VALUE_BYTES);
         super::super::heap::charge_construction(bytes, &mut self.interp.resources)
             .map_err(PyError::resource_error)
@@ -128,12 +127,12 @@ impl<'s> Vm<'s> {
     /// `element_bytes` is the modeled size of one element.
     fn replace_container_payload(
         &mut self,
-        container: Value<'s>,
+        container: Value,
         old_len: usize,
         new_len: usize,
         element_bytes: u64,
-        install: impl FnOnce(&Builder<'_>, &mut Object),
-    ) -> PyResult<'s, ()> {
+        install: impl FnOnce(&mut Object),
+    ) -> PyResult<()> {
         let overflow = || PyError::resource_error("modeled object size overflow");
         let size = |length: usize| {
             u64::try_from(length)
@@ -178,7 +177,7 @@ impl<'s> Vm<'s> {
     /// The registered kind of an inline or wide registered value.
     pub(super) fn registered_kind(
         &self,
-        value: &Value<'_>,
+        value: &Value,
     ) -> Option<&'static super::super::native::ValueKindDef> {
         if let Some((index, _)) = value.registered_parts() {
             return self.state.types.value_kind(index);
@@ -193,7 +192,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The heap view object behind a checked array handle.
-    fn array_object(&self, array: PyArray<'s>) -> PyResult<'s, &ArrayObject> {
+    fn array_object(&self, array: PyArray) -> PyResult<&ArrayObject> {
         self.state
             .heap
             .get(array.value())
@@ -203,7 +202,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The element storage behind an array, borrowed for reading.
-    fn array_storage_object(&self, storage: Value<'s>) -> PyResult<'s, &ArrayStorage> {
+    fn array_storage_object(&self, storage: Value) -> PyResult<&ArrayStorage> {
         self.get(storage)
             .map_err(PyError::runtime_error)?
             .native::<ArrayStorage>()
@@ -221,7 +220,7 @@ impl<'s> Vm<'s> {
         size: Option<usize>,
         line: bool,
         binary: bool,
-    ) -> PyResult<'s, PyStreamRead> {
+    ) -> PyResult<PyStreamRead> {
         if binary {
             let start = self.stdin_position.min(self.stdin.len());
             let available = &self.stdin[start..];
@@ -300,7 +299,7 @@ impl<'s> Vm<'s> {
         size: Option<usize>,
         line: bool,
         binary: bool,
-    ) -> PyResult<'s, PyStreamRead> {
+    ) -> PyResult<PyStreamRead> {
         loop {
             if let Some(read) = self.take_pending_stdin(size, line, binary)? {
                 return Ok(read);
@@ -347,7 +346,7 @@ impl<'s> Vm<'s> {
         size: Option<usize>,
         line: bool,
         binary: bool,
-    ) -> PyResult<'s, Option<PyStreamRead>> {
+    ) -> PyResult<Option<PyStreamRead>> {
         if binary {
             let cap = size.unwrap_or(usize::MAX);
             let length = if line {
@@ -396,7 +395,7 @@ impl<'s> Vm<'s> {
         &mut self,
         size: Option<usize>,
         line: bool,
-    ) -> PyResult<'s, Option<PyStreamRead>> {
+    ) -> PyResult<Option<PyStreamRead>> {
         let valid_len = match std::str::from_utf8(&self.stdin_stream_pending) {
             Ok(text) => text.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
@@ -464,7 +463,7 @@ impl<'s> Vm<'s> {
 impl<'s> Vm<'s> {
     /// The namespace a dict handle views, when it is a namespace view rather than a stored
     /// dict.
-    fn namespace_view(&self, dict: Value<'s>) -> PyResult<'s, Option<NamespaceHandle<'s>>> {
+    fn namespace_view(&self, dict: Value) -> PyResult<Option<NamespaceHandle>> {
         match self.get(dict).map_err(PyError::runtime_error)? {
             Object::NamespaceDict(target) => Ok(Some(self.namespace_handle(target))),
             _ => Ok(None),
@@ -474,7 +473,7 @@ impl<'s> Vm<'s> {
     /// The name to bind for a key stored in a namespace view. CPython's namespaces are dicts
     /// and accept any hashable key; shellsim's live on name-keyed storage, so other keys are
     /// rejected.
-    fn namespace_key(&self, key: &Value<'s>) -> PyResult<'s, String> {
+    fn namespace_key(&self, key: &Value) -> PyResult<String> {
         match self.string_value(key)? {
             Some(name) => Ok(name),
             None => Err(PyError::type_error(format!(
@@ -486,34 +485,34 @@ impl<'s> Vm<'s> {
 }
 
 /// The stored form of a subcommand registered on a parser's subparsers.
-fn stored_subcommand(builder: &Builder<'_>, command: PySubcommandSpec<'_>) -> SubcommandSpec {
+fn stored_subcommand(command: PySubcommandSpec) -> SubcommandSpec {
     SubcommandSpec {
         name: command.name,
         help: command.help,
-        parser: builder.store(command.parser.value()),
+        parser: Ref::from(command.parser.value()),
     }
 }
 
 /// The state one step of a lazy iterator needs, copied out of its heap object.
-enum LazyStep<'s> {
+enum LazyStep {
     Count {
         current: i64,
         step: i64,
     },
     Callable {
-        callable: Value<'s>,
-        sentinel: Value<'s>,
+        callable: Value,
+        sentinel: Value,
         exhausted: bool,
     },
 }
 
-impl<'s> PyRefs<'s> for Vm<'s> {
-    fn handle(&self, r: &heap::Ref) -> Value<'s> {
-        Vm::handle(self, r)
+impl PyRefs for Vm<'_> {
+    fn value(&self, r: &heap::Ref) -> Value {
+        Vm::value(self, r)
     }
 }
 
-impl<'s> PyRuntime<'s> for Vm<'s> {
+impl PyRuntime for Vm<'_> {
     fn set_test_timeout(&mut self, nanoseconds: Option<u64>) {
         self.execution.test_timeout =
             nanoseconds
@@ -525,32 +524,32 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 });
     }
 
-    fn reserve_memory(&mut self, bytes: usize) -> PyResult<'s, ()> {
+    fn reserve_memory(&mut self, bytes: usize) -> PyResult<()> {
         self.reserve_result(bytes).map_err(PyError::resource_error)
     }
 
-    fn charge_cpu(&mut self, units: u64) -> PyResult<'s, ()> {
+    fn charge_cpu(&mut self, units: u64) -> PyResult<()> {
         Vm::charge_cpu(self, units).map_err(PyError::resource_error)
     }
 
-    fn class_of(&self, value: &Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn class_of(&self, value: &Value) -> PyResult<Value> {
         self.type_of(value).map_err(PyError::runtime_error)
     }
 
-    fn dictionary_of(&mut self, value: Value<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn dictionary_of(&mut self, value: Value) -> PyResult<Option<Value>> {
         Vm::dictionary_of(self, value).map_err(PyError::resource_error)
     }
 
     fn type_metadata(
         &mut self,
-        value: Value<'s>,
+        value: Value,
         field: super::super::native::TypeMetadata,
-    ) -> PyResult<'s, Option<Value<'s>>> {
+    ) -> PyResult<Option<Value>> {
         Vm::type_metadata(self, value, field)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn kind(&self, value: &Value<'s>) -> PyResult<'s, PyKind> {
+    fn kind(&self, value: &Value) -> PyResult<PyKind> {
         if value.inline_string_len().is_some() {
             return Ok(PyKind::String);
         }
@@ -618,28 +617,28 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn string_value(&self, value: &Value<'s>) -> PyResult<'s, Option<String>> {
+    fn string_value(&self, value: &Value) -> PyResult<Option<String>> {
         string::string_value(&self.state.heap, *value).map_err(PyError::runtime_error)
     }
 
-    fn bytes_value(&self, value: &Value<'s>) -> PyResult<'s, Option<Vec<u8>>> {
+    fn bytes_value(&self, value: &Value) -> PyResult<Option<Vec<u8>>> {
         string::bytes_value(&self.state.heap, *value).map_err(PyError::runtime_error)
     }
 
-    fn new_string(&mut self, value: String) -> PyResult<'s, Value<'s>> {
+    fn new_string(&mut self, value: String) -> PyResult<Value> {
         self.allocate_string(value).map_err(PyError::resource_error)
     }
 
-    fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<'s, Value<'s>> {
+    fn new_bytes(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_bytes(value).map_err(PyError::resource_error)
     }
 
-    fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<'s, Value<'s>> {
+    fn new_bytearray(&mut self, value: Vec<u8>) -> PyResult<Value> {
         self.allocate_bytearray(value)
             .map_err(PyError::resource_error)
     }
 
-    fn native_kind(&self, value: &Value<'s>) -> PyResult<'s, Option<PyNativeKind>> {
+    fn native_kind(&self, value: &Value) -> PyResult<Option<PyNativeKind>> {
         if !value.is_object() {
             return Ok(None);
         }
@@ -659,74 +658,67 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn identity(&self, value: &Value<'s>) -> Option<PyIdentity> {
+    fn identity(&self, value: &Value) -> Option<PyIdentity> {
         Vm::identity(self, *value).ok().flatten().map(PyIdentity)
     }
 
-    fn identical(&self, left: &Value<'s>, right: &Value<'s>) -> bool {
+    fn identical(&self, left: &Value, right: &Value) -> bool {
         Vm::identical(self, *left, *right)
     }
 
-    fn nested(
-        &mut self,
-        f: &mut dyn for<'c> FnMut(&mut dyn PyRuntime<'c>, PyScope<'c, 's>) -> PyResult<'c, ()>,
-    ) -> PyResult<'s, ()> {
+    fn nested(&mut self, f: &mut dyn FnMut(&mut dyn PyRuntime) -> PyResult<()>) -> PyResult<()> {
         let mut child = self.scope();
-        f(&mut child, PhantomData)
+        f(&mut child)
     }
 
-    fn int_value(&self, value: &Value<'s>) -> Option<i64> {
+    fn int_value(&self, value: &Value) -> Option<i64> {
         number::int_value(&self.state.heap, *value)
     }
 
-    fn is_integer_type(&self, value: &Value<'s>) -> bool {
+    fn is_integer_type(&self, value: &Value) -> bool {
         matches!(
             value.native_value(),
             Some(NativeValue::BuiltinType(BuiltinType::Int))
         )
     }
 
-    fn is_string_type(&self, value: &Value<'s>) -> bool {
+    fn is_string_type(&self, value: &Value) -> bool {
         matches!(
             value.native_value(),
             Some(NativeValue::BuiltinType(BuiltinType::String))
         )
     }
 
-    fn type_name(&self, value: &Value<'s>) -> PyResult<'s, String> {
+    fn type_name(&self, value: &Value) -> PyResult<String> {
         self.type_name_of(value).map_err(PyError::runtime_error)
     }
 
-    fn is_ellipsis(&self, value: &Value<'s>) -> bool {
+    fn is_ellipsis(&self, value: &Value) -> bool {
         value.native_value() == Some(NativeValue::Ellipsis)
     }
 
-    fn not_implemented(&self) -> Value<'s> {
+    fn not_implemented(&self) -> Value {
         Value::Native(NativeValue::NotImplemented)
     }
 
-    fn is_not_implemented(&self, value: &Value<'s>) -> bool {
+    fn is_not_implemented(&self, value: &Value) -> bool {
         value.native_value() == Some(NativeValue::NotImplemented)
     }
 
-    fn number(&self, value: &Value<'s>) -> Option<super::number::NumberRef<'_>> {
+    fn number(&self, value: &Value) -> Option<super::number::NumberRef<'_>> {
         super::number::view(&self.state.heap, value)
     }
 
-    fn physical_compare(
-        &self,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> PyResult<'s, protocol::Comparison> {
+    fn physical_compare(&self, left: &Value, right: &Value) -> PyResult<protocol::Comparison> {
         protocol::compare(&self.state.heap, *left, *right).map_err(PyError::runtime_error)
     }
 
-    fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<'s, Value<'s>> {
+    fn new_complex(&mut self, real: f64, imag: f64) -> PyResult<Value> {
         self.allocate_object(Object::Complex { real, imag })
             .map_err(PyError::resource_error)
     }
 
-    fn integer_bigint(&self, value: &Value<'s>) -> PyResult<'s, Option<BigInt>> {
+    fn integer_bigint(&self, value: &Value) -> PyResult<Option<BigInt>> {
         Ok(match super::number::view(&self.state.heap, value) {
             Some(super::number::NumberRef::Int(value)) => Some(value.into()),
             Some(super::number::NumberRef::BigInt(value)) => Some(value.clone()),
@@ -736,7 +728,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn write_stream(&mut self, stream: &Value<'s>, text: &str) -> PyResult<'s, usize> {
+    fn write_stream(&mut self, stream: &Value, text: &str) -> PyResult<usize> {
         let Some(NativeValue::Stream(stream)) = stream.native_value() else {
             return Err(PyError::type_error("expected a simulated stream"));
         };
@@ -749,10 +741,10 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn read_stream(
         &mut self,
-        stream: &Value<'s>,
+        stream: &Value,
         size: Option<usize>,
         line: bool,
-    ) -> PyResult<'s, PyStreamRead> {
+    ) -> PyResult<PyStreamRead> {
         let binary = match stream.native_value() {
             Some(NativeValue::Stream(Stream::Stdin)) => false,
             Some(NativeValue::Stream(Stream::StdinBuffer)) => true,
@@ -765,39 +757,39 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn truth(&mut self, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn truth(&mut self, value: &Value) -> PyResult<bool> {
         self.truth_value(value).map_err(PyError::runtime_error)
     }
 
-    fn display(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
+    fn display(&mut self, value: &Value) -> PyResult<String> {
         self.display_value(value)
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
-    fn repr(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
+    fn repr(&mut self, value: &Value) -> PyResult<String> {
         self.repr_value(value)
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
-    fn payload_repr(&mut self, value: &Value<'s>) -> PyResult<'s, String> {
+    fn payload_repr(&mut self, value: &Value) -> PyResult<String> {
         self.repr_payload(value, &mut std::collections::BTreeSet::new())
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
-    fn default_object_repr(&self, value: &Value<'s>) -> PyResult<'s, String> {
+    fn default_object_repr(&self, value: &Value) -> PyResult<String> {
         Vm::default_object_repr(self, value).map_err(PyError::runtime_error)
     }
 
-    fn physical_length(&self, value: Value<'s>) -> PyResult<'s, Option<usize>> {
+    fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
         Vm::physical_length(self, value).map_err(PyError::runtime_error)
     }
 
     fn format_value(
         &mut self,
-        value: &Value<'s>,
+        value: &Value,
         conversion: Option<char>,
         specification: &str,
-    ) -> PyResult<'s, String> {
+    ) -> PyResult<String> {
         self.render_formatted_value(value, conversion, specification)
             .map_err(|message| {
                 if self.pending_exception.is_some() {
@@ -808,7 +800,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             })
     }
 
-    fn builtin_format(&mut self, value: &Value<'s>, specification: &str) -> PyResult<'s, String> {
+    fn builtin_format(&mut self, value: &Value, specification: &str) -> PyResult<String> {
         if let Some(rendered) = self
             .format_registered_number(value, specification)
             .map_err(|message| self.raised_or_runtime_error(message))?
@@ -823,40 +815,40 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         result.map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn reverse_value(&mut self, value: Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn reverse_value(&mut self, value: Value) -> PyResult<Value> {
         Vm::reverse_value(self, value).map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn reverse_builtin_sequence(&mut self, value: Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn reverse_builtin_sequence(&mut self, value: Value) -> PyResult<Value> {
         Vm::reverse_builtin_sequence(self, value)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn new_generic_alias(&mut self, origin: Value<'s>, item: Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn new_generic_alias(&mut self, origin: Value, item: Value) -> PyResult<Value> {
         Vm::new_generic_alias(self, origin, item)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn equals(&mut self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, bool> {
+    fn equals(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
         self.values_equal(left, right)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn physical_equals(&self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, bool> {
+    fn physical_equals(&self, left: &Value, right: &Value) -> PyResult<bool> {
         protocol::equals(&self.state.heap, *left, *right).map_err(PyError::runtime_error)
     }
 
     fn container_compare(
         &mut self,
         operator: super::super::ast::ComparisonOperator,
-        left: &Value<'s>,
-        right: &Value<'s>,
-    ) -> PyResult<'s, Option<bool>> {
+        left: &Value,
+        right: &Value,
+    ) -> PyResult<Option<bool>> {
         Vm::container_compare(self, operator, *left, *right)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn compare(&mut self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, Ordering> {
+    fn compare(&mut self, left: &Value, right: &Value) -> PyResult<Ordering> {
         self.sort_order(left, right).map_err(|message| {
             if self.pending_exception.is_some() {
                 PyError::new(PyErrorKind::Raised, message)
@@ -866,7 +858,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn less_than(&mut self, left: &Value<'s>, right: &Value<'s>) -> PyResult<'s, bool> {
+    fn less_than(&mut self, left: &Value, right: &Value) -> PyResult<bool> {
         self.compare_truth(super::super::ast::ComparisonOperator::Less, left, right)
             .map_err(|message| {
                 if self.pending_exception.is_some() {
@@ -877,7 +869,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             })
     }
 
-    fn get_attribute(&mut self, value: Value<'s>, name: &str) -> PyResult<'s, Option<Value<'s>>> {
+    fn get_attribute(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
         self.resolve_optional_attribute(value, name)
             .map_err(|message| {
                 if self.pending_exception.is_some() {
@@ -888,58 +880,46 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             })
     }
 
-    fn get_attribute_default(
-        &mut self,
-        value: Value<'s>,
-        name: &str,
-    ) -> PyResult<'s, Option<Value<'s>>> {
+    fn get_attribute_default(&mut self, value: Value, name: &str) -> PyResult<Option<Value>> {
         let symbol = self.symbol_id(name);
         self.lookup_attribute_default(value, symbol, name)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn set_attribute(&mut self, value: Value<'s>, name: &str, item: Value<'s>) -> PyResult<'s, ()> {
+    fn set_attribute(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {
         let symbol = self.intern_symbol(name).map_err(PyError::runtime_error)?;
         self.store_attribute_by_symbol(value, symbol, name, item)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn set_attribute_default(
-        &mut self,
-        value: Value<'s>,
-        name: &str,
-        item: Value<'s>,
-    ) -> PyResult<'s, ()> {
+    fn set_attribute_default(&mut self, value: Value, name: &str, item: Value) -> PyResult<()> {
         let symbol = self.intern_symbol(name).map_err(PyError::runtime_error)?;
         self.store_attribute_default(value, symbol, name, item)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn exception_with_args(&mut self, kind: &'static str, args: Vec<Value<'s>>) -> PyError {
+    fn exception_with_args(&mut self, kind: &'static str, args: Vec<Value>) -> PyError {
         PyError::new(PyErrorKind::Raised, self.raise_exception_args(kind, args))
     }
 
-    fn generator_stop(&mut self, generator: PyIterator<'s>) -> PyError {
+    fn generator_stop(&mut self, generator: PyIterator) -> PyError {
         let generator = generator.value();
         PyError::new(PyErrorKind::Raised, self.raise_stop_iteration(&generator))
     }
 
-    fn exception_args(
-        &mut self,
-        value: &Value<'s>,
-    ) -> PyResult<'s, Option<(String, Vec<Value<'s>>)>> {
+    fn exception_args(&mut self, value: &Value) -> PyResult<Option<(String, Vec<Value>)>> {
         Ok(exception_types::exception_args(self.state, *value)
             .map_err(PyError::runtime_error)?
             .map(|(base, args)| (base.to_string(), args)))
     }
 
-    fn delete_attribute_default(&mut self, value: Value<'s>, name: &str) -> PyResult<'s, ()> {
+    fn delete_attribute_default(&mut self, value: Value, name: &str) -> PyResult<()> {
         let symbol = self.intern_symbol(name).map_err(PyError::runtime_error)?;
         Vm::delete_attribute_default(self, value, symbol, name)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn list_len(&self, list: PyList<'s>) -> PyResult<'s, usize> {
+    fn list_len(&self, list: PyList) -> PyResult<usize> {
         match self
             .state
             .heap
@@ -951,60 +931,55 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn list_items(&mut self, list: PyList<'s>) -> PyResult<'s, Vec<Value<'s>>> {
+    fn list_items(&mut self, list: PyList) -> PyResult<Vec<Value>> {
         let list = list.value();
         let length = match self.get(list).map_err(PyError::runtime_error)? {
             Object::List(items) => items.len(),
             _ => return Err(PyError::runtime_error("list handle changed object kind")),
         };
         let bytes = length
-            .checked_mul(std::mem::size_of::<Value<'s>>())
+            .checked_mul(std::mem::size_of::<Value>())
             .ok_or_else(|| PyError::resource_error("list snapshot size overflow"))?;
         self.reserve_memory(bytes)?;
         match self.get(list).map_err(PyError::runtime_error)? {
-            Object::List(items) => Ok(self.handles(items)),
+            Object::List(items) => Ok(self.values(items)),
             _ => Err(PyError::runtime_error("list handle changed object kind")),
         }
     }
 
-    fn list_append(&mut self, list: PyList<'s>, value: Value<'s>) -> PyResult<'s, ()> {
+    fn list_append(&mut self, list: PyList, value: Value) -> PyResult<()> {
         let list = list.value();
         if !matches!(self.get(list), Ok(Object::List(_))) {
             return Err(PyError::runtime_error("list handle changed object kind"));
         }
         self.reserve_object_growth(list, MODELED_VALUE_BYTES)
             .map_err(PyError::resource_error)?;
-        self.modify(list, |builder, object| {
+        self.modify(list, |object| {
             let Object::List(items) = object else {
                 unreachable!("list kind was checked before reserving growth")
             };
-            items.push(builder.store(value));
+            items.push(Ref::from(value));
         })
         .map_err(PyError::runtime_error)
     }
 
-    fn list_insert(
-        &mut self,
-        list: PyList<'s>,
-        index: usize,
-        value: Value<'s>,
-    ) -> PyResult<'s, ()> {
+    fn list_insert(&mut self, list: PyList, index: usize, value: Value) -> PyResult<()> {
         let length = self.list_len(list)?;
         let list = list.value();
         let index = index.min(length);
         self.charge_shift(length - index)?;
         self.reserve_object_growth(list, MODELED_VALUE_BYTES)
             .map_err(PyError::resource_error)?;
-        self.modify(list, |builder, object| {
+        self.modify(list, |object| {
             let Object::List(items) = object else {
                 unreachable!("list kind was checked before reserving growth")
             };
-            items.insert(index, builder.store(value));
+            items.insert(index, Ref::from(value));
         })
         .map_err(PyError::runtime_error)
     }
 
-    fn list_extend(&mut self, list: PyList<'s>, values: Vec<Value<'s>>) -> PyResult<'s, ()> {
+    fn list_extend(&mut self, list: PyList, values: Vec<Value>) -> PyResult<()> {
         self.list_len(list)?;
         let list = list.value();
         let count = u64::try_from(values.len())
@@ -1014,27 +989,27 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .ok_or_else(|| PyError::resource_error("list growth overflow"))?;
         self.reserve_object_growth(list, bytes)
             .map_err(PyError::resource_error)?;
-        self.modify(list, |builder, object| {
+        self.modify(list, |object| {
             let Object::List(items) = object else {
                 unreachable!("list kind was checked before reserving growth")
             };
-            items.extend(values.into_iter().map(|value| builder.store(value)));
+            items.extend(values.into_iter().map(Ref::from));
         })
         .map_err(PyError::runtime_error)
     }
 
-    fn list_pop(&mut self, list: PyList<'s>, index: usize) -> PyResult<'s, Value<'s>> {
+    fn list_pop(&mut self, list: PyList, index: usize) -> PyResult<Value> {
         let length = self.list_len(list)?;
         let list = list.value();
         self.charge_shift(length.saturating_sub(index))?;
         let value = match self.get(list).map_err(PyError::runtime_error)? {
-            Object::List(items) if index < items.len() => self.handle(&items[index]),
+            Object::List(items) if index < items.len() => self.value(&items[index]),
             Object::List(_) => {
                 return Err(PyError::exception("IndexError", "pop index out of range"))
             }
             _ => return Err(PyError::runtime_error("list handle changed object kind")),
         };
-        self.modify(list, |_, object| {
+        self.modify(list, |object| {
             let Object::List(items) = object else {
                 unreachable!("list kind was checked before removal")
             };
@@ -1048,16 +1023,16 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn list_position(
         &mut self,
-        list: PyList<'s>,
-        needle: &Value<'s>,
+        list: PyList,
+        needle: &Value,
         start: usize,
         stop: usize,
-    ) -> PyResult<'s, Option<usize>> {
+    ) -> PyResult<Option<usize>> {
         let length = self.list_len(list)?;
         let list = list.value();
         for position in start.min(length)..stop.min(length) {
             let candidate = match self.get(list).map_err(PyError::runtime_error)? {
-                Object::List(items) => self.handle(&items[position]),
+                Object::List(items) => self.value(&items[position]),
                 _ => return Err(PyError::runtime_error("list handle changed object kind")),
             };
             self.charge_cpu(1).map_err(PyError::resource_error)?;
@@ -1071,7 +1046,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(None)
     }
 
-    fn list_reverse(&mut self, list: PyList<'s>) -> PyResult<'s, ()> {
+    fn list_reverse(&mut self, list: PyList) -> PyResult<()> {
         let length = self.list_len(list)?;
         self.charge_cpu(u64::try_from(length).unwrap_or(u64::MAX))
             .map_err(PyError::resource_error)?;
@@ -1083,7 +1058,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(())
     }
 
-    fn list_clear(&mut self, list: PyList<'s>) -> PyResult<'s, ()> {
+    fn list_clear(&mut self, list: PyList) -> PyResult<()> {
         let length = self.list_len(list)?;
         let list = list.value();
         let Object::List(items) = self.get_mut(list).map_err(PyError::runtime_error)? else {
@@ -1097,7 +1072,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .map_err(PyError::runtime_error)
     }
 
-    fn bytearray_items(&mut self, value: PyByteArray<'s>) -> PyResult<'s, Vec<u8>> {
+    fn bytearray_items(&mut self, value: PyByteArray) -> PyResult<Vec<u8>> {
         let value = value.value();
         let length = match self.get(value).map_err(PyError::runtime_error)? {
             Object::ByteArray(items) => items.len(),
@@ -1116,11 +1091,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn replace_bytearray_items(
-        &mut self,
-        value: PyByteArray<'s>,
-        items: Vec<u8>,
-    ) -> PyResult<'s, ()> {
+    fn replace_bytearray_items(&mut self, value: PyByteArray, items: Vec<u8>) -> PyResult<()> {
         let value = value.value();
         if !matches!(
             self.get(value).map_err(PyError::runtime_error)?,
@@ -1134,31 +1105,28 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .map_err(PyError::resource_error)
     }
 
-    fn tuple_items(&mut self, tuple: PyTuple<'s>) -> PyResult<'s, Vec<Value<'s>>> {
+    fn tuple_items(&mut self, tuple: PyTuple) -> PyResult<Vec<Value>> {
         let tuple = tuple.value();
         let length = match self.get(tuple).map_err(PyError::runtime_error)? {
             Object::Tuple(items) => items.len(),
             _ => return Err(PyError::runtime_error("tuple handle changed object kind")),
         };
         let bytes = length
-            .checked_mul(std::mem::size_of::<Value<'s>>())
+            .checked_mul(std::mem::size_of::<Value>())
             .ok_or_else(|| PyError::resource_error("tuple snapshot size overflow"))?;
         self.reserve_memory(bytes)?;
         match self.get(tuple).map_err(PyError::runtime_error)? {
-            Object::Tuple(items) => Ok(self.handles(items)),
+            Object::Tuple(items) => Ok(self.values(items)),
             _ => Err(PyError::runtime_error("tuple handle changed object kind")),
         }
     }
 
-    fn slice_parts(
-        &mut self,
-        value: &Value<'s>,
-    ) -> PyResult<'s, Option<super::super::slice::SliceBounds>> {
+    fn slice_parts(&mut self, value: &Value) -> PyResult<Option<super::super::slice::SliceBounds>> {
         self.slice_bounds(value)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn dict_items(&mut self, dict: PyDict<'s>) -> PyResult<'s, Vec<(Value<'s>, Value<'s>)>> {
+    fn dict_items(&mut self, dict: PyDict) -> PyResult<Vec<(Value, Value)>> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             return self
@@ -1170,19 +1138,19 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
         let bytes = length
-            .checked_mul(std::mem::size_of::<(Value<'s>, Value<'s>)>())
+            .checked_mul(std::mem::size_of::<(Value, Value)>())
             .ok_or_else(|| PyError::resource_error("dict snapshot size overflow"))?;
         self.reserve_memory(bytes)?;
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(items) | Object::DefaultDict { entries: items, .. } => Ok(items
                 .iter()
-                .map(|(key, value)| (self.handle(key), self.handle(value)))
+                .map(|(key, value)| (self.value(key), self.value(value)))
                 .collect()),
             _ => Err(PyError::runtime_error("dict handle changed object kind")),
         }
     }
 
-    fn dict_last_key(&mut self, dict: PyDict<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn dict_last_key(&mut self, dict: PyDict) -> PyResult<Option<Value>> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             let items = self
@@ -1192,13 +1160,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(items) | Object::DefaultDict { entries: items, .. } => {
-                Ok(items.iter().next_back().map(|(key, _)| self.handle(key)))
+                Ok(items.iter().next_back().map(|(key, _)| self.value(key)))
             }
             _ => Err(PyError::runtime_error("dict handle changed object kind")),
         }
     }
 
-    fn dict_get(&mut self, dict: PyDict<'s>, key: &Value<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn dict_get(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             // A namespace binds only names, so any other key is absent.
@@ -1218,18 +1186,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         match self.state.heap.get(id).map_err(PyError::runtime_error)? {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 // A key's `__eq__` may have removed the entry after the lookup found it.
-                Ok(entries.get(position).map(|entry| self.handle(&entry.1)))
+                Ok(entries.get(position).map(|entry| self.value(&entry.1)))
             }
             _ => Err(PyError::runtime_error("dict handle changed object kind")),
         }
     }
 
-    fn dict_insert(
-        &mut self,
-        dict: PyDict<'s>,
-        key: Value<'s>,
-        value: Value<'s>,
-    ) -> PyResult<'s, ()> {
+    fn dict_insert(&mut self, dict: PyDict, key: Value, value: Value) -> PyResult<()> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             let name = self.namespace_key(&key)?;
@@ -1242,9 +1205,9 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .map_err(|message| self.raised_or_runtime_error(message))?;
         if let Some(position) = position {
             let replaced = self
-                .modify(id, |builder, object| match object {
+                .modify(id, |object| match object {
                     Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                        entries.set_value(position, builder.store(value));
+                        entries.set_value(position, Ref::from(value));
                         true
                     }
                     _ => false,
@@ -1257,20 +1220,16 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
         self.reserve_object_growth(id, MODELED_MAPPING_ENTRY_BYTES)
             .map_err(PyError::resource_error)?;
-        self.modify(id, |builder, object| match object {
+        self.modify(id, |object| match object {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                entries.push(hash, (builder.store(key), builder.store(value)));
+                entries.push(hash, (Ref::from(key), Ref::from(value)));
             }
             _ => unreachable!("dict kind was checked during lookup"),
         })
         .map_err(PyError::runtime_error)
     }
 
-    fn dict_remove(
-        &mut self,
-        dict: PyDict<'s>,
-        key: &Value<'s>,
-    ) -> PyResult<'s, Option<Value<'s>>> {
+    fn dict_remove(&mut self, dict: PyDict, key: &Value) -> PyResult<Option<Value>> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             let Some(name) = self.string_value(key)? else {
@@ -1292,13 +1251,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
                 // A key's `__eq__` may already have removed the entry the lookup found.
                 match entries.get(position) {
-                    Some(entry) => self.handle(&entry.1),
+                    Some(entry) => self.value(&entry.1),
                     None => return Ok(None),
                 }
             }
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
-        self.modify(id, |_, object| {
+        self.modify(id, |object| {
             let (Object::Dict(entries) | Object::DefaultDict { entries, .. }) = object else {
                 unreachable!("dict kind was checked before removal")
             };
@@ -1310,11 +1269,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(Some(value))
     }
 
-    fn replace_dict_items(
-        &mut self,
-        dict: PyDict<'s>,
-        items: Vec<(Value<'s>, Value<'s>)>,
-    ) -> PyResult<'s, ()> {
+    fn replace_dict_items(&mut self, dict: PyDict, items: Vec<(Value, Value)>) -> PyResult<()> {
         let id = dict.value();
         if let Some(target) = self.namespace_view(id)? {
             let mut kept = Vec::with_capacity(items.len());
@@ -1359,7 +1314,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             old_len,
             new_len,
             MODELED_MAPPING_ENTRY_BYTES,
-            |builder, object| {
+            |object| {
                 let (Object::Dict(current)
                 | Object::DefaultDict {
                     entries: current, ..
@@ -1367,36 +1322,36 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 else {
                     unreachable!("dict kind was checked before replacement")
                 };
-                *current = entries.into_map(builder);
+                *current = entries.into_map();
             },
         )
     }
 
-    fn dict_copy(&mut self, dict: PyDict<'s>) -> PyResult<'s, Value<'s>> {
+    fn dict_copy(&mut self, dict: PyDict) -> PyResult<Value> {
         if let Some(target) = self.namespace_view(dict.value())? {
             return self
                 .namespace_snapshot_dict(target)
                 .map_err(PyError::resource_error);
         }
-        // Read the entries as handles first: the copy's allocation may move the source.
+        // Pin the entries first: the copy's allocation may collect, and it needs the heap.
         let (factory, entries) = match self.get(dict.value()).map_err(PyError::runtime_error)? {
             Object::Dict(entries) => (None, entries),
-            Object::DefaultDict { factory, entries } => (Some(self.handle(factory)), entries),
+            Object::DefaultDict { factory, entries } => (Some(self.value(factory)), entries),
             _ => return Err(PyError::runtime_error("dict handle changed object kind")),
         };
         let entries = entries
             .iter_hashed()
-            .map(|(hash, (key, value))| (hash, self.handle(key), self.handle(value)))
+            .map(|(hash, (key, value))| (hash, self.value(key), self.value(value)))
             .collect::<Vec<_>>();
-        self.alloc_with(|builder| {
+        self.alloc({
             let mut copy = OrderedMap::default();
             for (hash, key, value) in entries {
-                copy.push(hash, (builder.store(key), builder.store(value)));
+                copy.push(hash, (Ref::from(key), Ref::from(value)));
             }
             match factory {
                 None => Object::Dict(copy),
                 Some(factory) => Object::DefaultDict {
-                    factory: builder.store(factory),
+                    factory: Ref::from(factory),
                     entries: copy,
                 },
             }
@@ -1404,70 +1359,63 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn get_item(&mut self, container: Value<'s>, key: Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn get_item(&mut self, container: Value, key: Value) -> PyResult<Value> {
         self.subscript_value(container, key)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn builtin_get_item(
-        &mut self,
-        container: Value<'s>,
-        key: Value<'s>,
-    ) -> PyResult<'s, Value<'s>> {
+    fn builtin_get_item(&mut self, container: Value, key: Value) -> PyResult<Value> {
         self.subscript_builtin(container, key)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn builtin_contains(&mut self, container: Value<'s>, item: Value<'s>) -> PyResult<'s, bool> {
+    fn builtin_contains(&mut self, container: Value, item: Value) -> PyResult<bool> {
         self.contains_value(&container, &item)
             .map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn mapping_items(
-        &mut self,
-        value: Value<'s>,
-    ) -> PyResult<'s, Option<Vec<(Value<'s>, Value<'s>)>>> {
+    fn mapping_items(&mut self, value: Value) -> PyResult<Option<Vec<(Value, Value)>>> {
         Vm::mapping_items(self, value).map_err(|message| self.raised_or_runtime_error(message))
     }
 
-    fn new_dict_view(&mut self, kind: DictViewKind, mapping: Value<'s>) -> PyResult<'s, Value<'s>> {
+    fn new_dict_view(&mut self, kind: DictViewKind, mapping: Value) -> PyResult<Value> {
         if !mapping.is_object() {
             return Err(PyError::runtime_error("a dict view needs a mapping object"));
         }
-        self.alloc_with(|builder| Object::DictView {
+        self.alloc(Object::DictView {
             kind,
-            mapping: builder.store(mapping),
+            mapping: Ref::from(mapping),
         })
         .map_err(PyError::resource_error)
     }
 
-    fn dict_view(&self, value: &Value<'s>) -> PyResult<'s, Option<(DictViewKind, Value<'s>)>> {
+    fn dict_view(&self, value: &Value) -> PyResult<Option<(DictViewKind, Value)>> {
         if !value.is_object() {
             return Ok(None);
         }
         match self.get(*value).map_err(PyError::runtime_error)? {
-            Object::DictView { kind, mapping } => Ok(Some((*kind, self.handle(mapping)))),
+            Object::DictView { kind, mapping } => Ok(Some((*kind, self.value(mapping)))),
             _ => Ok(None),
         }
     }
 
-    fn set_items(&mut self, set: PySet<'s>) -> PyResult<'s, Vec<Value<'s>>> {
+    fn set_items(&mut self, set: PySet) -> PyResult<Vec<Value>> {
         let set = set.value();
         let length = match self.get(set).map_err(PyError::runtime_error)? {
             Object::Set(items) | Object::FrozenSet(items) => items.len(),
             _ => return Err(PyError::runtime_error("set handle changed object kind")),
         };
         let bytes = length
-            .checked_mul(std::mem::size_of::<Value<'s>>())
+            .checked_mul(std::mem::size_of::<Value>())
             .ok_or_else(|| PyError::resource_error("set snapshot size overflow"))?;
         self.reserve_memory(bytes)?;
         match self.get(set).map_err(PyError::runtime_error)? {
-            Object::Set(items) | Object::FrozenSet(items) => Ok(self.handles(items.iter())),
+            Object::Set(items) | Object::FrozenSet(items) => Ok(self.values(items.iter())),
             _ => Err(PyError::runtime_error("set handle changed object kind")),
         }
     }
 
-    fn set_is_frozen(&self, set: PySet<'s>) -> PyResult<'s, bool> {
+    fn set_is_frozen(&self, set: PySet) -> PyResult<bool> {
         match self.get(set.value()).map_err(PyError::runtime_error)? {
             Object::FrozenSet(_) => Ok(true),
             Object::Set(_) => Ok(false),
@@ -1475,7 +1423,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn set_insert(&mut self, set: PySet<'s>, value: Value<'s>) -> PyResult<'s, bool> {
+    fn set_insert(&mut self, set: PySet, value: Value) -> PyResult<bool> {
         let id = set.value();
         let (hash, position) = self
             .lookup_set_entry(id, &value)
@@ -1485,26 +1433,26 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
         self.reserve_object_growth(id, MODELED_SET_MEMBER_BYTES)
             .map_err(PyError::resource_error)?;
-        self.modify(id, |builder, object| {
+        self.modify(id, |object| {
             let Object::Set(items) = object else {
                 unreachable!("set kind was checked during lookup")
             };
-            items.push(hash, builder.store(value));
+            items.push(hash, Ref::from(value));
         })
         .map_err(PyError::runtime_error)?;
         Ok(true)
     }
 
-    fn set_first(&mut self, set: PySet<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn set_first(&mut self, set: PySet) -> PyResult<Option<Value>> {
         match self.get(set.value()).map_err(PyError::runtime_error)? {
             Object::Set(items) | Object::FrozenSet(items) => {
-                Ok(items.iter().next().map(|item| self.handle(item)))
+                Ok(items.iter().next().map(|item| self.value(item)))
             }
             _ => Err(PyError::runtime_error("set handle changed object kind")),
         }
     }
 
-    fn set_remove(&mut self, set: PySet<'s>, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn set_remove(&mut self, set: PySet, value: &Value) -> PyResult<bool> {
         let id = set.value();
         let Some(position) = self
             .find_set_entry(id, value)
@@ -1513,7 +1461,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             return Ok(false);
         };
         let removed = self
-            .modify(id, |_, object| match object {
+            .modify(id, |object| match object {
                 Object::Set(items) => Some(items.remove(position).is_some()),
                 _ => None,
             })
@@ -1529,7 +1477,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn replace_set_items(&mut self, set: PySet<'s>, items: Vec<Value<'s>>) -> PyResult<'s, ()> {
+    fn replace_set_items(&mut self, set: PySet, items: Vec<Value>) -> PyResult<()> {
         let id = set.value();
         match self.get(id).map_err(PyError::runtime_error)? {
             Object::Set(_) => {}
@@ -1547,46 +1495,36 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             _ => return Err(PyError::runtime_error("set handle changed object kind")),
         };
         let new_len = members.len();
-        self.replace_container_payload(
-            id,
-            old_len,
-            new_len,
-            MODELED_SET_MEMBER_BYTES,
-            |builder, object| {
-                let Object::Set(current) = object else {
-                    unreachable!("set kind was checked before replacement")
-                };
-                *current = members.into_set(builder);
-            },
-        )
+        self.replace_container_payload(id, old_len, new_len, MODELED_SET_MEMBER_BYTES, |object| {
+            let Object::Set(current) = object else {
+                unreachable!("set kind was checked before replacement")
+            };
+            *current = members.into_set();
+        })
     }
 
-    fn property_getter(&self, property: PyProperty<'s>) -> PyResult<'s, Value<'s>> {
+    fn property_getter(&self, property: PyProperty) -> PyResult<Value> {
         match self.get(property.value()).map_err(PyError::runtime_error)? {
-            Object::Property { getter, .. } => Ok(self.handle(getter)),
+            Object::Property { getter, .. } => Ok(self.value(getter)),
             _ => Err(PyError::runtime_error(
                 "property handle changed object kind",
             )),
         }
     }
 
-    fn property_setter(&self, property: PyProperty<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn property_setter(&self, property: PyProperty) -> PyResult<Option<Value>> {
         match self.get(property.value()).map_err(PyError::runtime_error)? {
-            Object::Property { setter, .. } => Ok(self.handle_optional(setter.as_ref())),
+            Object::Property { setter, .. } => Ok(self.value_optional(setter.as_ref())),
             _ => Err(PyError::runtime_error(
                 "property handle changed object kind",
             )),
         }
     }
 
-    fn new_property(
-        &mut self,
-        getter: Value<'s>,
-        setter: Option<Value<'s>>,
-    ) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::Property {
-            getter: builder.store(getter),
-            setter: builder.optional(setter),
+    fn new_property(&mut self, getter: Value, setter: Option<Value>) -> PyResult<Value> {
+        self.alloc(Object::Property {
+            getter: Ref::from(getter),
+            setter: Ref::optional(setter),
         })
         .map_err(PyError::resource_error)
     }
@@ -1594,28 +1532,28 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     fn new_builtin_instance(
         &mut self,
         builtin: BuiltinType,
-        class: Value<'s>,
-        args: CallArgs<'s>,
-    ) -> PyResult<'s, Value<'s>> {
+        class: Value,
+        args: CallArgs,
+    ) -> PyResult<Value> {
         let (arguments, keyword_arguments) = args.into_parts();
         Vm::new_builtin_instance(self, builtin, class, arguments, keyword_arguments)
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
-    fn new_instance(&mut self, class: Value<'s>, has_arguments: bool) -> PyResult<'s, Value<'s>> {
+    fn new_instance(&mut self, class: Value, has_arguments: bool) -> PyResult<Value> {
         Vm::new_instance(self, class, has_arguments)
             .map_err(|error| self.raised_or_runtime_error(error))
     }
 
     fn new_type(
         &mut self,
-        metaclass: Value<'s>,
+        metaclass: Value,
         name: String,
-        bases: Value<'s>,
-        namespace: Value<'s>,
-    ) -> PyResult<'s, Value<'s>> {
+        bases: Value,
+        namespace: Value,
+    ) -> PyResult<Value> {
         let bases = match bases.is_object().then(|| self.get(bases).ok()).flatten() {
-            Some(Object::Tuple(values)) => self.handles(values),
+            Some(Object::Tuple(values)) => self.values(values),
             _ => return Err(PyError::type_error("type.__new__() bases must be a tuple")),
         };
         let entries = match namespace
@@ -1625,7 +1563,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         {
             Some(Object::Dict(entries)) => entries
                 .iter()
-                .map(|(key, value)| (self.handle(key), self.handle(value)))
+                .map(|(key, value)| (self.value(key), self.value(value)))
                 .collect::<Vec<_>>(),
             _ => {
                 return Err(PyError::type_error(
@@ -1708,38 +1646,28 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::runtime_error)
     }
 
-    fn replace_list_items(&mut self, list: PyList<'s>, items: Vec<Value<'s>>) -> PyResult<'s, ()> {
+    fn replace_list_items(&mut self, list: PyList, items: Vec<Value>) -> PyResult<()> {
         let id = list.value();
         let old_len = match self.get(id).map_err(PyError::runtime_error)? {
             Object::List(current) => current.len(),
             _ => return Err(PyError::runtime_error("list handle changed object kind")),
         };
         let new_len = items.len();
-        self.replace_container_payload(
-            id,
-            old_len,
-            new_len,
-            MODELED_VALUE_BYTES,
-            |builder, object| {
-                let Object::List(current) = object else {
-                    unreachable!("list kind was checked before replacement")
-                };
-                *current = builder.refs(items);
-            },
-        )
+        self.replace_container_payload(id, old_len, new_len, MODELED_VALUE_BYTES, |object| {
+            let Object::List(current) = object else {
+                unreachable!("list kind was checked before replacement")
+            };
+            *current = Ref::all(items);
+        })
     }
 
-    fn call_type_default(
-        &mut self,
-        class: Value<'s>,
-        args: CallArgs<'s>,
-    ) -> PyResult<'s, Value<'s>> {
+    fn call_type_default(&mut self, class: Value, args: CallArgs) -> PyResult<Value> {
         let flow = Vm::call_type_default(self, class, args)
             .map_err(|message| self.raised_or_runtime_error(message))?;
         self.callback_value(flow)
     }
 
-    fn call_value(&mut self, callable: Value<'s>, args: CallArgs<'s>) -> PyResult<'s, Value<'s>> {
+    fn call_value(&mut self, callable: Value, args: CallArgs) -> PyResult<Value> {
         let (positional, keywords) = args.into_parts();
         let argument_count = positional.len();
         let total = argument_count
@@ -1766,7 +1694,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.callback_value(flow)
     }
 
-    fn is_callable(&self, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn is_callable(&self, value: &Value) -> PyResult<bool> {
         Ok(
             if matches!(
                 value.native_value(),
@@ -1792,15 +1720,14 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 let heap = &self.state.heap;
                 let defines_call = |class: &heap::Ref| {
                     matches!(
-                        heap.get(heap.handle(class)),
+                        heap.get(heap.value(class)),
                         Ok(Object::Class(class_object))
                             if class_object.attributes.contains_key("__call__")
                     )
                 };
                 match heap.get(class).map_err(PyError::runtime_error)? {
                     Object::Class(class_object) => {
-                        defines_call(&heap.store(class))
-                            || class_object.mro.iter().any(defines_call)
+                        defines_call(&Ref::from(class)) || class_object.mro.iter().any(defines_call)
                     }
                     _ => false,
                 }
@@ -1817,26 +1744,26 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         )
     }
 
-    fn is_iterator(&self, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn is_iterator(&self, value: &Value) -> PyResult<bool> {
         Vm::is_iterator(self, value).map_err(PyError::runtime_error)
     }
 
-    fn is_unbounded_iterator(&self, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn is_unbounded_iterator(&self, value: &Value) -> PyResult<bool> {
         Vm::is_unbounded_iterator(self, value).map_err(PyError::runtime_error)
     }
 
-    fn payload_iterator(&mut self, value: Value<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn payload_iterator(&mut self, value: Value) -> PyResult<Option<Value>> {
         Vm::payload_iterator(self, value).map_err(PyError::runtime_error)
     }
 
-    fn is_user_instance(&self, value: &Value<'s>) -> PyResult<'s, bool> {
+    fn is_user_instance(&self, value: &Value) -> PyResult<bool> {
         Ok(self
             .instance_class(*value)
             .map_err(PyError::runtime_error)?
             .is_some())
     }
 
-    fn iterator(&mut self, value: Value<'s>) -> PyResult<'s, PyIterator<'s>> {
+    fn iterator(&mut self, value: Value) -> PyResult<PyIterator> {
         if Vm::is_iterator(self, &value).map_err(PyError::runtime_error)? {
             return value.cast(self);
         }
@@ -1851,13 +1778,13 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .cast(self)
     }
 
-    fn iterator_next(&mut self, iterator: PyIterator<'s>) -> PyResult<'s, Option<Value<'s>>> {
+    fn iterator_next(&mut self, iterator: PyIterator) -> PyResult<Option<Value>> {
         let id = iterator.value();
         // Step a materialized iterator in place: cloning its payload would copy every remaining
         // value on each step.
         let materialized = match self.get(id).map_err(PyError::runtime_error)? {
             Object::Iterator { values, position } => {
-                Some(values.get(*position).map(|value| self.handle(value)))
+                Some(values.get(*position).map(|value| self.value(value)))
             }
             _ => None,
         };
@@ -1884,8 +1811,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 sentinel,
                 exhausted,
             } => LazyStep::Callable {
-                callable: self.handle(callable),
-                sentinel: self.handle(sentinel),
+                callable: self.value(callable),
+                sentinel: self.value(sentinel),
                 exhausted: *exhausted,
             },
             Object::SequenceIterator { .. }
@@ -1946,11 +1873,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn generator_send(
-        &mut self,
-        generator: PyIterator<'s>,
-        value: Value<'s>,
-    ) -> PyResult<'s, Option<Value<'s>>> {
+    fn generator_send(&mut self, generator: PyIterator, value: Value) -> PyResult<Option<Value>> {
         let id = generator.value();
         if !matches!(
             self.state.heap.get(id).map_err(PyError::runtime_error)?,
@@ -1962,24 +1885,20 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .map_err(PyError::runtime_error)
     }
 
-    fn generator_return_value(&self, generator: PyIterator<'s>) -> PyResult<'s, Value<'s>> {
+    fn generator_return_value(&self, generator: PyIterator) -> PyResult<Value> {
         match self
             .get(generator.value())
             .map_err(PyError::runtime_error)?
         {
             Object::Generator(generator) if generator.exhausted => {
-                Ok(self.handle(&generator.return_value))
+                Ok(self.value(&generator.return_value))
             }
             Object::Generator(_) => Err(PyError::runtime_error("coroutine has not completed")),
             _ => Err(PyError::type_error("expected a coroutine")),
         }
     }
 
-    fn coroutine_step(
-        &mut self,
-        coroutine: PyIterator<'s>,
-        value: Value<'s>,
-    ) -> PyResult<'s, (u8, Value<'s>)> {
+    fn coroutine_step(&mut self, coroutine: PyIterator, value: Value) -> PyResult<(u8, Value)> {
         let id = coroutine.value();
         if !matches!(
             self.state.heap.get(id).map_err(PyError::runtime_error)?,
@@ -1993,7 +1912,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 .generator_return_value(coroutine)
                 .map(|value| (1, value)),
             Err(error) => match self.pending_exception.take() {
-                Some(exception) => Ok((2, self.handle(&exception.value))),
+                Some(exception) => Ok((2, self.value(&exception.value))),
                 None => Err(PyError::runtime_error(error)),
             },
         }
@@ -2001,7 +1920,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     /// `generator.close()`: raise `GeneratorExit` at the suspended `yield`. The generator may run
     /// cleanup code, but yielding another value is an error.
-    fn generator_close(&mut self, generator: PyIterator<'s>) -> PyResult<'s, ()> {
+    fn generator_close(&mut self, generator: PyIterator) -> PyResult<()> {
         let id = generator.value();
         if !matches!(
             self.state.heap.get(id).map_err(PyError::runtime_error)?,
@@ -2015,7 +1934,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     /// `generator.throw(exception)`: raise `exception`, an instance or an exception class, at the
     /// suspended `yield` and return the next value the generator yields.
-    fn generator_throw(&mut self, generator: PyIterator<'s>, exception: Value<'s>) -> PyResult<'s> {
+    fn generator_throw(&mut self, generator: PyIterator, exception: Value) -> PyResult {
         let id = generator.value();
         if !matches!(
             self.state.heap.get(id).map_err(PyError::runtime_error)?,
@@ -2061,15 +1980,15 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn new_iterator(&mut self, values: Vec<Value<'s>>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::Iterator {
-            values: builder.refs(values),
+    fn new_iterator(&mut self, values: Vec<Value>) -> PyResult<Value> {
+        self.alloc(Object::Iterator {
+            values: Ref::all(values),
             position: 0,
         })
         .map_err(PyError::resource_error)
     }
 
-    fn new_count_iterator(&mut self, start: i64, step: i64) -> PyResult<'s, Value<'s>> {
+    fn new_count_iterator(&mut self, start: i64, step: i64) -> PyResult<Value> {
         Vm::allocate_object(
             self,
             Object::CountIterator {
@@ -2080,22 +1999,22 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn new_default_dict(&mut self, factory: PyCallable<'s>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::DefaultDict {
-            factory: builder.store(factory.into_value()),
+    fn new_default_dict(&mut self, factory: PyCallable) -> PyResult<Value> {
+        self.alloc(Object::DefaultDict {
+            factory: Ref::from(factory.into_value()),
             entries: Default::default(),
         })
         .map_err(PyError::resource_error)
     }
 
-    fn new_list(&mut self, items: Vec<Value<'s>>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::List(builder.refs(items)))
+    fn new_list(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        self.alloc(Object::List(Ref::all(items)))
             .map_err(PyError::resource_error)
     }
 
-    fn new_import_path(&mut self) -> PyResult<'s, Value<'s>> {
+    fn new_import_path(&mut self) -> PyResult<Value> {
         if let Some(path) = &self.state.sys_path {
-            return Ok(self.handle(path));
+            return Ok(self.value(path));
         }
         let mut values = Vec::with_capacity(self.state.import_paths.len());
         for path in self.state.import_paths.clone() {
@@ -2109,32 +2028,32 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(path)
     }
 
-    fn new_tuple(&mut self, items: Vec<Value<'s>>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| Object::Tuple(builder.refs(items)))
+    fn new_tuple(&mut self, items: Vec<Value>) -> PyResult<Value> {
+        self.alloc(Object::Tuple(Ref::all(items)))
             .map_err(PyError::resource_error)
     }
 
-    fn new_dict(&mut self, items: Vec<(Value<'s>, Value<'s>)>) -> PyResult<'s, Value<'s>> {
+    fn new_dict(&mut self, items: Vec<(Value, Value)>) -> PyResult<Value> {
         let entries = self
             .ordered_map(items)
             .map_err(|message| self.raised_or_runtime_error(message))?;
-        self.alloc_with(|builder| Object::Dict(entries.into_map(builder)))
+        self.alloc(Object::Dict(entries.into_map()))
             .map_err(PyError::resource_error)
     }
 
-    fn new_set(&mut self, items: Vec<Value<'s>>) -> PyResult<'s, Value<'s>> {
+    fn new_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
         let members = self
             .distinct_members(items)
             .map_err(|message| self.raised_or_runtime_error(message))?;
-        self.alloc_with(|builder| Object::Set(members.into_set(builder)))
+        self.alloc(Object::Set(members.into_set()))
             .map_err(PyError::resource_error)
     }
 
-    fn new_frozen_set(&mut self, items: Vec<Value<'s>>) -> PyResult<'s, Value<'s>> {
+    fn new_frozen_set(&mut self, items: Vec<Value>) -> PyResult<Value> {
         let members = self
             .distinct_members(items)
             .map_err(|message| self.raised_or_runtime_error(message))?;
-        self.alloc_with(|builder| Object::FrozenSet(members.into_set(builder)))
+        self.alloc(Object::FrozenSet(members.into_set()))
             .map_err(PyError::resource_error)
     }
 
@@ -2142,7 +2061,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &self,
         kind: &'static super::super::native::ValueKindDef,
         payload: u64,
-    ) -> PyResult<'s, Value<'s>> {
+    ) -> PyResult<Value> {
         let index = self
             .state
             .types
@@ -2153,7 +2072,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn value_kind_payload(
         &self,
-        value: &Value<'s>,
+        value: &Value,
         kind: &'static super::super::native::ValueKindDef,
     ) -> Option<u64> {
         let (index, payload) = value.registered_parts()?;
@@ -2164,7 +2083,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &mut self,
         kind: &'static super::super::native::ValueKindDef,
         payload: [u64; 2],
-    ) -> PyResult<'s, Value<'s>> {
+    ) -> PyResult<Value> {
         let index = self
             .state
             .types
@@ -2188,7 +2107,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn wide_value_kind_payload(
         &self,
-        value: &Value<'s>,
+        value: &Value,
         kind: &'static super::super::native::ValueKindDef,
     ) -> Option<[u64; 2]> {
         let Object::WideValue {
@@ -2204,21 +2123,18 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         std::ptr::eq(self.state.types.value_kind(*index)?, kind).then_some(*payload)
     }
 
-    fn value_kind_of(
-        &self,
-        value: &Value<'s>,
-    ) -> Option<&'static super::super::native::ValueKindDef> {
+    fn value_kind_of(&self, value: &Value) -> Option<&'static super::super::native::ValueKindDef> {
         self.registered_kind(value)
     }
 
-    fn builtin_type(&self, name: &str) -> Option<Value<'s>> {
+    fn builtin_type(&self, name: &str) -> Option<Value> {
         BuiltinType::ALL
             .iter()
             .find(|builtin| builtin.name() == name)
             .map(|builtin| Value::Native(NativeValue::BuiltinType(*builtin)))
     }
 
-    fn type_object(&self, value: &Value<'s>) -> Option<PyTypeObject> {
+    fn type_object(&self, value: &Value) -> Option<PyTypeObject> {
         match value.native_value()? {
             NativeValue::BuiltinType(builtin) => Some(PyTypeObject::Builtin(builtin.name())),
             NativeValue::ValueKind(kind) => Some(PyTypeObject::Kind(kind)),
@@ -2229,7 +2145,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
     fn value_kind_type(
         &self,
         kind: &'static super::super::native::ValueKindDef,
-    ) -> PyResult<'s, Value<'s>> {
+    ) -> PyResult<Value> {
         self.state
             .types
             .value_kind_type_id(kind)
@@ -2239,11 +2155,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn new_array(
         &mut self,
-        buffer: PyArrayBuffer<'s>,
+        buffer: PyArrayBuffer,
         dtype: PyArrayDtype,
         shape: Vec<usize>,
         strides: Vec<isize>,
-    ) -> PyResult<'s, Value<'s>> {
+    ) -> PyResult<Value> {
         let count = shape
             .iter()
             .try_fold(1usize, |total, dimension| total.checked_mul(*dimension))
@@ -2267,14 +2183,14 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             PyArrayBuffer::Bytes(bytes) => {
                 self.alloc(Object::Native(Box::new(ArrayStorage::Bytes(bytes))))
             }
-            PyArrayBuffer::Values(values) => self.alloc_with(|builder| {
-                Object::Native(Box::new(ArrayStorage::Values(builder.refs(values))))
-            }),
+            PyArrayBuffer::Values(values) => self.alloc(Object::Native(Box::new(
+                ArrayStorage::Values(Ref::all(values)),
+            ))),
         }
         .map_err(PyError::resource_error)?;
-        self.alloc_with(|builder| {
+        self.alloc({
             Object::Native(Box::new(ArrayObject {
-                storage: builder.store(storage),
+                storage: Ref::from(storage),
                 view,
                 base: None,
             }))
@@ -2282,12 +2198,12 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn new_array_view(&mut self, base: PyArray<'s>, view: PyArrayView) -> PyResult<'s, Value<'s>> {
+    fn new_array_view(&mut self, base: PyArray, view: PyArrayView) -> PyResult<Value> {
         let array = self.array_object(base)?;
         let (storage, base_writeable, owner) = (
-            self.handle(&array.storage),
+            self.value(&array.storage),
             array.view.writeable,
-            self.handle_optional(array.base.as_ref())
+            self.value_optional(array.base.as_ref())
                 .unwrap_or(base.value()),
         );
         if view.writeable && !base_writeable {
@@ -2301,33 +2217,33 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             matches!(buffer, ArrayStorage::Values(_)),
             buffer.byte_len(),
         )?;
-        self.alloc_with(|builder| {
+        self.alloc({
             Object::Native(Box::new(ArrayObject {
-                storage: builder.store(storage),
+                storage: Ref::from(storage),
                 view,
-                base: Some(builder.store(owner)),
+                base: Some(Ref::from(owner)),
             }))
         })
         .map_err(PyError::resource_error)
     }
 
-    fn array_view(&self, array: PyArray<'s>) -> PyResult<'s, PyArrayView> {
+    fn array_view(&self, array: PyArray) -> PyResult<PyArrayView> {
         Ok(self.array_object(array)?.view.clone())
     }
 
-    fn array_storage(&self, array: PyArray<'s>) -> PyResult<'s, PyIdentity> {
-        let storage = self.handle(&self.array_object(array)?.storage);
+    fn array_storage(&self, array: PyArray) -> PyResult<PyIdentity> {
+        let storage = self.value(&self.array_object(array)?.storage);
         Vm::identity(self, storage)
             .map_err(PyError::runtime_error)?
             .map(PyIdentity)
             .ok_or_else(|| PyError::runtime_error("array storage is not an object"))
     }
 
-    fn array_base(&self, array: PyArray<'s>) -> PyResult<'s, Option<Value<'s>>> {
-        Ok(self.handle_optional(self.array_object(array)?.base.as_ref()))
+    fn array_base(&self, array: PyArray) -> PyResult<Option<Value>> {
+        Ok(self.value_optional(self.array_object(array)?.base.as_ref()))
     }
 
-    fn set_array_writeable(&mut self, array: PyArray<'s>, writeable: bool) -> PyResult<'s, ()> {
+    fn set_array_writeable(&mut self, array: PyArray, writeable: bool) -> PyResult<()> {
         let array = self
             .get_mut(array.value())
             .map_err(PyError::runtime_error)?
@@ -2337,15 +2253,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(())
     }
 
-    fn read_arrays(
-        &self,
-        arrays: &[PyArray<'s>],
-        read: &mut PyArrayReader<'_, 's>,
-    ) -> PyResult<'s, ()> {
+    fn read_arrays(&self, arrays: &[PyArray], read: &mut PyArrayReader<'_>) -> PyResult<()> {
         let mut lent = Vec::with_capacity(arrays.len());
         for array in arrays {
             let ArrayObject { storage, view, .. } = self.array_object(*array)?;
-            let data = match self.array_storage_object(self.handle(storage))? {
+            let data = match self.array_storage_object(self.value(storage))? {
                 ArrayStorage::Bytes(bytes) => PyArrayData::Bytes(bytes),
                 ArrayStorage::Values(values) => PyArrayData::Values(values),
             };
@@ -2356,30 +2268,26 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn write_array(
         &mut self,
-        array: PyArray<'s>,
-        write: &mut dyn FnMut(&Builder<'_>, PyArrayMut<'_>) -> PyResult<'s, ()>,
-    ) -> PyResult<'s, ()> {
+        array: PyArray,
+        write: &mut dyn FnMut(PyArrayMut<'_>) -> PyResult<()>,
+    ) -> PyResult<()> {
         let ArrayObject { storage, view, .. } = self.array_object(array)?;
         if !view.writeable {
             return Err(PyError::value_error("assignment destination is read-only"));
         }
-        let storage = self.handle(storage);
-        self.modify(storage, |builder, object| {
+        let storage = self.value(storage);
+        self.modify(storage, |object| {
             let data = match object.native_mut::<ArrayStorage>() {
                 Some(ArrayStorage::Bytes(bytes)) => PyArrayDataMut::Bytes(bytes),
                 Some(ArrayStorage::Values(values)) => PyArrayDataMut::Values(values),
                 None => return Err(PyError::runtime_error("array storage changed object kind")),
             };
-            write(builder, PyArrayMut { data })
+            write(PyArrayMut { data })
         })
         .map_err(PyError::runtime_error)?
     }
 
-    fn apply_operator(
-        &mut self,
-        operator: PyOperator,
-        operands: &[Value<'s>],
-    ) -> PyResult<'s, Value<'s>> {
+    fn apply_operator(&mut self, operator: PyOperator, operands: &[Value]) -> PyResult<Value> {
         let result = match (operator, operands) {
             (PyOperator::Binary(operator), [left, right]) => {
                 self.binary_value(operator, *left, *right)
@@ -2405,7 +2313,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn new_integer(&mut self, decimal: &str) -> PyResult<'s, Value<'s>> {
+    fn new_integer(&mut self, decimal: &str) -> PyResult<Value> {
         self.charge_cpu(u64::try_from(decimal.len()).unwrap_or(u64::MAX))
             .map_err(PyError::resource_error)?;
         self.reserve_result(decimal.len().saturating_mul(2))
@@ -2416,7 +2324,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.new_bigint(value)
     }
 
-    fn new_bigint(&mut self, value: BigInt) -> PyResult<'s, Value<'s>> {
+    fn new_bigint(&mut self, value: BigInt) -> PyResult<Value> {
         if let Some(value) = value.to_i64() {
             return Ok(Value::Int(value));
         }
@@ -2425,7 +2333,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Vm::allocate_object(self, Object::BigInt(value)).map_err(PyError::resource_error)
     }
 
-    fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<'s, Value<'s>> {
+    fn new_regex(&mut self, pattern: String, flags: u32) -> PyResult<Value> {
         Vm::allocate_object(
             self,
             Object::Native(Box::new(RegexObject { pattern, flags })),
@@ -2433,7 +2341,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn new_match(&mut self, data: PyMatchData<'s>) -> PyResult<'s, Value<'s>> {
+    fn new_match(&mut self, data: PyMatchData) -> PyResult<Value> {
         let PyMatchData {
             subject,
             regex,
@@ -2444,10 +2352,10 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             pos,
             endpos,
         } = data;
-        self.alloc_with(|builder| {
+        self.alloc({
             Object::Native(Box::new(MatchObject {
-                subject: builder.store(subject),
-                regex: builder.store(regex),
+                subject: Ref::from(subject),
+                regex: Ref::from(regex),
                 text,
                 groups,
                 group_names,
@@ -2459,7 +2367,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn regex_parts(&mut self, regex: PyRegex<'s>) -> PyResult<'s, (String, u32)> {
+    fn regex_parts(&mut self, regex: PyRegex) -> PyResult<(String, u32)> {
         let RegexObject { pattern, flags } = self
             .state
             .heap
@@ -2473,7 +2381,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok((pattern, flags))
     }
 
-    fn match_data(&mut self, matched: PyMatch<'s>) -> PyResult<'s, PyMatchData<'s>> {
+    fn match_data(&mut self, matched: PyMatch) -> PyResult<PyMatchData> {
         let match_object = self
             .state
             .heap
@@ -2491,8 +2399,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
             .and_then(|total| total.checked_add(match_object.spans.len().saturating_mul(16)));
         let bytes = bytes.ok_or_else(|| PyError::resource_error("match snapshot is too large"))?;
         let data = PyMatchData {
-            subject: self.handle(&match_object.subject),
-            regex: self.handle(&match_object.regex),
+            subject: self.value(&match_object.subject),
+            regex: self.value(&match_object.regex),
             text: match_object.text.clone(),
             groups: match_object.groups.clone(),
             group_names: match_object.group_names.clone(),
@@ -2504,7 +2412,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(data)
     }
 
-    fn marker(&self, marker: PyMarker) -> Value<'s> {
+    fn marker(&self, marker: PyMarker) -> Value {
         Value::Native(match marker {
             PyMarker::TypingList => NativeValue::TypingList,
             PyMarker::EnumType => NativeValue::BuiltinType(BuiltinType::Enum),
@@ -2518,7 +2426,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         })
     }
 
-    fn mark_dataclass(&mut self, class: PyClass<'s>) -> PyResult<'s, ()> {
+    fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()> {
         let Object::Class(class_object) = self
             .state
             .heap
@@ -2535,7 +2443,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.argv.first().cloned().unwrap_or_else(|| "-".into())
     }
 
-    fn new_argv(&mut self) -> PyResult<'s, Value<'s>> {
+    fn new_argv(&mut self) -> PyResult<Value> {
         let mut values = Vec::with_capacity(self.argv.len());
         for argument in self.argv {
             values.push(self.new_string(argument.clone())?);
@@ -2549,7 +2457,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         description: Option<String>,
         add_help: bool,
         is_subcommand: bool,
-    ) -> PyResult<'s, Value<'s>> {
+    ) -> PyResult<Value> {
         Vm::allocate_object(
             self,
             Object::Native(Box::new(ArgumentParserObject {
@@ -2566,8 +2474,8 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn argument_parser_parts(
         &mut self,
-        parser: PyArgumentParser<'s>,
-    ) -> PyResult<'s, PyArgumentParserData<'s>> {
+        parser: PyArgumentParser,
+    ) -> PyResult<PyArgumentParserData> {
         let ArgumentParserObject {
             prog,
             description,
@@ -2595,11 +2503,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 names: argument.names.clone(),
                 dest: argument.dest.clone(),
                 required: argument.required,
-                default: self.handle(&argument.default),
+                default: self.value(&argument.default),
                 store_true: argument.store_true,
                 store_false: argument.store_false,
                 integer: argument.integer,
-                choices: self.handles(&argument.choices),
+                choices: self.values(&argument.choices),
                 help: argument.help.clone(),
             })
             .collect();
@@ -2610,7 +2518,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                     commands.push(PySubcommandSpec {
                         name: command.name.clone(),
                         help: command.help.clone(),
-                        parser: self.handle(&command.parser).cast(self)?,
+                        parser: self.value(&command.parser).cast(self)?,
                     });
                 }
                 Some(PySubparsersSpec {
@@ -2635,12 +2543,12 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn append_argument(
         &mut self,
-        parser: PyArgumentParser<'s>,
-        argument: PyArgumentSpec<'s>,
-    ) -> PyResult<'s, ()> {
+        parser: PyArgumentParser,
+        argument: PyArgumentSpec,
+    ) -> PyResult<()> {
         self.reserve_object_growth(parser.value(), 96)
             .map_err(PyError::resource_error)?;
-        self.modify(parser.value(), |builder, object| {
+        self.modify(parser.value(), |object| {
             let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
@@ -2659,11 +2567,11 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 names,
                 dest,
                 required,
-                default: builder.store(default),
+                default: Ref::from(default),
                 store_true,
                 store_false,
                 integer,
-                choices: builder.refs(choices),
+                choices: Ref::all(choices),
                 help,
             });
             Ok(())
@@ -2673,10 +2581,10 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn configure_subparsers(
         &mut self,
-        parser: PyArgumentParser<'s>,
-        subparsers: PySubparsersSpec<'s>,
-    ) -> PyResult<'s, ()> {
-        self.modify(parser.value(), |builder, object| {
+        parser: PyArgumentParser,
+        subparsers: PySubparsersSpec,
+    ) -> PyResult<()> {
+        self.modify(parser.value(), |object| {
             let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
@@ -2703,10 +2611,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 dest,
                 required,
                 help,
-                commands: commands
-                    .into_iter()
-                    .map(|command| stored_subcommand(builder, command))
-                    .collect(),
+                commands: commands.into_iter().map(stored_subcommand).collect(),
             });
             Ok(())
         })
@@ -2715,12 +2620,12 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 
     fn append_subcommand(
         &mut self,
-        parser: PyArgumentParser<'s>,
-        command: PySubcommandSpec<'s>,
-    ) -> PyResult<'s, ()> {
+        parser: PyArgumentParser,
+        command: PySubcommandSpec,
+    ) -> PyResult<()> {
         self.reserve_object_growth(parser.value(), 96)
             .map_err(PyError::resource_error)?;
-        self.modify(parser.value(), |builder, object| {
+        self.modify(parser.value(), |object| {
             let Some(parser_object) = object.native_mut::<ArgumentParserObject>() else {
                 return Err(PyError::runtime_error("parser handle changed object kind"));
             };
@@ -2738,9 +2643,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                     command.name
                 )));
             }
-            subparsers
-                .commands
-                .push(stored_subcommand(builder, command));
+            subparsers.commands.push(stored_subcommand(command));
             Ok(())
         })
         .map_err(PyError::runtime_error)?
@@ -2750,7 +2653,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.argv.iter().skip(1).cloned().collect()
     }
 
-    fn import_module(&mut self, name: &str) -> PyResult<'s, Value<'s>> {
+    fn import_module(&mut self, name: &str) -> PyResult<Value> {
         let stack_len = self.stack.len();
         self.import(name, false).map_err(PyError::runtime_error)?;
         let module = self
@@ -2766,9 +2669,9 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         &mut self,
         name: String,
         path: String,
-        spec: Value<'s>,
-        loader: Value<'s>,
-    ) -> PyResult<'s, Value<'s>> {
+        spec: Value,
+        loader: Value,
+    ) -> PyResult<Value> {
         let module_name = self
             .allocate_string(name.clone())
             .map_err(PyError::resource_error)?;
@@ -2796,14 +2699,14 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 ]),
             )
             .map_err(PyError::resource_error)?;
-        self.alloc_with(|builder| Object::Module {
+        self.alloc(Object::Module {
             name,
-            scope: builder.store(scope),
+            scope: Ref::from(scope),
         })
         .map_err(PyError::resource_error)
     }
 
-    fn exec_module(&mut self, module: PyModule<'s>, path: &str) -> PyResult<'s, ()> {
+    fn exec_module(&mut self, module: PyModule, path: &str) -> PyResult<()> {
         let source = self.interp.read_text(path)?;
         let code = self.compile_module_source(&source, path).map_err(|error| {
             // A stopped resource meter is the only resource failure the front end reports.
@@ -2818,7 +2721,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         else {
             return Err(PyError::runtime_error("module handle changed object kind"));
         };
-        let scope = self.handle(scope);
+        let scope = self.value(scope);
         let import_root = path
             .rsplit_once('/')
             .map_or_else(|| "/".to_string(), |(parent, _)| parent.to_string());
@@ -2842,19 +2745,19 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         }
     }
 
-    fn new_namespace(&mut self, values: Vec<(String, Value<'s>)>) -> PyResult<'s, Value<'s>> {
-        self.alloc_with(|builder| {
+    fn new_namespace(&mut self, values: Vec<(String, Value)>) -> PyResult<Value> {
+        self.alloc({
             Object::Native(Box::new(NamespaceObject {
                 values: values
                     .into_iter()
-                    .map(|(name, value)| (name, builder.store(value)))
+                    .map(|(name, value)| (name, Ref::from(value)))
                     .collect(),
             }))
         })
         .map_err(PyError::resource_error)
     }
 
-    fn new_raises_context(&mut self, expected: String) -> PyResult<'s, Value<'s>> {
+    fn new_raises_context(&mut self, expected: String) -> PyResult<Value> {
         Vm::allocate_object(
             self,
             Object::Native(Box::new(RaisesContextObject { expected })),
@@ -2862,7 +2765,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         .map_err(PyError::resource_error)
     }
 
-    fn raises_expected(&self, context: PyRaisesContext<'s>) -> PyResult<'s, String> {
+    fn raises_expected(&self, context: PyRaisesContext) -> PyResult<String> {
         let RaisesContextObject { expected } = self
             .state
             .heap
@@ -2873,18 +2776,18 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(expected.clone())
     }
 
-    fn exception_type_name(&self, value: &Value<'s>) -> Option<&'static str> {
+    fn exception_type_name(&self, value: &Value) -> Option<&'static str> {
         match value.native_value() {
             Some(NativeValue::ExceptionType(ExceptionType(name))) => Some(name),
             _ => None,
         }
     }
 
-    fn exception_type(&self, name: &'static str) -> Value<'s> {
+    fn exception_type(&self, name: &'static str) -> Value {
         Value::Native(NativeValue::ExceptionType(ExceptionType(name)))
     }
 
-    fn wait_on(&mut self, reasons: Vec<crate::scheduler::WaitReason>) -> PyResult<'s, ()> {
+    fn wait_on(&mut self, reasons: Vec<crate::scheduler::WaitReason>) -> PyResult<()> {
         if reasons.is_empty() {
             return Err(PyError::runtime_error(
                 "cannot wait on an empty resource set",
@@ -2994,24 +2897,24 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Some((self.traceback_filename(), u32::try_from(span.line).ok()?))
     }
 
-    fn frame_module_name(&mut self, depth: usize) -> PyResult<'s, Option<Value<'s>>> {
+    fn frame_module_name(&mut self, depth: usize) -> PyResult<Option<Value>> {
         // Each frame resolves names through a scope that roots in its module; the main script's
         // frames root in the global namespace.
         let Some(frame) = self.bytecode_frames.iter().rev().nth(depth) else {
             return Ok(None);
         };
-        let scope = self.handle_optional(frame.scope.as_ref());
+        let scope = self.value_optional(frame.scope.as_ref());
         self.module_name_of(scope).map_err(PyError::runtime_error)
     }
 
-    fn function_flags(&self, value: &Value<'s>) -> PyResult<'s, Option<(bool, bool)>> {
+    fn function_flags(&self, value: &Value) -> PyResult<Option<(bool, bool)>> {
         if !value.is_object() {
             return Ok(None);
         }
         let function = match self.get(*value).map_err(PyError::runtime_error)? {
             Object::Function { .. } => *value,
             Object::DescriptorBoundMethod { descriptor, .. } if descriptor.is_object() => {
-                self.handle(descriptor)
+                self.value(descriptor)
             }
             // A suspended generator or coroutine reports the flags of the code it runs.
             Object::Generator(generator) => {
@@ -3029,14 +2932,14 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(Some((signature.is_generator, signature.is_coroutine)))
     }
 
-    fn function_parameters(&self, value: &Value<'s>) -> PyResult<'s, Option<Vec<PyParameter<'s>>>> {
+    fn function_parameters(&self, value: &Value) -> PyResult<Option<Vec<PyParameter>>> {
         if !value.is_object() {
             return Ok(None);
         }
         let (function, bound) = match self.get(*value).map_err(PyError::runtime_error)? {
             Object::Function { .. } => (*value, false),
             Object::DescriptorBoundMethod { descriptor, .. } if descriptor.is_object() => {
-                (self.handle(descriptor), true)
+                (self.value(descriptor), true)
             }
             Object::DescriptorBoundMethod { .. } => return Ok(None),
             _ => return Ok(None),
@@ -3063,7 +2966,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
                 .iter_mut()
                 .find(|parameter| Some(parameter.name.as_str()) == name)
             {
-                parameter.default = Some(self.handle(default));
+                parameter.default = Some(self.value(default));
             }
         }
         if bound {
@@ -3080,24 +2983,24 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         Ok(Some(parameters))
     }
 
-    fn active_exception(&self) -> Option<Value<'s>> {
+    fn active_exception(&self) -> Option<Value> {
         self.exception_stack
             .last()
-            .map(|exception| self.handle(&exception.value))
+            .map(|exception| self.value(&exception.value))
     }
 
-    fn loaded_modules(&mut self) -> PyResult<'s, Value<'s>> {
+    fn loaded_modules(&mut self) -> PyResult<Value> {
         let mut names: Vec<String> = self.state.modules.keys().cloned().collect();
         names.sort();
         let mut items = Vec::with_capacity(names.len());
         for name in names {
-            let module = self.handle(&self.state.modules[&name]);
+            let module = self.value(&self.state.modules[&name]);
             items.push((self.new_string(name)?, module));
         }
         self.new_dict(items)
     }
 
-    fn register_module(&mut self, name: &str, module: Value<'s>) -> PyResult<'s, ()> {
+    fn register_module(&mut self, name: &str, module: Value) -> PyResult<()> {
         let is_module = matches!(module.native_value(), Some(NativeValue::Module(_)))
             || (module.is_object()
                 && matches!(
@@ -3124,7 +3027,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
         self.interp.process.ppid
     }
 
-    fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<'s, ()> {
+    fn send_os_signal(&mut self, pid: u32, signal: crate::process::Signal) -> PyResult<()> {
         self.interp.send_signal(pid, signal).map_err(|error| {
             if error.contains("does not exist") {
                 PyError::os_error(3, "No such process", None)
@@ -3138,7 +3041,7 @@ impl<'s> PyRuntime<'s> for Vm<'s> {
 impl<'s> Vm<'s> {
     /// The value of an immediate call a native made; an exit request propagates as the
     /// native error that unwinds to the dispatch loop.
-    fn callback_value(&mut self, flow: Flow) -> PyResult<'s, Value<'s>> {
+    fn callback_value(&mut self, flow: Flow) -> PyResult<Value> {
         match self.immediate_value(flow).map_err(PyError::runtime_error)? {
             Ok(value) => Ok(value),
             Err(Flow::Exit(status)) => Err(PyError::exit(status)),

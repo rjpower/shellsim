@@ -54,10 +54,10 @@ pub(super) trait PyModuleLoader {
         &mut self,
         roots: &[String],
         module: &str,
-    ) -> PyResult<'static, Option<(String, String)>>;
+    ) -> PyResult<Option<(String, String)>>;
 }
 
-fn charge_cpu(interp: &mut Interp, units: usize) -> PyResult<'static, ()> {
+fn charge_cpu(interp: &mut Interp, units: usize) -> PyResult<()> {
     let units = u64::try_from(units).unwrap_or(u64::MAX);
     interp
         .resources
@@ -66,7 +66,7 @@ fn charge_cpu(interp: &mut Interp, units: usize) -> PyResult<'static, ()> {
         .ok_or_else(|| PyError::resource_error("Python CPU limit exceeded"))
 }
 
-fn reserve_memory(interp: &mut Interp, bytes: usize) -> PyResult<'static, ()> {
+fn reserve_memory(interp: &mut Interp, bytes: usize) -> PyResult<()> {
     let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
     interp
         .resources
@@ -84,7 +84,7 @@ impl PyFilesystem for Interp {
         (self.vfs.disk_used(), self.vfs.disk_limit())
     }
 
-    fn change_dir(&mut self, path: &str) -> PyResult<'static, ()> {
+    fn change_dir(&mut self, path: &str) -> PyResult<()> {
         let absolute = resolve_against(&self.cwd, path);
         let resolved = self.vfs.realpath(&absolute, true).map_err(map_vfs_error)?;
         let node = self
@@ -100,7 +100,7 @@ impl PyFilesystem for Interp {
         Ok(())
     }
 
-    fn read_text(&mut self, path: &str) -> PyResult<'static, String> {
+    fn read_text(&mut self, path: &str) -> PyResult<String> {
         let length = self.fs_file_len(&self.cwd, path).map_err(map_vfs_error)?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error("text file exceeds the 4 MiB limit"));
@@ -114,7 +114,7 @@ impl PyFilesystem for Interp {
             .map_err(|_| PyError::runtime_error(format!("file is not UTF-8: {path}")))
     }
 
-    fn write_text(&mut self, path: &str, contents: &str) -> PyResult<'static, ()> {
+    fn write_text(&mut self, path: &str, contents: &str) -> PyResult<()> {
         reserve_memory(self, contents.len())?;
         charge_cpu(self, contents.len())?;
         let path = resolve_against(&self.cwd, path);
@@ -124,11 +124,11 @@ impl PyFilesystem for Interp {
             .map_err(map_vfs_error)
     }
 
-    fn append_text(&mut self, path: &str, contents: &str) -> PyResult<'static, usize> {
+    fn append_text(&mut self, path: &str, contents: &str) -> PyResult<usize> {
         self.append_python_file(path, contents.as_bytes())
     }
 
-    fn read_bytes(&mut self, path: &str) -> PyResult<'static, Vec<u8>> {
+    fn read_bytes(&mut self, path: &str) -> PyResult<Vec<u8>> {
         let length = self.fs_file_len(&self.cwd, path).map_err(map_vfs_error)?;
         if length > MAX_TEXT_FILE {
             return Err(PyError::resource_error(
@@ -141,7 +141,7 @@ impl PyFilesystem for Interp {
             .map_err(map_vfs_error)
     }
 
-    fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<'static, ()> {
+    fn write_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<()> {
         reserve_memory(self, contents.len())?;
         charge_cpu(self, contents.len())?;
         let path = resolve_against(&self.cwd, path);
@@ -151,23 +151,23 @@ impl PyFilesystem for Interp {
             .map_err(map_vfs_error)
     }
 
-    fn append_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<'static, usize> {
+    fn append_bytes(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
         self.append_python_file(path, contents)
     }
 
-    fn remove_file(&mut self, path: &str) -> PyResult<'static, ()> {
+    fn remove_file(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs.remove_file(&cwd, path).map_err(map_vfs_error)
     }
 
-    fn remove_tree(&mut self, path: &str) -> PyResult<'static, ()> {
+    fn remove_tree(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs.remove_all(&cwd, path).map_err(map_vfs_error)
     }
 
-    fn rename(&mut self, source: &str, destination: &str) -> PyResult<'static, ()> {
+    fn rename(&mut self, source: &str, destination: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs
@@ -192,7 +192,7 @@ impl PyFilesystem for Interp {
             .is_ok_and(|node| matches!(node.kind, crate::vfs::NodeKind::Symlink(_)))
     }
 
-    fn list_dir(&mut self, path: &str) -> PyResult<'static, Vec<String>> {
+    fn list_dir(&mut self, path: &str) -> PyResult<Vec<String>> {
         let entries = self.fs_list_dir(&self.cwd, path).map_err(map_vfs_error)?;
         charge_cpu(self, entries.len())?;
         reserve_memory(
@@ -202,7 +202,7 @@ impl PyFilesystem for Interp {
         Ok(entries)
     }
 
-    fn metadata(&self, path: &str, follow: bool) -> PyResult<'static, PyFileMetadata> {
+    fn metadata(&self, path: &str, follow: bool) -> PyResult<PyFileMetadata> {
         let node = self
             .fs_metadata(&self.cwd, path, follow)
             .map_err(map_vfs_error)?;
@@ -220,19 +220,19 @@ impl PyFilesystem for Interp {
         })
     }
 
-    fn rmdir(&mut self, path: &str) -> PyResult<'static, ()> {
+    fn rmdir(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs.rmdir(&cwd, path).map_err(map_vfs_error)
     }
 
-    fn chmod(&mut self, path: &str, mode: u32) -> PyResult<'static, ()> {
+    fn chmod(&mut self, path: &str, mode: u32) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs.chmod(&cwd, path, mode).map_err(map_vfs_error)
     }
 
-    fn symlink(&mut self, target: &str, link_path: &str) -> PyResult<'static, ()> {
+    fn symlink(&mut self, target: &str, link_path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         self.vfs
@@ -240,18 +240,18 @@ impl PyFilesystem for Interp {
             .map_err(map_vfs_error)
     }
 
-    fn read_link(&self, path: &str) -> PyResult<'static, String> {
+    fn read_link(&self, path: &str) -> PyResult<String> {
         self.vfs.read_link(&self.cwd, path).map_err(map_vfs_error)
     }
 
-    fn touch(&mut self, path: &str) -> PyResult<'static, ()> {
+    fn touch(&mut self, path: &str) -> PyResult<()> {
         self.sync_vfs_time();
         let cwd = self.cwd.clone();
         let now = self.vfs.mutation_time();
         self.vfs.touch(&cwd, path, now).map_err(map_vfs_error)
     }
 
-    fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<'static, ()> {
+    fn mkdir(&mut self, path: &str, parents: bool, exist_ok: bool) -> PyResult<()> {
         if exist_ok && self.vfs.is_dir(&self.cwd, path) {
             return Ok(());
         }
@@ -268,7 +268,7 @@ impl PyFilesystem for Interp {
         result.map_err(map_vfs_error)
     }
 
-    fn glob(&mut self, pattern: &str) -> PyResult<'static, Vec<String>> {
+    fn glob(&mut self, pattern: &str) -> PyResult<Vec<String>> {
         let relative = !pattern.starts_with('/');
         let absolute_pattern = resolve_against(&self.cwd, pattern);
         let pattern = glob::Pattern::new(&absolute_pattern)
@@ -304,7 +304,7 @@ impl PyFilesystem for Interp {
 }
 
 impl Interp {
-    fn append_python_file(&mut self, path: &str, contents: &[u8]) -> PyResult<'static, usize> {
+    fn append_python_file(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
         reserve_memory(self, contents.len())?;
         charge_cpu(self, contents.len())?;
         let path = resolve_against(&self.cwd, path);
@@ -321,7 +321,7 @@ impl PyModuleLoader for Interp {
         &mut self,
         roots: &[String],
         module: &str,
-    ) -> PyResult<'static, Option<(String, String)>> {
+    ) -> PyResult<Option<(String, String)>> {
         let attempts = roots.len().saturating_mul(2);
         let root_bytes = roots
             .iter()

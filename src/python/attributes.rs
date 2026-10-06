@@ -77,7 +77,7 @@ enum Storage<'h> {
     Dictionary(&'h HashMap<SymbolId, Ref>),
 }
 
-fn storage<'h>(heap: &'h Heap, instance: Value<'_>) -> Result<Storage<'h>, String> {
+fn storage<'h>(heap: &'h Heap, instance: Value) -> Result<Storage<'h>, String> {
     Ok(match heap.attributes(instance)? {
         None => Storage::Shaped {
             shape: ShapeId::ROOT,
@@ -104,7 +104,7 @@ impl Shapes {
         &self,
         heap: &Heap,
         symbols: &Symbols,
-        instance: Value<'_>,
+        instance: Value,
     ) -> Result<Vec<String>, String> {
         match storage(heap, instance)? {
             Storage::Shaped { shape, len } => (0..len)
@@ -135,12 +135,12 @@ impl Shapes {
     }
 
     /// Every attribute stored directly on an instance, as (name, value) pairs.
-    pub fn attribute_values<'s>(
+    pub fn attribute_values(
         &self,
         heap: &Heap,
         symbols: &Symbols,
-        instance: Value<'_>,
-    ) -> Result<Vec<(String, Value<'s>)>, String> {
+        instance: Value,
+    ) -> Result<Vec<(String, Value)>, String> {
         self.attribute_names(heap, symbols, instance)?
             .into_iter()
             .map(|name| {
@@ -155,12 +155,12 @@ impl Shapes {
             .collect()
     }
 
-    pub fn attribute_by_symbol<'s>(
+    pub fn attribute_by_symbol(
         &self,
         heap: &Heap,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         let slot = match heap.attributes(instance)? {
             None => None,
             Some(InstanceAttributes::Dictionary(values)) => values.get(&symbol),
@@ -168,7 +168,7 @@ impl Shapes {
                 self.slot(*shape, symbol).and_then(|slot| values.get(slot))
             }
         };
-        Ok(heap.handle_optional(slot))
+        Ok(heap.value_optional(slot))
     }
 
     /// The cacheable location of a shaped attribute, or `None` when the instance uses a
@@ -176,7 +176,7 @@ impl Shapes {
     pub fn slot_by_symbol(
         &self,
         heap: &Heap,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
     ) -> Result<Option<InstanceAttributeSlot>, String> {
         let Some(InstanceAttributes::Shaped { shape, values }) = heap.attributes(instance)? else {
@@ -259,10 +259,7 @@ impl InstanceAttributeSlot {
 /// What an inline cache keys a heap object's attribute lookups on: its type and the shape of
 /// its instance attributes, `None` when it has none. An object whose attributes live in a
 /// dictionary has no key, so no site caches it.
-pub fn site_key(
-    heap: &Heap,
-    instance: Value<'_>,
-) -> Result<Option<(TypeId, Option<ShapeId>)>, String> {
+pub fn site_key(heap: &Heap, instance: Value) -> Result<Option<(TypeId, Option<ShapeId>)>, String> {
     let (type_id, attributes) = heap.typed_attributes(instance)?;
     Ok(match attributes {
         None => Some((type_id, None)),
@@ -277,25 +274,20 @@ pub struct AttributeStore<'a> {
     pub heap: &'a mut Heap,
     pub shapes: &'a mut Shapes,
     pub symbols: &'a mut Symbols,
-    pub roots: &'a mut dyn Roots,
+    pub roots: &'a dyn Roots,
     pub resources: &'a mut Resources,
 }
 
 impl AttributeStore<'_> {
-    pub fn insert(
-        &mut self,
-        instance: Value<'_>,
-        name: &str,
-        value: Value<'_>,
-    ) -> Result<(), String> {
+    pub fn insert(&mut self, instance: Value, name: &str, value: Value) -> Result<(), String> {
         let symbol = self.symbols.intern(name, self.resources)?;
         self.insert_by_symbol(instance, symbol, value)
     }
 
-    pub fn extend<'v>(
+    pub fn extend(
         &mut self,
-        instance: Value<'_>,
-        values: impl IntoIterator<Item = (String, Value<'v>)>,
+        instance: Value,
+        values: impl IntoIterator<Item = (String, Value)>,
     ) -> Result<(), String> {
         for (name, value) in values {
             self.insert(instance, &name, value)?;
@@ -305,9 +297,9 @@ impl AttributeStore<'_> {
 
     pub fn insert_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         match storage(self.heap, instance)? {
             Storage::Dictionary(values) => {
@@ -318,28 +310,24 @@ impl AttributeStore<'_> {
                 };
                 self.heap
                     .reserve_object_growth(instance, growth, self.roots, self.resources)?;
-                self.heap
-                    .modify_attributes(instance, |builder, attributes| {
-                        let Some(InstanceAttributes::Dictionary(values)) =
+                self.heap.modify_attributes(instance, |attributes| {
+                    let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut()
+                    else {
+                        unreachable!("instance representation changed without yielding")
+                    };
+                    values.insert(symbol, Ref::from(value));
+                })
+            }
+            Storage::Shaped { shape, len } => {
+                if let Some(slot) = self.shapes.slot(shape, symbol) {
+                    return self.heap.modify_attributes(instance, |attributes| {
+                        let Some(InstanceAttributes::Shaped { values, .. }) =
                             attributes.as_deref_mut()
                         else {
                             unreachable!("instance representation changed without yielding")
                         };
-                        values.insert(symbol, builder.store(value));
-                    })
-            }
-            Storage::Shaped { shape, len } => {
-                if let Some(slot) = self.shapes.slot(shape, symbol) {
-                    return self
-                        .heap
-                        .modify_attributes(instance, |builder, attributes| {
-                            let Some(InstanceAttributes::Shaped { values, .. }) =
-                                attributes.as_deref_mut()
-                            else {
-                                unreachable!("instance representation changed without yielding")
-                            };
-                            values[slot] = builder.store(value);
-                        });
+                        values[slot] = Ref::from(value);
+                    });
                 }
                 if len >= MAX_SHAPED_ATTRIBUTES {
                     return self.insert_dictionary(instance, symbol, value);
@@ -351,10 +339,10 @@ impl AttributeStore<'_> {
 
     fn append_shaped(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         shape: ShapeId,
         symbol: SymbolId,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         // Grow the instance first: that reservation may collect, while the shape table's own
         // small charge cannot. The first attribute also pays for the storage box.
@@ -366,61 +354,59 @@ impl AttributeStore<'_> {
         self.heap
             .reserve_object_growth(instance, growth, self.roots, self.resources)?;
         let next_shape = self.shapes.transition(shape, symbol, self.resources)?;
-        self.heap
-            .modify_attributes(instance, |builder, attributes| {
-                let attributes = attributes.get_or_insert_with(Default::default);
-                let InstanceAttributes::Shaped { shape, values } = &mut **attributes else {
-                    unreachable!("instance representation changed without yielding")
-                };
-                *shape = next_shape;
-                values.push(builder.store(value));
-            })
+        self.heap.modify_attributes(instance, |attributes| {
+            let attributes = attributes.get_or_insert_with(Default::default);
+            let InstanceAttributes::Shaped { shape, values } = &mut **attributes else {
+                unreachable!("instance representation changed without yielding")
+            };
+            *shape = next_shape;
+            values.push(Ref::from(value));
+        })
     }
 
     /// Remove one instance attribute and return its value, or `None` when the instance does
     /// not have it. A shaped instance first converts to dictionary storage, because shapes only
     /// grow; attribute caches never match dictionary instances, so they stay valid.
-    pub fn remove_by_symbol<'s>(
+    pub fn remove_by_symbol(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         if let Storage::Shaped { shape, .. } = storage(self.heap, instance)? {
             if self.shapes.slot(shape, symbol).is_none() {
                 return Ok(None);
             }
             self.convert_to_dictionary(instance, 0)?;
         }
-        let removed = self.heap.modify_attributes(instance, |_, attributes| {
+        let removed = self.heap.modify_attributes(instance, |attributes| {
             let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
                 unreachable!("instance was converted to dictionary storage")
             };
             values.remove(&symbol)
         })?;
-        Ok(self.heap.handle_optional(removed.as_ref()))
+        Ok(self.heap.value_optional(removed.as_ref()))
     }
 
     fn insert_dictionary(
         &mut self,
-        instance: Value<'_>,
+        instance: Value,
         symbol: SymbolId,
-        value: Value<'_>,
+        value: Value,
     ) -> Result<(), String> {
         if !self.convert_to_dictionary(instance, INSTANCE_DICT_ENTRY_BYTES)? {
             return self.insert_by_symbol(instance, symbol, value);
         }
-        self.heap
-            .modify_attributes(instance, |builder, attributes| {
-                let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
-                    unreachable!("instance was converted to dictionary storage")
-                };
-                values.insert(symbol, builder.store(value));
-            })
+        self.heap.modify_attributes(instance, |attributes| {
+            let Some(InstanceAttributes::Dictionary(values)) = attributes.as_deref_mut() else {
+                unreachable!("instance was converted to dictionary storage")
+            };
+            values.insert(symbol, Ref::from(value));
+        })
     }
 
     /// Move a shaped instance's attributes into dictionary storage, reserving `extra` more
     /// bytes. Returns `false` when the instance already uses a dictionary.
-    fn convert_to_dictionary(&mut self, instance: Value<'_>, extra: u64) -> Result<bool, String> {
+    fn convert_to_dictionary(&mut self, instance: Value, extra: u64) -> Result<bool, String> {
         let (shape, shaped_len, boxed) = match self.heap.attributes(instance)? {
             None => (ShapeId::ROOT, 0, false),
             Some(InstanceAttributes::Shaped { shape, values }) => (*shape, values.len(), true),
@@ -443,7 +429,7 @@ impl AttributeStore<'_> {
                     .ok_or("invalid instance shape slot")
             })
             .collect::<Result<Vec<_>, _>>()?;
-        self.heap.modify_attributes(instance, |_, attributes| {
+        self.heap.modify_attributes(instance, |attributes| {
             let attributes = attributes.get_or_insert_with(Default::default);
             let InstanceAttributes::Shaped { values, .. } = &mut **attributes else {
                 unreachable!("instance representation changed without yielding")

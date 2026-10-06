@@ -1,9 +1,9 @@
 //! Iteration, generator suspension, and sequence unpacking.
 //!
 //! A suspended generator keeps its operand stack, exception stack and lexical scope as stored
-//! references inside its heap object. Resuming it moves the caller's operands aside as handles,
-//! installs the saved stack, and runs the frame in a child handle scope; suspending stores the
-//! frame's state back into the object before that scope ends.
+//! references inside its heap object. Resuming it moves the caller's operands aside as pinned
+//! values, installs the saved stack, and runs the frame in a child pin scope; suspending stores
+//! the frame's state back into the object before that scope ends.
 
 use super::super::heap::Ref;
 use super::{
@@ -12,30 +12,30 @@ use super::{
     PyStreamRead, RaisedException, Slot, SlotValue, Stream, Value, Vm,
 };
 
-/// An exception on its way into or out of a generator frame, with its value as a handle so it
-/// can be held across allocation. [`RaisedException`] is its stored form.
+/// An exception on its way into or out of a generator frame, with its value pinned so it can be
+/// held across allocation. [`RaisedException`] is its stored form.
 #[derive(Clone)]
-struct ThrownException<'s> {
+struct ThrownException {
     kind: String,
-    value: Value<'s>,
+    value: Value,
 }
 
 /// How a suspended generator resumes: with the value of its `yield` expression, or with an
 /// exception raised at that `yield`.
-enum GeneratorResume<'s> {
-    Send(Value<'s>),
-    Throw(ThrownException<'s>),
+enum GeneratorResume {
+    Send(Value),
+    Throw(ThrownException),
 }
 
 /// What became of an exception thrown into a generator suspended in `yield from`, after
 /// [`Vm::forward_throw`] passed it to the subiterator.
-enum ForwardedThrow<'s> {
+enum ForwardedThrow {
     /// The subiterator yielded this value; the delegating generator stays suspended.
-    Yielded(Value<'s>),
+    Yielded(Value),
     /// The subiterator returned this value, which becomes the value of `yield from`.
-    Returned(Value<'s>),
+    Returned(Value),
     /// Raise this exception at the delegating generator's `yield from`.
-    Raise(ThrownException<'s>),
+    Raise(ThrownException),
 }
 
 /// An iterator classified by [`Vm::advance_iterator`] whose advance needs a second pass over
@@ -52,16 +52,16 @@ enum SlowPathAdvance {
 }
 
 /// The end of one generator step, with any value re-rooted in the step's scope.
-enum GeneratorStep<'s> {
-    Yielded(Value<'s>, usize),
-    Returned(Value<'s>),
+enum GeneratorStep {
+    Yielded(Value, usize),
+    Returned(Value),
     Finished,
 }
 
 impl<'s> Vm<'s> {
     /// `reversed(x)` consults the type's reverse slot before the length and indexed sequence
     /// protocol. It does not accept an arbitrary iterable as a sequence.
-    pub(super) fn reverse_value(&mut self, value: Value<'s>) -> Result<Value<'s>, String> {
+    pub(super) fn reverse_value(&mut self, value: Value) -> Result<Value, String> {
         if let Some(iterator) =
             self.invoke_slot(&value, Slot::Reversed, "__reversed__", Vec::new())?
         {
@@ -110,10 +110,7 @@ impl<'s> Vm<'s> {
 
     /// The native list, tuple and range reverse slots use physical payload indexing, so an
     /// inherited slot does not re-enter a subclass's `__getitem__` override.
-    pub(super) fn reverse_builtin_sequence(
-        &mut self,
-        value: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+    pub(super) fn reverse_builtin_sequence(&mut self, value: Value) -> Result<Value, String> {
         let subject = value;
         let length = self
             .physical_length(subject)?
@@ -121,9 +118,9 @@ impl<'s> Vm<'s> {
         self.reverse_items(subject, length)
     }
 
-    fn reverse_items(&mut self, value: Value<'s>, length: usize) -> Result<Value<'s>, String> {
-        self.alloc_with(|builder| Object::ReverseIterator {
-            owner: builder.store(value),
+    fn reverse_items(&mut self, value: Value, length: usize) -> Result<Value, String> {
+        self.alloc(Object::ReverseIterator {
+            owner: Ref::from(value),
             next: length,
         })
     }
@@ -135,7 +132,7 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    pub(super) fn make_iterator(&mut self, iterable: Value<'s>) -> Result<Value<'s>, String> {
+    pub(super) fn make_iterator(&mut self, iterable: Value) -> Result<Value, String> {
         if let Some(NativeValue::Stream(stream)) = iterable.native_value() {
             if matches!(stream, Stream::Stdin | Stream::StdinBuffer) {
                 // `for line in sys.stdin` needs a heap-object iterator (not the generic
@@ -156,8 +153,8 @@ impl<'s> Vm<'s> {
             return Ok(iterator);
         }
         let values = self.iterable_values(&iterable)?;
-        self.alloc_with(|builder| Object::Iterator {
-            values: builder.refs(values),
+        self.alloc(Object::Iterator {
+            values: Ref::all(values),
             position: 0,
         })
     }
@@ -166,16 +163,13 @@ impl<'s> Vm<'s> {
     /// what the builtin `__iter__` slots return, so `str.__iter__(instance)` does not dispatch
     /// back into a subclass's override. Returns `None` when the payload is not a builtin
     /// iterable.
-    pub(super) fn payload_iterator(
-        &mut self,
-        iterable: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn payload_iterator(&mut self, iterable: Value) -> Result<Option<Value>, String> {
         if iterable.is_object() {
             match self.get(iterable)? {
                 Object::List(_) | Object::Tuple(_) => {
                     return self
-                        .alloc_with(|builder| Object::SequenceIterator {
-                            owner: builder.store(iterable),
+                        .alloc(Object::SequenceIterator {
+                            owner: Ref::from(iterable),
                             position: 0,
                         })
                         .map(Some);
@@ -212,10 +206,7 @@ impl<'s> Vm<'s> {
     /// Builtin strings, byte strings and hash containers keep their existing snapshot iteration
     /// behavior, but enter it before their new `__iter__` slots to avoid redispatching into the
     /// native wrapper. Copying one element at a time charges its retained size before the next.
-    fn snapshot_builtin_iterator(
-        &mut self,
-        iterable: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    fn snapshot_builtin_iterator(&mut self, iterable: Value) -> Result<Option<Value>, String> {
         let mut values = Vec::new();
         if let Some(text) = string::string_value(&self.state.heap, iterable)? {
             for character in text.chars() {
@@ -228,9 +219,9 @@ impl<'s> Vm<'s> {
             }
         } else if iterable.is_object() {
             let members = match self.get(iterable)? {
-                Object::Set(items) | Object::FrozenSet(items) => self.handles(items.iter()),
+                Object::Set(items) | Object::FrozenSet(items) => self.values(items.iter()),
                 Object::Dict(entries) | Object::DefaultDict { entries, .. } => {
-                    self.handles(entries.iter().map(|(key, _)| key))
+                    self.values(entries.iter().map(|(key, _)| key))
                 }
                 _ => return Ok(None),
             };
@@ -240,8 +231,8 @@ impl<'s> Vm<'s> {
         } else {
             return Ok(None);
         }
-        self.alloc_with(|builder| Object::Iterator {
-            values: builder.refs(values),
+        self.alloc(Object::Iterator {
+            values: Ref::all(values),
             position: 0,
         })
         .map(Some)
@@ -249,7 +240,7 @@ impl<'s> Vm<'s> {
 
     /// Whether `value` is an iterator: one of the runtime's lazy iterator objects, or an object
     /// whose class defines `__next__`.
-    pub(super) fn is_iterator(&self, value: &Value<'s>) -> Result<bool, String> {
+    pub(super) fn is_iterator(&self, value: &Value) -> Result<bool, String> {
         if value.is_object()
             && matches!(
                 self.get(*value)?,
@@ -278,10 +269,7 @@ impl<'s> Vm<'s> {
     /// A class that sets `__iter__ = None` declares its instances not iterable, even when it
     /// defines `__getitem__`, and an `__iter__` that returns something other than an iterator
     /// raises `TypeError`.
-    pub(super) fn class_iterator(
-        &mut self,
-        iterable: &Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn class_iterator(&mut self, iterable: &Value) -> Result<Option<Value>, String> {
         match self.state.types.slot(self.type_id(iterable)?, Slot::Iter)? {
             None => return Ok(None),
             Some(SlotValue::Descriptor {
@@ -306,10 +294,7 @@ impl<'s> Vm<'s> {
 
     /// The next item of `iterator`, or `None` once it is exhausted. A `StopIteration` raised by
     /// a class's `__next__` ends the iteration rather than propagating.
-    pub(super) fn next_until_stop(
-        &mut self,
-        iterator: &Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn next_until_stop(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
         match self.iterator_next(iterator) {
             Err(_) if self.pending_stop_iteration() => {
                 self.pending_exception = None;
@@ -320,7 +305,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Classify and, where possible, advance one iterator with a single heap lookup.
-    fn advance_iterator(&mut self, iterator: Value<'s>) -> Result<IteratorAdvance<'s>, String> {
+    fn advance_iterator(&mut self, iterator: Value) -> Result<IteratorAdvance, String> {
         let slow_path = match self.get_mut(iterator)? {
             Object::Iterator { values, position } => {
                 if *position >= values.len() {
@@ -379,17 +364,17 @@ impl<'s> Vm<'s> {
                 let Object::Iterator { values, .. } = self.get(iterator)? else {
                     unreachable!("iterator kind was checked above")
                 };
-                let value = self.handle(&values[index]);
+                let value = self.value(&values[index]);
                 Ok(IteratorAdvance::Yield(value))
             }
             SlowPathAdvance::Sequence(position) => {
                 let Object::SequenceIterator { owner, .. } = self.get(iterator)? else {
                     unreachable!("iterator kind was checked above")
                 };
-                let owner = self.handle(owner);
+                let owner = self.value(owner);
                 let value = match self.get(owner)? {
                     Object::List(values) | Object::Tuple(values) => {
-                        self.handle_optional(values.get(position))
+                        self.value_optional(values.get(position))
                     }
                     _ => return Err("iterator source changed object kind".into()),
                 };
@@ -406,7 +391,7 @@ impl<'s> Vm<'s> {
                 let Object::ReverseIterator { owner, .. } = self.get(iterator)? else {
                     unreachable!("iterator kind was checked above")
                 };
-                let owner = self.handle(owner);
+                let owner = self.value(owner);
                 self.charge_cpu(1)?;
                 let index = i64::try_from(index)
                     .map_err(|_| self.raise_exception("OverflowError", "sequence is too large"))?;
@@ -421,8 +406,8 @@ impl<'s> Vm<'s> {
                     unreachable!("iterator kind was checked above")
                 };
                 Ok(IteratorAdvance::Callable {
-                    callable: self.handle(callable),
-                    sentinel: self.handle(sentinel),
+                    callable: self.value(callable),
+                    sentinel: self.value(sentinel),
                 })
             }
             SlowPathAdvance::Stream(binary) => self.advance_stream_iterator(binary),
@@ -431,7 +416,7 @@ impl<'s> Vm<'s> {
 
     /// Read one line from `sys.stdin`/`sys.stdin.buffer` for a `for` loop, suspending on the same
     /// `WaitReason` a direct `readline()` call would produce.
-    fn advance_stream_iterator(&mut self, binary: bool) -> Result<IteratorAdvance<'s>, String> {
+    fn advance_stream_iterator(&mut self, binary: bool) -> Result<IteratorAdvance, String> {
         let stream = if binary {
             Stream::StdinBuffer
         } else {
@@ -457,8 +442,8 @@ impl<'s> Vm<'s> {
 
     pub(super) fn next_stored_iterator(
         &mut self,
-        iterator: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+        iterator: Value,
+    ) -> Result<Option<Value>, String> {
         match self.advance_iterator(iterator)? {
             IteratorAdvance::Yield(value) => Ok(Some(value)),
             IteratorAdvance::Exhausted => Ok(None),
@@ -473,7 +458,7 @@ impl<'s> Vm<'s> {
         }
     }
 
-    fn exhaust_callable_iterator(&mut self, iterator: Value<'s>) -> Result<(), String> {
+    fn exhaust_callable_iterator(&mut self, iterator: Value) -> Result<(), String> {
         let Object::CallableIterator { exhausted, .. } = self.get_mut(iterator)? else {
             return Err("iterator changed object kind".into());
         };
@@ -510,7 +495,7 @@ impl<'s> Vm<'s> {
                 for value in values[tail_start..tail_end].iter().copied() {
                     self.push_materialized(&mut tail, value)?;
                 }
-                outputs.push(self.alloc_with(|builder| Object::List(builder.refs(tail)))?);
+                outputs.push(self.alloc(Object::List(Ref::all(tail)))?);
             } else {
                 let source_index = if index < star_index {
                     index
@@ -530,7 +515,7 @@ impl<'s> Vm<'s> {
     /// Unpack `value` into exactly `expected` targets. As in CPython, only an exact list, tuple
     /// or dict reports how many items it held when there are too many; any other iterable is
     /// read one item past `expected`, so unpacking an infinite iterator still fails.
-    fn unpack_exactly(&mut self, value: Value<'s>, expected: usize) -> Result<(), String> {
+    fn unpack_exactly(&mut self, value: Value, expected: usize) -> Result<(), String> {
         let known_length = if value.is_object() {
             match self.get(value)? {
                 Object::List(values) | Object::Tuple(values) => Some(values.len()),
@@ -716,7 +701,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The generator `value` refers to, unless it is some other kind of iterator.
-    fn suspendable_generator(&self, value: &Value<'s>) -> Result<Option<Value<'s>>, String> {
+    fn suspendable_generator(&self, value: &Value) -> Result<Option<Value>, String> {
         if !value.is_object() {
             return Ok(None);
         }
@@ -724,19 +709,19 @@ impl<'s> Vm<'s> {
     }
 
     /// Take the value a generator returned, leaving `None` behind so that it is reported once.
-    fn take_return_value(&mut self, generator: Value<'s>) -> Result<Value<'s>, String> {
-        let returned = self.modify(generator, |builder, object| match object {
+    fn take_return_value(&mut self, generator: Value) -> Result<Value, String> {
+        let returned = self.modify(generator, |object| match object {
             Object::Generator(state) => Ok(std::mem::replace(
                 &mut state.return_value,
-                builder.store(Value::None),
+                Ref::from(Value::None),
             )),
             _ => Err(String::from("object is not a generator")),
         })??;
-        Ok(self.handle(&returned))
+        Ok(self.value(&returned))
     }
 
     /// Make `exception` the pending exception.
-    fn set_pending_thrown(&mut self, exception: ThrownException<'s>) {
+    fn set_pending_thrown(&mut self, exception: ThrownException) {
         let value = self.store(exception.value);
         self.pending_exception = Some(RaisedException {
             kind: exception.kind,
@@ -744,11 +729,11 @@ impl<'s> Vm<'s> {
         });
     }
 
-    /// Take the pending exception as a handle.
-    fn take_pending_thrown(&mut self) -> Option<ThrownException<'s>> {
+    /// Take the pending exception, pinning its value.
+    fn take_pending_thrown(&mut self) -> Option<ThrownException> {
         let exception = self.pending_exception.take()?;
         Some(ThrownException {
-            value: self.handle(&exception.value),
+            value: self.value(&exception.value),
             kind: exception.kind,
         })
     }
@@ -756,7 +741,7 @@ impl<'s> Vm<'s> {
     /// Close a generator as `generator.close()` does: raise `GeneratorExit` at its suspension
     /// point and let it run its cleanup. A generator that yields again instead raises
     /// `RuntimeError`; any other exception it raises stays pending.
-    pub(super) fn close_generator(&mut self, generator: Value<'s>) -> Result<(), String> {
+    pub(super) fn close_generator(&mut self, generator: Value) -> Result<(), String> {
         let value = self.allocate_exception("GeneratorExit".into(), String::new())?;
         let exit = ThrownException {
             kind: "GeneratorExit".into(),
@@ -790,9 +775,9 @@ impl<'s> Vm<'s> {
     /// exception is raised in the delegating generator.
     fn forward_throw(
         &mut self,
-        subiterator: &Value<'s>,
-        exception: ThrownException<'s>,
-    ) -> Result<ForwardedThrow<'s>, String> {
+        subiterator: &Value,
+        exception: ThrownException,
+    ) -> Result<ForwardedThrow, String> {
         let generator = self.suspendable_generator(subiterator)?;
         if exception.kind == "GeneratorExit" {
             let closed = match generator {
@@ -837,9 +822,9 @@ impl<'s> Vm<'s> {
     /// value.
     fn call_subiterator_method(
         &mut self,
-        method: Value<'s>,
-        argument: Value<'s>,
-    ) -> Result<ForwardedThrow<'s>, String> {
+        method: Value,
+        argument: Value,
+    ) -> Result<ForwardedThrow, String> {
         let result = <Self as PyRuntime>::call_value(
             self,
             method,
@@ -864,25 +849,22 @@ impl<'s> Vm<'s> {
     /// Resume one generator frame until its next yield or terminal return. A generator's operand
     /// stack is kept separate from its caller's stack, while its lexical scope remains in the
     /// shared heap so closures and mutations preserve normal Python aliasing.
-    pub(super) fn resume_generator(
-        &mut self,
-        generator: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn resume_generator(&mut self, generator: Value) -> Result<Option<Value>, String> {
         self.resume_generator_with(generator, Value::None)
     }
 
     pub(super) fn resume_generator_with(
         &mut self,
-        generator: Value<'s>,
-        sent: Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+        generator: Value,
+        sent: Value,
+    ) -> Result<Option<Value>, String> {
         self.resume_generator_frame(generator, GeneratorResume::Send(sent))
     }
 
     /// Raise the `StopIteration` that ends iteration over `iterator`. A generator that has just
     /// returned passes its return value as the exception's `value`, once; later calls, and
     /// other iterators, raise it without arguments.
-    pub(super) fn raise_stop_iteration(&mut self, iterator: &Value<'s>) -> String {
+    pub(super) fn raise_stop_iteration(&mut self, iterator: &Value) -> String {
         let returned = if self
             .suspendable_generator(iterator)
             .ok()
@@ -901,7 +883,7 @@ impl<'s> Vm<'s> {
         self.raise_exception_args("StopIteration", args)
     }
 
-    fn set_generator_running(&mut self, generator: Value<'s>, value: bool) -> Result<(), String> {
+    fn set_generator_running(&mut self, generator: Value, value: bool) -> Result<(), String> {
         if let Object::Generator(state) = self.get_mut(generator)? {
             state.running = value;
         }
@@ -916,34 +898,34 @@ impl<'s> Vm<'s> {
     /// including one thrown before it starts or after it finishes, stays pending and closes it.
     pub(super) fn throw_into_generator(
         &mut self,
-        generator: Value<'s>,
+        generator: Value,
         exception: RaisedException,
-    ) -> Result<Option<Value<'s>>, String> {
+    ) -> Result<Option<Value>, String> {
         let exception = ThrownException {
-            value: self.handle(&exception.value),
+            value: self.value(&exception.value),
             kind: exception.kind,
         };
         self.resume_generator_frame(generator, GeneratorResume::Throw(exception))
     }
 
-    /// Run one generator step in a child handle scope, so the handles the step creates are
+    /// Run one generator step in a child pin scope, so the pins the step creates are
     /// released when it suspends; the yielded value crosses back as a stored reference.
     fn resume_generator_frame(
         &mut self,
-        generator: Value<'s>,
-        resume: GeneratorResume<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+        generator: Value,
+        resume: GeneratorResume,
+    ) -> Result<Option<Value>, String> {
         let yielded = {
             let mut vm = self.scope();
             vm.run_generator_step(generator, resume)?
         };
-        Ok(yielded.map(|value| self.handle(&value)))
+        Ok(yielded.map(|value| self.value(&value)))
     }
 
     fn run_generator_step(
         &mut self,
-        generator: Value<'s>,
-        resume: GeneratorResume<'s>,
+        generator: Value,
+        resume: GeneratorResume,
     ) -> Result<Option<Ref>, String> {
         const MAX_GENERATOR_DEPTH: usize = 256;
         if self.call_depth >= MAX_GENERATOR_DEPTH {
@@ -953,14 +935,14 @@ impl<'s> Vm<'s> {
             return Err("object is not a generator".into());
         };
         let code = state.code.clone();
-        let function = self.handle(&state.function);
-        let scope = self.handle(&state.scope);
+        let function = self.value(&state.function);
+        let scope = self.value(&state.scope);
         let mut instruction_pointer = state.instruction_pointer;
         let mut handlers = state.handlers.clone();
         let contexts = state.contexts.iter().map(Ref::dup).collect();
         let exhausted = state.exhausted;
         let running = state.running;
-        let subiterator = self.handle_optional(state.stack.last());
+        let subiterator = self.value_optional(state.stack.last());
         if running {
             return Err("generator already executing".into());
         }
@@ -1021,12 +1003,12 @@ impl<'s> Vm<'s> {
             }
         }
         self.set_generator_running(generator, true)?;
-        // Move the caller's operands and exceptions aside as handles, which keep them rooted,
+        // Move the caller's operands and exceptions aside as pinned values, which keep them live,
         // and install the generator's saved frame state in their place.
         let outer_stack = self.execution.stack.split_off(&self.state.heap, 0);
         let outer_exceptions = std::mem::take(&mut self.execution.exception_stack)
             .into_iter()
-            .map(|exception| (exception.kind, self.handle(&exception.value)))
+            .map(|exception| (exception.kind, self.value(&exception.value)))
             .collect::<Vec<_>>();
         let generator_exceptions = {
             let Object::Generator(state) = self.state.heap.get(generator)? else {
@@ -1038,7 +1020,7 @@ impl<'s> Vm<'s> {
                 .iter()
                 .map(|(kind, value)| RaisedException {
                     kind: kind.clone(),
-                    value: self.state.heap.store(self.state.heap.handle(value)),
+                    value: Ref::from(self.state.heap.value(value)),
                 })
                 .collect::<Vec<_>>()
         };
@@ -1082,14 +1064,14 @@ impl<'s> Vm<'s> {
         } = resume;
         // Re-root the frame's result before anything below can allocate.
         let result = result.map(|flow| match flow {
-            Flow::Yield(value) => GeneratorStep::Yielded(self.handle(&value), next_instruction),
-            Flow::Return(value) => GeneratorStep::Returned(self.handle(&value)),
+            Flow::Yield(value) => GeneratorStep::Yielded(self.value(&value), next_instruction),
+            Flow::Return(value) => GeneratorStep::Returned(self.value(&value)),
             Flow::Halt | Flow::Exit(_) => GeneratorStep::Finished,
             flow => unreachable!("a generator step cannot end with {flow:?}"),
         });
         let generator_exceptions = std::mem::take(&mut self.execution.exception_stack)
             .into_iter()
-            .map(|exception| (exception.kind, self.handle(&exception.value)))
+            .map(|exception| (exception.kind, self.value(&exception.value)))
             .collect::<Vec<_>>();
         for (kind, value) in outer_exceptions {
             let value = self.store(value);
@@ -1102,27 +1084,27 @@ impl<'s> Vm<'s> {
 
         match result {
             Ok(GeneratorStep::Yielded(value, next_instruction)) => {
-                self.modify(generator, |builder, object| {
+                self.modify(generator, |object| {
                     if let Object::Generator(state) = object {
                         state.instruction_pointer = next_instruction;
                         state.handlers = handlers;
                         state.contexts = contexts;
                         state.exceptions = generator_exceptions
                             .into_iter()
-                            .map(|(kind, value)| (kind, builder.store(value)))
+                            .map(|(kind, value)| (kind, Ref::from(value)))
                             .collect();
-                        state.stack = builder.refs(frame_result_stack);
+                        state.stack = Ref::all(frame_result_stack);
                         state.running = false;
                     }
                 })?;
                 Ok(Some(self.store(value)))
             }
             Ok(GeneratorStep::Returned(value)) => {
-                self.modify(generator, |builder, object| {
+                self.modify(generator, |object| {
                     if let Object::Generator(state) = object {
                         state.exhausted = true;
                         state.running = false;
-                        state.return_value = builder.store(value);
+                        state.return_value = Ref::from(value);
                     }
                 })?;
                 Ok(None)

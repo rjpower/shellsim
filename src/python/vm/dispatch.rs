@@ -22,7 +22,7 @@ impl<'s> Vm<'s> {
     pub(super) fn execute_code(
         &mut self,
         code: &CodeRef,
-        entry: FrameEntry<'_>,
+        entry: FrameEntry,
     ) -> Result<Flow, (String, super::super::source::Span)> {
         let mut resume = ResumePoint {
             instruction_pointer: 0,
@@ -41,7 +41,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         resume: &mut ResumePoint,
         stack_base: usize,
-        entry: FrameEntry<'_>,
+        entry: FrameEntry,
     ) -> Result<Flow, (String, super::super::source::Span)> {
         let frame = self
             .enter_frame(code, resume.instruction_pointer, stack_base, entry, false)
@@ -83,7 +83,7 @@ impl<'s> Vm<'s> {
         code: &CodeRef,
         instruction_pointer: usize,
         stack_base: usize,
-        entry: FrameEntry<'_>,
+        entry: FrameEntry,
         called: bool,
     ) -> Result<BytecodeFrame, String> {
         let code_cache = frame_index(self.ensure_code_cache(code)?)?;
@@ -122,10 +122,10 @@ impl<'s> Vm<'s> {
         &mut self,
         budget: usize,
     ) -> Result<Flow, (String, super::super::source::Span)> {
-        // Handles made while executing live in this child scope and die with each instruction;
+        // Pins made while executing live in this child scope and die with each instruction;
         // only stored references in the VM's roots carry values from one instruction to the next.
-        // An instruction that works in place on the operand stack makes no handle at all, so
-        // the operand stack, a root, is what keeps its values alive.
+        // An instruction that works in place on the operand stack pins nothing at all, so the
+        // operand stack, a root, is what keeps its values alive.
         let mut vm = self.scope();
         // The VM runs synchronously for one bounded quantum. Interrupt state can change only when
         // control returns to the scheduler, so one check defines the quantum's safe-point edge.
@@ -179,7 +179,7 @@ impl<'s> Vm<'s> {
                 return Ok(Flow::Exit(137));
             }
             *executed += 1;
-            // Handles and native scratch live for one semantic instruction. Releasing the
+            // Pins and native scratch live for one semantic instruction. Releasing the
             // previous instruction's here avoids double-counting a materialized result after it
             // has moved into a heap object.
             self.reset_scope_if_used();
@@ -614,10 +614,7 @@ impl<'s> Vm<'s> {
 
     /// The value of a call made in [`CallMode::Immediate`], which leaves it on the operand
     /// stack; an exit request propagates as the flow to return from the current arm.
-    pub(super) fn immediate_value(
-        &mut self,
-        flow: Flow,
-    ) -> Result<Result<Value<'s>, Flow>, String> {
+    pub(super) fn immediate_value(&mut self, flow: Flow) -> Result<Result<Value, Flow>, String> {
         match flow {
             Flow::Next => self.pop().map(Ok),
             Flow::Exit(status) => Ok(Err(Flow::Exit(status))),
@@ -652,7 +649,7 @@ impl<'s> Vm<'s> {
         }
         let (success, value) = match self.get(outcome)? {
             super::super::heap::Object::Tuple(items) if items.len() == 2 => {
-                (self.handle(&items[0]), self.handle(&items[1]))
+                (self.value(&items[0]), self.value(&items[1]))
             }
             _ => return Err("invalid coroutine scheduler outcome".into()),
         };
@@ -823,14 +820,14 @@ impl<'s> Vm<'s> {
         self.call(3, &[], &[false, false, false], CallMode::Immediate)
     }
 
-    /// The innermost handled exception's kind and value, as a handle that stays valid while
+    /// The innermost handled exception's kind and value, pinned so it stays valid while
     /// `__exit__` runs guest code.
-    fn active_exception(&self) -> Result<(String, Value<'s>), String> {
+    fn active_exception(&self) -> Result<(String, Value), String> {
         let exception = self.exception_stack.last().ok_or("no active exception")?;
-        Ok((exception.kind.clone(), self.handle(&exception.value)))
+        Ok((exception.kind.clone(), self.value(&exception.value)))
     }
 
-    fn exception_class(&self, kind: &str, value: &Value<'s>) -> Result<Value<'s>, String> {
+    fn exception_class(&self, kind: &str, value: &Value) -> Result<Value, String> {
         // A builtin exception instance has no class object; its class is the registered type.
         if exception_types::exception_base(self.state, *value)?.is_some()
             && self.instance_class(*value)?.is_none()
@@ -848,7 +845,7 @@ impl<'s> Vm<'s> {
     fn dispatch_async_with_finish_exception(&mut self) -> Result<Flow, String> {
         let suppress = self.pop()?;
         let exception = self.exception_stack.pop().ok_or("no active exception")?;
-        let (kind, value) = (exception.kind, self.handle(&exception.value));
+        let (kind, value) = (exception.kind, self.value(&exception.value));
         if self.truth_value(&suppress)? {
             self.pending_exception = None;
             Ok(Flow::Next)
@@ -898,8 +895,8 @@ impl<'s> Vm<'s> {
         }
     }
 
-    /// `LoadLocal`: copy a local slot's stored reference onto the operand stack without making
-    /// a handle.
+    /// `LoadLocal`: copy a local slot's stored reference onto the operand stack without pinning
+    /// it.
     #[inline(always)]
     fn load_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
         let value = match locals {
@@ -925,8 +922,8 @@ impl<'s> Vm<'s> {
         Ok(())
     }
 
-    /// `StoreLocal`: move the operand stack's top reference into a local slot without making a
-    /// handle for it.
+    /// `StoreLocal`: move the operand stack's top reference into a local slot without pinning
+    /// it.
     #[inline(always)]
     fn store_fast(&mut self, locals: LocalsLocation, slot: usize) -> Result<(), String> {
         if self.frame_stack_len() == 0 {

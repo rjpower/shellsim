@@ -26,10 +26,10 @@ static MODULE_SIGNATURE: Signature =
     Signature::new("searchsorted", &["a", "v", "side", "sorter"], 2);
 static METHOD_SIGNATURE: Signature = Signature::new("searchsorted", &["v", "side", "sorter"], 1);
 
-pub(in crate::python) fn module_searchsorted<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(in crate::python) fn module_searchsorted(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
+) -> PyResult {
     let bound = MODULE_SIGNATURE.bind(&args)?;
     searchsorted(
         runtime,
@@ -40,11 +40,11 @@ pub(in crate::python) fn module_searchsorted<'s>(
     )
 }
 
-pub(in crate::python) fn method_searchsorted<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver_value: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(in crate::python) fn method_searchsorted(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     let bound = METHOD_SIGNATURE.bind(&args)?;
     searchsorted(
         runtime,
@@ -63,10 +63,7 @@ fn depth_error(ndim: usize) -> PyError {
     }
 }
 
-fn parse_side<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    side: Option<PyValue<'s>>,
-) -> PyResult<'s, bool> {
+fn parse_side(runtime: &mut dyn PyRuntime, side: Option<PyValue>) -> PyResult<bool> {
     let Some(value) = side else { return Ok(false) };
     let text = runtime.string_value(&value)?.unwrap_or_default();
     match text.as_str() {
@@ -79,11 +76,11 @@ fn parse_side<'s>(
 }
 
 /// `sorter`'s int64 values, checked for an integer dtype and matching length.
-fn parse_sorter<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    sorter: Option<PyValue<'s>>,
+fn parse_sorter(
+    runtime: &mut dyn PyRuntime,
+    sorter: Option<PyValue>,
     n: usize,
-) -> PyResult<'s, Option<Vec<i64>>> {
+) -> PyResult<Option<Vec<i64>>> {
     let Some(value) = sorter else { return Ok(None) };
     let array = convert::as_array(runtime, value)?;
     if !array.dtype.is_integer() {
@@ -117,13 +114,13 @@ fn binary_search(n: usize, right: bool, mut cmp: impl FnMut(usize) -> Ordering) 
     lo
 }
 
-fn searchsorted<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    a_value: PyValue<'s>,
-    v_value: PyValue<'s>,
-    side: Option<PyValue<'s>>,
-    sorter: Option<PyValue<'s>>,
-) -> PyResult<'s> {
+fn searchsorted(
+    runtime: &mut dyn PyRuntime,
+    a_value: PyValue,
+    v_value: PyValue,
+    side: Option<PyValue>,
+    sorter: Option<PyValue>,
+) -> PyResult {
     let a = convert::as_array(runtime, a_value)?;
     if a.ndim() != 1 {
         return Err(depth_error(a.ndim()));
@@ -209,7 +206,7 @@ fn searchsorted<'s>(
 }
 
 /// `array`'s elements as one contiguous UCS-4 buffer, in C order (1-D, so that is index order).
-fn str_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'s, Vec<u8>> {
+fn str_bytes(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<Vec<u8>> {
     match array::contiguous_buffer(runtime, array)? {
         PyArrayBuffer::Bytes(bytes) => Ok(bytes),
         PyArrayBuffer::Values(_) => unreachable!("str arrays are byte-backed"),

@@ -331,29 +331,29 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
 };
 
-fn native_acosh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_acosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "acosh")
 }
 
-fn native_asinh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_asinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "asinh")
 }
 
-fn native_atanh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_atanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "atanh")
 }
 
-fn native_cosh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_cosh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "cosh")
 }
 
-fn native_gamma<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_gamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "gamma")
 }
 
 /// `math.isclose(a, b, *, rel_tol=1e-09, abs_tol=0.0)`, binding its four parameters as CPython
 /// does: `a` and `b` by position or name, and the tolerances by name only.
-fn native_isclose<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_isclose(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     const NAMES: [&str; 4] = ["a", "b", "rel_tol", "abs_tol"];
     let positional = args.positional();
     if positional.len() > 2 {
@@ -362,7 +362,7 @@ fn native_isclose<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
             positional.len()
         )));
     }
-    let mut bound: [Option<Value<'s>>; 4] = [None; 4];
+    let mut bound: [Option<Value>; 4] = [None; 4];
     for (slot, value) in bound.iter_mut().zip(positional) {
         *slot = Some(*value);
     }
@@ -400,35 +400,35 @@ fn native_isclose<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
         .map_err(math_error)
 }
 
-fn native_lgamma<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_lgamma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "lgamma")
 }
 
-fn native_sinh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_sinh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "sinh")
 }
 
-fn native_tanh<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_tanh(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "tanh")
 }
 
-fn native_acos<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_acos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "acos")
 }
 
-fn native_asin<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_asin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "asin")
 }
 
-fn native_atan<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_atan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "atan")
 }
 
-fn native_atan2<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_atan2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "atan2")
 }
 
-fn native_ceil<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_ceil(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     if let Some(result) = rounding_method(runtime, &args, "__ceil__")? {
         return Ok(result);
     }
@@ -438,11 +438,11 @@ fn native_ceil<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
 /// The result of an instance's `__floor__`, `__ceil__` or `__trunc__`, which `math.floor`,
 /// `math.ceil` and `math.trunc` call for values that are not builtin real numbers, as CPython
 /// does. `None` means the caller should convert the value to a float instead.
-fn rounding_method<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
+fn rounding_method(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
     method: &str,
-) -> PyResult<'s, Option<Value<'s>>> {
+) -> PyResult<Option<Value>> {
     let [value] = args.positional() else {
         return Ok(None);
     };
@@ -462,7 +462,7 @@ fn rounding_method<'s>(
 }
 
 /// Compute exact combinations with work and result storage bounded before multiplication.
-fn native_comb<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_comb(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.comb", 2, 2)?;
     args.reject_keywords("math.comb")?;
     let n = integer_argument(runtime, &args.positional()[0], "comb")?;
@@ -501,7 +501,7 @@ fn native_comb<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
 
 /// Compute exact permutations `n! / (n - k)!` (`n!` when `k` is omitted or `None`), bounding work
 /// and result storage before multiplication as [`native_comb`] does.
-fn native_perm<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_perm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.perm", 1, 2)?;
     args.reject_keywords("math.perm")?;
     let n = integer_argument(runtime, &args.positional()[0], "perm")?;
@@ -538,23 +538,23 @@ fn native_perm<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     runtime.new_bigint(result)
 }
 
-fn native_cos<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_cos(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "cos")
 }
 
-fn native_degrees<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_degrees(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "degrees")
 }
 
-fn native_exp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_exp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "exp")
 }
 
-fn native_fabs<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_fabs(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "fabs")
 }
 
-fn native_factorial<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_factorial(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.factorial", 1, 1)?;
     args.reject_keywords("math.factorial")?;
     let value = integer_argument(runtime, &args.positional()[0], "factorial")?;
@@ -583,19 +583,15 @@ fn native_factorial<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> 
     runtime.new_bigint(result)
 }
 
-fn native_floor<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_floor(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_round_direction(runtime, args, true)
 }
 
-fn native_trunc<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_trunc(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_round_direction(runtime, args, false)
 }
 
-fn native_round_direction<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-    floor: bool,
-) -> PyResult<'s> {
+fn native_round_direction(runtime: &mut dyn PyRuntime, args: CallArgs, floor: bool) -> PyResult {
     args.expect_positional("math integer conversion", 1, 1)?;
     args.reject_keywords("math integer conversion")?;
     let method = if floor { "__floor__" } else { "__trunc__" };
@@ -618,19 +614,15 @@ fn native_round_direction<'s>(
     runtime.new_integer(&format!("{value:.0}"))
 }
 
-fn native_gcd<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_gcd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     integer_fold(runtime, args, false)
 }
 
-fn native_lcm<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_lcm(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     integer_fold(runtime, args, true)
 }
 
-fn integer_fold<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-    lcm: bool,
-) -> PyResult<'s> {
+fn integer_fold(runtime: &mut dyn PyRuntime, args: CallArgs, lcm: bool) -> PyResult {
     args.reject_keywords(if lcm { "math.lcm" } else { "math.gcd" })?;
     let mut result = if lcm {
         BigInt::from(1_u8)
@@ -658,21 +650,17 @@ fn integer_fold<'s>(
     runtime.new_bigint(result)
 }
 
-fn integer_argument<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    value: &Value<'s>,
-    name: &str,
-) -> PyResult<'s, BigInt> {
+fn integer_argument(runtime: &dyn PyRuntime, value: &Value, name: &str) -> PyResult<BigInt> {
     runtime
         .integer_bigint(value)?
         .ok_or_else(|| PyError::type_error(format!("{name}() only accepts integral values")))
 }
 
-fn bigint_gcd<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
+fn bigint_gcd(
+    runtime: &mut dyn PyRuntime,
     mut left: BigInt,
     mut right: BigInt,
-) -> PyResult<'s, BigInt> {
+) -> PyResult<BigInt> {
     runtime.reserve_memory(bigint_bytes(&left)?.max(bigint_bytes(&right)?))?;
     // Each Euclid step is one long division, and a step can shrink the operands by as little as
     // one bit, so the total is charged step by step rather than estimated up front.
@@ -686,46 +674,46 @@ fn bigint_gcd<'s>(
     Ok(left.abs())
 }
 
-fn bigint_bytes<'s>(value: &BigInt) -> PyResult<'s, usize> {
+fn bigint_bytes(value: &BigInt) -> PyResult<usize> {
     usize::try_from(value.bits().div_ceil(8).max(1))
         .map_err(|_| PyError::resource_error("integer result is too large"))
 }
 
-fn native_hypot<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_hypot(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "hypot")
 }
 
-fn native_isinf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_isinf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "isinf")
 }
 
-fn native_isfinite<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_isfinite(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "isfinite")
 }
 
-fn native_isnan<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_isnan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "isnan")
 }
 
-fn native_log<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_log(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log")
 }
 
-fn native_log10<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_log10(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log10")
 }
 
-fn native_log2<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_log2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log2")
 }
 
-fn native_pow<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_pow(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "pow")
 }
 
 /// Multiply `start` (default 1) by each item of the iterable through the `*` protocol, so
 /// integers stay exact and NumPy scalars and other numeric types keep their own rules.
-fn native_prod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_prod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     if args.positional().len() != 1 {
         return Err(PyError::type_error(format!(
             "prod() takes exactly 1 positional argument ({} given)",
@@ -743,12 +731,12 @@ fn native_prod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     };
     let iterator = runtime.iterator(args.positional()[0])?;
     let multiply = PyOperator::Binary(BinaryOperator::Multiply);
-    // The iterable is unbounded, so each step runs in its own handle scope. The running product
+    // The iterable is unbounded, so each step runs in its own pin scope. The running product
     // crosses scopes in a one-element list.
-    let product = runtime.new_list(vec![start])?.cast::<PyList<'s>>(runtime)?;
+    let product = runtime.new_list(vec![start])?.cast::<PyList>(runtime)?;
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             let Some(item) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
@@ -762,34 +750,30 @@ fn native_prod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     Ok(runtime.list_items(product)?[0])
 }
 
-fn native_radians<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_radians(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "radians")
 }
 
-fn native_sin<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_sin(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "sin")
 }
 
-fn native_sqrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_sqrt(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "sqrt")
 }
 
-fn native_tan<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_tan(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "tan")
 }
 
-fn native_call<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-    name: &'static str,
-) -> PyResult<'s> {
+fn native_call(runtime: &mut dyn PyRuntime, args: CallArgs, name: &'static str) -> PyResult {
     args.reject_keywords(&format!("math.{name}"))?;
     let values = args
         .positional()
         .iter()
         .cloned()
         .map(|value| real_argument(runtime, value))
-        .collect::<PyResult<'s, Vec<_>>>()?;
+        .collect::<PyResult<Vec<_>>>()?;
     runtime.charge_cpu(u64::try_from(values.len()).unwrap_or(u64::MAX))?;
     let value = call(name, &values).map_err(math_error)?;
     Ok(match value {
@@ -801,7 +785,7 @@ fn native_call<'s>(
 
 /// A real argument as a float. Like CPython, an instance of a user class, such as a `Fraction`,
 /// converts through its `__float__`.
-fn real_argument<'s>(runtime: &mut dyn PyRuntime<'s>, value: Value<'s>) -> PyResult<'s, f64> {
+fn real_argument(runtime: &mut dyn PyRuntime, value: Value) -> PyResult<f64> {
     let method = match runtime.kind(&value)? {
         PyKind::Instance => runtime.get_attribute(value, "__float__")?,
         _ => None,
@@ -1203,43 +1187,43 @@ pub fn sqrt(value: f64) -> MathResult {
     Ok(MathValue::Float(value.sqrt()))
 }
 
-fn native_cbrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_cbrt(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "cbrt")
 }
 
-fn native_copysign<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_copysign(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "copysign")
 }
 
-fn native_erf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_erf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "erf")
 }
 
-fn native_erfc<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_erfc(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "erfc")
 }
 
-fn native_exp2<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_exp2(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "exp2")
 }
 
-fn native_expm1<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_expm1(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "expm1")
 }
 
-fn native_fmod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_fmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "fmod")
 }
 
-fn native_log1p<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_log1p(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "log1p")
 }
 
-fn native_remainder<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_remainder(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "remainder")
 }
 
-fn native_ulp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_ulp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     native_call(runtime, args, "ulp")
 }
 
@@ -1386,7 +1370,7 @@ fn ulp(x: f64) -> f64 {
     x.next_up() - x
 }
 
-fn native_frexp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_frexp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.frexp", 1, 1)?;
     args.reject_keywords("math.frexp")?;
     let value = real_argument(runtime, args.positional()[0])?;
@@ -1414,7 +1398,7 @@ pub fn frexp(x: f64) -> (f64, i32) {
     (mantissa, biased - 1022)
 }
 
-fn native_modf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_modf(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.modf", 1, 1)?;
     args.reject_keywords("math.modf")?;
     let value = real_argument(runtime, args.positional()[0])?;
@@ -1429,7 +1413,7 @@ fn native_modf<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     runtime.new_tuple(vec![Value::Float(fraction), Value::Float(integer)])
 }
 
-fn native_ldexp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_ldexp(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.ldexp", 2, 2)?;
     args.reject_keywords("math.ldexp")?;
     let value = real_argument(runtime, args.positional()[0])?;
@@ -1450,7 +1434,7 @@ fn native_ldexp<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     Ok(Value::Float(result))
 }
 
-fn native_fma<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_fma(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.fma", 3, 3)?;
     args.reject_keywords("math.fma")?;
     let x = real_argument(runtime, args.positional()[0])?;
@@ -1466,7 +1450,7 @@ fn native_fma<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
     Ok(Value::Float(result))
 }
 
-fn native_nextafter<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_nextafter(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.nextafter", 2, 2)?;
     args.reject_unknown_keywords("math.nextafter", &["steps"])?;
     let x = real_argument(runtime, args.positional()[0])?;
@@ -1523,7 +1507,7 @@ fn float_from_ordinal(ordinal: i64) -> f64 {
     }
 }
 
-fn native_isqrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_isqrt(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.isqrt", 1, 1)?;
     args.reject_keywords("math.isqrt")?;
     let value = integer_argument(runtime, &args.positional()[0], "isqrt")?;
@@ -1550,13 +1534,13 @@ fn native_isqrt<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     runtime.new_bigint(estimate)
 }
 
-/// The float items of an iterable, converted one at a time so no handles are retained.
-fn float_items<'s>(runtime: &mut dyn PyRuntime<'s>, iterable: Value<'s>) -> PyResult<'s, Vec<f64>> {
+/// The float items of an iterable, converted one at a time so no values stay pinned.
+fn float_items(runtime: &mut dyn PyRuntime, iterable: Value) -> PyResult<Vec<f64>> {
     let iterator = runtime.iterator(iterable)?;
     let mut values = Vec::new();
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             let Some(item) = runtime.iterator_next(iterator)? else {
                 exhausted = true;
                 return Ok(());
@@ -1570,7 +1554,7 @@ fn float_items<'s>(runtime: &mut dyn PyRuntime<'s>, iterable: Value<'s>) -> PyRe
     Ok(values)
 }
 
-fn native_fsum<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_fsum(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.fsum", 1, 1)?;
     args.reject_keywords("math.fsum")?;
     let values = float_items(runtime, args.positional()[0])?;
@@ -1580,7 +1564,7 @@ fn native_fsum<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
 
 /// Exactly rounded sum of floats, keeping a list of non-overlapping partial sums so the final
 /// rounding happens once.
-pub fn fsum<'s>(values: &[f64]) -> PyResult<'s, f64> {
+pub fn fsum(values: &[f64]) -> PyResult<f64> {
     if values.iter().any(|value| !value.is_finite()) {
         let total: f64 = values.iter().sum();
         if total.is_nan() && !values.iter().any(|value| value.is_nan()) {
@@ -1635,7 +1619,7 @@ pub fn fsum<'s>(values: &[f64]) -> PyResult<'s, f64> {
     Ok(high)
 }
 
-fn native_dist<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_dist(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.dist", 2, 2)?;
     args.reject_keywords("math.dist")?;
     let p = float_items(runtime, args.positional()[0])?;
@@ -1656,7 +1640,7 @@ fn native_dist<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
 
 /// `sumprod(p, q)`: the sum of pairwise products through the `*` and `+` protocols, so integers
 /// stay exact; the inputs must have equal lengths.
-fn native_sumprod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn native_sumprod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("math.sumprod", 2, 2)?;
     args.reject_keywords("math.sumprod")?;
     let left = runtime.iterator(args.positional()[0])?;
@@ -1665,10 +1649,10 @@ fn native_sumprod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> Py
     let add = PyOperator::Binary(BinaryOperator::Add);
     let total = runtime
         .new_list(vec![Value::Int(0)])?
-        .cast::<PyList<'s>>(runtime)?;
+        .cast::<PyList>(runtime)?;
     let mut exhausted = false;
     while !exhausted {
-        runtime.nested(&mut |runtime, _| {
+        runtime.nested(&mut |runtime| {
             let a = runtime.iterator_next(left)?;
             let b = runtime.iterator_next(right)?;
             let (a, b) = match (a, b) {

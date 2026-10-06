@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use crate::interp::Interp;
 
 use ast::StatementKind;
-use heap::Value;
+use heap::{Ref, Value};
 
 type Out<'a> = &'a mut Vec<u8>;
 
@@ -116,8 +116,8 @@ impl Clone for GlobalBindings {
 }
 
 impl heap::Roots for GlobalBindings {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut heap::Ref)) {
-        for value in self.values.iter_mut().flatten() {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&heap::Ref)) {
+        for value in self.values.iter().flatten() {
             visitor(value);
         }
     }
@@ -125,8 +125,8 @@ impl heap::Roots for GlobalBindings {
 
 impl GlobalBindings {
     #[inline(always)]
-    fn get<'s>(&self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
-        heap.handle_optional(self.values.get(symbol.index()).and_then(Option::as_ref))
+    fn get(&self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value> {
+        heap.value_optional(self.values.get(symbol.index()).and_then(Option::as_ref))
     }
 
     /// The stored reference of a binding, for pushing onto the operand stack directly.
@@ -138,15 +138,14 @@ impl GlobalBindings {
     #[inline(always)]
     fn insert(
         &mut self,
-        heap: &heap::Heap,
         symbol: symbols::SymbolId,
-        value: Value<'_>,
+        value: Value,
         resources: &mut crate::resources::Resources,
     ) -> Result<(), String> {
         if self.values.len() <= symbol.index() {
             self.grow(symbol, resources)?;
         }
-        self.values[symbol.index()] = Some(heap.store(value));
+        self.values[symbol.index()] = Some(Ref::from(value));
         Ok(())
     }
 
@@ -178,20 +177,16 @@ impl GlobalBindings {
         Ok(())
     }
 
-    fn remove<'s>(&mut self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value<'s>> {
+    fn remove(&mut self, heap: &heap::Heap, symbol: symbols::SymbolId) -> Option<Value> {
         let removed = self.values.get_mut(symbol.index()).and_then(Option::take);
-        heap.handle_optional(removed.as_ref())
+        heap.value_optional(removed.as_ref())
     }
 
     /// Every populated `(name, value)` binding, resolved through the heap's symbol table, for
     /// `globals()` on the entry-point script or REPL. Slot order here just follows `SymbolId`
     /// allocation order, not Python's per-dict insertion order; callers that need a stable order
     /// sort the result themselves.
-    fn entries<'s>(
-        &self,
-        heap: &heap::Heap,
-        symbols: &symbols::Symbols,
-    ) -> Vec<(String, Value<'s>)> {
+    fn entries(&self, heap: &heap::Heap, symbols: &symbols::Symbols) -> Vec<(String, Value)> {
         self.values
             .iter()
             .enumerate()
@@ -199,7 +194,7 @@ impl GlobalBindings {
                 let value = value.as_ref()?;
                 let symbol = symbols::SymbolId::from_index(index)?;
                 let name = symbols.name(symbol)?.to_string();
-                Some((name, heap.handle(value)))
+                Some((name, heap.value(value)))
             })
             .collect()
     }
@@ -252,6 +247,14 @@ pub(crate) struct PythonContinuation {
     stderr: Vec<u8>,
     original_cwd: String,
 }
+
+// A `Value` is pinned only until the quantum that made it ends, and it is not `Send`. Requiring
+// the state a process keeps between quanta to be `Send` keeps values out of it at compile time;
+// that state holds stored references instead.
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<PythonContinuation>();
+};
 
 /// Result of parsing and starting a Python command.
 pub(crate) enum PythonCommandStart {
@@ -440,7 +443,6 @@ pub(crate) fn start_python(
     if state
         .globals
         .insert(
-            &state.heap,
             name_symbol,
             Value::inline_string("__main__").expect("short builtin string"),
             &mut interp.resources,
@@ -453,14 +455,14 @@ pub(crate) fn start_python(
         .first()
         .filter(|script| !matches!(script.as_str(), "-c" | "-" | ""))
     {
-        // No VM scope exists yet, so release the handle once the global table holds the value.
-        let handle_base = state.heap.handle_count();
+        // No VM scope exists yet, so release the pin once the global table holds the value.
+        let pin_base = state.heap.pin_count();
         let file = match Value::inline_string(script) {
             Some(value) => value,
             // The fresh state's only references are its globals.
             None => match state.heap.alloc(
                 heap::Object::String(script.clone().into()),
-                &mut state.globals,
+                &state.globals,
                 &mut interp.resources,
             ) {
                 Ok(value) => value,
@@ -473,8 +475,8 @@ pub(crate) fn start_python(
         };
         let inserted = state
             .globals
-            .insert(&state.heap, file_symbol, file, &mut interp.resources);
-        state.heap.truncate_handles(handle_base);
+            .insert(file_symbol, file, &mut interp.resources);
+        state.heap.truncate_pins(pin_base);
         if inserted.is_err() {
             return PythonCommandStart::Ready(137);
         }
@@ -1493,6 +1495,52 @@ mod tests {
         );
     }
 
+    /// Collect before every allocation while running a program that exercises calls, classes,
+    /// generators, exceptions, sorting and containers. Any value Rust code holds without a pin
+    /// is freed at its first chance, so a missing pin shows up as a stale reference here.
+    #[test]
+    fn programs_survive_a_collection_at_every_allocation() {
+        let source = r#"
+class Point:
+    def __init__(self, x, y):
+        self.x = x
+        self.y = y
+    def __repr__(self):
+        return f"Point({self.x}, {self.y})"
+    def __lt__(self, other):
+        return (self.x, self.y) < (other.x, other.y)
+
+def numbers(limit):
+    for value in range(limit):
+        yield str(value) * 2
+
+def outer():
+    seen = []
+    def inner(value):
+        seen.append([value, {"key": value}])
+        return len(seen)
+    return inner, seen
+
+inner, seen = outer()
+for item in numbers(20):
+    inner(item)
+points = sorted(Point(i % 7, -i) for i in range(30))
+words = sorted({str(i): [i] * 3 for i in range(25)}, key=lambda word: (len(word), word[::-1]))
+try:
+    {}["missing" + str(len(words))]
+except KeyError as error:
+    caught = repr(error)
+merged = {**{"a": [1]}, **{"b": (2, "two")}}
+print(len(seen), seen[-1], points[:3], words[-3:], caught, merged)
+"#;
+        let expected = run(source);
+        assert_eq!(expected.0, 0, "{}", expected.2);
+        heap::COLLECT_EVERY_ALLOCATION.with(|flag| flag.set(true));
+        let stressed = run(source);
+        heap::COLLECT_EVERY_ALLOCATION.with(|flag| flag.set(false));
+        assert_eq!(stressed, expected);
+    }
+
     #[test]
     fn global_binding_growth_is_charged_before_mutation() {
         let mut resources = Resources::new(Limits {
@@ -1507,7 +1555,7 @@ mod tests {
 
         assert_eq!(
             globals
-                .insert(&heap, symbol, Value::Int(1), &mut resources)
+                .insert(symbol, Value::Int(1), &mut resources)
                 .unwrap_err(),
             "memory limit exceeded"
         );

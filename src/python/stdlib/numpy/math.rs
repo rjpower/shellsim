@@ -66,11 +66,7 @@ pub(in crate::python) fn round_number(dtype: DType, number: Number, decimals: i6
 /// element (via [`element::read_number`]/[`element::write_number`]) rather than dispatching on
 /// dtype, since rounding needs no dtype-specific arithmetic — every numeric kind's `Number` cast
 /// back through `write_number` the same "unsafe" cast `astype` uses.
-fn round_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
-    decimals: i64,
-) -> PyResult<'s, Array<'s>> {
+fn round_array(runtime: &mut dyn PyRuntime, array: &Array, decimals: i64) -> PyResult<Array> {
     let scale = decimal_scale(decimals);
     let count = array.size();
     array::reserve_elements(runtime, array.dtype, count)?;
@@ -101,7 +97,7 @@ fn round_array<'s>(
 
 /// The scalar or array `result` boxed the way NumPy returns it: a NumPy scalar for a 0-d
 /// result, the array itself otherwise.
-fn finish_array<'s>(runtime: &mut dyn PyRuntime<'s>, result: Array<'s>) -> PyResult<'s> {
+fn finish_array(runtime: &mut dyn PyRuntime, result: Array) -> PyResult {
     if result.ndim() == 0 {
         convert::element_to_scalar(runtime, &result, result.view.offset)
     } else {
@@ -110,11 +106,7 @@ fn finish_array<'s>(runtime: &mut dyn PyRuntime<'s>, result: Array<'s>) -> PyRes
 }
 
 /// Store `result` into `out=` if given, otherwise box it the way NumPy returns a result.
-fn finish_with_out<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    result: Array<'s>,
-    out: Option<PyValue<'s>>,
-) -> PyResult<'s> {
+fn finish_with_out(runtime: &mut dyn PyRuntime, result: Array, out: Option<PyValue>) -> PyResult {
     match out {
         Some(out) => {
             let out = Array::from_value(runtime, out)?;
@@ -125,7 +117,7 @@ fn finish_with_out<'s>(
     }
 }
 
-fn module_round<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn module_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("round", &["a", "decimals", "out"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
@@ -134,11 +126,7 @@ fn module_round<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
     finish_with_out(runtime, result, bound.value("out"))
 }
 
-fn method_round<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn method_round(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("round", &["decimals", "out"], 0);
     let bound = SIGNATURE.bind(&args)?;
     let array = Array::from_value(runtime, receiver)?;
@@ -153,11 +141,7 @@ fn method_round<'s>(
 
 /// `ndarray.clip(min=None, max=None, out=None)`: reaches the frozen Python `numpy._math._clip`,
 /// the same way `squeeze`/`swapaxes`/`trace` reach `numpy._shapes`.
-fn method_clip<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn method_clip(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     super::reduce::python_method(runtime, "numpy._math", "_clip", receiver, args)
 }
 

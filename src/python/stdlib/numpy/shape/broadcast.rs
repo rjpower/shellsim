@@ -13,11 +13,11 @@ use super::super::convert;
 
 /// A view of `array` with `shape`, repeating length-one and missing leading axes. Errors use
 /// the text of NumPy's `broadcast_to`.
-pub(super) fn broadcast_view<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    array: &Array<'s>,
+pub(super) fn broadcast_view(
+    runtime: &mut dyn PyRuntime,
+    array: &Array,
     shape: &[usize],
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     if shape.is_empty() && array.ndim() > 0 {
         return Err(PyError::value_error(
             "cannot broadcast a non-scalar to a scalar array",
@@ -53,10 +53,7 @@ pub(super) fn broadcast_view<'s>(
 }
 
 /// `np.broadcast_to(array, shape, subok=False)`: a read-only broadcast view.
-pub(super) fn module_broadcast_to<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(super) fn module_broadcast_to(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("broadcast_to", &["array", "shape", "subok"], 2);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("array"))?;

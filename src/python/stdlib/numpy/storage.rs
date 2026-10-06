@@ -43,7 +43,7 @@ impl NativeObject for ArrayStorage {
         }
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
         if let Self::Values(values) = self {
             for slot in values {
                 visit(slot);
@@ -91,9 +91,9 @@ impl NativeObject for ArrayObject {
             .ok_or_else(overflow)
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
-        visit(&mut self.storage);
-        if let Some(base) = &mut self.base {
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
+        visit(&self.storage);
+        if let Some(base) = &self.base {
             visit(base);
         }
     }

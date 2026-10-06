@@ -50,15 +50,11 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     }],
 };
 
-fn test_case<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn test_case(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::TestCaseType))
 }
 
-fn assert_equal<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    _receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn assert_equal(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("assertEqual", 2, 3)?;
     args.reject_keywords("assertEqual")?;
     if runtime.equals(&args.positional()[0], &args.positional()[1])? {
@@ -76,28 +72,20 @@ fn assert_equal<'s>(
     Err(PyError::exception("AssertionError", message))
 }
 
-fn assert_true<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn assert_true(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     assert_truth(runtime, receiver, args, true)
 }
 
-fn assert_false<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn assert_false(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     assert_truth(runtime, receiver, args, false)
 }
 
-fn assert_truth<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    _receiver: Value<'s>,
-    args: CallArgs<'s>,
+fn assert_truth(
+    runtime: &mut dyn PyRuntime,
+    _receiver: Value,
+    args: CallArgs,
     expected: bool,
-) -> PyResult<'s> {
+) -> PyResult {
     let name = if expected {
         "assertTrue"
     } else {
@@ -123,11 +111,7 @@ fn assert_truth<'s>(
     Err(PyError::exception("AssertionError", message))
 }
 
-fn assert_is_none<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    _receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn assert_is_none(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("assertIsNone", 1, 2)?;
     args.reject_keywords("assertIsNone")?;
     if args.positional()[0].is_none() {
@@ -142,11 +126,7 @@ fn assert_is_none<'s>(
     Err(PyError::exception("AssertionError", message))
 }
 
-fn assert_raises<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    _receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn assert_raises(runtime: &mut dyn PyRuntime, _receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("assertRaises", 1, 1)?;
     args.reject_keywords("assertRaises")?;
     let PyExceptionType(expected) = args.positional()[0].cast(runtime)?;
@@ -196,21 +176,13 @@ pub(crate) static RAISES_CONTEXT_TYPE: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn raises_enter<'s>(
-    _runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn raises_enter(_runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("pytest.raises.__enter__", 0, 0)?;
     args.reject_keywords("pytest.raises.__enter__")?;
     Ok(receiver)
 }
 
-fn raises_exit<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn raises_exit(runtime: &mut dyn PyRuntime, receiver: Value, args: CallArgs) -> PyResult {
     args.expect_positional("pytest.raises.__exit__", 3, 3)?;
     args.reject_keywords("pytest.raises.__exit__")?;
     let context = receiver.cast::<PyRaisesContext>(runtime)?;

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use super::super::ast::{Program, Statement, StatementKind};
 use super::super::bytecode::{KeywordName, ParameterKind};
-use super::super::heap::GeneratorObject;
+use super::super::heap::{GeneratorObject, Ref};
 use super::super::scopes;
 use super::{
     expect_arity, number, range_length, string, BigInt, BinaryOperator, Builtin, BuiltinType,
@@ -17,7 +17,7 @@ use num_traits::{One, Signed, Zero};
 impl<'s> Vm<'s> {
     /// Length of a builtin representation without consulting Python slots. Native length slots
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
-    pub(super) fn physical_length(&self, value: Value<'s>) -> Result<Option<usize>, String> {
+    pub(super) fn physical_length(&self, value: Value) -> Result<Option<usize>, String> {
         let subject = value;
         if let Some(length) = string::string_length(&self.state.heap, subject)? {
             return Ok(Some(length));
@@ -35,7 +35,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The builtin `abs(value)`, through the `__abs__` slot.
-    pub(super) fn absolute(&mut self, value: Value<'s>) -> Result<Value<'s>, String> {
+    pub(super) fn absolute(&mut self, value: Value) -> Result<Value, String> {
         if let Some(result) = self.invoke_slot(&value, Slot::Absolute, "__abs__", Vec::new())? {
             return Ok(result);
         }
@@ -49,11 +49,7 @@ impl<'s> Vm<'s> {
     /// Parse the source string passed to `exec` or `eval` (`builtin`). Parsing is charged
     /// before it runs, and nesting is bounded so dynamic source cannot recurse without limit.
     /// `eval` ignores leading spaces and tabs, as CPython does.
-    fn parse_dynamic_source(
-        &mut self,
-        builtin: &str,
-        source: &Value<'s>,
-    ) -> Result<Program, String> {
+    fn parse_dynamic_source(&mut self, builtin: &str, source: &Value) -> Result<Program, String> {
         let source = string::string_value(&self.state.heap, *source)?.ok_or_else(|| {
             self.record_native_error(PyError::type_error(format!(
                 "{builtin}() arg 1 must be a string, bytes or code object"
@@ -88,7 +84,7 @@ impl<'s> Vm<'s> {
         })
     }
 
-    fn pow_integer_argument(&self, value: &Value<'s>) -> Result<(BigInt, usize), PyError> {
+    fn pow_integer_argument(&self, value: &Value) -> Result<(BigInt, usize), PyError> {
         let integer = <Self as PyRuntime>::integer_bigint(self, value)?.ok_or_else(|| {
             PyError::type_error("pow() 3rd argument not allowed unless all arguments are integers")
         })?;
@@ -98,7 +94,7 @@ impl<'s> Vm<'s> {
 
     /// `dir(value)` through a `__dir__` that the value's class defines: the names it returns,
     /// sorted, or `None` when the class defines none.
-    fn custom_dir(&mut self, value: &Value<'s>) -> Result<Option<Value<'s>>, String> {
+    fn custom_dir(&mut self, value: &Value) -> Result<Option<Value>, String> {
         let Some(class) = self.instance_class(*value)? else {
             return Ok(None);
         };
@@ -119,11 +115,10 @@ impl<'s> Vm<'s> {
         self.charge_cpu(u64::try_from(names.len()).unwrap_or(u64::MAX))?;
         names.sort_by(|left, right| left.0.cmp(&right.0));
         let values = names.into_iter().map(|(_, item)| item).collect::<Vec<_>>();
-        self.alloc_with(|builder| Object::List(builder.refs(values)))
-            .map(Some)
+        self.alloc(Object::List(Ref::all(values))).map(Some)
     }
 
-    fn dir_names(&self, value: &Value<'s>) -> Result<Vec<String>, String> {
+    fn dir_names(&self, value: &Value) -> Result<Vec<String>, String> {
         if let Some(NativeValue::Module(module)) = value.native_value() {
             return Ok(module
                 .functions
@@ -140,7 +135,7 @@ impl<'s> Vm<'s> {
             if let Object::Class(class_object) = self.get(class)? {
                 names.extend(class_object.attributes.keys().cloned());
                 for ancestor in &class_object.mro {
-                    if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
+                    if let Object::Class(ancestor) = self.get(self.value(ancestor))? {
                         names.extend(ancestor.attributes.keys().cloned());
                     }
                 }
@@ -149,7 +144,7 @@ impl<'s> Vm<'s> {
         }
         match self.get(*value)? {
             Object::Module { scope, .. } => {
-                let namespace = self.module_namespace(self.handle(scope))?;
+                let namespace = self.module_namespace(self.value(scope))?;
                 Ok(self
                     .namespace_entries(namespace)?
                     .into_iter()
@@ -159,7 +154,7 @@ impl<'s> Vm<'s> {
             Object::Class(class_object) => {
                 let mut names = class_object.attributes.keys().cloned().collect::<Vec<_>>();
                 for ancestor in &class_object.mro {
-                    if let Object::Class(ancestor) = self.get(self.handle(ancestor))? {
+                    if let Object::Class(ancestor) = self.get(self.value(ancestor))? {
                         names.extend(ancestor.attributes.keys().cloned());
                     }
                 }
@@ -170,7 +165,7 @@ impl<'s> Vm<'s> {
     }
 
     /// The names a builtin value's registered type and its ancestors publish, for `dir()`.
-    fn type_attribute_names(&self, value: &Value<'s>) -> Result<Vec<String>, String> {
+    fn type_attribute_names(&self, value: &Value) -> Result<Vec<String>, String> {
         let type_id = self.type_id(value)?;
         let ty = self.state.types.get(type_id)?;
         let mut names = ty.attributes.keys().cloned().collect::<Vec<_>>();
@@ -270,7 +265,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Push one expanded positional argument, metering the stack growth.
-    fn push_argument(&mut self, value: Value<'s>) -> Result<(), String> {
+    fn push_argument(&mut self, value: Value) -> Result<(), String> {
         self.reserve_result(64)?;
         self.charge_cpu(1)?;
         self.push(value);
@@ -282,7 +277,7 @@ impl<'s> Vm<'s> {
         &mut self,
         names: &mut Vec<KeywordName>,
         name: Arc<str>,
-        value: Value<'s>,
+        value: Value,
     ) -> Result<(), String> {
         if names
             .iter()
@@ -317,7 +312,7 @@ impl<'s> Vm<'s> {
                     descriptor,
                     ..
                 } if descriptor.is_object() => {
-                    let (receiver, descriptor) = (self.handle(receiver), self.handle(descriptor));
+                    let (receiver, descriptor) = (self.value(receiver), self.value(descriptor));
                     return self.call_python(
                         descriptor,
                         Some(receiver),
@@ -349,14 +344,11 @@ impl<'s> Vm<'s> {
                 .map_err(|error| self.record_native_error(error));
         }
         if function.is_object() {
-            /// What a heap callable is, with the handles its call needs.
-            enum Callee<'v> {
-                BoundMethod {
-                    receiver: Value<'v>,
-                    descriptor: Value<'v>,
-                },
-                GenericAlias(Value<'v>),
-                Instance(Value<'v>),
+            /// What a heap callable is, with the values its call needs.
+            enum Callee {
+                BoundMethod { receiver: Value, descriptor: Value },
+                GenericAlias(Value),
+                Instance(Value),
                 Class,
                 Other,
             }
@@ -366,10 +358,10 @@ impl<'s> Vm<'s> {
                     descriptor,
                     ..
                 } => Callee::BoundMethod {
-                    receiver: self.handle(receiver),
-                    descriptor: self.handle(descriptor),
+                    receiver: self.value(receiver),
+                    descriptor: self.value(descriptor),
                 },
-                Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.handle(origin)),
+                Object::GenericAlias { origin, .. } => Callee::GenericAlias(self.value(origin)),
                 Object::Class(_) => Callee::Class,
                 _ => match self.instance_class(function)? {
                     Some(class) => Callee::Instance(class),
@@ -470,7 +462,7 @@ impl<'s> Vm<'s> {
         }
         if let Some(NativeValue::NativeFunction(function)) = function.native_value() {
             let call = CallArgs::new(arguments, keyword_arguments);
-            // Kept as handles so a suspension can store them for the retry.
+            // Kept as pinned values so a suspension can store them for the retry.
             let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
             let previous_suspend = self.native_suspend_allowed;
             self.native_suspend_allowed = self.may_suspend(mode);
@@ -810,7 +802,7 @@ impl<'s> Vm<'s> {
                     .map(|name| self.allocate_string(name))
                     .collect::<Result<Vec<_>, _>>()?;
                 {
-                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    let value = self.alloc(Object::List(Ref::all(values)))?;
                     Ok(self.produce(value))
                 }
             }
@@ -906,7 +898,7 @@ impl<'s> Vm<'s> {
                 })?;
                 let values = keyed.into_iter().map(|(_, value)| value);
                 {
-                    let value = self.alloc_with(|builder| Object::List(builder.refs(values)))?;
+                    let value = self.alloc(Object::List(Ref::all(values)))?;
                     Ok(self.produce(value))
                 }
             }
@@ -945,7 +937,7 @@ impl<'s> Vm<'s> {
                 };
                 // CPython keeps the first of equal items: only a strictly smaller (for `min`) or
                 // larger (for `max`) key replaces the selection.
-                let mut selected: Option<(Value<'s>, Value<'s>)> = None;
+                let mut selected: Option<(Value, Value)> = None;
                 for value in values {
                     self.charge_cpu(1)?;
                     let key = match key_function {
@@ -1101,9 +1093,9 @@ impl<'s> Vm<'s> {
                         return Err("iter(v, w): v must be callable".into());
                     }
                     return {
-                        let value = self.alloc_with(|builder| Object::CallableIterator {
-                            callable: builder.store(arguments[0]),
-                            sentinel: builder.store(arguments[1]),
+                        let value = self.alloc(Object::CallableIterator {
+                            callable: Ref::from(arguments[0]),
+                            sentinel: Ref::from(arguments[1]),
                             exhausted: false,
                         })?;
                         Ok(self.produce(value))
@@ -1148,12 +1140,12 @@ impl<'s> Vm<'s> {
                     let index = start
                         .checked_add(offset)
                         .ok_or("enumerate index exceeds the bounded integer range")?;
-                    result.push(self.alloc_with(|builder| {
-                        Object::Tuple(vec![builder.store(Value::Int(index)), builder.store(value)])
+                    result.push(self.alloc({
+                        Object::Tuple(vec![Ref::from(Value::Int(index)), Ref::from(value)])
                     })?);
                 }
                 {
-                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    let value = self.alloc(Object::List(Ref::all(result)))?;
                     Ok(self.produce(value))
                 }
             }
@@ -1168,10 +1160,10 @@ impl<'s> Vm<'s> {
                     self.reserve_result(64)?;
                     self.charge_cpu(1)?;
                     let tuple = sequences.iter().map(|values| values[index]);
-                    result.push(self.alloc_with(|builder| Object::Tuple(builder.refs(tuple)))?);
+                    result.push(self.alloc(Object::Tuple(Ref::all(tuple)))?);
                 }
                 {
-                    let value = self.alloc_with(|builder| Object::List(builder.refs(result)))?;
+                    let value = self.alloc(Object::List(Ref::all(result)))?;
                     Ok(self.produce(value))
                 }
             }
@@ -1208,9 +1200,9 @@ impl<'s> Vm<'s> {
                     _ => return Err("super() expects a class and instance".into()),
                 };
                 {
-                    let value = self.alloc_with(|builder| Object::Super {
-                        start_class: builder.store(start_class),
-                        receiver: builder.store(receiver),
+                    let value = self.alloc(Object::Super {
+                        start_class: Ref::from(start_class),
+                        receiver: Ref::from(receiver),
                     })?;
                     Ok(self.produce(value))
                 }
@@ -1219,8 +1211,7 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 0, 0)?;
                 let target = self.current_globals_target()?;
                 {
-                    let value =
-                        self.alloc_with(|builder| Object::NamespaceDict(target.store(builder)))?;
+                    let value = self.alloc(Object::NamespaceDict(target.store()))?;
                     Ok(self.produce(value))
                 }
             }
@@ -1256,8 +1247,8 @@ impl<'s> Vm<'s> {
     /// construction and the native type constructors.
     pub(super) fn call_type_default(
         &mut self,
-        class: Value<'s>,
-        args: CallArgs<'s>,
+        class: Value,
+        args: CallArgs,
     ) -> Result<Flow, String> {
         let (arguments, keyword_arguments) = args.into_parts();
         if class.is_object() && matches!(self.get(class)?, Object::Class { .. }) {
@@ -1283,12 +1274,12 @@ impl<'s> Vm<'s> {
     fn call_native_method(
         &mut self,
         method: &'static super::super::native::MethodDef,
-        receiver: Value<'s>,
-        native_receiver: Value<'s>,
-        call: CallArgs<'s>,
+        receiver: Value,
+        native_receiver: Value,
+        call: CallArgs,
         mode: CallMode,
     ) -> Result<Flow, String> {
-        // Kept as handles so a suspension can store them for the retry.
+        // Kept as pinned values so a suspension can store them for the retry.
         let retry_arguments = matches!(mode, CallMode::Deferred(_)).then(|| call.clone());
         let previous_suspend = self.native_suspend_allowed;
         self.native_suspend_allowed = self.may_suspend(mode);
@@ -1324,23 +1315,19 @@ impl<'s> Vm<'s> {
     /// `TypeError` when `class` carries a non-empty `__abstractmethods__`, which `abc.ABCMeta`
     /// sets on every class it creates. Only the class's own attribute is consulted, so ordinary
     /// instantiation costs one hash lookup.
-    fn reject_abstract_instantiation(
-        &mut self,
-        class: Value<'s>,
-        name: &str,
-    ) -> Result<(), String> {
+    fn reject_abstract_instantiation(&mut self, class: Value, name: &str) -> Result<(), String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Ok(());
         };
         let Some(abstract_methods) = class_object.attributes.get("__abstractmethods__") else {
             return Ok(());
         };
-        let abstract_methods = self.handle(abstract_methods);
+        let abstract_methods = self.value(abstract_methods);
         if !abstract_methods.is_object() {
             return Ok(());
         }
         let names = match self.get(abstract_methods)? {
-            Object::Set(members) | Object::FrozenSet(members) => self.handles(members),
+            Object::Set(members) | Object::FrozenSet(members) => self.values(members),
             _ => return Ok(()),
         };
         if names.is_empty() {
@@ -1372,25 +1359,25 @@ impl<'s> Vm<'s> {
 
     fn call_user_class(
         &mut self,
-        class: Value<'s>,
-        arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
+        class: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
         dispatch_metaclass: bool,
     ) -> Result<Flow, String> {
         let Object::Class(class_object) = self.get(class)? else {
             return Err("type.__call__ requires a class".into());
         };
         let name = class_object.name.clone();
-        let metaclass = self.handle(&class_object.metaclass);
+        let metaclass = self.value(&class_object.metaclass);
         let layout = class_object.layout;
         let exception_base = class_object.exception_base;
         let is_dataclass = class_object.is_dataclass;
         let dataclass_fields = class_object
             .dataclass_fields
             .iter()
-            .map(|(field, default)| (field.clone(), self.handle_optional(default.as_ref())))
+            .map(|(field, default)| (field.clone(), self.value_optional(default.as_ref())))
             .collect::<Vec<_>>();
-        let enum_members = self.handles(&class_object.enum_members);
+        let enum_members = self.values(&class_object.enum_members);
         if dispatch_metaclass && metaclass.is_object() {
             if let Some((owner, descriptor)) = self.class_attribute_entry(metaclass, "__call__")? {
                 let callable = self.bind_descriptor(descriptor, Some(class), metaclass, owner)?;
@@ -1499,9 +1486,7 @@ impl<'s> Vm<'s> {
             .ok_or("class has no registered type")?;
         let instance = if exception_base.is_some() {
             let args = arguments.clone();
-            self.alloc_with_typed(instance_type, |builder| {
-                Object::Exception(builder.refs(args))
-            })?
+            self.allocate_typed(instance_type, Object::Exception(Ref::all(args)))?
         } else {
             let payload = match builtin_payload {
                 Some(value) => self.state.heap.copy_builtin_payload(value)?,
@@ -1604,8 +1589,8 @@ impl<'s> Vm<'s> {
     /// bound slots into a heap scope.
     fn call_python(
         &mut self,
-        function: Value<'s>,
-        receiver: Option<Value<'s>>,
+        function: Value,
+        receiver: Option<Value>,
         positional: usize,
         keywords: &[KeywordName],
         mode: CallMode,
@@ -1614,7 +1599,7 @@ impl<'s> Vm<'s> {
             return Err("bound descriptor is not callable".into());
         };
         let code = function_object.code.clone();
-        let closure = self.handle_optional(function_object.closure.as_ref());
+        let closure = self.value_optional(function_object.closure.as_ref());
         let signature = &code.call_signature;
         let suspends = signature.is_generator || signature.is_coroutine;
         if !suspends && self.call_depth == Self::MAX_CALL_DEPTH {
@@ -1630,7 +1615,7 @@ impl<'s> Vm<'s> {
         if suspends || signature.heap_locals {
             let locals = self.execution.locals[locals_base..]
                 .iter()
-                .map(|slot| self.handle_optional(slot.as_ref()))
+                .map(|slot| self.value_optional(slot.as_ref()))
                 .collect::<Vec<_>>();
             self.execution.locals.truncate(locals_base);
             if suspends {
@@ -1650,9 +1635,9 @@ impl<'s> Vm<'s> {
     /// partially extended locals on error.
     fn bind_arguments(
         &mut self,
-        function: Value<'s>,
+        function: Value,
         code: &CodeRef,
-        receiver: Option<Value<'s>>,
+        receiver: Option<Value>,
         positional: usize,
         keywords: &[KeywordName],
         locals_base: usize,
@@ -1734,9 +1719,9 @@ impl<'s> Vm<'s> {
                     extras.push(self.peek(count - 1 - index)?);
                 }
                 self.reserve_result(extras.len().saturating_mul(64))?;
-                Some(self.alloc_with(|builder| Object::Tuple(builder.refs(extras)))?)
+                Some(self.alloc(Object::Tuple(Ref::all(extras)))?)
             }
-            Some(_) => Some(self.alloc_with(|builder| Object::Tuple(builder.refs([])))?),
+            Some(_) => Some(self.alloc(Object::Tuple(Ref::all([])))?),
             None => None,
         };
         let keyword_variadic = match signature.keyword_variadic_slot {
@@ -1812,7 +1797,7 @@ impl<'s> Vm<'s> {
     /// takes, worded as CPython words it.
     fn too_many_positional(
         &mut self,
-        function: Value<'s>,
+        function: Value,
         code: &CodeRef,
         given: usize,
         keywords: &[KeywordName],
@@ -1864,7 +1849,7 @@ impl<'s> Vm<'s> {
     /// positional slots nor `keywords` supply.
     fn check_required_parameters(
         &mut self,
-        function: Value<'s>,
+        function: Value,
         code: &CodeRef,
         filled: usize,
         keywords: &[KeywordName],
@@ -1910,9 +1895,9 @@ impl<'s> Vm<'s> {
     /// completion here.
     fn enter_python_function(
         &mut self,
-        function: Value<'s>,
+        function: Value,
         code: &CodeRef,
-        entry: FrameEntry<'_>,
+        entry: FrameEntry,
         mode: CallMode,
     ) -> Result<Flow, String> {
         self.call_depth += 1;
@@ -1947,7 +1932,7 @@ impl<'s> Vm<'s> {
 
     /// The `__name__` of a function object, for tracebacks and error messages.
     pub(super) fn function_name(&self, function: &super::super::heap::Ref) -> String {
-        match self.state.heap.get(self.handle(function)) {
+        match self.state.heap.get(self.value(function)) {
             Ok(Object::Function(function_object)) => function_object.name.clone(),
             _ => "<function>".to_string(),
         }
@@ -1955,17 +1940,17 @@ impl<'s> Vm<'s> {
 
     fn create_generator(
         &mut self,
-        function: Value<'s>,
+        function: Value,
         code: &CodeRef,
-        closure: Option<Value<'s>>,
-        locals: Vec<Option<Value<'s>>>,
+        closure: Option<Value>,
+        locals: Vec<Option<Value>>,
     ) -> Result<Flow, String> {
         let scope = self.function_scope(code, closure, locals)?;
-        let generator = self.alloc_with(|builder| {
+        let generator = self.alloc({
             Object::Generator(Box::new(GeneratorObject {
-                function: builder.store(function),
+                function: Ref::from(function),
                 code: code.clone(),
-                scope: builder.store(scope),
+                scope: Ref::from(scope),
                 instruction_pointer: 0,
                 handlers: Vec::new(),
                 contexts: Vec::new(),
@@ -1973,7 +1958,7 @@ impl<'s> Vm<'s> {
                 stack: Vec::new(),
                 exhausted: false,
                 running: false,
-                return_value: builder.store(Value::None),
+                return_value: Ref::from(Value::None),
             }))
         })?;
         Ok(self.produce(generator))
@@ -1982,7 +1967,7 @@ impl<'s> Vm<'s> {
     /// The frame entry for `exec`/`eval` code: no locals of its own, names resolved through the
     /// calling frame's scope. A caller that keeps its locals in the frame exposes a snapshot of
     /// them, which the dynamic code can read but, as in CPython, not rebind.
-    fn dynamic_code_entry(&mut self) -> Result<FrameEntry<'s>, String> {
+    fn dynamic_code_entry(&mut self) -> Result<FrameEntry, String> {
         let enclosing = self.lookup_scope();
         let Some((base, code)) = self
             .bytecode_frames
@@ -1992,7 +1977,7 @@ impl<'s> Vm<'s> {
             return Ok(FrameEntry::dynamic(enclosing));
         };
         let locals = (0..code.local_names.len())
-            .map(|slot| self.handle_optional(self.locals.get(base + slot)?.as_ref()))
+            .map(|slot| self.value_optional(self.locals.get(base + slot)?.as_ref()))
             .collect();
         let snapshot = self.function_scope(&code, enclosing, locals)?;
         Ok(FrameEntry::dynamic(Some(snapshot)))
@@ -2003,9 +1988,9 @@ impl<'s> Vm<'s> {
     fn function_scope(
         &mut self,
         code: &CodeRef,
-        closure: Option<Value<'s>>,
-        locals: Vec<Option<Value<'s>>>,
-    ) -> Result<Value<'s>, String> {
+        closure: Option<Value>,
+        locals: Vec<Option<Value>>,
+    ) -> Result<Value, String> {
         let uses_repl_globals = closure
             .map(|scope| scopes::uses_repl_globals(self.heap(), scope))
             .transpose()?
@@ -2027,12 +2012,12 @@ impl<'s> Vm<'s> {
     /// when the result is an instance of the class. Any other result is returned as is.
     fn construct_with_new(
         &mut self,
-        class: Value<'s>,
+        class: Value,
         class_type: super::super::object_model::TypeId,
         owner: super::super::object_model::TypeId,
-        constructor: Value<'s>,
-        arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
+        constructor: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
     ) -> Result<Flow, String> {
         // `__new__` is a static method that receives the class explicitly.
         let constructor = self
@@ -2094,9 +2079,9 @@ impl<'s> Vm<'s> {
     fn builtin_value(
         &mut self,
         builtin: BuiltinType,
-        arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<Value<'s>, String> {
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
         match self.call_builtin_type(builtin, arguments, keyword_arguments)? {
             Flow::Next => self.pop(),
             _ => Err(format!("{}() did not produce a value", builtin.name())),
@@ -2109,10 +2094,10 @@ impl<'s> Vm<'s> {
     pub(super) fn new_builtin_instance(
         &mut self,
         builtin: BuiltinType,
-        class: Value<'s>,
-        arguments: Vec<Value<'s>>,
-        keyword_arguments: Vec<(String, Value<'s>)>,
-    ) -> Result<Value<'s>, String> {
+        class: Value,
+        arguments: Vec<Value>,
+        keyword_arguments: Vec<(String, Value)>,
+    ) -> Result<Value, String> {
         let name = builtin.name();
         let subclass = match class.native_value() {
             Some(NativeValue::BuiltinType(class_type)) if class_type == builtin => None,
@@ -2175,9 +2160,9 @@ impl<'s> Vm<'s> {
     /// by that builtin's `__new__`.
     pub(super) fn new_instance(
         &mut self,
-        class: Value<'s>,
+        class: Value,
         has_arguments: bool,
-    ) -> Result<Value<'s>, String> {
+    ) -> Result<Value, String> {
         if matches!(
             class.native_value(),
             Some(NativeValue::BuiltinType(BuiltinType::Object))
@@ -2241,20 +2226,17 @@ impl<'s> Vm<'s> {
         self.allocate_typed(instance_type, Object::Bare)
     }
 
-    pub(super) fn iterator_next(
-        &mut self,
-        iterator: &Value<'s>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub(super) fn iterator_next(&mut self, iterator: &Value) -> Result<Option<Value>, String> {
         if !iterator.is_object() {
             return Err(self.raise_object_type_error(iterator, "is not an iterator"));
         }
         let iterator = *iterator;
         // Copy out only the fields a step needs. Cloning a materialized iterator, generator or
         // instance payload on every step would make iteration quadratic in host time.
-        enum Step<'v> {
+        enum Step {
             Callable {
-                callable: Value<'v>,
-                sentinel: Value<'v>,
+                callable: Value,
+                sentinel: Value,
                 exhausted: bool,
             },
             Count {
@@ -2269,8 +2251,8 @@ impl<'s> Vm<'s> {
                 sentinel,
                 exhausted,
             } => Step::Callable {
-                callable: self.handle(callable),
-                sentinel: self.handle(sentinel),
+                callable: self.value(callable),
+                sentinel: self.value(sentinel),
                 exhausted: *exhausted,
             },
             Object::CountIterator { current, step } => Step::Count {
@@ -2394,17 +2376,17 @@ impl<'s> Vm<'s> {
         &mut self,
         pending: PendingNativeCall,
     ) -> Result<Flow, String> {
-        /// The native a retried call invokes, with its receiver as a handle.
+        /// The native a retried call invokes, with its receiver pinned.
         #[derive(Clone, Copy)]
-        enum Target<'v> {
+        enum Target {
             Function(&'static super::FunctionDef),
-            Method(&'static super::super::native::MethodDef, Value<'v>),
+            Method(&'static super::super::native::MethodDef, Value),
         }
         if matches!(pending, PendingNativeCall::Input { .. }) {
             return self.resume_input(pending);
         }
         let call_span = pending.call_span();
-        // Take handles for the stored arguments before anything can allocate.
+        // Pin the stored arguments before anything can allocate.
         let (target, arguments) = match pending {
             PendingNativeCall::Function {
                 function,
@@ -2417,7 +2399,7 @@ impl<'s> Vm<'s> {
                 arguments,
                 ..
             } => (
-                Target::Method(method, self.handle(&receiver)),
+                Target::Method(method, self.value(&receiver)),
                 arguments.load(self),
             ),
             PendingNativeCall::Input { .. } => unreachable!("handled above"),
@@ -2462,7 +2444,7 @@ impl<'s> Vm<'s> {
 
     /// A native function's result goes on the stack; a wait it requested afterwards, through
     /// `pending_wait`, blocks the process once the result is in place.
-    fn native_result(&mut self, value: Value<'s>) -> Flow {
+    fn native_result(&mut self, value: Value) -> Flow {
         self.push(value);
         match self.pending_wait.take() {
             Some(reason) => self.suspend(reason, None),
@@ -2493,7 +2475,7 @@ impl<'s> Vm<'s> {
     }
 
     /// Strip the trailing newline `input()` reads and raise `EOFError` on an empty read.
-    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value<'s>, String> {
+    fn finish_input(&mut self, read: PyStreamRead) -> Result<Value, String> {
         let mut text = match read {
             PyStreamRead::Text(text) => text,
             PyStreamRead::Bytes(_) => {

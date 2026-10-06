@@ -128,7 +128,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn read_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn read_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.read_text", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.read_text")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -138,7 +138,7 @@ fn read_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResul
         .and_then(|text| runtime.new_string(text))
 }
 
-fn write_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn write_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.write_text", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.write_text")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -147,7 +147,7 @@ fn write_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
     Ok(Value::None)
 }
 
-fn append_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn append_text(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.append_text", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.append_text")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -158,7 +158,7 @@ fn append_text<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
         .map_err(|_| PyError::overflow_error("file position exceeds Python int range"))
 }
 
-fn read_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn read_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.read_bytes", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.read_bytes")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -168,7 +168,7 @@ fn read_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
         .and_then(|bytes| runtime.new_bytes(bytes))
 }
 
-fn write_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn write_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.write_bytes", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.write_bytes")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -177,7 +177,7 @@ fn write_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     Ok(Value::None)
 }
 
-fn append_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn append_bytes(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.append_bytes", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.append_bytes")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -190,7 +190,7 @@ fn append_bytes<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRe
 
 /// `(used, limit)` bytes of the simulated disk. An unlimited disk reports `i64::MAX` as its
 /// limit so callers can still compute a finite free space.
-fn disk_usage<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn disk_usage(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.disk_usage", 0, 0)?;
     args.reject_keywords("_shellsim_vfs.disk_usage")?;
     let (used, limit) = runtime.filesystem().disk_usage();
@@ -199,35 +199,35 @@ fn disk_usage<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
     runtime.new_tuple(vec![used, limit])
 }
 
-fn exists<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn exists(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.exists", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.exists")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().exists(&path)))
 }
 
-fn is_file<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn is_file(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.is_file", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.is_file")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().is_file(&path)))
 }
 
-fn is_dir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn is_dir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.is_dir", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.is_dir")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().is_dir(&path)))
 }
 
-fn is_symlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn is_symlink(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.is_symlink", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.is_symlink")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
     Ok(Value::Bool(runtime.filesystem().is_symlink(&path)))
 }
 
-fn list_dir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn list_dir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.list_dir", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.list_dir")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -241,7 +241,7 @@ fn list_dir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult
 
 /// `stat(path, follow)`: `(mode, size, mtime_ms, kind)` where kind is 0 for a regular file,
 /// 1 for a directory, 2 for a symlink and 3 for anything else.
-fn stat<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn stat(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.stat", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.stat")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -263,7 +263,7 @@ fn stat<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s>
     runtime.new_tuple(vec![mode, size, mtime, kind])
 }
 
-fn rmdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn rmdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.rmdir", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.rmdir")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -271,7 +271,7 @@ fn rmdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     Ok(Value::None)
 }
 
-fn chmod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn chmod(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.chmod", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.chmod")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -283,7 +283,7 @@ fn chmod<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     Ok(Value::None)
 }
 
-fn symlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn symlink(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.symlink", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.symlink")?;
     let OwnedPyString(target) = args.positional()[0].cast(runtime)?;
@@ -292,7 +292,7 @@ fn symlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<
     Ok(Value::None)
 }
 
-fn readlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn readlink(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.readlink", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.readlink")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -300,7 +300,7 @@ fn readlink<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult
     runtime.new_string(target)
 }
 
-fn utime<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn utime(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.utime", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.utime")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -308,7 +308,7 @@ fn utime<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     Ok(Value::None)
 }
 
-fn mkdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn mkdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.mkdir", 3, 3)?;
     args.reject_keywords("_shellsim_vfs.mkdir")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -318,7 +318,7 @@ fn mkdir<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s
     Ok(Value::None)
 }
 
-fn glob_paths<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn glob_paths(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.glob", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.glob")?;
     let OwnedPyString(pattern) = args.positional()[0].cast(runtime)?;
@@ -330,7 +330,7 @@ fn glob_paths<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResu
     runtime.new_list(values)
 }
 
-fn remove_file<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn remove_file(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.remove_file", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.remove_file")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -338,7 +338,7 @@ fn remove_file<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     Ok(Value::None)
 }
 
-fn remove_tree<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn remove_tree(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.remove_tree", 1, 1)?;
     args.reject_keywords("_shellsim_vfs.remove_tree")?;
     let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
@@ -346,7 +346,7 @@ fn remove_tree<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     Ok(Value::None)
 }
 
-fn rename<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn rename(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("_shellsim_vfs.rename", 2, 2)?;
     args.reject_keywords("_shellsim_vfs.rename")?;
     let OwnedPyString(source) = args.positional()[0].cast(runtime)?;

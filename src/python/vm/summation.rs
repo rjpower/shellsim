@@ -67,9 +67,9 @@ impl<'s> Vm<'s> {
     /// `sum(iterable, start=0)`.
     pub(super) fn builtin_sum(
         &mut self,
-        values: Vec<Value<'s>>,
-        start: Value<'s>,
-    ) -> Result<Value<'s>, String> {
+        values: Vec<Value>,
+        start: Value,
+    ) -> Result<Value, String> {
         self.reject_sequence_start(&start)?;
         let mut items = values.into_iter();
         let mut total = start;
@@ -139,7 +139,7 @@ impl<'s> Vm<'s> {
         Ok(total)
     }
 
-    fn reject_sequence_start(&mut self, start: &Value<'s>) -> Result<(), String> {
+    fn reject_sequence_start(&mut self, start: &Value) -> Result<(), String> {
         let kind = if string::string_ref(self.heap(), *start)?.is_some() {
             "strings [use ''.join(seq) instead]"
         } else {
@@ -154,7 +154,7 @@ impl<'s> Vm<'s> {
 
     /// Classify `value` for the fast paths. Registered numbers such as NumPy scalars are not
     /// Python `int`, `float`, or `complex` objects, so they take the generic path.
-    fn sum_item(&self, value: &Value<'s>) -> Result<Item, String> {
+    fn sum_item(&self, value: &Value) -> Result<Item, String> {
         if number::registered_number(self.heap(), value).is_some() {
             return Ok(Item::Other);
         }

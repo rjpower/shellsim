@@ -193,7 +193,7 @@ pub(super) fn os_error_subclass(errno: i32) -> &'static str {
 /// message can fail on self-referential arguments, so callers that only classify use this.
 pub(super) fn exception_type_name(
     state: &ReplState,
-    value: Value<'_>,
+    value: Value,
 ) -> Result<Option<String>, String> {
     if !value.is_object() {
         return Ok(None);
@@ -209,7 +209,7 @@ pub(super) fn exception_type_name(
 /// `value` is not an exception.
 pub(super) fn exception_base(
     state: &ReplState,
-    value: Value<'_>,
+    value: Value,
 ) -> Result<Option<&'static str>, String> {
     if !value.is_object() {
         return Ok(None);
@@ -219,10 +219,10 @@ pub(super) fn exception_base(
 
 /// The closest builtin exception class and the constructor arguments of an exception instance,
 /// which its payload holds as `BaseException.args`.
-pub(super) fn exception_args<'s>(
+pub(super) fn exception_args(
     state: &ReplState,
-    value: Value<'_>,
-) -> Result<Option<(&'static str, Vec<Value<'s>>)>, String> {
+    value: Value,
+) -> Result<Option<(&'static str, Vec<Value>)>, String> {
     let Some(base) = exception_base(state, value)? else {
         return Ok(None);
     };
@@ -230,7 +230,7 @@ pub(super) fn exception_args<'s>(
     let Object::Exception(args) = heap.get(value)? else {
         return Err("exception instance has a non-exception layout".into());
     };
-    Ok(Some((base, heap.handles(args))))
+    Ok(Some((base, heap.values(args))))
 }
 
 #[cfg(test)]

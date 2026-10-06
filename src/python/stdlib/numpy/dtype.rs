@@ -174,7 +174,7 @@ impl DType {
     }
 
     /// A `<U{chars}` string dtype.
-    pub(in crate::python) fn str(chars: usize) -> PyResult<'static, Self> {
+    pub(in crate::python) fn str(chars: usize) -> PyResult<Self> {
         let chars = u32::try_from(chars)
             .ok()
             .filter(|chars| *chars <= MAX_STR_CHARS)
@@ -351,7 +351,7 @@ impl DType {
     }
 
     /// Parse a dtype string such as `int8`, `<i8`, `f`, `U5`, or `object`.
-    pub(in crate::python) fn parse(text: &str) -> PyResult<'static, Self> {
+    pub(in crate::python) fn parse(text: &str) -> PyResult<Self> {
         let not_understood = || PyError::type_error(format!("data type '{text}' not understood"));
         if let Some(body) = text.strip_prefix('>').filter(|body| !body.is_empty()) {
             let dtype = Self::parse(body)?;
@@ -471,7 +471,7 @@ fn wider(left: DType, right: DType) -> DType {
 
 /// `np.promote_types` for two strong dtypes. Strings promote only with strings; mixing a string
 /// with a number has no common dtype and raises `TypeError`.
-pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<'static, DType> {
+pub(in crate::python) fn promote(left: DType, right: DType) -> PyResult<DType> {
     use Category::*;
     let (left, right) = (left.native(), right.native());
     let (a, b) = if left.category() <= right.category() {
@@ -533,7 +533,7 @@ impl Weak {
 }
 
 /// NEP 50: the result dtype of a strong dtype combined with a weak Python scalar.
-pub(in crate::python) fn promote_weak(strong: DType, weak: Weak) -> PyResult<'static, DType> {
+pub(in crate::python) fn promote_weak(strong: DType, weak: Weak) -> PyResult<DType> {
     use Category::*;
     let strong = strong.native();
     Ok(match (strong.category(), weak) {
@@ -551,7 +551,7 @@ pub(in crate::python) fn promote_weak(strong: DType, weak: Weak) -> PyResult<'st
 
 /// NEP 50 result type of strong dtypes (arrays, NumPy scalars, dtype specifications) and weak
 /// Python scalars, as used by ufuncs and `np.result_type`.
-pub(in crate::python) fn result_type(strong: &[DType], weak: &[Weak]) -> PyResult<'static, DType> {
+pub(in crate::python) fn result_type(strong: &[DType], weak: &[Weak]) -> PyResult<DType> {
     let Some((first, rest)) = strong.split_first() else {
         return Ok(weak
             .iter()
@@ -579,7 +579,7 @@ pub(in crate::python) enum Casting {
 }
 
 impl Casting {
-    pub(in crate::python) fn parse(text: &str) -> PyResult<'static, Self> {
+    pub(in crate::python) fn parse(text: &str) -> PyResult<Self> {
         Ok(match text {
             "no" => Self::No,
             "equiv" => Self::Equiv,

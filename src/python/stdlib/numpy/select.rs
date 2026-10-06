@@ -34,18 +34,18 @@ pub(in crate::python) static ARRAY_METHODS: NativeTypeDef = NativeTypeDef {
     getters: &[],
 };
 
-fn receiver<'s>(runtime: &dyn PyRuntime<'s>, value: PyValue<'s>) -> PyResult<'s, Array<'s>> {
+fn receiver(runtime: &dyn PyRuntime, value: PyValue) -> PyResult<Array> {
     Array::from_value(runtime, value)
 }
 
 /// The truth of `mask`, broadcast to `shape`, in C order. `mask` need not already be boolean:
 /// it converts with NumPy's per-dtype truth rule, the same as an `if` condition or `bool(x)`.
 /// Shared by `where`, `copyto`, and masked ufunc calls (`np.add(a, b, where=mask)`).
-pub(in crate::python) fn broadcast_truth<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    mask: &Array<'s>,
+pub(in crate::python) fn broadcast_truth(
+    runtime: &mut dyn PyRuntime,
+    mask: &Array,
     shape: &[usize],
-) -> PyResult<'s, Vec<bool>> {
+) -> PyResult<Vec<bool>> {
     let mask = if mask.dtype == DType::BOOL {
         mask.clone()
     } else {
@@ -70,7 +70,7 @@ pub(in crate::python) fn broadcast_truth<'s>(
 /// `np.nonzero(a)`/`a.nonzero()`: one int64 index array per axis, C order. Unlike the internal
 /// boolean-mask path ([`index::nonzero`]), which treats a 0-d array as shape `(1,)` for `a[mask]`
 /// indexing, the top-level function rejects 0-d input outright.
-fn nonzero<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'s, PyValue<'s>> {
+fn nonzero(runtime: &mut dyn PyRuntime, array: &Array) -> PyResult<PyValue> {
     if array.ndim() == 0 {
         return Err(PyError::value_error(
             "Calling nonzero on 0d arrays is not allowed. Use np.atleast_1d(scalar).nonzero() \
@@ -88,21 +88,18 @@ fn nonzero<'s>(runtime: &mut dyn PyRuntime<'s>, array: &Array<'s>) -> PyResult<'
     runtime.new_tuple(outputs)
 }
 
-pub(in crate::python) fn module_nonzero<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(in crate::python) fn module_nonzero(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("nonzero", &["a"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let array = convert::as_array(runtime, bound.required("a"))?;
     nonzero(runtime, &array)
 }
 
-fn method_nonzero<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver_value: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn method_nonzero(
+    runtime: &mut dyn PyRuntime,
+    receiver_value: PyValue,
+    args: CallArgs,
+) -> PyResult {
     args.expect_positional("nonzero", 0, 0)?;
     args.reject_keywords("nonzero")?;
     let array = receiver(runtime, receiver_value)?;
@@ -110,11 +107,11 @@ fn method_nonzero<'s>(
 }
 
 /// One NEP 50 operand (array or weak Python scalar) cast to `dtype`.
-fn operand_array<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    operand: ufunc::Operand<'s>,
+fn operand_array(
+    runtime: &mut dyn PyRuntime,
+    operand: ufunc::Operand,
     dtype: DType,
-) -> PyResult<'s, Array<'s>> {
+) -> PyResult<Array> {
     match operand {
         ufunc::Operand::Array(array) => convert::cast_array(runtime, &array, dtype, false),
         ufunc::Operand::Weak { value, leaf, .. } => {
@@ -124,12 +121,12 @@ fn operand_array<'s>(
 }
 
 /// Combine two same-dtype, same-shape broadcast buffers by `truth`, element by element.
-fn select_buffer<'s>(
+fn select_buffer(
     truth: &[bool],
     itemsize: usize,
-    x: &PyArrayBuffer<'s>,
-    y: &PyArrayBuffer<'s>,
-) -> PyArrayBuffer<'s> {
+    x: &PyArrayBuffer,
+    y: &PyArrayBuffer,
+) -> PyArrayBuffer {
     match (x, y) {
         (PyArrayBuffer::Bytes(x), PyArrayBuffer::Bytes(y)) => {
             let mut out = vec![0u8; truth.len() * itemsize];
@@ -153,12 +150,12 @@ fn select_buffer<'s>(
 
 /// `np.where(condition, x, y)`: `x` where `condition` is true, `y` elsewhere, promoted and
 /// broadcast together like a binary ufunc.
-fn where_select<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    condition: PyValue<'s>,
-    x: PyValue<'s>,
-    y: PyValue<'s>,
-) -> PyResult<'s> {
+fn where_select(
+    runtime: &mut dyn PyRuntime,
+    condition: PyValue,
+    x: PyValue,
+    y: PyValue,
+) -> PyResult {
     let condition = convert::array_from_python(runtime, condition, Some(DType::BOOL), false)?;
     let operands = [ufunc::operand(runtime, x)?.0, ufunc::operand(runtime, y)?.0];
     let dtype = ufunc::common_dtype(&operands)?;
@@ -176,10 +173,7 @@ fn where_select<'s>(
     Ok(array::new_array(runtime, buffer, dtype, shape)?.value())
 }
 
-pub(in crate::python) fn module_where<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(in crate::python) fn module_where(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature = Signature::new("where", &["condition", "x", "y"], 1);
     let bound = SIGNATURE.bind(&args)?;
     let condition = bound.required("condition");
@@ -196,12 +190,12 @@ pub(in crate::python) fn module_where<'s>(
 }
 
 /// Keep only the offsets and matching buffer entries selected by `truth`.
-fn filter_selected<'s>(
+fn filter_selected(
     truth: &[bool],
     itemsize: usize,
     offsets: &[usize],
-    buffer: &PyArrayBuffer<'s>,
-) -> (Vec<usize>, PyArrayBuffer<'s>) {
+    buffer: &PyArrayBuffer,
+) -> (Vec<usize>, PyArrayBuffer) {
     let selected_offsets = offsets
         .iter()
         .zip(truth)
@@ -230,10 +224,7 @@ fn filter_selected<'s>(
 
 /// `np.copyto(dst, src, casting='same_kind', where=True)`: `dst[...] = src`, masked by `where`.
 /// Always returns `None`.
-pub(in crate::python) fn module_copyto<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+pub(in crate::python) fn module_copyto(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     static SIGNATURE: Signature =
         Signature::new("copyto", &["dst", "src"], 2).keyword_only(&["casting", "where"]);
     let bound = SIGNATURE.bind(&args)?;

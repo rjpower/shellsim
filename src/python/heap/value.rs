@@ -1,19 +1,19 @@
-//! Value representations: the heap's own word, stored references, and scoped handles.
+//! Value representations: the heap's own word, stored references, and pinned values.
 //!
 //! Three types share one compact 16-byte layout (a tag, a 64-bit payload and seven auxiliary
-//! bytes) and differ only in what an object payload means and who may hold them:
+//! bytes) and differ only in who may hold them:
 //!
-//! - [`Raw`] is the heap's own word: an immediate or an [`ObjectId`]. It never leaves the heap
-//!   module tree, because an `ObjectId` of a young object changes when the collector moves it.
-//! - [`Ref`] is a stored reference inside a heap object or a VM root. Outside the heap it is
-//!   opaque: it can be read through a scope ([`Heap::handle`](super::Heap::handle)) but neither
-//!   copied nor constructed, so a stale reference cannot be carried in a Rust local.
-//! - [`Value<'s>`] is a handle: an immediate, or an index into the heap's handle stack, which
-//!   the collector rewrites when the referenced object moves. The lifetime `'s` is the handle
-//!   scope that owns the entry, so a handle cannot outlive its scope.
+//! - [`Raw`] is the heap's own word: an immediate or an [`ObjectId`].
+//! - [`Ref`] is a stored reference inside a heap object or a VM root, which the collector
+//!   traces. It is not `Copy`, so a reference cannot be duplicated into an untraced place by
+//!   accident.
+//! - [`Value`] is the word Rust code works with. Objects never move, so a value names its object
+//!   directly; it is rooted by the heap's pin stack from the moment it is made until the
+//!   instruction or native loop that made it ends. A value is not `Send`, and interpreter state
+//!   must be, so a value cannot be stored in the VM's persistent state.
 //!
 //! Immediates (ints, floats, bools, `None`, short strings, native markers and registered inline
-//! values) carry no scope: every constructor yields a `Value<'static>`, usable in any scope.
+//! values) need no pin.
 
 use std::marker::PhantomData;
 
@@ -151,22 +151,6 @@ impl Raw {
         matches!(self.tag, ValueTag::Object)
     }
 
-    /// The handle-stack index this word names when it is the object payload of a handle.
-    pub(super) const fn handle_index(self) -> Option<usize> {
-        match self.tag {
-            ValueTag::Object => Some(self.payload as usize),
-            _ => None,
-        }
-    }
-
-    pub(super) const fn handle(index: usize) -> Self {
-        Self {
-            payload: index as u64,
-            aux: [0; 7],
-            tag: ValueTag::Object,
-        }
-    }
-
     const fn immediate_int(self) -> Option<i64> {
         match self.tag {
             ValueTag::Int | ValueTag::Bool => Some(self.payload as i64),
@@ -284,17 +268,18 @@ const fn string_tag(length: usize) -> ValueTag {
 
 /// A reference stored in a heap object or a VM root.
 ///
-/// Slots are the collector's unit of work: it traces and rewrites every slot reachable from the
-/// roots. Outside the heap a slot is read-only and cannot be duplicated, so the only way to use
-/// what it names is to take a scoped [`Value`] from it while the containing object is borrowed.
-/// Equality is identity: two slots are equal when they name the same object or immediate.
+/// Slots are the collector's unit of work: it traces every slot reachable from the roots. A slot
+/// is made from a pinned [`Value`] and read back as one with [`Heap::value`](super::Heap::value);
+/// it cannot be copied, so the only references the collector cannot see are the pinned values
+/// themselves. Equality is identity: two slots are equal when they name the same object or
+/// immediate.
 #[derive(PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Ref(pub(super) Raw);
 
 impl Ref {
     /// The immediate this slot holds, or `None` for an object reference.
-    pub fn immediate(&self) -> Option<Value<'static>> {
+    pub fn immediate(&self) -> Option<Value> {
         (!self.0.is_object()).then(|| Value::from_raw(self.0))
     }
 
@@ -307,25 +292,58 @@ impl Ref {
     }
 
     /// A stored immediate, for root containers that hold Python values without a heap, such as
-    /// the type registry's native method entries. Only immediates can be stored this way; an
-    /// object must be stored through the scope that holds its handle.
+    /// the type registry's native method entries.
     ///
     /// # Panics
     ///
-    /// Panics when `value` is an object handle.
-    pub fn from_immediate(value: Value<'static>) -> Self {
+    /// Panics when `value` is an object.
+    pub fn from_immediate(value: Value) -> Self {
         assert!(
             !value.is_object(),
-            "only immediates can be stored without a scope"
+            "only immediates can be stored without a value"
         );
         Self(value.raw())
     }
 
-    /// Copy a stored reference for a root container's `Clone` implementation. Never hold the
-    /// result in a Rust local across an allocation: it is not a handle and the collector cannot
-    /// see it there.
+    /// Copy a stored reference for a root container's `Clone` implementation, or to move it
+    /// between roots. Never hold the result in a Rust local across an allocation: it is not
+    /// pinned and the collector cannot see it there.
     pub(crate) fn dup(&self) -> Self {
         Self(self.0)
+    }
+
+    /// The stored form of an optional value.
+    pub fn optional(value: Option<Value>) -> Option<Ref> {
+        value.map(Ref::from)
+    }
+
+    /// The stored form of each named value.
+    pub fn named(
+        values: impl IntoIterator<Item = (String, Value)>,
+    ) -> std::collections::HashMap<String, Ref> {
+        values
+            .into_iter()
+            .map(|(name, value)| (name, Ref::from(value)))
+            .collect()
+    }
+
+    /// The stored form of each of `values`, sized exactly: collecting straight from a
+    /// `Vec<Value>` would reuse its allocation, so a list cut down to a few items could keep the
+    /// capacity of the snapshot it came from, while the modeled size counts items.
+    pub fn all(values: impl IntoIterator<Item = Value>) -> Vec<Ref> {
+        let values = values.into_iter();
+        let mut refs = Vec::with_capacity(values.size_hint().0);
+        refs.extend(values.map(Ref::from));
+        refs
+    }
+}
+
+impl From<Value> for Ref {
+    /// The stored form of a pinned value. Place it in a heap object or a root before the value's
+    /// pin is released.
+    #[inline(always)]
+    fn from(value: Value) -> Self {
+        Self(value.raw())
     }
 }
 
@@ -335,61 +353,58 @@ impl std::fmt::Debug for Ref {
     }
 }
 
-/// A scoped handle to a Python value.
+/// A Python value as Rust code holds it: an immediate, or an object's id.
 ///
-/// Immediates are stored inline. Object handles index the heap's handle stack, whose entries the
-/// collector rewrites when it moves an object, so a `Value` stays valid across any allocation.
-/// `'s` is the scope that owns the handle-stack entry; the scope truncates the stack when it
-/// ends, and the type system keeps the handle from outliving it.
-///
-/// Handles have no equality: two handles to one object may use different entries. Compare
-/// identity through the scope (`identical`) and immediates through their accessors.
+/// Objects never move, so the id is all a value needs. A value made from a stored reference or
+/// an allocation is pinned on the heap's pin stack, which keeps its object alive through any
+/// collection until the instruction or native loop that made it releases its pins. The
+/// `PhantomData` makes values neither `Send` nor `Sync`, so they cannot be kept in interpreter
+/// state, which must be `Send`; store a [`Ref`] there instead.
 #[derive(Clone, Copy)]
-pub struct Value<'s> {
+pub struct Value {
     raw: Raw,
-    scope: PhantomData<&'s ()>,
+    pinned: PhantomData<*const ()>,
 }
 
 // Immediate constructors keep the enum-variant spelling (`Value::Int(3)`, `Value::None`) that
-// the interpreter and native modules read naturally; each produces a `'static` handle because an
-// immediate needs no scope.
-impl Value<'_> {
+// the interpreter and native modules read naturally.
+impl Value {
     #[allow(non_upper_case_globals)]
-    pub const None: Value<'static> = Value::from_raw(Raw::NONE);
+    pub const None: Value = Value::from_raw(Raw::NONE);
 
     #[allow(non_snake_case)]
-    pub const fn Int(value: i64) -> Value<'static> {
+    pub const fn Int(value: i64) -> Value {
         Value::from_raw(Raw::int(value))
     }
 
     #[allow(non_snake_case)]
-    pub const fn Float(value: f64) -> Value<'static> {
+    pub const fn Float(value: f64) -> Value {
         Value::from_raw(Raw::float(value))
     }
 
     #[allow(non_snake_case)]
-    pub const fn Bool(value: bool) -> Value<'static> {
+    pub const fn Bool(value: bool) -> Value {
         Value::from_raw(Raw::bool(value))
     }
 
     #[allow(non_snake_case)]
-    pub(in crate::python) fn Native(value: NativeValue) -> Value<'static> {
+    pub(in crate::python) fn Native(value: NativeValue) -> Value {
         Value::from_raw(Raw::native(value))
     }
 
-    pub fn registered(kind: u8, payload: u64) -> Value<'static> {
+    pub fn registered(kind: u8, payload: u64) -> Value {
         Value::from_raw(Raw::registered(kind, payload))
     }
 
     /// A string of at most fifteen bytes stored inline, or `None` when it needs a heap object.
-    pub fn inline_string(value: &str) -> Option<Value<'static>> {
+    pub fn inline_string(value: &str) -> Option<Value> {
         Raw::inline_string(value).map(Value::from_raw)
     }
 
-    pub(super) const fn from_raw(raw: Raw) -> Value<'static> {
+    pub(super) const fn from_raw(raw: Raw) -> Value {
         Value {
             raw,
-            scope: PhantomData,
+            pinned: PhantomData,
         }
     }
 
@@ -397,13 +412,13 @@ impl Value<'_> {
         self.raw
     }
 
-    /// Whether this handle names a heap object rather than an immediate.
+    /// Whether this value names a heap object rather than an immediate.
     pub const fn is_object(self) -> bool {
         self.raw.is_object()
     }
 
-    /// This value as an immediate usable in any scope, or `None` for an object handle.
-    pub const fn immediate(self) -> Option<Value<'static>> {
+    /// This value when it is an immediate, or `None` for an object.
+    pub const fn immediate(self) -> Option<Value> {
         if self.raw.is_object() {
             None
         } else {
@@ -411,10 +426,22 @@ impl Value<'_> {
         }
     }
 
-    /// Whether both values are the same immediate. Object handles never compare equal here;
-    /// compare them by identity through their scope.
-    pub fn same_immediate(self, other: Value<'_>) -> bool {
+    /// Whether both values are the same immediate. Objects never compare equal here; compare
+    /// them with [`Value::is`].
+    pub fn same_immediate(self, other: Value) -> bool {
         !self.raw.is_object() && !other.raw.is_object() && self.raw == other.raw
+    }
+
+    /// Python's `is`: the same object or the same immediate.
+    #[inline(always)]
+    pub fn is(self, other: Value) -> bool {
+        self.raw == other.raw
+    }
+
+    /// Whether this value and a stored reference name the same object or immediate.
+    #[inline(always)]
+    pub fn is_ref(self, slot: &Ref) -> bool {
+        self.raw == slot.0
     }
 
     pub const fn is_none(self) -> bool {
@@ -466,23 +493,16 @@ impl Value<'_> {
     }
 }
 
-impl std::fmt::Debug for Value<'_> {
+impl std::fmt::Debug for Value {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.raw.is_object() {
-            formatter
-                .debug_tuple("Handle")
-                .field(&self.raw.payload)
-                .finish()
-        } else {
-            self.raw.fmt(formatter)
-        }
+        self.raw.fmt(formatter)
     }
 }
 
 const _: () = assert!(std::mem::size_of::<Raw>() == 16);
 const _: () = assert!(std::mem::size_of::<Ref>() == 16);
 const _: () = assert!(std::mem::size_of::<Option<Ref>>() == 16);
-const _: () = assert!(std::mem::size_of::<Value<'static>>() == 16);
+const _: () = assert!(std::mem::size_of::<Value>() == 16);
 
 #[cfg(test)]
 mod tests {
@@ -490,7 +510,7 @@ mod tests {
 
     #[test]
     fn compact_values_are_exactly_sixteen_bytes() {
-        assert_eq!(std::mem::size_of::<Value<'static>>(), 16);
+        assert_eq!(std::mem::size_of::<Value>(), 16);
         assert_eq!(
             Value::inline_string("123456789012345")
                 .unwrap()
@@ -504,9 +524,10 @@ mod tests {
     fn immediates_compare_and_objects_do_not() {
         assert!(Value::Int(3).same_immediate(Value::Int(3)));
         assert!(!Value::Int(3).same_immediate(Value::Float(3.0)));
-        let handle = Value::from_raw(Raw::handle(0));
-        assert!(!handle.same_immediate(handle));
-        assert!(handle.immediate().is_none());
+        let object = Value::from_raw(Raw::object(ObjectId::from_bits(7)));
+        assert!(!object.same_immediate(object));
+        assert!(object.is(object));
+        assert!(object.immediate().is_none());
         assert_eq!(Value::Bool(true).immediate_int(), Some(1));
     }
 }

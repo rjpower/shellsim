@@ -85,8 +85,8 @@ pub(in crate::python) static MATCH_TYPE: NativeTypeDef = NativeTypeDef {
     ],
 };
 
-type Method = for<'s> fn(&mut dyn PyRuntime<'s>, PyValue<'s>, CallArgs<'s>) -> PyResult<'s>;
-type Getter = for<'s> fn(&mut dyn PyRuntime<'s>, PyValue<'s>) -> PyResult<'s>;
+type Method = fn(&mut dyn PyRuntime, PyValue, CallArgs) -> PyResult;
+type Getter = fn(&mut dyn PyRuntime, PyValue) -> PyResult;
 
 const fn pattern_method(name: &'static str, call: Method) -> MethodDef {
     MethodDef {
@@ -243,9 +243,9 @@ impl NativeObject for MatchObject {
             .ok_or_else(|| "modeled object size overflow".into())
     }
 
-    fn visit_refs(&mut self, visit: &mut dyn FnMut(&mut Ref)) {
-        visit(&mut self.subject);
-        visit(&mut self.regex);
+    fn visit_refs(&self, visit: &mut dyn FnMut(&Ref)) {
+        visit(&self.subject);
+        visit(&self.regex);
     }
 
     fn dup(&self) -> Box<dyn NativeObject> {
@@ -290,7 +290,7 @@ fn flag_repr(flags: u32) -> String {
 }
 
 /// `_re.compile(pattern, flags)`: validate and compile a pattern string into a `re.Pattern`.
-fn compile<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn compile(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("re.compile", 1, 2)?;
     args.reject_unknown_keywords("re.compile", &["flags"])?;
     let pattern = string_arg(runtime, &args.positional()[0], "regex pattern", MAX_PATTERN)?;
@@ -299,7 +299,7 @@ fn compile<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<
     runtime.new_regex(pattern, flags)
 }
 
-fn escape<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn escape(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("re.escape", 1, 1)?;
     args.reject_keywords("re.escape")?;
     let text = string_arg(runtime, &args.positional()[0], "escape input", MAX_INPUT)?;
@@ -308,18 +308,15 @@ fn escape<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'
 }
 
 /// A `re.Pattern` receiver with its compiled engine.
-struct Compiled<'s> {
-    value: Value<'s>,
+struct Compiled {
+    value: Value,
     pattern: String,
     flags: u32,
     regex: Regex,
 }
 
-fn compiled<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: Value<'s>,
-) -> PyResult<'s, Compiled<'s>> {
-    let (pattern, flags) = runtime.regex_parts(receiver.cast::<PyRegex<'s>>(runtime)?)?;
+fn compiled(runtime: &mut dyn PyRuntime, receiver: Value) -> PyResult<Compiled> {
+    let (pattern, flags) = runtime.regex_parts(receiver.cast::<PyRegex>(runtime)?)?;
     let regex = build_regex(&pattern, flags)?;
     Ok(Compiled {
         value: receiver,
@@ -329,25 +326,25 @@ fn compiled<'s>(
     })
 }
 
-fn pattern_pattern<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
-    let (pattern, _) = runtime.regex_parts(receiver.cast::<PyRegex<'s>>(runtime)?)?;
+fn pattern_pattern(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (pattern, _) = runtime.regex_parts(receiver.cast::<PyRegex>(runtime)?)?;
     runtime.new_string(pattern)
 }
 
 /// `Pattern.flags` includes the implied UNICODE flag unless ASCII was requested, as CPython
 /// reports for str patterns.
-fn pattern_flags<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
-    let (_, flags) = runtime.regex_parts(receiver.cast::<PyRegex<'s>>(runtime)?)?;
+fn pattern_flags(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
+    let (_, flags) = runtime.regex_parts(receiver.cast::<PyRegex>(runtime)?)?;
     let implied = if flags & ASCII != 0 { 0 } else { UNICODE };
     Ok(Value::Int(i64::from(flags | implied)))
 }
 
-fn pattern_groups<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn pattern_groups(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let compiled = compiled(runtime, receiver)?;
     int_value(compiled.regex.captures_len().saturating_sub(1))
 }
 
-fn pattern_groupindex<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn pattern_groupindex(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let compiled = compiled(runtime, receiver)?;
     let mut items = Vec::new();
     for (index, name) in compiled.regex.capture_names().enumerate() {
@@ -365,36 +362,24 @@ enum CaptureMode {
     FullMatch,
 }
 
-fn pattern_search<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_search(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     pattern_capture(runtime, receiver, args, CaptureMode::Search)
 }
 
-fn pattern_match<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_match(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     pattern_capture(runtime, receiver, args, CaptureMode::Match)
 }
 
-fn pattern_fullmatch<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_fullmatch(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     pattern_capture(runtime, receiver, args, CaptureMode::FullMatch)
 }
 
 /// The `string, pos=0, endpos=len(string)` arguments shared by the capture and find methods.
-fn subject_args<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
+fn subject_args(
+    runtime: &mut dyn PyRuntime,
+    args: &CallArgs,
     name: &str,
-) -> PyResult<'s, (Value<'s>, String, Window)> {
+) -> PyResult<(Value, String, Window)> {
     args.expect_positional(name, 1, 3)?;
     args.reject_unknown_keywords(name, &["pos", "endpos"])?;
     let subject = args.positional()[0];
@@ -414,12 +399,12 @@ fn subject_args<'s>(
     Ok((subject, text, window))
 }
 
-fn pattern_capture<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
+fn pattern_capture(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
     mode: CaptureMode,
-) -> PyResult<'s> {
+) -> PyResult {
     let name = match mode {
         CaptureMode::Search => "re.Pattern.search",
         CaptureMode::Match => "re.Pattern.match",
@@ -475,28 +460,20 @@ fn pattern_capture<'s>(
     allocate_match(runtime, &context, &captures, &mut cursor)
 }
 
-fn pattern_findall<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_findall(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     pattern_find(runtime, receiver, args, false)
 }
 
-fn pattern_finditer<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_finditer(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     pattern_find(runtime, receiver, args, true)
 }
 
-fn pattern_find<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
+fn pattern_find(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
     return_matches: bool,
-) -> PyResult<'s> {
+) -> PyResult {
     let name = if return_matches {
         "re.Pattern.finditer"
     } else {
@@ -553,20 +530,12 @@ fn pattern_find<'s>(
     }
 }
 
-fn pattern_sub<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_sub(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let (rendered, _) = pattern_substitute(runtime, receiver, args, "re.Pattern.sub")?;
     runtime.new_string(rendered)
 }
 
-fn pattern_subn<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_subn(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let (rendered, count) = pattern_substitute(runtime, receiver, args, "re.Pattern.subn")?;
     let rendered = runtime.new_string(rendered)?;
     let count = int_value(count)?;
@@ -575,12 +544,12 @@ fn pattern_subn<'s>(
 
 /// `Pattern.sub(repl, string, count=0)` and `subn`: the replaced text and the number of
 /// replacements. `repl` is a template string or a callable receiving each match.
-fn pattern_substitute<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
+fn pattern_substitute(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
     name: &str,
-) -> PyResult<'s, (String, usize)> {
+) -> PyResult<(String, usize)> {
     args.expect_positional(name, 2, 3)?;
     args.reject_unknown_keywords(name, &["count"])?;
     let compiled = compiled(runtime, receiver)?;
@@ -665,11 +634,7 @@ fn pattern_substitute<'s>(
 
 /// `Pattern.split(string, maxsplit=0)`: the text between matches, with each capturing group's
 /// text (or `None`) inserted between pieces as CPython does.
-fn pattern_split<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn pattern_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     const NAME: &str = "re.Pattern.split";
     args.expect_positional(NAME, 1, 2)?;
     args.reject_unknown_keywords(NAME, &["maxsplit"])?;
@@ -711,9 +676,9 @@ fn pattern_split<'s>(
     runtime.new_list(pieces)
 }
 
-enum Replacement<'s> {
+enum Replacement {
     Template(Vec<Piece>),
-    Callable(Value<'s>),
+    Callable(Value),
 }
 
 /// One element of a parsed replacement template.
@@ -724,7 +689,7 @@ enum Piece {
 
 /// Parse a `re.sub` template: `\1`, `\g<1>` and `\g<name>` group references, the C escapes
 /// CPython accepts, and literal text. Unknown alphabetic escapes and unknown groups are errors.
-fn parse_template<'s>(template: &str, regex: &Regex) -> PyResult<'s, Vec<Piece>> {
+fn parse_template(template: &str, regex: &Regex) -> PyResult<Vec<Piece>> {
     let group_count = regex.captures_len();
     let mut pieces = Vec::new();
     let mut literal = String::new();
@@ -734,7 +699,7 @@ fn parse_template<'s>(template: &str, regex: &Regex) -> PyResult<'s, Vec<Piece>>
             pieces.push(Piece::Literal(std::mem::take(literal)));
         }
     };
-    let group = |index: usize| -> PyResult<'s, Piece> {
+    let group = |index: usize| -> PyResult<Piece> {
         if index < group_count {
             Ok(Piece::Group(index))
         } else {
@@ -835,14 +800,14 @@ struct Window {
     endpos: usize,
 }
 
-fn window<'s>(
-    runtime: &dyn PyRuntime<'s>,
+fn window(
+    runtime: &dyn PyRuntime,
     text: &str,
-    pos: Option<Value<'s>>,
-    endpos: Option<Value<'s>>,
-) -> PyResult<'s, Window> {
+    pos: Option<Value>,
+    endpos: Option<Value>,
+) -> PyResult<Window> {
     let length = text.chars().count();
-    let clamp = |value: Option<Value<'s>>| -> PyResult<'s, Option<usize>> {
+    let clamp = |value: Option<Value>| -> PyResult<Option<usize>> {
         let Some(value) = value.filter(|value| !value.is_none()) else {
             return Ok(None);
         };
@@ -871,10 +836,10 @@ fn window<'s>(
 }
 
 /// Everything a match object records about where it came from.
-struct MatchContext<'c, 's> {
-    regex: Value<'s>,
+struct MatchContext<'c> {
+    regex: Value,
     engine: &'c Regex,
-    subject: Value<'s>,
+    subject: Value,
     /// The whole subject string.
     text: &'c str,
     /// Byte offset of the haystack the engine searched within `text`.
@@ -904,12 +869,12 @@ impl CharCursor {
     }
 }
 
-fn allocate_match<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    context: &MatchContext<'_, 's>,
+fn allocate_match(
+    runtime: &mut dyn PyRuntime,
+    context: &MatchContext<'_>,
     captures: &Captures<'_>,
     cursor: &mut CharCursor,
-) -> PyResult<'s> {
+) -> PyResult {
     let whole = captures
         .get(0)
         .ok_or_else(|| PyError::runtime_error("regex engine returned no whole match"))?;
@@ -951,19 +916,12 @@ fn allocate_match<'s>(
     })
 }
 
-fn match_data<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-) -> PyResult<'s, PyMatchData<'s>> {
-    runtime.match_data(receiver.cast::<PyMatch<'s>>(runtime)?)
+fn match_data(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult<PyMatchData> {
+    runtime.match_data(receiver.cast::<PyMatch>(runtime)?)
 }
 
 /// Resolve a group argument (an index or a name) to its position.
-fn group_index<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyMatchData<'s>,
-    value: &Value<'s>,
-) -> PyResult<'s, usize> {
+fn group_index(runtime: &mut dyn PyRuntime, data: &PyMatchData, value: &Value) -> PyResult<usize> {
     let no_such_group = || PyError::exception("IndexError", "no such group");
     if let Some(name) = runtime.string_value(value)? {
         return data
@@ -979,12 +937,12 @@ fn group_index<'s>(
         .ok_or_else(no_such_group)
 }
 
-fn group_value<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    data: &PyMatchData<'s>,
+fn group_value(
+    runtime: &mut dyn PyRuntime,
+    data: &PyMatchData,
     index: usize,
-    default: Value<'s>,
-) -> PyResult<'s> {
+    default: Value,
+) -> PyResult {
     match data.groups.get(index) {
         Some(Some(text)) => runtime.new_string(text.clone()),
         _ => Ok(default),
@@ -992,11 +950,7 @@ fn group_value<'s>(
 }
 
 /// `Match.group(*groups)`: one group's text, or a tuple when several are asked for.
-fn match_group<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_group(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.reject_keywords("re.Match.group")?;
     let data = match_data(runtime, receiver)?;
     match args.positional() {
@@ -1016,11 +970,7 @@ fn match_group<'s>(
     }
 }
 
-fn match_getitem<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_getitem(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("re.Match.__getitem__", 1, 1)?;
     args.reject_keywords("re.Match.__getitem__")?;
     let data = match_data(runtime, receiver)?;
@@ -1028,7 +978,7 @@ fn match_getitem<'s>(
     group_value(runtime, &data, index, Value::None)
 }
 
-fn default_arg<'s>(args: &CallArgs<'s>, name: &str) -> PyResult<'s, Value<'s>> {
+fn default_arg(args: &CallArgs, name: &str) -> PyResult<Value> {
     args.expect_positional(name, 0, 1)?;
     args.reject_unknown_keywords(name, &["default"])?;
     Ok(args
@@ -1039,11 +989,7 @@ fn default_arg<'s>(args: &CallArgs<'s>, name: &str) -> PyResult<'s, Value<'s>> {
         .unwrap_or(Value::None))
 }
 
-fn match_groups<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_groups(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let default = default_arg(&args, "re.Match.groups")?;
     let data = match_data(runtime, receiver)?;
     let mut groups = Vec::with_capacity(data.groups.len().saturating_sub(1));
@@ -1053,11 +999,7 @@ fn match_groups<'s>(
     runtime.new_tuple(groups)
 }
 
-fn match_groupdict<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_groupdict(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let default = default_arg(&args, "re.Match.groupdict")?;
     let data = match_data(runtime, receiver)?;
     let mut items = Vec::new();
@@ -1070,40 +1012,28 @@ fn match_groupdict<'s>(
     runtime.new_dict(items)
 }
 
-fn match_start<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_start(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let (start, _) = match_span_of(runtime, receiver, args, "re.Match.start")?;
     Ok(Value::Int(start))
 }
 
-fn match_end<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_end(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let (_, end) = match_span_of(runtime, receiver, args, "re.Match.end")?;
     Ok(Value::Int(end))
 }
 
-fn match_span<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_span(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     let (start, end) = match_span_of(runtime, receiver, args, "re.Match.span")?;
     runtime.new_tuple(vec![Value::Int(start), Value::Int(end)])
 }
 
 /// The `(start, end)` of the requested group, `(-1, -1)` when it did not participate.
-fn match_span_of<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
+fn match_span_of(
+    runtime: &mut dyn PyRuntime,
+    receiver: PyValue,
+    args: CallArgs,
     name: &str,
-) -> PyResult<'s, (i64, i64)> {
+) -> PyResult<(i64, i64)> {
     args.expect_positional(name, 0, 1)?;
     args.reject_keywords(name)?;
     let data = match_data(runtime, receiver)?;
@@ -1114,7 +1044,7 @@ fn match_span_of<'s>(
     span_pair(data.spans.get(index).copied().flatten())
 }
 
-fn span_pair<'s>(span: Option<(usize, usize)>) -> PyResult<'s, (i64, i64)> {
+fn span_pair(span: Option<(usize, usize)>) -> PyResult<(i64, i64)> {
     let Some((start, end)) = span else {
         return Ok((-1, -1));
     };
@@ -1125,11 +1055,7 @@ fn span_pair<'s>(span: Option<(usize, usize)>) -> PyResult<'s, (i64, i64)> {
     Ok((convert(start)?, convert(end)?))
 }
 
-fn match_expand<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    receiver: PyValue<'s>,
-    args: CallArgs<'s>,
-) -> PyResult<'s> {
+fn match_expand(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("re.Match.expand", 1, 1)?;
     args.reject_keywords("re.Match.expand")?;
     let data = match_data(runtime, receiver)?;
@@ -1144,25 +1070,25 @@ fn match_expand<'s>(
     runtime.new_string(output)
 }
 
-fn match_string<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_string(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     Ok(match_data(runtime, receiver)?.subject)
 }
 
-fn match_re<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_re(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     Ok(match_data(runtime, receiver)?.regex)
 }
 
-fn match_pos<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_pos(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     int_value(match_data(runtime, receiver)?.pos)
 }
 
-fn match_endpos<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_endpos(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     int_value(match_data(runtime, receiver)?.endpos)
 }
 
 /// The group CPython reports as last matched: the participating group that ends last, with the
 /// outermost (lowest-numbered) group winning ties, since it closes after the groups it contains.
-fn last_group(data: &PyMatchData<'_>) -> Option<usize> {
+fn last_group(data: &PyMatchData) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (index, span) in data.spans.iter().enumerate().skip(1) {
         let Some((_, end)) = span else {
@@ -1175,7 +1101,7 @@ fn last_group(data: &PyMatchData<'_>) -> Option<usize> {
     best.map(|(index, _)| index)
 }
 
-fn match_lastindex<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_lastindex(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let data = match_data(runtime, receiver)?;
     match last_group(&data) {
         Some(index) => int_value(index),
@@ -1183,7 +1109,7 @@ fn match_lastindex<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -
     }
 }
 
-fn match_lastgroup<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_lastgroup(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let data = match_data(runtime, receiver)?;
     match last_group(&data).and_then(|index| data.group_names.get(index).cloned().flatten()) {
         Some(name) => runtime.new_string(name),
@@ -1191,7 +1117,7 @@ fn match_lastgroup<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -
     }
 }
 
-fn match_regs<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyResult<'s> {
+fn match_regs(runtime: &mut dyn PyRuntime, receiver: PyValue) -> PyResult {
     let data = match_data(runtime, receiver)?;
     let mut spans = Vec::with_capacity(data.spans.len());
     for span in &data.spans {
@@ -1201,18 +1127,14 @@ fn match_regs<'s>(runtime: &mut dyn PyRuntime<'s>, receiver: PyValue<'s>) -> PyR
     runtime.new_tuple(spans)
 }
 
-fn int_value<'s>(value: usize) -> PyResult<'s> {
+fn int_value(value: usize) -> PyResult {
     i64::try_from(value)
         .map(Value::Int)
         .map_err(|_| PyError::overflow_error("value is outside Python int range"))
 }
 
 /// A `count`/`maxsplit` argument: zero means unlimited, negative values are rejected.
-fn count_arg<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    value: Option<Value<'s>>,
-    name: &str,
-) -> PyResult<'s, usize> {
+fn count_arg(runtime: &dyn PyRuntime, value: Option<Value>, name: &str) -> PyResult<usize> {
     let Some(value) = value else {
         return Ok(0);
     };
@@ -1220,12 +1142,12 @@ fn count_arg<'s>(
     usize::try_from(count).map_err(|_| PyError::value_error(format!("{name} must be non-negative")))
 }
 
-fn flags_arg<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    args: &CallArgs<'s>,
+fn flags_arg(
+    runtime: &dyn PyRuntime,
+    args: &CallArgs,
     positional_index: usize,
     function: &str,
-) -> PyResult<'s, u32> {
+) -> PyResult<u32> {
     let positional = args.positional().get(positional_index).cloned();
     let keyword = args.keyword(function, "flags")?.cloned();
     if positional.is_some() && keyword.is_some() {
@@ -1239,12 +1161,12 @@ fn flags_arg<'s>(
     u32::try_from(value).map_err(|_| PyError::value_error("regex flags are out of range"))
 }
 
-fn string_arg<'s>(
-    runtime: &dyn PyRuntime<'s>,
-    value: &Value<'s>,
+fn string_arg(
+    runtime: &dyn PyRuntime,
+    value: &Value,
     label: &str,
     maximum: usize,
-) -> PyResult<'s, String> {
+) -> PyResult<String> {
     let OwnedPyString(value) = (*value).cast(runtime)?;
     if value.len() > maximum {
         Err(PyError::value_error(format!(
@@ -1261,7 +1183,7 @@ thread_local! {
 }
 
 /// Compile a Python pattern with `flags`, through the host-side cache.
-pub(in crate::python) fn build_regex<'s>(pattern: &str, flags: u32) -> PyResult<'s, Regex> {
+pub(in crate::python) fn build_regex(pattern: &str, flags: u32) -> PyResult<Regex> {
     if pattern.len() > MAX_PATTERN {
         return Err(PyError::value_error(
             "regex pattern exceeds the bounded pattern limit",
@@ -1313,7 +1235,7 @@ pub(in crate::python) fn build_regex<'s>(pattern: &str, flags: u32) -> PyResult<
 /// `[` inside a class, `(?#...)` comments and the `a`, `u` and `L` inline flags. In verbose
 /// mode, whitespace and `#` inside a class are escaped because the engine would otherwise drop
 /// them where Python keeps them literal.
-fn translate_pattern<'s>(pattern: &str, flags: u32) -> PyResult<'s, String> {
+fn translate_pattern(pattern: &str, flags: u32) -> PyResult<String> {
     let mut ascii = flags & ASCII != 0;
     let verbose = flags & VERBOSE != 0;
     let chars: Vec<char> = pattern.chars().collect();

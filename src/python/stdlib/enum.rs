@@ -37,16 +37,12 @@ pub(crate) static ENUM_TYPE: NativeTypeDef = NativeTypeDef {
     ],
 };
 
-fn enum_base<'s>(runtime: &mut dyn PyRuntime<'s>) -> PyResult<'s> {
+fn enum_base(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::EnumType))
 }
 
 /// The instance attribute a member was given when its class was created.
-fn member_attribute<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    member: Value<'s>,
-    attribute: &str,
-) -> PyResult<'s> {
+fn member_attribute(runtime: &mut dyn PyRuntime, member: Value, attribute: &str) -> PyResult {
     runtime
         .get_attribute_default(member, attribute)?
         .ok_or_else(|| {
@@ -54,18 +50,15 @@ fn member_attribute<'s>(
         })
 }
 
-fn member_name<'s>(runtime: &mut dyn PyRuntime<'s>, member: Value<'s>) -> PyResult<'s> {
+fn member_name(runtime: &mut dyn PyRuntime, member: Value) -> PyResult {
     member_attribute(runtime, member, "_name_")
 }
 
-fn member_value<'s>(runtime: &mut dyn PyRuntime<'s>, member: Value<'s>) -> PyResult<'s> {
+fn member_value(runtime: &mut dyn PyRuntime, member: Value) -> PyResult {
     member_attribute(runtime, member, "_value_")
 }
 
-fn member_name_text<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    member: Value<'s>,
-) -> PyResult<'s, String> {
+fn member_name_text(runtime: &mut dyn PyRuntime, member: Value) -> PyResult<String> {
     let name = member_name(runtime, member)?;
     runtime
         .string_value(&name)?
@@ -73,10 +66,7 @@ fn member_name_text<'s>(
 }
 
 /// `Enum.__repr__`: `<Color.RED: 1>`.
-pub(crate) fn slot_repr<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    member: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+pub(crate) fn slot_repr(runtime: &mut dyn PyRuntime, member: Value) -> PyResult<Option<Value>> {
     let class_name = runtime.type_name(&member)?;
     let name = member_name_text(runtime, member)?;
     let value = member_value(runtime, member)?;
@@ -87,20 +77,14 @@ pub(crate) fn slot_repr<'s>(
 }
 
 /// `Enum.__str__`: `Color.RED`.
-pub(crate) fn slot_str<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    member: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+pub(crate) fn slot_str(runtime: &mut dyn PyRuntime, member: Value) -> PyResult<Option<Value>> {
     let class_name = runtime.type_name(&member)?;
     let name = member_name_text(runtime, member)?;
     runtime.new_string(format!("{class_name}.{name}")).map(Some)
 }
 
 /// `Enum.__hash__` hashes the member name, as CPython does.
-pub(crate) fn slot_hash<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    member: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+pub(crate) fn slot_hash(runtime: &mut dyn PyRuntime, member: Value) -> PyResult<Option<Value>> {
     let name = member_name_text(runtime, member)?;
     Ok(Some(Value::Int(super::super::hash::string(&name))))
 }

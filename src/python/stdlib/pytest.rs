@@ -27,7 +27,7 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     values: &[],
 };
 
-fn set_timeout<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn set_timeout(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     use super::super::native::PyValueCast;
     use super::super::number::PyNumber;
     args.expect_positional("_pytest._set_timeout", 1, 1)?;
@@ -43,20 +43,20 @@ fn set_timeout<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyRes
     Ok(super::super::Value::None)
 }
 
-fn fail<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn fail(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     control_error(runtime, args, "pytest.fail", "Failed")
 }
 
-fn skip<'s>(runtime: &mut dyn PyRuntime<'s>, args: CallArgs<'s>) -> PyResult<'s> {
+fn skip(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     control_error(runtime, args, "pytest.skip", "Skipped")
 }
 
-fn control_error<'s>(
-    runtime: &mut dyn PyRuntime<'s>,
-    args: CallArgs<'s>,
+fn control_error(
+    runtime: &mut dyn PyRuntime,
+    args: CallArgs,
     function: &str,
     kind: &'static str,
-) -> PyResult<'s> {
+) -> PyResult {
     args.expect_positional(function, 0, 1)?;
     args.reject_keywords(function)?;
     let message = args

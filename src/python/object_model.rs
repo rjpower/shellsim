@@ -498,8 +498,8 @@ impl TypeSlots {
     }
 
     /// Every cached descriptor reference, for the registry's root set.
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
-        for entry in &mut self.0 {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for entry in &self.0 {
             if let Some(SlotValue::Descriptor { value, .. }) = entry {
                 visitor(value);
             }
@@ -612,12 +612,12 @@ impl Clone for TypeRegistry {
 /// Completed user class objects own their Python-visible namespace. The registry roots those
 /// class objects, builtin attributes, and cached protocol descriptors in both slot tables.
 impl heap::Roots for TypeRegistry {
-    fn visit_refs(&mut self, visitor: &mut dyn FnMut(&mut Ref)) {
-        for ty in &mut self.types {
-            for value in ty.attributes.values_mut() {
+    fn visit_refs(&self, visitor: &mut dyn FnMut(&Ref)) {
+        for ty in &self.types {
+            for value in ty.attributes.values() {
                 visitor(value);
             }
-            if let Some(value) = &mut ty.value {
+            if let Some(value) = &ty.value {
                 visitor(value);
             }
             ty.local_slots.visit_refs(visitor);
@@ -951,11 +951,7 @@ impl TypeRegistry {
     /// The class object of `value` when `value` is an instance of a user class, whatever payload
     /// the class's layout gave it. Class objects and enum members resolve through their own
     /// paths and return `None` here, as do builtin values.
-    pub fn instance_class<'s>(
-        &self,
-        heap: &Heap,
-        value: Value<'_>,
-    ) -> Result<Option<Value<'s>>, String> {
+    pub fn instance_class(&self, heap: &Heap, value: Value) -> Result<Option<Value>, String> {
         if !value.is_object() {
             return Ok(None);
         }
@@ -970,7 +966,7 @@ impl TypeRegistry {
             .value
             .as_ref()
             .ok_or("instance of a class whose construction is incomplete")?;
-        Ok(Some(heap.handle(class)))
+        Ok(Some(heap.value(class)))
     }
 
     pub fn register(
@@ -2236,10 +2232,7 @@ fn install_slot_wrappers_for_type(ty: &mut PyType, owner: TypeId) {
 
 /// CPython 3.14 rejects `NotImplemented` in a boolean context. Truth-testing it usually means an
 /// operator method's result was used without checking whether the method declined.
-fn not_implemented_bool<'s>(
-    _: &mut dyn PyRuntime<'s>,
-    _: Value<'s>,
-) -> PyResult<'s, Option<Value<'s>>> {
+fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Value>> {
     Err(PyError::type_error(
         "NotImplemented should not be used in a boolean context",
     ))
