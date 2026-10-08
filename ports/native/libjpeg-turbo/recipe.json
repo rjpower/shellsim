@@ -1,0 +1,58 @@
+{
+  "kind": "native-library",
+  "name": "libjpeg-turbo",
+  "version": "2.1.5.1",
+  "target_profile": "wasi-cpython-v1",
+  "target": "wasm32-wasip1",
+  "linkage": "static",
+  "source": {
+    "url": "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/2.1.5.1/libjpeg-turbo-2.1.5.1.tar.gz",
+    "sha256": "2fdc3feb6e9deb17adec9bafa3321419aa19f8f4e5dea7bf8486844ca22207bf"
+  },
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang",
+    "wasi-sdk-llvm-ar"
+  ],
+  "target_dependencies": [],
+  "features": {
+    "sample_bits": 8,
+    "libjpeg_abi": 62,
+    "memory_source_destination": true,
+    "simd": false,
+    "assembly": false,
+    "threads": false,
+    "arithmetic_coding": false,
+    "turbojpeg": false,
+    "shared": false
+  },
+  "transitive_link_flags": [],
+  "exports": {
+    "headers": [
+      "include/jpeglib.h",
+      "include/jmorecfg.h",
+      "include/jerror.h",
+      "include/jconfig.h"
+    ],
+    "archives": [
+      "lib/libjpeg.a"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/libjpeg.pc"
+    ],
+    "licenses": [
+      "licenses/libjpeg-turbo.txt",
+      "licenses/README.ijg"
+    ]
+  },
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "c1119575543f08c909166e0fa17d27cc3c40edd4688a4b7f638b14a50de7c76f"
+    },
+    {
+      "file": "../dependencies.py",
+      "sha256": "b13546aee08e3e2befee7ca09d40293c475b3db19a05ad4dfeae818247d3ab44"
+    }
+  ]
+}
