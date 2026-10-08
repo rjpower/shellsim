@@ -36,6 +36,8 @@ use crate::vfs::{resolve_against, VfsError};
 
 use super::util::ewln;
 
+mod dynamic;
+
 // The stripped static CPython + NumPy image is 13.4 MB. Keep compilation input bounded.
 const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
@@ -337,6 +339,7 @@ struct Host {
     directories: BTreeMap<u32, String>,
     limits: StoreLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
+    dynamic: dynamic::Dynamic,
 }
 
 #[derive(Default)]
@@ -407,7 +410,11 @@ fn guest_file(
 }
 
 fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
-    caller.get_export("memory").and_then(Extern::into_memory)
+    caller
+        .data()
+        .dynamic
+        .shared_memory
+        .or_else(|| caller.get_export("memory").and_then(Extern::into_memory))
 }
 
 fn read_u32(caller: &mut Caller<'_, Host>, address: u32) -> Option<u32> {
@@ -1938,6 +1945,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     // success. Non-WASI namespaces must still be rejected at instantiation.
     for import in module.imports() {
         if import.module() != "wasi_snapshot_preview1"
+            && !(import.module() == dynamic::NAMESPACE
+                && matches!(import.name(), "open" | "symbol" | "error"))
             && !(import.module() == "shellsim"
                 && matches!(
                     import.name(),
@@ -1959,6 +1968,13 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         }
     }
     let mut linker = build_linker(command_engine());
+    let dynamic_enabled = module
+        .imports()
+        .any(|import| import.module() == dynamic::NAMESPACE);
+    if dynamic_enabled {
+        dynamic::compatible_main(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    }
+    dynamic::register(&mut linker);
     register_frame_yield(&mut linker);
     linker
         .define_unknown_imports_as_traps(&module)
@@ -1985,12 +2001,22 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .memory_remaining()
         .saturating_sub(DIRECTORY_MEMORY)
         .saturating_sub(table_memory)
+        .saturating_sub(if dynamic_enabled {
+            dynamic::MEMORY_RESERVATION
+        } else {
+            0
+        })
         // Keep bounded host-call scratch (including random_get) outside the store reservation.
         .saturating_sub(MAX_IO_BYTES as u64)
         .min(memory_cap);
     let reserved = memory_limit
         .saturating_add(DIRECTORY_MEMORY)
         .saturating_add(table_memory);
+    let reserved = reserved.saturating_add(if dynamic_enabled {
+        dynamic::MEMORY_RESERVATION
+    } else {
+        0
+    });
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
@@ -2025,8 +2051,10 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             })
             .memories(1)
             .tables(16)
+            .instances(33)
             .build(),
         interaction: launch.interaction,
+        dynamic: dynamic::Dynamic::new(dynamic_enabled),
     };
     Ok(Guest {
         execution: Box::pin(execute(host, linker, module, path.to_string())),
@@ -2093,10 +2121,15 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
         }
     });
     let result = match linker.instantiate_async(&mut store, &module).await {
-        Ok(instance) => match instance.get_typed_func::<(), ()>(&mut store, "_start") {
-            Ok(start) => start.call_async(&mut store, ()).await,
-            Err(error) => Err(error),
-        },
+        Ok(instance) => {
+            store.data_mut().dynamic.main = Some(instance);
+            let shared_memory = instance.get_memory(&mut store, "memory");
+            store.data_mut().dynamic.shared_memory = shared_memory;
+            match instance.get_typed_func::<(), ()>(&mut store, "_start") {
+                Ok(start) => start.call_async(&mut store, ()).await,
+                Err(error) => Err(error),
+            }
+        }
         Err(error) => Err(error),
     };
     let _ = charge_consumed_fuel(store.as_context_mut());
