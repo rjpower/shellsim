@@ -24,6 +24,20 @@ shellsim-python ./project/tests --pytest
 `--entry`, `--pytest`, `--root`, resource limits, and `--json`. Simulated imports remain confined
 to frozen modules and the virtual filesystem.
 
+The Python API can stage a trusted PyPI requirement with `Environment.install_pypi(requirement)`
+after installing the `shellsim[pypi]` extra.
+Host `uv` resolves dependencies and builds source distributions with Python 3.14. After
+checking wheel tags and native files, shellsim copies the result into
+`/usr/lib/python3.14/site-packages` atomically without changing the current directory.
+A failed resolution or an incompatible native
+distribution raises `PackageInstallError` before staging.
+When resolution selects NumPy 2.5.3, shellsim uses its bundled implementation and omits that
+wheel's files. The bundled NumPy implements a subset of that version's API. Other versions and
+native distributions remain incompatible.
+Source builds can execute build code on the host; the simulated Python process still has no host
+network or filesystem access. Installing package files does not imply that every Python API they
+use is implemented by shellsim. Do not mutate the same environment concurrently during installation.
+
 Virtual-filesystem packages execute their `__init__.py` before child modules, expose stable
 `__name__`, `__package__`, and `__file__` values, cache module identity, and resolve leading-dot
 imports within the current package. Imports beyond the top-level package fail explicitly.

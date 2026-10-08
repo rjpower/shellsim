@@ -5,6 +5,132 @@ use shellsim::{python, Environment, Limits};
 use super::support::{run_python_text as run, run_python_text_in as run_in};
 
 #[test]
+fn builtins_module_reuses_interpreter_builtin_values() {
+    let source = r#"import builtins
+import sys
+print(builtins.exec is exec, builtins.str is str, builtins.ValueError is ValueError)
+print(builtins.__name__, sys.modules['builtins'] is builtins)
+print(getattr(builtins, 'True') is True, hasattr(builtins, 'compile'))
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "True True True\nbuiltins True\nTrue False\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn typing_type_checking_is_false_at_runtime() {
+    assert_eq!(
+        run("from typing import TYPE_CHECKING\nprint(TYPE_CHECKING is False)"),
+        (0, "True\n".into(), String::new())
+    );
+}
+
+#[test]
+fn pkgutil_get_data_reads_package_resources_from_the_vfs() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/demo").unwrap();
+    environment
+        .vfs
+        .put_file("/work/demo/__init__.py", Vec::new(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/demo/data.bin", vec![0, 255, 10], 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/secret.bin", b"private".to_vec(), 0o644)
+        .unwrap();
+    environment.cwd = "/work".into();
+
+    let source = r#"from pkgutil import get_data
+print(get_data('demo', 'data.bin'))
+print(get_data('typing', 'data.bin'))
+try:
+    get_data('demo', 'missing.bin')
+except FileNotFoundError:
+    print('missing')
+try:
+    get_data('demo', '../secret.bin')
+except ValueError:
+    print('contained')
+"#;
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            "b'\\x00\\xff\\n'\nNone\nmissing\ncontained\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn copyreg_registration_is_shared_with_copy() {
+    let source = r#"import copy
+import copyreg
+
+class Box:
+    def __init__(self, value):
+        self.value = value
+
+def reduce_box(value):
+    return Box, (value.value + 1,)
+
+copyreg.pickle(Box, reduce_box)
+print(copyreg.dispatch_table is copy.dispatch_table)
+print(copy.copy(Box(4)).value, copy.deepcopy(Box(4)).value)
+try:
+    copyreg.pickle(Box, None)
+except TypeError:
+    print('invalid reducer')
+try:
+    copyreg.pickle(Box, reduce_box, object())
+except TypeError:
+    print('invalid constructor')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "True\n5 5\ninvalid reducer\ninvalid constructor\n".into(),
+            String::new()
+        )
+    );
+}
+
+#[test]
+fn unicodedata_normalize_decomposes_and_recomposes_unicode() {
+    let source = r#"from unicodedata import normalize
+print([hex(ord(ch)) for ch in normalize('NFKD', 'café')])
+print(normalize('NFKD', 'café').encode('ascii', 'ignore').decode('ascii'))
+print(normalize('NFKC', 'ﬀ'), normalize('NFC', 'e\u0301'))
+print(len(normalize('NFKD', 'ﷺ')))
+try:
+    normalize('invalid', 'text')
+except ValueError:
+    print('invalid form')
+try:
+    normalize('NFKD', 42)
+except TypeError:
+    print('invalid type')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "['0x63', '0x61', '0x66', '0x65', '0x301']\ncafe\nff é\n18\ninvalid form\ninvalid type\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn html_escape_matches_common_markup_rules() {
     assert_eq!(
         run("from html import escape\nprint(escape(\"A&B <'\\\"'>\"))\nprint(escape(\"A&B <'\\\"'>\", quote=False))"),
@@ -934,6 +1060,24 @@ print(zlib.decompress(compressed), zlib.crc32(b'123456789'))
             "b'AP9oZWxsbw==' b'\\x00\\xffhello'\nb'\\x00\\xffhello' 3421780262\n".into(),
             String::new(),
         )
+    );
+}
+
+#[test]
+fn frozen_binascii_decodes_yaml_base64_and_raises_its_error_type() {
+    let source = r#"
+import base64
+import binascii
+
+print(base64.decodebytes(b'SG Vs\n bG8h'), binascii.b2a_base64(b'hi', newline=False))
+try:
+    binascii.a2b_base64(b'a')
+except binascii.Error:
+    print('invalid')
+"#;
+    assert_eq!(
+        run(source),
+        (0, "b'Hello!' b'aGk='\ninvalid\n".into(), String::new())
     );
 }
 

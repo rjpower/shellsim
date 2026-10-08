@@ -15,7 +15,7 @@ use super::super::native::PyValue as Value;
 use super::super::native::{
     CallArgs, FunctionDef, GetterDef, MethodDef, NativeFn, NativeMethodFn, NativeTypeDef,
     OwnedPyString, PyByteArray, PyBytes, PyCallable, PyDict, PyError, PyIterator, PyKind, PyList,
-    PyProperty, PyResult, PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
+    PyModule, PyProperty, PyResult, PyRuntime, PySequence, PySet, PyTuple, PyValue, PyValueCast,
     TypeMetadata,
 };
 use super::super::number::{index_argument, PyNumber};
@@ -391,13 +391,28 @@ pub(crate) static INSTANCE_DICT_GETTER: GetterDef = GetterDef {
 
 pub(crate) static MODULE_TYPE: NativeTypeDef = NativeTypeDef {
     name: "module",
-    methods: &[],
+    methods: &[method("module", "__init__", module_init)],
     getters: &[GetterDef {
         owner: "module",
         name: "__dict__",
         get: object_dict,
     }],
 };
+
+/// Initialize the live namespace of a module subclass after its payload is allocated.
+fn module_init(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
+    args.expect_positional("module.__init__", 1, 2)?;
+    args.reject_keywords("module.__init__")?;
+    receiver.cast::<PyModule>(runtime)?;
+    args.positional()[0].cast::<OwnedPyString>(runtime)?;
+    runtime.set_attribute(receiver, "__name__", args.positional()[0])?;
+    runtime.set_attribute(
+        receiver,
+        "__doc__",
+        args.positional().get(1).copied().unwrap_or(Value::None),
+    )?;
+    Ok(Value::None)
+}
 
 pub(crate) static ITERATOR_TYPE: NativeTypeDef = NativeTypeDef {
     name: "iterator",

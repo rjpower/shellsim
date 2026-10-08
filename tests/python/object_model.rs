@@ -80,6 +80,62 @@ fn subclassing_non_subclassable_builtins_raises_type_error() {
 }
 
 #[test]
+fn module_subclasses_share_the_live_module_namespace() {
+    let source = r#"
+from types import ModuleType
+
+class LazyModule(ModuleType):
+    def __init__(self, name):
+        super().__init__(name)
+        self.answer = 42
+
+    def __getattr__(self, name):
+        if name == "missing":
+            return self.answer + 1
+        raise AttributeError(name)
+
+module = LazyModule("sample")
+assert type(module) is LazyModule
+assert isinstance(module, ModuleType)
+assert module.__name__ == "sample"
+assert module.__dict__["answer"] == 42
+assert module.missing == 43
+module.__dict__["answer"] = 7
+assert module.answer == 7
+module.answer = 9
+assert vars(module)["answer"] == 9
+del module.answer
+assert "answer" not in vars(module)
+
+class WithProperty(ModuleType):
+    @property
+    def answer(self):
+        return 5
+
+value = WithProperty("property")
+value.__dict__["answer"] = 8
+assert value.answer == 5
+for action in (lambda: setattr(value, "answer", 9), lambda: delattr(value, "answer")):
+    try:
+        action()
+    except AttributeError:
+        pass
+    else:
+        raise AssertionError("read-only property was writable")
+assert ModuleType("base", "doc").__doc__ == "doc"
+try:
+    ModuleType(12)
+except TypeError:
+    pass
+else:
+    raise AssertionError("module name accepted a non-string")
+"#;
+    let (status, stdout, stderr) = run_python_text(source);
+    assert_eq!(status, 0, "{stderr}");
+    assert!(stdout.is_empty());
+}
+
+#[test]
 fn type_predicates_follow_user_mro_and_builtin_layouts() {
     assert_eq!(
         run_shell(

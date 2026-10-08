@@ -22,6 +22,7 @@ from ._api import (
 )
 from .display_host import DisplayHost
 from .package import Package, PackageSpec
+from .pypi import PackageInstallError
 
 __all__ = [
     "Action",
@@ -37,6 +38,7 @@ __all__ = [
     "Limits",
     "MountResult",
     "Package",
+    "PackageInstallError",
     "PackageSpec",
     "RunResult",
     "ShellSession",

@@ -82,6 +82,12 @@ pub fn mount_host_tree_report(
     let import_git = has_git_metadata(&host_root)?;
     let before = environment.vfs.clone();
     let result = (|| {
+        if !environment.vfs.exists("/", &destination_root) {
+            environment
+                .vfs
+                .put_dir(&destination_root, 0o755)
+                .map_err(|error| format!("cannot create {destination_root}: {error}"))?;
+        }
         let mut report = mount_inner(environment, &host_root, &destination_root)?;
         if import_git {
             let history = crate::commands::git::import::import_head_history(

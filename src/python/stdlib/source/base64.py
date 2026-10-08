@@ -1,5 +1,7 @@
 """RFC 4648 helpers over shellsim's bounded byte codec core."""
 
+import binascii
+
 from _base64 import b64decode as _b64decode
 from _base64 import b64encode
 from _base64 import urlsafe_b64decode as _urlsafe_b64decode
@@ -20,3 +22,9 @@ def urlsafe_b64decode(value):
 
 standard_b64encode = b64encode
 standard_b64decode = b64decode
+
+
+def decodebytes(value):
+    if not isinstance(value, (bytes, bytearray)):
+        raise TypeError("decodebytes requires a bytes-like object")
+    return binascii.a2b_base64(value)

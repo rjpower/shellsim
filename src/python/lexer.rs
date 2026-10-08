@@ -89,6 +89,10 @@ impl<'a> Lexer<'a> {
                     self.bump();
                     self.byte_string(start)?
                 }
+                'u' | 'U' if self.followed_by_quote() => {
+                    self.bump();
+                    self.string(start)?
+                }
                 'a'..='z' | 'A'..='Z' | '_' => self.name(),
                 '0'..='9' => self.number(start, false)?,
                 '\'' | '"' => self.string(start)?,
@@ -880,6 +884,14 @@ mod tests {
         assert_eq!(tokens[0].kind, TokenKind::Name("name".into()));
         assert_eq!(tokens[2].kind, TokenKind::String("café\n".into()));
         assert_eq!(tokens[3].kind, TokenKind::Newline);
+    }
+
+    #[test]
+    fn unicode_prefix_uses_ordinary_string_escapes() {
+        let tokens = lex("u'café\\n' U\"x\" u'''multi\nline'''").unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::String("café\n".into()));
+        assert_eq!(tokens[1].kind, TokenKind::String("x".into()));
+        assert_eq!(tokens[2].kind, TokenKind::String("multi\nline".into()));
     }
 
     #[test]

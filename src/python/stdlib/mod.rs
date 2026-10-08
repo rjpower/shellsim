@@ -33,6 +33,7 @@ pub mod subprocess;
 pub mod sys;
 pub mod time;
 pub mod typing;
+mod unicodedata;
 pub mod unittest;
 mod vfs;
 mod warnings;
@@ -105,6 +106,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_shellsim_subprocess" => Some(&subprocess::MODULE),
         "_time" => Some(&time::MODULE),
         "typing" => Some(&typing::MODULE),
+        "_unicodedata" => Some(&unicodedata::MODULE),
         "unittest" => Some(&unittest::MODULE),
         "_shellsim_warnings" => Some(&warnings::MODULE),
         _ if name.starts_with("_numpy") => numpy::native_module(name),

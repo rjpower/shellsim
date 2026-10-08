@@ -335,6 +335,16 @@ class Environment:
             skipped_directories=tuple(report["skipped_directories"]),
         )
 
+    def install_pypi(self, requirement: str) -> None:
+        """Resolve a trusted PyPI requirement with host uv and stage compatible Python files.
+
+        Source distributions can run build code on the host. Native wheels and extensions are
+        rejected before any files are copied into the simulated environment.
+        """
+        from .pypi import install_pypi
+
+        install_pypi(self, requirement)
+
 
 class Container:
     """A shellsim machine whose guest can call explicitly registered Python host tools.

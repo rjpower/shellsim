@@ -7,14 +7,14 @@ object identity, so cycles and shared references are preserved.
 
 __all__ = ["Error", "copy", "deepcopy", "replace"]
 
+from copyreg import dispatch_table
+
 
 class Error(Exception):
     pass
 
 
 error = Error
-
-dispatch_table = {}
 
 _ATOMIC = (type(None), int, float, bool, complex, str, bytes, type, range, slice, frozenset,
            type(Ellipsis), type(NotImplemented))

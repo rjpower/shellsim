@@ -165,6 +165,34 @@ fn project_ingestion_reports_skipped_dependency_directories() {
     assert!(!environment.vfs.exists("/", "/work/.venv/config"));
 }
 
+#[test]
+fn site_packages_mount_creates_parent_directories_and_imports_from_elsewhere() {
+    let package = TestDirectory::new();
+    std::fs::write(package.path().join("installed.py"), "answer = 42\n")
+        .expect("write installed package");
+    let mut environment = Environment::new();
+    environment.set_var("PWD", "/work");
+
+    let report = shellsim::host_ingest::mount_host_tree_report(
+        &mut environment,
+        package.path(),
+        "/usr/lib/python3.14/site-packages",
+    )
+    .expect("mount site-packages");
+    assert_eq!(report.files, 1);
+    assert!(environment
+        .vfs
+        .exists("/", "/usr/lib/python3.14/site-packages/installed.py"));
+    assert_eq!(
+        super::support::run_python_text_in(
+            &mut environment,
+            "import installed, os\nprint(installed.answer, os.getcwd())",
+        ),
+        (0, "42 /work\n".into(), String::new()),
+    );
+    assert_eq!(environment.cwd, "/work");
+}
+
 #[cfg(unix)]
 #[test]
 fn project_ingestion_rejects_host_symlinks() {
@@ -183,8 +211,14 @@ fn project_ingestion_rejects_host_symlinks() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("refusing host symlink"));
 
     let mut environment = Environment::new();
-    let error = shellsim::host_ingest::mount_host_tree(&mut environment, project.path(), "/work")
-        .unwrap_err();
+    let error = shellsim::host_ingest::mount_host_tree(
+        &mut environment,
+        project.path(),
+        "/usr/lib/python3.14/site-packages",
+    )
+    .unwrap_err();
     assert!(error.contains("refusing host symlink"));
-    assert!(!environment.vfs.exists("/", "/work/main.py"));
+    assert!(!environment
+        .vfs
+        .exists("/", "/usr/lib/python3.14/site-packages"));
 }

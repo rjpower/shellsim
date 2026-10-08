@@ -822,7 +822,8 @@ impl Heap {
             | Object::FrozenSet(_)
             | Object::BigInt(_)
             | Object::Float(_)
-            | Object::Complex { .. }) => Ok(snapshot::dup_object(object)),
+            | Object::Complex { .. }
+            | Object::Module { .. }) => Ok(snapshot::dup_object(object)),
             _ => Err("value cannot be the payload of a builtin subclass instance".into()),
         }
     }

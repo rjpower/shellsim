@@ -45,6 +45,7 @@ num-bigint = "0.4"
 num-traits = "0.2"
 libm = "0.2"
 stacker = "0.1"
+unicode-normalization = "0.1"
 
 # Process-level syscall sandbox (Linux only): a startup seccomp filter that denies
 # network/exec/fork so no Python-level trick can reach the real OS for those. shellsim

@@ -135,6 +135,19 @@ environment = shellsim.Environment()
 result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
 ```
 
+To stage a trusted PyPI distribution and its dependencies, install `shellsim[pypi]`:
+
+```python
+environment = shellsim.Environment()
+environment.install_pypi("roman==4.2")
+result = environment.run_python("import roman; print(roman.toRoman(42))")
+print(result.stdout)  # b'XLII\n'
+```
+
+Shellsim copies compatible pure Python packages into virtual site-packages without changing the
+environment's working directory. Resolution failures and native wheels raise
+`shellsim.PackageInstallError`; source distributions may run build code on the host.
+
 ## Clock modes
 
 A machine runs on virtual time by default: when every process waits on a timer, the scheduler

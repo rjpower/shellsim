@@ -37,25 +37,49 @@ class SourceFileLoader:
 
 
 class ModuleSpec:
-    def __init__(self, name, loader, origin):
+    def __init__(self, name, loader, origin, is_package=False):
         self.name = name
         self.loader = loader
         self.origin = origin
+        self.submodule_search_locations = [] if is_package else None
 
 
 def spec_from_file_location(name, location):
     name = str(name)
     location = str(location)
-    return ModuleSpec(name, SourceFileLoader(name, location), location)
+    return ModuleSpec(
+        name, SourceFileLoader(name, location), location,
+        is_package=location.endswith("/__init__.py"),
+    )
+
+
+def spec_from_loader(name, loader, *, origin=None, is_package=None):
+    """Describe a loader without granting it host import machinery."""
+    name = str(name)
+    if is_package is None:
+        is_package = loader.is_package(name) if hasattr(loader, "is_package") else False
+    if not isinstance(is_package, bool):
+        raise TypeError("is_package must be bool or None")
+    return ModuleSpec(name, loader, origin, is_package=is_package)
 
 
 def module_from_spec(spec):
     if spec.loader is None:
         raise ValueError("module spec has no loader")
-    return _new_module(spec.name, spec.origin, spec, spec.loader)
+    origin = spec.origin if spec.origin is not None else ""
+    module = _new_module(spec.name, origin, spec, spec.loader)
+    if spec.origin is None:
+        del module.__file__
+    if spec.submodule_search_locations is not None:
+        module.__package__ = spec.name
+        module.__path__ = spec.submodule_search_locations
+    return module
 
 
 class _Util:
+    def spec_from_loader(self, name, loader, *, origin=None, is_package=None):
+        return spec_from_loader(name, loader, origin=origin, is_package=is_package)
+
     def spec_from_file_location(self, name, location):
         return spec_from_file_location(name, location)
 

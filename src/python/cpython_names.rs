@@ -163,6 +163,11 @@ const BUILTIN_NAMES: &[&str] = &[
     "zip",
 ];
 
+/// Names CPython exposes in `builtins`; the VM installs only those it implements.
+pub(super) fn builtin_names() -> impl Iterator<Item = &'static str> {
+    BUILTIN_NAMES.iter().copied()
+}
+
 /// Sorted so lookups can binary-search.
 const STDLIB_MODULES: &[&str] = &[
     "__future__",
