@@ -158,11 +158,11 @@ builtin_module_names = (
 stdlib_module_names = frozenset(
     (
         "abc", "argparse", "asyncio", "base64", "bisect", "builtins", "cmath", "codecs",
-        "collections", "contextlib", "copy", "csv", "dataclasses", "datetime", "enum", "errno",
-        "fractions", "functools", "glob", "hashlib", "heapq", "http", "importlib", "inspect",
+        "collections", "contextlib", "copy", "csv", "dataclasses", "datetime", "decimal", "enum", "errno",
+        "fractions", "functools", "glob", "hashlib", "heapq", "html", "http", "importlib", "inspect",
         "io", "itertools", "json", "keyword", "logging", "math", "operator", "os", "pathlib",
         "posixpath", "random", "re", "shutil", "signal", "stat", "statistics", "string",
-        "struct", "subprocess", "sys", "tempfile", "textwrap", "time", "types", "typing",
+        "struct", "subprocess", "sys", "tempfile", "textwrap", "threading", "time", "types", "typing",
         "unittest", "urllib", "uuid", "warnings", "zipfile", "zlib",
     )
 )

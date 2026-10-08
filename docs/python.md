@@ -157,6 +157,15 @@ float or complex result. Fractions hash like equal integers and floats and suppo
 `limit_denominator`, and `from_float`. `Decimal` operands, the `numbers` ABCs, and format
 specifications are not supported.
 
+The frozen `decimal` module supports finite decimal strings and integers, context-precision
+arithmetic, powers, and `quantize` with half-even or half-up
+rounding. Precision and exponent magnitudes are bounded at 1,000. Special values and the rest of
+CPython's decimal context API are not implemented. `dataclasses` supports ordinary field defaults,
+per-instance `default_factory`, class and instance detection, and `eq`, `frozen`, and `kw_only`
+decorator options. `html.escape` and VFS-backed `importlib.resources.files` are available.
+`threading.RLock` coordinates the single simulated interpreter; Python thread creation is not
+provided.
+
 The frozen `warnings` module implements `warn`, `warn_explicit`, `filterwarnings`, `simplefilter`,
 `resetwarnings`, `catch_warnings` with `record=True`, and CPython's `default`, `once`, `module`,
 `always`, `ignore`, and `error` actions. A warning names the line executing `stacklevel` frames up.
@@ -177,7 +186,7 @@ attribute of a module, class, or instance raises `AttributeError`. Argument-bind
 function by `__name__`; CPython uses the qualified name for nested functions and methods.
 
 CPython behavior that shellsim does not model fails differently. An unimplemented builtin such as
-`memoryview`, an unimplemented standard-library module such as `threading`, or a missing method of a
+`memoryview`, an unimplemented standard-library module such as `multiprocessing`, or a missing method of a
 builtin value stops the program with exit status 2 and an "unsupported by minimal shim" diagnostic.
 These failures cannot be caught, so an `except ImportError` fallback cannot mistake a shellsim gap
 for functionality that is really absent.

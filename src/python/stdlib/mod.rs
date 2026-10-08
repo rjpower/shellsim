@@ -83,7 +83,7 @@ pub(super) fn native_module(name: &str) -> Option<&'static ModuleDef> {
         "_base64" => Some(&base64::MODULE),
         "_json" => Some(&json::MODULE),
         "_collections" => Some(&collections::MODULE),
-        "dataclasses" => Some(&dataclasses::MODULE),
+        "_dataclasses" => Some(&dataclasses::MODULE),
         "enum" => Some(&r#enum::MODULE),
         "_heapq" => Some(&heapq::MODULE),
         "_hashlib" => Some(&hashlib::MODULE),

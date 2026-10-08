@@ -104,13 +104,14 @@ fn missing_methods_on_builtin_values_report_the_minimal_shim_diagnostic() {
 
 #[test]
 fn unmodeled_standard_modules_report_the_minimal_shim_diagnostic() {
-    // CPython always has `threading`, so an ImportError fallback would take a path CPython never
+    // CPython always has `multiprocessing`, so an ImportError fallback would take a path CPython never
     // takes. A module outside the standard library is absent, as it is in bare CPython.
-    let (status, _, stderr) =
-        run_python_text("try:\n    import threading\nexcept ImportError:\n    print('caught')");
+    let (status, _, stderr) = run_python_text(
+        "try:\n    import multiprocessing\nexcept ImportError:\n    print('caught')",
+    );
     assert_eq!(status, 2);
     assert!(
-        stderr.contains("standard-library module \"threading\" is not implemented"),
+        stderr.contains("standard-library module \"multiprocessing\" is not implemented"),
         "{stderr}"
     );
 
