@@ -553,6 +553,67 @@ fn infinite_wasm_loop_is_metered() {
 }
 
 #[test]
+fn static_module_image_bound_and_compilation_cost_are_enforced() {
+    // A large ignored custom section tests the image boundary without a numerical fixture.
+    let mut bytes = wat::parse_str("(module (func (export \"_start\")))").unwrap();
+    let payload_len = 13 * 1024 * 1024;
+    bytes.push(0);
+    let mut length = payload_len + 1;
+    loop {
+        let byte = (length & 127) as u8;
+        length >>= 7;
+        bytes.push(byte | if length != 0 { 128 } else { 0 });
+        if length == 0 {
+            break;
+        }
+    }
+    bytes.push(0); // Empty custom-section name.
+    bytes.resize(bytes.len() + payload_len, 0);
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 1_000_000_000,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+
+    let mut constrained = Environment::with_limits(Limits {
+        cpu: 100_000_000,
+        ..Limits::default()
+    });
+    constrained.vfs.write("/", "/app", &bytes, 0o755).unwrap();
+    let (status, _, stderr) = run(&mut constrained, "/app");
+    assert_eq!(status, 137);
+    assert!(String::from_utf8_lossy(&stderr).contains("wasm compilation budget exhausted"));
+
+    bytes.resize(16 * 1024 * 1024 + 1, 0);
+    environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
+    let (status, _, stderr) = run(&mut environment, "/app");
+    assert_eq!(status, 126);
+    assert!(String::from_utf8_lossy(&stderr).contains("wasm module exceeds size limit"));
+}
+
+#[test]
+fn large_static_guest_tables_have_a_bounded_reservation() {
+    let mut environment = Environment::with_limits(Limits {
+        memory: 128 * 1024 * 1024,
+        ..Limits::default()
+    });
+    install(&mut environment,
+        "(module (memory (export \"memory\") 320) (table 10771 funcref) (func (export \"_start\")))");
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert!(environment.resources.outcome(0, 0, 0).usage.memory_peak >= 68 * 1024 * 1024);
+    for source in [
+        "(module (memory (export \"memory\") 320) (table 16385 funcref) (func (export \"_start\")))",
+        "(module (memory (export \"memory\") 1) (table 10771 funcref) (func (export \"_start\")))",
+    ] {
+        install(&mut environment, source);
+        let (status, _, stderr) = run(&mut environment, "/app");
+        assert_eq!(status, 126);
+        assert!(String::from_utf8_lossy(&stderr).contains("table minimum size"));
+    }
+}
+
+#[test]
 fn oversized_linear_memory_is_rejected() {
     let mut environment = Environment::new();
     install(

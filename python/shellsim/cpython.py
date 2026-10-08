@@ -7,9 +7,12 @@ process boundary and the environment's cumulative resource limits.
 
 from __future__ import annotations
 
+import email
 import hashlib
 import json
+import re
 import shlex
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -121,6 +124,7 @@ class CPythonRuntime:
             raise TypeError("requirement must be str")
         if _REQUIREMENT.fullmatch(requirement) is None:
             raise ValueError("requirement must name a PyPI distribution with optional extras or version")
+        self._verify()
         with tempfile.TemporaryDirectory(prefix="shellsim-cpython-pypi-") as temp:
             target = Path(temp) / "site-packages"
             target.mkdir()
@@ -128,23 +132,36 @@ class CPythonRuntime:
             for port in self.manifest.get("native_ports", ()):
                 name = port["name"]
                 version = port["version"]
+                modules = port.get("builtin_modules")
                 if (
-                    name not in self.builtin_modules
-                    or not name.isidentifier()
-                    or not all(char.isdigit() or char == "." for char in version)
+                    re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) is None
+                    or re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version) is None
+                    or not isinstance(modules, list)
+                    or not modules
+                    or any(
+                        not isinstance(module, str)
+                        or not all(part.isidentifier() for part in module.split("."))
+                        or module not in self.builtin_modules
+                        for module in modules
+                    )
                 ):
                     raise PackageInstallError("invalid builtin native provider manifest")
-                metadata = target / f"{name}-{version}.dist-info"
-                metadata.mkdir()
-                headers = f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n"
-                for dependency in port["requires_dist"]:
-                    if _REQUIREMENT.fullmatch(dependency) is None:
-                        raise PackageInstallError("invalid builtin native provider dependency")
-                    headers += f"Requires-Dist: {dependency}\n"
-                (metadata / "METADATA").write_text(headers)
-                # This records an already linked provider; no host native wheel is installed.
-                (metadata / "WHEEL").write_text("Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py313-none-any\n")
-                (metadata / "RECORD").write_text("")
+                directory = f"{name}-{version}.dist-info"
+                if port.get("dist_info") != self.site_packages + "/" + directory:
+                    raise PackageInstallError("invalid builtin native provider metadata path")
+                source = self.bundle / "rootfs" / port["dist_info"].lstrip("/")
+                if not source.is_dir() or not (source / "METADATA").is_file():
+                    raise PackageInstallError("builtin native provider metadata is missing from the bundle")
+                metadata = email.message_from_bytes((source / "METADATA").read_bytes())
+                if (
+                    metadata["Name"] != name
+                    or metadata["Version"] != version
+                    or metadata.get_all("Requires-Dist", []) != port["requires_dist"]
+                ):
+                    raise PackageInstallError("builtin native provider metadata differs from its recipe")
+                # Seed the exact verified metadata already mounted with this provider; an
+                # installer must not replace its source identity or distribution version.
+                shutil.copytree(source, target / directory)
                 constraints.append(f"{name}=={version}")
             command = [
                 "uv",

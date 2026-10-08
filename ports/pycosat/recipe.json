@@ -3,6 +3,8 @@
   "version": "0.6.6",
   "target": "wasm32-wasip1",
   "linkage": "cpython-builtin",
+  "builtin_modules": ["pycosat"],
+  "dist_info": "/usr/lib/python3.13/site-packages/pycosat-0.6.6.dist-info",
   "requires_dist": [],
   "source": {
     "url": "https://files.pythonhosted.org/packages/5b/81/cf8ebf77fc4f06f680ad3ee43d0d01826f6d6054828f1cf3b42d944b82a1/pycosat-0.6.6.tar.gz",

@@ -36,8 +36,13 @@ use crate::vfs::{resolve_against, VfsError};
 
 use super::util::ewln;
 
-const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
+// The stripped static CPython + NumPy image is 13.4 MB. Keep compilation input bounded.
+const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
+const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
+const LARGE_TABLE_ELEMENTS: usize = 16_384;
+// Bound all sixteen possible tables with a conservative per-element host allocation.
+const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 // CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
@@ -1968,7 +1973,9 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .unwrap_or(0);
     // Small utilities retain their existing reservation, allowing several in one pipeline.
     // Larger static interpreter images receive a larger bounded heap reservation.
-    let memory_cap = if minimum_memory > DEFAULT_WASM_MEMORY as u64 {
+    let large_image = minimum_memory > DEFAULT_WASM_MEMORY as u64;
+    let table_memory = if large_image { LARGE_TABLE_MEMORY } else { 0 };
+    let memory_cap = if large_image {
         MAX_WASM_MEMORY as u64
     } else {
         DEFAULT_WASM_MEMORY as u64
@@ -1977,10 +1984,13 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .resources
         .memory_remaining()
         .saturating_sub(DIRECTORY_MEMORY)
+        .saturating_sub(table_memory)
         // Keep bounded host-call scratch (including random_get) outside the store reservation.
         .saturating_sub(MAX_IO_BYTES as u64)
         .min(memory_cap);
-    let reserved = memory_limit.saturating_add(DIRECTORY_MEMORY);
+    let reserved = memory_limit
+        .saturating_add(DIRECTORY_MEMORY)
+        .saturating_add(table_memory);
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
@@ -2008,7 +2018,11 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         directories: BTreeMap::new(),
         limits: StoreLimitsBuilder::new()
             .memory_size(memory_limit as usize)
-            .table_elements(10_000)
+            .table_elements(if large_image {
+                LARGE_TABLE_ELEMENTS
+            } else {
+                DEFAULT_TABLE_ELEMENTS
+            })
             .memories(1)
             .tables(16)
             .build(),

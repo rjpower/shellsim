@@ -1,0 +1,16 @@
+--- a/Modules/makesetup
++++ b/Modules/makesetup
+@@ -185,2 +185,6 @@
+-			*.*)		echo 1>&2 "bad word $arg in $line"
+-					exit 1;;
++			*.*)		if ! echo "$arg" | grep -Eq '^[a-zA-Z_][a-zA-Z0-9_]*(\.[a-zA-Z_][a-zA-Z0-9_]*)+$'; then
++						echo 1>&2 "bad word $arg in $line"
++						exit 1
++					fi
++					mods="$mods $arg"
++					mods_upper=$(echo $mods | tr '[a-z]' '[A-Z]');;
+@@ -299,2 +303,2 @@
+-		EXTDECLS="${EXTDECLS}extern PyObject* PyInit_$mod(void);$NL"
+-		INITBITS="${INITBITS}    {\"$mod\", PyInit_$mod},$NL"
++		EXTDECLS="${EXTDECLS}extern PyObject* PyInit_${mod##*.}(void);$NL"
++		INITBITS="${INITBITS}    {\"$mod\", PyInit_${mod##*.}},$NL"

@@ -30,6 +30,22 @@ def bundle(tmp_path: Path) -> Path:
     return tmp_path
 
 
+def provider_metadata(bundle: Path, manifest: dict, name: str, version: str) -> str:
+    """Add the exact seeded provider metadata to a verified test bundle."""
+    path = f"/usr/lib/python3.13/site-packages/{name}-{version}.dist-info"
+    source = bundle / "rootfs" / path.lstrip("/")
+    source.mkdir(parents=True)
+    files = {
+        "METADATA": f"Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n",
+        "WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py313-none-any\n",
+        "RECORD": "",
+    }
+    for filename, content in files.items():
+        (source / filename).write_text(content)
+        manifest["files"][path + "/" + filename] = hashlib.sha256(content.encode()).hexdigest()
+    return path
+
+
 def test_bundle_integrity_checked_before_mount(bundle: Path) -> None:
     runtime = shellsim.CPythonRuntime(bundle)
     environment = shellsim.Environment()
@@ -107,7 +123,16 @@ def test_source_built_guest() -> None:
 def test_native_provider_seeds_resolution(bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     manifest = json.loads((bundle / "manifest.json").read_text())
     manifest["builtin_modules"] = ["pycosat"]
-    manifest["native_ports"] = [{"name": "pycosat", "version": "0.6.6", "requires_dist": []}]
+    metadata_path = provider_metadata(bundle, manifest, "pycosat", "0.6.6")
+    manifest["native_ports"] = [
+        {
+            "name": "pycosat",
+            "version": "0.6.6",
+            "builtin_modules": ["pycosat"],
+            "requires_dist": [],
+            "dist_info": metadata_path,
+        }
+    ]
     (bundle / "manifest.json").write_text(json.dumps(manifest))
 
     def resolve(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -124,3 +149,55 @@ def test_native_provider_seeds_resolution(bundle: Path, monkeypatch: pytest.Monk
     environment = shellsim.Environment()
     runtime.install_pypi(environment, "pycosat==0.6.6")
     assert b"Version: 0.6.6\n" in environment.read_file(runtime.site_packages + "/pycosat-0.6.6.dist-info/METADATA")
+
+
+@pytest.mark.parametrize("modules", [None, [], ["numpy._core.missing"], ["numpy.._core"]])
+def test_native_provider_rejects_missing_or_unlinked_modules(
+    bundle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    modules: object,
+) -> None:
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    manifest["builtin_modules"] = ["numpy._core._multiarray_umath"]
+    manifest["native_ports"] = [{"name": "numpy", "version": "2.3.5", "requires_dist": [], "builtin_modules": modules}]
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid provider must fail before host resolution")
+
+    monkeypatch.setattr(shellsim.cpython.subprocess, "run", forbidden)
+    runtime = shellsim.CPythonRuntime(bundle)
+    with pytest.raises(shellsim.PackageInstallError, match="invalid builtin native provider"):
+        runtime.install_pypi(shellsim.Environment(), "numpy")
+
+
+def test_native_distribution_can_have_multiple_qualified_builtin_modules(
+    bundle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    modules = ["numpy._core._multiarray_umath", "numpy.fft._pocketfft_umath"]
+    manifest["builtin_modules"] = modules
+    metadata_path = provider_metadata(bundle, manifest, "numpy", "2.3.5")
+    manifest["native_ports"] = [
+        {
+            "name": "numpy",
+            "version": "2.3.5",
+            "requires_dist": [],
+            "builtin_modules": modules,
+            "dist_info": metadata_path,
+        }
+    ]
+    (bundle / "manifest.json").write_text(json.dumps(manifest))
+
+    def resolve(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        target = Path(command[command.index("--target") + 1])
+        assert "Name: numpy\nVersion: 2.3.5\n" in (target / "numpy-2.3.5.dist-info/METADATA").read_text()
+        assert Path(command[command.index("--constraint") + 1]).read_text() == "numpy==2.3.5\n"
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(shellsim.cpython.subprocess, "run", resolve)
+    runtime = shellsim.CPythonRuntime(bundle)
+    environment = shellsim.Environment()
+    runtime.install_pypi(environment, "numpy==2.3.5")
+    assert b"Version: 2.3.5\n" in environment.read_file(runtime.site_packages + "/numpy-2.3.5.dist-info/METADATA")

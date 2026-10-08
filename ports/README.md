@@ -60,6 +60,12 @@ the interpreter seed installed distribution metadata for uv, so
 Resolution constrains each builtin provider to its linked version; incompatible
 version requirements fail before installation.
 
+Native recipes declare their distribution's qualified `builtin_modules` and
+verified `dist_info` directory. Resolution seeds the exact bundled distribution
+metadata and checks every declared extension against the interpreter's builtin
+module table. A distribution such as NumPy can contain Python files and several
+statically linked extension modules without its distribution name being a builtin.
+
 The pycosat port compiles the upstream 0.6.6 C extension into CPython's builtin
 module table through `Modules/Setup.local`. Its pinned source includes PicoSAT.
 The upstream `NGETRUSAGE` option disables resource timestamp diagnostics because
@@ -87,3 +93,34 @@ Upstream build references:
 [CPython WASI instructions](https://devguide.python.org/getting-started/setup-building/#wasi),
 [CPython 3.13 WASI tooling](https://github.com/python/cpython/tree/3.13/Tools/wasm),
 and [WASI SDK 24](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-24).
+
+## Real NumPy graph spike
+
+The narrow graph workflow accepts Atlas's `magiccube==0.3.0` root:
+
+```sh
+uv run --python 3.13 ports/spike_numpy.py magiccube==0.3.0
+```
+
+It verifies the upstream pure wheel and NumPy source archive, resolves the real
+`magiccube -> numpy` metadata under all eleven fixed CPython/WASI marker values,
+uses or builds the approved static NumPy profile, stages the pure wheel, and runs
+array reductions and reversible Rubik cube rotations through native NumPy object
+arrays. The NumPy index artifact contains resolution metadata only and is never
+installed. Numerical code comes from the verified CPython bundle.
+
+The default directories are `/tmp/shellsim-numpy` for the native bundle and
+`/tmp/shellsim-numpy-workflow` for graph and execution evidence. `--bundle` selects
+an existing development bundle. Cached bundles must match the NumPy and CPython
+recipes, source identities, SDK, and declared extension modules. The workflow
+recreates its uv lock and compares the actual guest's marker profile before
+recording successful execution.
+
+`--resolve-only` writes `plan.json` and `resolution/uv.lock` without claiming a
+build or guest execution. `--numpy-requirement 'numpy==2.2.0'` demonstrates rejection
+of a native version absent from the curated index. A successful execution writes
+`result.json`, guest output, and resource usage. This spike is one measured graph;
+it does not replace the public installer with a general guest-platform resolver.
+The [experimental NumPy profile](numpy/README.md) omits FFT and cannot honor
+NumPy's floating-point warning and exception policy on WASI. The measured cube
+and integer-array operations do not establish complete NumPy compatibility.
