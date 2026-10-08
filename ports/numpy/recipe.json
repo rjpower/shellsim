@@ -46,7 +46,7 @@
     },
     {
       "file": "../cpython/build.py",
-      "sha256": "5ea76606657435f563ea22f54129f79fb6d2ae3be77f3531da8210171bab4b77"
+      "sha256": "a0acac4b89f2b069099eaa8842468bdd7a02c9501a886fd9ee3a7b916cc23032"
     }
   ],
   "builtin_modules": [

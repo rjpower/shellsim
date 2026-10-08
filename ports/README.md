@@ -8,6 +8,7 @@ WASI adapter. The recipe currently supports an x86_64 Linux build host.
 ```sh
 uv run --no-project --python 3.13 ports/cpython/build.py
 uv run --no-project --python 3.13 ports/cpython/build.py --with-pycosat
+uv run --no-project --python 3.13 ports/cpython/build.py --with-pillow
 ```
 
 The work directory defaults to `/tmp/shellsim-cpython`. It contains downloaded
@@ -78,8 +79,10 @@ assert result.returncode == 0, result.stderr
 
 This establishes a static native source recipe. Dynamic extension loading,
 arbitrary host native wheels, threads, process spawning, and sockets are not
-supported. Optional CPython modules requiring external libraries, including
-zlib, ssl, ctypes, and readline, are absent from this initial build. Unsupported
+supported. The [native dependency foundation](native/README.md) supplies zlib
+when selected, sharing its verified target artifact with Pillow's PNG profile.
+Other optional CPython modules requiring external libraries, including
+ssl, ctypes, and readline, are absent from this build. Unsupported
 WASI capabilities fail explicitly. `Environment.run_python` continues to select
 shellsim's existing Python VM.
 

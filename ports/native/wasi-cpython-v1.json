@@ -1,0 +1,14 @@
+{
+  "name": "wasi-cpython-v1",
+  "target": "wasm32-wasip1",
+  "sdk_version": "24.0",
+  "sdk_sha256": "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5",
+  "linkage": "static",
+  "threads": false,
+  "cpp_exceptions": false,
+  "sysroot_libraries": "pinned-sdk-only",
+  "compiler_flags": [
+    "-O2",
+    "-g0"
+  ]
+}

@@ -15,6 +15,11 @@ build inputs on the trusted host. A fresh work directory is required after
 changing source patches or build tooling. Download archives may be copied into
 its `downloads` directory; their complete SHA256 values are checked on every run.
 
+Changes to the shared CPython builder also change this recipe's identity. A
+bundle made with an earlier builder remains evidence for its earlier recipe;
+the graph workflow rejects it for the current profile. Updating the recorded
+builder checksum alone does not validate a newly assembled NumPy image.
+
 The recipe pins the source, Meson/Cython/Ninja versions, patches, and build
 scripts. Meson and Cython run on the host, while all native compilation uses the
 SDK and target CPython headers supplied through a dedicated pkg-config provider.

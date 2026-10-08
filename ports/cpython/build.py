@@ -19,7 +19,10 @@ import urllib.request
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from ports.native.dependencies import dependency_prefix, digest, file_hash, target_environment, toolchain_identity
+from ports.native.zlib.build import build_zlib
 from ports.numpy.build import apply_patch, build_numpy, check_build_scripts, install_numpy
+from ports.pillow.build import build_pillow, install_pillow
 
 
 def fetch_extract(spec, work):
@@ -95,6 +98,10 @@ def main():
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--with-pycosat", action="store_true", help="statically link the pinned native pycosat port")
     parser.add_argument("--with-numpy", action="store_true", help="statically link the pinned native NumPy port")
+    parser.add_argument("--with-zlib", action="store_true", help="link the pinned shared target zlib artifact")
+    parser.add_argument(
+        "--with-pillow", action="store_true", help="link Pillow's PNG profile and its target zlib dependency"
+    )
     parser.add_argument("--build-python", type=Path, help="reuse a trusted native CPython 3.13 helper")
     args = parser.parse_args()
     work = args.work_dir.resolve()
@@ -118,16 +125,63 @@ def main():
     ):
         raise ValueError("The native build helper must match the pinned CPython version")
     sysroot = sdk / "share" / "wasi-sysroot"
+    toolchain = toolchain_identity(recipe, sdk)
+    target_artifacts = {}
+    target_links = []
+    prefix = work / "dependency-prefix"
+    if args.with_zlib or args.with_pillow:
+        directory = Path(__file__).parent.parent / "native/zlib"
+        zlib_recipe = json.loads((directory / "recipe.json").read_text())
+        zlib_source = fetch_extract(zlib_recipe["source"], work)
+        zlib_prefix, _ = build_zlib(zlib_recipe, zlib_source, sdk, work, toolchain, run)
+        target_artifacts, target_links = dependency_prefix(
+            recipe["optional_target_dependencies"]["zlib"],
+            {"native/zlib": zlib_prefix},
+            prefix,
+            recipe["target_profile"],
+        )
+    profile = {
+        "recipe": recipe,
+        "builder_sha256": file_hash(Path(__file__)),
+        "toolchain": toolchain,
+        "host_helper_sha256": file_hash(helper),
+        "host_tools": {
+            "driver": {"version": sys.version.split()[0], "sha256": file_hash(Path(sys.executable))},
+            "make": {"sha256": file_hash(Path(shutil.which("make")))},
+            "python-build-helper": {"version": recipe["version"], "sha256": file_hash(helper)},
+        },
+        "ports": {
+            name: file_hash(Path(__file__).parent.parent / name / "recipe.json")
+            for name, enabled in (
+                ("numpy", args.with_numpy),
+                ("pycosat", args.with_pycosat),
+                ("pillow", args.with_pillow),
+            )
+            if enabled
+        },
+        "dependencies": {name: item["artifact_sha256"] for name, item in target_artifacts.items()},
+    }
+    marker = work / "cpython-profile.sha256"
+    profile_hash = digest(profile)
+    if marker.exists() and marker.read_text().strip() != profile_hash:
+        raise ValueError("CPython build inputs changed; use a clean build directory")
+    if not marker.exists() and (guest / "Makefile").exists():
+        raise ValueError("Unidentified cached CPython build; use a clean build directory")
+    marker.write_text(profile_hash + "\n")
     guest_env = dict(
-        env,
+        target_environment(sdk),
         CC=f"{sdk / 'bin/clang'} --sysroot={sysroot}",
         AR=str(sdk / "bin/llvm-ar"),
         RANLIB=str(sdk / "bin/llvm-ranlib"),
         CONFIG_SITE=str(source / "Tools/wasm/config.site-wasm32-wasi"),
         CFLAGS="-O2 -g0",
         PKG_CONFIG_PATH="",
-        PKG_CONFIG_LIBDIR=str(sysroot / "lib/pkgconfig"),
+        PKG_CONFIG_LIBDIR=str(prefix / "lib/pkgconfig") if target_artifacts else "",
+        PKG_CONFIG="/bin/false",
     )
+    if target_artifacts:
+        guest_env["ZLIB_CFLAGS"] = f"-I{prefix / 'include'}"
+        guest_env["ZLIB_LIBS"] = " ".join(target_links)
     if not (guest / "Makefile").exists():
         build = subprocess.check_output([str(source / "config.guess")], text=True).strip()
         run(
@@ -148,6 +202,13 @@ def main():
     port_sources = {}
     setup = guest / "Modules/Setup.local"
     setup_text = "# shellsim static native ports\n"
+    link_consumers = {}
+    if target_artifacts:
+        setup_text += f"*static*\nzlib zlibmodule.c -I{prefix / 'include'} {' '.join(target_links)}\n"
+        link_consumers["cpython.zlib"] = {
+            "dependency_artifacts": profile["dependencies"],
+            "link_inputs": target_links,
+        }
     if args.with_pycosat:
         port = json.loads(Path(__file__).parent.parent.joinpath("pycosat/recipe.json").read_text())
         port_source = fetch_extract(port["source"], work)
@@ -156,6 +217,27 @@ def main():
         setup_text += "*static*\n" + port["setup"] + "\n"
         native_ports.append(port)
         port_sources[port["name"]] = port_source
+    if args.with_pillow:
+        directory = Path(__file__).parent.parent / "pillow"
+        port = json.loads((directory / "recipe.json").read_text())
+        if port["target_development"] != {"cpython": recipe["version"]}:
+            raise ValueError("Pillow's pinned CPython development configuration does not match")
+        for patch in port["patches"]:
+            apply_patch(source, directory / patch["file"], patch["sha256"])
+        pillow_source = fetch_extract(port["source"], work)
+        dependencies, links = dependency_prefix(
+            port["target_dependencies"], {"native/zlib": zlib_prefix}, prefix, recipe["target_profile"]
+        )
+        archive, inputs = build_pillow(port, pillow_source, source, guest, sdk, work, dependencies, prefix, run)
+        setup_text += f"*static*\nPIL._imaging {archive} {' '.join(links)} -lm\n"
+        link_consumers["PIL._imaging"] = {
+            "inputs": inputs,
+            "archive_sha256": file_hash(archive),
+            "dependency_artifacts": profile["dependencies"],
+            "link_inputs": [str(archive), *links, "-lm"],
+        }
+        native_ports.append(port)
+        port_sources[port["name"]] = pillow_source
     if args.with_numpy:
         directory = Path(__file__).parent.parent / "numpy"
         port = json.loads((directory / "recipe.json").read_text())
@@ -203,6 +285,8 @@ def main():
     for config in (guest / "build").glob("lib.*/_sysconfigdata_*.py"):
         shutil.copyfile(config, stdlib / config.name)
     shutil.copyfile(source / "LICENSE", root / "CPYTHON-LICENSE")
+    if target_artifacts:
+        shutil.copyfile(prefix / "licenses/zlib.txt", root / "ZLIB-LICENSE")
     for port in native_ports:
         port_source = port_sources[port["name"]]
         license_file = "LICENSE.txt" if port["name"] == "numpy" else "LICENSE"
@@ -210,6 +294,8 @@ def main():
         if port["name"] == "numpy":
             install_numpy(work / "numpy-build", stdlib / "site-packages")
             install_numpy_notices(port_source, root)
+        elif port["name"] == "pillow":
+            install_pillow(port_source, stdlib / "site-packages")
         install_metadata(port, port_source, root)
         if port["name"] == "pycosat":
             notice = (port_source / "picosat.c").read_text().split("*/", 1)[0]
@@ -225,6 +311,10 @@ def main():
         "site_packages": "/usr/lib/python3.13/site-packages",
         "builtin_modules": builtin_modules,
         "native_ports": native_ports,
+        "native_libraries": target_artifacts,
+        "link_consumers": link_consumers,
+        "build_profile": profile,
+        "build_profile_sha256": profile_hash,
         "files": files,
     }
     (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
