@@ -13,6 +13,40 @@ use crate::python::error::{Control, PyResult};
 use num_traits::{One, Signed, Zero};
 
 impl<'s> Vm<'s> {
+    /// Resolve a data-class field declaration only when its initializer needs a default.
+    fn dataclass_default(&mut self, default: Option<Value>) -> PyResult<Option<Value>> {
+        let Some(default) = default else {
+            return Ok(None);
+        };
+        if !default.is_object() || !matches!(self.get(default)?, Object::Bare) {
+            return Ok(Some(default));
+        }
+        let Some(marker) = self.get_attribute_default(default, "_shellsim_dataclass_field")? else {
+            return Ok(Some(default));
+        };
+        if !self.truth(&marker)? {
+            return Ok(Some(default));
+        }
+        let factory = self
+            .get_attribute_default(default, "has_factory")?
+            .ok_or("data class field lost factory marker")?;
+        if self.truth(&factory)? {
+            let callable = self
+                .get_attribute_default(default, "default_factory")?
+                .ok_or("data class field lost default factory")?;
+            return self
+                .call_value(callable, CallArgs::new(Vec::new(), Vec::new()))
+                .map(Some);
+        }
+        let has_default = self
+            .get_attribute_default(default, "has_default")?
+            .ok_or("data class field lost default marker")?;
+        if self.truth(&has_default)? {
+            return self.get_attribute_default(default, "default");
+        }
+        Ok(None)
+    }
+
     /// Length of a builtin representation without consulting Python slots. Native length slots
     /// and the `len()` fallback share this path so their metering and results cannot diverge.
     pub(super) fn physical_length(&self, value: Value) -> PyResult<Option<usize>> {
@@ -1371,6 +1405,14 @@ impl<'s> Vm<'s> {
             .map(|(field, default)| (field.clone(), self.value_optional(default.as_ref())))
             .collect::<Vec<_>>();
         let enum_members = self.values(&class_object.enum_members);
+        let dataclass_kw_only = if is_dataclass {
+            match self.class_attribute(class, "__shellsim_dataclass_kw_only__")? {
+                Some(value) => self.truth(&value)?,
+                None => false,
+            }
+        } else {
+            false
+        };
         if dispatch_metaclass && metaclass.is_object() {
             if let Some((owner, descriptor)) = self.class_attribute_entry(metaclass, "__call__")? {
                 let callable = self.bind_descriptor(descriptor, Some(class), metaclass, owner)?;
@@ -1488,6 +1530,11 @@ impl<'s> Vm<'s> {
             self.allocate_typed(instance_type, payload)?
         };
         if is_dataclass {
+            if dataclass_kw_only && !arguments.is_empty() {
+                return Err(PyError::type_error(format!(
+                    "{name}() accepts keyword arguments only"
+                )));
+            }
             let mut values = Vec::new();
             for (index, (field, default)) in dataclass_fields.iter().enumerate() {
                 if index < arguments.len()
@@ -1497,13 +1544,17 @@ impl<'s> Vm<'s> {
                         format!("{name}() got multiple values for argument {field:?}").into(),
                     );
                 }
-                let value = keyword_arguments
+                let supplied = keyword_arguments
                     .iter()
                     .find(|(name, _)| name == field)
                     .map(|(_, value)| *value)
-                    .or_else(|| arguments.get(index).copied())
-                    .or(*default)
-                    .ok_or_else(|| format!("{name}() missing required argument: {field:?}"))?;
+                    .or_else(|| arguments.get(index).copied());
+                let value = match supplied {
+                    Some(value) => value,
+                    None => self
+                        .dataclass_default(*default)?
+                        .ok_or_else(|| format!("{name}() missing required argument: {field:?}"))?,
+                };
                 if keyword_arguments
                     .iter()
                     .filter(|(name, _)| name == field)

@@ -2166,6 +2166,22 @@ impl PyRuntime for Vm<'_> {
     }
 
     fn mark_dataclass(&mut self, class: PyClass) -> PyResult<()> {
+        let fields = {
+            let Object::Class(class_object) = self.state.heap.get(class.value())? else {
+                return Err(PyError::runtime_error("class handle changed object kind"));
+            };
+            class_object
+                .dataclass_fields
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>()
+        };
+        let mut names = Vec::with_capacity(fields.len());
+        for name in fields {
+            names.push(self.new_string(name)?);
+        }
+        let names = self.new_tuple(names)?;
+        self.set_attribute(class.value(), "__shellsim_dataclass_field_names__", names)?;
         let Object::Class(class_object) = self.state.heap.get_mut(class.value())? else {
             return Err(PyError::runtime_error("class handle changed object kind"));
         };

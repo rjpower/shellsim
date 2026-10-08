@@ -5,6 +5,128 @@ use shellsim::{python, Environment, Limits};
 use super::support::{run_python_text as run, run_python_text_in as run_in};
 
 #[test]
+fn html_escape_matches_common_markup_rules() {
+    assert_eq!(
+        run("from html import escape\nprint(escape(\"A&B <'\\\"'>\"))\nprint(escape(\"A&B <'\\\"'>\", quote=False))"),
+        (
+            0,
+            "A&amp;B &lt;&#x27;&quot;&#x27;&gt;\nA&amp;B &lt;'\"'&gt;\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn threading_rlock_is_reentrant_and_balanced_in_one_interpreter() {
+    assert_eq!(
+        run("from threading import RLock\nlock = RLock()\nwith lock:\n    print(lock.acquire(False), lock._is_owned())\n    lock.release()\nprint(lock._is_owned())\ntry:\n    lock.release()\nexcept RuntimeError:\n    print('unheld')"),
+        (0, "True True\nFalse\nunheld\n".into(), String::new())
+    );
+}
+
+#[test]
+fn importlib_resources_reads_only_staged_package_files() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/demo").unwrap();
+    environment
+        .vfs
+        .put_file("/work/demo/__init__.py", Vec::new(), 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .put_file("/work/demo/data.txt", b"guest data".to_vec(), 0o644)
+        .unwrap();
+    environment.cwd = "/work".into();
+    assert_eq!(
+        run_in(&mut environment, "from importlib import resources\nprint(resources.files('demo').joinpath('data.txt').read_text())"),
+        (0, "guest data\n".into(), String::new())
+    );
+}
+
+#[test]
+fn dataclass_field_factory_and_class_detection_are_effective() {
+    let source = r#"from dataclasses import dataclass, field, is_dataclass
+@dataclass
+class Row:
+    name: str
+    items: list = field(default_factory=list)
+
+a = Row('a')
+b = Row('a')
+a.items.append(3)
+print(a.items, b.items, a == b, is_dataclass(Row), is_dataclass(a))
+@dataclass(kw_only=True)
+class Options:
+    enabled: bool = True
+
+print(Options(enabled=False).enabled)
+try:
+    Options(False)
+except TypeError:
+    print('keyword only')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "[3] [] False True True\nFalse\nkeyword only\n".into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
+fn frozen_dataclasses_compare_hash_and_reject_updates() {
+    let source = r#"from dataclasses import dataclass, FrozenInstanceError
+@dataclass(frozen=True)
+class Point:
+    x: int
+    y: int = 2
+
+a = Point(1)
+b = Point(1, 2)
+print(a == b, hash(a) == hash(b), a != Point(2))
+try:
+    a.x = 4
+except FrozenInstanceError:
+    print('frozen')
+"#;
+    assert_eq!(
+        run(source),
+        (0, "True True True\nfrozen\n".into(), String::new())
+    );
+}
+
+#[test]
+fn decimal_keeps_finite_values_exact_and_applies_context_rounding() {
+    let source = r#"from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, getcontext
+print(Decimal('1.20') + Decimal('2.3'))
+print(Decimal('2.345').quantize(Decimal('0.01')))
+print(Decimal('2.345').quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
+getcontext().prec = 4
+print(Decimal(1) / Decimal(3), f"{Decimal('2.50'):f}")
+print(Decimal('1e2') == Decimal(100), Decimal('0.1') * Decimal('0.2'))
+print(f"{Decimal('2.345'):.2f}", Decimal('123.4').adjusted(), Decimal('0').is_zero())
+print(hash(Decimal('2.0')) == hash(2))
+getcontext().prec = 3
+print(Decimal('1.234') + Decimal('0.006'), Decimal('1.234') * Decimal('2'))
+try:
+    Decimal('bad')
+except InvalidOperation:
+    print('invalid')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            "3.50\n2.34\n2.35\n0.3333 2.50\nTrue 0.02\n2.34 2 True\nTrue\n1.24 2.47\ninvalid\n"
+                .into(),
+            String::new(),
+        )
+    );
+}
+
+#[test]
 fn urllib_request_uses_typed_routes_and_file_like_responses() {
     let mut environment = Environment::new();
     environment
