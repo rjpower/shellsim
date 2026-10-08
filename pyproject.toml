@@ -26,6 +26,7 @@ keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simula
 
 [project.optional-dependencies]
 c = ["shellsim-c-toolchain==0.1.30"]
+pypi = ["uv>=0.12,<1"]
 
 [project.urls]
 Homepage = "https://github.com/rjpower/shellsim"

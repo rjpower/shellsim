@@ -53,10 +53,22 @@ const MAX_RUNNER_FILES: usize = 128;
 const MAX_RUNNER_FILE_BYTES: usize = 256 * 1024;
 const MAX_RUNNER_SOURCE_BYTES: usize = 512 * 1024;
 const MAX_RUNNER_WRAPPER_BYTES: usize = 1024 * 1024;
+/// Guest-only installation root searched after the script or working directory.
+const SITE_PACKAGES: &str = "/usr/lib/python3.14/site-packages";
 
 /// Return whether an offline package command can supply this third-party distribution.
 pub(crate) fn is_bundled_distribution(name: &str) -> bool {
     matches!(name, "numpy" | "pytest" | "pytest_json_ctrf")
+}
+
+/// Whether a Python import resolves to shellsim's own implementation before the VFS.
+///
+/// This reads the closed module registries without creating an interpreter, so host package
+/// staging can reject import-name collisions without consuming simulated resources.
+pub fn is_bundled_python_module(name: &str) -> bool {
+    name == "builtins"
+        || stdlib::native_module(name).is_some()
+        || stdlib::frozen_module(name).is_some()
 }
 
 /// Persistent locals for the deliberately-small foreground Python REPL.
@@ -294,6 +306,7 @@ pub(crate) fn start_python(
             ..ReplState::default()
         };
         state.import_paths.push(interp.cwd.clone());
+        state.import_paths.push(SITE_PACKAGES.to_string());
         interp.python_repl = Some(state);
         out.extend_from_slice(
             b"Python 3.14.0 (shellsim)\nType exit() or quit() to return to the shell.\n>>> ",
@@ -358,6 +371,7 @@ pub(crate) fn start_python(
         }
     };
     state.import_paths.push(import_root);
+    state.import_paths.push(SITE_PACKAGES.to_string());
     PythonCommandStart::Running(Box::new(PythonContinuation {
         argv: py_argv,
         stdin: execution_stdin,

@@ -18,6 +18,16 @@ print(documented())
 }
 
 #[test]
+fn unicode_prefixed_strings_execute_in_multiline_expressions() {
+    let source = r#"
+value = 'x' + (u',[]{}' if True else U'')\
+    + u' café'
+print(value)
+"#;
+    assert_eq!(run(source), (0, "x,[]{} café\n".into(), String::new()));
+}
+
+#[test]
 fn crlf_sources_lex_like_their_lf_form() {
     // Blank lines keep indentation, a backslash continues the line, and a triple-quoted string
     // spanning CRLF lines contains LF, matching CPython's universal-newline source decoding.

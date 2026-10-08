@@ -51,6 +51,10 @@ pub(super) static MODULE: ModuleDef = ModuleDef {
     ],
     values: &[
         ValueDef::Factory {
+            name: "TYPE_CHECKING",
+            get: type_checking,
+        },
+        ValueDef::Factory {
             name: "List",
             get: list,
         },
@@ -107,6 +111,10 @@ const fn typing_value(name: &'static str) -> ValueDef {
 
 fn list(runtime: &mut dyn PyRuntime) -> PyResult {
     Ok(runtime.marker(PyMarker::TypingList))
+}
+
+fn type_checking(_runtime: &mut dyn PyRuntime) -> PyResult {
+    Ok(PyValue::Bool(false))
 }
 
 fn type_var(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {

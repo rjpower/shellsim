@@ -169,6 +169,51 @@ print(sys.path[0], value.answer)
 }
 
 #[test]
+fn site_packages_import_without_changing_the_working_directory() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .put_dir("/usr/lib/python3.14/site-packages", 0o755)
+        .unwrap();
+    environment
+        .vfs
+        .put_file(
+            "/usr/lib/python3.14/site-packages/installed.py",
+            b"answer = 42\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    environment.vfs.put_dir("/work/project", 0o755).unwrap();
+    environment.set_var("PWD", "/work/project");
+
+    let source = "import installed, os, sys\nprint(installed.answer, os.getcwd())\nprint(sys.path[0], sys.path[1])";
+    assert_eq!(
+        run_in(&mut environment, source),
+        (
+            0,
+            b"42 /work/project\n/work/project /usr/lib/python3.14/site-packages\n".to_vec(),
+            Vec::new(),
+        )
+    );
+    assert_eq!(environment.cwd, "/work/project");
+    environment
+        .vfs
+        .put_file(
+            "/work/project/installed.py",
+            b"answer = 7\n".to_vec(),
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(
+        run_in(
+            &mut environment,
+            "import installed\nprint(installed.answer)"
+        ),
+        (0, b"7\n".to_vec(), Vec::new()),
+    );
+}
+
+#[test]
 fn math_and_string_constants_match_cpython() {
     let source = r#"import math
 import string
@@ -558,6 +603,39 @@ print(module.__name__, module.__file__, module.__package__, module.__spec__ is s
             0,
             b"importlib importlib.util\nplugin_name /work/pkg/plugin.py True\nplugin_name /work/pkg/plugin.py  True 42\n".to_vec(),
             Vec::new()
+        )
+    );
+}
+
+#[test]
+fn importlib_specs_preserve_package_metadata_for_vfs_loaders() {
+    let source = r#"from importlib import util
+
+class Loader:
+    def is_package(self, name):
+        return name == 'demo.pkg'
+
+    def create_module(self, spec):
+        return None
+
+loader = Loader()
+spec = util.spec_from_loader('demo.pkg', loader)
+module = util.module_from_spec(spec)
+print(spec.submodule_search_locations, module.__package__, module.__path__)
+print(hasattr(module, '__file__'), module.__spec__ is spec)
+plain = util.spec_from_loader('demo.pkg', loader, is_package=False)
+print(plain.submodule_search_locations is None)
+try:
+    util.spec_from_loader('demo.pkg', loader, is_package='yes')
+except TypeError:
+    print('invalid package flag')
+"#;
+    assert_eq!(
+        run(source),
+        (
+            0,
+            b"[] demo.pkg []\nFalse True\nTrue\ninvalid package flag\n".to_vec(),
+            Vec::new(),
         )
     );
 }

@@ -165,20 +165,24 @@ impl<'s> Vm<'s> {
         if !value.is_object() {
             return self.type_attribute_names(value);
         }
+        if let Object::Module { scope, .. } = self.get(*value)? {
+            let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
+            let mut names = self
+                .namespace_entries(namespace)?
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>();
+            if let Some(class) = self.instance_class(*value)? {
+                names.extend(self.class_attribute_names(class)?);
+            }
+            return Ok(names);
+        }
         if let Some(class) = self.instance_class(*value)? {
             let mut names = self.instance_attribute_names(*value)?;
             names.extend(self.class_attribute_names(class)?);
             return Ok(names);
         }
         match self.get(*value)? {
-            Object::Module { scope, .. } => {
-                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
-                Ok(self
-                    .namespace_entries(namespace)?
-                    .into_iter()
-                    .map(|(name, _)| name)
-                    .collect())
-            }
             Object::Class(_) => self.class_attribute_names(*value),
             _ => self.type_attribute_names(value),
         }

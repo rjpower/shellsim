@@ -183,14 +183,28 @@ impl<'s> Vm<'s> {
     #[cold]
     #[inline(never)]
     fn resolve_builtin(&mut self, symbol: SymbolId) -> PyResult<Value> {
+        self.builtin_binding(symbol)?.ok_or_else(|| {
+            let name = self.symbol_name(symbol);
+            if cpython_names::is_cpython_builtin(name) {
+                return format!("builtin {name:?} is not implemented").into();
+            }
+            PyError::exception("NameError", format!("name '{name}' is not defined"))
+        })
+    }
+
+    /// Resolve one existing builtin without treating unsupported CPython names as values.
+    fn builtin_binding(&mut self, symbol: SymbolId) -> PyResult<Option<Value>> {
         if let Some((module_name, attribute)) =
             super::super::stdlib::frozen_builtin(self.symbol_name(symbol))
         {
             self.import(module_name, false)?;
             let module = self.pop()?;
-            return self.resolve_attribute(module, attribute)?.ok_or_else(|| {
-                format!("frozen module {module_name:?} does not define {attribute:?}").into()
-            });
+            return self
+                .resolve_attribute(module, attribute)?
+                .map(Some)
+                .ok_or_else(|| {
+                    format!("frozen module {module_name:?} does not define {attribute:?}").into()
+                });
         }
         let name = self.symbol_name(symbol);
         let value = (|| {
@@ -220,6 +234,9 @@ impl<'s> Vm<'s> {
                 return Some(Value::Native(NativeValue::BuiltinType(builtin_type)));
             }
             match name {
+                "False" => return Some(Value::Bool(false)),
+                "True" => return Some(Value::Bool(true)),
+                "None" => return Some(Value::None),
                 "Ellipsis" => return Some(Value::Native(NativeValue::Ellipsis)),
                 "NotImplemented" => return Some(Value::Native(NativeValue::NotImplemented)),
                 _ => {}
@@ -240,12 +257,7 @@ impl<'s> Vm<'s> {
             };
             Some(Value::Native(NativeValue::Function(builtin)))
         })();
-        value.ok_or_else(|| {
-            if cpython_names::is_cpython_builtin(name) {
-                return format!("builtin {name:?} is not implemented").into();
-            }
-            PyError::exception("NameError", format!("name '{name}' is not defined"))
-        })
+        Ok(value)
     }
 
     pub(super) fn store_name(&mut self, symbol: SymbolId) -> PyResult<()> {
@@ -678,6 +690,32 @@ impl<'s> Vm<'s> {
         Ok(compiled)
     }
 
+    /// Make the interpreter's supported builtin values importable as one module.
+    /// Unsupported CPython names remain absent instead of becoming callable stubs.
+    fn import_builtins(&mut self, bind_root: bool) -> PyResult<()> {
+        let mut names = vec![
+            (
+                "__name__",
+                Value::inline_string("builtins").expect("short builtin string"),
+            ),
+            ("__doc__", Value::None),
+            (
+                "__package__",
+                Value::inline_string("").expect("empty builtin string"),
+            ),
+        ];
+        for name in cpython_names::builtin_names() {
+            let symbol = self.intern_symbol(name)?;
+            if let Some(value) = self.builtin_binding(symbol)? {
+                names.push((name, value));
+            }
+        }
+        let (module, _) = self.allocate_module("builtins".to_string(), names)?;
+        let stored = self.store(module);
+        self.state.modules.insert("builtins".to_string(), stored);
+        self.finish_import("builtins", module, bind_root)
+    }
+
     pub(super) fn import(&mut self, name: &str, bind_root: bool) -> PyResult<()> {
         let name = self.resolve_import_name(name)?;
         if let Some(module) = super::super::stdlib::native_module(&name) {
@@ -689,6 +727,9 @@ impl<'s> Vm<'s> {
         }
         if let Some(module) = self.loaded_module(&name) {
             return self.finish_import(&name, module, bind_root);
+        }
+        if name == "builtins" {
+            return self.import_builtins(bind_root);
         }
 
         self.ensure_package_parent(&name)?;

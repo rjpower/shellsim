@@ -671,10 +671,17 @@ fn panic_suffix(payload: &(dyn Any + Send)) -> String {
     }
 }
 
+/// Query the fixed Python module registry without running guest code.
+#[pyfunction]
+fn is_bundled_python_module(name: &str) -> bool {
+    shellsim::python::is_bundled_python_module(name)
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
     module.add_class::<NativeContainer>()?;
+    module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     Ok(())
 }

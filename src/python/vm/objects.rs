@@ -82,6 +82,7 @@ pub(super) fn is_subclassable_builtin(builtin: BuiltinType) -> bool {
             | BuiltinType::ByteArray
             | BuiltinType::Float
             | BuiltinType::Complex
+            | BuiltinType::Module
     )
 }
 
@@ -290,7 +291,10 @@ impl<'s> Vm<'s> {
             return Ok(None);
         }
         let (type_id, shape) = if owner.is_object() {
-            if matches!(self.get(owner)?, Object::Class(_) | Object::Super { .. }) {
+            if matches!(
+                self.get(owner)?,
+                Object::Class(_) | Object::Super { .. } | Object::Module { .. }
+            ) {
                 return Ok(None);
             }
             let Some(key) = attributes::site_key(self.heap(), owner)? else {
@@ -644,6 +648,39 @@ impl<'s> Vm<'s> {
                 }
             }
         }
+        if owner.is_object() {
+            if let Object::Module { scope, .. } = self.get(owner)? {
+                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
+                if let Some((defining_type, descriptor)) = self.type_lookup(owner_type, name)? {
+                    if self.is_data_descriptor(&descriptor)? {
+                        return self.bind_type_attribute(
+                            descriptor,
+                            Some(owner),
+                            owner_type,
+                            defining_type,
+                        );
+                    }
+                }
+                if let Some(value) = self.namespace_lookup(namespace, name)? {
+                    return Ok(Some(value));
+                }
+                if let Some((defining_type, descriptor)) = self.type_lookup(owner_type, name)? {
+                    return self.bind_type_attribute(
+                        descriptor,
+                        Some(owner),
+                        owner_type,
+                        defining_type,
+                    );
+                }
+                // PEP 562 applies only to the module namespace, after the type lookup.
+                let hook = self.namespace_lookup(namespace, "__getattr__")?;
+                let Some(hook) = hook.filter(|_| name != "__class__") else {
+                    return Ok(None);
+                };
+                let name = self.allocate_string(name.to_string())?;
+                return self.invoke_value(hook, vec![name]).map(Some);
+            }
+        }
         if let Some(class) = instance_class {
             return self.lookup_instance_attribute(owner, class, symbol, name);
         }
@@ -656,21 +693,7 @@ impl<'s> Vm<'s> {
         }
         if owner.is_object() {
             match self.get(owner)? {
-                Object::Module { scope, .. } => {
-                    let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
-                    if let Some(value) = self.namespace_lookup(namespace, name)? {
-                        return Ok(Some(value));
-                    }
-                    // PEP 562: a module-level `__getattr__` supplies names the module does not
-                    // define, which is how packages import submodules lazily. It runs after
-                    // the type's attributes, of which modules model only `__class__`.
-                    let hook = self.namespace_lookup(namespace, "__getattr__")?;
-                    let Some(hook) = hook.filter(|_| name != "__class__") else {
-                        return Ok(None);
-                    };
-                    let name = self.allocate_string(name.to_string())?;
-                    return self.invoke_value(hook, vec![name]).map(Some);
-                }
+                Object::Module { .. } => unreachable!("modules resolve above"),
                 Object::Function(function_object) => {
                     let FunctionObject {
                         name: function_name,
@@ -835,6 +858,15 @@ impl<'s> Vm<'s> {
                     .ok_or("exception type is not registered")?;
                 Some(Object::MappingProxy(ProxyTarget::RegisteredType(type_id)))
             }
+            _ if owner.is_object() && matches!(self.get(owner)?, Object::Module { .. }) => {
+                let Object::Module { scope, .. } = self.get(owner)? else {
+                    unreachable!("checked above")
+                };
+                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
+                return self
+                    .alloc(Object::NamespaceDict(namespace.store()))
+                    .map(Some);
+            }
             _ if self.has_instance_dict(owner)? => {
                 return self
                     .alloc(Object::NamespaceDict(NamespaceTarget::Instance(Ref::from(
@@ -847,11 +879,6 @@ impl<'s> Vm<'s> {
                     Object::Class { .. } => self
                         .alloc(Object::MappingProxy(ProxyTarget::Class(Ref::from(owner))))
                         .map(Some),
-                    Object::Module { scope, .. } => {
-                        let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
-                        self.alloc(Object::NamespaceDict(namespace.store()))
-                            .map(Some)
-                    }
                     _ => Ok(None),
                 };
             }
@@ -953,7 +980,25 @@ impl<'s> Vm<'s> {
                 *args = Ref::all(items);
             });
         }
+        let module_scope = if owner.is_object() {
+            match self.get(owner)? {
+                Object::Module { scope, .. } => Some(self.value(scope)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if module_scope.is_some() && (name == "__dict__" || name == "__class__") {
+            return Err(self.reject_builtin_attribute_store(owner, name));
+        }
         let Some(class) = self.instance_class(owner)? else {
+            if let Some(scope) = module_scope {
+                return self.namespace_store(
+                    super::namespace::NamespaceHandle::Scope(scope),
+                    name,
+                    value,
+                );
+            }
             if owner.is_object() {
                 match self.get(owner)? {
                     Object::Class { .. } => {
@@ -961,10 +1006,6 @@ impl<'s> Vm<'s> {
                     }
                     Object::Function { .. } => {
                         return self.set_function_attribute(owner, symbol, name, Some(value))
-                    }
-                    Object::Module { scope, .. } => {
-                        let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
-                        return self.namespace_store(namespace, name, value);
                     }
                     _ => {}
                 }
@@ -1033,7 +1074,11 @@ impl<'s> Vm<'s> {
                 ));
             }
         }
-        self.insert_attribute_by_symbol(owner, symbol, value)?;
+        if let Some(scope) = module_scope {
+            self.namespace_store(super::namespace::NamespaceHandle::Scope(scope), name, value)?;
+        } else {
+            self.insert_attribute_by_symbol(owner, symbol, value)?;
+        }
         Ok(())
     }
 
@@ -1117,9 +1162,24 @@ impl<'s> Vm<'s> {
         if !owner.is_object() {
             return Err(self.reject_builtin_attribute_store(owner, name));
         }
+        let module_scope = match self.get(owner)? {
+            Object::Module { scope, .. } => Some(self.value(scope)),
+            _ => None,
+        };
+        if module_scope.is_some() && (name == "__dict__" || name == "__class__") {
+            return Err(self.reject_builtin_attribute_store(owner, name));
+        }
         let class = match self.get(owner)? {
             _ if self.instance_class(owner)?.is_some() => {
                 self.instance_class(owner)?.expect("checked above")
+            }
+            _ if module_scope.is_some() => {
+                let scope = module_scope.expect("checked above");
+                let namespace = super::namespace::NamespaceHandle::Scope(scope);
+                if self.namespace_delete(namespace, name)?.is_none() {
+                    return Err(self.missing_attribute(&owner, name));
+                }
+                return Ok(());
             }
             _ if exception_types::exception_base(self.state, owner)?.is_some() => {
                 if self.remove_attribute_by_symbol(owner, symbol)?.is_none() {
@@ -1130,13 +1190,6 @@ impl<'s> Vm<'s> {
             Object::Class { .. } => return self.set_class_attribute(owner, symbol, name, None),
             Object::Function { .. } => {
                 return self.set_function_attribute(owner, symbol, name, None)
-            }
-            Object::Module { scope, .. } => {
-                let namespace = super::namespace::NamespaceHandle::Scope(self.value(scope));
-                if self.namespace_delete(namespace, name)?.is_none() {
-                    return Err(self.missing_attribute(&owner, name));
-                }
-                return Ok(());
             }
             _ => return Err(self.reject_builtin_attribute_store(owner, name)),
         };
@@ -1183,7 +1236,12 @@ impl<'s> Vm<'s> {
                 ));
             }
         }
-        if self.remove_attribute_by_symbol(owner, symbol)?.is_none() {
+        let removed = if let Some(scope) = module_scope {
+            self.namespace_delete(super::namespace::NamespaceHandle::Scope(scope), name)?
+        } else {
+            self.remove_attribute_by_symbol(owner, symbol)?
+        };
+        if removed.is_none() {
             return Err(self.missing_attribute(&owner, name));
         }
         Ok(())
@@ -3880,6 +3938,14 @@ impl<'s> Vm<'s> {
                 expect_arity(&arguments, 0, 0)?;
                 self.allocate_object(Object::Bare)?
             }
+            BuiltinType::Module => {
+                expect_arity(&arguments, 1, 2)?;
+                let name = string::string_value(&self.state.heap, arguments[0])?
+                    .ok_or_else(|| PyError::type_error("module name must be a string"))?;
+                let doc = arguments.get(1).copied().unwrap_or(Value::None);
+                self.allocate_module(name, vec![("__name__", arguments[0]), ("__doc__", doc)])?
+                    .0
+            }
             BuiltinType::Slice => {
                 if arguments.is_empty() || arguments.len() > 3 {
                     return Err(PyError::exception(
@@ -4183,7 +4249,6 @@ impl<'s> Vm<'s> {
                 })?
             }
             BuiltinType::Function
-            | BuiltinType::Module
             | BuiltinType::Iterator
             | BuiltinType::Generator
             | BuiltinType::Exception
