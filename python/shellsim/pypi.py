@@ -153,7 +153,9 @@ def _remove_bundled_distributions(target: Path) -> int:
             raise PackageInstallError(f"{distribution.name}: RECORD does not list itself")
         for path in paths:
             path.unlink()
-        directories = {parent for path in paths for parent in path.parents if parent != target and target in parent.parents}
+        directories = {
+            parent for path in paths for parent in path.parents if parent != target and target in parent.parents
+        }
         for directory in sorted(directories, key=lambda path: len(path.parts), reverse=True):
             if directory.exists() and not any(directory.iterdir()):
                 directory.rmdir()
@@ -181,8 +183,7 @@ def _compatibility_blockers(target: Path, bundled_count: int = 0) -> list[str]:
         if "Root-Is-Purelib: true" not in metadata:
             blockers.append(f"{distribution.name}: wheel is not purelib")
         if not any(
-            tag.endswith("-none-any") and {"py3", "py314"}.intersection(tag.split("-")[0].split("."))
-            for tag in tags
+            tag.endswith("-none-any") and {"py3", "py314"}.intersection(tag.split("-")[0].split(".")) for tag in tags
         ):
             blockers.append(f"{distribution.name}: incompatible wheel tags {', '.join(tags) or '(none)'}")
     paths = []
