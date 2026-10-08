@@ -735,11 +735,16 @@ impl Vfs {
     }
 
     pub fn metadata(&self, cwd: &str, path: &str, follow: bool) -> Result<Node> {
+        self.metadata_ref(cwd, path, follow).cloned()
+    }
+
+    /// Inspect a resolved node without copying its file payload. Kernel metadata conversions
+    /// borrow this view only for the duration of a syscall.
+    pub(crate) fn metadata_ref(&self, cwd: &str, path: &str, follow: bool) -> Result<&Node> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, follow)?;
         self.nodes
             .get(&real)
-            .cloned()
             .ok_or_else(|| VfsError::NotFound(path.to_string()))
     }
 
@@ -796,6 +801,22 @@ impl Vfs {
                 kind: NodeKind::Symlink(t),
                 ..
             }) => Ok(t.clone()),
+            _ => Err(VfsError::Invalid(path.to_string())),
+        }
+    }
+
+    /// Read at most `maximum` bytes of a symlink target without cloning the full target.
+    /// The result is bytes because WASI may truncate a UTF-8 target between code points.
+    pub(crate) fn read_link_prefix(
+        &self,
+        cwd: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>> {
+        match &self.metadata_ref(cwd, path, false)?.kind {
+            NodeKind::Symlink(target) => {
+                Ok(target.as_bytes()[..target.len().min(maximum)].to_vec())
+            }
             _ => Err(VfsError::Invalid(path.to_string())),
         }
     }
@@ -1012,16 +1033,15 @@ impl Vfs {
         Ok(id)
     }
 
-    pub(crate) fn orphan_metadata(&self, id: u64) -> Result<Node> {
+    pub(crate) fn orphan_metadata(&self, id: u64) -> Result<&Node> {
         self.orphaned
             .get(&id)
-            .cloned()
             .ok_or_else(|| VfsError::NotFound(format!("unlinked file {id}")))
     }
 
     pub(crate) fn orphan_len(&self, id: u64) -> Result<usize> {
         let node = self.orphan_metadata(id)?;
-        let NodeKind::File(bytes) = node.kind else {
+        let NodeKind::File(bytes) = &node.kind else {
             unreachable!("orphan is always a file")
         };
         Ok(bytes.len())

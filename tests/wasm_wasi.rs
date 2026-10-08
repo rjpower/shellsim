@@ -193,7 +193,7 @@ fn virtual_display_rejects_bad_geometry_and_unmetered_allocation() {
             (import "shellsim" "display_open" (func $open (param i32 i32 i32) (result i32)))
             (memory (export "memory") 1)
             (func (export "_start")
-                (drop (call $open (i32.const 2) (i32.const 2) (i32.const 1)))))"#,
+                (drop (call $open (i32.const 1024) (i32.const 1024) (i32.const 1)))))"#,
     );
     assert_eq!(run(&mut constrained, "/app").0, 137);
     assert!(constrained.display.frame().is_none());
@@ -557,7 +557,7 @@ fn oversized_linear_memory_is_rejected() {
     let mut environment = Environment::new();
     install(
         &mut environment,
-        r#"(module (memory (export "memory") 512) (func (export "_start")))"#,
+        r#"(module (memory (export "memory") 1025) (func (export "_start")))"#,
     );
     let (status, stdout, stderr) = run(&mut environment, "/app");
     assert_eq!(status, 126);
@@ -837,4 +837,135 @@ fn guest_descriptor_poll_is_explicitly_unsupported() {
     install(&mut environment, &sleeper(1, 0));
     // WASI errno 58 is ENOTSUP.
     assert_eq!(run(&mut environment, "/app"), (58, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_directory_handles_support_relative_stat_and_cookie_reads() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/data").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/data/a", b"abc", 0o644)
+        .unwrap();
+    environment.vfs.mkdir_all("/", "/work/data/b").unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "path_filestat_get" (func $stat (param i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_readdir" (func $read (param i32 i32 i32 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 512) "work/data")
+        (data (i32.const 528) "a")
+        (func (export "_start") (local $fd i32)
+            (if (call $open (i32.const 4) (i32.const 1) (i32.const 512) (i32.const 9)
+                (i32.const 2) (i64.const -1) (i64.const -1) (i32.const 0) (i32.const 0)) (then unreachable))
+            (local.set $fd (i32.load (i32.const 0)))
+            (if (call $stat (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1) (i32.const 64)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 96)) (i64.const 3)) (then unreachable))
+            ;; One dirent is 24 bytes plus the one-byte filename. Cookie 1 starts at b.
+            (if (call $read (local.get $fd) (i32.const 128) (i32.const 25) (i64.const 1) (i32.const 8)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 8)) (i32.const 25)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 152)) (i32.const 98)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 148)) (i32.const 3)) (then unreachable))
+            (if (call $close (local.get $fd)) (then unreachable))
+            (call $exit (call $read (local.get $fd) (i32.const 128) (i32.const 25) (i64.const 0) (i32.const 8)))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (8, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_directory_handle_growth_is_bounded() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 512) ".")
+        (func (export "_start") (local $errno i32)
+            (loop $open_more
+                (local.set $errno (call $open (i32.const 4) (i32.const 1) (i32.const 512) (i32.const 1)
+                    (i32.const 2) (i64.const -1) (i64.const -1) (i32.const 0) (i32.const 0)))
+                (br_if $open_more (i32.eqz (local.get $errno))))
+            (call $exit (local.get $errno))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (51, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_standard_stream_stat_is_available_and_closed_descriptors_fail() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "fd_filestat_get" (func $stat (param i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (func (export "_start")
+            (if (call $stat (i32.const 0) (i32.const 32)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 48)) (i32.const 2)) (then unreachable))
+            (if (call $close (i32.const 0)) (then unreachable))
+            (call $exit (call $stat (i32.const 0) (i32.const 32)))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (8, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_directory_reads_truncate_headers_and_validate_guest_buffers() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/data").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/data/a", b"x", 0o644)
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_readdir" (func $read (param i32 i32 i32 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 512) "work/data")
+        (func (export "_start") (local $fd i32)
+            ;; libc opendir asks for nonblocking directory access.
+            (if (call $open (i32.const 4) (i32.const 1) (i32.const 512) (i32.const 9)
+                (i32.const 2) (i64.const -1) (i64.const -1) (i32.const 4) (i32.const 0)) (then unreachable))
+            (local.set $fd (i32.load (i32.const 0)))
+            (if (call $read (local.get $fd) (i32.const 64) (i32.const 1) (i64.const 0) (i32.const 8)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 8)) (i32.const 1)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 64)) (i32.const 1)) (then unreachable))
+            (if (call $read (local.get $fd) (i32.const 64) (i32.const 25) (i64.const 1) (i32.const 8)) (then unreachable))
+            (if (i32.load (i32.const 8)) (then unreachable))
+            (call $exit (call $read (local.get $fd) (i32.const -1) (i32.const 25) (i64.const 0) (i32.const 8)))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (21, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn wasi_readlink_copies_only_a_bounded_target_prefix() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .symlink("/", &"target".repeat(200_000), "/work/link")
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_readlink" (func $link (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 512) "work/link")
+        (func (export "_start")
+            (if (call $link (i32.const 4) (i32.const 512) (i32.const 9) (i32.const 64) (i32.const 2) (i32.const 8)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 8)) (i32.const 2)) (then unreachable))
+            (if (i32.ne (i32.load16_u (i32.const 64)) (i32.const 24948)) (then unreachable))
+            (if (i32.ne (call $link (i32.const 4) (i32.const 512) (i32.const 9) (i32.const 64) (i32.const 1048577) (i32.const 8)) (i32.const 28)) (then unreachable))
+            (call $exit (call $link (i32.const 4) (i32.const 512) (i32.const 9) (i32.const -1) (i32.const 2) (i32.const 8)))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (21, Vec::new(), Vec::new()));
 }

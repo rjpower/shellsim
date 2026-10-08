@@ -13,7 +13,7 @@
 //! instantiation. Neither path grants ambient host capabilities. [`WasmSession`] runs one guest
 //! against buffered standard streams for display-driven embedding.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
@@ -37,9 +37,16 @@ use crate::vfs::{resolve_against, VfsError};
 use super::util::ewln;
 
 const MAX_WASM_BYTES: usize = 8 * 1024 * 1024;
-const MAX_WASM_MEMORY: usize = 16 * 1024 * 1024;
+const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
+// CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
+const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_MODULES: usize = 4;
+// Directory handles occupy an adapter-only range above the kernel's bounded regular fds.
+const FIRST_DIRECTORY_FD: u32 = 1024;
+const MAX_DIRECTORY_HANDLES: u32 = 64;
+// Reserve path storage and conservative map overhead before allocating directory handles.
+const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
 const MAX_CACHED_MODULE_BYTES: usize = 128 * 1024 * 1024;
 // Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
 // utility usable on ordinary input without relaxing the host's execution bound.
@@ -322,6 +329,7 @@ struct Host {
     closed_stdio: BTreeSet<i32>,
     open_files: BTreeSet<i32>,
     append_files: BTreeSet<i32>,
+    directories: BTreeMap<u32, String>,
     limits: StoreLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
 }
@@ -508,7 +516,12 @@ fn preopen_base(caller: &Caller<'_, Host>, fd: u32) -> Result<String, i32> {
     match fd {
         3 => Ok(caller.data().cwd.clone()),
         4 => Ok("/".to_string()),
-        _ => Err(ERRNO_BADF),
+        _ => caller
+            .data()
+            .directories
+            .get(&fd)
+            .cloned()
+            .ok_or(ERRNO_BADF),
     }
 }
 
@@ -517,16 +530,40 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         Ok(cwd) => cwd,
         Err(error) => return error,
     };
-    if request.oflags & !0b1111 != 0 || request.fdflags & !1 != 0 {
+    if request.oflags & !0b1111 != 0 || request.fdflags & !5 != 0 {
         return ERRNO_INVAL;
-    }
-    if request.oflags & 2 != 0 {
-        return ERRNO_NOTDIR;
     }
     let path = match read_path(&mut caller, request.path_pointer, request.path_length) {
         Ok(path) => path,
         Err(error) => return error,
     };
+    let info = ActiveSystem::new(&mut caller.data_mut().machine.get()).metadata(&cwd, &path, true);
+    if matches!(&info, Ok(info) if info.kind == FileKind::Directory) {
+        if request.oflags & !2 != 0 || request.fdflags & !4 != 0 {
+            return ERRNO_INVAL;
+        }
+        let Some(fd) = (FIRST_DIRECTORY_FD..FIRST_DIRECTORY_FD + MAX_DIRECTORY_HANDLES)
+            .find(|fd| !caller.data().directories.contains_key(fd))
+        else {
+            return ERRNO_NOSPC;
+        };
+        if !write_u32(&mut caller, request.result, fd) {
+            return ERRNO_FAULT;
+        }
+        let path = resolve_against(&cwd, &path);
+        if path.len() > 4096 {
+            return ERRNO_INVAL;
+        }
+        // Paths and handle count are bounded independently of guest-controlled allocation.
+        caller.data_mut().directories.insert(fd, path);
+        return ERRNO_SUCCESS;
+    }
+    if request.oflags & 2 != 0 {
+        return info.map_or_else(|error| syscall_errno(&error), |_| ERRNO_NOTDIR);
+    }
+    if request.fdflags & 4 != 0 {
+        return ERRNO_INVAL;
+    }
     let readable = request.rights_base & 2 != 0;
     let writable = request.rights_base & 64 != 0;
     let options = OpenFile {
@@ -731,6 +768,10 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
             value[0] = 3;
             u64::MAX
         }
+        _ if caller.data().directories.contains_key(&fd) => {
+            value[0] = 3;
+            u64::MAX
+        }
         _ => match guest_file(&mut caller, fd as i32) {
             Ok(file) => {
                 value[0] = 4;
@@ -752,6 +793,9 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
 }
 
 fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
+    if caller.data_mut().directories.remove(&fd).is_some() {
+        return ERRNO_SUCCESS;
+    }
     let fd = fd as i32;
     if (0..=2).contains(&fd) {
         let host = caller.data_mut();
@@ -825,15 +869,32 @@ fn filestat(info: &FileInfo) -> [u8; 64] {
 }
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    let cwd = caller.data().cwd.clone();
+    if fd <= 2 {
+        if caller.data().closed_stdio.contains(&(fd as i32)) {
+            return ERRNO_BADF;
+        }
+        // Standard streams can be pipes, captures, or terminals; they have no regular-file size.
+        let mut value = [0; 64];
+        value[16] = 2;
+        value[24..32].copy_from_slice(&1_u64.to_le_bytes());
+        let Some(memory) = memory(&mut caller) else {
+            return ERRNO_FAULT;
+        };
+        return if memory.write(&mut caller, result as usize, &value).is_ok() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        };
+    }
+    let directory = preopen_base(&caller, fd).ok();
+    let regular_file = caller.data().open_files.contains(&(fd as i32));
     let info = {
         let mut machine = caller.data_mut().machine.get();
         let system = &mut ActiveSystem::new(&mut machine);
-        match fd {
-            3 => system.metadata("/", &cwd, true),
-            4 => system.metadata("/", "/", true),
-            5.. => system.metadata_fd(fd as i32),
-            _ => return ERRNO_BADF,
+        match directory {
+            Some(path) => system.metadata("/", &path, true),
+            None if regular_file => system.metadata_fd(fd as i32),
+            None => return ERRNO_BADF,
         }
     };
     let info = match info {
@@ -890,6 +951,185 @@ fn path_filestat_get(
     }
 }
 
+/// Encode stable sorted VFS directory entries using preview1 cookies. A short buffer receives
+/// a prefix of the final dirent, as required by libc's readdir retry protocol.
+fn fd_readdir(
+    mut caller: Caller<'_, Host>,
+    fd: u32,
+    pointer: u32,
+    length: u32,
+    cookie: u64,
+    result: u32,
+) -> i32 {
+    let base = match preopen_base(&caller, fd) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
+    if length as usize > MAX_IO_BYTES {
+        return ERRNO_INVAL;
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return ERRNO_FAULT;
+    };
+    let end = (pointer as usize).saturating_add(length as usize);
+    if end > memory.data(&caller).len() {
+        return ERRNO_FAULT;
+    }
+    let reservation = {
+        let mut machine = caller.data_mut().machine.get();
+        // list_dir scans the VFS and may generate finite /proc or /dev entries. Charge the
+        // full scan before it runs, and reserve all possible names plus the output buffer.
+        let nodes = machine.vfs.len() as u64;
+        let processes = machine.processes.iter().count() as u64;
+        if !machine
+            .resources
+            .charge_cpu(nodes.saturating_add(processes).saturating_mul(16))
+        {
+            return ERRNO_NOSPC;
+        }
+        let (path_bytes, link_bytes, longest_link) = machine.vfs.all_paths().fold(
+            (0_u64, 0_u64, 0_u64),
+            |(paths, links, longest), (path, node)| {
+                let length = match &node.kind {
+                    crate::vfs::NodeKind::Symlink(target) => target.len() as u64,
+                    _ => 0,
+                };
+                (
+                    paths.saturating_add(path.len() as u64),
+                    links.saturating_add(length),
+                    longest.max(length),
+                )
+            },
+        );
+        // FileInfo retains a symlink target for native callers. Only one such result is live
+        // during enumeration, but its copy still needs both CPU and temporary memory.
+        if !machine.resources.charge_cpu(link_bytes) {
+            return ERRNO_NOSPC;
+        }
+        let names = path_bytes
+            .saturating_add(nodes.saturating_mul(64))
+            .saturating_add(processes.saturating_mul(64))
+            .saturating_add(16 * 1024);
+        let reservation = names
+            .saturating_mul(2)
+            .saturating_add(u64::from(length))
+            .saturating_add(longest_link);
+        if !machine.resources.reserve_memory(reservation) {
+            return ERRNO_NOSPC;
+        }
+        reservation
+    };
+    let errno = (|| {
+        let entries =
+            match ActiveSystem::new(&mut caller.data_mut().machine.get()).list_dir("/", &base) {
+                Ok(entries) => entries,
+                Err(error) => return syscall_errno(&error),
+            };
+        let mut bytes = Vec::with_capacity(length as usize);
+        for (index, name) in entries
+            .iter()
+            .enumerate()
+            .skip(usize::try_from(cookie).unwrap_or(usize::MAX))
+        {
+            if bytes.len() >= length as usize {
+                break;
+            }
+            let info = match ActiveSystem::new(&mut caller.data_mut().machine.get())
+                .metadata(&base, name, false)
+            {
+                Ok(info) => info,
+                Err(error) => return syscall_errno(&error),
+            };
+            let mut entry = [0; 24];
+            entry[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            entry[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
+            entry[20] = match info.kind {
+                FileKind::Directory => 3,
+                FileKind::File => 4,
+                FileKind::Symlink => 7,
+            };
+            for part in [&entry[..], name.as_bytes()] {
+                let remaining = length as usize - bytes.len();
+                bytes.extend_from_slice(&part[..part.len().min(remaining)]);
+            }
+        }
+        if memory.write(&mut caller, pointer as usize, &bytes).is_ok()
+            && write_u32(&mut caller, result, bytes.len() as u32)
+        {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        }
+    })();
+    caller
+        .data_mut()
+        .machine
+        .get()
+        .resources
+        .release_memory(reservation);
+    errno
+}
+
+fn path_readlink(
+    mut caller: Caller<'_, Host>,
+    fd: u32,
+    pointer: u32,
+    length: u32,
+    buffer: u32,
+    buffer_length: u32,
+    result: u32,
+) -> i32 {
+    let base = match preopen_base(&caller, fd) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
+    let path = match read_path(&mut caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return error,
+    };
+    if buffer_length as usize > MAX_IO_BYTES {
+        return ERRNO_INVAL;
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return ERRNO_FAULT;
+    };
+    if (buffer as usize).saturating_add(buffer_length as usize) > memory.data(&caller).len() {
+        return ERRNO_FAULT;
+    }
+    let reservation = u64::from(buffer_length);
+    {
+        let mut machine = caller.data_mut().machine.get();
+        if !machine.resources.charge_cpu(reservation)
+            || !machine.resources.reserve_memory(reservation)
+        {
+            return ERRNO_NOSPC;
+        }
+    }
+    let errno =
+        (|| {
+            let bytes = match ActiveSystem::new(&mut caller.data_mut().machine.get())
+                .read_link_prefix(&base, &path, buffer_length as usize)
+            {
+                Ok(bytes) => bytes,
+                Err(error) => return syscall_errno(&error),
+            };
+            if memory.write(&mut caller, buffer as usize, &bytes).is_ok()
+                && write_u32(&mut caller, result, bytes.len() as u32)
+            {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            }
+        })();
+    caller
+        .data_mut()
+        .machine
+        .get()
+        .resources
+        .release_memory(reservation);
+    errno
+}
+
 fn path_unlink_file(mut caller: Caller<'_, Host>, fd: u32, pointer: u32, length: u32) -> i32 {
     let cwd = match preopen_base(&caller, fd) {
         Ok(cwd) => cwd,
@@ -944,11 +1184,14 @@ fn path_rename(
     new_pointer: u32,
     new_length: u32,
 ) -> i32 {
-    if !matches!(old_fd, 3 | 4) || !matches!(new_fd, 3 | 4) {
-        return ERRNO_BADF;
-    }
-    let old_base = preopen_base(&caller, old_fd).expect("preopen fd was checked");
-    let new_base = preopen_base(&caller, new_fd).expect("preopen fd was checked");
+    let old_base = match preopen_base(&caller, old_fd) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
+    let new_base = match preopen_base(&caller, new_fd) {
+        Ok(base) => base,
+        Err(error) => return error,
+    };
     let old_path = match read_path(&mut caller, old_pointer, old_length) {
         Ok(path) => path,
         Err(error) => return error,
@@ -1420,6 +1663,9 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
         .func_wrap("wasi_snapshot_preview1", "fd_fdstat_get", fd_fdstat_get)
         .expect("unique WASI import");
     linker
+        .func_wrap("wasi_snapshot_preview1", "fd_readdir", fd_readdir)
+        .expect("unique WASI import");
+    linker
         .func_wrap("wasi_snapshot_preview1", "fd_filestat_get", fd_filestat_get)
         .expect("unique WASI import");
     linker
@@ -1449,6 +1695,9 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
             "path_remove_directory",
             path_remove_directory,
         )
+        .expect("unique WASI import");
+    linker
+        .func_wrap("wasi_snapshot_preview1", "path_readlink", path_readlink)
         .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "path_rename", path_rename)
@@ -1532,6 +1781,22 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
                     ERRNO_SUCCESS
                 } else {
                     ERRNO_BADF
+                }
+            },
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "clock_res_get",
+            |mut caller: Caller<'_, Host>, clock: u32, result: u32| {
+                if clock > 1 {
+                    return ERRNO_INVAL;
+                }
+                if write_u64(&mut caller, result, 1) {
+                    ERRNO_SUCCESS
+                } else {
+                    ERRNO_FAULT
                 }
             },
         )
@@ -1693,11 +1958,30 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     linker
         .define_unknown_imports_as_traps(&module)
         .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
+    let minimum_memory = module
+        .exports()
+        .filter_map(|export| match export.ty() {
+            wasmtime::ExternType::Memory(memory) => Some(memory.minimum().saturating_mul(65_536)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    // Small utilities retain their existing reservation, allowing several in one pipeline.
+    // Larger static interpreter images receive a larger bounded heap reservation.
+    let memory_cap = if minimum_memory > DEFAULT_WASM_MEMORY as u64 {
+        MAX_WASM_MEMORY as u64
+    } else {
+        DEFAULT_WASM_MEMORY as u64
+    };
     let memory_limit = interp
         .resources
         .memory_remaining()
-        .min(MAX_WASM_MEMORY as u64);
-    if !interp.resources.reserve_memory(memory_limit) {
+        .saturating_sub(DIRECTORY_MEMORY)
+        // Keep bounded host-call scratch (including random_get) outside the store reservation.
+        .saturating_sub(MAX_IO_BYTES as u64)
+        .min(memory_cap);
+    let reserved = memory_limit.saturating_add(DIRECTORY_MEMORY);
+    if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
     let machine = MachineAccess::default();
@@ -1721,6 +2005,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         closed_stdio: BTreeSet::new(),
         open_files: BTreeSet::new(),
         append_files: BTreeSet::new(),
+        directories: BTreeMap::new(),
         limits: StoreLimitsBuilder::new()
             .memory_size(memory_limit as usize)
             .table_elements(10_000)
@@ -1732,7 +2017,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     Ok(Guest {
         execution: Box::pin(execute(host, linker, module, path.to_string())),
         machine,
-        reserved: memory_limit,
+        reserved,
     })
 }
 

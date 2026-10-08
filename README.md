@@ -148,6 +148,13 @@ Shellsim copies compatible pure Python packages into virtual site-packages witho
 environment's working directory. Resolution failures and native wheels raise
 `shellsim.PackageInstallError`; source distributions may run build code on the host.
 
+An opt-in `shellsim.CPythonRuntime` mounts a source-built upstream CPython 3.13.7
+WASI interpreter and runs it through the virtual process boundary. It supports
+portable pure PyPI dependencies and a pinned static pycosat native source port.
+See [CPython WASI ports](ports/README.md) for build, mount, package installation,
+resource limits, and current capability limits. `Environment.run_python`
+continues to use shellsim's Python VM.
+
 ## Clock modes
 
 A machine runs on virtual time by default: when every process waits on a timer, the scheduler

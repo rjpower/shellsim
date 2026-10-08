@@ -57,6 +57,7 @@ include = [
     "infra/**/*.py",
     "python/**/*.py",
     "toolchain/**/*.py",
+    "ports/**/*.py",
     "tests/python/test_*.py",
     "tests/python_package/**/*.py",
     "tests/tooling/**/*.py",

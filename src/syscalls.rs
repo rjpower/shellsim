@@ -134,6 +134,13 @@ pub(crate) trait System {
     ) -> Result<(), SyscallError>;
     fn touch(&mut self, base: &str, path: &str, mtime_ms: u64) -> Result<(), SyscallError>;
     fn read_link(&mut self, base: &str, path: &str) -> Result<String, SyscallError>;
+    /// Copy a bounded byte prefix of a virtual symlink target for guest-memory APIs.
+    fn read_link_prefix(
+        &mut self,
+        base: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, SyscallError>;
     fn canonicalize(
         &mut self,
         base: &str,
@@ -308,7 +315,7 @@ impl System for ActiveSystem<'_> {
             return Ok(FileInfo::pseudo_from(node?));
         }
         Ok(FileInfo::from(
-            self.interp.vfs.metadata(base, path, follow)?,
+            self.interp.vfs.metadata_ref(base, path, follow)?,
         ))
     }
 
@@ -320,7 +327,7 @@ impl System for ActiveSystem<'_> {
                 if let Some(node) = crate::pseudo_fs::metadata(self.interp, "/", &file.path, true) {
                     return Ok(FileInfo::pseudo_from(node?));
                 }
-                self.interp.vfs.metadata("/", &file.path, true)?
+                self.interp.vfs.metadata_ref("/", &file.path, true)?
             }
         };
         Ok(FileInfo::from(node))
@@ -542,6 +549,19 @@ impl System for ActiveSystem<'_> {
 
     fn read_link(&mut self, base: &str, path: &str) -> Result<String, SyscallError> {
         Ok(self.interp.fs_read_link(base, path)?)
+    }
+
+    fn read_link_prefix(
+        &mut self,
+        base: &str,
+        path: &str,
+        maximum: usize,
+    ) -> Result<Vec<u8>, SyscallError> {
+        if let Some(target) = crate::pseudo_fs::read_link(self.interp, base, path) {
+            let target = target?;
+            return Ok(target.as_bytes()[..target.len().min(maximum)].to_vec());
+        }
+        Ok(self.interp.vfs.read_link_prefix(base, path, maximum)?)
     }
 
     fn canonicalize(
@@ -893,9 +913,9 @@ fn allocated_blocks(size_bytes: u64) -> u64 {
         .saturating_mul(UNITS_PER_BLOCK)
 }
 
-impl From<crate::vfs::Node> for FileInfo {
-    fn from(node: crate::vfs::Node) -> Self {
-        let (kind, size, blocks, link_target, native_executable) = match node.kind {
+impl From<&crate::vfs::Node> for FileInfo {
+    fn from(node: &crate::vfs::Node) -> Self {
+        let (kind, size, blocks, link_target, native_executable) = match &node.kind {
             NodeKind::File(data) => {
                 let size = data.len() as u64;
                 (FileKind::File, size, allocated_blocks(size), None, false)
@@ -906,7 +926,7 @@ impl From<crate::vfs::Node> for FileInfo {
             NodeKind::Symlink(target) => {
                 let size = target.len() as u64;
                 // A symlink's target is stored inline rather than in an allocated data block.
-                (FileKind::Symlink, size, 0, Some(target), false)
+                (FileKind::Symlink, size, 0, Some(target.clone()), false)
             }
             // Native executables are not backed by simulated disk bytes; keep the historical
             // zero size (the process image lives outside the VFS quota) and charge no blocks.
@@ -932,7 +952,7 @@ impl FileInfo {
     /// what a real pseudo filesystem reports: no allocated blocks, and a zero-size directory.
     /// Generated file content (e.g. `/proc/meminfo`) keeps its real content length.
     fn pseudo_from(node: crate::vfs::Node) -> Self {
-        let mut info = Self::from(node);
+        let mut info = Self::from(&node);
         info.blocks = 0;
         if info.kind == FileKind::Directory {
             info.size = 0;
