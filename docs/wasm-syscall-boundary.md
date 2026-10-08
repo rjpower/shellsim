@@ -71,13 +71,17 @@ whole VFS scan and reserves names, transient symlink metadata, and output before
 rather than copying their payloads. Directory handles retain resolved paths; renaming a directory
 does not retarget an existing handle.
 
-Wasm images are limited to 16 MiB, enough for the measured 13.4 MB static CPython + NumPy image.
+Wasm images are limited to 16 MiB, enough for the measured 15.2 MB static CPython + NumPy + Pillow image.
 Compilation is charged at ten CPU units per image byte, including cache hits.
 Modules with an exported memory minimum of at most 16 MiB
-retain the 16 MiB linear-memory cap. Larger static images, including the source-built CPython
+retain the 16 MiB memory cap. Larger static images, including the source-built CPython
 guest, may reserve up to 64 MiB. Both caps are clamped by the machine's remaining memory, with
 264 KiB reserved for directory handles and 1 MiB left for temporary host-call buffers. These are
 conservative reservations for the lifetime of the process, not measurements of its live heap.
+Standard Wasm exception handling uses a deferred reference collector. Linear memory and
+the exception heap share this aggregate cap; approved growth is counted once and rolled back
+on allocation failure. Unreachable exception objects are reclaimed, allowing repeated
+setjmp/longjmp recovery. The Wasm GC language proposal remains disabled.
 Small images retain the 10,000-element table limit. Larger static images may use
 16,384 elements per table, with an additional 4 MiB reservation covering all sixteen
 permitted tables. The measured NumPy image requires 10,771 elements.

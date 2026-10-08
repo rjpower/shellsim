@@ -10,7 +10,7 @@ Build against an existing trusted SDK 24 static CPython work directory:
 
 ```sh
 uv run --no-project ports/dynamic/build.py --bundle /tmp/shellsim-cpython
-SHELLSIM_DYNAMIC_ARTIFACTS=/tmp/shellsim-dynamic cargo test --test wasm_dynamic
+SHELLSIM_DYNAMIC_ARTIFACTS=/tmp/shellsim-dynamic cargo test --test wasm_dynamic -- --include-ignored
 ```
 
 The script leaves the source bundle untouched. It writes a new interpreter,
@@ -59,6 +59,12 @@ cancellation. Libraries receive the same virtual WASI boundary as the main
 module; loading never reads a host library or grants host execution capabilities.
 
 ## Current frontier
+
+The loader ABI retains SDK 24 and the v1 static profile. Build its base interpreter
+with `--target-profile wasi-cpython-v1` or use an existing verified v1 bundle.
+The build driver rejects the SDK 34 exception profile before relinking. SDK 34's
+C++ exception runtime does not support shared libraries, so the v2 static
+cross-archive exception proof does not extend this dynamic ABI.
 
 The profile retains libraries and data for the process lifetime; `dlclose` does
 not unload them. A failed load disables further loads in that process because

@@ -1,28 +1,38 @@
 # Shared native target dependencies
 
-The foundation profile links CPython 3.13.7's `zlib` module and Pillow 12.3.0's
-PNG codecs against one zlib 1.3.1 target artifact. zlib is a native-library
-provider and has no Python distribution metadata.
+The foundation profile links CPython 3.13.7's `zlib` module, Pillow 12.3.0's
+PNG codecs and FreeType 2.13.3 against one zlib 1.3.1 target artifact. Pillow
+also consumes scalar libjpeg-turbo 2.1.5.1 for JPEG. These target libraries
+have no Python distribution metadata.
 
 ```sh
 uv run --no-project --python 3.13 ports/cpython/build.py \
   --work-dir /tmp/shellsim-native --with-pillow
 SHELLSIM_NATIVE_BUNDLE=/tmp/shellsim-native uv run pytest \
   tests/python_package/test_native_dependencies.py
-uv run pytest tests/tooling/test_native_dependencies.py
+uv run pytest tests/tooling/test_native_artifacts.py
 ```
 
-`--with-pillow` selects zlib automatically. `--with-zlib` builds only the stdlib
+`--with-pillow` selects all three libraries automatically. `--with-zlib` builds only the stdlib
 consumer. The default profile has no external target libraries. Native package
 selection happens before the final static interpreter link; the public pure-wheel
 installer cannot add a new native library to an assembled interpreter.
 
 ## Recipe and artifact contract
 
-`wasi-cpython-v1.json` fixes WASI Preview 1, SDK 24, static linking, and the absence
-of threads and C++ exception support. The SDK supplies libc and compiler runtime
-libraries. The profile does not expand NumPy's existing FFT or floating-point
-exception support.
+`wasi-cpython-v2.json` fixes WASI Preview 1, SDK 34, static linking and standard
+Wasm exception instructions. C setjmp/longjmp uses LLVM's SJLJ pass and
+`libsetjmp`; C++ uses `-fwasm-exceptions` and the matching libc++/libc++abi/libunwind
+sysroot. The final link must also receive `-fwasm-exceptions`. LTO and threads
+are outside this profile. NumPy's FFT builtin and its ordinary unique hash path
+are enabled; floating-point warning and exception policy remains unsupported.
+
+The SDK 24 v1 profile remains selectable with `--target-profile wasi-cpython-v1`
+for bare CPython or pycosat and the existing dynamic C-extension ABI. Its added
+empty flag lists do not change that ABI. The migrated native library recipes
+require v2; cross-profile artifacts are rejected. The dynamic loader explicitly
+rejects v2 inputs. Upstream SDK 34 does not support C++ exceptions across shared
+libraries; cross-library claims here cover separately compiled static archives.
 
 Each library recipe declares its source URL and SHA256, target profile, host
 tools, exact target dependencies, selected features, exported headers/archives/
@@ -52,7 +62,7 @@ with explicit target headers and archive paths. They execute no build-system
 download or host-library discovery. The declared source and SDK archives are
 fetched and checked before compilation; source pins are not signatures.
 
-The image manifest records `native_libraries` once and names both consumers in
+The image manifest records `native_libraries` once and names consumers in
 `link_consumers`, with identical zlib artifact identities and explicit archive
 inputs. CPython's build profile also records the builder, host driver, native
 helper, make, recipe, SDK, and dependency identities. CPython and Pillow refuse
@@ -61,15 +71,31 @@ do not erase identity markers while retaining target objects.
 
 ## Verification and limits
 
-The guest tests compress and decompress data, write a PNG to `/tmp` in Shellsim's
-VFS, reopen it, and compare size, mode, and pixels. They reject invalid compressed
-and image data and verify disabled optional codec libraries. An unbounded zlib
-compression loop must stop at the guest's cumulative CPU limit. Wasm fuel meters
-the library's native instructions; linear memory and VFS writes use the existing
-memory and disk accounting. Target libraries receive no new host capabilities.
+The guest tests cover compression, PNG/JPEG VFS round trips, recoverable malformed
+JPEG errors, scalable font rasterization, invalid fonts, disabled codec libraries
+and CPU exhaustion. Wasm fuel meters native instructions. Wasmtime's deferred
+reference collector reclaims exception objects. Linear memory and its exception
+heap share one aggregate memory bound and one guest reservation; failed growth
+rolls back the approved delta. The Wasm GC language proposal remains disabled.
+VFS writes retain disk accounting. Target libraries receive no new host capabilities.
+
+The independent SDK probes verify nested setjmp returns, longjmp zero normalization,
+C++ typed catch/rethrow/destruction across static archives, one million recoveries
+and fuel exhaustion:
+
+```sh
+PYTHONPATH=. uv run --no-project python ports/native/exceptions/verify.py \
+  --sdk /tmp/shellsim-native/wasi-sdk-34.0-x86_64-linux \
+  --work-dir /tmp/shellsim-exceptions
+SHELLSIM_EXCEPTION_ARTIFACTS=/tmp/shellsim-exceptions \
+  cargo test --test wasm_exceptions -- --include-ignored
+```
+
+Compiler guidance: [setjmp/longjmp](https://github.com/WebAssembly/wasi-sdk/blob/wasi-sdk-34/SetjmpLongjmp.md)
+and [C++ exceptions](https://github.com/WebAssembly/wasi-sdk/blob/wasi-sdk-34/CppExceptions.md).
 
 The artifacts are integrity records for trusted builds, not an untrusted package
 build sandbox. The build host executes reviewed scripts and native helper tools.
-Pillow's [PNG profile](../pillow/README.md) does not establish compatibility for
+Pillow's [imaging profile](../pillow/README.md) does not establish compatibility for
 all Pillow APIs or optional libraries. Dynamic loading and a general package
 resolver remain separate work.

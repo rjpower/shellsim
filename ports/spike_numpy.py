@@ -1,4 +1,4 @@
-"""Resolve and run one real Atlas dependency graph through a static NumPy recipe.
+"""Resolve and run magiccube through a static NumPy recipe.
 
 The native index contains resolution metadata only. Its wheel is never installed:
 NumPy code comes exclusively from the verified source-built CPython bundle.

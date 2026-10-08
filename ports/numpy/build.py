@@ -11,6 +11,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from ports.native.dependencies import target_environment, target_profile
+
 
 def apply_patch(source, patch, expected_hash):
     """Apply a verified patch once, refusing mismatched cached build inputs."""
@@ -58,7 +60,7 @@ def build_numpy(recipe, source, cpython_source, cpython_build, sdk, work, jobs, 
         if patch["file"] == "numpy-wasi.patch":
             apply_patch(source, directory / patch["file"], patch["sha256"])
     tools = work / "numpy-build-tools"
-    env = dict(os.environ, SOURCE_DATE_EPOCH="1756857600")
+    env = target_environment(sdk)
     if not (tools / "bin/python").exists():
         subprocess.run(["uv", "venv", "--python", "3.13", str(tools)], check=True)
     subprocess.run(
@@ -91,7 +93,8 @@ def build_numpy(recipe, source, cpython_source, cpython_build, sdk, work, jobs, 
     )
     pkg_config.chmod(0o755)
     cross = work / "numpy-wasi.cross"
-    c_args = [f"--sysroot={sysroot}", "-O2", "-g0"]
+    profile = target_profile(recipe)
+    c_args = [f"--sysroot={sysroot}", *profile["compiler_flags"]]
     cross.write_text(
         "[binaries]\n"
         + "".join(
@@ -107,7 +110,7 @@ def build_numpy(recipe, source, cpython_source, cpython_build, sdk, work, jobs, 
         )
         + "[host_machine]\nsystem = 'wasi'\ncpu_family = 'wasm32'\ncpu = 'wasm32'\nendian = 'little'\n"
         + "[properties]\nneeds_exe_wrapper = true\nlongdouble_format = 'IEEE_QUAD_LE'\n"
-        + f"[built-in options]\nc_args = {c_args!r}\ncpp_args = {[*c_args, '-fno-exceptions']!r}\n"
+        + f"[built-in options]\nc_args = {c_args!r}\ncpp_args = {[*c_args, *profile['cpp_flags']]!r}\n"
     )
     longdouble = work / "numpy-longdouble.c"
     longdouble.write_text(

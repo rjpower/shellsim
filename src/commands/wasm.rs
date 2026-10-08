@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Config, Engine, Error, Extern, Linker, Memory, Module, Store,
-    StoreContextMut, StoreLimits, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Memory,
+    Module, Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{DescriptorError, IoPoll};
@@ -37,8 +37,9 @@ use crate::vfs::{resolve_against, VfsError};
 use super::util::ewln;
 
 mod dynamic;
+mod limits;
 
-// The stripped static CPython + NumPy image is 13.4 MB. Keep compilation input bounded.
+// The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
 const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
@@ -132,7 +133,11 @@ fn command_engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::default();
-        config.consume_fuel(true).wasm_exceptions(true);
+        config
+            .consume_fuel(true)
+            .wasm_exceptions(true)
+            .wasm_gc(false)
+            .collector(Collector::DeferredReferenceCounting);
         Engine::new(&config).expect("valid Wasmtime configuration")
     })
 }
@@ -337,7 +342,7 @@ struct Host {
     open_files: BTreeSet<i32>,
     append_files: BTreeSet<i32>,
     directories: BTreeMap<u32, String>,
-    limits: StoreLimits,
+    limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
     dynamic: dynamic::Dynamic,
 }
@@ -559,12 +564,12 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         else {
             return ERRNO_NOSPC;
         };
-        if !write_u32(&mut caller, request.result, fd) {
-            return ERRNO_FAULT;
-        }
         let path = resolve_against(&cwd, &path);
         if path.len() > 4096 {
             return ERRNO_INVAL;
+        }
+        if !write_u32(&mut caller, request.result, fd) {
+            return ERRNO_FAULT;
         }
         // Paths and handle count are bounded independently of guest-controlled allocation.
         caller.data_mut().directories.insert(fd, path);
@@ -2042,17 +2047,20 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         open_files: BTreeSet::new(),
         append_files: BTreeSet::new(),
         directories: BTreeMap::new(),
-        limits: StoreLimitsBuilder::new()
-            .memory_size(memory_limit as usize)
-            .table_elements(if large_image {
-                LARGE_TABLE_ELEMENTS
-            } else {
-                DEFAULT_TABLE_ELEMENTS
-            })
-            .memories(1)
-            .tables(16)
-            .instances(33)
-            .build(),
+        limits: limits::GuestLimits::new(
+            StoreLimitsBuilder::new()
+                .memory_size(memory_limit as usize)
+                .table_elements(if large_image {
+                    LARGE_TABLE_ELEMENTS
+                } else {
+                    DEFAULT_TABLE_ELEMENTS
+                })
+                .memories(1)
+                .tables(16)
+                .instances(dynamic::MAX_LOADS + 1)
+                .build(),
+            memory_limit as usize,
+        ),
         interaction: launch.interaction,
         dynamic: dynamic::Dynamic::new(dynamic_enabled),
     };

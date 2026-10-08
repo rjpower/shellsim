@@ -14,8 +14,8 @@ def load_tool(name, relative):
     return module
 
 
-NUMPY_BUILD = load_tool("numpy_port_build", "ports/numpy/build.py")
 CPYTHON_BUILD = load_tool("cpython_port_build", "ports/cpython/build.py")
+NUMPY_BUILD = load_tool("numpy_port_build", "ports/numpy/build.py")
 
 
 def test_profile_accepts_same_identity_and_refuses_changed_inputs(tmp_path):

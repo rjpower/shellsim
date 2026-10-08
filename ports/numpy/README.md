@@ -1,7 +1,7 @@
 # NumPy static WASI port
 
-This recipe builds upstream NumPy 2.3.5 into CPython 3.13.7 using WASI SDK 24.0.
-It installs NumPy's Python package and registers twelve qualified native modules
+This recipe builds upstream NumPy 2.3.5 into CPython 3.13.7 using WASI SDK 34.0.
+It installs NumPy's Python package and registers thirteen qualified native modules
 in CPython's builtin table. It does not load a host native wheel.
 
 ```sh
@@ -36,14 +36,12 @@ symbol namespace because their `long` integer ABI is 32 bits on wasm32, while
 modern Generator uses 64-bit integers. This preserves the two implementations;
 it does not promise identical random streams across platforms.
 
-SDK 24 has no C++ exception runtime. All selected C++ targets compile with
-`-fno-exceptions`; NumPy's hash optimization for `unique` returns `NotImplemented`
-and its existing Python sorting path handles the operation. FFT's native module
-is omitted, so `import numpy.fft` raises an explicit `ImportError`. NumPy's extension
-modules used only by its own test suite and its SIMD inspection module are also
-omitted. The SDK's C++ allocation failure behavior can terminate the guest rather
-than raise a Python exception; Python/NumPy allocations retain their upstream
-error paths. Threads, dynamic native loading, and ctypes are unsupported.
+The shared v2 profile enables standard Wasm C++ exceptions and links the SDK's
+matching exception runtime. NumPy's ordinary `unique` hash optimization and
+`numpy.fft._pocketfft_umath` are enabled. The build removes the old SDK 24
+exception workarounds. NumPy's own test-only extension modules and SIMD inspection
+module remain omitted. Guest checks cover complex and real FFT round trips and
+invalid lengths. Threads, dynamic native loading, and ctypes remain unsupported.
 
 ### Floating-point policy gap
 

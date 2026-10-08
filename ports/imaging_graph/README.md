@@ -2,7 +2,8 @@
 
 `ports/spike_images.py` resolves imageio 2.37.0's real pure wheel against the
 source metadata of the static NumPy 2.3.5 and Pillow 12.3.0 providers. Pillow
-consumes the native zlib 1.3.1 artifact. The resolver has two local indexes and
+consumes the native zlib 1.3.1, libjpeg-turbo 2.1.5.1 and FreeType 2.13.3 artifacts
+under the SDK 34 v2 profile. The resolver has two local indexes and
 runs offline with the guest's WASI markers; optional imageio plugins are outside
 this graph.
 

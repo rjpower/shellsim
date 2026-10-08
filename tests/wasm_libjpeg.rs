@@ -3,10 +3,10 @@ use shellsim::{Environment, Limits};
 use std::path::PathBuf;
 
 #[test]
+#[ignore = "requires built libjpeg artifacts"]
 fn scalar_jpeg_round_trip_and_fatal_invalid_input() {
-    let Some(directory) = std::env::var_os("SHELLSIM_LIBJPEG_ARTIFACTS") else {
-        return;
-    };
+    let directory = std::env::var_os("SHELLSIM_LIBJPEG_ARTIFACTS")
+        .expect("set SHELLSIM_LIBJPEG_ARTIFACTS to the built fixture directory");
     let mut environment = Environment::with_limits(Limits {
         cpu: 100_000_000,
         memory: 64 * 1024 * 1024,

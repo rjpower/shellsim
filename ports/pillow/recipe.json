@@ -2,7 +2,7 @@
   "kind": "python-extension",
   "name": "pillow",
   "version": "12.3.0",
-  "target_profile": "wasi-cpython-v1",
+  "target_profile": "wasi-cpython-v2",
   "target": "wasm32-wasip1",
   "linkage": "cpython-builtin",
   "source": {
@@ -21,16 +21,24 @@
     {
       "port": "native/zlib",
       "version": "1.3.1"
+    },
+    {
+      "port": "native/libjpeg-turbo",
+      "version": "2.1.5.1"
+    },
+    {
+      "port": "native/freetype",
+      "version": "2.13.3"
     }
   ],
   "features": {
     "png": true,
-    "jpeg": false,
+    "jpeg": true,
     "jpeg2000": false,
     "tiff": false,
     "webp": false,
     "avif": false,
-    "freetype": false,
+    "freetype": true,
     "lcms": false,
     "raqm": false,
     "imagequant": false,
@@ -67,7 +75,8 @@
     "defusedxml; extra == \"xmp\""
   ],
   "builtin_modules": [
-    "PIL._imaging"
+    "PIL._imaging",
+    "PIL._imagingft"
   ],
   "dist_info": "/usr/lib/python3.13/site-packages/pillow-12.3.0.dist-info",
   "patches": [
@@ -79,12 +88,17 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "7e5c64eca0eea181f32a4754b465a7c1fade371a31ccd79f6dde8fab72acb4b2"
+      "sha256": "9693c3018e4396684dc35177725f75e8c678e81c9b3cfb352a95f6575b71dfb8"
     },
     {
       "file": "../native/dependencies.py",
-      "sha256": "b13546aee08e3e2befee7ca09d40293c475b3db19a05ad4dfeae818247d3ab44"
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
     }
   ],
-  "verify": "import zlib; from PIL import Image; assert zlib.decompress(zlib.compress(b\"round trip\")) == b\"round trip\"; image = Image.new(\"RGB\", (3, 2), (20, 40, 60)); image.save(\"/tmp/roundtrip.png\"); restored = Image.open(\"/tmp/roundtrip.png\"); assert restored.tobytes() == image.tobytes()"
+  "verify": "import zlib; from PIL import Image; assert zlib.decompress(zlib.compress(b\"round trip\")) == b\"round trip\"; image = Image.new(\"RGB\", (3, 2), (20, 40, 60)); image.save(\"/tmp/roundtrip.png\"); restored = Image.open(\"/tmp/roundtrip.png\"); assert restored.tobytes() == image.tobytes()",
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  }
 }

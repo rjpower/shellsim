@@ -1,6 +1,7 @@
 """Exercise real zlib and Pillow through a source-built WASI image and the VFS."""
 
 import os
+from pathlib import Path
 
 import pytest
 import shellsim
@@ -14,18 +15,21 @@ def native_runtime():
     runtime = shellsim.CPythonRuntime(bundle)
     environment = shellsim.Environment(cpu=2_000_000_000, memory=256 * 1024 * 1024, disk=64 * 1024 * 1024)
     runtime.mount(environment)
+    environment.write_file("/font.ttf", (Path(__file__).parents[1] / "fixtures/fonts/DejaVuSans.ttf").read_bytes())
     return runtime, environment
 
 
 def test_manifest_has_one_native_zlib_provider_for_both_consumers(native_runtime):
     runtime, _ = native_runtime
     libraries = runtime.manifest["native_libraries"]
-    assert list(libraries) == ["native/zlib"]
+    assert set(libraries) == {"native/zlib", "native/libjpeg-turbo", "native/freetype"}
     identity = libraries["native/zlib"]["artifact_sha256"]
     for consumer in ("cpython.zlib", "PIL._imaging"):
-        assert runtime.manifest["link_consumers"][consumer]["dependency_artifacts"] == {"native/zlib": identity}
+        assert runtime.manifest["link_consumers"][consumer]["dependency_artifacts"]["native/zlib"] == identity
+    assert libraries["native/freetype"]["inputs"]["dependency_artifacts"] == {"native/zlib": identity}
     assert "zlib" in runtime.builtin_modules
     assert "PIL._imaging" in runtime.builtin_modules
+    assert "PIL._imagingft" in runtime.builtin_modules
     assert all(port["name"] != "zlib" for port in runtime.manifest["native_ports"])
 
 
@@ -85,21 +89,64 @@ except UnidentifiedImageError:
 else:
     raise AssertionError('invalid image accepted')
 assert features.check_codec('zlib')
-assert not features.check_codec('jpg')
+assert features.check_codec('jpg')
 assert not features.check_codec('jpg_2000')
 assert not features.check_codec('libtiff')
 try:
-    Image.new('RGB', (2, 2)).save('/tmp/disabled.jpg')
+    Image.new('RGB', (2, 2)).save('/tmp/disabled.jp2')
 except OSError:
     pass
 else:
-    raise AssertionError('disabled JPEG encoder accepted')
+    raise AssertionError('disabled JPEG2000 encoder accepted')
 print('invalid data and optional codec frontiers passed')
 """,
         ],
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"invalid data and optional codec frontiers passed\n"
+
+
+def test_jpeg_recovery_and_freetype_rasterization_in_vfs(native_runtime):
+    runtime, environment = native_runtime
+    result = runtime.run(
+        environment,
+        [
+            "-c",
+            """
+from PIL import Image, ImageFont, features
+from io import BytesIO
+assert features.check_module('freetype2')
+assert not features.check_feature('raqm')
+font = ImageFont.truetype('/font.ttf', 24)
+mask = font.getmask('A')
+assert mask.size[0] > 0 and mask.size[1] > 0 and sum(mask) > 0
+try:
+    ImageFont.truetype(BytesIO(b'invalid font'), 24)
+except OSError:
+    pass
+else:
+    raise AssertionError('invalid font accepted')
+image = Image.new('RGB', (8, 8), (240, 20, 30))
+image.save('/tmp/roundtrip.jpg', quality=95)
+encoded = open('/tmp/roundtrip.jpg', 'rb').read()
+for invalid in (encoded[:len(encoded)//2], encoded[:-20]):
+    try:
+        with Image.open(BytesIO(invalid)) as restored:
+            restored.load()
+    except OSError:
+        pass
+    else:
+        raise AssertionError('truncated JPEG accepted')
+with Image.open('/tmp/roundtrip.jpg') as restored:
+    assert restored.size == (8, 8) and restored.mode == 'RGB'
+    assert all(abs(a-b) <= 3 for a, b in zip(restored.getpixel((0, 0)), (240, 20, 30)))
+print('JPEG recovery and FreeType rasterization passed')
+""",
+        ],
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"JPEG recovery and FreeType rasterization passed\n"
+    assert environment.read_file("/tmp/roundtrip.jpg").startswith(b"\xff\xd8")
 
 
 def test_native_compression_obeys_guest_cpu_budget(native_runtime):

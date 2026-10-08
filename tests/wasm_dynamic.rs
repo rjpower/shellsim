@@ -12,8 +12,11 @@ fn environment() -> Environment {
     })
 }
 
-fn artifacts() -> Option<PathBuf> {
-    std::env::var_os("SHELLSIM_DYNAMIC_ARTIFACTS").map(PathBuf::from)
+fn artifacts() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("SHELLSIM_DYNAMIC_ARTIFACTS")
+            .expect("set SHELLSIM_DYNAMIC_ARTIFACTS to the built fixture directory"),
+    )
 }
 
 fn put(environment: &mut Environment, source: &Path, target: &str, executable: bool) {
@@ -54,10 +57,9 @@ fn dynamic_bridge_rejects_an_unmarked_executable() {
 }
 
 #[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
 fn c_library_shares_data_callbacks_constructors_and_handles() {
-    let Some(artifacts) = artifacts() else {
-        return;
-    };
+    let artifacts = artifacts();
     let mut environment = environment();
     put(&mut environment, &artifacts.join("main.wasm"), "/app", true);
     put(
@@ -71,10 +73,9 @@ fn c_library_shares_data_callbacks_constructors_and_handles() {
 }
 
 #[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
 fn c_library_rejects_wrong_abi_and_missing_imports() {
-    let Some(artifacts) = artifacts() else {
-        return;
-    };
+    let artifacts = artifacts();
     let mut environment = environment();
     put(&mut environment, &artifacts.join("main.wasm"), "/app", true);
     put(
@@ -102,10 +103,9 @@ fn c_library_rejects_wrong_abi_and_missing_imports() {
 }
 
 #[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
 fn dynamic_execution_obeys_cpu_and_memory_limits() {
-    let Some(artifacts) = artifacts() else {
-        return;
-    };
+    let artifacts = artifacts();
     let main = std::fs::read(artifacts.join("main.wasm")).unwrap();
     let mut environment = Environment::with_limits(Limits {
         cpu: 10,
@@ -138,10 +138,9 @@ fn mount_tree(environment: &mut Environment, root: &Path, directory: &Path) {
 }
 
 #[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
 fn cpython_imports_two_independent_extensions_into_one_live_interpreter() {
-    let Some(artifacts) = artifacts() else {
-        return;
-    };
+    let artifacts = artifacts();
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(artifacts.join("manifest.json")).unwrap()).unwrap();
     let root = PathBuf::from(manifest["source_bundle"].as_str().unwrap()).join("rootfs");
@@ -219,6 +218,7 @@ fn synthetic_main(body: &str) -> Vec<u8> {
         (global $heap (mut i32) (i32.const 4096))
         (data (i32.const 32) "/lib.so")
         (data (i32.const 64) "answer")
+        (export "fixture_open" (func $open))
         (func (export "malloc") (param $bytes i32) (result i32) (local $base i32)
             (local.set $base (global.get $heap))
             (global.set $heap (i32.add (global.get $heap) (local.get $bytes)))
@@ -277,6 +277,28 @@ fn dynamic_constructor_cpu_is_charged() {
         .write("/", "/lib.so", &library, 0o644)
         .unwrap();
     assert_eq!(run(&mut environment, "/app").0, 137);
+}
+
+#[test]
+fn dynamic_constructor_cannot_recursively_load_a_library() {
+    let mut environment = environment();
+    let main = synthetic_main(
+        "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))",
+    );
+    let library = synthetic_library(
+        r"\01\04\00\00\00\00",
+        r#"
+        (import "env" "fixture_open" (func $open (param i32 i32 i32) (result i32)))
+        (func (export "__wasm_call_ctors")
+            (if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable)))
+        "#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
 }
 
 #[test]

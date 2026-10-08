@@ -9,6 +9,7 @@ from ports.native.dependencies import (
     file_hash,
     seal_artifact,
     target_environment,
+    target_profile,
     verify_artifact,
 )
 
@@ -53,8 +54,7 @@ def build_zlib(recipe, source, sdk, work, toolchain, run):
         run(
             [
                 str(sdk / "bin/clang"),
-                "-O2",
-                "-g0",
+                *target_profile(recipe)["compiler_flags"],
                 "-DZ_HAVE_UNISTD_H",
                 "-c",
                 str(source / (name + ".c")),

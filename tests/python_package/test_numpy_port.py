@@ -52,7 +52,7 @@ print('numpy numerical operations passed')
     assert result.stdout == b"numpy numerical operations passed\n"
 
 
-def test_numpy_unique_sort_fallback(numpy_runtime):
+def test_numpy_unique(numpy_runtime):
     runtime, environment = numpy_runtime
     result = runtime.run(
         environment,
@@ -104,25 +104,31 @@ print('random integer ABIs passed')
     assert result.stdout == b"random integer ABIs passed\n"
 
 
-def test_numpy_fft_frontier(numpy_runtime):
+def test_numpy_fft_round_trip_and_invalid_length(numpy_runtime):
     runtime, environment = numpy_runtime
     result = runtime.run(
         environment,
         [
             "-c",
             """
+import numpy as np
+assert np.fft._pocketfft_umath.__spec__.origin == 'built-in'
+values = np.array([1., 2., 3., 4.])
+assert np.allclose(np.fft.fft(values), [10, -2+2j, -2, -2-2j])
+assert np.allclose(np.fft.ifft(np.fft.fft(values)).real, values)
+assert np.allclose(np.fft.irfft(np.fft.rfft(values)), values)
 try:
-    import numpy.fft
-except ImportError as error:
-    assert str(error) == 'numpy.fft is unavailable in the static WASI profile: C++ exception runtime required'
+    np.fft.fft(values, n=0)
+except ValueError:
+    pass
 else:
-    raise AssertionError('FFT unexpectedly available in the static spike profile')
-print('FFT frontier passed')
+    raise AssertionError('zero FFT length accepted')
+print('FFT round trip and invalid length passed')
 """,
         ],
     )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == b"FFT frontier passed\n"
+    assert result.stdout == b"FFT round trip and invalid length passed\n"
 
 
 def test_numpy_floating_point_policy_frontier(numpy_runtime):

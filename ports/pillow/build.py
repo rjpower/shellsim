@@ -1,4 +1,4 @@
-"""Compile Pillow's upstream core for an explicit zlib-only WASI profile.
+"""Compile Pillow's upstream core and FreeType bindings for a static WASI profile.
 
 The pinned source lists are read as literals, without executing setup.py and its
 ambient host-library discovery. No optional external codecs or host headers enter
@@ -9,7 +9,7 @@ import ast
 import shutil
 from pathlib import Path
 
-from ports.native.dependencies import artifact_input, digest, file_hash, target_environment
+from ports.native.dependencies import artifact_input, digest, file_hash, target_environment, target_profile
 
 
 def pillow_sources(source):
@@ -63,13 +63,13 @@ def build_pillow(recipe, source, cpython_source, cpython_build, sdk, work, depen
     build.mkdir(exist_ok=True)
     marker = build / "inputs.json"
     identity = digest(inputs)
-    archive = build / "libpillow.a"
+    archives = {"PIL._imaging": build / "libpillow.a", "PIL._imagingft": build / "libpillow-freetype.a"}
     if marker.exists():
         recorded = marker.read_text().splitlines()
         if recorded[0] != identity:
             raise ValueError("Pillow dependency inputs changed; use a clean build directory")
-        if archive.exists() and len(recorded) == 2 and recorded[1] == file_hash(archive):
-            return archive, inputs
+        if len(recorded) == 2 and recorded[1] == digest({name: file_hash(path) for name, path in archives.items()}):
+            return archives, inputs
         raise ValueError("Pillow archive integrity failure")
     env = target_environment(sdk)
     objects = []
@@ -78,9 +78,9 @@ def build_pillow(recipe, source, cpython_source, cpython_build, sdk, work, depen
         run(
             [
                 str(sdk / "bin/clang"),
-                "-O2",
-                "-g0",
+                *target_profile(recipe)["compiler_flags"],
                 "-DHAVE_LIBZ",
+                "-DHAVE_LIBJPEG",
                 f'-DPILLOW_VERSION="{recipe["version"]}"',
                 f"-I{prefix / 'include'}",
                 f"-I{cpython_source / 'Include'}",
@@ -96,9 +96,38 @@ def build_pillow(recipe, source, cpython_source, cpython_build, sdk, work, depen
             build / f"{index}.log",
         )
         objects.append(output)
-    run([str(sdk / "bin/llvm-ar"), "rcs", str(archive), *map(str, objects)], build, env, build / "archive.log")
-    marker.write_text(identity + "\n" + file_hash(archive) + "\n")
-    return archive, inputs
+    run(
+        [str(sdk / "bin/llvm-ar"), "rcs", str(archives["PIL._imaging"]), *map(str, objects)],
+        build,
+        env,
+        build / "archive.log",
+    )
+    output = build / "imagingft.o"
+    run(
+        [
+            str(sdk / "bin/clang"),
+            *target_profile(recipe)["compiler_flags"],
+            f'-DPILLOW_VERSION="{recipe["version"]}"',
+            f"-I{prefix / 'include/freetype2'}",
+            f"-I{cpython_source / 'Include'}",
+            f"-I{cpython_build}",
+            "-c",
+            str(source / "src/_imagingft.c"),
+            "-o",
+            str(output),
+        ],
+        build,
+        env,
+        build / "imagingft.log",
+    )
+    run(
+        [str(sdk / "bin/llvm-ar"), "rcs", str(archives["PIL._imagingft"]), str(output)],
+        build,
+        env,
+        build / "freetype-archive.log",
+    )
+    marker.write_text(identity + "\n" + digest({name: file_hash(path) for name, path in archives.items()}) + "\n")
+    return archives, inputs
 
 
 def install_pillow(source, site_packages):

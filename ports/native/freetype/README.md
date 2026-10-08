@@ -1,24 +1,27 @@
-# FreeType build candidate
+# FreeType static target library
 
-This candidate pins FreeType 2.13.3 and selects TrueType/CFF fonts, autohinting,
-grayscale and monochrome rasterization. It consumes the declared native zlib
-1.3.1 artifact and invokes the pinned SDK compiler directly. Optional libpng,
-bzip2, Brotli, HarfBuzz, SVG, SDF and LZW support are disabled.
+FreeType 2.13.3 selects TrueType/CFF fonts, autohinting, grayscale and monochrome
+rasterization. It consumes the declared zlib 1.3.1 artifact under the SDK 34
+`wasi-cpython-v2` profile. Optional libpng, bzip2, Brotli, HarfBuzz, SVG, SDF and
+LZW support are disabled. No host-library discovery is performed.
 
-The source SHA256 comes from the [upstream release announcement](https://lists.gnu.org/archive/html/freetype-announce/2024-08/msg00000.html).
+The source SHA256 comes from the
+[upstream release announcement](https://lists.gnu.org/archive/html/freetype-announce/2024-08/msg00000.html).
+The real cmap validators and rasterizer retain their upstream setjmp/longjmp
+paths. The shared profile supplies standard Wasm exception instructions and
+`libsetjmp`, and consumers link FreeType before zlib and `-lm`.
 
-The build is blocked by WASI SDK 24's lack of setjmp/longjmp in the existing
-`wasi-cpython-v1` profile. Compiling `src/base/ftbase.c` includes
-`include/freetype/config/ftstdlib.h`, which includes the SDK's `setjmp.h` and
-fails. The upstream TrueType cmap validator, general validator and grayscale
-rasterizer all use non-local jumps. Removing this support would change error
-handling and rasterization behavior.
+`--with-pillow` builds this artifact and the `_imagingft` consumer. A separate
+probe loads a scalable TrueType font through the VFS, rasterizes `A`, rejects
+malformed font bytes, and exercises the guest CPU limit:
 
-SDK 24 recommends `-mllvm -wasm-enable-sjlj`, which requires WebAssembly exception
-handling support. This candidate does not enable that flag or claim a verified
-artifact. Resolving the runtime/toolchain profile boundary is required before
-building the library, linking Pillow `_imagingft`, or running a font probe.
+```sh
+PYTHONPATH=. uv run --no-project python ports/native/freetype/verify.py \
+  --bundle /tmp/shellsim-native --work-dir /tmp/shellsim-freetype
+SHELLSIM_FREETYPE_ARTIFACTS=/tmp/shellsim-freetype \
+  cargo test --test wasm_freetype -- --include-ignored
+```
 
-When enabled, consumers use `-I<prefix>/include/freetype2` and link
-`lib/libfreetype.a`, followed by `lib/libz.a` and `-lm`. The build API accepts
-verified dependency providers and emits the shared immutable artifact contract.
+The font and license in `tests/fixtures/fonts` come from the pinned Pillow source
+archive. That directory records their hashes and redistribution terms. This
+subset does not claim arbitrary font format or shaping compatibility.

@@ -10,6 +10,7 @@ from ports.native.dependencies import (
     file_hash,
     seal_artifact,
     target_environment,
+    target_profile,
     verify_artifact,
 )
 
@@ -89,8 +90,7 @@ def build_freetype(recipe, source, sdk, work, toolchain, providers, run):
         run(
             [
                 str(sdk / "bin/clang"),
-                "-O2",
-                "-g0",
+                *target_profile(recipe)["compiler_flags"],
                 "-DFT2_BUILD_LIBRARY",
                 "-I" + str(include),
                 "-I" + str(build / "dependencies/include"),

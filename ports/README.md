@@ -1,7 +1,7 @@
 # CPython WASI ports
 
 The CPython recipe builds upstream CPython 3.13.7 as a static WASI Preview 1
-command with WASI SDK 24.0. Downloads are pinned by SHA256. Build tools run on
+command with WASI SDK 34.0 and the versioned static v2 profile. Downloads are pinned by SHA256. Build tools run on
 the trusted host; the resulting interpreter runs through shellsim's virtual
 WASI adapter. The recipe currently supports an x86_64 Linux build host.
 
@@ -77,9 +77,11 @@ result = runtime.run(env, ["-c", "import pycosat; assert pycosat.solve([[1], [-1
 assert result.returncode == 0, result.stderr
 ```
 
-This establishes a static native source recipe. Dynamic extension loading,
-arbitrary host native wheels, threads, process spawning, and sockets are not
-supported. The [native dependency foundation](native/README.md) supplies zlib
+This establishes a static native source recipe. The separate
+[dynamic loader experiment](dynamic/README.md) imports small C extensions into
+a live interpreter built for its explicit ABI. Arbitrary host native wheels,
+threads, process spawning, and sockets are unsupported.
+The [native dependency foundation](native/README.md) supplies zlib
 when selected, sharing its verified target artifact with Pillow's PNG profile.
 Other optional CPython modules requiring external libraries, including
 ssl, ctypes, and readline, are absent from this build. Unsupported
@@ -95,11 +97,16 @@ SHELLSIM_CPYTHON_BUNDLE=/tmp/shellsim-cpython uv run pytest tests/python_package
 Upstream build references:
 [CPython WASI instructions](https://devguide.python.org/getting-started/setup-building/#wasi),
 [CPython 3.13 WASI tooling](https://github.com/python/cpython/tree/3.13/Tools/wasm),
-and [WASI SDK 24](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-24).
+and [WASI SDK 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34).
+
+`--target-profile wasi-cpython-v1` retains the SDK 24 bare-interpreter/pycosat build
+needed by the dynamic C-extension proof. The current NumPy and imaging recipes
+use v2. See [the native profile guide](native/README.md) for exception flags,
+artifact identities and the explicit shared-library frontier.
 
 ## Real NumPy graph spike
 
-The narrow graph workflow accepts Atlas's `magiccube==0.3.0` root:
+The narrow graph workflow accepts the `magiccube==0.3.0` root:
 
 ```sh
 uv run --python 3.13 ports/spike_numpy.py magiccube==0.3.0
@@ -124,6 +131,6 @@ build or guest execution. `--numpy-requirement 'numpy==2.2.0'` demonstrates reje
 of a native version absent from the curated index. A successful execution writes
 `result.json`, guest output, and resource usage. This spike is one measured graph;
 it does not replace the public installer with a general guest-platform resolver.
-The [experimental NumPy profile](numpy/README.md) omits FFT and cannot honor
+The [experimental NumPy profile](numpy/README.md) supports FFT but cannot honor
 NumPy's floating-point warning and exception policy on WASI. The measured cube
 and integer-array operations do not establish complete NumPy compatibility.

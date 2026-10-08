@@ -38,6 +38,9 @@ def run(command: list[str], cwd: Path | None = None) -> None:
 
 def build(bundle: Path, output: Path) -> None:
     """Keep both extensions separate from the interpreter's one-time loader relink."""
+    recipe = json.loads((bundle / "manifest.json").read_text())["recipe"]
+    if recipe["target_profile"] != "wasi-cpython-v1" or recipe["sdk"]["version"] != "24.0":
+        raise ValueError("Dynamic ABI v1 requires the static SDK 24 v1 bundle; exception profiles are unsupported")
     source = bundle / "Python-3.13.7"
     guest = bundle / "wasi-build"
     sdk = bundle / "wasi-sdk-24.0-x86_64-linux"

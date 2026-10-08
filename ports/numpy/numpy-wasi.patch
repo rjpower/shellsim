@@ -94,11 +94,6 @@
 +#define random_weibull npy_legacy_random_weibull
 +#define random_zipf npy_legacy_random_zipf
 +#endif
---- a/numpy/_core/meson.build
-+++ b/numpy/_core/meson.build
-@@ -720 +720 @@
--    '-fexceptions',
-+    host_machine.system() == 'wasi' ? '-fno-exceptions' : '-fexceptions',
 --- a/numpy/_core/src/common/npy_hashtable.cpp
 +++ b/numpy/_core/src/common/npy_hashtable.cpp
 @@ -16,0 +17 @@
@@ -111,20 +106,3 @@
 +#ifdef Py_GIL_DISABLED
 @@ -46,0 +48 @@
 +#endif
---- a/numpy/_core/src/multiarray/unique.cpp
-+++ b/numpy/_core/src/multiarray/unique.cpp
-@@ -166,0 +167,4 @@
-+#if defined(__wasi__)
-+    /* Use NumPy's sort fallback when the SDK has no C++ exception runtime. */
-+    Py_RETURN_NOTIMPLEMENTED;
-+#else
-@@ -183,0 +188 @@
-+#endif
---- a/numpy/fft/__init__.py
-+++ b/numpy/fft/__init__.py
-@@ -202,0 +203,5 @@
-+import sys as _sys
-+
-+if _sys.platform == 'wasi':
-+    raise ImportError('numpy.fft is unavailable in the static WASI profile: C++ exception runtime required')
-+

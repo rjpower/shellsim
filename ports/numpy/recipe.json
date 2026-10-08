@@ -7,7 +7,7 @@
   "requires_dist": [],
   "dependencies": {
     "cpython": "3.13.7",
-    "wasi_sdk": "24.0"
+    "wasi_sdk": "34.0"
   },
   "source": {
     "url": "https://files.pythonhosted.org/packages/76/65/21b3bc86aac7b8f2862db1e808f1ea22b028e30a225a34a5ede9bf8678f2/numpy-2.3.5.tar.gz",
@@ -23,16 +23,16 @@
     "lapack": "internal-c-fallback",
     "threading": false,
     "simd": false,
-    "cpp_exceptions": false,
+    "cpp_exceptions": true,
     "longdouble_format": "IEEE_QUAD_LE",
-    "fft": false,
+    "fft": true,
     "longdouble_printf": true,
     "floating_point_exceptions": false
   },
   "patches": [
     {
       "file": "numpy-wasi.patch",
-      "sha256": "5be4be97733d9b0619f53f9e0ad9ee751a1f43e7c4296e995233dffe07d1fddb"
+      "sha256": "ea0d6de59241d9fa742f8069ff0ae086fc636868e787da0b31880bec14428937"
     },
     {
       "file": "cpython-qualified-builtins.patch",
@@ -42,11 +42,15 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "38f77c63c0fda5ce4f6e2abb0bf0a33e4833d3e4daa36b586c8a225e662c9de3"
+      "sha256": "939ece342a6d25a054fe7a5b0c1f884d860c78baaeeb9eaec097045e4be82d14"
     },
     {
       "file": "../cpython/build.py",
-      "sha256": "a0acac4b89f2b069099eaa8842468bdd7a02c9501a886fd9ee3a7b916cc23032"
+      "sha256": "52cad42c23d167f16990e68e5a0448ab5e87d83add052e801777691ce7623ec9"
+    },
+    {
+      "file": "../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
     }
   ],
   "builtin_modules": [
@@ -61,8 +65,10 @@
     "numpy.random._sfc64",
     "numpy.random.bit_generator",
     "numpy.random._generator",
-    "numpy.random.mtrand"
+    "numpy.random.mtrand",
+    "numpy.fft._pocketfft_umath"
   ],
   "dist_info": "/usr/lib/python3.13/site-packages/numpy-2.3.5.dist-info",
-  "verify": "import numpy as np; assert np.__version__ == '2.3.5'; a=np.array([[1,2],[3,4]],dtype=np.int64); assert a.sum()==10; assert (a@a).tolist()==[[7,10],[15,22]]; assert np.unique([3,1,3,2]).tolist()==[1,2,3]"
+  "verify": "import numpy as np; assert np.__version__ == '2.3.5'; a=np.array([[1,2],[3,4]],dtype=np.int64); assert a.sum()==10; assert (a@a).tolist()==[[7,10],[15,22]]; assert np.unique([3,1,3,2]).tolist()==[1,2,3]",
+  "target_profile": "wasi-cpython-v2"
 }

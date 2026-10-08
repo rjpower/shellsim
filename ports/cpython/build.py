@@ -20,9 +20,21 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from ports.native.dependencies import dependency_prefix, digest, file_hash, target_environment, toolchain_identity
+from ports.native.freetype.build import build_freetype
 from ports.native.zlib.build import build_zlib
 from ports.numpy.build import apply_patch, build_numpy, check_build_scripts, install_numpy
 from ports.pillow.build import build_pillow, install_pillow
+
+
+def build_jpeg(recipe, source, sdk, work, toolchain, run):
+    """Load the hyphenated catalog entry without adding a second public name."""
+    import importlib.util
+
+    path = Path(__file__).parent.parent / "native/libjpeg-turbo/build.py"
+    spec = importlib.util.spec_from_file_location("libjpeg_build", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.build_libjpeg_turbo(recipe, source, sdk, work, toolchain, run)
 
 
 def fetch_extract(spec, work):
@@ -96,17 +108,21 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work-dir", type=Path, default=Path("/tmp/shellsim-cpython"))
     parser.add_argument("--jobs", type=int, default=8)
+    parser.add_argument("--target-profile", choices=("wasi-cpython-v1", "wasi-cpython-v2"), default="wasi-cpython-v2")
     parser.add_argument("--with-pycosat", action="store_true", help="statically link the pinned native pycosat port")
     parser.add_argument("--with-numpy", action="store_true", help="statically link the pinned native NumPy port")
     parser.add_argument("--with-zlib", action="store_true", help="link the pinned shared target zlib artifact")
     parser.add_argument(
-        "--with-pillow", action="store_true", help="link Pillow's PNG profile and its target zlib dependency"
+        "--with-pillow", action="store_true", help="link Pillow PNG/JPEG/FreeType and its declared target libraries"
     )
     parser.add_argument("--build-python", type=Path, help="reuse a trusted native CPython 3.13 helper")
     args = parser.parse_args()
     work = args.work_dir.resolve()
     work.mkdir(parents=True, exist_ok=True)
-    recipe = json.loads(Path(__file__).with_name("recipe.json").read_text())
+    if args.target_profile == "wasi-cpython-v1" and (args.with_numpy or args.with_pillow or args.with_zlib):
+        raise ValueError("The current native library recipes require wasi-cpython-v2")
+    recipe_file = "recipe-v1.json" if args.target_profile == "wasi-cpython-v1" else "recipe.json"
+    recipe = json.loads(Path(__file__).with_name(recipe_file).read_text())
     source = fetch_extract(recipe["source"], work)
     sdk = fetch_extract(recipe["sdk"], work)
     host = work / "host-build"
@@ -128,18 +144,35 @@ def main():
     toolchain = toolchain_identity(recipe, sdk)
     target_artifacts = {}
     target_links = []
+    providers = {}
     prefix = work / "dependency-prefix"
     if args.with_zlib or args.with_pillow:
         directory = Path(__file__).parent.parent / "native/zlib"
         zlib_recipe = json.loads((directory / "recipe.json").read_text())
         zlib_source = fetch_extract(zlib_recipe["source"], work)
         zlib_prefix, _ = build_zlib(zlib_recipe, zlib_source, sdk, work, toolchain, run)
+        providers["native/zlib"] = zlib_prefix
+        if args.with_pillow:
+            for name, builder in (("libjpeg-turbo", build_jpeg), ("freetype", build_freetype)):
+                library_recipe = json.loads(
+                    (Path(__file__).parent.parent / "native" / name / "recipe.json").read_text()
+                )
+                library_source = fetch_extract(library_recipe["source"], work)
+                arguments = [library_recipe, library_source, sdk, work, toolchain]
+                if name == "freetype":
+                    arguments.append(providers)
+                providers["native/" + name], _ = builder(*arguments, run)
         target_artifacts, target_links = dependency_prefix(
             recipe["optional_target_dependencies"]["zlib"],
             {"native/zlib": zlib_prefix},
             prefix,
             recipe["target_profile"],
         )
+        if args.with_pillow:
+            pillow_recipe = json.loads(Path(__file__).parent.parent.joinpath("pillow/recipe.json").read_text())
+            target_artifacts, _ = dependency_prefix(
+                pillow_recipe["target_dependencies"], providers, prefix, recipe["target_profile"]
+            )
     profile = {
         "recipe": recipe,
         "builder_sha256": file_hash(Path(__file__)),
@@ -174,7 +207,13 @@ def main():
         AR=str(sdk / "bin/llvm-ar"),
         RANLIB=str(sdk / "bin/llvm-ranlib"),
         CONFIG_SITE=str(source / "Tools/wasm/config.site-wasm32-wasi"),
-        CFLAGS="-O2 -g0",
+        CFLAGS=" ".join(toolchain["profile"]["compiler_flags"]),
+        LDFLAGS=" ".join(
+            [
+                *toolchain["profile"]["link_flags"],
+                *(toolchain["profile"]["cpp_flags"] if args.with_numpy else []),
+            ]
+        ),
         PKG_CONFIG_PATH="",
         PKG_CONFIG_LIBDIR=str(prefix / "lib/pkgconfig") if target_artifacts else "",
         PKG_CONFIG="/bin/false",
@@ -206,7 +245,7 @@ def main():
     if target_artifacts:
         setup_text += f"*static*\nzlib zlibmodule.c -I{prefix / 'include'} {' '.join(target_links)}\n"
         link_consumers["cpython.zlib"] = {
-            "dependency_artifacts": profile["dependencies"],
+            "dependency_artifacts": {"native/zlib": profile["dependencies"]["native/zlib"]},
             "link_inputs": target_links,
         }
     if args.with_pycosat:
@@ -226,16 +265,18 @@ def main():
             apply_patch(source, directory / patch["file"], patch["sha256"])
         pillow_source = fetch_extract(port["source"], work)
         dependencies, links = dependency_prefix(
-            port["target_dependencies"], {"native/zlib": zlib_prefix}, prefix, recipe["target_profile"]
+            port["target_dependencies"], providers, prefix, recipe["target_profile"]
         )
-        archive, inputs = build_pillow(port, pillow_source, source, guest, sdk, work, dependencies, prefix, run)
-        setup_text += f"*static*\nPIL._imaging {archive} {' '.join(links)} -lm\n"
-        link_consumers["PIL._imaging"] = {
-            "inputs": inputs,
-            "archive_sha256": file_hash(archive),
-            "dependency_artifacts": profile["dependencies"],
-            "link_inputs": [str(archive), *links, "-lm"],
-        }
+        target_artifacts.update(dependencies)
+        archives, inputs = build_pillow(port, pillow_source, source, guest, sdk, work, dependencies, prefix, run)
+        for name, archive in archives.items():
+            setup_text += f"*static*\n{name} {archive} {' '.join(links)} -lm\n"
+            link_consumers[name] = {
+                "inputs": inputs,
+                "archive_sha256": file_hash(archive),
+                "dependency_artifacts": {key: item["artifact_sha256"] for key, item in dependencies.items()},
+                "link_inputs": [str(archive), *links, "-lm"],
+            }
         native_ports.append(port)
         port_sources[port["name"]] = pillow_source
     if args.with_numpy:
@@ -250,7 +291,10 @@ def main():
         port_source = fetch_extract(port["source"], work)
         archives, support = build_numpy(port, port_source, source, guest, sdk, work, args.jobs, run)
         libraries = (
-            " ".join(str(path) for path in [*archives.values(), *support]) + " -lc++ -lc++abi -lc-printscan-long-double"
+            " ".join(str(path) for path in [*archives.values(), *support])
+            + " "
+            + " ".join(toolchain["profile"]["cpp_link_flags"])
+            + " -lc-printscan-long-double"
         )
         setup_text += (
             "*static*\n"
@@ -287,6 +331,9 @@ def main():
     shutil.copyfile(source / "LICENSE", root / "CPYTHON-LICENSE")
     if target_artifacts:
         shutil.copyfile(prefix / "licenses/zlib.txt", root / "ZLIB-LICENSE")
+    if args.with_pillow:
+        for name in ("libjpeg-turbo.txt", "README.ijg", "FTL.TXT", "GPLv2.TXT", "LICENSE.TXT"):
+            shutil.copyfile(prefix / "licenses" / name, root / name)
     for port in native_ports:
         port_source = port_sources[port["name"]]
         license_file = "LICENSE.txt" if port["name"] == "numpy" else "LICENSE"

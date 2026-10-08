@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path, PurePosixPath
 
 
@@ -35,20 +36,41 @@ def target_environment(sdk):
     }
 
 
+def target_profile(recipe):
+    """Read a versioned profile; callers use its compiler and final link flags."""
+    return json.loads(Path(__file__).with_name(recipe["target_profile"] + ".json").read_text())
+
+
 def toolchain_identity(recipe, sdk):
     """Bind the declared SDK archive to the tools and sysroot actually consumed."""
-    profile = json.loads(Path(__file__).with_name(recipe["target_profile"] + ".json").read_text())
+    profile = target_profile(recipe)
     if (
         profile["sdk_sha256"] != recipe["sdk"]["sha256"]
         or profile["target"] != recipe["target"]
         or profile["sdk_version"] != recipe["sdk"]["version"]
     ):
         raise ValueError("Target profile conflicts with the selected toolchain")
-    files = [sdk / "bin/clang", sdk / "bin/llvm-ar", sdk / "bin/wasm-ld"]
+    compiler_version = subprocess.check_output([str(sdk / "bin/clang"), "--version"], text=True)
+    # SDK 24 predates VERSION; its compiler identity is still recorded and hashed.
+    version_file = sdk / "VERSION"
+    if version_file.exists() and version_file.read_text().splitlines()[0] != profile["sdk_version"]:
+        raise ValueError("Installed SDK version conflicts with the target profile")
+    files = [
+        sdk / "bin/clang",
+        sdk / "bin/llvm-ar",
+        sdk / "bin/llvm-ranlib",
+        sdk / "bin/llvm-strip",
+        sdk / "bin/wasm-ld",
+    ]
+    if version_file.exists():
+        files.append(version_file)
+    files += sorted(path for path in (sdk / "bin").glob("*.cfg") if path.is_file())
+    files += sorted(path for path in (sdk / "lib/clang").rglob("*") if path.is_file())
     files += sorted(path for path in (sdk / "share/wasi-sysroot").rglob("*") if path.is_file())
     return {
         "sdk": recipe["sdk"],
         "profile": profile,
+        "compiler_version": compiler_version,
         "files_sha256": digest({str(p.relative_to(sdk)): file_hash(p) for p in files}),
     }
 

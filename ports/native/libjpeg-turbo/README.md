@@ -13,10 +13,10 @@ PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-libjpeg uv run --no-project python \
   ports/native/libjpeg-turbo/verify.py \
   --source-archive /tmp/shellsim-port-libjpeg/libjpeg-turbo-2.1.5.1.tar.gz \
   --source /tmp/shellsim-port-libjpeg/libjpeg-turbo-2.1.5.1 \
-  --sdk /tmp/shellsim-numpy-final/wasi-sdk-24.0-x86_64-linux \
+  --sdk /tmp/shellsim-native/wasi-sdk-34.0-x86_64-linux \
   --work-dir /tmp/shellsim-port-libjpeg
 SHELLSIM_LIBJPEG_ARTIFACTS=/tmp/shellsim-port-libjpeg \
-  cargo test --test wasm_libjpeg
+  cargo test --test wasm_libjpeg -- --include-ignored
 ```
 
 The driver performs no downloads. Artifact inputs include the consumed source
@@ -28,22 +28,12 @@ invalid bytes in a separate process using upstream `jpeg_std_error` and its fata
 error handler. This proves process-level rejection; it does not prove recovery
 within one process. The Rust harness runs both cases inside Shellsim's VFS.
 
-Pillow JPEG integration requires `-DHAVE_LIBJPEG`, this artifact's include path,
-and `libjpeg.a` in the final static link. Pillow's JPEG error handlers use
-`setjmp`/`longjmp`. SDK 24's target `setjmp.h` rejects compilation without Wasm
-exception handling (`-mllvm -wasm-enable-sjlj`), which the current target profile
-and runtime do not support. Do not enable Pillow JPEG until that foundation is
-implemented and tested. No error recovery stubs are supplied here.
-
-A minimal reproduction of that toolchain frontier is:
-
-```c
-#include <setjmp.h>
-int main(void) { jmp_buf buffer; return setjmp(buffer); }
-```
-
-Compile it with the pinned SDK's ordinary `bin/clang`; the header emits its
-exception-handling requirement before linking. Library artifact support can be
-integrated independently of enabling Pillow's JPEG consumer.
+Pillow JPEG integration enables `HAVE_LIBJPEG` and consumes this artifact under
+the SDK 34 static v2 profile. Its upstream error handlers retain real
+`setjmp`/`longjmp`, implemented through standard Wasm exceptions and `libsetjmp`.
+The Pillow guest test decodes truncated valid JPEG data, observes `OSError`,
+and then decodes a valid JPEG in the same interpreter. The separate scalar
+probe still checks upstream process-level fatal handling. No recovery stubs
+or host codec fallback are used.
 
 This software is based in part on the work of the Independent JPEG Group.
