@@ -116,6 +116,33 @@ no native manifest. Catalog distribution identities and hashes are authoritative
 The catalog is currently an explicit local trusted input; public artifact
 publication is a follow-up.
 
+### Combining port catalogs
+
+Combine the catalogs produced by individual ports before selecting packages:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  -m ports._support.catalog \
+  --runtime /path/to/runtime \
+  --catalog /path/to/numpy-catalog \
+  --catalog /path/to/pillow-catalog \
+  --catalog /path/to/imageio-catalog \
+  --output /path/to/combined-catalog
+```
+
+Run this host command from the repository root with Shellsim installed. Pass the
+output directory as `CPythonRuntime(..., universe=...)` or as the catalog input
+to the [release builder](python/cpython/README.md). The output must not exist.
+The composer verifies wheel bytes, runtime compatibility, provider identities,
+and the full native dependency closure before publishing the directory.
+
+Distinct package versions remain available for uv to select from requirement
+ranges or exact lock pins. Conflicting artifacts for the same package version
+or provider fail; wheel bytes and upstream metadata are preserved. Catalogs
+must declare their wheels directly; embedded local pure-wheel indexes are not
+supported by composition. Uncatalogued pure dependencies can still resolve
+through the installer's configured index.
+
 ## Native tools and libraries
 
 The [native catalog](native/catalog/README.md) installs guest build tools and
