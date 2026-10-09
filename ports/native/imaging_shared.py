@@ -70,20 +70,36 @@ def admit_linker(recipe, directory, prefix):
     return command, manifest
 
 
-def shared_dependencies(recipe, providers, destination):
-    """Admit the shallow imaging graph before copying headers or linking it.
+def shared_dependencies(recipe, providers, destination, toolchain):
+    """Validate the exact shared DAG before staging its complete header closure.
 
-    Direct dependencies and one transitive level are supported. Deeper graphs
-    fail explicitly; they need recursive admission before using this helper.
+    Returned manifests and link arguments remain direct dependencies, matching
+    emitted DT_NEEDED and each consumer's immediate artifact edges. Shared
+    descendants are deduplicated for admission and header staging.
     """
     selected = {}
-    libraries = []
-    for requirement in recipe["target_dependencies"]:
+    visiting = set()
+    sonames = {}
+    order = []
+    edge_count = 0
+
+    def select(requirement):
+        nonlocal edge_count
+        edge_count += 1
+        if edge_count > 256:
+            raise ValueError("Shared dependency graph exceeds its edge bound")
         name = requirement["port"]
+        if name in visiting:
+            raise ValueError("Cyclic shared target dependency: " + name)
         if name not in providers:
             raise ValueError("Missing shared target dependency: " + name)
-        prefix = providers[name]
-        artifact = verify_artifact(prefix)
+        if name in selected:
+            prefix, artifact = selected[name]
+        else:
+            if len(selected) >= 64:
+                raise ValueError("Shared dependency graph exceeds its provider bound")
+            prefix = providers[name]
+            artifact = verify_artifact(prefix)
         dependency = artifact["inputs"]["recipe"]
         if (
             dependency["version"] != requirement["version"]
@@ -92,50 +108,70 @@ def shared_dependencies(recipe, providers, destination):
             or dependency["linkage"] != "shared"
             or dependency.get("abi") != recipe["abi"]
             or dependency["name"] != name.removeprefix("native/")
+            or artifact["inputs"]["toolchain"] != toolchain
         ):
-            raise ValueError("Shared dependency profile, linkage or ABI differs: " + name)
-        # Every supplied child must retain the exact identities of its own
-        # declared providers; a compatible version alone is insufficient.
+            raise ValueError("Shared dependency identity or cohort differs: " + name)
+        if name in selected:
+            return artifact
+        soname = dependency["soname"]
+        if not soname or Path(soname).name != soname or soname in (".", ".."):
+            raise ValueError("Invalid shared dependency SONAME")
+        owner = sonames.get(soname)
+        if owner is not None and owner != name:
+            raise ValueError("Conflicting shared dependency SONAME: " + soname)
+        sonames[soname] = name
+        selected[name] = prefix, artifact
+        visiting.add(name)
+        children = dependency["target_dependencies"]
+        if len({child["port"] for child in children}) != len(children):
+            raise ValueError("Duplicate shared dependency edge: " + name)
         expected = {}
-        for child in dependency["target_dependencies"]:
-            if child["port"] not in providers:
-                raise ValueError("Missing transitive shared dependency")
-            manifest = verify_artifact(providers[child["port"]])
-            child_recipe = manifest["inputs"]["recipe"]
-            if (
-                child_recipe["version"] != child["version"]
-                or child_recipe["target_profile"] != recipe["target_profile"]
-                or child_recipe["target"] != recipe["target"]
-                or child_recipe["linkage"] != "shared"
-                or child_recipe.get("abi") != recipe["abi"]
-                or child_recipe["name"] != child["port"].removeprefix("native/")
-                or manifest["inputs"]["toolchain"] != artifact["inputs"]["toolchain"]
-            ):
-                raise ValueError("Transitive shared dependency cohort differs")
-            if child_recipe["target_dependencies"] or manifest["inputs"]["dependency_artifacts"]:
-                raise ValueError("Shared imaging graphs deeper than one transitive level are unsupported")
-            if needed_libraries(providers[child["port"]] / "lib" / child_recipe["soname"]):
-                raise ValueError("Transitive shared dependency has undeclared libraries")
+        needed = []
+        for child in children:
+            manifest = select(child)
             expected[child["port"]] = manifest["artifact_sha256"]
+            needed.append(manifest["inputs"]["recipe"]["soname"])
         if artifact["inputs"]["dependency_artifacts"] != expected:
-            raise ValueError("Shared dependency artifact closure differs")
-        needed = sorted(
-            manifest["inputs"]["recipe"]["soname"]
-            for manifest in (verify_artifact(providers[child["port"]]) for child in dependency["target_dependencies"])
-        )
-        if sorted(needed_libraries(prefix / "lib" / dependency["soname"])) != needed:
-            raise ValueError("Shared dependency emitted closure differs")
-        selected[name] = artifact
-        for relative in dependency["exports"]["headers"]:
+            raise ValueError("Shared dependency artifact closure differs: " + name)
+        if sorted(needed_libraries(prefix / "lib" / soname)) != sorted(needed):
+            raise ValueError("Shared dependency emitted closure differs: " + name)
+        visiting.remove(name)
+        order.append(name)
+        return artifact
+
+    requirements = recipe["target_dependencies"]
+    if len({item["port"] for item in requirements}) != len(requirements):
+        raise ValueError("Duplicate direct shared dependency")
+    direct = {item["port"]: select(item) for item in requirements}
+    headers = {}
+    for name in order:
+        prefix, artifact = selected[name]
+        for relative in artifact["inputs"]["recipe"]["exports"]["headers"]:
+            source = prefix / relative
+            identity = file_hash(source)
+            if relative in headers and headers[relative][1] != identity:
+                raise ValueError("Conflicting shared dependency header: " + relative)
             target = destination / relative
+            parent = target.parent
+            while parent != destination.parent:
+                if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                    raise ValueError("Invalid shared dependency header destination")
+                parent = parent.parent
+            if target.is_symlink():
+                raise ValueError("Invalid shared dependency header destination")
+            if target.exists() and (not target.is_file() or target.is_symlink() or file_hash(target) != identity):
+                raise ValueError("Conflicting shared dependency header: " + relative)
+            headers[relative] = source, identity
+    # No dependency, cohort or header failure can partially stage the graph.
+    for relative, (source, identity) in sorted(headers.items()):
+        target = destination / relative
+        if not target.exists():
             target.parent.mkdir(parents=True, exist_ok=True)
-            if target.exists():
-                if file_hash(target) != file_hash(prefix / relative):
-                    raise ValueError("Conflicting shared dependency header: " + relative)
-                continue
-            shutil.copyfile(prefix / relative, target)
-        libraries.append(prefix / "lib" / dependency["soname"])
-    return selected, libraries
+            shutil.copyfile(source, target)
+            if file_hash(target) != identity:
+                raise ValueError("Shared dependency header changed while staging: " + relative)
+    libraries = [providers[name] / "lib" / item["inputs"]["recipe"]["soname"] for name, item in direct.items()]
+    return direct, libraries
 
 
 def prepare_source(recipe, source, build):
@@ -205,9 +241,7 @@ def build_shared(recipe, directory, source, sdk, work, toolchain, providers, run
         raise ValueError("Shared imaging requires ABI v2")
     build = work / (recipe["name"] + "-shared-build")
     build.mkdir(parents=True, exist_ok=True)
-    dependencies, libraries = shared_dependencies(recipe, providers, build / "dependencies")
-    if any(item["inputs"]["toolchain"] != toolchain for item in dependencies.values()):
-        raise ValueError("Shared imaging provider toolchain differs")
+    dependencies, libraries = shared_dependencies(recipe, providers, build / "dependencies", toolchain)
     inputs = artifact_input(recipe, directory, toolchain, dependencies)
     inputs["source_tree_sha256"] = digest(
         {path.relative_to(source).as_posix(): file_hash(path) for path in sorted(source.rglob("*")) if path.is_file()}

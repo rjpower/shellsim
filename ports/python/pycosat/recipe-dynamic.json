@@ -1,0 +1,23 @@
+{
+  "name": "pycosat",
+  "version": "0.6.6",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "requires_dist": [],
+  "target_dependencies": [],
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/5b/81/cf8ebf77fc4f06f680ad3ee43d0d01826f6d6054828f1cf3b42d944b82a1/pycosat-0.6.6.tar.gz",
+    "sha256": "a376cfae20b16fcfbef24bf3c047a8a294c35032bb051fa98842c12bbab6f0ff"
+  },
+  "build": {
+    "adapter": "python-extension",
+    "module": "pycosat",
+    "sources": ["pycosat.c"],
+    "metadata": "PKG-INFO",
+    "licenses": ["LICENSE", "AUTHORS.md"],
+    "defines": ["NGETRUSAGE"],
+    "native_dependencies": []
+  },
+  "tests": [{"kind": "python", "script": "tests/probes/operations.py"}]
+}
