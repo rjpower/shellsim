@@ -25,10 +25,9 @@ int main(void) {
     void *mix = dlsym(provider, "ffi_mix");
     void *identity = dlsym(provider, "ffi_identity");
     void *apply = dlsym(provider, "ffi_apply");
-    int (*via_host)(int (*)(int, int), int, int) =
-        (int (*)(int (*)(int, int), int, int))dlsym(provider, "ffi_via_host");
+    int (*via_host)(int, int) = (int (*)(int, int))dlsym(provider, "ffi_via_host");
     if (!add || !mix || !identity || !apply || !via_host) return 2;
-    if (via_host((int (*)(int, int))add, 19, 23) != 42) return 10;
+    if (via_host(19, 23) != 42) return 10;
 
     uint8_t tags[2] = {1, 1};
     uint64_t values[2] = {17, 25};

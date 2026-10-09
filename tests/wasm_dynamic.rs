@@ -894,6 +894,52 @@ fn v2_start_observes_resolved_external_got_values() {
 }
 
 #[test]
+fn v2_resolves_own_got_symbols_before_relocations() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))",
+        "",
+    );
+    let side = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(import "GOT.mem" "own_data" (global $data (mut i32)))
+        (import "GOT.func" "own_function" (global $function (mut i32)))
+        (global (export "own_data") i32 (i32.const 12))
+        (func (export "own_function") (result i32) (i32.const 7))
+        (func (export "__wasm_apply_data_relocs")
+            (if (i32.eqz (global.get $data)) (then unreachable))
+            (if (i32.eqz (global.get $function)) (then unreachable)))"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_rejects_own_got_when_a_start_section_could_read_it() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+        "",
+    );
+    let side = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(import "GOT.func" "own_function" (global (mut i32)))
+        (func (export "own_function"))
+        (func $start) (start $start)"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
 fn v2_small_executable_can_grow_above_sixteen_mebibytes() {
     let main = synthetic_main_profile(
         true,

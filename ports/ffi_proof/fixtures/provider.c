@@ -20,11 +20,10 @@ __attribute__((visibility("default"))) int ffi_apply(int (*callback)(int), int v
     return callback(value) + 1;
 }
 
-__attribute__((visibility("default"))) int ffi_via_host(int (*function)(int, int), int left,
-                                                       int right) {
+__attribute__((visibility("default"))) int ffi_via_host(int left, int right) {
     const uint8_t tags[2] = {1, 1};
     const uint64_t values[2] = {(uint32_t)left, (uint32_t)right};
     uint64_t result = 0;
-    if (ffi_invoke((uint32_t)(uintptr_t)function, tags, values, 2, 1, &result)) return -1;
+    if (ffi_invoke((uint32_t)(uintptr_t)ffi_add, tags, values, 2, 1, &result)) return -1;
     return (int)result;
 }

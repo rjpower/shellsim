@@ -2,8 +2,11 @@
 
 This port builds a small C main and a separate C provider with the pinned SDK
 34 toolchain. The main loads the provider through the production dynamic loader.
-The provider can import the versioned `shellsim_ffi_v1` boundary itself. It
-calls table entries after checking their exact Wasm scalar signature. A fixed
+The provider takes the address of its own exported function and imports the
+versioned `shellsim_ffi_v1` boundary. The loader fills its own-symbol GOT
+entry before running relocations and constructors; modules with a start
+section cannot use such deferred entries. The boundary calls table entries
+after checking their exact Wasm scalar signature. A fixed
 `i32 -> i32` closure slot calls a guest
 dispatcher and can be released. The host receives raw Wasm values and guest
 addresses only; it never dereferences guest pointers as host pointers.

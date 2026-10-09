@@ -117,6 +117,7 @@ struct Layout {
     table_size: u32,
     table_align: u32,
     needed: Vec<String>,
+    has_start: bool,
 }
 
 /// A bounded binary cursor: section lengths and LEB values are checked before slicing.
@@ -210,6 +211,7 @@ pub(super) fn compatible_main(source: &[u8], abi: Abi) -> Result<(), Error> {
 
 fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
     compatible_main(source, abi)?;
+    let mut has_start = false;
     if abi == Abi::V2 {
         // A stripped private tag has no reliable symbol name. This initial ABI therefore
         // requires every side-library exception tag to be imported from the main runtime.
@@ -218,6 +220,7 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
             let kind = cursor.byte()?;
             let len = cursor.number()? as usize;
             let payload = cursor.take(len)?;
+            has_start |= kind == 8;
             if kind == 13 && Cursor(payload).number()? != 0 {
                 return Err(Error::msg(
                     "dynamic ABI v2 requires side-library exception tags to be imported",
@@ -249,6 +252,7 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
                     table_size: payload.number()?,
                     table_align: payload.number()?,
                     needed: Vec::new(),
+                    has_start: false,
                 });
             }
             2 => {
@@ -284,6 +288,7 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
     }
     let mut result = result.ok_or_else(|| Error::msg("library is missing dylink memory layout"))?;
     result.needed = needed;
+    result.has_start = has_start;
     if result.memory_align > 16
         || result.table_align > 14
         || result.memory_size as usize > super::MAX_WASM_MEMORY
@@ -721,16 +726,38 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
             )?),
             ("GOT.mem" | "GOT.func", _) => {
                 let initial = if abi == Abi::V2 {
-                    let symbol =
-                        import_symbol(caller, name, false, &dependencies).ok_or_else(|| {
-                            Error::msg(format!("unresolved pre-start dynamic symbol: {name}"))
-                        })?;
-                    if (namespace == "GOT.mem" && !matches!(symbol.0, Extern::Global(_)))
-                        || (namespace == "GOT.func" && !matches!(symbol.0, Extern::Func(_)))
-                    {
-                        return Err(Error::msg(format!("dynamic symbol kind mismatch: {name}")));
+                    if let Some(symbol) = import_symbol(caller, name, false, &dependencies) {
+                        if (namespace == "GOT.mem" && !matches!(symbol.0, Extern::Global(_)))
+                            || (namespace == "GOT.func" && !matches!(symbol.0, Extern::Func(_)))
+                        {
+                            return Err(Error::msg(format!(
+                                "dynamic symbol kind mismatch: {name}"
+                            )));
+                        }
+                        address(caller, symbol.0, symbol.1)?
+                    } else {
+                        let own = module
+                            .exports()
+                            .find(|export| export.name() == name)
+                            .ok_or_else(|| {
+                                Error::msg(format!("unresolved pre-start dynamic symbol: {name}"))
+                            })?;
+                        if (namespace == "GOT.mem" && !matches!(own.ty(), ExternType::Global(_)))
+                            || (namespace == "GOT.func" && !matches!(own.ty(), ExternType::Func(_)))
+                        {
+                            return Err(Error::msg(format!(
+                                "dynamic symbol kind mismatch: {name}"
+                            )));
+                        }
+                        if layout.has_start {
+                            return Err(Error::msg(
+                                "dynamic module start cannot use a self-referential GOT symbol",
+                            ));
+                        }
+                        // A side module's own exports acquire Store addresses only after
+                        // instantiation. Fill this mutable import before relocations or ctors.
+                        0
                     }
-                    address(caller, symbol.0, symbol.1)?
                 } else {
                     0
                 };
