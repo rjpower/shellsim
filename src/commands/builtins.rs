@@ -234,7 +234,7 @@ fn cmd_hash(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i3
     status
 }
 
-const COMPAT_SHOPTS: &[&str] = &["expand_aliases", "sourcepath"];
+const COMPAT_SHOPTS: &[&str] = &["expand_aliases", "nullglob", "sourcepath"];
 
 fn cmd_shopt(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
     let (mode, names) = match args.first().map(String::as_str) {
