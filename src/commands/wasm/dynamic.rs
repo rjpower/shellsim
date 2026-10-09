@@ -8,7 +8,10 @@
 //! are imported from the main runtime. Compilation scratch is charged before cache lookup;
 //! retained images and table growth are released with the owning process.
 
-use super::{build_linker, command_engine, compiled_command_module, memory, Host, MAX_WASM_BYTES};
+use super::{
+    build_linker, command_engine, compiled_command_module, ffi, fibers, memory, Host,
+    MAX_WASM_BYTES,
+};
 use crate::vfs::resolve_against;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -302,7 +305,7 @@ fn align(value: u32, exponent: u32) -> Result<u32, Error> {
         .ok_or_else(|| Error::msg("dylink address overflow"))
 }
 
-fn reserve(caller: &mut Caller<'_, Host>, bytes: u64) -> Result<(), Error> {
+pub(super) fn reserve(caller: &mut Caller<'_, Host>, bytes: u64) -> Result<(), Error> {
     let total = caller
         .data()
         .dynamic
@@ -327,6 +330,18 @@ fn reserve(caller: &mut Caller<'_, Host>, bytes: u64) -> Result<(), Error> {
     }
     caller.data_mut().dynamic.reserved = total;
     Ok(())
+}
+
+/// Undo a v2 reservation only when the operation it preflighted made no Store change.
+pub(super) fn unreserve(caller: &mut Caller<'_, Host>, bytes: u64) {
+    debug_assert_eq!(caller.data().dynamic.abi, Some(Abi::V2));
+    caller.data_mut().dynamic.reserved -= bytes;
+    caller
+        .data()
+        .dynamic
+        .retained
+        .fetch_sub(bytes, Ordering::Relaxed);
+    caller.data().machine.get().resources.release_memory(bytes);
 }
 
 fn reserve_table(caller: &mut Caller<'_, Host>, entries: u64) -> Result<(), Error> {
@@ -644,7 +659,10 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
         .ok_or_else(|| Error::msg("dylink allocation overflow"))?
         .max(1);
     let malloc = main.get_typed_func::<u32, u32>(&mut *caller, "malloc")?;
-    let raw_base = malloc.call_async(&mut *caller, allocation).await?;
+    let raw_base = {
+        let _fiber = fibers::begin(&mut *caller)?;
+        malloc.call_async(&mut *caller, allocation).await?
+    };
     if raw_base == 0 {
         return Err(Error::msg("dynamic library data allocation failed"));
     }
@@ -680,6 +698,11 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
         let name = import.name();
         let value = match (namespace, name) {
             ("wasi_snapshot_preview1", _) => continue,
+            (namespace, name)
+                if abi == Abi::V2 && namespace == ffi::NAMESPACE && ffi::supported(name) =>
+            {
+                continue;
+            }
             ("env", "memory") => {
                 imports_memory = true;
                 Extern::Memory(shared_memory)
@@ -743,7 +766,10 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
     // Defined extra memories are rejected by the Store's one-memory limit; unavailable WASI
     // operations retain the main executable's explicit trap boundary.
     linker.define_unknown_imports_as_traps(&module)?;
-    let instance = linker.instantiate_async(&mut *caller, &module).await?;
+    let instance = {
+        let _fiber = fibers::begin(&mut *caller)?;
+        linker.instantiate_async(&mut *caller, &module).await?
+    };
     for (namespace, name, global) in got {
         let symbol = import_symbol(caller, &name, false, &dependencies)
             .or_else(|| {
@@ -765,6 +791,7 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
     }
     for name in ["__wasm_apply_data_relocs", "__wasm_call_ctors"] {
         if let Some(function) = instance.get_func(&mut *caller, name) {
+            let _fiber = fibers::begin(&mut *caller)?;
             function
                 .typed::<(), ()>(&*caller)?
                 .call_async(&mut *caller, ())

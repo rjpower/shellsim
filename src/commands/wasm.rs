@@ -40,6 +40,8 @@ use crate::vfs::{resolve_against, VfsError};
 use super::util::ewln;
 
 mod dynamic;
+mod ffi;
+mod fibers;
 mod guest_memory;
 mod threads;
 
@@ -362,6 +364,8 @@ struct Host {
     limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
     dynamic: dynamic::Dynamic,
+    ffi: ffi::State,
+    fibers: fibers::Budget,
     thread: Option<threads::ThreadContext>,
     retained: Arc<AtomicU64>,
 }
@@ -2001,6 +2005,7 @@ fn cwd_set(
 
 fn build_linker(engine: &Engine) -> Linker<Host> {
     let mut linker = Linker::<Host>::new(engine);
+    ffi::register(&mut linker);
     posix_process::register(&mut linker);
     linker
         .func_wrap("shellsim_posix_v1", "cwd_get", cwd_get)
@@ -2411,6 +2416,7 @@ pub(super) fn validate_imports(module: &Module, threaded: bool) -> Result<(), Er
                 ))
             || (dynamic::Abi::from_namespace(import.module()).is_some()
                 && matches!(import.name(), "open" | "symbol" | "error"))
+            || (!threaded && import.module() == ffi::NAMESPACE && ffi::supported(import.name()))
             || (import.module() == "shellsim"
                 && matches!(
                     import.name(),
@@ -2476,7 +2482,11 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .map_err(|error| (126, format!("{path}: {error}")))?;
     let mut linker = build_linker(command_engine());
     let mut dynamic_abi = None;
+    let mut ffi_requested = false;
     for import in module.imports() {
+        if import.module() == ffi::NAMESPACE {
+            ffi_requested = true;
+        }
         if let Some(abi) = dynamic::Abi::from_namespace(import.module()) {
             if dynamic_abi.is_some_and(|old| old != abi) {
                 return Err((
@@ -2486,6 +2496,12 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             }
             dynamic_abi = Some(abi);
         }
+    }
+    if ffi_requested {
+        if thread_profile.is_some() || dynamic_abi.is_some_and(|abi| abi != dynamic::Abi::V2) {
+            return Err((126, format!("{path}: FFI requires dynamic loading ABI v2")));
+        }
+        dynamic_abi = Some(dynamic::Abi::V2);
     }
     if let Some(abi) = dynamic_abi {
         dynamic::compatible_main(&wasm, abi).map_err(|error| (126, format!("{path}: {error}")))?;
@@ -2518,6 +2534,13 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         0
     };
     let loader_memory = dynamic_abi.map_or(0, dynamic::Abi::fixed_reservation);
+    // Every async Store owns one live or cached Wasmtime fiber stack. Thread slots
+    // already prepay theirs in THREAD_HOST_BYTES.
+    let main_stack_memory = if thread_profile.is_some() {
+        0
+    } else {
+        ASYNC_STACK_BYTES as u64
+    };
     let memory_cap = if thread_profile.is_some() {
         MAX_WASM_MEMORY as u64
     } else if dynamic_abi == Some(dynamic::Abi::V2) {
@@ -2533,6 +2556,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .saturating_sub(DIRECTORY_MEMORY)
         .saturating_sub(table_memory)
         .saturating_sub(loader_memory)
+        .saturating_sub(main_stack_memory)
         // Only v1 prepays its Store reservation. V2 heap and host scratch compete for the
         // same remaining environment budget when they actually allocate.
         .saturating_sub(if dynamic_abi == Some(dynamic::Abi::V2) {
@@ -2594,7 +2618,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     };
     let reserved = reserved
         .saturating_add(loader_memory)
-        .saturating_add(thread_memory);
+        .saturating_add(thread_memory)
+        .saturating_add(main_stack_memory);
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
@@ -2658,6 +2683,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         },
         interaction: launch.interaction,
         dynamic: dynamic::Dynamic::new(dynamic_abi, reserved.dynamic.clone()),
+        ffi: ffi::State::default(),
+        fibers: fibers::Budget::default(),
         thread: None,
         retained: reserved.dynamic.clone(),
     };
@@ -2810,6 +2837,7 @@ fn finish_guest(
         .stop_reason()
         .map_or(status, |reason| reason.exit_status());
     if worker && returned && status == 0 {
+        fibers::release_store(&mut host);
         GuestOutcome::ThreadReturn { host }
     } else {
         GuestOutcome::Exit { status, host }

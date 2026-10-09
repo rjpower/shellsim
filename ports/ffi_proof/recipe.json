@@ -1,0 +1,12 @@
+{
+  "name": "wasi-ffi-scalar-proof",
+  "version": 1,
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "sdk_sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+  "build_script_sha256": "0f74ce830cd4f4e272ead08aa860e47949ff2e6c158c8c7b09c933329fed14f7",
+  "bridge_sha256": "be7b9455df9d179e1ff9fe0c364e57ddebbd06b2e86b58f59eac64901f48b26f",
+  "sources_sha256": {
+    "fixtures/main.c": "22e7adbf21919f91b1410dc7da57fa5ac28726a67c58473e0bd728d959ee4e6f",
+    "fixtures/provider.c": "a63620264ad7f7ddc8dd27738769bd8fbfba042814008c5cae518e1339d66104"
+  }
+}

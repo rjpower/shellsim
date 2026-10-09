@@ -457,6 +457,8 @@ impl ThreadGroup {
             ),
             interaction: None,
             dynamic: dynamic::Dynamic::new(None, self.template.retained.clone()),
+            ffi: super::ffi::State::default(),
+            fibers: super::fibers::Budget::default(),
             thread: None,
             retained: self.template.retained.clone(),
         });

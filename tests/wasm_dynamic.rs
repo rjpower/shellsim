@@ -1029,7 +1029,8 @@ fn v2_guest_table_growth_charges_environment_and_releases_on_exit() {
     "#,
         "",
     );
-    for (budget, status) in [(4 * 1024 * 1024, 0), (2 * 1024 * 1024, 137)] {
+    // The outer Wasmtime async stack is now charged in addition to linear memory and table growth.
+    for (budget, status) in [(6 * 1024 * 1024, 0), (4 * 1024 * 1024, 137)] {
         let mut environment = Environment::with_limits(Limits {
             memory: budget,
             ..Limits::default()
@@ -1039,7 +1040,7 @@ fn v2_guest_table_growth_charges_environment_and_releases_on_exit() {
         assert_eq!(outcome.exit_status, status);
         assert_eq!(environment.resources.memory_mark(), 0);
         if status == 0 {
-            assert!(outcome.usage.memory_peak > 2 * 1024 * 1024);
+            assert!(outcome.usage.memory_peak > 4 * 1024 * 1024);
         }
     }
 }
