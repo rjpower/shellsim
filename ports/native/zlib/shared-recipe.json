@@ -1,0 +1,90 @@
+{
+  "kind": "native-library",
+  "name": "zlib",
+  "version": "1.3.1",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "linkage": "shared",
+  "source": {
+    "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+    "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23"
+  },
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang",
+    "wasi-sdk-llvm-ar"
+  ],
+  "target_dependencies": [],
+  "features": {
+    "gzip": true,
+    "shared": true,
+    "runtime_owner": "main-executable"
+  },
+  "transitive_link_flags": [],
+  "exports": {
+    "headers": [
+      "include/zlib.h",
+      "include/zconf.h"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/zlib.pc"
+    ],
+    "licenses": [
+      "licenses/zlib.txt"
+    ],
+    "shared_libraries": [
+      "lib/libz.so"
+    ]
+  },
+  "build_scripts": [
+    {
+      "file": "../imaging_shared.py",
+      "sha256": "7d7412173e7f78b014c19582f1e83809172a1de8e99f914559ca991b581dddb8"
+    },
+    {
+      "file": "build.py",
+      "sha256": "475230e09cec8ca1f81bc26ae2290c8ee27e646e29728bed6c845bf7d669b178"
+    },
+    {
+      "file": "../dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
+    },
+    {
+      "file": "../../toolchain/wasi_sdk/build.py",
+      "sha256": "97e424ec9fb67f59d0c029cd547dba4cb1c16e47fda0a62651cadf652b4fddad"
+    },
+    {
+      "file": "../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    },
+    {
+      "file": "../freetype/build.py",
+      "sha256": "04f219113ef614f0633bd73c82c7b913430dc3422743013a705de5cbb8842684"
+    },
+    {
+      "file": "../libjpeg-turbo/build.py",
+      "sha256": "5028428c4f4c5aa60e1de45a88811f286fd8d43e38123f1194dc817537e1a586"
+    }
+  ],
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "soname": "libz.so",
+  "link_flags": [
+    "-fPIC",
+    "-nostdlib",
+    "-shared",
+    "-Wl,--no-entry,--export-all,--unresolved-symbols=import-dynamic,--fatal-warnings"
+  ],
+  "linker": {
+    "recipe": "../../toolchain/llvm/recipe.json",
+    "recipe_sha256": "e03403a50aaa4600210d3ec13d80393f7a887ca4d4bfc4ea0b241903b17a8e58"
+  }
+}

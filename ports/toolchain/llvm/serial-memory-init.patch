@@ -1,0 +1,86 @@
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -72,0 +73 @@
++  bool serialMemoryInit;
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -225,0 +226,3 @@
++
++def serial_memory_init: FF<"serial-memory-init">,
++  HelpText<"Require serialized shared memory initialization; trap on concurrent initialization">;
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -560,0 +561 @@
++  ctx.arg.serialMemoryInit = args.hasArg(OPT_serial_memory_init);
+@@ -757,0 +759,3 @@
++  if (ctx.arg.serialMemoryInit && !ctx.arg.sharedMemory)
++    error("--serial-memory-init requires --shared-memory");
++
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -1475,7 +1475,9 @@
+-      // Notify any waiters that memory initialization is complete
+-      writeGetFlagAddress();
+-      writeI32Const(os, -1, "number of waiters");
+-      writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
+-      writeUleb128(os, WASM_OPCODE_ATOMIC_NOTIFY, "atomic.notify");
+-      writeMemArg(os, 2, 0);
+-      writeU8(os, WASM_OPCODE_DROP, "drop");
++      if (!ctx.arg.serialMemoryInit) {
++        // Notify any waiters that memory initialization is complete
++        writeGetFlagAddress();
++        writeI32Const(os, -1, "number of waiters");
++        writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
++        writeUleb128(os, WASM_OPCODE_ATOMIC_NOTIFY, "atomic.notify");
++        writeMemArg(os, 2, 0);
++        writeU8(os, WASM_OPCODE_DROP, "drop");
++      }
+@@ -1489,8 +1491,14 @@
+-      writeGetFlagAddress();
+-      writeI32Const(os, 1, "expected flag value");
+-      writeI64Const(os, -1, "timeout");
+-
+-      writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
+-      writeUleb128(os, WASM_OPCODE_I32_ATOMIC_WAIT, "i32.atomic.wait");
+-      writeMemArg(os, 2, 0);
+-      writeU8(os, WASM_OPCODE_DROP, "drop");
++      if (ctx.arg.serialMemoryInit) {
++        // The embedding runtime holds its process initialization gate across
++        // suspension. Observing an active initializer violates that contract.
++        writeU8(os, 0x00, "unreachable: concurrent initialization");
++      } else {
++        writeGetFlagAddress();
++        writeI32Const(os, 1, "expected flag value");
++        writeI64Const(os, -1, "timeout");
++
++        writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
++        writeUleb128(os, WASM_OPCODE_I32_ATOMIC_WAIT, "i32.atomic.wait");
++        writeMemArg(os, 2, 0);
++        writeU8(os, WASM_OPCODE_DROP, "drop");
++      }
+--- /dev/null
++++ b/lld/test/wasm/serial-memory-init.s
+@@ -0,0 +1,23 @@
++# RUN: llvm-mc -filetype=obj -triple=wasm32-unknown-unknown -mattr=+atomics,+bulk-memory %s -o %t.o
++# RUN: wasm-ld --no-entry --shared-memory --features=atomics,bulk-memory,mutable-globals --max-memory=131072 --export=value %t.o -o %t.default.wasm
++# RUN: llvm-objdump -d %t.default.wasm | FileCheck %s --check-prefix=DEFAULT
++# RUN: wasm-ld --no-entry --shared-memory --serial-memory-init --features=atomics,bulk-memory,mutable-globals --max-memory=131072 --export=value %t.o -o %t.serial.wasm
++# RUN: llvm-objdump -d %t.serial.wasm | FileCheck %s --check-prefix=SERIAL
++# RUN: not wasm-ld --no-entry --serial-memory-init %t.o -o %t.invalid.wasm 2>&1 | FileCheck %s --check-prefix=ERROR
++
++# DEFAULT: memory.atomic.notify
++# DEFAULT: memory.atomic.wait32
++# SERIAL: i32.atomic.rmw.cmpxchg
++# SERIAL-NOT: memory.atomic.notify
++# SERIAL-NOT: memory.atomic.wait32
++# SERIAL: unreachable
++# SERIAL-NOT: memory.atomic.notify
++# SERIAL-NOT: memory.atomic.wait32
++# ERROR: --serial-memory-init requires --shared-memory
++
++.section .data.value,"",@
++.globl value
++.p2align 2
++value:
++.int32 17
++.size value, 4

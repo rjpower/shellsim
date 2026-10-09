@@ -1,4 +1,11 @@
-# Pillow static imaging profile
+# Pillow imaging profiles
+
+[The independent extension build](DYNAMIC.md) produces an installable wheel
+with shared zlib, JPEG and FreeType providers, plus imaging math and morphology.
+It requires the declared LLVM deferred-initialization toolchain and a compatible
+fixed CPython runtime. The static recipe below remains a separate product.
+
+## Static imaging profile
 
 This recipe builds upstream Pillow 12.3.0 for CPython 3.13.7 and the SDK 34
 `wasi-cpython-v2` profile. `PIL._imaging` and `PIL._imagingft` are qualified static
