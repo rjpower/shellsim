@@ -15,7 +15,17 @@ The canonical dynamic bridge is `ports/toolchain/wasi_sdk/dynamic.c`. The SDK34
 recipe pins its source and the main-owned libc/C++ exception runtime. Independent
 side modules import that runtime using `shellsim_dylink_v2` and the exact ABI
 `shellsim-wasi-sdk34-cpython3137-v2`. SDK24 remains a separate static profile and
-fixture ABI. Threaded dynamic ABI v3 is not part of this runtime.
+fixture ABI. The threaded runtime is built separately by
+[`wasi_threads`](../../toolchain/wasi_threads/README.md); it uses the compiler
+target `wasm32-wasip1-threads` and exact ABI
+`shellsim-wasi-sdk34-cpython3137-threads-v3`.
+
+`CPythonRuntime` admits these compiler target and ABI pairs explicitly. The
+curated Python catalog target, native wheel tag, and patched uv resolver
+platform remain `wasm32-wasip1` for both cohorts. Native wheel and provider
+content must still declare the runtime's exact dynamic ABI. A release
+descriptor records the compiler target as `runtime_target` while its `target`
+field records the Python wheel platform; the reader rejects crossed pairs.
 
 `stdlib_zlib.py` builds upstream CPython's zlib extension and its independently
 pinned shared zlib provider. It consumes the runtime's verified source bundle,

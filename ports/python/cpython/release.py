@@ -14,6 +14,7 @@ from pathlib import Path
 
 from shellsim._cpython_release import _descriptor, _digest, _validate_entry
 from shellsim._native_release import _validate_entry as _validate_native_entry
+from shellsim.cpython import _MAX_MANIFEST_BYTES, _PYTHON_PACKAGE_PLATFORM
 from shellsim.native_packages import verify_release_catalog
 
 
@@ -77,10 +78,11 @@ def build_release(
         manifest = json.loads((stage / "runtime/manifest.json").read_text())
         descriptor = {
             "schema_version": 1,
-            "target": "wasm32-wasip1",
+            "target": _PYTHON_PACKAGE_PLATFORM,
+            "runtime_target": manifest["recipe"]["target"],
             "python_version": "3.13.7",
             "abi": manifest.get("dynamic_abi"),
-            "runtime_manifest_sha256": _digest(stage / "runtime/manifest.json", 1024 * 1024),
+            "runtime_manifest_sha256": _digest(stage / "runtime/manifest.json", _MAX_MANIFEST_BYTES),
             "catalog_sha256": _digest(stage / "universe/catalog.json", 1024 * 1024),
             "resolvers": {"linux-x86_64-glibc": {**resolver, "min_glibc": floor, "needed_libraries": libraries}},
         }

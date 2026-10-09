@@ -16,6 +16,8 @@ from shellsim.native_packages import _digest
 
 from ports.python.cpython import release
 
+ABI = "shellsim-wasi-sdk34-cpython3137-v2"
+
 
 def _sha(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -33,7 +35,7 @@ def release_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
             {
                 "recipe": {"version": "3.13.7", "target": "wasm32-wasip1", "prefix": "/usr"},
                 "site_packages": "/usr/lib/python3.13/site-packages",
-                "dynamic_abi": "test-wasi-abi",
+                "dynamic_abi": ABI,
                 "files": {"/usr/bin/python3.wasm": _sha(binary)},
             }
         )
@@ -44,7 +46,7 @@ def release_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
         json.dumps(
             {
                 "schema_version": 1,
-                "abi": "test-wasi-abi",
+                "abi": ABI,
                 "target": "wasm32-wasip1",
                 "python_version": "3.13.7",
                 "packages": [],
@@ -67,7 +69,7 @@ def _built(release_inputs: tuple[Path, Path, Path], destination: Path) -> Path:
 
 
 def _marked_wasm() -> bytes:
-    marker = b"\x0cshellsim.abi" + b"test-wasi-abi"
+    marker = b"\x0cshellsim.abi" + ABI.encode()
     return b"\0asm\x01\0\0\0" + bytes((0, len(marker))) + marker
 
 
@@ -146,13 +148,61 @@ def test_release_is_deterministic_and_offline_cache_is_verified(release_inputs, 
     assert first.read_bytes() == second.read_bytes()
     cache = tmp_path / "cache"
     runtime = shellsim.CPythonRuntime.from_release(first, cache_dir=cache)
-    assert runtime.manifest["dynamic_abi"] == "test-wasi-abi"
+    assert runtime.manifest["dynamic_abi"] == ABI
     (first.parent / "cohort.zip").unlink()
     (first.parent / "uv-linux-x86_64-glibc").unlink()
     assert shellsim.CPythonRuntime.from_release(first, cache_dir=cache, offline=True).bundle == runtime.bundle
     (runtime.bundle / "rootfs/usr/bin/python3.wasm").write_bytes(b"changed")
     with pytest.raises(shellsim.PackageInstallError, match="cached CPython release is corrupt"):
         shellsim.CPythonRuntime.from_release(first, cache_dir=cache, offline=True)
+
+
+def test_threaded_release_keeps_wheel_platform_and_pins_runtime_target(release_inputs, tmp_path):
+    runtime, universe, _ = release_inputs
+    manifest_path = runtime / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["recipe"]["target"] = "wasm32-wasip1-threads"
+    manifest["recipe"]["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-threads-v3"
+    manifest["dynamic_abi"] = manifest["recipe"]["dynamic_abi"]
+    manifest_path.write_text(json.dumps(manifest))
+    catalog_path = universe / "catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    catalog["abi"] = manifest["dynamic_abi"]
+    catalog_path.write_text(json.dumps(catalog))
+
+    descriptor = _built(release_inputs, tmp_path / "release")
+    data = json.loads(descriptor.read_text())
+    assert data["target"] == "wasm32-wasip1"
+    assert data["runtime_target"] == "wasm32-wasip1-threads"
+    loaded = shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+    assert loaded.manifest["dynamic_abi"] == manifest["dynamic_abi"]
+
+    data["runtime_target"] = "wasm32-wasip1"
+    descriptor.write_text(json.dumps(data))
+    with pytest.raises(shellsim.PackageInstallError):
+        shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "other-cache")
+
+
+def test_base_release_descriptor_without_runtime_target_still_loads(release_inputs, tmp_path):
+    descriptor = _built(release_inputs, tmp_path / "release")
+    data = json.loads(descriptor.read_text())
+    del data["runtime_target"]
+    descriptor.write_text(json.dumps(data))
+    runtime = shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+    assert runtime.manifest["recipe"]["target"] == "wasm32-wasip1"
+
+
+def test_release_rejects_threaded_runtime_with_base_catalog(release_inputs, tmp_path):
+    runtime, _, _ = release_inputs
+    manifest_path = runtime / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["recipe"]["target"] = "wasm32-wasip1-threads"
+    manifest["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-threads-v3"
+    manifest_path.write_text(json.dumps(manifest))
+    output = tmp_path / "release"
+    with pytest.raises(shellsim.PackageInstallError):
+        _built(release_inputs, output)
+    assert not output.exists()
 
 
 def test_cached_runtime_cannot_be_changed_with_its_manifest(release_inputs, tmp_path):
@@ -253,7 +303,7 @@ def test_release_rejects_native_wheel_with_missing_provider(release_inputs, tmp_
                     "schema_version": 1,
                     "name": "probe",
                     "version": "1.0",
-                    "abi": "test-wasi-abi",
+                    "abi": ABI,
                     "recipe": {},
                     "artifacts": [
                         {
