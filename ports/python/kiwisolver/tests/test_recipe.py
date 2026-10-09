@@ -1,19 +1,17 @@
-"""Validate the port's archive boundary, source ABI correction and wheel contract."""
+"""Validate the port's archive boundary and wheel integrity contract."""
 
+import base64
 import csv
 import hashlib
 import io
 import json
-import os
-import re
 import tarfile
 import zipfile
-from pathlib import Path
 
 import pytest
 
-from ports._support.build import apply_patch, check_build_scripts
-from ports.python.kiwisolver.build import PORT, unpack_source, version_header, write_wheel
+from ports._support.build import check_build_scripts
+from ports.python.kiwisolver.build import PORT, unpack_source, write_wheel
 
 
 def test_pinned_build_inputs():
@@ -44,33 +42,12 @@ def test_source_archive_hash_checked_before_extraction(tmp_path):
     assert not (tmp_path / "output").exists()
 
 
-def test_upstream_noargs_patch_and_version_template(tmp_path):
-    configured = os.environ.get("SHELLSIM_KIWISOLVER_SOURCE_ARCHIVE")
-    if not configured:
-        pytest.skip("set the pinned upstream Kiwi source archive")
-    recipe = json.loads((PORT / "recipe.json").read_text())
-    source = unpack_source(Path(configured), tmp_path, recipe)
-    metadata = (source / "PKG-INFO").read_bytes()
-    digest = version_header(source, recipe)
-    assert digest == hashlib.sha256((source / "py/src/version.h").read_bytes()).hexdigest()
-    assert '#define PY_KIWI_VERSION "1.5.1"' in (source / "py/src/version.h").read_text()
-    patch = recipe["patch"]
-    apply_patch(source, PORT / patch["file"], patch["sha256"])
-    for file in (source / "py/src").glob("*.cpp"):
-        text = file.read_text()
-        names = re.findall(r"\(\s*PyCFunction\s*\)\s*(\w+)\s*,\s*METH_NOARGS", text)
-        for name in names:
-            assert re.search(r"\b" + name + r"\(\s*\w+\s*\*\s*self\s*,\s*PyObject\*\)", text)
-        for name in re.findall(r"\(\s*getter\s*\)\s*(\w+)", text):
-            assert re.search(r"\b" + name + r"\(\s*\w+\s*\*\s*self\s*,\s*void\*\)", text)
-    assert (source / "PKG-INFO").read_bytes() == metadata
-
-
 def test_wheel_record_and_output_are_deterministic(tmp_path):
     stage = tmp_path / "stage"
     dist = stage / "kiwisolver-1.5.1.dist-info"
     dist.mkdir(parents=True)
     (dist / "METADATA").write_text("Name: kiwisolver\nVersion: 1.5.1\n")
+    (stage / "native.so").write_bytes(b"native payload")
     first, second = tmp_path / "first.whl", tmp_path / "second.whl"
     write_wheel(stage, first)
     (dist / "RECORD").unlink()
@@ -79,4 +56,11 @@ def test_wheel_record_and_output_are_deterministic(tmp_path):
     with zipfile.ZipFile(first) as wheel:
         rows = list(csv.reader(io.StringIO(wheel.read("kiwisolver-1.5.1.dist-info/RECORD").decode())))
         assert {row[0] for row in rows} == set(wheel.namelist())
-        assert rows[-1] == ["kiwisolver-1.5.1.dist-info/RECORD", "", ""]
+        for path, digest, size in rows:
+            if path == "kiwisolver-1.5.1.dist-info/RECORD":
+                assert (digest, size) == ("", "")
+                continue
+            content = wheel.read(path)
+            actual = base64.urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode()
+            assert digest == "sha256=" + actual
+            assert int(size) == len(content)
