@@ -373,6 +373,7 @@ async fn wait(
                 ERRNO_FAULT
             });
         }
+        super::threaded_dynamic::can_block(caller.data())?;
         caller
             .data()
             .machine

@@ -1,0 +1,38 @@
+--- a/configure
++++ b/configure
+@@ -9633,12 +9633,12 @@
+       # Note: wasi requires --export-memory.
+       # Note: --export-memory is implicit unless --import-memory is given
+       # Note: this requires LLVM >= 16.
+-      as_fn_append CFLAGS " -target wasm32-wasi-threads -pthread"
+-      as_fn_append CFLAGS_NODIST " -target wasm32-wasi-threads -pthread"
+-      as_fn_append LDFLAGS_NODIST " -target wasm32-wasi-threads -pthread"
++      as_fn_append CFLAGS " --target=wasm32-wasip1-threads -pthread"
++      as_fn_append CFLAGS_NODIST " --target=wasm32-wasip1-threads -pthread"
++      as_fn_append LDFLAGS_NODIST " --target=wasm32-wasip1-threads -pthread"
+       as_fn_append LDFLAGS_NODIST " -Wl,--import-memory"
+       as_fn_append LDFLAGS_NODIST " -Wl,--export-memory"
+-      as_fn_append LDFLAGS_NODIST " -Wl,--max-memory=10485760"
++      as_fn_append LDFLAGS_NODIST " -Wl,--max-memory=67108864"
+ 
+ fi
+ 
+--- a/configure.ac
++++ b/configure.ac
+@@ -2469,12 +2469,12 @@
+       # Note: wasi requires --export-memory.
+       # Note: --export-memory is implicit unless --import-memory is given
+       # Note: this requires LLVM >= 16.
+-      AS_VAR_APPEND([CFLAGS], [" -target wasm32-wasi-threads -pthread"])
+-      AS_VAR_APPEND([CFLAGS_NODIST], [" -target wasm32-wasi-threads -pthread"])
+-      AS_VAR_APPEND([LDFLAGS_NODIST], [" -target wasm32-wasi-threads -pthread"])
++      AS_VAR_APPEND([CFLAGS], [" --target=wasm32-wasip1-threads -pthread"])
++      AS_VAR_APPEND([CFLAGS_NODIST], [" --target=wasm32-wasip1-threads -pthread"])
++      AS_VAR_APPEND([LDFLAGS_NODIST], [" --target=wasm32-wasip1-threads -pthread"])
+       AS_VAR_APPEND([LDFLAGS_NODIST], [" -Wl,--import-memory"])
+       AS_VAR_APPEND([LDFLAGS_NODIST], [" -Wl,--export-memory"])
+-      AS_VAR_APPEND([LDFLAGS_NODIST], [" -Wl,--max-memory=10485760"])
++      AS_VAR_APPEND([LDFLAGS_NODIST], [" -Wl,--max-memory=67108864"])
+     ])
+ 
+     dnl gh-117645: Set the memory size to 20 MiB, the stack size to 8 MiB,

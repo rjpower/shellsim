@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 
 pub(super) const NAMESPACE: &str = "shellsim_threads_v1";
+pub(super) const NAMESPACE_V2: &str = "shellsim_threads_v2";
 pub(super) const MAX_THREADS: usize = 16;
 // The pinned wasi-libc pthread_create checks the proposal's 29-bit positive TIDs.
 const MAX_THREAD_ID: u32 = 0x1fff_ffff;
@@ -243,18 +244,48 @@ mod tests {
 pub(super) struct Profile {
     pub(super) minimum_pages: u64,
     pub(super) maximum_pages: u64,
+    pub(super) dynamic: bool,
+    pub(super) main_tls: Arc<std::collections::BTreeSet<String>>,
+}
+
+impl Profile {
+    pub(super) fn table_limit(&self) -> usize {
+        if self.dynamic {
+            super::threaded_dynamic::MAX_TABLE_ELEMENTS
+        } else {
+            4096
+        }
+    }
+    pub(super) fn instance_limit(&self) -> usize {
+        if self.dynamic {
+            super::threaded_dynamic::MAX_MODULES + 1
+        } else {
+            1
+        }
+    }
+    pub(super) fn host_bytes(&self) -> u64 {
+        if self.dynamic {
+            ASYNC_STACK_BYTES as u64 + 128 * 1024 + self.table_limit() as u64 * 16
+        } else {
+            THREAD_HOST_BYTES
+        }
+    }
 }
 
 pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> {
     let mut shared = None;
     let mut scheduler = false;
     let mut dynamic = false;
+    let mut scheduler_v2 = false;
+    let mut marker = false;
+    let mut marker_seen = false;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         match payload? {
             wasmparser::Payload::ImportSection(imports) => {
                 for import in imports.into_imports() {
                     let import = import?;
                     scheduler |= import.module == NAMESPACE;
+                    scheduler_v2 |= import.module == NAMESPACE_V2;
                     dynamic |= super::dynamic::Abi::from_namespace(import.module).is_some();
                     if let wasmparser::TypeRef::Memory(memory) = import.ty {
                         if memory.shared {
@@ -265,7 +296,7 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
                                 || import.name != "memory"
                                 || memory.memory64
                                 || shared.is_some()
-                                || maximum > 1024
+                                || maximum > super::threaded_dynamic::MAX_MEMORY_PAGES
                             {
                                 return Err(wasmtime::Error::msg(
                                     "unsupported thread shared-memory ABI",
@@ -274,6 +305,8 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
                             shared = Some(Profile {
                                 minimum_pages: memory.initial,
                                 maximum_pages: maximum,
+                                dynamic: false,
+                                main_tls: Arc::new(Default::default()),
                             });
                         }
                     }
@@ -305,6 +338,13 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
                     }
                 }
             }
+            wasmparser::Payload::CustomSection(section) if section.name() == "shellsim.abi" => {
+                if marker_seen {
+                    return Err(Error::msg("duplicate thread ABI marker"));
+                }
+                marker_seen = true;
+                marker = section.data() == super::threaded_dynamic::MARKER;
+            }
             wasmparser::Payload::MemorySection(memories) => {
                 for memory in memories {
                     if memory?.shared {
@@ -317,12 +357,16 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
             _ => {}
         }
     }
-    if shared.is_some() && (!scheduler || dynamic) {
-        return Err(wasmtime::Error::msg(
-            "shared memory requires the static shellsim_threads_v1 ABI",
-        ));
-    }
-    if shared.is_none() && scheduler {
+    if let Some(profile) = &mut shared {
+        if scheduler_v2 && marker && !scheduler && !dynamic {
+            profile.dynamic = true;
+            profile.main_tls = Arc::new(super::threaded_dynamic::layout::main_tls_exports(bytes)?);
+        } else if !scheduler || scheduler_v2 || dynamic || profile.maximum_pages > 1024 {
+            return Err(wasmtime::Error::msg(
+                "shared memory requires an exact thread ABI",
+            ));
+        }
+    } else if scheduler || scheduler_v2 {
         return Err(wasmtime::Error::msg(
             "thread scheduler imports require shared memory",
         ));
@@ -346,15 +390,29 @@ struct Control {
     live: usize,
     init_owner: Option<u32>,
     init_failed: bool,
+    dynamic: super::threaded_dynamic::Process,
+    slots: BTreeMap<u32, usize>,
 }
 
 #[derive(Clone)]
 pub(super) struct ThreadContext {
     control: Arc<Mutex<Control>>,
     tid: u32,
+    slot: usize,
+    dynamic: bool,
+    pub(super) main_tls: Arc<std::collections::BTreeSet<String>>,
 }
 
 impl ThreadContext {
+    pub(super) fn slot(&self) -> usize {
+        self.slot
+    }
+    pub(super) fn id(&self) -> u32 {
+        self.tid
+    }
+    pub(super) fn dynamic_process(&self) -> super::threaded_dynamic::Process {
+        self.control.lock().expect("thread control").dynamic.clone()
+    }
     pub(super) fn memory(&self) -> SharedMemory {
         self.control.lock().expect("thread control").memory.clone()
     }
@@ -368,6 +426,7 @@ pub(super) struct ThreadGroup {
     module: Module,
     path: String,
     scheduled: Option<crate::clock::EventId>,
+    profile: Profile,
 }
 
 struct Template {
@@ -404,6 +463,8 @@ pub(super) fn start(
         live: 1,
         init_owner: None,
         init_failed: false,
+        dynamic: super::threaded_dynamic::Process::default(),
+        slots: BTreeMap::from([(0, 0)]),
     }));
     let machine = host.machine.clone();
     let template = Template {
@@ -422,6 +483,7 @@ pub(super) fn start(
         module,
         path,
         scheduled: None,
+        profile,
     };
     group.insert(0, 0, Some(host));
     Ok(Guest {
@@ -448,10 +510,10 @@ impl ThreadGroup {
             limits: limits::GuestLimits::new(
                 StoreLimitsBuilder::new()
                     .memory_size(0)
-                    .table_elements(4096)
+                    .table_elements(self.profile.table_limit())
                     .memories(1)
                     .tables(1)
-                    .instances(1)
+                    .instances(self.profile.instance_limit())
                     .build(),
                 0,
             ),
@@ -460,22 +522,38 @@ impl ThreadGroup {
             ffi: super::ffi::State::default(),
             fibers: super::fibers::Budget::default(),
             thread: None,
+            threaded_dynamic: super::threaded_dynamic::StoreState::default(),
             retained: self.template.retained.clone(),
         });
-        host.limits = limits::GuestLimits::new(
-            StoreLimitsBuilder::new()
-                .memory_size(0)
-                .table_elements(4096)
-                .memories(1)
-                .tables(1)
-                .instances(1)
-                .build(),
-            0,
-        );
+        let heap_cap = if self.profile.dynamic {
+            64 * 1024 * 1024
+        } else {
+            0
+        };
+        let store_limits = StoreLimitsBuilder::new()
+            .memory_size(heap_cap)
+            .table_elements(self.profile.table_limit())
+            .memories(1)
+            .tables(1)
+            .instances(self.profile.instance_limit())
+            .build();
+        host.limits = if self.profile.dynamic {
+            limits::GuestLimits::threaded_exception_heap(
+                store_limits,
+                heap_cap,
+                machine.clone(),
+                self.template.retained.clone(),
+            )
+        } else {
+            limits::GuestLimits::new(store_limits, 0)
+        };
         host.machine = machine.clone();
         host.thread = Some(ThreadContext {
             control: self.control.clone(),
             tid,
+            slot: self.control.lock().expect("thread control").slots[&tid],
+            dynamic: self.profile.dynamic,
+            main_tls: self.profile.main_tls.clone(),
         });
         self.guests.insert(
             tid,
@@ -528,7 +606,9 @@ impl ThreadGroup {
                 GuestPoll::Ready(outcome) => match *outcome {
                     GuestOutcome::ThreadReturn { .. } if tid != 0 => {
                         self.guests.remove(&tid);
-                        self.control.lock().expect("thread control").live -= 1;
+                        let mut control = self.control.lock().expect("thread control");
+                        control.live -= 1;
+                        control.slots.remove(&tid);
                     }
                     other => {
                         self.cancel_timer(interp);
@@ -541,7 +621,7 @@ impl ThreadGroup {
                 }
                 GuestPoll::Pending => {
                     let mut control = self.control.lock().expect("thread control");
-                    if !control.waits.blocked(tid) {
+                    if !control.waits.blocked(tid) && !control.dynamic.paused(tid) {
                         control.ready.push_back(tid);
                     }
                 }
@@ -556,7 +636,14 @@ impl ThreadGroup {
                     .push_back(tid);
             }
         }
-        let control = self.control.lock().expect("thread control");
+        let process = self.control.lock().expect("thread control").dynamic.clone();
+        let ready = process.take_ready();
+        let mut control = self.control.lock().expect("thread control");
+        for tid in ready {
+            if self.guests.contains_key(&tid) && !control.ready.contains(&tid) {
+                control.ready.push_back(tid);
+            }
+        }
         if !control.ready.is_empty() {
             return GuestPoll::Pending;
         }
@@ -590,7 +677,7 @@ impl ThreadGroup {
     }
 }
 
-fn register(linker: &mut Linker<Host>) {
+pub(super) fn register(linker: &mut Linker<Host>) {
     linker
         .func_wrap(
             "wasi",
@@ -605,6 +692,7 @@ fn register(linker: &mut Linker<Host>) {
                 {
                     return Err(exhausted());
                 }
+                super::threaded_dynamic::can_block(caller.data())?;
                 let thread = caller.data().thread.as_ref().expect("thread host");
                 let mut control = thread.control.lock().expect("thread control");
                 if control.init_owner.is_some() || control.init_failed {
@@ -623,78 +711,142 @@ fn register(linker: &mut Linker<Host>) {
                     .next_tid
                     .checked_add(1)
                     .ok_or_else(|| Error::msg("thread ID overflow"))?;
+                let slot = (0..MAX_THREADS)
+                    .find(|slot| !control.slots.values().any(|used| used == slot))
+                    .expect("live thread slot bound");
+                control.slots.insert(tid, slot);
                 control.live += 1;
                 control.spawns.push((tid, argument));
                 Ok(tid as i32)
             },
         )
         .expect("thread spawn import");
-    linker
-        .func_wrap(
-            NAMESPACE,
-            "notify",
-            |caller: Caller<'_, Host>, address: u32, count: u32| -> Result<i32, Error> {
-                if !caller
-                    .data()
-                    .machine
-                    .get()
-                    .resources
-                    .charge_cpu(MAX_THREADS as u64)
-                {
-                    return Err(exhausted());
-                }
-                let thread = caller.data().thread.as_ref().expect("thread host");
-                let mut control = thread.control.lock().expect("thread control");
-                atomic_word(&control.memory, address)?;
-                let ready = control.waits.notify(address, count);
-                let count = ready.len() as i32;
-                control.ready.extend(ready);
-                Ok(count)
-            },
-        )
-        .expect("thread notify import");
-    linker
-        .func_wrap_async(
-            NAMESPACE,
-            "wait32",
-            |caller: Caller<'_, Host>, (address, expected, timeout): (u32, u32, i64)| {
-                Box::new(async move {
-                    let thread = caller.data().thread.as_ref().expect("thread host").clone();
-                    let machine = caller.data().machine.clone();
-                    let now = {
-                        let mut interp = machine.get();
-                        if !interp.resources.charge_cpu(MAX_THREADS as u64) {
-                            return Err(exhausted());
-                        }
-                        interp.clock.monotonic_ns()
-                    };
+    for namespace in [NAMESPACE, NAMESPACE_V2] {
+        linker
+            .func_wrap(
+                namespace,
+                "notify",
+                |caller: Caller<'_, Host>, address: u32, count: u32| -> Result<i32, Error> {
+                    if !caller
+                        .data()
+                        .machine
+                        .get()
+                        .resources
+                        .charge_cpu(MAX_THREADS as u64)
                     {
-                        let mut control = thread.control.lock().expect("thread control");
-                        let observed =
-                            atomic_word(&control.memory, address)?.load(Ordering::SeqCst);
-                        if let Some(result) = control
-                            .waits
-                            .begin(thread.tid, address, observed, expected, timeout, now)
-                            .map_err(|error| Error::msg(format!("thread wait failed: {error:?}")))?
-                        {
-                            return Ok(result as i32);
-                        }
+                        return Err(exhausted());
                     }
-                    poll_fn(|_| {
-                        let mut control = thread.control.lock().expect("thread control");
-                        match control.waits.take_result(thread.tid) {
-                            Some(result) => Poll::Ready(Ok(result as i32)),
-                            None => {
-                                machine.signals().suspension = Some(Suspension::Yielded);
-                                Poll::Pending
+                    let thread = caller.data().thread.as_ref().expect("thread host");
+                    let mut control = thread.control.lock().expect("thread control");
+                    atomic_word(&control.memory, address)?;
+                    let ready = control.waits.notify(address, count);
+                    let count = ready.len() as i32;
+                    control.ready.extend(ready);
+                    Ok(count)
+                },
+            )
+            .expect("thread notify import");
+        linker
+            .func_wrap_async(
+                namespace,
+                "wait32",
+                |caller: Caller<'_, Host>, (address, expected, timeout): (u32, u32, i64)| {
+                    Box::new(async move {
+                        super::threaded_dynamic::can_block(caller.data())?;
+                        let thread = caller.data().thread.as_ref().expect("thread host").clone();
+                        let machine = caller.data().machine.clone();
+                        let now = {
+                            let mut interp = machine.get();
+                            if !interp.resources.charge_cpu(MAX_THREADS as u64) {
+                                return Err(exhausted());
+                            }
+                            interp.clock.monotonic_ns()
+                        };
+                        {
+                            let mut control = thread.control.lock().expect("thread control");
+                            let observed =
+                                atomic_word(&control.memory, address)?.load(Ordering::SeqCst);
+                            if let Some(result) = control
+                                .waits
+                                .begin(thread.tid, address, observed, expected, timeout, now)
+                                .map_err(|error| {
+                                    Error::msg(format!("thread wait failed: {error:?}"))
+                                })?
+                            {
+                                return Ok(result as i32);
                             }
                         }
+                        poll_fn(|_| {
+                            let mut control = thread.control.lock().expect("thread control");
+                            match control.waits.take_result(thread.tid) {
+                                Some(result) => Poll::Ready(Ok(result as i32)),
+                                None => {
+                                    machine.signals().suspension = Some(Suspension::Yielded);
+                                    Poll::Pending
+                                }
+                            }
+                        })
+                        .await
                     })
-                    .await
+                },
+            )
+            .expect("thread wait import");
+    }
+    linker
+        .func_wrap_async(
+            NAMESPACE_V2,
+            "thread_ready",
+            |mut caller: Caller<'_, Host>, (low, high): (u32, u32)| {
+                Box::new(async move {
+                    let main = caller
+                        .data()
+                        .threaded_dynamic
+                        .main
+                        .expect("thread main instance");
+                    let memory_size = caller
+                        .data()
+                        .thread
+                        .as_ref()
+                        .expect("thread host")
+                        .memory()
+                        .data_size();
+                    if caller.data().threaded_dynamic.ready
+                        || low >= high
+                        || high as usize > memory_size
+                        || !low.is_multiple_of(16)
+                        || !high.is_multiple_of(16)
+                    {
+                        return Err(Error::msg(format!(
+                            "invalid worker stack readiness: low={low} high={high}"
+                        )));
+                    }
+                    let pointer = main
+                        .get_global(&mut caller, "__stack_pointer")
+                        .ok_or_else(|| Error::msg("thread stack pointer is unavailable"))?
+                        .get(&mut caller)
+                        .i32()
+                        .ok_or_else(|| Error::msg("invalid thread stack pointer"))?
+                        as u32;
+                    if pointer < low || pointer > high {
+                        return Err(Error::msg("worker stack pointer exceeds bounds"));
+                    }
+                    caller.data_mut().threaded_dynamic.stack_bounds = Some((low, high));
+                    if let Some(export) =
+                        main.get_export(&mut caller, "__wasm_apply_global_tls_relocs")
+                    {
+                        let function = export
+                            .into_func()
+                            .ok_or_else(|| Error::msg("invalid global TLS relocation export"))?
+                            .typed::<(), ()>(&caller)?;
+                        let _fiber = super::fibers::begin(&mut caller)?;
+                        function.call_async(&mut caller, ()).await?;
+                    }
+                    caller.data_mut().threaded_dynamic.ready = true;
+                    super::threaded_dynamic::checkpoint(caller.as_context_mut()).await
                 })
             },
         )
-        .expect("thread wait import");
+        .expect("thread ready import");
 }
 
 #[allow(unsafe_code)]
@@ -722,17 +874,15 @@ fn atomic_word(
     })
 }
 
-async fn execute_thread(host: Host, module: Module, path: String, argument: u32) -> GuestOutcome {
-    let initial_fuel = host.initial_fuel;
-    let thread = host.thread.as_ref().expect("thread host").clone();
-    let machine = host.machine.clone();
-    let mut store = Store::new(command_engine(), host);
-    store.limiter(|host| &mut host.limits);
-    store.set_fuel(initial_fuel).expect("fuel configured");
-    store
-        .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
-        .expect("fuel configured");
-    store.call_hook(|mut store, hook| {
+struct ThreadHook;
+
+#[async_trait::async_trait]
+impl wasmtime::CallHookHandler<Host> for ThreadHook {
+    async fn handle_call_event(
+        &self,
+        mut store: StoreContextMut<'_, Host>,
+        hook: CallHook,
+    ) -> Result<(), Error> {
         if matches!(hook, CallHook::CallingHost) {
             charge_consumed_fuel(store.as_context_mut())?;
             let host = store.data_mut();
@@ -747,18 +897,33 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
             host.closed_stdio = (0..3)
                 .filter(|fd| interp.process.fds.get(*fd).is_err())
                 .collect();
-        } else if matches!(hook, CallHook::ReturningFromHost) {
+        } else if matches!(hook, CallHook::ReturningFromHost | CallHook::FuelResume) {
             let mut interp = store.data_mut().machine.get();
             if let Some(signal) = interp.0.as_mut().and_then(Interp::take_default_termination) {
                 return Err(Error::new(GuestExit(128 + signal.number())));
             }
         }
+        super::threaded_dynamic::checkpoint(store.as_context_mut()).await?;
         Ok(())
-    });
+    }
+}
+
+async fn execute_thread(host: Host, module: Module, path: String, argument: u32) -> GuestOutcome {
+    let initial_fuel = host.initial_fuel;
+    let thread = host.thread.as_ref().expect("thread host").clone();
+    let machine = host.machine.clone();
+    let mut store = Store::new(command_engine(), host);
+    store.limiter(|host| &mut host.limits);
+    store.set_fuel(initial_fuel).expect("fuel configured");
+    store
+        .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
+        .expect("fuel configured");
+    store.call_hook_async(ThreadHook);
     let mut linker = build_linker(command_engine());
     register(&mut linker);
     posix_exec::register(&mut linker);
     posix_open::register(&mut linker);
+    super::threaded_dynamic::register(&mut linker);
     let result = async {
         linker.define(&store, "env", "memory", thread.memory())?;
         linker.define_unknown_imports_as_traps(&module)?;
@@ -784,6 +949,11 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
             control.init_failed |= initialized.is_err();
         }
         let instance = initialized?;
+        if thread.dynamic {
+            super::threaded_dynamic::prepare_main(store.as_context_mut(), &module, instance)?;
+        }
+        store.data_mut().threaded_dynamic.main = Some(instance);
+        store.data_mut().threaded_dynamic.ready = thread.tid == 0;
         if thread.tid == 0 {
             instance
                 .get_typed_func::<(), ()>(&mut store, "_start")?

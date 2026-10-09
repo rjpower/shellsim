@@ -4,17 +4,23 @@
 //! Wasm scalar slots and checks the table function's exact signature before a
 //! guest-to-guest call. No value or pointer becomes a host address.
 
-use super::{dynamic, fibers, memory, Host, ERRNO_FAULT, ERRNO_INVAL, ERRNO_NOSPC, ERRNO_SUCCESS};
+use super::{
+    dynamic, fibers, memory, threaded_dynamic, Host, ERRNO_FAULT, ERRNO_INVAL, ERRNO_NOSPC,
+    ERRNO_SUCCESS,
+};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use wasmtime::{Caller, Error, Func, FuncType, Global, Linker, Mutability, Ref, Val, ValType};
+use wasmtime::{
+    AsContextMut, Caller, Error, Func, FuncType, Global, Instance, Linker, Mutability, Ref,
+    StoreContextMut, Val, ValType,
+};
 
 pub(super) const NAMESPACE: &str = "shellsim_ffi_v1";
 const MAX_PARAMS: usize = 16;
-const MAX_CLOSURES: usize = 64;
-const CLOSURE_METADATA_BYTES: u64 = 4096;
+pub(super) const MAX_CLOSURES: usize = 64;
+pub(super) const CLOSURE_METADATA_BYTES: u64 = 4096;
 const STACK_GUARD_BYTES: u32 = 64;
 
 pub(super) fn supported(name: &str) -> bool {
@@ -41,7 +47,7 @@ pub(super) struct State {
 }
 
 #[derive(Clone, Copy)]
-enum Scalar {
+pub(super) enum Scalar {
     I32,
     I64,
     F32,
@@ -88,6 +94,66 @@ impl Scalar {
     }
 }
 
+async fn synchronize(caller: &mut Caller<'_, Host>) -> Result<(), Error> {
+    // Static threaded FFI is rejected by admission. During main instantiation
+    // the validated v3 thread exists before its local Instance is available.
+    if caller.data().thread.is_some() {
+        threaded_dynamic::callbacks::synchronize(caller).await?;
+    }
+    Ok(())
+}
+
+fn main_instance(host: &Host) -> Option<Instance> {
+    host.threaded_dynamic.main.or(host.dynamic.main)
+}
+
+/// Immutable callback metadata may cross Stores; Func handles may not.
+#[derive(Clone)]
+pub(super) enum CallbackSpec {
+    Legacy {
+        dispatch: u32,
+        userdata: u32,
+    },
+    Typed {
+        dispatch: u32,
+        userdata: u32,
+        tags: Arc<[Scalar]>,
+        result: Option<Scalar>,
+    },
+}
+
+pub(super) fn make_callback(
+    mut store: StoreContextMut<'_, Host>,
+    spec: &CallbackSpec,
+    active: Arc<AtomicBool>,
+) -> Func {
+    match spec {
+        CallbackSpec::Legacy { dispatch, userdata } => {
+            let dispatch = *dispatch;
+            let userdata = *userdata;
+            let signature = FuncType::new(store.engine(), [ValType::I32], [ValType::I32]);
+            Func::new_async(&mut store, signature, move |caller, params, results| {
+                let active = active.clone();
+                Box::new(async move {
+                    let Val::I32(argument) = params[0] else {
+                        return Err(Error::msg("FFI callback argument type changed"));
+                    };
+                    results[0] = Val::I32(
+                        dispatch_callback(caller, dispatch, userdata, argument, active).await?,
+                    );
+                    Ok(())
+                })
+            })
+        }
+        CallbackSpec::Typed {
+            dispatch,
+            userdata,
+            tags,
+            result,
+        } => make_typed_closure(store, *dispatch, *userdata, tags.clone(), *result, active),
+    }
+}
+
 fn same_types(mut actual: impl Iterator<Item = ValType>, expected: &[ValType]) -> bool {
     expected.iter().all(|expected| {
         actual
@@ -97,14 +163,23 @@ fn same_types(mut actual: impl Iterator<Item = ValType>, expected: &[ValType]) -
 }
 
 fn stack_contract(caller: &mut Caller<'_, Host>) -> Result<(Global, u32, u32), Error> {
-    let main = caller
-        .data()
-        .dynamic
-        .main
-        .ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
+    let main =
+        main_instance(caller.data()).ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
     let stack = main
         .get_global(&mut *caller, "__stack_pointer")
         .ok_or_else(|| Error::msg("FFI callback stack is unavailable"))?;
+    if let Some((low, high)) = caller.data().threaded_dynamic.stack_bounds {
+        let floor = low
+            .checked_add(STACK_GUARD_BYTES)
+            .ok_or_else(|| Error::msg("FFI callback stack floor is invalid"))?;
+        if stack.ty(&*caller).mutability() != Mutability::Var
+            || high <= floor
+            || stack.get(&mut *caller).i32().is_none()
+        {
+            return Err(Error::msg("FFI callback stack contract is invalid"));
+        }
+        return Ok((stack, floor, high));
+    }
     let stack_low = main
         .get_global(&mut *caller, "__stack_low")
         .ok_or_else(|| Error::msg("FFI callback stack floor is unavailable"))?;
@@ -144,6 +219,7 @@ async fn invoke(
     result_tag: u32,
     result_ptr: u32,
 ) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
     if count as usize > MAX_PARAMS || result_tag > 4 {
         return Ok(ERRNO_INVAL);
     }
@@ -188,7 +264,7 @@ async fn invoke(
         };
         Some(tag)
     };
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -235,14 +311,15 @@ async fn dispatch_callback(
     if !active.load(Ordering::Acquire) {
         return Err(Error::msg("released FFI callback"));
     }
+    synchronize(&mut caller).await?;
+    if !active.load(Ordering::Acquire) {
+        return Err(Error::msg("released FFI callback"));
+    }
     if !caller.data().machine.get().resources.charge_cpu(8) {
         return Err(super::exhausted());
     }
-    let main = caller
-        .data()
-        .dynamic
-        .main
-        .ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
+    let main =
+        main_instance(caller.data()).ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
     let table = main
         .get_table(&mut caller, "__indirect_function_table")
         .ok_or_else(|| Error::msg("FFI callback table vanished"))?;
@@ -282,6 +359,10 @@ async fn dispatch_callback_typed(
     if !active.load(Ordering::Acquire) {
         return Err(Error::msg("released FFI callback"));
     }
+    synchronize(&mut caller).await?;
+    if !active.load(Ordering::Acquire) {
+        return Err(Error::msg("released FFI callback"));
+    }
     if !caller
         .data()
         .machine
@@ -291,11 +372,8 @@ async fn dispatch_callback_typed(
     {
         return Err(super::exhausted());
     }
-    let main = caller
-        .data()
-        .dynamic
-        .main
-        .ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
+    let main =
+        main_instance(caller.data()).ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
     let table = main
         .get_table(&mut caller, "__indirect_function_table")
         .ok_or_else(|| Error::msg("FFI callback table vanished"))?;
@@ -367,6 +445,7 @@ async fn closure_alloc(
     userdata: u32,
     output_ptr: u32,
 ) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
@@ -379,7 +458,7 @@ async fn closure_alloc(
     if caller.data().ffi.closures.len() >= MAX_CLOSURES {
         return Ok(ERRNO_NOSPC);
     }
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -397,6 +476,20 @@ async fn closure_alloc(
     }
     if !caller.data().machine.get().resources.charge_cpu(16) {
         return Err(super::exhausted());
+    }
+    if caller.data().threaded_dynamic.main.is_some() {
+        let Some(slot) = threaded_dynamic::callbacks::reserve(&mut caller).await? else {
+            return Ok(ERRNO_NOSPC);
+        };
+        let spec = CallbackSpec::Legacy {
+            dispatch: dispatch_index,
+            userdata,
+        };
+        if !threaded_dynamic::callbacks::define(&mut caller, slot, spec).await? {
+            return Ok(ERRNO_INVAL);
+        }
+        memory.write(&mut caller, output_ptr as usize, &slot.to_le_bytes())?;
+        return Ok(ERRNO_SUCCESS);
     }
     let reservation = CLOSURE_METADATA_BYTES;
     dynamic::reserve(&mut caller, reservation)?;
@@ -453,6 +546,7 @@ async fn closure_alloc_typed(
     result_tag: u32,
     output_ptr: u32,
 ) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
     if count as usize > MAX_PARAMS || result_tag > 4 {
         return Ok(ERRNO_INVAL);
     }
@@ -487,7 +581,7 @@ async fn closure_alloc_typed(
     if caller.data().ffi.closures.len() >= MAX_CLOSURES {
         return Ok(ERRNO_NOSPC);
     }
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -515,6 +609,22 @@ async fn closure_alloc_typed(
     {
         return Err(super::exhausted());
     }
+    if caller.data().threaded_dynamic.main.is_some() {
+        let Some(slot) = threaded_dynamic::callbacks::reserve(&mut caller).await? else {
+            return Ok(ERRNO_NOSPC);
+        };
+        let spec = CallbackSpec::Typed {
+            dispatch: dispatch_index,
+            userdata,
+            tags: tags.into(),
+            result,
+        };
+        if !threaded_dynamic::callbacks::define(&mut caller, slot, spec).await? {
+            return Ok(ERRNO_INVAL);
+        }
+        memory.write(&mut caller, output_ptr as usize, &slot.to_le_bytes())?;
+        return Ok(ERRNO_SUCCESS);
+    }
     let reservation = CLOSURE_METADATA_BYTES;
     dynamic::reserve(&mut caller, reservation)?;
     let slot = match table.grow(&mut caller, 1, Ref::Func(None)) {
@@ -530,7 +640,7 @@ async fn closure_alloc_typed(
     };
     let active = Arc::new(AtomicBool::new(true));
     let function = make_typed_closure(
-        &mut caller,
+        caller.as_context_mut(),
         dispatch_index,
         userdata,
         tags.into(),
@@ -552,7 +662,7 @@ async fn closure_alloc_typed(
 }
 
 fn make_typed_closure(
-    caller: &mut Caller<'_, Host>,
+    mut caller: StoreContextMut<'_, Host>,
     dispatch_index: u32,
     userdata: u32,
     tags: Arc<[Scalar]>,
@@ -564,7 +674,7 @@ fn make_typed_closure(
         tags.iter().map(|tag| tag.ty()),
         result.iter().map(|tag| tag.ty()),
     );
-    Func::new_async(caller, signature, move |caller, params, results| {
+    Func::new_async(&mut caller, signature, move |caller, params, results| {
         let active = active.clone();
         let tags = tags.clone();
         Box::new(async move {
@@ -586,7 +696,8 @@ fn make_typed_closure(
     })
 }
 
-fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32, Error> {
+async fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
@@ -599,7 +710,7 @@ fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32,
     if caller.data().ffi.closures.len() >= MAX_CLOSURES {
         return Ok(ERRNO_NOSPC);
     }
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -610,6 +721,13 @@ fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32,
     }
     if !caller.data().machine.get().resources.charge_cpu(8) {
         return Err(super::exhausted());
+    }
+    if caller.data().threaded_dynamic.main.is_some() {
+        let Some(slot) = threaded_dynamic::callbacks::reserve(&mut caller).await? else {
+            return Ok(ERRNO_NOSPC);
+        };
+        memory.write(&mut caller, output_ptr as usize, &slot.to_le_bytes())?;
+        return Ok(ERRNO_SUCCESS);
     }
     dynamic::reserve(&mut caller, CLOSURE_METADATA_BYTES)?;
     let slot = match table.grow(&mut caller, 1, Ref::Func(None)) {
@@ -636,7 +754,7 @@ fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32,
     Ok(ERRNO_SUCCESS)
 }
 
-fn closure_define_typed(
+async fn closure_define_typed(
     mut caller: Caller<'_, Host>,
     index: u32,
     dispatch_index: u32,
@@ -645,14 +763,10 @@ fn closure_define_typed(
     count: u32,
     result_tag: u32,
 ) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
     if count as usize > MAX_PARAMS || result_tag > 4 {
         return Ok(ERRNO_INVAL);
     }
-    let Some(position) = caller.data().ffi.closures.iter().position(|closure| {
-        closure.index == index && closure.active.load(Ordering::Acquire) && !closure.prepared
-    }) else {
-        return Ok(ERRNO_INVAL);
-    };
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
@@ -675,7 +789,7 @@ fn closure_define_typed(
     } else {
         Some(Scalar::parse(result_tag as u8).expect("bounded scalar tag"))
     };
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -705,9 +819,29 @@ fn closure_define_typed(
     {
         return Err(super::exhausted());
     }
+    if caller.data().threaded_dynamic.main.is_some() {
+        let spec = CallbackSpec::Typed {
+            dispatch: dispatch_index,
+            userdata,
+            tags: tags.into(),
+            result,
+        };
+        return Ok(
+            if threaded_dynamic::callbacks::define(&mut caller, index, spec).await? {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_INVAL
+            },
+        );
+    }
+    let Some(position) = caller.data().ffi.closures.iter().position(|closure| {
+        closure.index == index && closure.active.load(Ordering::Acquire) && !closure.prepared
+    }) else {
+        return Ok(ERRNO_INVAL);
+    };
     let active = caller.data().ffi.closures[position].active.clone();
     let function = make_typed_closure(
-        &mut caller,
+        caller.as_context_mut(),
         dispatch_index,
         userdata,
         tags.into(),
@@ -719,7 +853,17 @@ fn closure_define_typed(
     Ok(ERRNO_SUCCESS)
 }
 
-fn closure_release(mut caller: Caller<'_, Host>, index: u32) -> Result<i32, Error> {
+async fn closure_release(mut caller: Caller<'_, Host>, index: u32) -> Result<i32, Error> {
+    synchronize(&mut caller).await?;
+    if caller.data().threaded_dynamic.main.is_some() {
+        return Ok(
+            if threaded_dynamic::callbacks::release(&mut caller, index).await? {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_INVAL
+            },
+        );
+    }
     let Some(position) = caller
         .data()
         .ffi
@@ -729,7 +873,7 @@ fn closure_release(mut caller: Caller<'_, Host>, index: u32) -> Result<i32, Erro
     else {
         return Ok(ERRNO_INVAL);
     };
-    let Some(main) = caller.data().dynamic.main else {
+    let Some(main) = main_instance(caller.data()) else {
         return Ok(ERRNO_INVAL);
     };
     let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
@@ -784,24 +928,32 @@ pub(super) fn register(linker: &mut Linker<Host>) {
         )
         .expect("unique FFI import");
     linker
-        .func_wrap(NAMESPACE, "closure_reserve", closure_reserve)
+        .func_wrap_async(NAMESPACE, "closure_reserve", |caller, (output,): (u32,)| {
+            Box::new(closure_reserve(caller, output))
+        })
         .expect("unique FFI import");
     linker
-        .func_wrap(
+        .func_wrap_async(
             NAMESPACE,
             "closure_define_typed",
-            |caller: Caller<'_, Host>,
-             index: u32,
-             dispatch: u32,
-             userdata: u32,
-             tags: u32,
-             count: u32,
-             result_tag: u32| {
-                closure_define_typed(caller, index, dispatch, userdata, tags, count, result_tag)
+            |caller,
+             (index, dispatch, userdata, tags, count, result_tag): (
+                u32,
+                u32,
+                u32,
+                u32,
+                u32,
+                u32,
+            )| {
+                Box::new(closure_define_typed(
+                    caller, index, dispatch, userdata, tags, count, result_tag,
+                ))
             },
         )
         .expect("unique FFI import");
     linker
-        .func_wrap(NAMESPACE, "closure_release", closure_release)
+        .func_wrap_async(NAMESPACE, "closure_release", |caller, (index,): (u32,)| {
+            Box::new(closure_release(caller, index))
+        })
         .expect("unique FFI import");
 }

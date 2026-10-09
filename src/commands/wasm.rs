@@ -43,6 +43,7 @@ mod dynamic;
 mod ffi;
 mod fibers;
 mod guest_memory;
+mod threaded_dynamic;
 mod threads;
 
 use guest_memory::GuestMemory;
@@ -367,6 +368,7 @@ struct Host {
     ffi: ffi::State,
     fibers: fibers::Budget,
     thread: Option<threads::ThreadContext>,
+    threaded_dynamic: threaded_dynamic::StoreState,
     retained: Arc<AtomicU64>,
 }
 
@@ -1860,6 +1862,7 @@ async fn poll_oneoff(
                 ERRNO_FAULT
             });
         }
+        threaded_dynamic::can_block(caller.data())?;
         let host = caller.data_mut();
         if let Some(deadline) = earliest {
             let buffered = matches!(host.stdio, Stdio::Buffered { .. });
@@ -1910,6 +1913,7 @@ fn wrap_stream_call(linker: &mut Linker<Host>, name: &str, call: StreamFn) {
                         match call(&mut caller, fd, iovs, count, result)? {
                             StreamCall::Done(errno) => return Ok(errno),
                             StreamCall::Blocked(reason) => {
+                                threaded_dynamic::can_block(caller.data())?;
                                 let machine = caller.data().machine.clone();
                                 machine.suspend(Suspension::Blocked(reason)).await;
                             }
@@ -2390,14 +2394,20 @@ impl Guest {
 
 /// Apply the same namespace boundary before initial launch and exec preflight.
 /// Broad WASI imports may remain unused; unavailable operations trap on use.
-pub(super) fn validate_imports(module: &Module, threaded: bool) -> Result<(), Error> {
+pub(super) fn validate_imports(
+    module: &Module,
+    threaded: bool,
+    threaded_dynamic: bool,
+) -> Result<(), Error> {
     for import in module.imports() {
         let allowed = import.module() == "wasi_snapshot_preview1"
             || (threaded
                 && ((import.module() == "env" && import.name() == "memory")
                     || (import.module() == "wasi" && import.name() == "thread-spawn")
                     || (import.module() == threads::NAMESPACE
-                        && matches!(import.name(), "wait32" | "notify"))))
+                        && matches!(import.name(), "wait32" | "notify"))
+                    || (import.module() == threads::NAMESPACE_V2
+                        && matches!(import.name(), "wait32" | "notify" | "thread_ready"))))
             || (import.module() == "shellsim_posix_v1"
                 && matches!(
                     import.name(),
@@ -2414,9 +2424,14 @@ pub(super) fn validate_imports(module: &Module, threaded: bool) -> Result<(), Er
                         | "process_identity"
                         | "process_exec"
                 ))
+            || (threaded
+                && import.module() == threaded_dynamic::NAMESPACE
+                && matches!(import.name(), "open" | "symbol" | "error"))
             || (dynamic::Abi::from_namespace(import.module()).is_some()
                 && matches!(import.name(), "open" | "symbol" | "error"))
-            || (!threaded && import.module() == ffi::NAMESPACE && ffi::supported(import.name()))
+            || ((!threaded || threaded_dynamic)
+                && import.module() == ffi::NAMESPACE
+                && ffi::supported(import.name()))
             || (import.module() == "shellsim"
                 && matches!(
                     import.name(),
@@ -2478,8 +2493,14 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     interp.resources.release_memory(scratch);
     let module =
         compiled.map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
-    validate_imports(&module, thread_profile.is_some())
-        .map_err(|error| (126, format!("{path}: {error}")))?;
+    validate_imports(
+        &module,
+        thread_profile.is_some(),
+        thread_profile
+            .as_ref()
+            .is_some_and(|profile| profile.dynamic),
+    )
+    .map_err(|error| (126, format!("{path}: {error}")))?;
     let mut linker = build_linker(command_engine());
     let mut dynamic_abi = None;
     let mut ffi_requested = false;
@@ -2497,9 +2518,16 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             dynamic_abi = Some(abi);
         }
     }
-    if ffi_requested {
+    if ffi_requested
+        && !thread_profile
+            .as_ref()
+            .is_some_and(|profile| profile.dynamic)
+    {
         if thread_profile.is_some() || dynamic_abi.is_some_and(|abi| abi != dynamic::Abi::V2) {
-            return Err((126, format!("{path}: FFI requires dynamic loading ABI v2")));
+            return Err((
+                126,
+                format!("{path}: FFI requires dynamic loading ABI v2 or threaded v3"),
+            ));
         }
         dynamic_abi = Some(dynamic::Abi::V2);
     }
@@ -2541,8 +2569,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     } else {
         ASYNC_STACK_BYTES as u64
     };
-    let memory_cap = if thread_profile.is_some() {
-        MAX_WASM_MEMORY as u64
+    let memory_cap = if let Some(profile) = &thread_profile {
+        profile.maximum_pages * 65_536
     } else if dynamic_abi == Some(dynamic::Abi::V2) {
         256 * 1024 * 1024
     } else if large_image {
@@ -2588,7 +2616,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     let reserved = linear_reservation
         .saturating_add(DIRECTORY_MEMORY)
         .saturating_add(table_memory);
-    let thread_memory = if thread_profile.is_some() {
+    let thread_memory = if let Some(profile) = thread_profile.as_ref() {
         let mut metadata = (interp.process.cwd.len() as u64).saturating_add(96);
         for value in &launch.argv {
             metadata = metadata
@@ -2608,7 +2636,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             return Err((137, format!("{path}: thread metadata budget exhausted")));
         }
         let image = module.image_range();
-        threads::THREAD_HOST_BYTES * threads::MAX_THREADS as u64
+        profile.host_bytes() * threads::MAX_THREADS as u64
             + metadata
             + (image.end as usize).saturating_sub(image.start as usize) as u64
             + (wasm.len() as u64).saturating_mul(2)
@@ -2686,6 +2714,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         ffi: ffi::State::default(),
         fibers: fibers::Budget::default(),
         thread: None,
+        threaded_dynamic: threaded_dynamic::StoreState::default(),
         retained: reserved.dynamic.clone(),
     };
     if let Some(profile) = thread_profile {
@@ -2837,7 +2866,9 @@ fn finish_guest(
         .stop_reason()
         .map_or(status, |reason| reason.exit_status());
     if worker && returned && status == 0 {
+        host.limits.release_thread_heap();
         fibers::release_store(&mut host);
+        threaded_dynamic::release_store(&mut host);
         GuestOutcome::ThreadReturn { host }
     } else {
         GuestOutcome::Exit { status, host }

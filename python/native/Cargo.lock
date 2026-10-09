@@ -955,6 +955,7 @@ dependencies = [
 name = "shellsim"
 version = "0.1.30"
 dependencies = [
+ "async-trait",
  "base64",
  "crc32fast",
  "flate2",
@@ -1215,8 +1216,6 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "49.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c28a746e47c5683ec1233967948c729c18e978a59fda2b964ac6d8fae9f8f3f8"
 dependencies = [
  "addr2line",
  "async-trait",

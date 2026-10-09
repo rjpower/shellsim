@@ -379,7 +379,7 @@ fn reserve_table(caller: &mut Caller<'_, Host>, entries: u64) -> Result<(), Erro
     reserve(caller, entries.saturating_mul(16))
 }
 
-fn canonical_runtime_symbol(name: &str) -> bool {
+pub(super) fn canonical_runtime_symbol(name: &str) -> bool {
     name.starts_with("__cxa_")
         || name.starts_with("_Unwind_")
         || matches!(

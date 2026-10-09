@@ -1,0 +1,36 @@
+{
+  "name": "threaded-ctypes-runtime",
+  "version": "3.13.7",
+  "target": "wasm32-wasip1-threads",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "build_scripts": [
+    {
+      "file": "threaded_ffi_assembly.py",
+      "sha256": "808f511c4554b0cd555d3e73627c91ba9c01398fa4fcb2b56022d594871a3c67"
+    },
+    {
+      "file": "assembly.py",
+      "sha256": "310596051ce0856ca2f5099068898740863a3e38a8a77b238f5b263b458ff7e5"
+    },
+    {
+      "file": "stdlib_ctypes_threaded_recipe.json",
+      "sha256": "abe4d964abff6b23f02030415425b068924d8664d76aea8120586079275d7515"
+    },
+    {
+      "file": "../../native/libffi/threaded/recipe.json",
+      "sha256": "2a593762432598c37855a41136eda672c7cf4e9966939504f54add73aec20352"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    }
+  ]
+}
