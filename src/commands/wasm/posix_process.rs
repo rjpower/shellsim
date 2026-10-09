@@ -8,29 +8,78 @@ use crate::process::Signal;
 use crate::syscalls::{ProcessSpawn, SignalTarget, SpawnFdAction};
 
 const MAX_STRINGS: usize = 131_072;
-// Environment entries coexist briefly with copied map keys/values during decoding.
-const DECODE_MEMORY: u64 = 2 * MAX_STRINGS as u64 + 32_768;
+// Shared strings can retain geometric Vec capacity; environment key/value
+// copies coexist briefly with those strings. Reserve that aggregate peak.
+const DECODE_MEMORY: u64 = 3 * MAX_STRINGS as u64 + 32_768;
 const O_CLOEXEC: u32 = 0x0008_0000;
 const ERRNO_CHILD: i32 = 12;
 const ERRNO_SRCH: i32 = 71;
 
-fn range(bytes: &[u8], pointer: u32, length: usize) -> Result<&[u8], i32> {
-    let start = pointer as usize;
-    let end = start.checked_add(length).ok_or(ERRNO_FAULT)?;
-    bytes.get(start..end).ok_or(ERRNO_FAULT)
+/// Borrow ordinary ranges and copy bounded shared ranges without exposing a heap slice.
+pub(super) trait ReadGuest {
+    fn range(&self, pointer: u32, length: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32>;
+    fn c_string(&self, pointer: u32, limit: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32>;
 }
 
-fn string(bytes: &[u8], pointer: u32, remaining: &mut usize) -> Result<String, i32> {
-    let available = bytes.get(pointer as usize..).ok_or(ERRNO_FAULT)?;
-    let scan = &available[..available.len().min(*remaining)];
-    let end = scan.iter().position(|byte| *byte == 0).ok_or(ERRNO_INVAL)?;
-    *remaining -= end + 1;
-    std::str::from_utf8(&scan[..end])
-        .map(str::to_owned)
-        .map_err(|_| ERRNO_INVAL)
+impl<T: AsRef<[u8]>> ReadGuest for T {
+    fn range(&self, pointer: u32, length: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+        let start = pointer as usize;
+        let end = start.checked_add(length).ok_or(ERRNO_FAULT)?;
+        self.as_ref()
+            .get(start..end)
+            .map(std::borrow::Cow::Borrowed)
+            .ok_or(ERRNO_FAULT)
+    }
+
+    fn c_string(&self, pointer: u32, limit: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+        let available = self.as_ref().get(pointer as usize..).ok_or(ERRNO_FAULT)?;
+        let bytes = &available[..available.len().min(limit)];
+        let end = bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or(ERRNO_INVAL)?;
+        Ok(std::borrow::Cow::Borrowed(&bytes[..end]))
+    }
 }
 
-fn path(bytes: &[u8], pointer: u32, remaining: &mut usize) -> Result<String, i32> {
+pub(super) struct GuestReader<'a, 'b> {
+    pub(super) memory: &'a GuestMemory,
+    pub(super) caller: &'a Caller<'b, Host>,
+}
+
+impl ReadGuest for GuestReader<'_, '_> {
+    fn range(&self, pointer: u32, length: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+        self.memory
+            .bytes(self.caller, pointer as usize, length)
+            .map_err(|_| ERRNO_FAULT)
+    }
+
+    fn c_string(&self, pointer: u32, limit: usize) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+        if pointer as usize > self.memory.data_size(self.caller) {
+            return Err(ERRNO_FAULT);
+        }
+        self.memory
+            .c_string(self.caller, pointer as usize, limit)
+            .map_err(|_| ERRNO_INVAL)
+    }
+}
+
+fn string(bytes: &impl ReadGuest, pointer: u32, remaining: &mut usize) -> Result<String, i32> {
+    let value = bytes.c_string(pointer, *remaining)?;
+    *remaining -= value.len() + 1;
+    match value {
+        std::borrow::Cow::Borrowed(bytes) => std::str::from_utf8(bytes)
+            .map(str::to_owned)
+            .map_err(|_| ERRNO_INVAL),
+        std::borrow::Cow::Owned(bytes) => String::from_utf8(bytes).map_err(|_| ERRNO_INVAL),
+    }
+}
+
+pub(super) fn path(
+    bytes: &impl ReadGuest,
+    pointer: u32,
+    remaining: &mut usize,
+) -> Result<String, i32> {
     let value = string(bytes, pointer, remaining)?;
     if value.len() > 4096 {
         return Err(ERRNO_INVAL);
@@ -38,8 +87,8 @@ fn path(bytes: &[u8], pointer: u32, remaining: &mut usize) -> Result<String, i32
     Ok(value)
 }
 
-fn vector(
-    bytes: &[u8],
+pub(super) fn vector(
+    bytes: &impl ReadGuest,
     pointer: u32,
     count: u32,
     remaining: &mut usize,
@@ -50,7 +99,7 @@ fn vector(
     if count > 256 {
         return Err(ERRNO_INVAL);
     }
-    let entries = range(bytes, pointer, (count as usize + 1) * 4)?;
+    let entries = bytes.range(pointer, (count as usize + 1) * 4)?;
     if entries[count as usize * 4..] != [0, 0, 0, 0] {
         return Err(ERRNO_INVAL);
     }
@@ -70,15 +119,38 @@ fn signal(number: i32) -> Option<Signal> {
     Signal::parse(&number.to_string())
 }
 
+/// Probe virtual identities without queuing a signal or changing dispositions.
+fn signal_probe(processes: &crate::process::ProcessTable, pid: i32, current_group: u32) -> i32 {
+    let exists = if pid > 0 {
+        processes.get(pid as u32).is_some()
+    } else if pid == -1 {
+        return ERRNO_NOTSUP;
+    } else {
+        let group = if pid == 0 {
+            current_group
+        } else {
+            pid.unsigned_abs()
+        };
+        processes
+            .iter()
+            .any(|process| process.process_group == group)
+    };
+    if exists {
+        ERRNO_SUCCESS
+    } else {
+        ERRNO_SRCH
+    }
+}
+
 type SpawnParams = (u32, u32, u32, u32, u32, u32, u32, u32, u32, u32);
 
-fn decode_spawn(bytes: &[u8], params: SpawnParams) -> Result<ProcessSpawn, i32> {
+fn decode_spawn(bytes: &impl ReadGuest, params: SpawnParams) -> Result<ProcessSpawn, i32> {
     let (executable_path, argv, argc, env, envc, actions, actionc, options, defaults, output) =
         params;
     if argc == 0 || actionc > 64 || options & !3 != 0 || (options & 2 == 0 && defaults != 0) {
         return Err(ERRNO_INVAL);
     }
-    range(bytes, output, 4)?;
+    bytes.range(output, 4)?;
     let mut remaining = MAX_STRINGS;
     let executable = path(bytes, executable_path, &mut remaining)?;
     if executable.is_empty() {
@@ -95,7 +167,7 @@ fn decode_spawn(bytes: &[u8], params: SpawnParams) -> Result<ProcessSpawn, i32> 
             Ok((name.to_owned(), value.to_owned()))
         })
         .collect::<Result<BTreeMap<_, _>, _>>()?;
-    let records = range(bytes, actions, actionc as usize * 24)?;
+    let records = bytes.range(actions, actionc as usize * 24)?;
     let mut decoded = Vec::with_capacity(actionc as usize);
     let valid_fd = |fd: i32| (0..MAX_FDS_PER_PROCESS as i32 + 5).contains(&fd);
     for record in records.chunks_exact(24) {
@@ -184,7 +256,13 @@ fn spawn(mut caller: Caller<'_, Host>, params: SpawnParams) -> Result<i32, Error
         return Err(exhausted());
     }
     drop(machine);
-    let decoded = decode_spawn(memory.data(&caller), params);
+    let decoded = decode_spawn(
+        &GuestReader {
+            memory: &memory,
+            caller: &caller,
+        },
+        params,
+    );
     let outcome = match decoded {
         Ok(spec) => ActiveSystem::new(&mut caller.data_mut().machine.get())
             .spawn_process(spec)
@@ -206,8 +284,8 @@ fn pipe(mut caller: Caller<'_, Host>, flags: i32, reader: u32, writer: u32) -> R
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
-    if range(memory.data(&caller), reader, 4).is_err()
-        || range(memory.data(&caller), writer, 4).is_err()
+    if memory.range(&caller, reader as usize, 4).is_err()
+        || memory.range(&caller, writer as usize, 4).is_err()
         || reader.abs_diff(writer) < 4
     {
         return Ok(ERRNO_FAULT);
@@ -239,8 +317,8 @@ async fn wait(
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
-    if range(memory.data(&caller), status, 4).is_err()
-        || range(memory.data(&caller), observed, 4).is_err()
+    if memory.range(&caller, status as usize, 4).is_err()
+        || memory.range(&caller, observed as usize, 4).is_err()
         || status.abs_diff(observed) < 4
     {
         return Ok(ERRNO_FAULT);
@@ -358,17 +436,23 @@ pub(super) fn register(linker: &mut Linker<Host>) {
         .func_wrap(
             "shellsim_posix_v1",
             "process_kill",
-            |mut caller: Caller<'_, Host>, pid: i32, number: i32| -> i32 {
+            |mut caller: Caller<'_, Host>, pid: i32, number: i32| -> Result<i32, Error> {
                 let mut machine = caller.data_mut().machine.get();
                 if number == 0 {
-                    return if pid > 0 && machine.processes.get(pid as u32).is_some() {
-                        ERRNO_SUCCESS
-                    } else {
-                        ERRNO_SRCH
-                    };
+                    if !machine
+                        .resources
+                        .charge_cpu(crate::process::MAX_PROCESSES as u64)
+                    {
+                        return Err(exhausted());
+                    }
+                    return Ok(signal_probe(
+                        &machine.processes,
+                        pid,
+                        machine.process.process_group,
+                    ));
                 }
                 let Some(signal) = signal(number) else {
-                    return ERRNO_INVAL;
+                    return Ok(ERRNO_INVAL);
                 };
                 let target = if pid > 0 {
                     SignalTarget::Process(pid as u32)
@@ -377,12 +461,12 @@ pub(super) fn register(linker: &mut Linker<Host>) {
                 } else if pid < -1 {
                     SignalTarget::Group(pid.unsigned_abs())
                 } else {
-                    return ERRNO_NOTSUP;
+                    return Ok(ERRNO_NOTSUP);
                 };
-                match ActiveSystem::new(&mut machine).kill(target, signal) {
+                Ok(match ActiveSystem::new(&mut machine).kill(target, signal) {
                     Ok(()) => ERRNO_SUCCESS,
                     Err(_) => ERRNO_SRCH,
-                }
+                })
             },
         )
         .expect("unique process import");
@@ -411,6 +495,71 @@ pub(super) fn register(linker: &mut Linker<Host>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zero_signal_probes_virtual_groups_without_changing_processes() {
+        let mut processes = crate::process::ProcessTable::new(12, "/".into(), BTreeMap::new());
+        let child = processes
+            .spawn(
+                12,
+                crate::process::ChildPlacement::NewProcessGroup,
+                "child",
+                "/",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let before = processes.iter().cloned().collect::<Vec<_>>();
+        assert_eq!(signal_probe(&processes, 0, 12), ERRNO_SUCCESS);
+        assert_eq!(signal_probe(&processes, -(child as i32), 12), ERRNO_SUCCESS);
+        assert_eq!(signal_probe(&processes, child as i32, 12), ERRNO_SUCCESS);
+        assert_eq!(signal_probe(&processes, -99, 12), ERRNO_SRCH);
+        assert_eq!(signal_probe(&processes, 0, 99), ERRNO_SRCH);
+        assert_eq!(signal_probe(&processes, i32::MIN, 12), ERRNO_SRCH);
+        assert_eq!(signal_probe(&processes, -1, 12), ERRNO_NOTSUP);
+        assert_eq!(processes.iter().cloned().collect::<Vec<_>>(), before);
+    }
+
+    #[test]
+    fn near_limit_shared_string_consumes_owned_storage_without_copying() {
+        struct OwnedReader {
+            bytes: Vec<u8>,
+            allocated: std::cell::Cell<*const u8>,
+        }
+        impl ReadGuest for OwnedReader {
+            fn range(
+                &self,
+                pointer: u32,
+                length: usize,
+            ) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+                self.bytes.range(pointer, length)
+            }
+            fn c_string(
+                &self,
+                pointer: u32,
+                limit: usize,
+            ) -> Result<std::borrow::Cow<'_, [u8]>, i32> {
+                let bytes = self.bytes.c_string(pointer, limit)?.into_owned();
+                self.allocated.set(bytes.as_ptr());
+                Ok(std::borrow::Cow::Owned(bytes))
+            }
+        }
+        let mut bytes = vec![b'a'; MAX_STRINGS];
+        bytes[MAX_STRINGS - 1] = 0;
+        let reader = OwnedReader {
+            bytes,
+            allocated: std::cell::Cell::new(std::ptr::null()),
+        };
+        let mut remaining = MAX_STRINGS;
+        let value = string(&reader, 0, &mut remaining).unwrap();
+        assert_eq!(value.len(), MAX_STRINGS - 1);
+        assert_eq!(value.as_ptr(), reader.allocated.get());
+        assert_eq!(remaining, 0);
+        assert_eq!(string(&reader, 0, &mut remaining), Err(ERRNO_INVAL));
+        let unterminated = vec![b'a'; MAX_STRINGS + 1];
+        let mut remaining = MAX_STRINGS;
+        assert_eq!(string(&unterminated, 0, &mut remaining), Err(ERRNO_INVAL));
+        assert_eq!(remaining, MAX_STRINGS);
+    }
 
     #[test]
     fn decoder_bounds_vectors_strings_actions_and_outputs() {

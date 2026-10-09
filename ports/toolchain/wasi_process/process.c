@@ -40,46 +40,36 @@ pid_t getpid(void) { return shellsim_process_identity(SHELLSIM_PROCESS_ID_SELF);
 pid_t getppid(void) { return shellsim_process_identity(SHELLSIM_PROCESS_ID_PARENT); }
 
 extern void (*__real_signal(int signal_number, void (*handler)(int)))(int);
-extern int __real_open(const char *path, int flags, ...);
-extern int __real_openat(int directory, const char *path, int flags, ...);
+__attribute__((import_module("shellsim_posix_v1"), import_name("descriptor_open")))
+extern int shellsim_descriptor_open(int directory, const char *path, int flags, uint32_t mode);
 
-static int finish_open(int fd, int flags) {
-    if (fd < 0 || !(flags & O_CLOEXEC)) return fd;
-    if (fcntl(fd, F_SETFD, FD_CLOEXEC) == 0) return fd;
-    int error = errno;
-    close(fd);
-    errno = error;
+static int virtual_open(int directory, const char *path, int flags, mode_t mode) {
+    int fd = shellsim_descriptor_open(directory, path, flags, mode);
+    if (fd >= 0) return fd;
+    errno = -fd;
     return -1;
 }
 
 int __wrap_open(const char *path, int flags, ...) {
-    int sdk_flags = flags & ~O_CLOEXEC;
-    int fd;
+    mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list arguments;
         va_start(arguments, flags);
-        mode_t mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, mode_t);
         va_end(arguments);
-        fd = __real_open(path, sdk_flags, mode);
-    } else {
-        fd = __real_open(path, sdk_flags);
     }
-    return finish_open(fd, flags);
+    return virtual_open(AT_FDCWD, path, flags, mode);
 }
 
 int __wrap_openat(int directory, const char *path, int flags, ...) {
-    int sdk_flags = flags & ~O_CLOEXEC;
-    int fd;
+    mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list arguments;
         va_start(arguments, flags);
-        mode_t mode = va_arg(arguments, mode_t);
+        mode = va_arg(arguments, mode_t);
         va_end(arguments);
-        fd = __real_openat(directory, path, sdk_flags, mode);
-    } else {
-        fd = __real_openat(directory, path, sdk_flags);
     }
-    return finish_open(fd, flags);
+    return virtual_open(directory, path, flags, mode);
 }
 
 void (*__wrap_signal(int signal_number, void (*handler)(int)))(int) {

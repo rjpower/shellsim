@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Memory,
-    Module, Store, StoreContextMut, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Module,
+    Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{
@@ -40,7 +40,13 @@ use crate::vfs::{resolve_against, VfsError};
 use super::util::ewln;
 
 mod dynamic;
+mod guest_memory;
+mod threads;
+
+use guest_memory::GuestMemory;
 mod limits;
+mod posix_exec;
+mod posix_open;
 mod posix_process;
 
 // The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
@@ -79,6 +85,7 @@ const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
+const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
 const ERRNO_NOSPC: i32 = 51;
 const ERRNO_RANGE: i32 = 68;
 
@@ -138,7 +145,10 @@ fn command_engine() -> &'static Engine {
         let mut config = Config::default();
         config
             .consume_fuel(true)
+            .async_stack_size(ASYNC_STACK_BYTES)
             .wasm_exceptions(true)
+            .wasm_threads(true)
+            .shared_memory(true)
             .wasm_gc(false)
             .collector(Collector::DeferredReferenceCounting);
         Engine::new(&config).expect("valid Wasmtime configuration")
@@ -146,6 +156,7 @@ fn command_engine() -> &'static Engine {
 }
 
 fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
+    threads::reject_raw_waits(source)?;
     static CACHE: OnceLock<Mutex<ModuleCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ModuleCache::default()));
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
@@ -170,12 +181,11 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
 /// borrow the machine from the slot; a second simultaneous borrow is a bug and panics rather
 /// than deadlocking.
 #[derive(Clone, Default)]
-pub(crate) struct MachineAccess(Arc<MachineShared>);
+pub(crate) struct MachineAccess(Arc<MachineShared>, Arc<Mutex<Signals>>);
 
 #[derive(Default)]
 struct MachineShared {
     machine: Mutex<Option<Interp>>,
-    signals: Mutex<Signals>,
 }
 
 /// State passed between host calls and the poller across a guest suspension.
@@ -281,8 +291,12 @@ impl MachineAccess {
         MachineGuard(self.slot())
     }
 
+    fn fork_thread(&self) -> Self {
+        Self(self.0.clone(), Arc::default())
+    }
+
     fn signals(&self) -> std::sync::MutexGuard<'_, Signals> {
-        self.0.signals.lock().expect("wasm signal lock")
+        self.1.lock().expect("wasm signal lock")
     }
 
     /// Return `Pending` once so the poller can report `suspension` to the scheduler.
@@ -348,6 +362,8 @@ struct Host {
     limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
     dynamic: dynamic::Dynamic,
+    thread: Option<threads::ThreadContext>,
+    retained: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -520,12 +536,20 @@ fn descriptor_control(
     })
 }
 
-fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
+fn memory(caller: &mut Caller<'_, Host>) -> Option<GuestMemory> {
+    if let Some(thread) = &caller.data().thread {
+        return Some(GuestMemory::Shared(thread.memory()));
+    }
     caller
         .data()
         .dynamic
         .shared_memory
-        .or_else(|| caller.get_export("memory").and_then(Extern::into_memory))
+        .map(GuestMemory::Ordinary)
+        .or_else(|| match caller.get_export("memory")? {
+            Extern::Memory(memory) => Some(GuestMemory::Ordinary(memory)),
+            Extern::SharedMemory(memory) => Some(GuestMemory::Shared(memory)),
+            _ => None,
+        })
 }
 
 fn read_u32(caller: &mut Caller<'_, Host>, address: u32) -> Option<u32> {
@@ -1191,7 +1215,7 @@ fn fd_readdir(
         return ERRNO_FAULT;
     };
     let end = (pointer as usize).saturating_add(length as usize);
-    if end > memory.data(&caller).len() {
+    if end > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = {
@@ -1312,7 +1336,7 @@ fn path_readlink(
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
-    if (buffer as usize).saturating_add(buffer_length as usize) > memory.data(&caller).len() {
+    if (buffer as usize).saturating_add(buffer_length as usize) > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = u64::from(buffer_length);
@@ -1438,7 +1462,7 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
     let Some(end) = (pointer as usize).checked_add(length as usize) else {
         return ERRNO_FAULT;
     };
-    if end > memory.data(&caller).len() {
+    if end > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = u64::from(length);
@@ -1474,7 +1498,7 @@ fn exhausted() -> Error {
 /// reads and writes, so a larger request transfers a prefix instead of failing.
 fn iovecs(
     caller: &mut Caller<'_, Host>,
-    memory: &Memory,
+    memory: &GuestMemory,
     iovs: u32,
     count: u32,
 ) -> Result<Vec<(usize, usize)>, i32> {
@@ -1496,7 +1520,7 @@ fn iovecs(
         let end = (pointer as usize)
             .checked_add(length as usize)
             .ok_or(ERRNO_FAULT)?;
-        if end > memory.data(&*caller).len() {
+        if end > memory.data_size(&*caller) {
             return Err(ERRNO_FAULT);
         }
         let length = (length as usize).min(MAX_IO_BYTES - total);
@@ -1531,7 +1555,7 @@ fn fd_write(
     };
     let mut bytes = Vec::new();
     for (pointer, length) in vectors {
-        bytes.extend_from_slice(&memory.data(&*caller)[pointer..pointer + length]);
+        bytes.extend_from_slice(&memory.bytes(&*caller, pointer, length)?);
     }
     let host = caller.data_mut();
     let buffered = host.buffered_streams.get(&fd).copied();
@@ -1557,7 +1581,7 @@ fn fd_write(
             match outcome {
                 Ok(IoPoll::Ready(count)) => count,
                 Ok(IoPoll::Blocked(_)) if state.nonblocking => {
-                    return Ok(StreamCall::Done(ERRNO_AGAIN))
+                    return Ok(StreamCall::Done(ERRNO_AGAIN));
                 }
                 Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
                 Err(SyscallError::Descriptor(DescriptorError::BrokenPipe)) => {
@@ -1633,7 +1657,7 @@ fn fd_read(
         _ => match ActiveSystem::new(&mut host.machine.get()).read(fd, total) {
             Ok(IoPoll::Ready(bytes)) => bytes,
             Ok(IoPoll::Blocked(_)) if state.nonblocking => {
-                return Ok(StreamCall::Done(ERRNO_AGAIN))
+                return Ok(StreamCall::Done(ERRNO_AGAIN));
             }
             Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
             Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
@@ -1708,7 +1732,7 @@ fn poll_waits(caller: &mut Caller<'_, Host>, input: u32, count: u32) -> Result<V
                             fd: field(record, 16, 4) as i32,
                             writing: record[8] == 2,
                         },
-                    })
+                    });
                 }
                 _ => return Err(ERRNO_INVAL),
             }
@@ -1746,7 +1770,7 @@ async fn poll_oneoff(
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
-    let length = memory.data(&caller).len();
+    let length = memory.data_size(&caller);
     if (output as usize)
         .checked_add(count as usize * EVENT_BYTES as usize)
         .is_none_or(|end| end > length)
@@ -1931,7 +1955,7 @@ fn cwd_set(
     };
     if (output as usize)
         .checked_add(capacity as usize)
-        .is_none_or(|end| end > memory.data(&caller).len())
+        .is_none_or(|end| end > memory.data_size(&caller))
     {
         return Ok(ERRNO_FAULT);
     }
@@ -2264,10 +2288,15 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
 
 /// A started guest, advanced one poll at a time inside [`MachineAccess::enter`].
 struct Guest {
-    execution: Pin<Box<dyn Future<Output = GuestOutcome> + Send>>,
+    execution: Execution,
     machine: MachineAccess,
     /// Memory reserved for the guest's store until the owner releases it.
     reserved: GuestReservation,
+}
+
+enum Execution {
+    Single(Pin<Box<dyn Future<Output = GuestOutcome> + Send>>),
+    Threads(Box<threads::ThreadGroup>),
 }
 
 /// Retained images and v2 heap growth share an accounting counter with the guest owner, so cancellation
@@ -2288,9 +2317,18 @@ impl GuestReservation {
 }
 
 /// A stopped guest and the host state it leaves behind.
-struct GuestOutcome {
-    status: i32,
-    host: Host,
+enum GuestOutcome {
+    Exit {
+        status: i32,
+        host: Host,
+    },
+    ThreadReturn {
+        host: Host,
+    },
+    Exec {
+        spec: posix_exec::ExecSpec,
+        host: Host,
+    },
 }
 
 enum GuestPoll {
@@ -2311,7 +2349,12 @@ struct Launch<'a> {
 
 impl Guest {
     fn poll(&mut self, interp: &mut Interp) -> GuestPoll {
-        let execution = &mut self.execution;
+        if let Execution::Threads(group) = &mut self.execution {
+            return group.poll(interp);
+        }
+        let Execution::Single(execution) = &mut self.execution else {
+            unreachable!()
+        };
         let outcome = self.machine.enter(interp, || {
             execution
                 .as_mut()
@@ -2340,6 +2383,54 @@ impl Guest {
     }
 }
 
+/// Apply the same namespace boundary before initial launch and exec preflight.
+/// Broad WASI imports may remain unused; unavailable operations trap on use.
+pub(super) fn validate_imports(module: &Module, threaded: bool) -> Result<(), Error> {
+    for import in module.imports() {
+        let allowed = import.module() == "wasi_snapshot_preview1"
+            || (threaded
+                && ((import.module() == "env" && import.name() == "memory")
+                    || (import.module() == "wasi" && import.name() == "thread-spawn")
+                    || (import.module() == threads::NAMESPACE
+                        && matches!(import.name(), "wait32" | "notify"))))
+            || (import.module() == "shellsim_posix_v1"
+                && matches!(
+                    import.name(),
+                    "descriptor_control"
+                        | "descriptor_open"
+                        | "umask"
+                        | "cwd_get"
+                        | "cwd_set"
+                        | "process_pipe"
+                        | "process_spawn"
+                        | "process_wait"
+                        | "process_kill"
+                        | "process_signal_disposition"
+                        | "process_identity"
+                        | "process_exec"
+                ))
+            || (dynamic::Abi::from_namespace(import.module()).is_some()
+                && matches!(import.name(), "open" | "symbol" | "error"))
+            || (import.module() == "shellsim"
+                && matches!(
+                    import.name(),
+                    "path_chmod"
+                        | "display_open"
+                        | "display_present"
+                        | "input_poll_key"
+                        | "display_close"
+                ));
+        if !allowed {
+            return Err(Error::msg(format!(
+                "unsupported wasm import: {}.{}",
+                import.module(),
+                import.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate and compile a Wasm command and prepare its execution without running guest code.
 ///
 /// Failures return an exit status and a diagnostic without a trailing newline.
@@ -2363,49 +2454,26 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     {
         return Err((137, format!("{path}: wasm compilation budget exhausted")));
     }
-    let module = compiled_command_module(&wasm)
-        .map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
-    // Toolchains import a broad libc surface even when a particular compile does not call it.
-    // An unavailable WASI operation must trap if reached, never touch the host or return fake
-    // success. Non-WASI namespaces must still be rejected at instantiation.
-    for import in module.imports() {
-        if import.module() != "wasi_snapshot_preview1"
-            && !(import.module() == "shellsim_posix_v1"
-                && matches!(
-                    import.name(),
-                    "descriptor_control"
-                        | "umask"
-                        | "cwd_get"
-                        | "cwd_set"
-                        | "process_pipe"
-                        | "process_spawn"
-                        | "process_wait"
-                        | "process_kill"
-                        | "process_signal_disposition"
-                        | "process_identity"
-                ))
-            && !(dynamic::Abi::from_namespace(import.module()).is_some()
-                && matches!(import.name(), "open" | "symbol" | "error"))
-            && !(import.module() == "shellsim"
-                && matches!(
-                    import.name(),
-                    "path_chmod"
-                        | "display_open"
-                        | "display_present"
-                        | "input_poll_key"
-                        | "display_close"
-                ))
-        {
-            return Err((
-                126,
-                format!(
-                    "{path}: unsupported wasm import: {}.{}",
-                    import.module(),
-                    import.name()
-                ),
-            ));
-        }
+    threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let thread_profile =
+        threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let scratch = if thread_profile.is_some() {
+        (wasm.len() as u64).saturating_mul(65).saturating_add(4096)
+    } else {
+        0
+    };
+    if !interp.resources.reserve_memory(scratch) {
+        return Err((
+            137,
+            format!("{path}: thread compilation memory budget exhausted"),
+        ));
     }
+    let compiled = compiled_command_module(&wasm);
+    interp.resources.release_memory(scratch);
+    let module =
+        compiled.map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
+    validate_imports(&module, thread_profile.is_some())
+        .map_err(|error| (126, format!("{path}: {error}")))?;
     let mut linker = build_linker(command_engine());
     let mut dynamic_abi = None;
     for import in module.imports() {
@@ -2423,10 +2491,14 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         dynamic::compatible_main(&wasm, abi).map_err(|error| (126, format!("{path}: {error}")))?;
     }
     dynamic::register(&mut linker);
+    posix_exec::register(&mut linker);
+    posix_open::register(&mut linker);
     register_frame_yield(&mut linker);
-    linker
-        .define_unknown_imports_as_traps(&module)
-        .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
+    if thread_profile.is_none() {
+        linker
+            .define_unknown_imports_as_traps(&module)
+            .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
+    }
     let minimum_memory = module
         .exports()
         .filter_map(|export| match export.ty() {
@@ -2446,7 +2518,9 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         0
     };
     let loader_memory = dynamic_abi.map_or(0, dynamic::Abi::fixed_reservation);
-    let memory_cap = if dynamic_abi == Some(dynamic::Abi::V2) {
+    let memory_cap = if thread_profile.is_some() {
+        MAX_WASM_MEMORY as u64
+    } else if dynamic_abi == Some(dynamic::Abi::V2) {
         256 * 1024 * 1024
     } else if large_image {
         MAX_WASM_MEMORY as u64
@@ -2467,7 +2541,22 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             MAX_IO_BYTES as u64
         })
         .min(memory_cap);
-    let linear_reservation = if dynamic_abi == Some(dynamic::Abi::V2) {
+    let linear_reservation = if let Some(profile) = &thread_profile {
+        let maximum = profile.maximum_pages.saturating_mul(65_536);
+        if !interp.resources.charge_cpu(maximum) {
+            return Err((
+                137,
+                format!("{path}: thread shared memory initialization budget exhausted"),
+            ));
+        }
+        if maximum > memory_limit {
+            return Err((
+                137,
+                format!("{path}: thread shared memory budget exhausted"),
+            ));
+        }
+        maximum
+    } else if dynamic_abi == Some(dynamic::Abi::V2) {
         0
     } else {
         memory_limit
@@ -2475,7 +2564,37 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     let reserved = linear_reservation
         .saturating_add(DIRECTORY_MEMORY)
         .saturating_add(table_memory);
-    let reserved = reserved.saturating_add(loader_memory);
+    let thread_memory = if thread_profile.is_some() {
+        let mut metadata = (interp.process.cwd.len() as u64).saturating_add(96);
+        for value in &launch.argv {
+            metadata = metadata
+                .saturating_add(value.len() as u64)
+                .saturating_add(96);
+        }
+        for name in &interp.exported {
+            if let Some(value) = interp.vars.get(name) {
+                metadata = metadata
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(value.len() as u64)
+                    .saturating_add(96);
+            }
+        }
+        let metadata = metadata.saturating_mul(threads::MAX_THREADS as u64 + 2);
+        if !interp.resources.charge_cpu(metadata) {
+            return Err((137, format!("{path}: thread metadata budget exhausted")));
+        }
+        let image = module.image_range();
+        threads::THREAD_HOST_BYTES * threads::MAX_THREADS as u64
+            + metadata
+            + (image.end as usize).saturating_sub(image.start as usize) as u64
+            + (wasm.len() as u64).saturating_mul(2)
+            + 4096
+    } else {
+        0
+    };
+    let reserved = reserved
+        .saturating_add(loader_memory)
+        .saturating_add(thread_memory);
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
@@ -2539,9 +2658,19 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         },
         interaction: launch.interaction,
         dynamic: dynamic::Dynamic::new(dynamic_abi, reserved.dynamic.clone()),
+        thread: None,
+        retained: reserved.dynamic.clone(),
     };
+    if let Some(profile) = thread_profile {
+        return threads::start(host, module, path.to_string(), profile, reserved.clone()).map_err(
+            |error| {
+                interp.resources.release_memory(reserved.fixed);
+                (126, format!("{path}: {error}"))
+            },
+        );
+    }
     Ok(Guest {
-        execution: Box::pin(execute(host, linker, module, path.to_string())),
+        execution: Execution::Single(Box::pin(execute(host, linker, module, path.to_string()))),
         machine,
         reserved,
     })
@@ -2631,11 +2760,34 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
     let _ = charge_consumed_fuel(store.as_context_mut());
     let out_of_fuel = store.get_fuel().unwrap_or(0) == 0;
     let host = store.data_mut();
-    for fd in std::mem::take(&mut host.open_files) {
-        let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
+    if !result
+        .as_ref()
+        .is_err_and(|error| error.is::<posix_exec::GuestExec>())
+    {
+        for fd in std::mem::take(&mut host.open_files) {
+            let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
+        }
     }
+    finish_guest(result, store.into_data(), out_of_fuel, &path, false)
+}
+
+/// Preserve process-wide termination and exec separately from a worker return.
+fn finish_guest(
+    result: Result<(), Error>,
+    mut host: Host,
+    out_of_fuel: bool,
+    path: &str,
+    worker: bool,
+) -> GuestOutcome {
+    let returned = result.is_ok();
     let status = match result {
         Ok(()) => 0,
+        Err(error) if error.is::<posix_exec::GuestExec>() => {
+            let posix_exec::GuestExec(spec) = error
+                .downcast::<posix_exec::GuestExec>()
+                .expect("checked exec transfer");
+            return GuestOutcome::Exec { spec, host };
+        }
         Err(error) => match error.downcast_ref::<GuestExit>() {
             Some(exit) => exit.0,
             None => {
@@ -2657,9 +2809,10 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
         .resources
         .stop_reason()
         .map_or(status, |reason| reason.exit_status());
-    GuestOutcome {
-        status,
-        host: store.into_data(),
+    if worker && returned && status == 0 {
+        GuestOutcome::ThreadReturn { host }
+    } else {
+        GuestOutcome::Exit { status, host }
     }
 }
 
@@ -2742,6 +2895,13 @@ impl WasmProcess {
 
     /// Release the guest's reservations when the process ends, including when it is killed.
     pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
+        if let WasmState::Running(Guest {
+            execution: Execution::Threads(group),
+            ..
+        }) = &mut self.state
+        {
+            group.cancel_timer(interp);
+        }
         if self.reserved.fixed > 0 || self.reserved.dynamic.load(Ordering::Relaxed) > 0 {
             release_guest_resources(interp, &mut self.reserved);
         }
@@ -2776,8 +2936,41 @@ impl WasmProcess {
                 GuestPoll::Pending => return ShellPoll::Pending,
                 GuestPoll::Blocked(reason) => return ShellPoll::Blocked(reason),
                 GuestPoll::Exhausted => (ActiveSystem::new(interp).stop_status(), Vec::new()),
-                GuestPoll::Ready(outcome) => (outcome.status, outcome.host.diagnostic),
+                GuestPoll::Ready(outcome) => match *outcome {
+                    GuestOutcome::Exit { status, host } => (status, host.diagnostic),
+                    GuestOutcome::ThreadReturn { host } => (0, host.diagnostic),
+                    GuestOutcome::Exec { spec, host } => {
+                        self.reserved
+                            .dynamic
+                            .fetch_sub(spec.reserved_bytes, Ordering::Relaxed);
+                        if let Execution::Threads(group) = &mut guest.execution {
+                            group.cancel_timer(interp);
+                        }
+                        drop(host);
+                        self.state = WasmState::Exiting {
+                            status: 0,
+                            message: Vec::new(),
+                            offset: 0,
+                        };
+                        self.release_owned_memory(interp);
+                        match posix_exec::apply(spec, interp) {
+                            Ok(()) => return ShellPoll::Replaced,
+                            Err(error) => {
+                                self.state = WasmState::Exiting {
+                                    status: 126,
+                                    message: format!("{}: exec failed: {error}\n", self.path)
+                                        .into_bytes(),
+                                    offset: 0,
+                                };
+                                return self.poll(interp);
+                            }
+                        }
+                    }
+                },
             };
+            if let Execution::Threads(group) = &mut guest.execution {
+                group.cancel_timer(interp);
+            }
             self.state = WasmState::Exiting {
                 status,
                 message,
@@ -2904,7 +3097,13 @@ impl WasmSession {
         release_guest_resources(&mut environment, &mut guest.reserved);
         let (status, stdout, stderr) = match outcome {
             Some(outcome) => {
-                let GuestOutcome { status, host } = *outcome;
+                let (status, host) = match *outcome {
+                    GuestOutcome::Exit { status, host } => (status, host),
+                    GuestOutcome::ThreadReturn { host } => (0, host),
+                    GuestOutcome::Exec { .. } => {
+                        unreachable!("buffered exec is rejected before transfer")
+                    }
+                };
                 let Stdio::Buffered {
                     stdout, mut stderr, ..
                 } = host.stdio

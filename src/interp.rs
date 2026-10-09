@@ -260,6 +260,8 @@ pub struct ProcessState {
     handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
+    /// Replacement argv, environment and process labels retained by the current exec image.
+    pub(crate) exec_allocation_bytes: u64,
     /// Modeled bytes of bindings saved by `local` in active function scopes.
     local_saved_bytes: u64,
     /// Modeled bytes of positional parameters and variables saved by active function calls.
@@ -488,6 +490,7 @@ impl ProcessState {
             err_trap_active: self.err_trap_active && self.opt_errtrace,
             handling_error: self.handling_error,
             fork_allocation_bytes,
+            exec_allocation_bytes: 0,
             local_saved_bytes: self.local_saved_bytes,
             frame_saved_bytes: 0,
             state_baseline: 0,
@@ -858,6 +861,7 @@ impl Environment {
                 handling_error: false,
                 handling_signal: false,
                 fork_allocation_bytes: 0,
+                exec_allocation_bytes: 0,
                 local_saved_bytes: 0,
                 frame_saved_bytes: 0,
                 state_baseline: 0,
@@ -1118,6 +1122,7 @@ impl Environment {
             self.resources.release_memory(
                 child
                     .fork_allocation_bytes
+                    .saturating_add(child.exec_allocation_bytes)
                     .saturating_add(child.state_reserved)
                     .saturating_add(child.expansion_reserved),
             );
@@ -1135,7 +1140,7 @@ impl Environment {
     }
 
     /// Resolve bounded kernel shebangs into the same process image and PID.
-    fn resolve_spawn_image(
+    pub(crate) fn resolve_spawn_image(
         &mut self,
         mut path: String,
         mut argv: Vec<String>,
@@ -1222,7 +1227,7 @@ impl Environment {
         self.load_argv_program_from(pid, argv, &executable, false)
     }
 
-    fn load_argv_program_from(
+    pub(crate) fn load_argv_program_from(
         &mut self,
         pid: ProcessId,
         mut argv: Vec<String>,
@@ -1840,6 +1845,7 @@ impl Environment {
         let fork_allocation_bytes = self
             .process
             .fork_allocation_bytes
+            .saturating_add(self.process.exec_allocation_bytes)
             .saturating_add(self.process.state_reserved)
             .saturating_add(self.process.expansion_reserved);
         let parent_pid = self.process.ppid;
@@ -2137,6 +2143,16 @@ impl Environment {
         true
     }
 
+    /// Release a completed root image's launch metadata after charging any surviving bindings.
+    pub(crate) fn release_exec_metadata(&mut self) {
+        if self.process.exec_allocation_bytes == 0 {
+            return;
+        }
+        self.sync_shell_memory();
+        let bytes = std::mem::take(&mut self.process.exec_allocation_bytes);
+        self.resources.release_memory(bytes);
+    }
+
     /// Mark the active shell's caught-signal handler complete.
     pub(crate) fn finish_signal_handler(&mut self) {
         self.process.handling_signal = false;
@@ -2151,6 +2167,7 @@ impl Environment {
             self.resources.release_memory(
                 child
                     .fork_allocation_bytes
+                    .saturating_add(child.exec_allocation_bytes)
                     .saturating_add(child.state_reserved)
                     .saturating_add(child.expansion_reserved),
             );

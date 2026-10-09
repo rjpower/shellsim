@@ -41,11 +41,28 @@ virtual PID.
 SDK 34 defines `O_CLOEXEC` as zero. This fixed interpreter uses a reserved
 `0x00080000` flag in its process libc and CPython posix object. `pipe2`, `dup3`,
 `open`, and `openat` set virtual descriptor inheritance accordingly. Ordinary
+`open` and `openat` use the versioned `descriptor_open` import to install the
+descriptor and its flags atomically, including when guest threads can yield.
+The profile accepts read/write/search access, directories, final-component
+`O_NOFOLLOW`, creation, exclusivity, truncation, append and nonblocking mode.
+Other flag capabilities, including synchronous I/O, return `ENOTSUP`.
+Ordinary
 side modules built against the unmodified SDK still see its zero constant;
 they must use `fcntl(F_SETFD, FD_CLOEXEC)` when they need this behavior. A side
 module that statically links SDK's emulated `getpid` also retains its stub;
 ports needing virtual process identity must link to the fixed interpreter's
 canonical symbol.
+
+`exec.c` supplies canonical `execve`, `execv`, `execvp`, and `wait` for native
+tools that link this additional facade. Exec copies bounded UTF-8 argv and
+environment vectors, resolves the supplied PATH, validates the target image,
+then replaces the same virtual PID. Failed validation leaves the old image,
+environment and descriptors intact. Success stops all old guest threads and
+never returns. Buffered display sessions reject exec before replacement.
+The existing CPython overlay does not yet expose `os.exec*` through its platform
+configuration. `tempfile.c` supplies bounded `mkstemp` using virtual random
+bytes and exclusive creation; it never uses host files or a nonexclusive
+temporary-name fallback.
 
 The build overlay preserves the input bundle's native extension ABI. From the
 repository root, with the pinned source bundle already built:

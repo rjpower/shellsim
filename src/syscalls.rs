@@ -1259,6 +1259,12 @@ fn open_file_at(
         return Err(SyscallError::Descriptor(DescriptorError::DescriptorLimit));
     }
     let absolute = resolve_against(cwd, path);
+    // Creation/truncation must follow a final symlink; VFS writes intentionally replace
+    // their named node. Exclusivity, however, tests the link itself even when dangling.
+    if options.create && options.exclusive && interp.vfs.lexists("/", &absolute) {
+        return Err(SyscallError::File(VfsError::Exists(absolute)));
+    }
+    let absolute = interp.vfs.realpath(&absolute, true)?;
     if absolute == "/dev/null" || crate::pseudo_fs::device_kind("/", &absolute).is_some() {
         if options.create && options.exclusive {
             return Err(SyscallError::File(VfsError::Exists(absolute)));

@@ -1,0 +1,10 @@
+[package]
+name = "shellsim-pthreads-spike"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+wasmtime = { version = "=49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "threads"] }
+wasmparser = "=0.258.0"

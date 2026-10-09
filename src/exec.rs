@@ -2981,6 +2981,7 @@ pub(crate) fn poll_machine(
                 );
                 if owner_pid == target_pid {
                     interp.process.program = None;
+                    interp.release_exec_metadata();
                     interp.exiting = Some(status);
                     return Ok(MachinePoll::Ready(status));
                 }
@@ -3045,6 +3046,7 @@ pub(crate) fn poll_machine(
             }
         }
         ShellPoll::Ready(status) if owner_pid == target_pid => {
+            interp.release_exec_metadata();
             interp.invocations.finish_process(
                 owner_pid,
                 status,
