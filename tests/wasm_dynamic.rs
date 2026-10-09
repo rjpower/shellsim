@@ -1160,3 +1160,101 @@ fn v2_cancellation_releases_guest_table_growth() {
     assert!(outcome.usage.memory_peak > 400_000);
     assert_eq!(environment.resources.memory_mark(), 0);
 }
+
+const DEFERRED_V1: &str = r"\80\18\16shellsim.deferred-init\01";
+
+#[test]
+fn deferred_initializers_bind_self_functions_then_run_once_in_order() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (local.set $handle (call $open (i32.const 32) (i32.const 7) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (local.get $handle)) (then unreachable))
+    "#,
+        "",
+    );
+    let library = synthetic_library_profile(
+        true,
+        &format!(r"\01\04\04\00\01\00{DEFERRED_V1}"),
+        r#"
+        (import "env" "__indirect_function_table" (table 1 funcref))
+        (import "env" "__memory_base" (global $base i32))
+        (import "env" "__table_base" (global $table i32))
+        (import "GOT.func" "self_callback" (global $self (mut i32)))
+        (global $phase (mut i32) (i32.const 0))
+        (func $self_callback (export "self_callback") (result i32) (i32.const 42))
+        (elem (global.get $table) $self_callback)
+        (func (export "__wasm_apply_global_relocs")
+            (if (global.get $phase) (then unreachable))
+            (if (i32.eqz (global.get $self)) (then unreachable))
+            (global.set $phase (i32.const 1)))
+        (func (export "__wasm_init_memory")
+            (if (i32.ne (global.get $phase) (i32.const 1)) (then unreachable))
+            (i32.store (global.get $base) (i32.const 17))
+            (global.set $phase (i32.const 2)))
+        (func (export "__wasm_apply_data_relocs")
+            (if (i32.ne (global.get $phase) (i32.const 2)) (then unreachable))
+            (if (i32.ne (i32.load (global.get $base)) (i32.const 17)) (then unreachable))
+            (if (i32.ne (call_indirect (result i32) (global.get $self)) (i32.const 42)) (then unreachable))
+            (global.set $phase (i32.const 3)))
+        (func (export "__wasm_call_ctors")
+            (if (i32.ne (global.get $phase) (i32.const 3)) (then unreachable))
+            (global.set $phase (i32.const 4)))
+    "#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn deferred_initializers_reject_bad_metadata_starts_signatures_and_own_data() {
+    for (marker, extra) in [
+        (r"\80\18\16shellsim.deferred-init\02".to_owned(), ""),
+        (r"\80\18\16shEllsim.deferred-init\01".to_owned(), ""),
+        (format!("{DEFERRED_V1}{DEFERRED_V1}"), ""),
+        (r"\80\19\16shellsim.deferred-init\01\00".to_owned(), ""),
+        (DEFERRED_V1.to_owned(), "(func $start) (start $start)"),
+        (DEFERRED_V1.to_owned(), "(func (export \"__wasm_apply_global_relocs\") (param i32))"),
+        (DEFERRED_V1.to_owned(), "(import \"GOT.mem\" \"own\" (global (mut i32))) (global (export \"own\") (mut i32) (i32.const 0))"),
+    ] {
+        let mut environment = environment();
+        let main = synthetic_main_profile(true,
+            "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))", "");
+        let library = synthetic_library_profile(true, &format!(r"\01\04\00\00\00\00{marker}"), extra);
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &library, 0o644).unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    }
+}
+
+#[test]
+fn deferred_initializer_trap_releases_images_and_environment_remains_usable() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+        "",
+    );
+    let library = synthetic_library_profile(
+        true,
+        &format!(r"\01\04\00\00\00\00{DEFERRED_V1}"),
+        r#"(func (export "__wasm_apply_global_relocs") unreachable)"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app").0, 0);
+    assert_eq!(environment.resources.memory_mark(), 0);
+    let (outcome, stdout, stderr) = environment.run_script_capture("printf recovered");
+    assert_eq!(outcome.exit_status, 0);
+    assert_eq!(stdout, b"recovered");
+    assert!(stderr.is_empty());
+}

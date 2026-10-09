@@ -119,6 +119,7 @@ struct Layout {
     table_align: u32,
     needed: Vec<String>,
     has_start: bool,
+    deferred_init: bool,
 }
 
 /// A bounded binary cursor: section lengths and LEB values are checked before slicing.
@@ -238,6 +239,7 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
     let mut cursor = Cursor(data);
     let mut result = None;
     let mut needed = Vec::new();
+    let mut deferred_init = false;
     while !cursor.0.is_empty() {
         let kind = cursor.byte()?;
         let len = cursor.number()? as usize;
@@ -254,6 +256,7 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
                     table_align: payload.number()?,
                     needed: Vec::new(),
                     has_start: false,
+                    deferred_init: false,
                 });
             }
             2 => {
@@ -279,6 +282,18 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
                     needed.push(name.to_owned());
                 }
             }
+            128 => {
+                if abi != Abi::V2
+                    || deferred_init
+                    || payload.string()? != "shellsim.deferred-init"
+                    || payload.number()? != 1
+                {
+                    return Err(Error::msg(
+                        "unsupported or duplicate deferred initializer protocol",
+                    ));
+                }
+                deferred_init = true;
+            }
             3 | 4 if payload.number()? == 0 => {}
             3 | 4 => return Err(Error::msg("dylink symbol flags and TLS are unsupported")),
             _ => return Err(Error::msg("unsupported dylink metadata subsection")),
@@ -290,6 +305,12 @@ fn layout(source: &[u8], abi: Abi) -> Result<Layout, Error> {
     let mut result = result.ok_or_else(|| Error::msg("library is missing dylink memory layout"))?;
     result.needed = needed;
     result.has_start = has_start;
+    result.deferred_init = deferred_init;
+    if deferred_init && has_start {
+        return Err(Error::msg(
+            "deferred initializer protocol requires an absent module start",
+        ));
+    }
     if result.memory_align > 16
         || result.table_align > 14
         || result.memory_size as usize > super::MAX_WASM_MEMORY
@@ -609,6 +630,26 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
             "dynamic ABI v2 runtime symbols must be owned by the main executable",
         ));
     }
+    if layout.deferred_init {
+        for name in [
+            "__wasm_apply_global_relocs",
+            "__wasm_init_memory",
+            "__wasm_apply_data_relocs",
+            "__wasm_call_ctors",
+        ] {
+            if let Some(export) = module.exports().find(|export| export.name() == name) {
+                match export.ty() {
+                    ExternType::Func(function)
+                        if function.params().len() == 0 && function.results().len() == 0 => {}
+                    _ => {
+                        return Err(Error::msg(
+                            "deferred initializer must be a zero-argument void function",
+                        ))
+                    }
+                }
+            }
+        }
+    }
     let mut dependencies = Vec::new();
     for name in &layout.needed {
         let dependency = Box::pin(load(caller, format!("/lib/{name}"), 2)).await?;
@@ -746,6 +787,14 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
                                 "dynamic symbol kind mismatch: {name}"
                             )));
                         }
+                        if layout.deferred_init && namespace == "GOT.mem" {
+                            // Mutable exported address globals have not been relocated yet.
+                            // Protocol v1 supplies no relative data-symbol metadata, so own
+                            // data GOT binding needs a later explicitly described profile.
+                            return Err(Error::msg(
+                                "deferred initializer own data GOT symbols are unsupported",
+                            ));
+                        }
                         if layout.has_start {
                             return Err(Error::msg(
                                 "dynamic module start cannot use a self-referential GOT symbol",
@@ -813,7 +862,20 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
         let value = address(caller, symbol.0, symbol.1)?;
         global.set(&mut *caller, Val::I32(value as i32))?;
     }
-    for name in ["__wasm_apply_data_relocs", "__wasm_call_ctors"] {
+    // Protocol v1 omits the compiler's implicit start. Own function GOT slots
+    // now have stable addresses; relocate exported globals before owner memory
+    // initialization, data-pointer relocations, and constructors, in that order.
+    let initializers: &[&str] = if layout.deferred_init {
+        &[
+            "__wasm_apply_global_relocs",
+            "__wasm_init_memory",
+            "__wasm_apply_data_relocs",
+            "__wasm_call_ctors",
+        ]
+    } else {
+        &["__wasm_apply_data_relocs", "__wasm_call_ctors"]
+    };
+    for &name in initializers {
         if let Some(function) = instance.get_func(&mut *caller, name) {
             let _fiber = fibers::begin(&mut *caller)?;
             function
