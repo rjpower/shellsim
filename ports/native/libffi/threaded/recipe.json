@@ -45,7 +45,7 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "bd59c4ac3af7456ff5fe640148f8f4850b91aa5fdc015de429868b182b9c2fae"
+      "sha256": "72f241ca7e9b78349a0d22fb598e3221680a810670ce732454376846822b8ad3"
     },
     {
       "file": "toolchain.py",

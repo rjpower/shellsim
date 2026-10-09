@@ -6,8 +6,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from ports.native.libffi.threaded.toolchain import admit
-
 from ports._support.build import check_build_scripts
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
@@ -19,6 +17,7 @@ from ports.native.dependencies import (
     target_environment,
     verify_artifact,
 )
+from ports.native.libffi.threaded.toolchain import admit
 
 PORT = Path(__file__).resolve().parent
 SOURCES = ("_ctypes.c", "callbacks.c", "callproc.c", "stgdict.c", "cfield.c")

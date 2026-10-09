@@ -47,11 +47,11 @@
   "build_scripts": [
     {
       "file": "stdlib_ctypes_threaded.py",
-      "sha256": "aedc256e8e75f16cf5d22331819fcb49c0d6eb92b4c3efaf5d05935ea13ab509"
+      "sha256": "26fd5539ae0e4af17e74639df5f41d9f1b7d59b96cc3b83d135257a5543a944d"
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "2a593762432598c37855a41136eda672c7cf4e9966939504f54add73aec20352"
+      "sha256": "845d0a4a7de1042889e7d856ea0fec1f5a5380d28f31dd1eff0bab04bf0b839f"
     },
     {
       "file": "../../native/libffi/threaded/toolchain.py",
