@@ -59,7 +59,7 @@
     },
     {
       "file": "../../dynamic/fixtures/bridge.c",
-      "sha256": "be7b9455df9d179e1ff9fe0c364e57ddebbd06b2e86b58f59eac64901f48b26f"
+      "sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23"
     },
     {
       "file": "../../dynamic/fixtures/cpp_extension.cpp",

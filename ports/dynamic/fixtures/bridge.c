@@ -16,7 +16,7 @@ __attribute__((import_module(SHELLSIM_DYLINK_NAMESPACE), import_name("error")))
 extern uint32_t shellsim_error(char *, uint32_t);
 
 void *__wrap_dlopen(const char *path, int flags) {
-    if (!path) return NULL;
+    if (!path) return (void *)(uintptr_t)shellsim_open(NULL, 0, flags);
     return (void *)(uintptr_t)shellsim_open(path, strlen(path), flags);
 }
 void *__wrap_dlsym(void *handle, const char *symbol) {

@@ -20,6 +20,17 @@ SHELLSIM_FFI_PROOF_ARTIFACTS=/tmp/shellsim-ffi-proof \
   cargo test --test wasm_ffi -- --include-ignored
 ```
 
+The builder also produces `python_main_handle.so`. With a dynamic CPython
+bundle built from the same pinned SDK and canonical bridge, its guest test
+loads the extension and calls `PyLong_FromLong` through `dlopen(NULL)` and
+`dlsym` on the actual main interpreter:
+
+```sh
+SHELLSIM_FFI_PYTHON_BUNDLE=/tmp/shellsim-dynamic-v2-main-handle \
+SHELLSIM_FFI_PROOF_ARTIFACTS=/tmp/shellsim-ffi-proof \
+  cargo test --test wasm_dynamic sdk34_python_extension_calls_main_image_c_api -- --ignored
+```
+
 The ordinary test cases also check invalid signatures and output pointers,
 closure capacity, slot invalidation, exception unwinding, a nested virtual
 clock wait, and cancellation by `timeout`. The proof interface accepts only

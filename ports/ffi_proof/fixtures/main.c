@@ -15,7 +15,16 @@ static int callback_dispatch(uint32_t userdata, int argument) {
     return (int)userdata + argument;
 }
 
+__attribute__((visibility("default"))) int ffi_main_export(int value) {
+    return value + 2;
+}
+
 int main(void) {
+    void *main_image = dlopen(NULL, RTLD_NOW);
+    if (!main_image) return 11;
+    int (*from_main)(int) = (int (*)(int))dlsym(main_image, "ffi_main_export");
+    if (!from_main || from_main(40) != 42) return 12;
+    if (dlopen(NULL, 0) || !dlerror()) return 13;
     void *provider = dlopen("/lib/libffi_proof.so", RTLD_NOW | RTLD_LOCAL);
     if (!provider) {
         puts(dlerror());

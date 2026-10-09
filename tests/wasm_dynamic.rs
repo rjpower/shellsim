@@ -894,6 +894,57 @@ fn v2_start_observes_resolved_external_got_values() {
 }
 
 #[test]
+fn dlopen_null_returns_a_nonzero_main_image_handle() {
+    for v2 in [false, true] {
+        let mut environment = environment();
+        let main = synthetic_main_profile(
+            v2,
+            r#"(local.set $handle (call $open (i32.const 0) (i32.const 0) (i32.const 2)))
+            (if (i32.ne (local.get $handle) (i32.const -1)) (then unreachable))
+            (if (i32.ne (call_indirect (result i32)
+                (call $symbol (local.get $handle) (i32.const 128) (i32.const 11)))
+                (i32.const 42)) (then unreachable))
+            (if (call $open (i32.const 0) (i32.const 0) (i32.const 0)) (then unreachable))"#,
+            r#"(data (i32.const 128) "main_answer")
+            (func (export "main_answer") (result i32) (i32.const 42))"#,
+        );
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires a built SDK34 Python bundle and FFI proof extension"]
+fn sdk34_python_extension_calls_main_image_c_api() {
+    let bundle = PathBuf::from(std::env::var_os("SHELLSIM_FFI_PYTHON_BUNDLE").unwrap());
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_FFI_PROOF_ARTIFACTS").unwrap());
+    let rootfs = bundle.join("rootfs");
+    let mut environment = environment();
+    mount_tree(&mut environment, &rootfs, &rootfs);
+    put(
+        &mut environment,
+        &artifacts.join("python_main_handle.so"),
+        "/work/python_main_handle.so",
+        false,
+    );
+    environment
+        .vfs
+        .write(
+            "/",
+            "/work/probe.py",
+            b"import python_main_handle\nassert python_main_handle.answer() == 42\nprint('main-image CPython C API: ok')\n",
+            0o644,
+        )
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "/usr/bin/python3.wasm /work/probe.py"),
+        (0, b"main-image CPython C API: ok\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
 fn v2_resolves_own_got_symbols_before_relocations() {
     let mut environment = environment();
     let main = synthetic_main_profile(

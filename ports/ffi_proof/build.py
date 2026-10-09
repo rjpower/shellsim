@@ -48,6 +48,22 @@ def build(bundle: Path, output: Path) -> None:
     )
     mark_abi(provider, recipe["abi"].encode())
 
+    python_extension = output / "python_main_handle.so"
+    run(
+        [
+            clang,
+            *flags,
+            *toolchain["side_link_flags"],
+            f"-I{bundle / 'Python-3.13.7/Include'}",
+            f"-I{bundle / 'wasi-build'}",
+            str(PORT / "fixtures/python_main_handle.c"),
+            "-o",
+            str(python_extension),
+        ],
+        env=environment,
+    )
+    mark_abi(python_extension, recipe["abi"].encode())
+
     bridge_object = output / "bridge.o"
     run(
         [
@@ -86,7 +102,7 @@ def build(bundle: Path, output: Path) -> None:
         "recipe_sha256": file_hash(PORT / "recipe.json"),
         "build_script_sha256": recipe["build_script_sha256"],
         "sources_sha256": recipe["sources_sha256"],
-        "files": {path.name: file_hash(path) for path in (main, provider)},
+        "files": {path.name: file_hash(path) for path in (main, provider, python_extension)},
     }
     (output / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
 

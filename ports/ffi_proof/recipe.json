@@ -3,10 +3,11 @@
   "version": 1,
   "abi": "shellsim-wasi-sdk34-cpython3137-v2",
   "sdk_sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
-  "build_script_sha256": "0f74ce830cd4f4e272ead08aa860e47949ff2e6c158c8c7b09c933329fed14f7",
-  "bridge_sha256": "be7b9455df9d179e1ff9fe0c364e57ddebbd06b2e86b58f59eac64901f48b26f",
+  "build_script_sha256": "73c580b5de851bd65941143edd6a55423d73f365c31351a24f9ea7f3a0b60520",
+  "bridge_sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
   "sources_sha256": {
-    "fixtures/main.c": "bd4692a1282a7d98d5d251f113a878c5e0129f94b613780c9f88c930bb74546a",
-    "fixtures/provider.c": "89e1e78245560eb85c2059c57a57469b6c0f1293c10f5364257a3609aff125c5"
+    "fixtures/main.c": "e308799d26bae780bc8d84130451b33f7e05893e6af8e0630b174541383bfaef",
+    "fixtures/provider.c": "89e1e78245560eb85c2059c57a57469b6c0f1293c10f5364257a3609aff125c5",
+    "fixtures/python_main_handle.c": "e8c5331da342803d54629482ee02f73304cd36dcfb19ce805f4ff065fe9c7221"
   }
 }

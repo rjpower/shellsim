@@ -28,6 +28,7 @@ const ABI_SECTION: &str = "shellsim.abi";
 const ABI: &[u8] = b"shellsim-wasi-sdk24-cpython3137-v1";
 const ABI_V2: &[u8] = b"shellsim-wasi-sdk34-cpython3137-v2";
 pub(super) const MAX_LOADS: usize = 32;
+const MAIN_HANDLE: u32 = u32::MAX;
 const MAX_LIBRARY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_STRING_BYTES: usize = 4096;
@@ -570,11 +571,7 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
         .dynamic
         .abi
         .ok_or_else(|| Error::msg("dynamic loading ABI is unavailable"))?;
-    if flags & !(1 | 2 | 8 | 256 | 4096) != 0
-        || flags & 3 == 0
-        || flags & 3 == 3
-        || flags & (8 | 256) == (8 | 256)
-    {
+    if !valid_open_flags(flags) {
         return Err(Error::msg("unsupported dlopen flags"));
     }
     let path = resolve_against(&caller.data().cwd, &path);
@@ -836,6 +833,13 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
     Ok(handle)
 }
 
+fn valid_open_flags(flags: u32) -> bool {
+    flags & !(1 | 2 | 8 | 256 | 4096) == 0
+        && flags & 3 != 0
+        && flags & 3 != 3
+        && flags & (8 | 256) != (8 | 256)
+}
+
 pub(super) fn register(linker: &mut Linker<Host>) {
     for abi in [Abi::V1, Abi::V2] {
         linker
@@ -844,6 +848,14 @@ pub(super) fn register(linker: &mut Linker<Host>) {
                 "open",
                 |mut caller: Caller<'_, Host>, (pointer, length, flags): (u32, u32, u32)| {
                     Box::new(async move {
+                        if pointer == 0 && length == 0 {
+                            if !valid_open_flags(flags) {
+                                caller.data_mut().dynamic.error =
+                                    Some("unsupported dlopen flags".to_owned());
+                                return Ok(0);
+                            }
+                            return Ok(MAIN_HANDLE);
+                        }
                         let path = guest_string(&mut caller, pointer, length)?;
                         if caller.data().dynamic.loading || caller.data().dynamic.failed {
                             caller.data_mut().dynamic.error = Some(
@@ -889,7 +901,7 @@ pub(super) fn register(linker: &mut Linker<Host>) {
                  length: u32|
                  -> Result<u32, Error> {
                     let name = guest_string(&mut caller, pointer, length)?;
-                    let result = if handle == 0 {
+                    let result = if handle == 0 || handle == MAIN_HANDLE {
                         lookup(&mut caller, &name)
                     } else {
                         let library = caller

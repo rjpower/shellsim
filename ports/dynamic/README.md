@@ -46,9 +46,12 @@ file conflicts are rejected by catalog selection and staging. Symbol lookup sear
 the main executable and global libraries, then the deterministic dependency
 closure. All side EH tags are imported; C++ runtime symbols belong to the main
 executable. Compiler-emitted start initializers run under the process's
-metering; external GOT imports must resolve before instantiation, and unresolved
-self GOT imports are rejected. SDK 34 mutable exported globals contain absolute
-addresses; immutable exported data globals retain relative offsets. A side
+metering; external GOT imports must resolve before instantiation. A self GOT
+function or data import can resolve to the side module's own export after
+instantiation, before relocation functions and constructors. A side module
+with a start section cannot use that deferred resolution. SDK 34 mutable
+exported globals contain absolute addresses; immutable exported data globals
+retain relative offsets. A side
 module cannot define a private canonical C++ exception tag or runtime. TLS,
 unloading, guest-initiated nested loading and arbitrary native-wheel
 compatibility remain outside this proof. SDK 24 libraries cannot enter a v2
@@ -60,6 +63,9 @@ hits, and compilation consumes ten CPU units per source byte. Retained costs
 include the actual image, twice the source length, 4 KiB and table entries.
 Actual linear memory plus EH heap growth is limited to an aggregate 256 MiB
 within the environment's memory budget.
+The outer Wasmtime async stack is charged at 2 MiB. Each nested host call into
+guest code reserves another 2 MiB up to eight simultaneous levels; each
+Store retains its high-water charge until completion.
 
 ## SDK 24 ABI v1
 
@@ -99,6 +105,9 @@ an assertion that arbitrary marked binaries are compatible. The executable
 imports `open`, `symbol` and `error` from `shellsim_dylink_v1`, exports its memory,
 function table, mutable C stack pointer, `malloc` and required C API symbols.
 The C bridge supplies `dlopen`, `dlsym`, `dlerror` and a process-lifetime `dlclose`.
+`dlopen(NULL, flags)` returns a reserved nonzero main-image handle; `dlsym` on
+that handle searches the main executable and globally visible libraries.
+Unsupported flag combinations still fail through `dlerror`.
 
 Libraries use LLVM's wasm32 `dylink.0` layout and import the executable's memory,
 stack and table. The loader allocates aligned data through guest `malloc`, grows
