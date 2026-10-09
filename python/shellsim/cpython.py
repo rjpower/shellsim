@@ -102,6 +102,27 @@ class CPythonRuntime:
         self.builtin_modules = tuple(self.manifest.get("builtin_modules", ()))
         self._verify()
 
+    @classmethod
+    def from_release(
+        cls,
+        descriptor: Union[str, Path],
+        *,
+        cache_dir: Union[str, Path, None] = None,
+        venv: Union[str, Path, None] = None,
+        offline: bool = False,
+    ) -> CPythonRuntime:
+        """Load a trusted local release descriptor and verify its cached cohort.
+
+        The descriptor must be supplied by the caller until release assets and a
+        matching pin are published with shellsim. Downloads run only on the host.
+        """
+        from ._cpython_release import materialize
+
+        bundle, universe, uv = materialize(
+            Path(descriptor), cache_dir=Path(cache_dir) if cache_dir is not None else None, offline=offline
+        )
+        return cls(bundle, universe=universe, uv=uv, venv=venv)
+
     def _verify(self) -> None:
         root = self.bundle / "rootfs"
         if root.is_symlink() or not root.is_dir():
