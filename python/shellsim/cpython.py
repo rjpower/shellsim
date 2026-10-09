@@ -36,8 +36,18 @@ class CPythonRuntime:
     and ``rootfs``. Keep that directory unchanged while mounting it.
     """
 
-    def __init__(self, bundle: Union[str, Path]) -> None:
+    def __init__(
+        self,
+        bundle: Union[str, Path],
+        *,
+        universe: Union[str, Path, None] = None,
+        uv: Union[str, Path, None] = None,
+    ) -> None:
         self.bundle = Path(bundle)
+        self.universe = Path(universe) if universe is not None else None
+        self.uv = Path(uv).resolve() if uv is not None else None
+        if (self.universe is None) != (self.uv is None):
+            raise ValueError("a CPython package universe requires an explicit patched uv executable")
         manifest_path = self.bundle / "manifest.json"
         if manifest_path.stat().st_size > 1024 * 1024:
             raise ValueError("CPython manifest exceeds 1 MiB")
@@ -113,18 +123,25 @@ class CPythonRuntime:
         environment.mount(target, self.site_packages)
 
     def install_pypi(self, environment: Environment, requirement: str) -> None:
-        """Resolve pure wheels and dependencies with host uv for Python 3.13.
+        """Resolve packages for the bundle's Python and WASI ABI.
 
-        Source distributions may execute trusted build code on the host. Native
-        wheels require separate WASI source recipes.
-        The environment must be idle throughout staging. Guest imports use the
-        installed files without shellsim VM module substitutions.
+        A dynamic bundle requires an explicit local universe and patched uv.
+        Static bundles retain their existing pure-wheel installation path.
         """
         if not isinstance(requirement, str):
             raise TypeError("requirement must be str")
         if _REQUIREMENT.fullmatch(requirement) is None:
             raise ValueError("requirement must name a PyPI distribution with optional extras or version")
         self._verify()
+        if self.manifest.get("dynamic_abi"):
+            if self.universe is None or self.uv is None:
+                raise PackageInstallError("dynamic CPython packages require a local universe and patched uv executable")
+            from ._cpython_universe import install
+
+            install(self, environment, requirement)
+            return
+        if self.universe is not None:
+            raise PackageInstallError("a package universe requires a dynamic CPython bundle")
         with tempfile.TemporaryDirectory(prefix="shellsim-cpython-pypi-") as temp:
             target = Path(temp) / "site-packages"
             target.mkdir()

@@ -43,7 +43,53 @@ assert result.returncode == 0, result.stderr
 assert result.stdout == b"https\n"
 ```
 
-`install_pypi` uses host uv to resolve Python 3.13 requirements and dependencies.
+For a dynamic v2 bundle, build the pinned [uv WASI resolver](toolchain/uv/README.md)
+and make a local catalog for that bundle. The fixture builder uses the separately
+built zlib extension and provider; optional wheel arguments add the independently
+built NumPy wheel and the pinned upstream magiccube pure wheel:
+
+```sh
+uv run --no-project --python 3.13 python ports/dynamic/package_spike.py \
+  --bundle /tmp/shellsim-dynamic-v2 \
+  --output /tmp/shellsim-package-universe \
+  --numpy-wheel /tmp/shellsim-numpy-dynamic/numpy-2.3.5-cp313-cp313-wasm32_wasip1.whl \
+  --magiccube-wheel /tmp/shellsim-numpy-workflow/downloads/magiccube-0.3.0-py3-none-any.whl
+```
+
+The output contains `catalog.json`, native wheels and providers, and a local
+pure-wheel Simple index for this offline fixture. The installer generates a
+native Simple index from the catalog. A catalog declares `schema_version: 1`,
+`abi` matching the bundle's `dynamic_abi`, `target: wasm32-wasip1`,
+`python_version: 3.13.7`, `packages` with distribution name, version, relative
+wheel path, and whole-wheel SHA256, and `native_providers` with soname, relative
+path, `/lib` destination, SHA256, and declared native dependencies. Curated
+wheels carry `<distribution>.dist-info/shellsim-native.json` with the same ABI,
+name/version, source and compiler provenance, and each native file's relative
+path, SHA256, and native dependencies. The `pure_index` key can select a local
+Simple index; otherwise pure wheels resolve from PyPI. A curated distribution
+name is authoritative: its unavailable versions do not fall back to PyPI.
+
+```python
+runtime = CPythonRuntime(
+    "/tmp/shellsim-dynamic-v2",
+    universe="/tmp/shellsim-package-universe",
+    uv="/tmp/shellsim-uv/uv",
+)
+env = Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+runtime.mount(env)
+runtime.install_pypi(env, "magiccube==0.3.0")
+result = runtime.run(env, ["-c", "import magiccube, numpy; print(numpy.arange(4).sum())"])
+assert result.returncode == 0, result.stderr
+assert result.stdout == b"6\n"
+```
+
+Dynamic installation resolves the requirement and dependencies for the exact
+CPython 3.13.7 WASI target. It verifies wheel hashes, wheel contents, native
+ABI markers, declared provider closure, and file conflicts before one VFS
+mount. It requires an idle environment and never installs host-platform wheels.
+The local catalog and patched uv executable are explicit trusted host inputs.
+
+For a static bundle, `install_pypi` uses host uv to resolve Python 3.13 requirements and dependencies.
 Pure source distributions may execute build code on the trusted host. All
 resulting distributions must be pure wheels before atomic VFS import. Native
 wheels are rejected, and packages receive no shellsim VM module substitutions.
@@ -52,8 +98,8 @@ Both installers reject conflicting existing files; keep the environment idle
 throughout setup. Execution uses virtual files, descriptors, environment,
 clock, random source, and cumulative resource limits.
 
-Resolution uses Python 3.13 version markers and the host's platform markers.
-This initial installer supports portable pure dependencies; it does not yet
+Static-bundle resolution uses Python 3.13 version markers and the host's platform
+markers. That static path supports portable pure dependencies; it does not
 resolve Linux versus WASI dependency markers as distinct target platforms.
 The final validation rejects host native files. Recipes already linked into
 the interpreter seed installed distribution metadata for uv, so

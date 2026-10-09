@@ -1,0 +1,382 @@
+diff --git a/crates/uv-configuration/src/target_triple.rs b/crates/uv-configuration/src/target_triple.rs
+index 09dfb7d..6e7a1e5 100644
+--- a/crates/uv-configuration/src/target_triple.rs
++++ b/crates/uv-configuration/src/target_triple.rs
+@@ -368,6 +368,10 @@ pub enum TargetTriple {
+     #[cfg_attr(feature = "clap", value(name = "wasm32-pyodide2025"))]
+     Wasm32Pyodide2025,
+
++    /// A wasm32 WASI Preview 1 target.
++    #[cfg_attr(feature = "clap", value(name = "wasm32-wasip1"))]
++    Wasm32Wasip1,
++
+     /// An ARM64 target for iOS device
+     ///
+     /// By default, iOS 13.0 is used, but respects the `IPHONEOS_DEPLOYMENT_TARGET`
+@@ -637,6 +641,7 @@ impl TargetTriple {
+                 },
+                 Arch::Wasm32,
+             ),
++            Self::Wasm32Wasip1 => Platform::new(Os::WasiP1, Arch::Wasm32),
+             Self::Aarch64LinuxAndroid => {
+                 let api_level = android_api_level().map_or(24, |api_level| {
+                     debug!("Found Android API level: {}", api_level);
+@@ -739,6 +744,7 @@ impl TargetTriple {
+             Self::X8664LinuxAndroid => "x86_64",
+             Self::Wasm32Pyodide2024 => "wasm32",
+             Self::Wasm32Pyodide2025 => "wasm32",
++            Self::Wasm32Wasip1 => "wasm32",
+             Self::Arm64Ios => "arm64",
+             Self::Arm64IosSimulator => "arm64",
+             Self::X8664IosSimulator => "x86_64",
+@@ -788,6 +794,7 @@ impl TargetTriple {
+             Self::X8664LinuxAndroid => "Android",
+             Self::Wasm32Pyodide2024 => "Emscripten",
+             Self::Wasm32Pyodide2025 => "Emscripten",
++            Self::Wasm32Wasip1 => "wasi",
+             Self::Arm64Ios => "iOS",
+             Self::Arm64IosSimulator => "iOS",
+             Self::X8664IosSimulator => "iOS",
+@@ -840,6 +847,7 @@ impl TargetTriple {
+             // It doesn't really seem to mean anything? But for completeness we include it here.
+             Self::Wasm32Pyodide2024 => "#1",
+             Self::Wasm32Pyodide2025 => "#1",
++            Self::Wasm32Wasip1 => "0.0.0",
+             Self::Arm64Ios => "",
+             Self::Arm64IosSimulator => "",
+             Self::X8664IosSimulator => "",
+@@ -892,6 +900,7 @@ impl TargetTriple {
+             Self::Wasm32Pyodide2024 => "3.1.58",
+             // See https://pyodide.org/en/stable/development/abi/313.html
+             Self::Wasm32Pyodide2025 => "4.0.9",
++            Self::Wasm32Wasip1 => "0.0.0",
+             Self::Arm64Ios => "",
+             Self::Arm64IosSimulator => "",
+             Self::X8664IosSimulator => "",
+@@ -941,6 +950,7 @@ impl TargetTriple {
+             Self::X8664LinuxAndroid => "posix",
+             Self::Wasm32Pyodide2024 => "posix",
+             Self::Wasm32Pyodide2025 => "posix",
++            Self::Wasm32Wasip1 => "posix",
+             Self::Arm64Ios => "posix",
+             Self::Arm64IosSimulator => "posix",
+             Self::X8664IosSimulator => "posix",
+@@ -990,6 +1000,7 @@ impl TargetTriple {
+             Self::X8664LinuxAndroid => "android",
+             Self::Wasm32Pyodide2024 => "emscripten",
+             Self::Wasm32Pyodide2025 => "emscripten",
++            Self::Wasm32Wasip1 => "wasi",
+             Self::Arm64Ios => "ios",
+             Self::Arm64IosSimulator => "ios",
+             Self::X8664IosSimulator => "ios",
+@@ -1039,6 +1050,7 @@ impl TargetTriple {
+             Self::X8664LinuxAndroid => false,
+             Self::Wasm32Pyodide2024 => false,
+             Self::Wasm32Pyodide2025 => false,
++            Self::Wasm32Wasip1 => false,
+             Self::Arm64Ios => false,
+             Self::Arm64IosSimulator => false,
+             Self::X8664IosSimulator => false,
+@@ -1060,6 +1072,46 @@ impl TargetTriple {
+     }
+ }
+
++#[cfg(test)]
++mod tests {
++    use uv_pep508::{CanonicalMarkerValueString, MarkerEnvironment, MarkerEnvironmentBuilder};
++
++    use super::TargetTriple;
++
++    #[test]
++    fn wasi_preview_one_markers_match_shellsim_cpython() {
++        let base = MarkerEnvironment::try_from(MarkerEnvironmentBuilder {
++            implementation_name: "cpython",
++            implementation_version: "3.13.7",
++            os_name: "posix",
++            platform_machine: "x86_64",
++            platform_python_implementation: "CPython",
++            platform_release: "6.0",
++            platform_system: "Linux",
++            platform_version: "6.0",
++            python_full_version: "3.13.7",
++            python_version: "3.13",
++            sys_platform: "linux",
++        })
++        .unwrap();
++        let markers = TargetTriple::Wasm32Wasip1.markers(base);
++        assert_eq!(markers.implementation_name(), "cpython");
++        assert_eq!(markers.implementation_version().to_string(), "3.13.7");
++        assert_eq!(markers.os_name(), "posix");
++        assert_eq!(markers.platform_machine(), "wasm32");
++        assert_eq!(markers.platform_python_implementation(), "CPython");
++        assert_eq!(markers.platform_release(), "0.0.0");
++        assert_eq!(markers.platform_system(), "wasi");
++        assert_eq!(
++            markers.get_string(CanonicalMarkerValueString::PlatformVersion),
++            "0.0.0"
++        );
++        assert_eq!(markers.python_full_version().to_string(), "3.13.7");
++        assert_eq!(markers.python_version().to_string(), "3.13");
++        assert_eq!(markers.sys_platform(), "wasi");
++    }
++}
++
+ /// Return the macOS deployment target as parsed from the environment.
+ fn macos_deployment_target() -> Option<(u16, u16)> {
+     let version = std::env::var(EnvVars::MACOSX_DEPLOYMENT_TARGET).ok()?;
+diff --git a/crates/uv-distribution-types/src/prioritized_distribution.rs b/crates/uv-distribution-types/src/prioritized_distribution.rs
+index 1ff67e4..eb6eb16 100644
+--- a/crates/uv-distribution-types/src/prioritized_distribution.rs
++++ b/crates/uv-distribution-types/src/prioritized_distribution.rs
+@@ -920,6 +920,34 @@ fn implied_platform_markers(filename: &WheelFilename) -> MarkerTree {
+                 marker = marker.or(tag_marker);
+             }
+
++            PlatformTag::Pyodide { .. } | PlatformTag::PyEmscripten { .. } => {
++                let tag_marker = MarkerTree::expression(MarkerExpression::String {
++                    key: MarkerValueString::SysPlatform,
++                    operator: MarkerOperator::Equal,
++                    value: arcstr::literal!("emscripten"),
++                })
++                .and(MarkerTree::expression(MarkerExpression::String {
++                    key: MarkerValueString::PlatformMachine,
++                    operator: MarkerOperator::Equal,
++                    value: arcstr::literal!("wasm32"),
++                }));
++                marker = marker.or(tag_marker);
++            }
++
++            PlatformTag::WasiP1 => {
++                let tag_marker = MarkerTree::expression(MarkerExpression::String {
++                    key: MarkerValueString::SysPlatform,
++                    operator: MarkerOperator::Equal,
++                    value: arcstr::literal!("wasi"),
++                })
++                .and(MarkerTree::expression(MarkerExpression::String {
++                    key: MarkerValueString::PlatformMachine,
++                    operator: MarkerOperator::Equal,
++                    value: arcstr::literal!("wasm32"),
++                }));
++                marker = marker.or(tag_marker);
++            }
++
+             tag => {
+                 debug!("Unknown platform tag in wheel tag: {tag}");
+             }
+@@ -1075,6 +1103,22 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn test_pyodide_implied_platform_markers() {
++        assert_platform_markers(
++            "native-1.0-cp313-cp313-pyodide_2025_0_wasm32.whl",
++            "sys_platform == 'emscripten' and platform_machine == 'wasm32'",
++        );
++    }
++
++    #[test]
++    fn test_wasi_preview_one_implied_platform_markers() {
++        assert_platform_markers(
++            "native-1.0-cp313-cp313-wasm32_wasip1.whl",
++            "sys_platform == 'wasi' and platform_machine == 'wasm32'",
++        );
++    }
++
+     #[test]
+     fn test_implied_platform_markers() {
+         let filename = WheelFilename::from_str("example-1.0-py3-none-any.whl").unwrap();
+diff --git a/crates/uv-platform-tags/src/platform.rs b/crates/uv-platform-tags/src/platform.rs
+index d4f3d9d..67d9456 100644
+--- a/crates/uv-platform-tags/src/platform.rs
++++ b/crates/uv-platform-tags/src/platform.rs
+@@ -56,6 +56,7 @@ impl Platform {
+             Os::Windows => "Windows",
+             Os::Pyodide { .. } => "Pyodide",
+             Os::PyEmscripten { .. } => "Emscripten",
++            Os::WasiP1 => "WASI Preview 1",
+             Os::Macos { .. } => "macOS",
+             Os::FreeBsd { .. } => "FreeBSD",
+             Os::NetBsd { .. } => "NetBSD",
+@@ -91,6 +92,7 @@ pub enum Os {
+         major: u16,
+         minor: u16,
+     },
++    WasiP1,
+     Macos {
+         major: u16,
+         minor: u16,
+@@ -140,6 +142,7 @@ impl fmt::Display for Os {
+             Self::Android { .. } => write!(f, "android"),
+             Self::Pyodide { .. } => write!(f, "pyodide"),
+             Self::PyEmscripten { .. } => write!(f, "pyemscripten"),
++            Self::WasiP1 => write!(f, "wasip1"),
+             Self::Ios { .. } => write!(f, "ios"),
+         }
+     }
+diff --git a/crates/uv-platform-tags/src/platform_tag.rs b/crates/uv-platform-tags/src/platform_tag.rs
+index a0be20e..5204fa9 100644
+--- a/crates/uv-platform-tags/src/platform_tag.rs
++++ b/crates/uv-platform-tags/src/platform_tag.rs
+@@ -114,6 +114,8 @@ pub enum PlatformTag {
+     Pyodide { major: u16, minor: u16 },
+     /// Ex) `pyemscripten_2026_0_wasm32`
+     PyEmscripten { major: u16, minor: u16 },
++    /// Ex) `wasm32_wasip1`
++    WasiP1,
+     /// Ex) `ios_13_0_arm64_iphoneos` / `ios_13_0_arm64_iphonesimulator`
+     Ios {
+         major: u16,
+@@ -151,6 +153,7 @@ impl PlatformTag {
+             Self::Solaris { .. } => Some("Solaris"),
+             Self::Pyodide { .. } => Some("Pyodide"),
+             Self::PyEmscripten { .. } => Some("Emscripten"),
++            Self::WasiP1 => Some("WASI Preview 1"),
+             Self::Ios { .. } => Some("iOS"),
+         }
+     }
+@@ -471,6 +474,7 @@ impl std::fmt::Display for PlatformTag {
+             Self::PyEmscripten { major, minor } => {
+                 write!(f, "pyemscripten_{major}_{minor}_wasm32")
+             }
++            Self::WasiP1 => write!(f, "wasm32_wasip1"),
+             Self::Ios {
+                 major,
+                 minor,
+@@ -492,6 +496,7 @@ impl FromStr for PlatformTag {
+             "win_amd64" => return Ok(Self::WinAmd64),
+             "win_arm64" => return Ok(Self::WinArm64),
+             "win_ia64" => return Ok(Self::WinIa64),
++            "wasm32_wasip1" => return Ok(Self::WasiP1),
+             _ => {}
+         }
+
+@@ -985,6 +990,16 @@ mod tests {
+     use crate::tags::IosMultiarch;
+     use crate::{Arch, BinaryFormat};
+
++    #[test]
++    fn wasi_preview_one_platform() {
++        assert_eq!(
++            PlatformTag::from_str("wasm32_wasip1"),
++            Ok(PlatformTag::WasiP1)
++        );
++        assert_eq!(PlatformTag::WasiP1.to_string(), "wasm32_wasip1");
++        assert!(PlatformTag::from_str("wasm32_wasip2").is_err());
++    }
++
+     #[test]
+     fn any_platform() {
+         assert_eq!(PlatformTag::from_str("any"), Ok(PlatformTag::Any));
+diff --git a/crates/uv-platform-tags/src/tags.rs b/crates/uv-platform-tags/src/tags.rs
+index 9ab9de9..31a6084 100644
+--- a/crates/uv-platform-tags/src/tags.rs
++++ b/crates/uv-platform-tags/src/tags.rs
+@@ -822,6 +822,7 @@ fn compatible_tags(platform: &Platform) -> Result<Vec<PlatformTag>, PlatformErro
+
+             platform_tags
+         }
++        (Os::WasiP1, Arch::Wasm32) => vec![PlatformTag::WasiP1],
+         (Os::Pyodide { major, minor }, Arch::Wasm32) => {
+             vec![
+                 PlatformTag::PyEmscripten {
+@@ -1697,6 +1698,12 @@ mod tests {
+         );
+     }
+
++    #[test]
++    fn test_platform_tags_wasi_preview_one() {
++        let tags = compatible_tags(&Platform::new(Os::WasiP1, Arch::Wasm32)).unwrap();
++        assert_eq!(tags, vec![PlatformTag::WasiP1]);
++    }
++
+     #[test]
+     fn test_platform_tags_pyodide() {
+         let tags = compatible_tags(&Platform::new(
+diff --git a/crates/uv-platform/src/os.rs b/crates/uv-platform/src/os.rs
+index d714d86..f45b16c 100644
+--- a/crates/uv-platform/src/os.rs
++++ b/crates/uv-platform/src/os.rs
+@@ -104,6 +104,7 @@ impl From<&uv_platform_tags::Os> for Os {
+             uv_platform_tags::Os::Pyodide { .. } | uv_platform_tags::Os::PyEmscripten { .. } => {
+                 Self::new(target_lexicon::OperatingSystem::Emscripten)
+             }
++            uv_platform_tags::Os::WasiP1 => Self::new(target_lexicon::OperatingSystem::WasiP1),
+             uv_platform_tags::Os::Ios { .. } => {
+                 Self::new(target_lexicon::OperatingSystem::IOS(None))
+             }
+diff --git a/crates/uv-resolver/src/lock/mod.rs b/crates/uv-resolver/src/lock/mod.rs
+index 2520d00..cb79f7d 100644
+--- a/crates/uv-resolver/src/lock/mod.rs
++++ b/crates/uv-resolver/src/lock/mod.rs
+@@ -131,6 +131,17 @@ static MAC_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
+     let pep508 = MarkerTree::from_str("os_name == 'posix' and sys_platform == 'darwin'").unwrap();
+     UniversalMarker::new(pep508, ConflictMarker::TRUE)
+ });
++static WASI_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
++    let pep508 =
++        MarkerTree::from_str("sys_platform == 'wasi' and platform_machine == 'wasm32'").unwrap();
++    UniversalMarker::new(pep508, ConflictMarker::TRUE)
++});
++static EMSCRIPTEN_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
++    let pep508 =
++        MarkerTree::from_str("sys_platform == 'emscripten' and platform_machine == 'wasm32'")
++            .unwrap();
++    UniversalMarker::new(pep508, ConflictMarker::TRUE)
++});
+ static ANDROID_MARKERS: LazyLock<UniversalMarker> = LazyLock::new(|| {
+     let pep508 = MarkerTree::from_str("sys_platform == 'android'").unwrap();
+     UniversalMarker::new(pep508, ConflictMarker::TRUE)
+@@ -7797,6 +7808,24 @@ fn is_wheel_unreachable_for_marker(
+         return false;
+     }
+
++    if platform_tags
++        .iter()
++        .all(|tag| matches!(tag, PlatformTag::WasiP1))
++        && marker.is_disjoint(*WASI_MARKERS)
++    {
++        return true;
++    }
++
++    if platform_tags.iter().all(|tag| {
++        matches!(
++            tag,
++            PlatformTag::Pyodide { .. } | PlatformTag::PyEmscripten { .. }
++        )
++    }) && marker.is_disjoint(*EMSCRIPTEN_MARKERS)
++    {
++        return true;
++    }
++
+     if platform_tags.iter().all(PlatformTag::is_linux) {
+         if platform_tags.iter().all(PlatformTag::is_arm) {
+             if marker.is_disjoint(*LINUX_ARM_MARKERS) {
+diff --git a/crates/uv-torch/src/backend.rs b/crates/uv-torch/src/backend.rs
+index a1fec39..e1e21fc 100644
+--- a/crates/uv-torch/src/backend.rs
++++ b/crates/uv-torch/src/backend.rs
+@@ -481,6 +481,7 @@ impl TorchStrategy {
+                     | Os::Android { .. }
+                     | Os::Pyodide { .. }
+                     | Os::PyEmscripten { .. }
++                    | Os::WasiP1
+                     | Os::Ios { .. } => Either::Right(Either::Left(std::iter::once(
+                         TorchBackend::Cpu.index_url(*source),
+                     ))),
+@@ -514,6 +515,7 @@ impl TorchStrategy {
+                 | Os::Android { .. }
+                 | Os::Pyodide { .. }
+                 | Os::PyEmscripten { .. }
++                | Os::WasiP1
+                 | Os::Ios { .. } => Either::Right(Either::Left(std::iter::once(
+                     TorchBackend::Cpu.index_url(*source),
+                 ))),
+@@ -533,6 +535,7 @@ impl TorchStrategy {
+                 | Os::Android { .. }
+                 | Os::Pyodide { .. }
+                 | Os::PyEmscripten { .. }
++                | Os::WasiP1
+                 | Os::Ios { .. } => Either::Right(Either::Left(std::iter::once(
+                     TorchBackend::Cpu.index_url(*source),
+                 ))),

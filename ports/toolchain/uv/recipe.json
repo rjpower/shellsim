@@ -1,0 +1,17 @@
+{
+  "name": "uv-wasi-resolver",
+  "version": "0.12.3",
+  "host_target": "x86_64-unknown-linux-gnu",
+  "guest_python": "3.13.7",
+  "guest_target": "wasm32-wasip1",
+  "wheel_platform_tag": "wasm32_wasip1",
+  "source": {
+    "url": "https://github.com/astral-sh/uv.git",
+    "tag": "0.12.3",
+    "commit": "507230998c9541d67814b57463ac00e454ff6991"
+  },
+  "patch": {
+    "file": "uv-0.12.3-wasip1.patch",
+    "sha256": "b5653010317810015dc5cfe3bb8ccfb12ceb6d0c027a756029dc0b33db3f170f"
+  }
+}
