@@ -22,3 +22,25 @@ live in `tests`. Their manifest records the production toolchain recipe and
 fixture provenance separately. See `tests/README.md` for guest acceptance and
 the static threaded ABI's supported behavior. Threaded dynamic v3 remains
 separate unfinished work and is not enabled by this recipe.
+
+## Threaded dynamic sysroot
+
+`dynamic.py` builds the separate `dynamic-recipe.json` product. It verifies and
+extracts the pinned SDK and wasi-libc archives, applies scheduler wait/notify and
+worker stack-readiness patches, and overlays the rebuilt C runtime onto the
+SDK sysroot. The SDK's C++ headers and threaded exception runtime archives stay
+in that sysroot. Target compilation uses the isolated target environment.
+
+Pass `--sdk-archive`, `--libc-archive`, `--llvm-prefix`, `--cmake`, `--ninja`, and
+`--work`. The compiler prefix must be the normal `llvm/threaded.py` product;
+the complete compiler manifest and exact threaded compiler recipe are checked.
+Each build requires a fresh output directory. `prefix/manifest.json` records
+the recipe, compiler identity, host build tools, commands, and hashes of every
+sysroot and license file. A driver or input change requires a new product.
+
+Consumers compile with `--target=wasm32-wasip1-threads -pthread` and
+`--sysroot=<prefix>/sysroot`. This product supplies the
+`shellsim-wasi-sdk34-cpython3137-threads-v3` cohort and scheduler namespace
+`shellsim_threads_v2`; it cannot replace v1 or nonthreaded v2 artifacts.
+It builds no interpreter or acceptance fixtures. Production threaded loading
+and upstream interpreter acceptance are verified separately.
