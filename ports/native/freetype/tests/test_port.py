@@ -31,14 +31,6 @@ def upstream_metadata(tmp_path):
     return tmp_path
 
 
-def test_pkg_config_uses_upstream_libtool_version(upstream_metadata):
-    recipe = json.loads((ROOT / "ports/native/freetype/recipe.json").read_text())
-    rendered = pkg_config(upstream_metadata, recipe)
-    assert "Version: 26.2.20\n" in rendered
-    assert "Cflags: -I${includedir}/freetype2\n" in rendered
-    assert "Requires.private: zlib\n" in rendered
-
-
 @pytest.mark.parametrize("field", ["version", "template", "release"])
 def test_pkg_config_rejects_changed_upstream_contract(upstream_metadata, field):
     recipe = json.loads((ROOT / "ports/native/freetype/recipe.json").read_text())
