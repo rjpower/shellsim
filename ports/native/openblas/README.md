@@ -22,7 +22,7 @@ input, both complex precisions, REAL return types, integer/address widths, and
 libc environment and numeric conversion behavior.
 
 ```sh
-PYTHONPATH=. uv run --no-project --python 3.13 ports/native/openblas/verify.py \
+PYTHONPATH=. uv run --no-project --python 3.13 ports/native/openblas/tests/verify.py \
   --artifact /path/to/native-artifacts/input-hash \
   --sdk /path/to/wasi-sdk-34.0-x86_64-linux \
   --work-dir /tmp/shellsim-openblas-probe

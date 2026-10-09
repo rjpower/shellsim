@@ -2,7 +2,7 @@
 
 The recipe defines `shellsim-wasi-sdk34-cpython3137-v2` for a fixed CPython
 3.13.7 executable and independently linked wasm32 WASI shared modules. It pins
-the SDK archive, build utilities, fixtures and runtime notices. The builder
+the SDK archive, production build utilities, the canonical bridge, and runtime notices. The builder
 records actual tool and runtime archive hashes; it rejects changed reviewed
 inputs before compiling.
 
@@ -71,4 +71,5 @@ those commits. Allocator notices are extracted from the recorded source line
 range; both source and notice hashes are retained. The rootfs carries these
 notices under `/TOOLCHAIN-LICENSES`.
 
-Build and guest proof commands are in [the dynamic port](../../dynamic/README.md).
+Build commands are in [the CPython port](../../python/cpython/README.md).
+Guest ABI checks are in [the runtime fixtures](../../../tests/fixtures/wasm/dynamic/README.md).

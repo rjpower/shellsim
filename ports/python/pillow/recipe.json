@@ -1,0 +1,103 @@
+{
+  "kind": "python-extension",
+  "name": "pillow",
+  "version": "12.3.0",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "linkage": "cpython-builtin",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
+    "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce"
+  },
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang",
+    "wasi-sdk-llvm-ar"
+  ],
+  "target_development": {
+    "cpython": "3.13.7"
+  },
+  "target_dependencies": [
+    {
+      "port": "native/zlib",
+      "version": "1.3.1"
+    },
+    {
+      "port": "native/libjpeg-turbo",
+      "version": "2.1.5.1"
+    },
+    {
+      "port": "native/freetype",
+      "version": "2.13.3"
+    }
+  ],
+  "features": {
+    "png": true,
+    "jpeg": true,
+    "jpeg2000": false,
+    "tiff": false,
+    "webp": false,
+    "avif": false,
+    "freetype": true,
+    "lcms": false,
+    "raqm": false,
+    "imagequant": false,
+    "xcb": false,
+    "imagingmath": false,
+    "imagingmorph": false
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "furo; extra == \"docs\"",
+    "olefile; extra == \"docs\"",
+    "sphinx>=8.2; extra == \"docs\"",
+    "sphinx-autobuild; extra == \"docs\"",
+    "sphinx-copybutton; extra == \"docs\"",
+    "sphinx-inline-tabs; extra == \"docs\"",
+    "sphinxext-opengraph; extra == \"docs\"",
+    "olefile; extra == \"fpx\"",
+    "olefile; extra == \"mic\"",
+    "arro3-compute; extra == \"test-arrow\"",
+    "arro3-core; extra == \"test-arrow\"",
+    "nanoarrow; extra == \"test-arrow\"",
+    "pyarrow; extra == \"test-arrow\"",
+    "coverage>=7.4.2; extra == \"tests\"",
+    "defusedxml; extra == \"tests\"",
+    "markdown2; extra == \"tests\"",
+    "olefile; extra == \"tests\"",
+    "packaging; extra == \"tests\"",
+    "pytest; extra == \"tests\"",
+    "pytest-cov; extra == \"tests\"",
+    "pytest-timeout; extra == \"tests\"",
+    "pytest-xdist; extra == \"tests\"",
+    "setuptools; extra == \"tests\"",
+    "trove-classifiers>=2024.10.12; extra == \"tests\"",
+    "defusedxml; extra == \"xmp\""
+  ],
+  "builtin_modules": [
+    "PIL._imaging",
+    "PIL._imagingft"
+  ],
+  "dist_info": "/usr/lib/python3.13/site-packages/pillow-12.3.0.dist-info",
+  "patches": [
+    {
+      "file": "../numpy/cpython-qualified-builtins.patch",
+      "sha256": "678994500f8deaa9fca773db3fc7e33f29022092077dc690a103240e6a8c4f25"
+    }
+  ],
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "9693c3018e4396684dc35177725f75e8c678e81c9b3cfb352a95f6575b71dfb8"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    }
+  ],
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  }
+}

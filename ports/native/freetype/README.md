@@ -16,7 +16,7 @@ probe loads a scalable TrueType font through the VFS, rasterizes `A`, rejects
 malformed font bytes, and exercises the guest CPU limit:
 
 ```sh
-PYTHONPATH=. uv run --no-project python ports/native/freetype/verify.py \
+PYTHONPATH=. uv run --no-project python ports/native/freetype/tests/verify.py \
   --bundle /tmp/shellsim-native --work-dir /tmp/shellsim-freetype
 SHELLSIM_FREETYPE_ARTIFACTS=/tmp/shellsim-freetype \
   cargo test --test wasm_freetype -- --include-ignored
@@ -41,5 +41,5 @@ the upstream version checks without changing package release metadata.
 
 Set `SHELLSIM_FREETYPE_SOURCE`, `SHELLSIM_FREETYPE_PREFIX` and
 `SHELLSIM_FREETYPE_ZLIB_PREFIX` to run the pinned-source and actual pkg-config
-checks in `tests/tooling/test_freetype_port.py`. This metadata correction does
+checks in `ports/native/freetype/tests/test_port.py`. This metadata correction does
 not enable additional font formats, HarfBuzz or Matplotlib providers.

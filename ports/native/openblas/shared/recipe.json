@@ -70,7 +70,7 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "07f1a9758fba62bcdacd528d25a17c78c07994d9c58c8105602d391273f1f857"
+      "sha256": "abb986995ba3b3e627162863efd36e7be2965cdeb1475deca89bca675ecde020"
     },
     {
       "file": "../recipe.json",
@@ -81,8 +81,8 @@
       "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
     },
     {
-      "file": "../../../dynamic/build.py",
-      "sha256": "04233ccffa2b2ab33667a2caf2eb512c4a71f04ef0b450b64426da643bf28ef7"
+      "file": "../../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
     },
     {
       "file": "../../../toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",

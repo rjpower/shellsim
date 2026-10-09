@@ -49,7 +49,8 @@ locked = true
 strip = true
 
 [tool.pytest.ini_options]
-testpaths = ["tests/python_package", "tests/tooling"]
+testpaths = ["tests/python_package", "tests/tooling", "ports"]
+addopts = "--import-mode=importlib"
 
 [tool.marin-style]
 checks = ["ruff-check", "ruff-format"]
@@ -62,6 +63,7 @@ include = [
     "tests/python/test_*.py",
     "tests/python_package/**/*.py",
     "tests/tooling/**/*.py",
+    "tests/fixtures/wasm/**/*.py",
     "tools/*.py",
     "tools/**/*.py",
 ]

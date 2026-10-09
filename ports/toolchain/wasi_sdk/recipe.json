@@ -43,63 +43,23 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "e7be5dee2c17abe747d95e3a7845600aa5b64445b971e9a0328234f27c4e29ef"
+      "sha256": "97e424ec9fb67f59d0c029cd547dba4cb1c16e47fda0a62651cadf652b4fddad"
     },
     {
-      "file": "../../dynamic/build_v2.py",
-      "sha256": "2a528b0e3da236464501d6cf77098d6e59db1104e8655dfd690585d1b842f527"
+      "file": "../../python/cpython/dynamic.py",
+      "sha256": "dc4f25e943b36fdc93a6b99f22a5e2028937bc39e4d0648f83cca086a211455c"
     },
     {
-      "file": "../../dynamic/build.py",
-      "sha256": "04233ccffa2b2ab33667a2caf2eb512c4a71f04ef0b450b64426da643bf28ef7"
+      "file": "../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
     },
     {
       "file": "../../native/dependencies.py",
       "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
     },
     {
-      "file": "../../dynamic/fixtures/bridge.c",
+      "file": "dynamic.c",
       "sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23"
-    },
-    {
-      "file": "../../dynamic/fixtures/cpp_extension.cpp",
-      "sha256": "281577fb9f7100f466316169ab33fbf392507f2378f01161ee8dab879f2fb4e1"
-    },
-    {
-      "file": "../../dynamic/fixtures/exception_main.cpp",
-      "sha256": "b9841fbdae5ded5475596661d209d0c2e8fa565baf7d88b4ee79cbd1112914b0"
-    },
-    {
-      "file": "../../dynamic/fixtures/exception_side.cpp",
-      "sha256": "2928230164b5a966865c76f0c8fcffe954891111f7cac89709decf003e20cc41"
-    },
-    {
-      "file": "../../dynamic/fixtures/exception_types.hpp",
-      "sha256": "5cd42e91b7f053a52bcc0486af803b85699abe688c8ccee54e6f68408f26a8c7"
-    },
-    {
-      "file": "../../dynamic/fixtures/extension.c",
-      "sha256": "3a4f4173e6efa7b51f99518904cfdb5c7cabd1715609aeb44abb6f43553f413a"
-    },
-    {
-      "file": "../../dynamic/fixtures/jump_main.c",
-      "sha256": "2db953cada48a24f54d3a7e1288c53c41dc9ba9682a744d01c345b992cc4ea83"
-    },
-    {
-      "file": "../../dynamic/fixtures/jump_side.c",
-      "sha256": "98158c781b286fba3a0e0142ca1ecfd8d545d6d6224c7dae2278e7e30d1929c9"
-    },
-    {
-      "file": "../../dynamic/fixtures/library.c",
-      "sha256": "604c17e09c515451de990313c58cee6427f0c1d09e7d841805d5854fc56821c1"
-    },
-    {
-      "file": "../../dynamic/fixtures/main.c",
-      "sha256": "9b32c58fc9c08fd0b036f6c80aa935448fa64aa6b4b316ec1396a21e5734ac45"
-    },
-    {
-      "file": "../../dynamic/fixtures/zlib_extension.c",
-      "sha256": "d7d2cc048d9709a63409000cf45049e068da8a898115dbdc7d7c380b422d8da1"
     },
     {
       "file": "posix.c",

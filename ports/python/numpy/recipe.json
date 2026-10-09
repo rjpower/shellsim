@@ -1,0 +1,77 @@
+{
+  "name": "numpy",
+  "version": "2.3.5",
+  "target": "wasm32-wasip1",
+  "linkage": "cpython-builtin",
+  "requires_python": ">=3.11",
+  "requires_dist": [],
+  "dependencies": {
+    "cpython": "3.13.7",
+    "wasi_sdk": "34.0"
+  },
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/76/65/21b3bc86aac7b8f2862db1e808f1ea22b028e30a225a34a5ede9bf8678f2/numpy-2.3.5.tar.gz",
+    "sha256": "784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0"
+  },
+  "build_tools": {
+    "meson": "vendored-1.5.2",
+    "ninja": "1.13.0",
+    "cython": "3.1.6"
+  },
+  "features": {
+    "blas": "none",
+    "lapack": "internal-c-fallback",
+    "threading": false,
+    "simd": false,
+    "cpp_exceptions": true,
+    "longdouble_format": "IEEE_QUAD_LE",
+    "fft": true,
+    "longdouble_printf": true,
+    "floating_point_exceptions": false
+  },
+  "patches": [
+    {
+      "file": "numpy-wasi.patch",
+      "sha256": "ea0d6de59241d9fa742f8069ff0ae086fc636868e787da0b31880bec14428937"
+    },
+    {
+      "file": "cpython-qualified-builtins.patch",
+      "sha256": "678994500f8deaa9fca773db3fc7e33f29022092077dc690a103240e6a8c4f25"
+    }
+  ],
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "4836ebba637f85482aeda358364de551282fa0179f56e79b1c6646a9b6c19e02"
+    },
+    {
+      "file": "../cpython/build.py",
+      "sha256": "8aa69729a7e41b53f08cd7906f4881befa4eca5232fa174a816168e91476f686"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ],
+  "builtin_modules": [
+    "numpy._core._multiarray_umath",
+    "numpy.linalg.lapack_lite",
+    "numpy.linalg._umath_linalg",
+    "numpy.random._bounded_integers",
+    "numpy.random._common",
+    "numpy.random._mt19937",
+    "numpy.random._philox",
+    "numpy.random._pcg64",
+    "numpy.random._sfc64",
+    "numpy.random.bit_generator",
+    "numpy.random._generator",
+    "numpy.random.mtrand",
+    "numpy.fft._pocketfft_umath"
+  ],
+  "dist_info": "/usr/lib/python3.13/site-packages/numpy-2.3.5.dist-info",
+  "target_profile": "wasi-cpython-v2"
+}

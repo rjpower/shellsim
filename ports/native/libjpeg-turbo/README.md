@@ -10,7 +10,7 @@ Build from explicitly fetched, hash-verified inputs:
 
 ```sh
 PYTHONPATH=. UV_CACHE_DIR=/tmp/uv-libjpeg uv run --no-project python \
-  ports/native/libjpeg-turbo/verify.py \
+  ports/native/libjpeg-turbo/tests/verify.py \
   --source-archive /tmp/shellsim-port-libjpeg/libjpeg-turbo-2.1.5.1.tar.gz \
   --source /tmp/shellsim-port-libjpeg/libjpeg-turbo-2.1.5.1 \
   --sdk /tmp/shellsim-native/wasi-sdk-34.0-x86_64-linux \

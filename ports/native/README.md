@@ -6,7 +6,7 @@ also consumes scalar libjpeg-turbo 2.1.5.1 for JPEG. These target libraries
 have no Python distribution metadata.
 
 ```sh
-uv run --no-project --python 3.13 ports/cpython/build.py \
+uv run --no-project --python 3.13 ports/python/cpython/build.py \
   --work-dir /tmp/shellsim-native --with-pillow
 SHELLSIM_NATIVE_BUNDLE=/tmp/shellsim-native uv run pytest \
   tests/python_package/test_native_dependencies.py
@@ -16,7 +16,7 @@ uv run pytest tests/tooling/test_native_artifacts.py
 `--with-pillow` selects all three libraries automatically. `--with-zlib` builds only the stdlib
 consumer. The default profile has no external target libraries. In this static
 profile, native package selection happens before the final interpreter link.
-The separate [dynamic profile](../dynamic/README.md) loads independent extensions
+The separate [dynamic profile](../python/cpython/README.md) loads independent extensions
 and shared native dependencies into a fixed interpreter.
 
 ## Recipe and artifact contract
@@ -90,7 +90,7 @@ C++ typed catch/rethrow/destruction across static archives, one million recoveri
 and fuel exhaustion:
 
 ```sh
-PYTHONPATH=. uv run --no-project python ports/native/exceptions/verify.py \
+PYTHONPATH=. uv run --no-project python tests/fixtures/wasm/exceptions/verify.py \
   --sdk /tmp/shellsim-native/wasi-sdk-34.0-x86_64-linux \
   --work-dir /tmp/shellsim-exceptions
 SHELLSIM_EXCEPTION_ARTIFACTS=/tmp/shellsim-exceptions \
@@ -102,9 +102,9 @@ and [C++ exceptions](https://github.com/WebAssembly/wasi-sdk/blob/wasi-sdk-34/Cp
 
 The artifacts are integrity records for trusted builds, not an untrusted package
 build sandbox. The build host executes reviewed scripts and native helper tools.
-Pillow's [imaging profile](../pillow/README.md) does not establish compatibility for
+Pillow's [imaging profile](../python/pillow/README.md) does not establish compatibility for
 all Pillow APIs or optional libraries. The [shared OpenBLAS port](openblas/shared/README.md)
 supplies an independent `libopenblas.so`; the dynamic profile also proves shared
 zlib. The [package universe installer](../README.md) resolves Python requirements
 and stages the selected native closure without relinking CPython. Arbitrary
-native builds and a public artifact service remain outside this prototype.
+native builds and a public artifact service remain outside this profile.

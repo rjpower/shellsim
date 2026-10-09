@@ -17,7 +17,7 @@
   },
   "patch_sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
   "port_sources_sha256": {
-    "build.py": "a6309f16ec8c7c7a0fda492f11cad9397f368230dc1dd2bf20b78d5a9c762ae5",
+    "build.py": "69a190ca77bc58ba9ba0adae2b917e8a16a5de23964a59f86e60de29fdcc2c5d",
     "process.c": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272",
     "process_abi.h": "2469b06987ee082c407b100d941f60d57245c69d2f5a842ad423cced50474063",
     "process_port.h": "2089b30e1ad2f57bdcc91bbfc70a0fdd87399e0355afa6e71c0645b093437ee0",

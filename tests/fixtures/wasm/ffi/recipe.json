@@ -1,0 +1,13 @@
+{
+  "name": "wasi-ffi-fixture",
+  "version": 1,
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "sdk_sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+  "build_script_sha256": "b41a9fce1e1b69e92edf167efb7cfec56af9abb30627121bfec820acbbcb46bd",
+  "bridge_sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
+  "sources_sha256": {
+    "fixtures/main.c": "672189518c46412dfabfd8f796997347570dfd045b89d002319e43075301440c",
+    "fixtures/provider.c": "57484db1c9e63a467551ed1e91e37d41ef560e64fb15470f27b28a3b2e11d6ee",
+    "fixtures/python_main_handle.c": "e8c5331da342803d54629482ee02f73304cd36dcfb19ce805f4ff065fe9c7221"
+  }
+}

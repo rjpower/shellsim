@@ -9,7 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
-from ports.dynamic.build import mark_abi
+from ports._support.wasm import mark_abi
 from ports.native.dependencies import (
     artifact_input,
     digest,

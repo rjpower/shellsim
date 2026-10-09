@@ -1,7 +1,6 @@
 {
-  "name": "wasi-pthreads-spike",
+  "name": "wasi-pthreads",
   "version": "1",
-  "status": "shellsim-static-pthreads-execution-verified",
   "scheduler_namespace": "shellsim_threads_v1",
   "sdk": {
     "version": "34.0",
@@ -29,14 +28,6 @@
   },
   "build_scripts": [
     {
-      "file": "build.py",
-      "sha256": "a6c520121b825b631c3e652b54842f1e410cad6e13d367c9df3fe924cce3362f"
-    },
-    {
-      "file": "two_pthreads.c",
-      "sha256": "0af94ae9c2b5304f1b49d2557e5202af5ccfc6e27fff19bca1ec470bf83acd85"
-    },
-    {
       "file": "llvm-serial-memory-init.patch",
       "sha256": "5877b9c5e2b36d92ad84155e21d9a6006b6a424779de8b20d50391654debca17"
     },
@@ -49,28 +40,12 @@
       "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
     },
     {
-      "file": "../../numpy/build.py",
-      "sha256": "939ece342a6d25a054fe7a5b0c1f884d860c78baaeeb9eaec097045e4be82d14"
+      "file": "build.py",
+      "sha256": "67bd9736939b334b9e2acce016d5b05aca4a727b41e70bd5dd11b20b04c72eb5"
     },
     {
-      "file": "build_toolchain.py",
-      "sha256": "031e4fabf6b40de03316112b936b03b088f56ccda4213bbda9fe6330a4540363"
-    },
-    {
-      "file": "runner/Cargo.toml",
-      "sha256": "18ad06562264f3d6faef9006c6d97b98aaf1c59f5323aee867a05fe4637eb044"
-    },
-    {
-      "file": "runner/Cargo.lock",
-      "sha256": "fb26e6eab16f24a7161997fd6010abd7db150887803c86d5e06740f74779751a"
-    },
-    {
-      "file": "runner/src/main.rs",
-      "sha256": "22e784486fb6d29ef9fd5a0dcf7c1a0d9b702d658ffc9d8c2b4aba013b6df802"
-    },
-    {
-      "file": "sequential_pthreads.c",
-      "sha256": "004554bcc0fb87070984302b63582680cbccd27cb68c883bead2b80e5dbbd3e2"
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
     }
   ],
   "llvm_source": {

@@ -657,11 +657,11 @@ fn repeated_callbacks_reuse_one_nested_fiber_reservation() {
 }
 
 #[test]
-#[ignore = "requires ports/ffi_proof/build.py SDK 34 artifacts"]
+#[ignore = "requires tests/fixtures/wasm/ffi/build.py SDK 34 artifacts"]
 fn separately_compiled_sdk_provider_calls_and_callbacks() {
     let artifacts = PathBuf::from(
-        std::env::var_os("SHELLSIM_FFI_PROOF_ARTIFACTS")
-            .expect("set SHELLSIM_FFI_PROOF_ARTIFACTS to the proof artifact directory"),
+        std::env::var_os("SHELLSIM_FFI_FIXTURE_ARTIFACTS")
+            .expect("set SHELLSIM_FFI_FIXTURE_ARTIFACTS to the fixture artifact directory"),
     );
     let mut environment = Environment::with_limits(Limits {
         cpu: 100_000_000,
@@ -673,8 +673,8 @@ fn separately_compiled_sdk_provider_calls_and_callbacks() {
         .vfs
         .write(
             "/",
-            "/lib/libffi_proof.so",
-            &std::fs::read(artifacts.join("libffi_proof.so")).unwrap(),
+            "/lib/libffi_fixture.so",
+            &std::fs::read(artifacts.join("libffi_fixture.so")).unwrap(),
             0o644,
         )
         .unwrap();
@@ -683,7 +683,7 @@ fn separately_compiled_sdk_provider_calls_and_callbacks() {
         .write(
             "/",
             "/app",
-            &std::fs::read(artifacts.join("ffi_proof.wasm")).unwrap(),
+            &std::fs::read(artifacts.join("ffi_fixture.wasm")).unwrap(),
             0o755,
         )
         .unwrap();

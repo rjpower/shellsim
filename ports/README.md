@@ -1,288 +1,178 @@
-# CPython WASI ports
+# Shellsim ports
 
-The CPython recipe builds upstream CPython 3.13.7 as a static WASI Preview 1
-command with WASI SDK 34.0 and the versioned static v2 profile. Downloads are pinned by SHA256. Build tools run on
-the trusted host; the resulting interpreter runs through shellsim's virtual
-WASI adapter. The recipe currently supports an x86_64 Linux build host.
+This tree builds packages for Shellsim's virtual WASI environment. Trusted host
+builds fetch pinned upstream releases, apply reviewed patches, and produce
+verified runtime bundles, Python wheels, and native artifacts. Guest programs
+use Shellsim's filesystem, processes, clock, entropy, and resource limits.
+
+## Layout
+
+| Directory | Ownership |
+| --- | --- |
+| `python/<name>` | CPython and Python distributions, including their patches and tests |
+| `native/<name>` | Libraries, native development files, and guest build tools |
+| `toolchain/<name>` | Host resolver/compiler ports and guest platform support |
+| `_support` | Small shared build and test helpers |
+| `<port>/tests` | Recipe checks, guest programs, and port-specific acceptance |
+
+The production CPython builder lives in [python/cpython](python/cpython).
+The SDK owns its dynamic-loader bridge. Compiler, loader, exception and FFI
+conformance programs live under [tests/fixtures/wasm](../tests/fixtures/wasm);
+production builds do not compile those programs.
+
+Each recipe records upstream source URLs and SHA256 values, versions, target
+profile, build inputs, selected features, patches, and dependencies. Native
+artifacts retain exact compiled-provider identities. Pure wheels keep upstream
+metadata and tags; curated source builds retain their provenance. A recipe or
+builder change invalidates the corresponding build cache.
+
+## Python environment setup
+
+Build a bare CPython bundle and its SDK 34 dynamic runtime from the repository
+root. The build host needs uv, make, a native C compiler, and ordinary Unix
+build tools; the builder downloads the pinned SDK.
 
 ```sh
-uv run --no-project --python 3.13 ports/cpython/build.py
-uv run --no-project --python 3.13 ports/cpython/build.py --with-pycosat
-uv run --no-project --python 3.13 ports/cpython/build.py --with-pillow
+uv run --no-project --python 3.13 ports/python/cpython/build.py \
+  --work-dir /tmp/shellsim-cpython
+uv run --no-project --python 3.13 python -m ports.python.cpython.dynamic \
+  --bundle /tmp/shellsim-cpython --output /tmp/shellsim-runtime
 ```
 
-The work directory defaults to `/tmp/shellsim-cpython`. It contains downloaded
-sources, a native helper interpreter required for cross compilation, compiler
-logs, `rootfs`, and `manifest.json`. The helper stays on the host and is never
-included in the guest filesystem. Pass `--work-dir` to choose another build
-directory and `--jobs` to limit parallel compiler work. Build prerequisites are
-uv, a native C compiler, make, and ordinary Unix development tools. The script
-fetches its pinned WASI SDK. Keep generated binaries outside the repository.
+The [process overlay](toolchain/wasi_process/README.md) adds upstream CPython
+subprocess support through the virtual process kernel. The
+[zlib extension](python/cpython/STDLIB_ZLIB.md) supplies shared native compression.
+Build tools and native helper interpreters stay on the host. Runtime bundles
+contain the guest interpreter, standard library, license notices, and a manifest
+of file hashes. Verification checks integrity against trusted build inputs.
 
-The image installs `/usr/bin/python3.wasm` and `/usr/lib/python3.13`. The manifest
-records the recipe, source and SDK hashes, builtin module names, native ports,
-site-packages directory, and every image file's SHA256. Bundle verification
-checks these hashes before mounting. It is an integrity check for a trusted
-build, not a signature or an assurance about arbitrary supplied Wasm programs.
-
-Use the explicit runtime handle to mount the image and run interpreter arguments:
+Provide a matching package catalog and the pinned
+[uv WASI resolver](toolchain/uv/README.md):
 
 ```python
 from shellsim import CPythonRuntime, Environment
 
-runtime = CPythonRuntime("/tmp/shellsim-cpython")
-env = Environment(cpu=2_000_000_000, memory=256 * 1024 * 1024, disk=64 * 1024 * 1024)
-runtime.mount(env)
-result = runtime.run(env, ["-c", "import sys; print(sys.platform)"])
-assert result.returncode == 0, result.stderr
-assert result.stdout == b"wasi\n"
-
-runtime.install_pypi(env, "six==1.17.0")
-result = runtime.run(env, ["-c", "from six.moves import urllib_parse; print(urllib_parse.urlparse('https://example.org').scheme)"])
-assert result.returncode == 0, result.stderr
-assert result.stdout == b"https\n"
-```
-
-For a dynamic v2 bundle, build the pinned [uv WASI resolver](toolchain/uv/README.md)
-and make a local catalog for that bundle. The fixture builder uses the separately
-built zlib extension and provider; optional wheel arguments add the independently
-built NumPy wheel and the pinned upstream magiccube pure wheel:
-
-```sh
-uv run --no-project --python 3.13 ports/dynamic/package_spike.py \
-  --bundle /tmp/shellsim-dynamic-v2 \
-  --output /tmp/shellsim-package-universe \
-  --numpy-wheel /tmp/shellsim-numpy-dynamic/numpy-2.3.5-cp313-cp313-wasm32_wasip1.whl \
-  --magiccube-wheel /tmp/shellsim-numpy-workflow/downloads/magiccube-0.3.0-py3-none-any.whl
-```
-
-The output contains `catalog.json`, native wheels and providers, and a local
-pure-wheel Simple index for this offline fixture. The installer generates an
-authoritative Simple index from the catalog. A catalog declares `schema_version: 1`,
-`abi` matching the bundle's `dynamic_abi`, `target: wasm32-wasip1`,
-`python_version: 3.13.7`, `packages` with distribution name, version, relative
-wheel path, and whole-wheel SHA256, and `native_providers` with soname, relative
-path, `/lib` destination, SHA256, and declared native dependencies. Curated native
-wheels carry `<distribution>.dist-info/shellsim-native.json` with the same ABI,
-name/version, source and compiler provenance, and each native file's relative
-path, SHA256, and native dependencies. The same catalog can contain approved pure
-wheels, including wheels built by the [CellPyLib recipe](cellpylib/README.md).
-Those retain their standard pure tags and need no native manifest. Their source,
-identity and hash remain authoritative, and native files inside them are rejected.
-The `pure_index` key can select a local Simple index; otherwise ordinary pure
-dependencies resolve from PyPI. A curated distribution
-name is authoritative: its unavailable versions do not fall back to PyPI.
-
-```python
 runtime = CPythonRuntime(
-    "/tmp/shellsim-dynamic-v2",
-    universe="/tmp/shellsim-package-universe",
-    uv="/tmp/shellsim-uv/uv",
+    "/path/to/runtime",
+    universe="/path/to/package-catalog",
+    uv="/path/to/patched-uv",
+    venv="/app/.venv",
 )
-env = Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+env = Environment(cpu=4_000_000_000, memory=512 * 1024**2, disk=128 * 1024**2)
 runtime.mount(env)
-runtime.install_pypi(env, "magiccube==0.3.0")
-result = runtime.run(env, ["-c", "import magiccube, numpy; print(numpy.arange(4).sum())"])
+env.install_pypi(["pytest==8.4.1", "numpy==2.3.5"])
+result = env.run("python -c 'import numpy; print(numpy.arange(4).sum())'")
 assert result.returncode == 0, result.stderr
 assert result.stdout == b"6\n"
 ```
 
-Pass several PyPI specs as a list to solve them in one WASI dependency graph
-and import the result in one VFS transaction:
+The mounted venv has its own site-packages, `pyvenv.cfg`, Python launchers, and
+console entry points. Mounting sets `VIRTUAL_ENV` and prepends the venv's `bin`
+to `PATH`. Ordinary shell commands and child interpreters select that CPython.
+`Environment.run_python`, `install_pypi`, and `install_lock` use the mounted
+runtime. Without a CPython mount, the existing Python VM remains available.
+
+The host resolves all requested requirements together for CPython 3.13.7 on
+WASI. The ABI-scoped catalog supplies approved native and pure wheels; ordinary
+pure dependencies can come from a configured index or PyPI. An unavailable
+curated version is an error. The installer checks wheel contents, hashes, native
+ABI markers, dependency closure, and file conflicts before an atomic VFS import.
+It rejects host-native wheels and hidden native files in pure wheels. Installation
+requires an idle environment.
+
+Exact versions can instead come from a supported standalone `uv.lock`:
 
 ```python
-runtime.install_pypi(env, ["pytest==8.4.1", "numpy==2.3.5"])
-```
-
-An existing `uv.lock` can also supply exact versions. Mount the project source
-separately, then select the lock's extras and groups explicitly:
-
-```python
-runtime.install_lock(
-    env,
-    "/tmp/task/uv.lock",  # path on the trusted host
+env.install_lock(
+    "/path/to/uv.lock",
     extras=("plot",),
     groups=("test",),
     project_mounted=True,
 )
 ```
 
-`install_lock` accepts a standalone uv lock with one virtual or editable root at
-`.`. `project_mounted=True` states that this root is already in the virtual
-filesystem. The installer reads the lock's dependency graph through a frozen,
-offline uv export, then resolves its exact selected pins again for CPython
-3.13.7 on WASI. It uses the local curated catalog and configured pure-wheel
-index, rather than wheel URLs chosen for the lock creator's host. A missing
-curated version is an error. A lock with no selected registry dependencies
-is a valid no-op when its Python range and supported environment markers include
-the guest. No default dependency groups are selected; pass each wanted
-group by name. VCS, URL, local path, and non-root editable packages are rejected.
-All installed wheels must pass the same bounded verification and atomic import
-as direct PyPI specs. Both APIs require an idle environment.
-After mounting, `env.install_pypi(...)` and `env.install_lock(...)` use that
-CPython runtime and its WASI package universe. An environment without a
-CPython mount retains its existing Python VM package path.
+Mount the root project separately. Lock installation accepts one virtual or
+editable root at `.` and explicitly selected extras/groups. It exports the
+selected dependency pins offline, checks the lock's Python/environment constraints,
+and resolves the pins for the guest. Host wheel URLs do not determine guest
+artifacts. Missing curated versions fail; pins are not relaxed. VCS, URL, local
+path, and non-root editable dependencies are currently unsupported.
 
-Mounting a dynamic bundle creates a real isolated venv at `/work/.venv` by
-default. Pass `venv="/app/.venv"` to put it at a task's workspace. The venv has
-`pyvenv.cfg`, its own Python 3.13 site-packages, and `bin/python` launchers;
-CPython reports the venv as `sys.prefix` and `/usr` as `sys.base_prefix`.
-Mounted `/bin` and `/usr/bin` `python`, `python3`, and `python3.13` select the
-WASI interpreter through VFS links. Mounting also exports `VIRTUAL_ENV` and
-prepends the venv `bin` directory to the environment's existing `PATH`.
-Ordinary shell commands, console scripts, and child processes use this venv
-without an activation command. `python3.14` explicitly selects shellsim's
-Python VM; `Environment.run_python` selects the mounted CPython when present.
+### Catalog contract
 
-```python
-result = env.run("cd /work; python -c 'import sys; print(sys.prefix)'")
-assert result.returncode == 0, result.stderr
-assert result.stdout == b"/work/.venv\n"
-```
+`catalog.json` declares schema version 1, the runtime ABI, target
+`wasm32-wasip1`, Python version, and package records containing name, version,
+relative wheel path, and SHA256. Native-provider records declare their soname,
+relative file path, `/lib` destination, hash, and native dependencies. An optional
+`pure_index` selects a separate pure-wheel index.
 
-Installed packages go to the venv site-packages directory. The installer puts
-declared Python console entry points such as `pytest` in the venv `bin` directory
-with a guest interpreter shebang. It rejects raw or non-Python scripts, reserved
-venv command names, and file conflicts before importing package files. Bundle
-mounting and launcher setup form one transaction; a conflict leaves the
-preexisting VFS and environment variables intact.
+Native wheels carry `<distribution>.dist-info/shellsim-native.json`, recording
+package identity, ABI, source/compiler provenance, and native files with their
+hashes and provider dependencies. Pure catalog wheels use standard tags and need
+no native manifest. Catalog distribution identities and hashes are authoritative.
+The catalog is currently an explicit local trusted input; public artifact
+publication is a follow-up.
 
-Dynamic installation resolves the requirement and dependencies for the exact
-CPython 3.13.7 WASI target. It verifies wheel hashes, wheel contents, native
-ABI markers, declared provider closure, and file conflicts before one VFS
-mount. It requires an idle environment and never installs host-platform wheels.
-The local catalog and patched uv executable are explicit trusted host inputs.
+## Native tools and libraries
 
-## Native tools and development libraries
-
-Install guest tools and development files from a verified
-[native catalog](native/catalog/README.md) in the same environment as CPython:
+The [native catalog](native/catalog/README.md) installs guest build tools and
+native development artifacts into the same environment:
 
 ```python
 from shellsim import NativePackageUniverse
 
-native = NativePackageUniverse("/tmp/shellsim-native-tools/catalog/catalog.json")
-selected = native.install(
-    env,
-    ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
-)
+native = NativePackageUniverse("/path/to/native/catalog.json")
+native.install(env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"])
 result = env.run("cd /work; make -j2")
 assert result.returncode == 0, result.stderr
 ```
 
-Mount the project and its Makefile at `/work` before running the build. The
-catalog installs GNU make and the C compiler as `/usr/bin/make` and
-`/usr/bin/cc`; zlib headers and its static archive go under `/opt/zlib`.
-Guest compiler invocations can use `-I/opt/zlib/include` and
-`/opt/zlib/lib/libz.a`. Python requirements still use `env.install_pypi(...)`
-or `env.install_lock(...)`; native requirements use the native catalog above.
+Mount the project and Makefile at `/work` first. The catalog provides GNU make,
+a TinyCC C compiler, and zlib headers/archive. Provider hashes and compiled
+relationships are verified before one mount transaction. Successive installs
+reuse compatible installed artifacts and reject replacement or destination
+conflicts. Upgrade and uninstall are not implemented. Recursive make jobserver
+coordination and a C++ compiler remain missing.
 
-Native installation resolves the complete requested dependency graph, checks
-compiled provider identities and exported files, and mounts it atomically.
-Later native installs preserve already installed artifact identities, including
-across catalog instances. A compatible installed version is reused; a conflicting
-version or destination fails before mutation. Upgrade and uninstall operations
-are not implemented. Native package setup requires an idle environment.
+See [native dependency contracts](native/README.md) for profiles, exported files,
+cache identities, and compiler isolation.
 
-The current native catalog contains make, the TinyCC C toolchain, and zlib
-development files. Make executes parallel recipes and Makefile-remake exec
-through the virtual process kernel. Recursive jobserver coordination remains
-unsupported. This graph does not yet supply a C++ compiler or a complete
-build-essential collection. Catalogs and runtime bundles remain explicit local
-setup inputs.
+## Port tests
 
-## Static bundle installation
-
-For a static bundle, `install_pypi` uses host uv to resolve Python 3.13 requirements and dependencies.
-Pure source distributions may execute build code on the trusted host. All
-resulting distributions must be pure wheels before atomic VFS import. Native
-wheels are rejected, and packages receive no shellsim VM module substitutions.
-`install_wheel` accepts a local pure Python wheel without resolving dependencies.
-Both installers reject conflicting existing files; keep the environment idle
-throughout setup. Execution uses virtual files, descriptors, environment,
-clock, random source, and cumulative resource limits.
-
-Static-bundle resolution uses Python 3.13 version markers and the host's platform
-markers. That static path supports portable pure dependencies; it does not
-resolve Linux versus WASI dependency markers as distinct target platforms.
-The final validation rejects host native files. Recipes already linked into
-the interpreter seed installed distribution metadata for uv, so
-`runtime.install_pypi(env, "pycosat==0.6.6")` uses the builtin provider.
-Resolution constrains each builtin provider to its linked version; incompatible
-version requirements fail before installation.
-
-Native recipes declare their distribution's qualified `builtin_modules` and
-verified `dist_info` directory. Resolution seeds the exact bundled distribution
-metadata and checks every declared extension against the interpreter's builtin
-module table. A distribution such as NumPy can contain Python files and several
-statically linked extension modules without its distribution name being a builtin.
-
-The pycosat port compiles the upstream 0.6.6 C extension into CPython's builtin
-module table through `Modules/Setup.local`. Its pinned source includes PicoSAT.
-The upstream `NGETRUSAGE` option disables resource timestamp diagnostics because
-WASI does not provide `getrusage`. Verify the built extension inside shellsim:
-
-```python
-result = runtime.run(env, ["-c", "import pycosat; assert pycosat.solve([[1], [-1]]) == 'UNSAT'; assert pycosat.solve([[1]]) == [1]"])
-assert result.returncode == 0, result.stderr
-```
-
-This establishes a static native source recipe. The
-[dynamic loader](dynamic/README.md) imports ABI-matched WASI extension wheels
-into the v2 interpreter; arbitrary host native wheels remain unsupported. The
-[process port](toolchain/wasi_process/README.md) adds virtual POSIX spawn and
-`subprocess.Popen` to a separately built interpreter overlay. The base static
-bundle has neither process spawning nor threads; sockets remain unsupported.
-The [native dependency foundation](native/README.md) supplies zlib
-when selected, sharing its verified target artifact with Pillow's PNG profile.
-Other optional CPython modules requiring external libraries, including
-ssl, ctypes, and readline, are absent from this build. Unsupported
-WASI capabilities fail explicitly. Without an explicit CPython mount,
-`Environment.run_python` selects shellsim's existing Python VM.
-
-Run the opt-in package integration test against a built bundle:
+Keep package behavior checks beside the recipe that owns them. Host tests check
+recipe integrity, build inputs, and failure handling. Guest tests import or link
+the actual package, exercise useful behavior, and include invalid-input cases.
+Shared helpers in `_support/testing.py` mount verified bundles and install through
+the public APIs. Native fixtures belong to their port; runtime ABI conformance
+fixtures remain under `tests/fixtures/wasm`.
 
 ```sh
-SHELLSIM_CPYTHON_BUNDLE=/tmp/shellsim-cpython uv run pytest tests/python_package/test_cpython.py
+uv run --no-project --python /path/to/installed-shellsim/bin/python -m pytest ports
+uv run --no-project --python /path/to/installed-shellsim/bin/python -m pytest ports/python/kiwisolver
 ```
 
-Upstream build references:
-[CPython WASI instructions](https://devguide.python.org/getting-started/setup-building/#wasi),
-[CPython 3.13 WASI tooling](https://github.com/python/cpython/tree/3.13/Tools/wasm),
-and [WASI SDK 34](https://github.com/WebAssembly/wasi-sdk/releases/tag/wasi-sdk-34).
+Ordinary CI discovers port-local tests along with central API/tooling tests.
+Build-dependent guest tests require explicit artifact inputs and skip when those
+inputs are absent. A skip does not establish port acceptance. Central tests retain
+installer atomicity, resolver contracts, resource accounting, and unchanged task
+verifiers because those behaviors span ports. Repository gates are
+`./infra/pre-commit.py --all-files` and `./infra/ci/run_tests.py`.
 
-`--target-profile wasi-cpython-v1` retains the SDK 24 bare-interpreter/pycosat build
-needed by the dynamic C-extension proof. The current NumPy and imaging recipes
-use v2. See [the native profile guide](native/README.md) for exception flags,
-artifact identities and the explicit shared-library frontier.
+## Supported profiles and remaining work
 
-## Real NumPy graph spike
+SDK 34 dynamic linking supports separate C/C++ extensions, shared libraries,
+canonical C++ exceptions, NumPy and Kiwi. Library loading uses only the VFS and
+is bounded by resource accounting. TLS, unloading, cyclic native dependencies,
+and live loading across threads remain unsupported by this cohort.
 
-The narrow graph workflow accepts the `magiccube==0.3.0` root:
+Static CPython builds can include pycosat, NumPy, Pillow and shared native build
+inputs selected before the interpreter link. Static package installation accepts
+pure wheels; it uses host platform markers and therefore is limited to portable
+pure dependencies. The SDK 24 profile is retained for its existing narrow loader
+contract. ABI identifiers prevent mixing these profiles.
 
-```sh
-uv run --python 3.13 ports/spike_numpy.py magiccube==0.3.0
-```
-
-It verifies the upstream pure wheel and NumPy source archive, resolves the real
-`magiccube -> numpy` metadata under all eleven fixed CPython/WASI marker values,
-uses or builds the approved static NumPy profile, stages the pure wheel, and runs
-array reductions and reversible Rubik cube rotations through native NumPy object
-arrays. The NumPy index artifact contains resolution metadata only and is never
-installed. Numerical code comes from the verified CPython bundle.
-
-The default directories are `/tmp/shellsim-numpy` for the native bundle and
-`/tmp/shellsim-numpy-workflow` for graph and execution evidence. `--bundle` selects
-an existing development bundle. Cached bundles must match the NumPy and CPython
-recipes, source identities, SDK, and declared extension modules. The workflow
-recreates its uv lock and compares the actual guest's marker profile before
-recording successful execution.
-
-`--resolve-only` writes `plan.json` and `resolution/uv.lock` without claiming a
-build or guest execution. `--numpy-requirement 'numpy==2.2.0'` demonstrates rejection
-of a native version absent from the curated index. A successful execution writes
-`result.json`, guest output, and resource usage. This spike is one measured graph;
-it does not replace the public installer with a general guest-platform resolver.
-The [experimental NumPy profile](numpy/README.md) supports FFT but cannot honor
-NumPy's floating-point warning and exception policy on WASI. The measured cube
-and integer-array operations do not establish complete NumPy compatibility.
+The tested task set includes two Codeelo tasks, one CalibForge task, and a native
+build variant of a Codeelo task. It does not establish broad Tasktrove coverage.
+NumPy retains documented floating-point warning/exception-policy limits. Static
+Pillow omits several optional codecs. SciPy, dynamic Pillow, upstream ctypes,
+threaded dynamic loading, and Reasoning Gym still require further acceptance.

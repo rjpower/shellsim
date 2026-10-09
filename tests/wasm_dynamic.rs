@@ -1,5 +1,5 @@
 // Synthetic ABI failures run everywhere. Real SDK/CPython artifacts are opt-in and come from
-// ports/dynamic/build.py; guest file reads and writes use only the virtual filesystem.
+// tests/fixtures/wasm/dynamic/build.py; guest file reads and writes use only the virtual filesystem.
 use shellsim::{Environment, Limits};
 use std::path::{Path, PathBuf};
 
@@ -915,10 +915,10 @@ fn dlopen_null_returns_a_nonzero_main_image_handle() {
 }
 
 #[test]
-#[ignore = "requires a built SDK34 Python bundle and FFI proof extension"]
+#[ignore = "requires a built SDK34 Python bundle and FFI fixture extension"]
 fn sdk34_python_extension_calls_main_image_c_api() {
     let bundle = PathBuf::from(std::env::var_os("SHELLSIM_FFI_PYTHON_BUNDLE").unwrap());
-    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_FFI_PROOF_ARTIFACTS").unwrap());
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_FFI_FIXTURE_ARTIFACTS").unwrap());
     let rootfs = bundle.join("rootfs");
     let mut environment = environment();
     mount_tree(&mut environment, &rootfs, &rootfs);

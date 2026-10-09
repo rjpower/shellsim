@@ -53,7 +53,7 @@
     "ports/toolchain/wasi_sdk/posix.h": "031eac921644625f3f6923c224fe1341831e4340fc2d13bea7fee7ad3ccd38ee",
     "ports/toolchain/wasi_accounts/accounts.c": "b57ef20fe45093d5512ef7c69d401d136516b4f22ffae938a5232739f4a3350a",
     "ports/toolchain/wasi_accounts/pwd.h": "f52923825eb970392213654965a2ce8508e52fc67586deed68a7af396e622d97",
-    "ports/native/wasi-posix-tools-v1.json": "06466b4ad68d9c9b0f015f5251406218130b3817a0658d8ad561d58c28a15e1b",
+    "ports/native/wasi-posix-tools-v1.json": "bf5956ef3bc6d19a2b41003aa55e463077871fa4bdd7d7392096af5edaeffa48",
     "ports/toolchain/wasi_sdk/notices/llvm-LICENSE.TXT": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
     "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a",
     "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",

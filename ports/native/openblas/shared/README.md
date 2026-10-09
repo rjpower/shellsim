@@ -40,7 +40,7 @@ and virtual `getenv`/`atoi`. Interpreter bytes are checked before and after.
 
 ```sh
 PYTHONPATH=/path/to/current-shellsim-adapter uv run --no-project --python 3.13 \
-  ports/native/openblas/shared/verify.py \
+  ports/native/openblas/shared/tests/verify.py \
   --artifact /path/to/shared-openblas-artifact \
   --sdk /path/to/wasi-sdk-34.0-x86_64-linux \
   --runtime /path/to/fixed-sdk34-cpython-bundle \

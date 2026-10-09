@@ -13,8 +13,8 @@ import subprocess
 from functools import partial
 from pathlib import Path
 
-from ports.dynamic.build import mark_abi
-from ports.dynamic.build import run as run_command
+from ports._support.wasm import mark_abi
+from ports._support.wasm import run as run_command
 from ports.native.dependencies import file_hash, target_environment, target_profile
 from ports.toolchain.wasi_sdk.build import dynamic_toolchain
 
@@ -102,8 +102,8 @@ def build_process_bundle(bundle: Path, output: Path) -> None:
             str(process_object),
         ]
     )
-    bridge_source = PORT.parents[1] / "dynamic/fixtures/bridge.c"
-    if file_hash(bridge_source) != base["fixture_sources"]["bridge.c"]:
+    bridge_source = PORT.parent / "wasi_sdk/dynamic.c"
+    if file_hash(bridge_source) != base["runtime_sources"]["dynamic.c"]:
         raise ValueError("Pinned CPython dynamic bridge source differs")
     bridge_object = output / "bridge.o"
     run(
@@ -260,7 +260,6 @@ def build_process_bundle(bundle: Path, output: Path) -> None:
             },
         },
         "runtime_capabilities": [*base["runtime_capabilities"], "shellsim_process_v1"],
-        "proof_artifacts": {**base["proof_artifacts"], "python3.wasm": file_hash(python)},
         "files": {
             "/" + str(path.relative_to(rootfs)): file_hash(path) for path in sorted(rootfs.rglob("*")) if path.is_file()
         },

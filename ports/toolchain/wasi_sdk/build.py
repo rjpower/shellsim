@@ -7,8 +7,8 @@ import that runtime and its exception tag; they never link private runtime copie
 import json
 from pathlib import Path
 
+from ports._support.build import check_build_scripts
 from ports.native.dependencies import file_hash, toolchain_identity
-from ports.numpy.build import check_build_scripts
 
 
 def dynamic_toolchain(sdk):

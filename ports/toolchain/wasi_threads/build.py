@@ -1,115 +1,163 @@
-"""Compile and audit a pinned SDK pthread fixture without enabling host threads."""
+"""Build the pinned LLD/libc scheduler thread toolchain outside the repository."""
 
 import argparse
 import json
-import re
+import os
+import resource
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
-from ports.native.dependencies import file_hash, target_environment
-from ports.numpy.build import check_build_scripts
+from ports._support.build import apply_patch, check_build_scripts
+from ports.native.dependencies import file_hash
 
 
 def toolchain_identity(recipe):
-    """Compare compiler inputs without tying a toolchain to its test fixtures."""
-    identity = dict(recipe)
-    identity.pop("status", None)
-    identity["build_scripts"] = [
-        entry
-        for entry in recipe["build_scripts"]
-        if entry["file"] not in {"build.py", "two_pthreads.c", "sequential_pthreads.c"}
-        and not entry["file"].startswith("runner/")
-    ]
-    return identity
+    """Bind toolchain caches to every production recipe input and driver hash.
+
+    Fixture builders have a separate recipe. Renaming or changing a production
+    driver invalidates this identity even when compiler source inputs are equal.
+    """
+    return dict(recipe)
 
 
-def build_probe(sdk, output, toolchain=None, fixture="two_pthreads"):
-    if fixture not in {"two_pthreads", "sequential_pthreads"}:
-        raise ValueError("unknown pthread fixture")
+def extract(archive, destination, digest, selected):
+    if file_hash(archive) != digest:
+        raise ValueError("toolchain source archive SHA-256 mismatch")
+    if destination.exists():
+        raise ValueError("use a fresh toolchain work directory")
+    destination.mkdir()
+    with tarfile.open(archive) as source:
+        members = []
+        for member in source:
+            parts = Path(member.name).parts
+            if len(parts) < 2 or (selected and parts[1] not in selected):
+                continue
+            member.name = str(Path(*parts[1:]))
+            if member.islnk():
+                member.linkname = str(Path(*Path(member.linkname).parts[1:]))
+            members.append(member)
+        source.extractall(destination, members=members, filter="data")
+
+
+def run(command, log, environment):
+    with log.open("w") as output:
+        subprocess.run(command, env=environment, stdout=output, stderr=subprocess.STDOUT, check=True, timeout=3600)
+
+
+def build(sdk, llvm_archive, libc_archive, ninja, work):
     directory = Path(__file__).parent
     recipe = json.loads((directory / "recipe.json").read_text())
     check_build_scripts(recipe, directory)
     for name, digest in recipe["sdk_binaries"].items():
         if file_hash(sdk / "bin" / name) != digest:
-            raise ValueError("pthread probe requires the pinned SDK 34 binaries")
+            raise ValueError("toolchain build requires the pinned SDK 34 binaries")
     for name, digest in recipe["sdk_files"].items():
         if file_hash(sdk / name) != digest:
-            raise ValueError("pthread probe requires the pinned SDK 34 runtime inputs")
-    output.mkdir(parents=True, exist_ok=True)
-    target = output / (fixture.replace("_", "-") + (".wasm" if toolchain else "-raw.wasm"))
-    provenance = None
-    extra_flags = []
-    if toolchain is not None:
-        provenance = json.loads((toolchain / "toolchain-manifest.json").read_text())
-        if toolchain_identity(provenance["recipe"]) != toolchain_identity(recipe):
-            raise ValueError("patched toolchain recipe differs from the fixture recipe")
-        for path, digest in provenance["artifacts"].items():
-            if file_hash(toolchain / path) != digest:
-                raise ValueError("patched toolchain artifact SHA-256 mismatch")
-        linker = toolchain / "lld-build/bin/wasm-ld"
-        if not linker.exists():
-            linker.symlink_to("lld")
-        extra_flags = [
-            "--sysroot=" + str(toolchain / "libc-build/sysroot"),
-            "-fuse-ld=" + str(linker),
-            "-Wl,--shared-memory,--serial-memory-init",
-        ]
-    environment = target_environment(sdk)
-    command = [
-        str(sdk / "bin/clang"),
-        "--target=wasm32-wasip1-threads",
-        "-pthread",
-        "-O2",
-        "-g0",
-        *extra_flags,
-        str(directory / (fixture + ".c")),
-        "-Wl,--import-memory,--export-memory,--export=__stack_pointer,--export=__tls_base",
-        "-Wl,--initial-memory=16777216,--max-memory=16777216",
-        "-o",
-        str(target),
-    ]
-    subprocess.run(command, env=environment, check=True)
-    disassembly = subprocess.check_output(
-        [str(sdk / "bin/llvm-objdump"), "-d", str(target)], env=environment, text=True
+            raise ValueError("toolchain build requires the pinned SDK 34 runtime inputs")
+    work.mkdir(parents=True, exist_ok=True)
+    llvm = work / "llvm-source"
+    libc = work / "libc-source"
+    extract(
+        llvm_archive,
+        llvm,
+        recipe["llvm_source"]["sha256"],
+        {"llvm", "lld", "libc", "libunwind", "cmake", "third-party", "LICENSE.TXT"},
     )
-    (output / "fixture.disasm").write_text(disassembly)
-    raw_operations = {
-        operation: len(re.findall(r"\bmemory\.atomic\." + operation + r"\b", disassembly))
-        for operation in ("wait32", "wait64", "notify")
+    extract(libc_archive, libc, recipe["wasi_libc"]["sha256"], set())
+    for item in recipe["build_scripts"]:
+        if item["file"].endswith(".patch"):
+            apply_patch(llvm if item["file"].startswith("llvm") else libc, directory / item["file"], item["sha256"])
+    environment = dict(os.environ)
+    environment.pop("CFLAGS", None)
+    environment.pop("CXXFLAGS", None)
+    environment.pop("LDFLAGS", None)
+    llvm_build = work / "lld-build"
+    libc_build = work / "libc-build"
+    commands = [
+        [
+            "cmake",
+            "-G",
+            "Ninja",
+            "-S",
+            str(llvm / "llvm"),
+            "-B",
+            str(llvm_build),
+            "-DCMAKE_MAKE_PROGRAM=" + str(ninja),
+            "-DCMAKE_BUILD_TYPE=Release",
+            "-DLLVM_ENABLE_PROJECTS=lld",
+            "-DLLVM_TARGETS_TO_BUILD=WebAssembly",
+            "-DLLVM_INCLUDE_TESTS=OFF",
+            "-DLLVM_INCLUDE_EXAMPLES=OFF",
+            "-DLLVM_INCLUDE_BENCHMARKS=OFF",
+            "-DLLVM_ENABLE_ZLIB=OFF",
+            "-DLLVM_ENABLE_ZSTD=OFF",
+            "-DLLVM_ENABLE_LIBXML2=OFF",
+            "-DLLVM_ENABLE_BINDINGS=OFF",
+            "-DLLVM_PARALLEL_LINK_JOBS=1",
+        ],
+        ["cmake", "--build", str(llvm_build), "--target", "lld", "FileCheck", "--parallel", "8"],
+        [
+            "cmake",
+            "-S",
+            str(libc),
+            "-B",
+            str(libc_build),
+            "-DTARGET_TRIPLE=wasm32-wasip1-threads",
+            "-DBUILD_SHARED=OFF",
+            "-DBUILD_TESTS=OFF",
+            "-DCMAKE_C_COMPILER=" + str(sdk / "bin/clang"),
+            "-DCMAKE_ASM_COMPILER=" + str(sdk / "bin/clang"),
+            "-DCMAKE_AR=" + str(sdk / "bin/llvm-ar"),
+            "-DCMAKE_RANLIB=" + str(sdk / "bin/llvm-ranlib"),
+            "-DBUILTINS_LIB=" + str(sdk / "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a"),
+        ],
+        ["cmake", "--build", str(libc_build), "--parallel", "8"],
+    ]
+    resource.setrlimit(resource.RLIMIT_AS, (12 * 1024**3, 12 * 1024**3))
+    for index, command in enumerate(commands):
+        run(command, work / f"build-{index}.log", environment)
+    tools = {
+        name: subprocess.check_output([name, "--version"], text=True).splitlines()[0]
+        for name in ("cmake", "gcc", "g++")
     }
-    if toolchain is not None and any(raw_operations.values()):
-        raise ValueError("patched pthread fixture contains raw atomic wait/notify")
+    tools["ninja"] = subprocess.check_output([str(ninja), "--version"], text=True).strip()
     manifest = {
-        "schema_version": 1,
         "recipe": recipe,
-        "execution_verified": False,
-        "artifact": {"path": target.name, "sha256": file_hash(target)},
-        "raw_atomic_operations": raw_operations,
-        "toolchain_provenance": provenance,
-        "compile_command": command,
-        "memory_reservation_bytes": 16 * 1024 * 1024,
+        "host_tools": tools,
+        "commands": commands,
+        "build_limits": {
+            "compile_jobs": 8,
+            "link_jobs": 1,
+            "address_space_bytes_per_process": 12 * 1024**3,
+            "command_timeout_seconds": 3600,
+        },
+        "artifacts": {
+            str(path.relative_to(work)): file_hash(path)
+            for path in (
+                llvm_build / "bin/lld",
+                llvm_build / "bin/FileCheck",
+                libc_build / "sysroot/lib/wasm32-wasip1-threads/libc.a",
+            )
+        },
     }
-    (output / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    return target
+    (work / "toolchain-manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sdk", type=Path, required=True)
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--toolchain", type=Path)
-    parser.add_argument("--fixture", choices=("two_pthreads", "sequential_pthreads"), default="two_pthreads")
+    for name in ("sdk", "llvm-archive", "libc-archive", "ninja", "work-dir"):
+        parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
-    print(
-        build_probe(
-            args.sdk.resolve(),
-            args.output.resolve(),
-            args.toolchain.resolve() if args.toolchain else None,
-            args.fixture,
-        )
+    build(
+        args.sdk.resolve(),
+        args.llvm_archive.resolve(),
+        args.libc_archive.resolve(),
+        args.ninja.resolve(),
+        args.work_dir.resolve(),
     )
 
 

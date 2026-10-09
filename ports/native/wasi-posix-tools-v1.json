@@ -8,7 +8,12 @@
   "cpp_exceptions": false,
   "setjmp_longjmp": false,
   "sysroot_libraries": "pinned-sdk-only",
-  "compiler_flags": ["-O2", "-g0"],
-  "link_flags": ["-lwasi-emulated-signal"],
+  "compiler_flags": [
+    "-O2",
+    "-g0"
+  ],
+  "link_flags": [
+    "-lwasi-emulated-signal"
+  ],
   "required_host_imports": "shellsim_posix_v1"
 }
