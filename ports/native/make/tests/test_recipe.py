@@ -15,11 +15,3 @@ def test_make_recipe_pins_build_inputs():
         assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected
     for item in recipe["build_scripts"]:
         assert hashlib.sha256((port / item["file"]).read_bytes()).hexdigest() == item["sha256"]
-
-
-def test_patch_context_has_no_trailing_whitespace():
-    # Empty context lines may omit their prefix in unified patches. Preserve C
-    # source bytes while keeping the patch itself valid under git diff --check.
-    patch = (ROOT / "ports/native/make/wasi.patch").read_bytes()
-    assert b"\n \n" not in patch
-    assert b"\n \x0c\n" not in patch

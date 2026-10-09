@@ -11,7 +11,6 @@ uv run --no-project ports/python/numpy/dynamic.py \
   --runtime /tmp/shellsim-dynamic-v2 \
   --output /tmp/shellsim-numpy-dynamic
 SHELLSIM_DYNAMIC_V2_ARTIFACTS=/tmp/shellsim-dynamic-v2 \
-SHELLSIM_NUMPY_DYNAMIC_WHEEL=/tmp/shellsim-numpy-dynamic/numpy-2.3.5-cp313-cp313-wasm32_wasip1.whl \
 SHELLSIM_NUMPY_UNIVERSE=/path/to/catalog \
 SHELLSIM_PATCHED_UV=/path/to/patched-uv \
 uv run pytest ports/python/numpy/tests/test_dynamic_guest.py
