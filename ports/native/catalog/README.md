@@ -1,7 +1,7 @@
 # Native package catalog
 
-`NativePackageUniverse(catalog_path).install(environment, specs)` resolves bare
-names, exact pins and PEP440 version ranges from a bounded local catalog. It checks
+The native package resolver handles bare names, exact pins and PEP440 version
+ranges from a bounded local catalog. It checks
 all transitive version constraints together, including exact compiled-provider
 artifact identities, before mounting one staged rootfs transaction. Unavailable
 releases are errors; installation never builds packages or invokes host programs.
@@ -32,10 +32,9 @@ installs make at `/usr/bin/make`, cc at `/usr/bin/cc`, compiler/sysroot files at
 and `/wasi-sysroot`, and zlib development files at `/opt/zlib`.
 
 The CPython release producer can seal this catalog as an optional `native.zip`
-asset using `--native-catalog /path/to/catalog.json`. Call
-`NativePackageUniverse.from_release(trusted_descriptor, offline=True)` after
-the asset is cached, then use the same `install` method and version specs.
-Native delivery validates all listed artifacts and each version's dependency
-closure; it does not select a CPython interpreter or download the host uv
-resolver. The native archive is separate so a task that only needs make or cc
-can load it without the Python cohort.
+asset using `--native-catalog /path/to/catalog.json`. Prepare an environment
+with `Environment.from_release(trusted_descriptor, tools=["make", "shellsim-c-toolchain"])`.
+The native asset validator checks all listed artifacts and each version's
+dependency closure before setup. The archive stays separate from the Python
+cohort for independent integrity checks, while the public setup call selects
+both when tools are requested.

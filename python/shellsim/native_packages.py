@@ -317,7 +317,7 @@ def verify_release_catalog(catalog_path: Path) -> set[str]:
             if total > _MAX_RELEASE_BYTES or len(seen) >= _MAX_FILES:
                 raise ValueError("native release exceeds bounded file limits")
             seen.add(path.relative_to(root).as_posix())
-    universe = NativePackageUniverse(catalog_path)
+    universe = _NativePackageUniverse(catalog_path)
     expected = {"catalog.json"}
     metadata: dict[tuple[str, Version], dict[str, Any]] = {}
     for candidates in universe._packages.values():
@@ -337,7 +337,7 @@ def verify_release_catalog(catalog_path: Path) -> set[str]:
     return expected
 
 
-class NativePackageUniverse:
+class _NativePackageUniverse:
     """Install compatible versions from an explicit, bounded local native catalog.
 
     Specs use ordinary package names and version ranges, such as
@@ -419,7 +419,7 @@ class NativePackageUniverse:
     @classmethod
     def from_release(
         cls, descriptor: str | Path, *, cache_dir: str | Path | None = None, offline: bool = False
-    ) -> NativePackageUniverse:
+    ) -> _NativePackageUniverse:
         """Load a sealed native catalog without selecting a Python runtime or host resolver."""
         from ._native_release import materialize_native
 

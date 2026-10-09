@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import shellsim
 from shellsim._cpython_release import _fetch, _ReleaseRedirect
-from shellsim.native_packages import _digest
+from shellsim.native_packages import _digest, _NativePackageUniverse
 
 from ports.python.cpython import release
 
@@ -351,28 +351,28 @@ def test_native_release_loads_without_python_resolver_and_installs_tool(release_
     monkeypatch.setattr("shellsim._cpython_release.platform.system", lambda: "Darwin")
     cache = tmp_path / "cache"
     with pytest.raises(shellsim.PackageInstallError, match="not cached"):
-        shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
-    universe = shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=cache)
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
+    universe = _NativePackageUniverse.from_release(descriptor, cache_dir=cache)
     environment = shellsim.Environment()
     assert universe.install(environment, "make>=4.4,<5") == {"make": "4.4.1"}
     assert environment.read_file("/usr/bin/make") == b"guest make 4.4.1"
     (descriptor.parent / "native.zip").unlink()
-    assert shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True).catalog_path.is_file()
+    assert _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True).catalog_path.is_file()
     (universe.root / "artifacts/4.4.1/bin/make").write_bytes(b"changed")
     with pytest.raises(shellsim.PackageInstallError, match="cached native release is corrupt"):
-        shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
 
 
 def test_python_only_release_has_no_native_catalog(release_inputs, tmp_path):
     descriptor = _built(release_inputs, tmp_path / "release")
     with pytest.raises(shellsim.PackageInstallError, match="no native package catalog"):
-        shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
+        _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
 
 
 def test_cached_native_artifact_cannot_be_resealed_without_descriptor(release_inputs, tmp_path):
     native = _native_catalog(tmp_path / "native")
     descriptor = release.build_release(*release_inputs, tmp_path / "release", native_catalog=native)
-    universe = shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
+    universe = _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
     tool = universe.root / "artifacts/4.4.1/bin/make"
     tool.write_bytes(b"changed")
     manifest_path = universe.root / "artifacts/4.4.1/artifact.json"
@@ -385,7 +385,7 @@ def test_cached_native_artifact_cannot_be_resealed_without_descriptor(release_in
     catalog["packages"][0]["artifact_sha256"] = manifest["artifact_sha256"]
     universe.catalog_path.write_text(json.dumps(catalog))
     with pytest.raises(shellsim.PackageInstallError, match="cached native release is corrupt"):
-        shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache", offline=True)
+        _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache", offline=True)
 
 
 def test_native_release_rejects_unsatisfied_candidate_before_publication(release_inputs, tmp_path):
@@ -425,7 +425,7 @@ def test_native_release_archive_cannot_add_python_files(release_inputs, tmp_path
     descriptor.write_text(json.dumps(data))
     cache = tmp_path / "cache"
     with pytest.raises(shellsim.PackageInstallError, match="unsafe path"):
-        shellsim.NativePackageUniverse.from_release(descriptor, cache_dir=cache)
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache)
     assert not list(cache.iterdir())
 
 

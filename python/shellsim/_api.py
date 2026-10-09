@@ -9,6 +9,7 @@ import shlex
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 from . import _native
@@ -220,6 +221,79 @@ class Environment:
                 raise TypeError("http must be a mapping from URL patterns to shellsim.HttpResponse")
             for pattern, response in http.items():
                 self.route_http(pattern, response)
+
+    @classmethod
+    def from_release(
+        cls,
+        descriptor: Union[str, os.PathLike[str]],
+        *,
+        pypi: Optional[Union[str, Sequence[str]]] = None,
+        lock: Optional[Union[str, os.PathLike[str]]] = None,
+        tools: Union[str, Sequence[str]] = (),
+        project: Optional[Union[str, os.PathLike[str]]] = None,
+        extras: Sequence[str] = (),
+        groups: Sequence[str] = (),
+        limits: Optional[Limits] = None,
+        cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
+        offline: bool = False,
+    ) -> Environment:
+        """Prepare one guest with a verified CPython release and requested packages.
+
+        ``project`` is copied to ``/work`` before interpreter setup. A lock needs
+        that mounted root; its registry pins are reselected for the WASI guest.
+        Setup happens on a fresh environment, which is returned only on success.
+        ``offline`` applies to release assets; package resolution may use the
+        configured Python index when the release lacks a pure dependency.
+        """
+        if pypi is not None and lock is not None:
+            raise ValueError("choose either PyPI specs or a uv.lock file")
+        if lock is not None and project is None:
+            raise ValueError("uv.lock setup needs a project directory to mount at /work")
+        if lock is None and (extras or groups):
+            raise ValueError("extras and groups require a uv.lock file")
+        if limits is not None and not isinstance(limits, Limits):
+            raise TypeError("limits must be a shellsim.Limits instance")
+
+        from .cpython import CPythonRuntime, _requirements
+
+        requirements = _requirements(pypi) if pypi is not None else None
+        if isinstance(tools, str):
+            tool_specs = (tools,)
+        elif isinstance(tools, Sequence) and not isinstance(tools, (bytes, bytearray, memoryview)):
+            if len(tools) > 64:
+                raise ValueError("tools exceeds the native package request limit")
+            tool_specs = tuple(tools)
+        else:
+            raise TypeError("tools must be a native package spec or sequence of specs")
+        if any(not isinstance(spec, str) for spec in tool_specs):
+            raise TypeError("each tool spec must be str")
+        if tool_specs:
+            from .native_packages import _NativePackageUniverse, _requirement
+
+            for spec in tool_specs:
+                _requirement(spec)
+        if project is not None:
+            project_path = Path(os.fspath(project))
+            venv_source = project_path / ".venv"
+            if venv_source.exists() or venv_source.is_symlink():
+                raise ValueError("project contains a .venv that would overlap the mounted CPython environment")
+
+        runtime = CPythonRuntime.from_release(descriptor, cache_dir=cache_dir, offline=offline)
+        native = None
+        if tool_specs:
+            native = _NativePackageUniverse.from_release(descriptor, cache_dir=cache_dir, offline=offline)
+
+        environment = cls(limits=limits or Limits(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=256 * 1024 * 1024))
+        if project is not None:
+            environment.mount(project, "/work")
+        runtime.mount(environment)
+        if native is not None:
+            native.install(environment, tool_specs)
+        if requirements is not None:
+            environment.install_pypi(requirements)
+        elif lock is not None:
+            environment.install_lock(lock, extras=extras, groups=groups, project_mounted=True)
+        return environment
 
     @property
     def terminated(self) -> bool:

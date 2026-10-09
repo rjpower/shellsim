@@ -149,15 +149,19 @@ The [native catalog](native/catalog/README.md) installs guest build tools and
 native development artifacts into the same environment:
 
 ```python
-from shellsim import NativePackageUniverse
+from shellsim import Environment, Limits
 
-native = NativePackageUniverse("/path/to/native/catalog.json")
-native.install(env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"])
+env = Environment.from_release(
+    "/path/to/release.json",
+    tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
+    project="/path/to/project",
+    limits=Limits(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2),
+)
 result = env.run("cd /work; make -j2")
 assert result.returncode == 0, result.stderr
 ```
 
-Mount the project and Makefile at `/work` first. The catalog provides GNU make,
+The factory mounts the project and Makefile at `/work`. The catalog provides GNU make,
 a TinyCC C compiler, and zlib headers/archive. Provider hashes and compiled
 relationships are verified before one mount transaction. Successive installs
 reuse compatible installed artifacts and reject replacement or destination

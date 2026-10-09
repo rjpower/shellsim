@@ -79,20 +79,23 @@ uv run --no-project --python 3.13 python -m ports.python.cpython.release \
 Pass `--native-catalog /path/to/native/catalog.json` to add a separate
 `native.zip` asset to the same trusted descriptor. The native asset keeps the
 existing artifact manifests, exact toolchain identities, and dependency pins;
-it does not change the Python cohort or uv resolver. Native-only callers can
-load it without a CPython mount or a host uv compatibility check:
+it does not change the Python cohort or uv resolver. Request guest tools and
+Python packages together when preparing an environment:
 
 ```python
-from shellsim import Environment, NativePackageUniverse
+from shellsim import Environment
 
-tools = NativePackageUniverse.from_release("/path/to/release-output/release.json")
-env = Environment()
-tools.install(env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"])
+env = Environment.from_release(
+    "/path/to/release-output/release.json",
+    pypi=["pytest==8.4.1", "numpy==2.3.5"],
+    tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
+)
 ```
 
-The native archive is optional. `offline=True` requires a verified cached
-native asset. Old descriptors without a native section continue to load their
-Python cohort; requesting native tools from one reports the missing asset.
+The native archive is optional. With tools requested, `offline=True` requires
+its verified cache entry. Old descriptors without a native section continue to
+load their Python cohort; requesting native tools from one reports the missing
+asset.
 
 Use an installed shellsim package that includes this release helper. The
 producer records the resolver's measured glibc symbol floor and shared library
@@ -105,21 +108,26 @@ published descriptor still needs an independently recorded archive and resolver
 hash. No default descriptor or release URL is currently shipped.
 
 ```python
-from shellsim import CPythonRuntime, Environment
+from shellsim import Environment
 
-runtime = CPythonRuntime.from_release("/path/to/release-output/release.json")
-env = Environment()
-runtime.mount(env)
-env.install_pypi("numpy==2.3.5")
+env = Environment.from_release("/path/to/release-output/release.json", pypi="numpy==2.3.5")
 ```
 
-`from_release` reads the explicitly trusted local descriptor, verifies both
-assets, checks every cached runtime and catalog hash, and then uses the normal
-WASI package installer. `offline=True` uses only a verified cache entry. A
-corrupt cache entry or missing native version raises an error; neither case
-changes the guest filesystem. To publish elsewhere, pass `--base-url` with an
-immutable HTTPS asset directory and distribute the resulting descriptor through
-a trusted channel. The reader rejects HTTP, file URLs, path escapes and
+`Environment.from_release` reads the explicitly trusted local descriptor,
+verifies the runtime and catalogs, then mounts CPython and installs the
+requested packages. It returns only after setup succeeds. Its default limits
+are 4 billion CPU units, 512 MiB memory, 256 MiB disk and 4 MiB output;
+pass `limits=Limits(...)` to override them. Supply `project="/host/task"` to
+mount source at `/work` before package setup. For `uv.lock`, also pass the lock
+path, with optional `extras` and `groups`; a lock without a project is rejected.
+`offline=True` requires cached release assets, while package resolution can
+still contact the configured index for uncatalogued pure dependencies.
+
+The lower-level `CPythonRuntime.from_release` remains available for explicit
+mount and staged installs. A corrupt cache entry or missing native version
+raises an error. To publish elsewhere, pass `--base-url` with an immutable
+HTTPS asset directory and distribute the resulting descriptor through a
+trusted channel. The reader rejects HTTP, file URLs, path escapes and
 unapproved redirect hosts.
 
 Dynamic loader proofs and their catalog builder live under
