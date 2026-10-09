@@ -20,13 +20,19 @@ const STACK_GUARD_BYTES: u32 = 64;
 pub(super) fn supported(name: &str) -> bool {
     matches!(
         name,
-        "invoke" | "closure_alloc" | "closure_alloc_typed" | "closure_release"
+        "invoke"
+            | "closure_alloc"
+            | "closure_alloc_typed"
+            | "closure_reserve"
+            | "closure_define_typed"
+            | "closure_release"
     )
 }
 
 struct Closure {
     index: u32,
     active: Arc<AtomicBool>,
+    prepared: bool,
 }
 
 #[derive(Default)]
@@ -428,6 +434,7 @@ async fn closure_alloc(
     caller.data_mut().ffi.closures.push(Closure {
         index: slot as u32,
         active,
+        prepared: true,
     });
     memory.write(
         &mut caller,
@@ -522,15 +529,43 @@ async fn closure_alloc_typed(
         }
     };
     let active = Arc::new(AtomicBool::new(true));
-    let closure_active = active.clone();
-    let tags: Arc<[Scalar]> = tags.into();
+    let function = make_typed_closure(
+        &mut caller,
+        dispatch_index,
+        userdata,
+        tags.into(),
+        result,
+        active.clone(),
+    );
+    table.set(&mut caller, slot, Ref::Func(Some(function)))?;
+    caller.data_mut().ffi.closures.push(Closure {
+        index: slot as u32,
+        active,
+        prepared: true,
+    });
+    memory.write(
+        &mut caller,
+        output_ptr as usize,
+        &(slot as u32).to_le_bytes(),
+    )?;
+    Ok(ERRNO_SUCCESS)
+}
+
+fn make_typed_closure(
+    caller: &mut Caller<'_, Host>,
+    dispatch_index: u32,
+    userdata: u32,
+    tags: Arc<[Scalar]>,
+    result: Option<Scalar>,
+    active: Arc<AtomicBool>,
+) -> Func {
     let signature = FuncType::new(
         caller.engine(),
         tags.iter().map(|tag| tag.ty()),
         result.iter().map(|tag| tag.ty()),
     );
-    let function = Func::new_async(&mut caller, signature, move |caller, params, results| {
-        let active = closure_active.clone();
+    Func::new_async(caller, signature, move |caller, params, results| {
+        let active = active.clone();
         let tags = tags.clone();
         Box::new(async move {
             let value = dispatch_callback_typed(
@@ -548,17 +583,139 @@ async fn closure_alloc_typed(
             }
             Ok(())
         })
-    });
-    table.set(&mut caller, slot, Ref::Func(Some(function)))?;
+    })
+}
+
+fn closure_reserve(mut caller: Caller<'_, Host>, output_ptr: u32) -> Result<i32, Error> {
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (output_ptr as usize)
+        .checked_add(4)
+        .is_none_or(|end| end > memory.data_size(&caller))
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    if caller.data().ffi.closures.len() >= MAX_CLOSURES {
+        return Ok(ERRNO_NOSPC);
+    }
+    let Some(main) = caller.data().dynamic.main else {
+        return Ok(ERRNO_INVAL);
+    };
+    let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
+        return Ok(ERRNO_INVAL);
+    };
+    if table.size(&caller) == 0 || table.size(&caller) > u32::MAX as u64 {
+        return Ok(ERRNO_INVAL);
+    }
+    if !caller.data().machine.get().resources.charge_cpu(8) {
+        return Err(super::exhausted());
+    }
+    dynamic::reserve(&mut caller, CLOSURE_METADATA_BYTES)?;
+    let slot = match table.grow(&mut caller, 1, Ref::Func(None)) {
+        Ok(slot) => slot,
+        Err(_) => {
+            dynamic::unreserve(&mut caller, CLOSURE_METADATA_BYTES);
+            return if caller.data().machine.get().resources.is_stopped() {
+                Err(super::exhausted())
+            } else {
+                Ok(ERRNO_NOSPC)
+            };
+        }
+    };
     caller.data_mut().ffi.closures.push(Closure {
         index: slot as u32,
-        active,
+        active: Arc::new(AtomicBool::new(true)),
+        prepared: false,
     });
     memory.write(
         &mut caller,
         output_ptr as usize,
         &(slot as u32).to_le_bytes(),
     )?;
+    Ok(ERRNO_SUCCESS)
+}
+
+fn closure_define_typed(
+    mut caller: Caller<'_, Host>,
+    index: u32,
+    dispatch_index: u32,
+    userdata: u32,
+    tags_ptr: u32,
+    count: u32,
+    result_tag: u32,
+) -> Result<i32, Error> {
+    if count as usize > MAX_PARAMS || result_tag > 4 {
+        return Ok(ERRNO_INVAL);
+    }
+    let Some(position) = caller.data().ffi.closures.iter().position(|closure| {
+        closure.index == index && closure.active.load(Ordering::Acquire) && !closure.prepared
+    }) else {
+        return Ok(ERRNO_INVAL);
+    };
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    let mut codes = [0; MAX_PARAMS];
+    if memory
+        .read(&caller, tags_ptr as usize, &mut codes[..count as usize])
+        .is_err()
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    let mut tags = Vec::with_capacity(count as usize);
+    for code in &codes[..count as usize] {
+        let Some(tag) = Scalar::parse(*code) else {
+            return Ok(ERRNO_INVAL);
+        };
+        tags.push(tag);
+    }
+    let result = if result_tag == 0 {
+        None
+    } else {
+        Some(Scalar::parse(result_tag as u8).expect("bounded scalar tag"))
+    };
+    let Some(main) = caller.data().dynamic.main else {
+        return Ok(ERRNO_INVAL);
+    };
+    let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
+        return Ok(ERRNO_INVAL);
+    };
+    if !matches!(table.get(&mut caller, index as u64), Some(Ref::Func(None))) {
+        return Ok(ERRNO_INVAL);
+    }
+    let Some(Ref::Func(Some(dispatcher))) = table.get(&mut caller, dispatch_index as u64) else {
+        return Ok(ERRNO_INVAL);
+    };
+    let signature = dispatcher.ty(&caller);
+    if !same_types(
+        signature.params(),
+        &[ValType::I32, ValType::I32, ValType::I32],
+    ) || !same_types(signature.results(), &[ValType::I32])
+        || stack_contract(&mut caller).is_err()
+    {
+        return Ok(ERRNO_INVAL);
+    }
+    if !caller
+        .data()
+        .machine
+        .get()
+        .resources
+        .charge_cpu(count as u64 + 12)
+    {
+        return Err(super::exhausted());
+    }
+    let active = caller.data().ffi.closures[position].active.clone();
+    let function = make_typed_closure(
+        &mut caller,
+        dispatch_index,
+        userdata,
+        tags.into(),
+        result,
+        active,
+    );
+    table.set(&mut caller, index as u64, Ref::Func(Some(function)))?;
+    caller.data_mut().ffi.closures[position].prepared = true;
     Ok(ERRNO_SUCCESS)
 }
 
@@ -623,6 +780,24 @@ pub(super) fn register(linker: &mut Linker<Host>) {
                 Box::new(closure_alloc_typed(
                     caller, dispatch, userdata, tags, count, result_tag, output,
                 ))
+            },
+        )
+        .expect("unique FFI import");
+    linker
+        .func_wrap(NAMESPACE, "closure_reserve", closure_reserve)
+        .expect("unique FFI import");
+    linker
+        .func_wrap(
+            NAMESPACE,
+            "closure_define_typed",
+            |caller: Caller<'_, Host>,
+             index: u32,
+             dispatch: u32,
+             userdata: u32,
+             tags: u32,
+             count: u32,
+             result_tag: u32| {
+                closure_define_typed(caller, index, dispatch, userdata, tags, count, result_tag)
             },
         )
         .expect("unique FFI import");

@@ -694,3 +694,182 @@ fn separately_compiled_sdk_provider_calls_and_callbacks() {
         b"separate SDK provider, side FFI import and nested callback: ok\n"
     );
 }
+
+#[test]
+fn reserved_closure_slot_is_stable_until_typed_definition_and_release() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param f64) (result f64)))
+        (import "shellsim_ffi_v1" "closure_reserve"
+            (func $reserve (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_define_typed"
+            (func $define (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_release"
+            (func $release (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (f64.store (local.get 2)
+                (f64.add (f64.load (local.get 1))
+                    (f64.convert_i32_s (local.get 0))))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start") (local $slot i32) (local $unprepared i32)
+            (if (call $reserve (i32.const 256)) (then unreachable))
+            (local.set $slot (i32.load (i32.const 256)))
+            (if (i32.ne (local.get $slot) (i32.const 1)) (then unreachable))
+            (i32.store8 (i32.const 32) (i32.const 5))
+            (if (i32.ne (call $define (local.get $slot) (i32.const 0) (i32.const 2)
+                    (i32.const 32) (i32.const 1) (i32.const 4)) (i32.const 28))
+                (then unreachable))
+            (if (i32.eqz (ref.is_null (table.get (local.get $slot))))
+                (then unreachable))
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (call $define (local.get $slot) (i32.const 0) (i32.const 2)
+                    (i32.const 32) (i32.const 1) (i32.const 4)) (then unreachable))
+            (if (f64.ne (call_indirect (type $callback)
+                    (f64.const 1.5) (local.get $slot)) (f64.const 3.5))
+                (then unreachable))
+            (if (i32.ne (call $define (local.get $slot) (i32.const 0) (i32.const 0)
+                    (i32.const 32) (i32.const 1) (i32.const 4)) (i32.const 28))
+                (then unreachable))
+            (if (call $release (local.get $slot)) (then unreachable))
+            (if (i32.eqz (ref.is_null (table.get (local.get $slot))))
+                (then unreachable))
+            (if (call $reserve (i32.const 260)) (then unreachable))
+            (local.set $unprepared (i32.load (i32.const 260)))
+            (if (call $release (local.get $unprepared)) (then unreachable))
+            (if (i32.ne (table.size) (i32.const 3)) (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn reserved_closure_rejects_wrong_dispatcher_before_table_mutation() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (import "shellsim_ffi_v1" "closure_reserve" (func $reserve (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_define_typed"
+            (func $define (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_release" (func $release (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $wrong (param i32) (result i32) (local.get 0))
+        (elem (i32.const 0) $wrong)
+        (func (export "_start") (local $slot i32)
+            (if (call $reserve (i32.const 256)) (then unreachable))
+            (local.set $slot (i32.load (i32.const 256)))
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (i32.ne (call $define (local.get $slot) (i32.const 0)
+                    (i32.const 0) (i32.const 32) (i32.const 1) (i32.const 4))
+                    (i32.const 28)) (then unreachable))
+            (if (i32.eqz (ref.is_null (table.get (local.get $slot))))
+                (then unreachable))
+            (if (call $release (local.get $slot)) (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn reserved_closure_capacity_is_charged_and_not_reused() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (import "shellsim_ffi_v1" "closure_reserve" (func $reserve (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_release" (func $release (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (func (export "_start") (local $i i32)
+            (block $done (loop $more
+                (br_if $done (i32.ge_u (local.get $i) (i32.const 64)))
+                (if (call $reserve (i32.const 256)) (then unreachable))
+                (if (i32.ne (i32.load (i32.const 256))
+                        (i32.add (local.get $i) (i32.const 1))) (then unreachable))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $more)))
+            (if (i32.ne (call $reserve (i32.const 256)) (i32.const 51))
+                (then unreachable))
+            (if (i32.ne (table.size) (i32.const 65)) (then unreachable))
+            (local.set $i (i32.const 1))
+            (block $done (loop $more
+                (br_if $done (i32.gt_u (local.get $i) (i32.const 64)))
+                (if (call $release (local.get $i)) (then unreachable))
+                (local.set $i (i32.add (local.get $i) (i32.const 1)))
+                (br $more)))
+            (if (i32.ne (call $reserve (i32.const 256)) (i32.const 51))
+                (then unreachable))))"#;
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000,
+        memory: 8 * 1024 * 1024,
+        ..Limits::default()
+    });
+    environment
+        .vfs
+        .write("/", "/app", &wat::parse_str(wat).unwrap(), 0o755)
+        .unwrap();
+    let baseline = environment.resources.memory_mark();
+    let (outcome, _, stderr) = environment.run_script_capture("/app");
+    assert_eq!((outcome.exit_status, stderr), (0, Vec::new()));
+    assert!(outcome.usage.memory_peak < 8 * 1024 * 1024);
+    assert_eq!(environment.resources.memory_mark(), baseline);
+}
+
+#[test]
+fn timeout_cancels_a_prepared_reserved_closure_without_retained_fibers() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param f64) (result f64)))
+        (import "shellsim_ffi_v1" "closure_reserve" (func $reserve (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_define_typed"
+            (func $define (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "poll_oneoff"
+            (func $poll (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (i32.store (i32.const 16) (i32.const 1))
+            (i64.store (i32.const 24) (i64.const 10000000000))
+            (if (call $poll (i32.const 0) (i32.const 100)
+                    (i32.const 1) (i32.const 200)) (then unreachable))
+            (f64.store (local.get 2)
+                (f64.add (f64.load (local.get 1)) (f64.const 2)))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (call $reserve (i32.const 256)) (then unreachable))
+            (if (call $define (i32.load (i32.const 256)) (i32.const 0)
+                    (i32.const 0) (i32.const 32) (i32.const 1) (i32.const 4))
+                (then unreachable))
+            (drop (call_indirect (type $callback)
+                (f64.const 1.5) (i32.load (i32.const 256))))))"#;
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000,
+        memory: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    environment
+        .vfs
+        .write("/", "/app", &wat::parse_str(wat).unwrap(), 0o755)
+        .unwrap();
+    let first = environment.run_script_capture("timeout 1 /app; echo $?");
+    assert_eq!(
+        (first.0.exit_status, first.1, first.2),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+    let retained = environment.resources.memory_mark();
+    let second = environment.run_script_capture("timeout 1 /app; echo $?");
+    assert_eq!(
+        (second.0.exit_status, second.1, second.2),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.resources.memory_mark(), retained);
+    assert_eq!(environment.clock.monotonic_ns(), 2_000_000_000);
+}
