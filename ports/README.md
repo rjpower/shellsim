@@ -168,7 +168,11 @@ verifiers because those behaviors span ports. Repository gates are
 ## Supported profiles and remaining work
 
 SDK 34 dynamic linking supports separate C/C++ extensions, shared libraries,
-canonical C++ exceptions and setjmp/longjmp, NumPy and Kiwi. The libffi backend
+canonical C++ exceptions and setjmp/longjmp, NumPy, Kiwi and Pillow. The
+[Pillow port](python/pillow/DYNAMIC.md) supplies PNG/JPEG codecs, FreeType font
+rendering, image arithmetic and morphology through independently installed
+extensions. Its FreeType provider uses the [LLVM linker port](toolchain/llvm)
+and the loader's explicit initialization protocol. The libffi backend
 supports primitive and pointer calls and callbacks, with up to 16 arguments;
 aggregate and variadic signatures are explicitly rejected. Library loading uses only the VFS and
 is bounded by resource accounting. TLS, unloading, cyclic native dependencies,
@@ -182,6 +186,6 @@ contract. ABI identifiers prevent mixing these profiles.
 
 The tested task set includes two Codeelo tasks, one CalibForge task, and a native
 build variant of a Codeelo task. It does not establish broad Tasktrove coverage.
-NumPy retains documented floating-point warning/exception-policy limits. Static
-Pillow omits several optional codecs. SciPy, dynamic Pillow,
-threaded dynamic loading, and Reasoning Gym still require further acceptance.
+NumPy retains documented floating-point warning/exception-policy limits. Pillow
+omits several optional codecs. SciPy, threaded dynamic loading, and Reasoning Gym
+still require further acceptance.

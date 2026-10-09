@@ -1,0 +1,50 @@
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -73,0 +74 @@
++  bool deferSharedInit;
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -228,0 +229,3 @@
++
++def defer_shared_init: FF<"defer-shared-init">,
++  HelpText<"Export shared-library initialization thunks without a module start section">;
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -561,0 +562 @@
++  ctx.arg.deferSharedInit = args.hasArg(OPT_defer_shared_init);
+@@ -758,0 +760,5 @@
++  if (ctx.arg.deferSharedInit && !ctx.arg.shared)
++    error("--defer-shared-init requires --shared");
++  if (ctx.arg.deferSharedInit && ctx.arg.sharedMemory && !ctx.arg.serialMemoryInit)
++    error("--defer-shared-init with shared memory requires --serial-memory-init");
++
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -1211,0 +1212 @@
++    ctx.sym.initMemory->forceExport = ctx.arg.deferSharedInit;
+@@ -1252,0 +1254 @@
++    ctx.sym.applyGlobalRelocs->forceExport = ctx.arg.deferSharedInit;
+@@ -1258 +1260 @@
+-  if (ctx.sym.applyGlobalRelocs && ctx.sym.initMemory) {
++  if (!ctx.arg.deferSharedInit && ctx.sym.applyGlobalRelocs && ctx.sym.initMemory) {
+@@ -1530,0 +1533,5 @@
++  // The process loader owns memory initialization and runs Store-local
++  // relocations separately. No guest code may run during instantiation.
++  if (ctx.arg.deferSharedInit)
++    return;
++
+--- a/lld/wasm/SyntheticSections.cpp
++++ b/lld/wasm/SyntheticSections.cpp
+@@ -42 +42 @@
+-    writeUleb128(to, type, "subsection type");
++    writeU8(to, type, "subsection type");
+@@ -74,0 +75,9 @@
++
++  if (ctx.arg.deferSharedInit) {
++    // Application protocol extension: older loaders reject this unknown
++    // subsection instead of silently skipping explicit initialization.
++    SubSection sub(128);
++    writeStr(sub.os, "shellsim.deferred-init", "vendor initialization protocol");
++    writeUleb128(sub.os, 1, "deferred initialization protocol version");
++    sub.writeTo(os);
++  }

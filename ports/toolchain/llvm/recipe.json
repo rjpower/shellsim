@@ -1,0 +1,63 @@
+{
+  "name": "llvm-wasi-linker",
+  "version": "23-sdk34-deferred-init-1",
+  "source": {
+    "commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
+    "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
+    "sha256": "b4525499be9ccd65a0da8c9efbeb59a5955130b302a190a51883727d8c5c7542"
+  },
+  "protocol": {
+    "dylink_subsection_type": 128,
+    "type_encoding": "uint8",
+    "vendor": "shellsim.deferred-init",
+    "version": 1,
+    "reject_module_start": true
+  },
+  "patches": [
+    {
+      "file": "serial-memory-init.patch",
+      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
+      "inputs": {
+        "Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+        "Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+        "Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+        "Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+      }
+    },
+    {
+      "file": "deferred-shared-init.patch",
+      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
+      "inputs": {
+        "Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
+        "Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
+        "Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
+        "Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
+        "SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
+      }
+    }
+  ],
+  "build_limits": {
+    "compile_jobs": 4,
+    "link_jobs": 1,
+    "address_space_bytes_per_process": 12884901888,
+    "command_timeout_seconds": 3600
+  },
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
+    },
+    {
+      "file": "serial-memory-init.patch",
+      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522"
+    },
+    {
+      "file": "deferred-shared-init.patch",
+      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ]
+}
