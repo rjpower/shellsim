@@ -69,7 +69,6 @@ def test_adaptation_rejects_dynamic_loading_before_ctypes_import(tmp_path):
     derived, evidence = IMAGES.adapted_wheel(wheel, tmp_path, files)
     with zipfile.ZipFile(derived) as archive:
         adapted = archive.read("imageio/core/findlib.py").decode()
-        plugin = archive.read("imageio/plugins/pillow.py").decode()
         record = archive.read("imageio-2.37.0.dist-info/RECORD").decode()
     namespace = {}
     exec(adapted, namespace)
@@ -77,26 +76,9 @@ def test_adaptation_rejects_dynamic_loading_before_ctypes_import(tmp_path):
     with pytest.raises(NotImplementedError):
         namespace["load_lib"]([], [])
     assert "ctypes" not in namespace
-    assert "ExifTags, GifImagePlugin" not in plugin
-    assert 'if self._image.format == "GIF":\n            from PIL import GifImagePlugin' in plugin
     assert "imageio/core/findlib.py,sha256=" in record
     assert evidence["disabled"] == ["dynamic-library-loading"]
     assert evidence["wheel_sha256"] == hashlib.sha256(derived.read_bytes()).hexdigest()
-
-
-def test_pinned_upstream_adaptation_preserves_metadata_and_other_files(tmp_path):
-    import os
-    from pathlib import Path
-
-    source = os.environ.get("SHELLSIM_IMAGEIO_SOURCE_WHEEL")
-    if source is None:
-        pytest.skip("set the pinned upstream Imageio wheel")
-    source = Path(source)
-    destination = IMAGES.build(source, tmp_path / "output")
-    with zipfile.ZipFile(source) as before, zipfile.ZipFile(destination) as after:
-        assert before.namelist() and set(before.namelist()) == set(after.namelist())
-        changed = {name for name in before.namelist() if before.read(name) != after.read(name)}
-    assert changed == {"imageio/core/findlib.py", "imageio/plugins/pillow.py", "imageio-2.37.0.dist-info/RECORD"}
 
 
 @pytest.mark.parametrize("member", ["../escape", "/absolute", "package/native.so", "package/hidden.py"])

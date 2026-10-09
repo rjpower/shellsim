@@ -145,6 +145,10 @@ cache identities, and compiler isolation.
 Keep package behavior checks beside the recipe that owns them. Host tests check
 recipe integrity, build inputs, and failure handling. Guest tests import or link
 the actual package, exercise useful behavior, and include invalid-input cases.
+Avoid tests that copy recipe values, enumerate archive members, count extensions,
+or match patched source text. Verify the installed package's behavior instead.
+Archive checks should enforce integrity or safe extraction; dependency checks
+should exercise resolution, compatibility, or link ordering.
 Shared helpers in `_support/testing.py` mount verified bundles and install through
 the public APIs. Native fixtures belong to their port; runtime ABI conformance
 fixtures remain under `tests/fixtures/wasm`.

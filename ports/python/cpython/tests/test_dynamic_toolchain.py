@@ -1,4 +1,4 @@
-"""Check reviewed build inputs and the separation of main and side runtimes."""
+"""Check reviewed build inputs and reject incompatible interpreter profiles."""
 
 import json
 from pathlib import Path
@@ -32,53 +32,3 @@ def test_dynamic_builder_requires_fixed_bare_sdk34_interpreter(tmp_path, profile
     with pytest.raises(ValueError):
         build(bundle, output)
     assert not output.exists()
-
-
-def test_production_builder_emits_runtime_without_fixture_artifacts(tmp_path, monkeypatch):
-    from ports.python.cpython import dynamic
-
-    bundle = tmp_path / "base"
-    guest = bundle / "wasi-build"
-    guest.mkdir(parents=True)
-    source = bundle / "Python-3.13.7/Modules"
-    source.mkdir(parents=True)
-    (source / "posixmodule.c").write_text("upstream source")
-    (guest / "Modules").mkdir()
-    (guest / "Modules/posixmodule.o").write_bytes(b"base object")
-    (bundle / "rootfs/usr/bin").mkdir(parents=True)
-    (bundle / "rootfs/usr/bin/python3.wasm").write_bytes(b"static interpreter")
-    (bundle / "manifest.json").write_text(
-        json.dumps({"recipe": {"target_profile": "wasi-cpython-v2"}, "native_ports": []})
-    )
-    libc = tmp_path / "libc.a"
-    libc.write_bytes(b"canonical libc")
-    recipe = {"abi": "test-abi", "loader_namespace": "test-loader", "main_link_flags": [], "notices": []}
-    monkeypatch.setattr(dynamic, "dynamic_toolchain", lambda sdk: (recipe, {}, [libc]))
-    monkeypatch.setattr(dynamic, "target_environment", lambda sdk: {})
-    monkeypatch.setattr(
-        dynamic, "target_profile", lambda recipe: {"compiler_flags": [], "cpp_flags": [], "link_flags": []}
-    )
-    commands = []
-
-    def run(command, cwd=None, env=None):
-        commands.append(command)
-        if "-o" in command:
-            Path(command[command.index("-o") + 1]).write_bytes(b"compiled runtime")
-
-    def output(command, **kwargs):
-        if "llvm-nm" in command[0]:
-            return "malloc T 0 1\n"
-        if command[-1] == "shellsim_posix_compile":
-            return "clang -c posixmodule.c"
-        return "clang Programs/python.o Modules/posixmodule.o"
-
-    monkeypatch.setattr(dynamic, "run_command", run)
-    monkeypatch.setattr(dynamic.subprocess, "check_output", output)
-    destination = tmp_path / "runtime"
-    build(bundle, destination)
-    manifest = json.loads((destination / "manifest.json").read_text())
-    assert "proof_artifacts" not in manifest
-    assert "fixture_sources" not in manifest
-    assert not list(destination.glob("*.so"))
-    assert manifest["files"]["/usr/bin/python3.wasm"] == file_hash(destination / "python3.wasm")
-    assert all("tests/fixtures" not in str(argument) for command in commands for argument in command)
