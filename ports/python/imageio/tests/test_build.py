@@ -1,6 +1,7 @@
-"""Verify pure-wheel input admission and reviewed import adaptations."""
+"""Verify pinned pure-wheel admission and unchanged output bytes."""
 
 import hashlib
+import json
 import zipfile
 
 import pytest
@@ -44,41 +45,27 @@ def test_source_metadata_drift_is_rejected(metadata_source, mutation):
         verified_files(archive, recipe)
 
 
-def test_adaptation_rejects_dynamic_loading_before_ctypes_import(tmp_path):
-    import types
-    import zipfile
+def test_build_copies_verified_upstream_bytes(metadata_source, tmp_path, monkeypatch):
+    recipe, wheel = metadata_source
+    recipe["build_scripts"] = []
+    (tmp_path / "recipe.json").write_text(json.dumps(recipe))
+    monkeypatch.setattr(IMAGES, "PORT", tmp_path)
+    original = wheel.read_bytes()
+    copied = IMAGES.build(wheel, tmp_path / "output")
+    assert copied.read_bytes() == original
+    assert json.loads((copied.parent / "manifest.json").read_text())["sha256"] == hashlib.sha256(original).hexdigest()
 
-    wheel = tmp_path / "imageio-2.37.0-py3-none-any.whl"
-    source = (
-        "import sys\nimport ctypes\n"
-        "def load_lib(exact_lib_names, lib_names, lib_dirs=None):\n"
-        "    # Checks\n"
-        '    raise AssertionError("discovery reached")\n'
-    )
-    with zipfile.ZipFile(wheel, "w") as archive:
-        archive.writestr("imageio/core/findlib.py", source)
-        archive.writestr(
-            "imageio/plugins/pillow.py",
-            "from PIL import ExifTags, GifImagePlugin, Image, ImageSequence, UnidentifiedImageError\n"
-            'def read(self):\n        if self._image.format == "GIF":\n            # Converting GIF\n            pass\n',
-        )
-        archive.writestr("imageio-2.37.0.dist-info/RECORD", "")
-    with zipfile.ZipFile(wheel) as original:
-        files = {entry.filename: original.read(entry) for entry in original.infolist()}
-    wheel.unlink()
-    derived, evidence = IMAGES.adapted_wheel(wheel, tmp_path, files)
-    with zipfile.ZipFile(derived) as archive:
-        adapted = archive.read("imageio/core/findlib.py").decode()
-        record = archive.read("imageio-2.37.0.dist-info/RECORD").decode()
-    namespace = {}
-    exec(adapted, namespace)
-    namespace["sys"] = types.SimpleNamespace(platform="wasi")
-    with pytest.raises(NotImplementedError):
-        namespace["load_lib"]([], [])
-    assert "ctypes" not in namespace
-    assert "imageio/core/findlib.py,sha256=" in record
-    assert evidence["disabled"] == ["dynamic-library-loading"]
-    assert evidence["wheel_sha256"] == hashlib.sha256(derived.read_bytes()).hexdigest()
+
+def test_build_rejects_changed_source_before_copy(metadata_source, tmp_path, monkeypatch):
+    recipe, wheel = metadata_source
+    recipe["build_scripts"] = []
+    (tmp_path / "recipe.json").write_text(json.dumps(recipe))
+    monkeypatch.setattr(IMAGES, "PORT", tmp_path)
+    wheel.write_bytes(b"changed")
+    output = tmp_path / "output"
+    with pytest.raises(ValueError):
+        IMAGES.build(wheel, output)
+    assert not output.exists()
 
 
 @pytest.mark.parametrize("member", ["../escape", "/absolute", "package/native.so", "package/hidden.py"])

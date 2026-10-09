@@ -13,17 +13,6 @@
   "native_dependencies": {
     "native/zlib": "1.3.1"
   },
-  "adaptation": {
-    "file": "imageio-wasi.patch",
-    "sha256": "3536613ddad9d05b92a9d0b433336135e793a7595724f0ae06ff97323e5d0e6f",
-    "unsupported": [
-      "dynamic-library-loading"
-    ],
-    "lazy_imports": [
-      "ctypes",
-      "PIL.GifImagePlugin"
-    ]
-  },
   "requires_dist": [
     "numpy",
     "pillow>=8.3.2",
@@ -88,7 +77,7 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "9f068326b54b388fe1822343a84ffcffb0d00662cf99a194ba18b3b9b312675d"
+      "sha256": "3c9586a89f8d9e60b094c5fdb91697df3c9f13725f8e27d7a1adaae41fca5d7d"
     },
     {
       "file": "../../_support/pure_wheel.py",
