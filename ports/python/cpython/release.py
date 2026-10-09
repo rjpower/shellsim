@@ -13,6 +13,8 @@ import zipfile
 from pathlib import Path
 
 from shellsim._cpython_release import _descriptor, _digest, _validate_entry
+from shellsim._native_release import _validate_entry as _validate_native_entry
+from shellsim.native_packages import verify_release_catalog
 
 
 def _host_requirements(uv: Path) -> tuple[str, list[str]]:
@@ -45,9 +47,17 @@ def _archive(root: Path, destination: Path) -> None:
             archive.writestr(info, path.read_bytes())
 
 
-def build_release(runtime: Path, universe: Path, uv: Path, output: Path, *, base_url: str | None = None) -> Path:
+def build_release(
+    runtime: Path,
+    universe: Path,
+    uv: Path,
+    output: Path,
+    *,
+    base_url: str | None = None,
+    native_catalog: Path | None = None,
+) -> Path:
     """Copy and verify one release; return its trusted local descriptor path."""
-    if output.exists():
+    if output.exists() or output.is_symlink():
         raise ValueError("release output already exists")
     if uv.is_symlink() or not uv.is_file():
         raise ValueError("patched uv resolver must be a regular file")
@@ -84,11 +94,32 @@ def build_release(runtime: Path, universe: Path, uv: Path, output: Path, *, base
         shutil.copy2(stage / "uv", asset)
         descriptor["archive"]["url"] = (base_url or "") + "cohort.zip"
         descriptor["resolvers"]["linux-x86_64-glibc"]["url"] = (base_url or "") + asset.name
+        if native_catalog is not None:
+            verify_release_catalog(native_catalog)
+            native_stage = work / "native-stage"
+            native_stage.mkdir()
+            shutil.copytree(native_catalog.parent, native_stage / "native", symlinks=True)
+            native = {
+                "catalog_sha256": _digest(native_stage / "native/catalog.json", 1024 * 1024),
+                "archive": {"url": (base_url or "") + "native.zip"},
+            }
+            _validate_native_entry(native_stage, native)
+            native_archive = work / "native.zip"
+            _archive(native_stage, native_archive)
+            if native_archive.stat().st_size > 256 * 1024 * 1024:
+                raise ValueError("native release archive exceeds 256 MiB")
+            native["archive"].update(
+                {"sha256": _digest(native_archive, 256 * 1024 * 1024), "size": native_archive.stat().st_size}
+            )
+            descriptor["native"] = native
         (work / "release.json").write_text(json.dumps(descriptor, sort_keys=True, indent=2) + "\n")
         _descriptor(work / "release.json")
         deliver = work / "deliver"
         deliver.mkdir()
-        for name in ("cohort.zip", "uv-linux-x86_64-glibc", "release.json"):
+        assets = ["cohort.zip", "uv-linux-x86_64-glibc", "release.json"]
+        if native_catalog is not None:
+            assets.append("native.zip")
+        for name in assets:
             (work / name).replace(deliver / name)
         deliver.replace(output)
     return output / "release.json"
@@ -99,8 +130,18 @@ def main() -> None:
     for name in ("runtime", "universe", "uv", "output"):
         parser.add_argument(name, type=Path)
     parser.add_argument("--base-url", help="immutable HTTPS release asset directory; local sibling files by default")
+    parser.add_argument("--native-catalog", type=Path, help="verified native build-tool catalog")
     args = parser.parse_args()
-    print(build_release(args.runtime, args.universe, args.uv, args.output, base_url=args.base_url))
+    print(
+        build_release(
+            args.runtime,
+            args.universe,
+            args.uv,
+            args.output,
+            base_url=args.base_url,
+            native_catalog=args.native_catalog,
+        )
+    )
 
 
 if __name__ == "__main__":

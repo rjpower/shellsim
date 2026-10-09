@@ -30,3 +30,12 @@ Run the producer with `PYTHONPATH=.:toolchain/src uv run --no-project --python 3
 python -m ports.native.catalog.build MAKE_ARTIFACT ZLIB_ARTIFACT C_ZLIB_PROOF OUTPUT`. The output catalog
 installs make at `/usr/bin/make`, cc at `/usr/bin/cc`, compiler/sysroot files at `/tcc`
 and `/wasi-sysroot`, and zlib development files at `/opt/zlib`.
+
+The CPython release producer can seal this catalog as an optional `native.zip`
+asset using `--native-catalog /path/to/catalog.json`. Call
+`NativePackageUniverse.from_release(trusted_descriptor, offline=True)` after
+the asset is cached, then use the same `install` method and version specs.
+Native delivery validates all listed artifacts and each version's dependency
+closure; it does not select a CPython interpreter or download the host uv
+resolver. The native archive is separate so a task that only needs make or cc
+can load it without the Python cohort.

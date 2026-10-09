@@ -66,6 +66,24 @@ uv run --no-project --python 3.13 python -m ports.python.cpython.release \
   /path/to/release-output
 ```
 
+Pass `--native-catalog /path/to/native/catalog.json` to add a separate
+`native.zip` asset to the same trusted descriptor. The native asset keeps the
+existing artifact manifests, exact toolchain identities, and dependency pins;
+it does not change the Python cohort or uv resolver. Native-only callers can
+load it without a CPython mount or a host uv compatibility check:
+
+```python
+from shellsim import Environment, NativePackageUniverse
+
+tools = NativePackageUniverse.from_release("/path/to/release-output/release.json")
+env = Environment()
+tools.install(env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"])
+```
+
+The native archive is optional. `offline=True` requires a verified cached
+native asset. Old descriptors without a native section continue to load their
+Python cohort; requesting native tools from one reports the missing asset.
+
 Use an installed shellsim package that includes this release helper. The
 producer records the resolver's measured glibc symbol floor and shared library
 names. Build it with the [uv port](../../toolchain/uv/README.md), which emits an

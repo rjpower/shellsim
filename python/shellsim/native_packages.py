@@ -27,6 +27,7 @@ _MAX_NAMES = 64
 _MAX_SEARCH = 2048
 _MAX_FILES = 10_000
 _MAX_BYTES = 128 * 1024 * 1024
+_MAX_RELEASE_BYTES = 384 * 1024 * 1024
 _KINDS = {"devel", "runtime", "build-tool"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _INSTALL_ROOTS = ("/usr/bin/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")
@@ -257,6 +258,85 @@ def _artifact(root: Path, package: _Package, target: str) -> tuple[Path, dict[st
     return prefix, manifest
 
 
+def _coherent(
+    root: Path,
+    target: str,
+    selected: dict[str, _Package],
+    metadata: dict[tuple[str, Version], dict[str, Any]],
+    installed: dict[str, str],
+) -> bool:
+    if any(name in installed and installed[name] != package.digest for name, package in selected.items()):
+        return False
+    for package in selected.values():
+        key = package.name, package.version
+        if key not in metadata:
+            metadata[key] = _metadata(root, package, target)[1]
+        manifest = metadata[key]
+        declared = manifest["inputs"]["recipe"].get("target_dependencies", [])
+        pinned = manifest["inputs"].get("dependency_artifacts", {})
+        dependencies = {
+            selected[canonicalize_name(dependency.requirement.name)].recipe_port: selected[
+                canonicalize_name(dependency.requirement.name)
+            ]
+            for dependency in package.dependencies
+        }
+        if len(dependencies) != len(package.dependencies):
+            raise ValueError("native catalog has duplicate provider identities")
+        ports = [dependency["port"] for dependency in declared]
+        if len(set(ports)) != len(ports) or set(ports) != set(dependencies) or set(pinned) != set(ports):
+            raise ValueError("native catalog omits or adds a verified dependency edge")
+        for dependency in declared:
+            provider = dependencies[dependency["port"]]
+            if (
+                provider.digest != pinned[dependency["port"]]
+                or provider.version != Version(dependency["version"])
+                or ("target_profile" in dependency and provider.profile != dependency["target_profile"])
+            ):
+                return False
+    return True
+
+
+def verify_release_catalog(catalog_path: Path) -> set[str]:
+    """Validate every listed native release and return its exact regular files.
+
+    Each candidate must have a satisfiable, correctly pinned dependency closure;
+    different versions are checked separately and need not coexist in one guest.
+    """
+    catalog_path = Path(catalog_path)
+    root = catalog_path.parent
+    if catalog_path.name != "catalog.json" or root.is_symlink() or catalog_path.is_symlink():
+        raise ValueError("native release needs a regular catalog.json")
+    seen: set[str] = set()
+    visited = total = 0
+    for path in root.rglob("*"):
+        visited += 1
+        if visited > _MAX_FILES * 2 or path.is_symlink() or (not path.is_dir() and not path.is_file()):
+            raise ValueError("native release contains too many, linked or special paths")
+        if path.is_file():
+            total += path.stat().st_size
+            if total > _MAX_RELEASE_BYTES or len(seen) >= _MAX_FILES:
+                raise ValueError("native release exceeds bounded file limits")
+            seen.add(path.relative_to(root).as_posix())
+    universe = NativePackageUniverse(catalog_path)
+    expected = {"catalog.json"}
+    metadata: dict[tuple[str, Version], dict[str, Any]] = {}
+    for candidates in universe._packages.values():
+        for package in candidates:
+            prefix, manifest = _artifact(universe.root, package, universe.target)
+            base = prefix.relative_to(universe.root)
+            expected.add((base / "artifact.json").as_posix())
+            expected.update((base / name).as_posix() for name in manifest["files"])
+            _resolve(
+                universe._packages,
+                [f"{package.name}=={package.version}"],
+                lambda selected, expected=package: selected.get(expected.name) is expected
+                and _coherent(universe.root, universe.target, selected, metadata, {}),
+            )
+    if seen != expected:
+        raise ValueError("native release has missing or undeclared files")
+    return expected
+
+
 class NativePackageUniverse:
     """Install compatible versions from an explicit, bounded local native catalog.
 
@@ -336,6 +416,19 @@ class NativePackageUniverse:
             for name, values in packages.items()
         }
 
+    @classmethod
+    def from_release(
+        cls, descriptor: str | Path, *, cache_dir: str | Path | None = None, offline: bool = False
+    ) -> NativePackageUniverse:
+        """Load a sealed native catalog without selecting a Python runtime or host resolver."""
+        from ._native_release import materialize_native
+
+        return cls(
+            materialize_native(
+                Path(descriptor), cache_dir=Path(cache_dir) if cache_dir is not None else None, offline=offline
+            )
+        )
+
     def install(self, environment: Environment, specs: str | Sequence[str]) -> dict[str, str]:
         """Verify and stage the complete dependency closure before one atomic VFS mount.
 
@@ -349,42 +442,11 @@ class NativePackageUniverse:
     def _install_locked(self, environment: Environment, specs: str | Sequence[str]) -> dict[str, str]:
         installed = environment._native_installation
         metadata: dict[tuple[str, Version], dict[str, Any]] = {}
-
-        def coherent(selected: dict[str, _Package]) -> bool:
-            if any(
-                name in installed.artifacts and installed.artifacts[name] != package.digest
-                for name, package in selected.items()
-            ):
-                return False
-            for package in selected.values():
-                key = package.name, package.version
-                if key not in metadata:
-                    metadata[key] = _metadata(self.root, package, self.target)[1]
-                manifest = metadata[key]
-                declared = manifest["inputs"]["recipe"].get("target_dependencies", [])
-                pinned = manifest["inputs"].get("dependency_artifacts", {})
-                dependencies = {
-                    selected[canonicalize_name(dependency.requirement.name)].recipe_port: selected[
-                        canonicalize_name(dependency.requirement.name)
-                    ]
-                    for dependency in package.dependencies
-                }
-                if len(dependencies) != len(package.dependencies):
-                    raise ValueError("native catalog has duplicate provider identities")
-                ports = [dependency["port"] for dependency in declared]
-                if len(set(ports)) != len(ports) or set(ports) != set(dependencies) or set(pinned) != set(ports):
-                    raise ValueError("native catalog omits or adds a verified dependency edge")
-                for dependency in declared:
-                    provider = dependencies[dependency["port"]]
-                    if (
-                        provider.digest != pinned[dependency["port"]]
-                        or provider.version != Version(dependency["version"])
-                        or ("target_profile" in dependency and provider.profile != dependency["target_profile"])
-                    ):
-                        return False
-            return True
-
-        selected = _resolve(self._packages, [specs] if isinstance(specs, str) else specs, coherent)
+        selected = _resolve(
+            self._packages,
+            [specs] if isinstance(specs, str) else specs,
+            lambda choices: _coherent(self.root, self.target, choices, metadata, installed.artifacts),
+        )
         identities = {name: package.digest for name, package in selected.items()}
         if any(
             name in installed.artifacts and installed.artifacts[name] != identity
