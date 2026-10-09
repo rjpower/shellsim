@@ -78,4 +78,4 @@ jobs:
                   raise AssertionError("missing toolchain was accepted")
           PY
           python -m pip install dist/shellsim_c_toolchain-*.whl
-      - run: python -m pytest tests/python_package tests/tooling
+      - run: python -m pytest tests/python_package tests/tooling ports

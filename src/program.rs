@@ -643,6 +643,29 @@ mod tests {
             unreachable!("native writer does not duplicate descriptors")
         }
 
+        fn resize_file(&mut self, _fd: i32, _size: usize) -> Result<(), SyscallError> {
+            unreachable!("native writer does not resize files")
+        }
+
+        fn descriptor_readiness(
+            &self,
+            _fd: i32,
+            _writing: bool,
+        ) -> Result<IoPoll<crate::descriptors::DescriptorReady>, SyscallError> {
+            unreachable!("native writer does not poll descriptors")
+        }
+
+        fn directory_path(&self, _fd: i32) -> Result<String, SyscallError> {
+            unreachable!()
+        }
+
+        fn descriptor_state(
+            &self,
+            _fd: i32,
+        ) -> Result<crate::descriptors::DescriptorState, SyscallError> {
+            unreachable!("native writer does not inspect descriptors")
+        }
+
         fn file_state(&self, _fd: i32) -> Result<crate::descriptors::FileState, SyscallError> {
             unreachable!("native writer does not inspect files")
         }
@@ -801,6 +824,10 @@ mod tests {
             unreachable!("native writer does not inspect its PID")
         }
 
+        fn parent_pid(&self) -> crate::process::ProcessId {
+            0
+        }
+
         fn exec_argv(
             &mut self,
             _argv: Vec<String>,
@@ -819,6 +846,33 @@ mod tests {
 
         fn ignore_signal(&mut self, _signal: crate::process::Signal) -> Result<(), SyscallError> {
             unreachable!("native writer does not change signal dispositions")
+        }
+
+        fn signal_disposition(
+            &mut self,
+            _signal: crate::process::Signal,
+            _ignore: bool,
+        ) -> Result<(), SyscallError> {
+            unreachable!()
+        }
+        fn child_completion(
+            &self,
+            _pid: crate::process::ProcessId,
+        ) -> Result<Option<crate::process::ChildCompletion>, SyscallError> {
+            unreachable!()
+        }
+        fn pipe(
+            &mut self,
+            _close_on_exec: bool,
+            _nonblocking: bool,
+        ) -> Result<(i32, i32), SyscallError> {
+            unreachable!()
+        }
+        fn spawn_process(
+            &mut self,
+            _spec: crate::syscalls::ProcessSpawn,
+        ) -> Result<crate::process::ProcessId, SyscallError> {
+            unreachable!()
         }
 
         fn schedule_wake(&mut self, _duration_ns: u64) -> Result<u64, SyscallError> {

@@ -6,11 +6,15 @@ import base64
 import json
 import os
 import shlex
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 from . import _native
+
+if TYPE_CHECKING:
+    from .cpython import CPythonRuntime
 
 SimulationError = _native.SimulationError
 
@@ -19,6 +23,14 @@ ToolHandler = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
 class ToolError(Exception):
     """An intentional tool failure whose message may be returned to the guest."""
+
+
+@dataclass
+class _NativeInstallation:
+    """Immutable native export identities owned by one environment."""
+
+    artifacts: dict[str, str]
+    files: dict[str, tuple[str, int, int]]
 
 
 _MAX_U64 = (1 << 64) - 1
@@ -200,6 +212,9 @@ class Environment:
             resolved.disk,
             resolved.output,
         )
+        self._native_installation = _NativeInstallation({}, {})
+        self._native_install_lock = threading.RLock()
+        self._cpython_runtime: Optional[CPythonRuntime] = None
         if http is not None:
             if not isinstance(http, Mapping):
                 raise TypeError("http must be a mapping from URL patterns to shellsim.HttpResponse")
@@ -233,8 +248,8 @@ class Environment:
     ) -> RunResult:
         """Execute Python source directly in this environment.
 
-        The Python interpreter is fresh for each call. The simulated filesystem, cwd, resource
-        usage, and terminal exhaustion state belong to the persistent environment.
+        An explicitly mounted CPython bundle runs this source through its real WASI interpreter.
+        Otherwise the shellsim Python VM runs it. Filesystem and resource state persist.
         """
 
         if not isinstance(source, str):
@@ -244,10 +259,13 @@ class Environment:
         arguments = list(argv)
         if not all(isinstance(argument, str) for argument in arguments):
             raise TypeError("argv must be a sequence of str")
+        input_bytes = _as_bytes("stdin", stdin)
+        if self._cpython_runtime is not None:
+            return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
         metadata, stdout, stderr = self._native.run_python(
             source,
             arguments,
-            _as_bytes("stdin", stdin),
+            input_bytes,
         )
         return _decode_result(metadata, stdout, stderr)
 
@@ -335,15 +353,31 @@ class Environment:
             skipped_directories=tuple(report["skipped_directories"]),
         )
 
-    def install_pypi(self, requirement: str) -> None:
-        """Resolve a trusted PyPI requirement with host uv and stage compatible Python files.
+    def install_pypi(self, requirement: Union[str, Sequence[str]]) -> None:
+        """Install packages for the mounted CPython or the default shellsim Python VM.
 
-        Source distributions can run build code on the host. Native wheels and extensions are
-        rejected before any files are copied into the simulated environment.
+        The default VM path resolves with host uv and can build source distributions
+        on the host. A mounted dynamic CPython uses its explicit WASI universe.
         """
+        if self._cpython_runtime is not None:
+            self._cpython_runtime.install_pypi(self, requirement)
+            return
         from .pypi import install_pypi
 
         install_pypi(self, requirement)
+
+    def install_lock(
+        self,
+        lock: Union[str, os.PathLike[str]],
+        *,
+        extras: Sequence[str] = (),
+        groups: Sequence[str] = (),
+        project_mounted: bool = False,
+    ) -> None:
+        """Install a uv lock into the explicitly mounted CPython environment."""
+        if self._cpython_runtime is None:
+            raise SimulationError("install_lock requires a mounted CPython runtime")
+        self._cpython_runtime.install_lock(self, lock, extras=extras, groups=groups, project_mounted=project_mounted)
 
 
 class Container:

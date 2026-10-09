@@ -3,7 +3,9 @@
 //! Paths resolve only in the virtual filesystem. Open files live in the process descriptor
 //! table, so a guest cannot keep a second, unaccounted set of file handles or cursors.
 
-use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
+use crate::descriptors::{
+    DescriptorError, DescriptorReady, DescriptorState, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS,
+};
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::net::{HttpPoll, HttpRequest, NetworkRequest, RequestError, RouteError};
@@ -33,6 +35,36 @@ pub(crate) struct SpawnSpec {
     pub new_process_group: bool,
 }
 
+/// Ordered child descriptor and cwd operations applied before exec.
+#[derive(Clone, Debug)]
+pub(crate) enum SpawnFdAction {
+    Close(Fd),
+    Dup2 {
+        source: Fd,
+        destination: Fd,
+    },
+    CloseFrom(Fd),
+    Open {
+        fd: Fd,
+        path: String,
+        options: OpenFile,
+        mode: u32,
+        close_on_exec: bool,
+        nonblocking: bool,
+    },
+    Chdir(String),
+}
+
+/// POSIX process launch data copied from a guest before any kernel mutation.
+pub(crate) struct ProcessSpawn {
+    pub executable: String,
+    pub search_path: bool,
+    pub argv: Vec<String>,
+    pub environment: std::collections::BTreeMap<String, String>,
+    pub actions: Vec<SpawnFdAction>,
+    pub signal_defaults: Vec<crate::process::Signal>,
+}
+
 /// Recipient of a signal sent through [`System::kill`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SignalTarget {
@@ -48,6 +80,7 @@ pub(crate) enum SignalTarget {
 /// The borrowed handle cannot outlive the quantum, so blocked programs retain only owned state.
 pub(crate) trait System {
     fn pid(&self) -> crate::process::ProcessId;
+    fn parent_pid(&self) -> crate::process::ProcessId;
     fn environment(&self) -> std::collections::BTreeMap<String, String>;
     fn hostname(&self) -> &str;
     fn set_hostname(&mut self, name: &str) -> Result<(), SyscallError>;
@@ -105,6 +138,23 @@ pub(crate) trait System {
     ) -> Result<(), SyscallError>;
     /// Duplicate a process descriptor, sharing its open description and cursor.
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError>;
+    /// Inspect the access and type of any virtual descriptor, including streams and devices.
+    fn descriptor_state(&self, fd: Fd) -> Result<DescriptorState, SyscallError>;
+    /// Observe virtual descriptor readiness without performing I/O.
+    fn descriptor_readiness(
+        &self,
+        fd: Fd,
+        writing: bool,
+    ) -> Result<IoPoll<DescriptorReady>, SyscallError>;
+    fn directory_path(&self, fd: Fd) -> Result<String, SyscallError>;
+    /// Create both virtual pipe ends atomically, outside the reserved WASI preopen range.
+    fn pipe(&mut self, close_on_exec: bool, nonblocking: bool) -> Result<(Fd, Fd), SyscallError>;
+    fn spawn_process(
+        &mut self,
+        spec: ProcessSpawn,
+    ) -> Result<crate::process::ProcessId, SyscallError>;
+    /// Resize a writable regular-file description, retaining its shared cursor.
+    fn resize_file(&mut self, fd: Fd, size: usize) -> Result<(), SyscallError>;
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError>;
     fn close(&mut self, fd: Fd) -> Result<(), SyscallError>;
     fn seek(&mut self, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError>;
@@ -192,6 +242,17 @@ pub(crate) trait System {
     ) -> Result<(), SyscallError>;
     /// Ignore `signal` in this process. The disposition survives exec, as POSIX requires.
     fn ignore_signal(&mut self, signal: crate::process::Signal) -> Result<(), SyscallError>;
+    /// Set a kernel default or ignored disposition. Guest callbacks are outside this ABI.
+    fn signal_disposition(
+        &mut self,
+        signal: crate::process::Signal,
+        ignore: bool,
+    ) -> Result<(), SyscallError>;
+    /// Retain the completion reason needed by POSIX wait without reaping the child.
+    fn child_completion(
+        &self,
+        pid: crate::process::ProcessId,
+    ) -> Result<Option<crate::process::ChildCompletion>, SyscallError>;
     /// Observe only a direct child; an exited status remains available until reap.
     fn child_status(&self, pid: crate::process::ProcessId) -> Result<Option<i32>, SyscallError>;
     fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError>;
@@ -229,6 +290,10 @@ impl<'a> ActiveSystem<'a> {
 impl System for ActiveSystem<'_> {
     fn pid(&self) -> crate::process::ProcessId {
         self.interp.process.pid
+    }
+
+    fn parent_pid(&self) -> crate::process::ProcessId {
+        self.interp.process.ppid
     }
 
     fn environment(&self) -> std::collections::BTreeMap<String, String> {
@@ -320,6 +385,9 @@ impl System for ActiveSystem<'_> {
     }
 
     fn metadata_fd(&mut self, fd: Fd) -> Result<FileInfo, SyscallError> {
+        if let Ok(path) = self.directory_path(fd) {
+            return self.metadata("/", &path, true);
+        }
         let file = file_state(self.interp, fd)?;
         let node = match file.orphan {
             Some(id) => self.interp.vfs.orphan_metadata(id)?,
@@ -458,12 +526,136 @@ impl System for ActiveSystem<'_> {
     }
 
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError> {
+        let previous = self
+            .interp
+            .process
+            .fds
+            .get(destination)
+            .ok()
+            .and_then(|id| self.interp.descriptors.pipe_endpoint(id).ok().flatten());
         self.interp
             .process
             .fds
             .duplicate(source, destination, &mut self.interp.descriptors)?;
+        self.interp.wake_pipe_endpoint(previous);
         self.interp
             .refresh_descriptor_snapshot(self.interp.process.pid);
+        Ok(())
+    }
+
+    fn descriptor_state(&self, fd: Fd) -> Result<DescriptorState, SyscallError> {
+        Ok(self
+            .interp
+            .descriptors
+            .state(self.interp.process.fds.get(fd)?)?)
+    }
+
+    fn descriptor_readiness(
+        &self,
+        fd: Fd,
+        writing: bool,
+    ) -> Result<IoPoll<DescriptorReady>, SyscallError> {
+        let id = self.interp.process.fds.get(fd)?;
+        if let Some(file) = self.interp.descriptors.file_state(id)? {
+            if (writing && !file.writable) || (!writing && !file.readable) {
+                return Err(DescriptorError::WrongAccess.into());
+            }
+            let bytes = if writing {
+                u64::MAX
+            } else {
+                let length = match file.orphan {
+                    Some(id) => self.interp.vfs.orphan_len(id)?,
+                    None => self.interp.vfs.file_len("/", &file.path)?,
+                };
+                (length as u64).saturating_sub(file.cursor)
+            };
+            return Ok(IoPoll::Ready(DescriptorReady {
+                bytes,
+                hangup: false,
+            }));
+        }
+        Ok(self.interp.descriptors.readiness(id, writing)?)
+    }
+
+    fn directory_path(&self, fd: Fd) -> Result<String, SyscallError> {
+        Ok(self
+            .interp
+            .descriptors
+            .directory_path(self.interp.process.fds.get(fd)?)?
+            .to_owned())
+    }
+
+    fn pipe(&mut self, close_on_exec: bool, nonblocking: bool) -> Result<(Fd, Fd), SyscallError> {
+        let available: Vec<_> = (5..MAX_FDS_PER_PROCESS as i32 + 5)
+            .filter(|fd| self.interp.process.fds.get(*fd).is_err())
+            .take(2)
+            .collect();
+        if available.len() != 2 || self.interp.process.fds.iter().count() > MAX_FDS_PER_PROCESS - 2
+        {
+            return Err(DescriptorError::DescriptorLimit.into());
+        }
+        let reservation = crate::descriptors::DEFAULT_PIPE_CAPACITY as u64 + 256;
+        if !self.interp.resources.charge_cpu(1)
+            || !self.interp.resources.reserve_memory(reservation)
+        {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        let (reader, writer) = match self
+            .interp
+            .descriptors
+            .open_pipe(crate::descriptors::DEFAULT_PIPE_CAPACITY)
+        {
+            Ok(endpoints) => endpoints,
+            Err(error) => {
+                self.interp.resources.release_memory(reservation);
+                return Err(error.into());
+            }
+        };
+        let pipe = self
+            .interp
+            .descriptors
+            .pipe_endpoint(reader)?
+            .expect("fresh pipe endpoint")
+            .0;
+        self.interp.pipe_reservations.insert(pipe, reservation);
+        for (fd, description) in [(available[0], reader), (available[1], writer)] {
+            self.interp
+                .process
+                .fds
+                .install(fd, description, &mut self.interp.descriptors)
+                .expect("validated descriptor capacity and fresh description");
+            self.interp
+                .process
+                .fds
+                .set_close_on_exec(fd, close_on_exec)
+                .expect("installed descriptor");
+            self.interp
+                .descriptors
+                .set_nonblocking(description, nonblocking)
+                .expect("fresh description");
+        }
+        self.interp
+            .refresh_descriptor_snapshot(self.interp.process.pid);
+        Ok((available[0], available[1]))
+    }
+
+    fn spawn_process(
+        &mut self,
+        spec: ProcessSpawn,
+    ) -> Result<crate::process::ProcessId, SyscallError> {
+        self.interp.spawn_posix_child(spec)
+    }
+
+    fn resize_file(&mut self, fd: Fd, size: usize) -> Result<(), SyscallError> {
+        let file = file_state(self.interp, fd)?;
+        if !file.writable {
+            return Err(SyscallError::Permission);
+        }
+        self.interp.sync_vfs_time();
+        match file.orphan {
+            Some(id) => self.interp.vfs.resize_orphan(id, size)?,
+            None => self.interp.vfs.resize_file("/", &file.path, size)?,
+        }
         Ok(())
     }
 
@@ -738,6 +930,32 @@ impl System for ActiveSystem<'_> {
         })
     }
 
+    fn signal_disposition(
+        &mut self,
+        signal: crate::process::Signal,
+        ignore: bool,
+    ) -> Result<(), SyscallError> {
+        if ignore {
+            return self.ignore_signal(signal);
+        }
+        if matches!(
+            signal,
+            crate::process::Signal::Kill | crate::process::Signal::Stop
+        ) {
+            return Err(SyscallError::InvalidArgument);
+        }
+        self.interp.process.signal_dispositions.remove(&signal);
+        Ok(())
+    }
+
+    fn child_completion(
+        &self,
+        pid: crate::process::ProcessId,
+    ) -> Result<Option<crate::process::ChildCompletion>, SyscallError> {
+        self.child_status(pid)?;
+        Ok(self.interp.processes.completion(pid))
+    }
+
     fn reap_child(&mut self, pid: crate::process::ProcessId) -> Result<i32, SyscallError> {
         let status = self
             .child_status(pid)?
@@ -971,6 +1189,7 @@ pub(crate) enum SyscallError {
     Permission,
     ResourceExhausted,
     NoSuchProcess,
+    ExecutableFormat,
     Process(String),
 }
 
@@ -984,6 +1203,7 @@ impl std::fmt::Display for SyscallError {
             Self::Permission => write!(formatter, "permission denied"),
             Self::ResourceExhausted => write!(formatter, "resource exhausted"),
             Self::NoSuchProcess => write!(formatter, "no such process"),
+            Self::ExecutableFormat => write!(formatter, "unsupported executable format"),
             Self::Process(error) => write!(formatter, "{error}"),
         }
     }
@@ -1039,6 +1259,12 @@ fn open_file_at(
         return Err(SyscallError::Descriptor(DescriptorError::DescriptorLimit));
     }
     let absolute = resolve_against(cwd, path);
+    // Creation/truncation must follow a final symlink; VFS writes intentionally replace
+    // their named node. Exclusivity, however, tests the link itself even when dangling.
+    if options.create && options.exclusive && interp.vfs.lexists("/", &absolute) {
+        return Err(SyscallError::File(VfsError::Exists(absolute)));
+    }
+    let absolute = interp.vfs.realpath(&absolute, true)?;
     if absolute == "/dev/null" || crate::pseudo_fs::device_kind("/", &absolute).is_some() {
         if options.create && options.exclusive {
             return Err(SyscallError::File(VfsError::Exists(absolute)));
@@ -1049,7 +1275,9 @@ fn open_file_at(
                     .descriptors
                     .open_device(kind, options.readable, options.writable)?
             }
-            None => interp.descriptors.open_null()?,
+            None => interp
+                .descriptors
+                .open_null_with_access(options.readable, options.writable)?,
         };
         interp.install_new_description(fd, description)?;
         return Ok(());
@@ -1065,7 +1293,30 @@ fn open_file_at(
     let created_by_open = match interp.vfs.metadata("/", &absolute, true) {
         Ok(node) => {
             if matches!(node.kind, NodeKind::Dir) {
-                return Err(SyscallError::IsDirectory);
+                if options.writable || options.create || options.truncate || options.append {
+                    return Err(SyscallError::IsDirectory);
+                }
+                let path = interp.vfs.realpath(&absolute, true)?;
+                if path.len() > 4096 {
+                    return Err(SyscallError::InvalidArgument);
+                }
+                if interp
+                    .process
+                    .fds
+                    .iter()
+                    .filter(|(_, id)| {
+                        interp.descriptors.state(*id).is_ok_and(|state| {
+                            state.kind == crate::descriptors::DescriptorKind::Directory
+                        })
+                    })
+                    .count()
+                    >= 64
+                {
+                    return Err(DescriptorError::DescriptorLimit.into());
+                }
+                let description = interp.descriptors.open_directory(path)?;
+                interp.install_new_description(fd, description)?;
+                return Ok(());
             }
             if options.create && options.exclusive {
                 return Err(SyscallError::File(VfsError::Exists(absolute)));
@@ -1102,6 +1353,7 @@ fn open_file_at(
         cursor,
         options.readable,
         options.writable,
+        options.append,
         created_by_open,
     )?;
     interp.install_new_description(fd, description)?;
@@ -1129,7 +1381,11 @@ fn file_state(interp: &Interp, fd: Fd) -> Result<FileState, SyscallError> {
 
 /// Close a process-owned descriptor and update process metadata.
 fn close(interp: &mut Interp, fd: Fd) -> Result<(), SyscallError> {
+    let endpoint = interp
+        .descriptors
+        .pipe_endpoint(interp.process.fds.get(fd)?)?;
     interp.process.fds.close(fd, &mut interp.descriptors)?;
+    interp.wake_pipe_endpoint(endpoint);
     interp
         .vfs
         .retain_orphans(&interp.descriptors.live_orphans());
@@ -1159,7 +1415,11 @@ fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError
 /// Create one directory; unlike `mkdir_all`, this retains POSIX's existing-parent requirement.
 fn mkdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
-    interp.vfs.mkdir(cwd, path).map_err(Into::into)
+    interp.vfs.mkdir(cwd, path)?;
+    interp
+        .vfs
+        .chmod(cwd, path, 0o777 & !u32::from(interp.process.umask))
+        .map_err(Into::into)
 }
 
 /// Remove only an empty virtual directory.
@@ -1472,4 +1732,160 @@ mod tests {
             IoPoll::Ready(b"ok".to_vec())
         );
     }
+}
+#[test]
+fn kernel_pipe_capacity_and_aliases_release_once() {
+    let mut interp = Interp::new();
+    let initial = interp.resources.memory_mark();
+    let (reader, writer) = ActiveSystem::new(&mut interp).pipe(true, true).unwrap();
+    assert!(interp.resources.memory_mark() > initial);
+    assert!(interp.process.fds.close_on_exec(reader).unwrap());
+    ActiveSystem::new(&mut interp)
+        .duplicate(reader, 20)
+        .unwrap();
+    assert!(
+        ActiveSystem::new(&mut interp)
+            .descriptor_state(20)
+            .unwrap()
+            .nonblocking
+    );
+    for fd in [reader, writer] {
+        ActiveSystem::new(&mut interp).close(fd).unwrap();
+    }
+    assert!(interp.resources.memory_mark() > initial);
+    ActiveSystem::new(&mut interp).close(20).unwrap();
+    assert_eq!(interp.resources.memory_mark(), initial);
+}
+
+#[test]
+fn pipe_allocation_exhaustion_keeps_fd_table_and_budget_unchanged() {
+    let mut interp = Interp::with_limits(crate::resources::Limits {
+        memory: 1024,
+        ..crate::resources::Limits::default()
+    });
+    let initial = interp.resources.memory_mark();
+    let descriptors = interp.process.fds.iter().count();
+    assert!(matches!(
+        ActiveSystem::new(&mut interp).pipe(false, false),
+        Err(SyscallError::ResourceExhausted)
+    ));
+    assert_eq!(interp.process.fds.iter().count(), descriptors);
+    assert_eq!(interp.resources.memory_mark(), initial);
+    assert!(interp.pipe_reservations.is_empty());
+}
+
+#[test]
+fn failed_posix_child_setup_restores_files_fds_and_accounting() {
+    let mut interp = Interp::new();
+    let initial = interp.resources.memory_mark();
+    let pid = interp.process.pid;
+    let count = interp.processes.iter().count();
+    let result = ActiveSystem::new(&mut interp).spawn_process(ProcessSpawn {
+        executable: "/usr/bin/true".into(),
+        search_path: false,
+        argv: vec!["custom-argv0".into()],
+        environment: Default::default(),
+        signal_defaults: Vec::new(),
+        actions: vec![
+            SpawnFdAction::Open {
+                fd: 7,
+                path: "/work/staged".into(),
+                mode: 0o640,
+                close_on_exec: false,
+                nonblocking: false,
+                options: OpenFile {
+                    readable: false,
+                    writable: true,
+                    create: true,
+                    exclusive: false,
+                    truncate: false,
+                    append: false,
+                },
+            },
+            SpawnFdAction::Close(31),
+        ],
+    });
+    assert!(matches!(
+        result,
+        Err(SyscallError::Descriptor(DescriptorError::InvalidFd))
+    ));
+    assert!(interp.vfs.metadata("/", "/work/staged", true).is_err());
+    assert_eq!(interp.process.pid, pid);
+    assert_eq!(interp.processes.iter().count(), count);
+    assert_eq!(interp.resources.memory_mark(), initial);
+    assert!(interp.process.fds.get(7).is_err());
+}
+
+#[test]
+fn posix_spawn_rejects_junk_and_shebang_cycles_without_retaining_children() {
+    let mut interp = Interp::new();
+    for (path, content) in [
+        ("/work/junk", "not an executable"),
+        ("/work/a", "#!/work/b\n"),
+        ("/work/b", "#!/work/a\n"),
+    ] {
+        interp
+            .vfs
+            .write("/", path, content.as_bytes(), 0o755)
+            .unwrap();
+    }
+    let initial = interp.resources.memory_mark();
+    let count = interp.processes.iter().count();
+    for executable in ["/work/junk", "/work/a"] {
+        let result = ActiveSystem::new(&mut interp).spawn_process(ProcessSpawn {
+            executable: executable.into(),
+            search_path: false,
+            argv: vec![executable.into()],
+            environment: Default::default(),
+            signal_defaults: Vec::new(),
+            actions: Vec::new(),
+        });
+        assert!(matches!(result, Err(SyscallError::ExecutableFormat)));
+        assert_eq!(interp.processes.iter().count(), count);
+        assert_eq!(interp.resources.memory_mark(), initial);
+    }
+}
+
+#[test]
+fn posix_spawn_orders_actions_and_keeps_exact_environment() {
+    let mut interp = Interp::new();
+    let owner = interp.process.pid;
+    let baseline = interp.resources.memory_mark();
+    let (reader, writer) = ActiveSystem::new(&mut interp).pipe(true, false).unwrap();
+    ActiveSystem::new(&mut interp)
+        .ignore_signal(crate::process::Signal::Pipe)
+        .unwrap();
+    let environment = std::collections::BTreeMap::from([("LABEL".into(), "child".into())]);
+    let child = ActiveSystem::new(&mut interp)
+        .spawn_process(ProcessSpawn {
+            executable: "true".into(),
+            search_path: true,
+            argv: vec!["custom-argv0".into()],
+            environment: environment.clone(),
+            signal_defaults: vec![crate::process::Signal::Pipe],
+            actions: vec![
+                SpawnFdAction::Dup2 {
+                    source: reader,
+                    destination: 0,
+                },
+                SpawnFdAction::CloseFrom(3),
+            ],
+        })
+        .unwrap();
+    assert_eq!(
+        interp.processes.get(child).unwrap().environment,
+        environment
+    );
+    assert_eq!(interp.processes.get(child).unwrap().ppid, owner);
+    assert_eq!(
+        interp.process_description(child, 0).unwrap(),
+        interp.process.fds.get(reader).unwrap()
+    );
+    assert!(interp.process_description(child, reader).is_err());
+    assert!(interp.process_description(child, writer).is_err());
+    interp.cancel_unstarted_child(child);
+    for fd in [reader, writer] {
+        ActiveSystem::new(&mut interp).close(fd).unwrap();
+    }
+    assert_eq!(interp.resources.memory_mark(), baseline);
 }

@@ -387,10 +387,12 @@ fn assemble(interp: &mut Interp, parts: Vec<Part>, do_split_glob: bool) -> Vec<S
     // globbing
     let mut out = Vec::new();
     for (f, glob) in fields {
-        if do_split_glob && glob {
+        if do_split_glob && glob && f.split('/').any(is_glob_component) {
             let matches = glob_vfs(interp, &f);
             if matches.is_empty() {
-                out.push(f);
+                if !interp.shell_options.contains("nullglob") {
+                    out.push(f);
+                }
             } else {
                 out.extend(matches);
             }

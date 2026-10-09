@@ -2968,6 +2968,7 @@ pub(crate) fn poll_machine(
     if let Some(delivery) = interp.take_signal_delivery() {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
+                interp.processes.mark_signal_termination(owner_pid, signal);
                 let status = 128 + signal.number();
                 if let Some(mut program) = interp.process.program.take() {
                     program.release_owned_memory(interp);
@@ -2980,6 +2981,7 @@ pub(crate) fn poll_machine(
                 );
                 if owner_pid == target_pid {
                     interp.process.program = None;
+                    interp.release_exec_metadata();
                     interp.exiting = Some(status);
                     return Ok(MachinePoll::Ready(status));
                 }
@@ -3044,6 +3046,7 @@ pub(crate) fn poll_machine(
             }
         }
         ShellPoll::Ready(status) if owner_pid == target_pid => {
+            interp.release_exec_metadata();
             interp.invocations.finish_process(
                 owner_pid,
                 status,
@@ -3159,6 +3162,7 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
     if let Some(delivery) = interp.take_signal_delivery() {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
+                interp.processes.mark_signal_termination(owner, signal);
                 let status = 128 + signal.number();
                 if let Some(mut program) = interp.process.program.take() {
                     program.release_owned_memory(interp);

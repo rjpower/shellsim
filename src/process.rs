@@ -62,6 +62,7 @@ pub enum Signal {
     Child,
     Continue,
     Stop,
+    FileSize,
 }
 
 impl Signal {
@@ -78,6 +79,7 @@ impl Signal {
             Self::Child => 17,
             Self::Continue => 18,
             Self::Stop => 19,
+            Self::FileSize => 25,
         }
     }
 
@@ -92,6 +94,7 @@ impl Signal {
                 | Self::User2
                 | Self::Pipe
                 | Self::Terminate
+                | Self::FileSize
         )
     }
 
@@ -107,6 +110,7 @@ impl Signal {
             Self::Child => "CHLD",
             Self::Continue => "CONT",
             Self::Stop => "STOP",
+            Self::FileSize => "XFSZ",
         }
     }
 
@@ -124,6 +128,7 @@ impl Signal {
             "17" | "CHLD" => Some(Self::Child),
             "18" | "CONT" => Some(Self::Continue),
             "19" | "STOP" => Some(Self::Stop),
+            "25" | "XFSZ" => Some(Self::FileSize),
             _ => None,
         }
     }
@@ -138,6 +143,22 @@ pub enum ProcessStatus {
     Stopped(Signal),
     /// The process has completed and is waiting to be reaped.
     Exited(i32),
+}
+
+/// Completion reason retained independently of the shell's numeric exit status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ChildCompletion {
+    Exit(i32),
+    Signal(Signal),
+}
+
+impl ChildCompletion {
+    pub(crate) fn wait_status(self) -> i32 {
+        match self {
+            Self::Exit(code) => (code & 255) << 8,
+            Self::Signal(signal) => signal.number(),
+        }
+    }
 }
 
 /// Read-only process metadata used by `ps`, job control, and synthetic `/proc` files.
@@ -158,6 +179,8 @@ pub struct ProcessRecord {
     /// Snapshot of descriptor targets for generated `/proc/PID/fd` views.
     pub descriptors: BTreeMap<i32, String>,
     pub status: ProcessStatus,
+    /// A signal is not interchangeable with an explicit exit of `128 + signal`.
+    pub(crate) terminating_signal: Option<Signal>,
 }
 
 /// Placement of a new logical child relative to its parent.
@@ -265,6 +288,7 @@ impl ProcessTable {
                 environment,
                 descriptors: BTreeMap::new(),
                 status: ProcessStatus::Running,
+                terminating_signal: None,
             },
         );
         Self {
@@ -282,7 +306,7 @@ impl ProcessTable {
         cwd: &str,
         environment: BTreeMap<String, String>,
     ) -> Option<ProcessId> {
-        if self.records.len() >= MAX_PROCESSES {
+        if self.records.len() >= MAX_PROCESSES || self.next_pid > i32::MAX as u32 {
             return None;
         }
         let command = truncate_label(command);
@@ -308,6 +332,7 @@ impl ProcessTable {
                 environment,
                 descriptors: BTreeMap::new(),
                 status: ProcessStatus::Running,
+                terminating_signal: None,
             },
         );
         Some(pid)
@@ -333,6 +358,24 @@ impl ProcessTable {
             record.cwd = cwd.to_string();
             record.status = ProcessStatus::Exited(status);
         }
+    }
+
+    pub(crate) fn mark_signal_termination(&mut self, pid: ProcessId, signal: Signal) {
+        if let Some(record) = self.records.get_mut(&pid) {
+            record.terminating_signal = Some(signal);
+        }
+    }
+
+    pub(crate) fn completion(&self, pid: ProcessId) -> Option<ChildCompletion> {
+        let record = self.get(pid)?;
+        let ProcessStatus::Exited(code) = record.status else {
+            return None;
+        };
+        Some(
+            record
+                .terminating_signal
+                .map_or(ChildCompletion::Exit(code), ChildCompletion::Signal),
+        )
     }
 
     /// Mark a live process stopped while retaining its execution context.
@@ -449,6 +492,12 @@ impl ProcessTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posix_wait_distinguishes_numeric_exit_from_signal_death() {
+        assert_eq!(ChildCompletion::Exit(141).wait_status(), 141 << 8);
+        assert_eq!(ChildCompletion::Signal(Signal::Pipe).wait_status(), 13);
+    }
 
     #[test]
     fn spawn_truncates_long_labels_at_a_character_boundary() {

@@ -4,5 +4,10 @@ tests/corpus/oils-spec/cases/** -whitespace
 tests/corpus/whole-programs/modernish/probes/** -whitespace
 tests/corpus/whole-programs/zlib/{configure,Makefile.in,zconf.h.in,zlib.h} -whitespace
 tests/fixtures/tinycc/COPYING -whitespace
+# Runtime license notices retain the upstream bytes verified by the toolchain recipe.
+ports/toolchain/wasi_sdk/notices/** -whitespace
+# Unified-diff context preserves exact upstream bytes verified by the thread recipe.
+ports/toolchain/wasi_threads/llvm-serial-memory-init.patch -whitespace
+ports/toolchain/wasi_threads/wasi-libc-scheduler.patch -whitespace
 python/shellsim/_assets/tcc/** -whitespace
 python/shellsim/_assets/wasi-sysroot/** -whitespace

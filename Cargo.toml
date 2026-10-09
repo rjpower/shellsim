@@ -40,7 +40,8 @@ base64 = "0.22"
 crc32fast = "1"
 flate2 = "1"
 memchr = "2"
-wasmtime = { version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook"] }
+wasmtime = { version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook", "threads"] }
+wasmparser = "0.258.0"
 num-bigint = "0.4"
 num-traits = "0.2"
 libm = "0.2"

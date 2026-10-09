@@ -1,0 +1,54 @@
+--- a/src/main.c
++++ b/src/main.c
+@@ -612,3 +612,3 @@
+
+-#if defined(POSIX)
++#if defined(POSIX) && defined(HAVE_SIGPROCMASK)
+ sigset_t fatal_signal_set;
+@@ -1162,3 +1162,3 @@
+
+-#ifdef MK_OS_ZOS
++#if defined(MK_OS_ZOS) || defined(__wasi__)
+ extern char **environ;
+@@ -1166,3 +1166,3 @@
+
+-#if defined(_AMIGA) || defined(MK_OS_ZOS)
++#if defined(_AMIGA) || defined(MK_OS_ZOS) || defined(__wasi__)
+ int
+@@ -1250,3 +1250,3 @@
+
+-#ifdef  POSIX
++#if defined(POSIX) && defined(HAVE_SIGPROCMASK)
+   sigemptyset (&fatal_signal_set);
+@@ -1262,2 +1262,3 @@
+
++#ifndef __wasi__
+ #define FATAL_SIG(sig)                                                        \
+@@ -1298,2 +1299,3 @@
+ #undef  FATAL_SIG
++#endif
+
+@@ -1484,3 +1486,3 @@
+
+-#ifdef MK_OS_ZOS
++#if defined(MK_OS_ZOS) || defined(__wasi__)
+   char **envp = environ;
+@@ -2023,3 +2025,3 @@
+   /* Let the user send us SIGUSR1 to toggle the -d flag during the run.  */
+-#ifdef SIGUSR1
++#if defined(SIGUSR1) && !defined(__wasi__)
+   bsd_signal (SIGUSR1, debug_signal_handler);
+--- a/src/job.c
++++ b/src/job.c
+@@ -470,3 +470,3 @@
+
+-#ifdef POSIX
++#if defined(POSIX) && defined(HAVE_SIGPROCMASK)
+ extern sigset_t fatal_signal_set;
+--- a/src/dir.c
++++ b/src/dir.c
+@@ -1255,3 +1255,3 @@
+           size_t len = df->length + 1;
+-          size_t sz = sizeof (*d) - sizeof (d->d_name) + len;
++          size_t sz = offsetof (struct dirent, d_name) + len;
+           if (sz > bufsz)

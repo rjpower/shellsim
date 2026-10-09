@@ -1,5 +1,5 @@
 // These opt-in tests import a trusted, separately built CPython WASI fixture into the VFS.
-// Product execution then uses only virtual capabilities. Build with ports/cpython/build.py
+// Product execution then uses only virtual capabilities. Build with ports/python/cpython/build.py
 // and run with CPYTHON_WASI_ROOT=<rootfs> cargo test --test cpython_wasi -- --ignored.
 use std::path::Path;
 

@@ -136,6 +136,8 @@ pub struct Environment {
     pub scheduler: Scheduler,
     /// Machine-owned open descriptions shared by forked process descriptor tables.
     pub descriptors: DescriptorArena,
+    /// Capacity reserved for kernel-created pipes until their final endpoint closes.
+    pub(crate) pipe_reservations: BTreeMap<crate::descriptors::PipeId, u64>,
     /// Complete process-local contexts keyed by logical PID, with one active context.
     pub process: ProcessStates,
     /// Parent-side endpoints retained for live subprocess handles.
@@ -258,6 +260,8 @@ pub struct ProcessState {
     handling_signal: bool,
     /// Memory reserved for this forked context and released independently at exit.
     fork_allocation_bytes: u64,
+    /// Replacement argv, environment and process labels retained by the current exec image.
+    pub(crate) exec_allocation_bytes: u64,
     /// Modeled bytes of bindings saved by `local` in active function scopes.
     local_saved_bytes: u64,
     /// Modeled bytes of positional parameters and variables saved by active function calls.
@@ -486,6 +490,7 @@ impl ProcessState {
             err_trap_active: self.err_trap_active && self.opt_errtrace,
             handling_error: self.handling_error,
             fork_allocation_bytes,
+            exec_allocation_bytes: 0,
             local_saved_bytes: self.local_saved_bytes,
             frame_saved_bytes: 0,
             state_baseline: 0,
@@ -644,6 +649,34 @@ impl DerefMut for Environment {
 }
 
 impl Environment {
+    /// Release capacity only when every alias of both pipe endpoints has closed.
+    pub(crate) fn release_closed_pipe_memory(&mut self) {
+        let closed = self
+            .pipe_reservations
+            .keys()
+            .copied()
+            .filter(|pipe| !self.descriptors.contains_pipe(*pipe))
+            .collect::<Vec<_>>();
+        for pipe in closed {
+            if let Some(bytes) = self.pipe_reservations.remove(&pipe) {
+                self.resources.release_memory(bytes);
+            }
+        }
+    }
+
+    pub(crate) fn wake_pipe_endpoint(
+        &mut self,
+        endpoint: Option<(crate::descriptors::PipeId, bool)>,
+    ) {
+        if let Some((pipe, reader)) = endpoint {
+            self.scheduler.wake_waiters(if reader {
+                WaitReason::PipeWritable(pipe)
+            } else {
+                WaitReason::PipeReadable(pipe)
+            });
+        }
+        self.release_closed_pipe_memory();
+    }
     pub fn new() -> Self {
         Self::with_limits(Limits::default())
     }
@@ -769,6 +802,7 @@ impl Environment {
             terminal: crate::process::ControllingTerminal::new(ROOT_PID),
             scheduler: Scheduler::new(ROOT_PID),
             descriptors,
+            pipe_reservations: BTreeMap::new(),
             process: ProcessStates::new(ProcessState {
                 pid: ROOT_PID,
                 ppid: 0,
@@ -827,6 +861,7 @@ impl Environment {
                 handling_error: false,
                 handling_signal: false,
                 fork_allocation_bytes: 0,
+                exec_allocation_bytes: 0,
                 local_saved_bytes: 0,
                 frame_saved_bytes: 0,
                 state_baseline: 0,
@@ -906,6 +941,267 @@ impl Environment {
         Ok(pid)
     }
 
+    /// Prepare a POSIX child without dispatching it. Failed setup removes every child FD
+    /// reference and restores staged filesystem changes before returning to the caller.
+    pub(crate) fn spawn_posix_child(
+        &mut self,
+        spec: crate::syscalls::ProcessSpawn,
+    ) -> Result<ProcessId, crate::syscalls::SyscallError> {
+        use crate::syscalls::{ActiveSystem, SpawnFdAction, SyscallError, System};
+        if spec.argv.is_empty() || spec.executable.len() > 4096 {
+            return Err(SyscallError::InvalidArgument);
+        }
+        let launch_bytes = spec
+            .argv
+            .iter()
+            .map(|arg| arg.len() as u64 + 32)
+            .chain(
+                spec.environment
+                    .iter()
+                    .map(|(name, value)| (name.len() + value.len()) as u64 + 128),
+            )
+            .fold(256u64, u64::saturating_add)
+            .saturating_mul(2)
+            .saturating_add(64 * 1024);
+        let needs_snapshot = spec
+            .actions
+            .iter()
+            .any(|action| matches!(action, SpawnFdAction::Open { .. }));
+        let snapshot_bytes = if needs_snapshot {
+            self.vfs.disk_used().saturating_mul(2)
+        } else {
+            0
+        };
+        if !self
+            .resources
+            .reserve_memory(snapshot_bytes.saturating_add(launch_bytes))
+        {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        if !self
+            .resources
+            .charge_cpu(snapshot_bytes.saturating_add(spec.actions.len() as u64))
+        {
+            self.resources
+                .release_memory(snapshot_bytes.saturating_add(launch_bytes));
+            return Err(SyscallError::ResourceExhausted);
+        }
+        let original_vfs = needs_snapshot.then(|| self.vfs.clone());
+        let parent = self.process.pid;
+        let pid = match self.create_child(
+            &crate::process::command_label(&spec.argv),
+            true,
+            false,
+            false,
+            crate::process::ChildPlacement::Inherit,
+        ) {
+            Ok(pid) => pid,
+            Err(error) => {
+                self.resources
+                    .release_memory(snapshot_bytes.saturating_add(launch_bytes));
+                return Err(SyscallError::Process(error));
+            }
+        };
+        self.process
+            .states
+            .get_mut(&pid)
+            .expect("prepared child")
+            .fork_allocation_bytes += launch_bytes;
+        let setup = (|| {
+            let supplied_pwd = spec.environment.get("PWD").cloned();
+            self.configure_process(pid, None, Some(spec.environment))
+                .map_err(SyscallError::Process)?;
+            self.process.activate(pid).map_err(SyscallError::Process)?;
+            match supplied_pwd {
+                Some(value) => {
+                    self.process.vars.insert("PWD".into(), value);
+                }
+                None => {
+                    self.process.exported.remove("PWD");
+                }
+            }
+            for action in spec.actions {
+                match action {
+                    SpawnFdAction::Close(fd) => {
+                        ActiveSystem::new(self).close(fd)?;
+                    }
+                    SpawnFdAction::Dup2 {
+                        source,
+                        destination,
+                    } => {
+                        ActiveSystem::new(self).duplicate(source, destination)?;
+                        self.process.fds.set_close_on_exec(destination, false)?;
+                    }
+                    SpawnFdAction::CloseFrom(minimum) => {
+                        let fds = self
+                            .process
+                            .fds
+                            .iter()
+                            .map(|(fd, _)| fd)
+                            .filter(|fd| *fd >= minimum)
+                            .collect::<Vec<_>>();
+                        for fd in fds {
+                            ActiveSystem::new(self).close(fd)?;
+                        }
+                    }
+                    SpawnFdAction::Open {
+                        fd,
+                        path,
+                        options,
+                        mode,
+                        close_on_exec,
+                        nonblocking,
+                    } => {
+                        let cwd = self.process.cwd.clone();
+                        let existed = self.vfs.metadata(&cwd, &path, true).is_ok();
+                        ActiveSystem::new(self).open_file_at(fd, &cwd, &path, options)?;
+                        if options.create && !existed {
+                            self.vfs
+                                .chmod(&cwd, &path, mode & !u32::from(self.process.umask))?;
+                        }
+                        self.process.fds.set_close_on_exec(fd, close_on_exec)?;
+                        self.descriptors
+                            .set_nonblocking(self.process.fds.get(fd)?, nonblocking)?;
+                    }
+                    SpawnFdAction::Chdir(path) => {
+                        ActiveSystem::new(self).chdir(&path)?;
+                    }
+                }
+            }
+            for signal in spec.signal_defaults {
+                self.process.signal_dispositions.remove(&signal);
+            }
+            let requested = if spec.search_path {
+                spec.executable
+            } else {
+                crate::vfs::resolve_against(&self.process.cwd, &spec.executable)
+            };
+            let path_value = self
+                .process
+                .vars
+                .get("PATH")
+                .map_or("/bin:/usr/bin", String::as_str);
+            let search_work = if requested.contains('/') {
+                requested.len() as u64
+            } else {
+                (path_value.len() as u64).saturating_add(
+                    (path_value.split(':').count() as u64)
+                        .saturating_mul((requested.len() + self.process.cwd.len() + 16) as u64),
+                )
+            };
+            if !self.resources.charge_cpu(search_work) {
+                return Err(SyscallError::ResourceExhausted);
+            }
+            let executable = match crate::commands::util::resolve_executable_in(
+                &self.vfs,
+                &self.process.cwd,
+                self.process.vars.get("PATH").map(String::as_str),
+                &requested,
+            ) {
+                crate::commands::util::ExecutableLookup::Found(path) => path,
+                crate::commands::util::ExecutableLookup::NotFound => {
+                    return Err(SyscallError::File(crate::vfs::VfsError::NotFound(
+                        requested,
+                    )))
+                }
+                _ => return Err(SyscallError::Permission),
+            };
+            let (executable, argv) = self.resolve_spawn_image(executable, spec.argv)?;
+            let environment = self.child_env().into_iter().collect();
+            self.processes
+                .update_current(pid, &self.process.cwd, environment);
+            self.load_argv_program_from(pid, argv, &executable, true)
+                .map_err(SyscallError::Process)
+        })();
+        self.process
+            .activate(parent)
+            .expect("retained calling process");
+        if setup.is_err() {
+            let mut child = self.process.remove(pid).expect("prepared child state");
+            child.fds.close_all(&mut self.descriptors);
+            self.resources.release_memory(
+                child
+                    .fork_allocation_bytes
+                    .saturating_add(child.exec_allocation_bytes)
+                    .saturating_add(child.state_reserved)
+                    .saturating_add(child.expansion_reserved),
+            );
+            self.scheduler
+                .discard_runnable(pid)
+                .expect("child was never dispatched");
+            self.processes.exit(pid, 125, &child.cwd);
+            self.processes.reap(pid);
+            if let Some(vfs) = original_vfs {
+                self.vfs = vfs;
+            }
+        }
+        self.resources.release_memory(snapshot_bytes);
+        setup.map(|()| pid)
+    }
+
+    /// Resolve bounded kernel shebangs into the same process image and PID.
+    pub(crate) fn resolve_spawn_image(
+        &mut self,
+        mut path: String,
+        mut argv: Vec<String>,
+    ) -> Result<(String, Vec<String>), crate::syscalls::SyscallError> {
+        use crate::syscalls::SyscallError;
+        if !self.resources.charge_cpu(8 * 4096) {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        for _ in 0..8 {
+            if matches!(
+                self.vfs.metadata_ref("/", &path, true)?.kind,
+                crate::vfs::NodeKind::NativeExecutable(_)
+            ) || crate::commands::is_wasm_executable(&self.vfs, &path)
+            {
+                return Ok((path, argv));
+            }
+            let bytes = self.vfs.read_range("/", &path, 0, 4096)?;
+            if bytes.len() == 4096 && !bytes.contains(&b'\n') {
+                return Err(SyscallError::ExecutableFormat);
+            }
+            let line = bytes
+                .split(|byte| *byte == b'\n')
+                .next()
+                .unwrap_or_default();
+            let line = std::str::from_utf8(line).map_err(|_| SyscallError::ExecutableFormat)?;
+            let body = line
+                .strip_prefix("#!")
+                .ok_or(SyscallError::ExecutableFormat)?
+                .trim();
+            let (interpreter, argument) = body
+                .split_once(char::is_whitespace)
+                .map_or((body, ""), |(name, argument)| (name, argument.trim()));
+            if !interpreter.starts_with('/') {
+                return Err(SyscallError::ExecutableFormat);
+            }
+            let interpreter = match crate::commands::util::resolve_executable_in(
+                &self.vfs,
+                &self.process.cwd,
+                None,
+                interpreter,
+            ) {
+                crate::commands::util::ExecutableLookup::Found(path) => path,
+                crate::commands::util::ExecutableLookup::NotFound => {
+                    return Err(SyscallError::File(crate::vfs::VfsError::NotFound(
+                        interpreter.into(),
+                    )))
+                }
+                _ => return Err(SyscallError::Permission),
+            };
+            let mut script_argv = vec![interpreter.clone()];
+            if !argument.is_empty() {
+                script_argv.push(argument.to_owned());
+            }
+            script_argv.push(path);
+            script_argv.extend(argv.into_iter().skip(1));
+            argv = script_argv;
+            path = interpreter;
+        }
+        Err(SyscallError::ExecutableFormat)
+    }
+
     /// Replace process `pid`'s program with an argv image, like `execve` after PATH lookup.
     /// The PID, descriptors, cwd, and environment are retained; the process-table label
     /// follows the new image.
@@ -925,7 +1221,18 @@ impl Environment {
     pub(crate) fn load_argv_program(
         &mut self,
         pid: ProcessId,
+        argv: Vec<String>,
+    ) -> Result<(), String> {
+        let executable = argv[0].clone();
+        self.load_argv_program_from(pid, argv, &executable, false)
+    }
+
+    pub(crate) fn load_argv_program_from(
+        &mut self,
+        pid: ProcessId,
         mut argv: Vec<String>,
+        executable: &str,
+        preserve_argv0: bool,
     ) -> Result<(), String> {
         let state = self
             .process
@@ -936,15 +1243,15 @@ impl Environment {
             &self.vfs,
             &state.cwd,
             state.vars.get("PATH").map(String::as_str),
-            &argv[0],
+            executable,
         );
         let native = match lookup {
             crate::commands::util::ExecutableLookup::Found(path) => {
                 match self
                     .vfs
-                    .metadata("/", &path, true)
+                    .metadata_ref("/", &path, true)
                     .ok()
-                    .map(|node| node.kind)
+                    .map(|node| &node.kind)
                 {
                     Some(crate::vfs::NodeKind::NativeExecutable(
                         crate::vfs::NativeProgram::LegacyRegistered("sh" | "bash" | "dash" | "zsh"),
@@ -972,11 +1279,14 @@ impl Environment {
                         None
                     }
                     Some(crate::vfs::NodeKind::NativeExecutable(image)) => {
-                        Some(crate::program::NativeProcess::from_image(image, &argv))
+                        Some(crate::program::NativeProcess::from_image(*image, &argv))
                     }
                     Some(crate::vfs::NodeKind::File(_))
                         if crate::commands::is_wasm_executable(&self.vfs, &path) =>
                     {
+                        if !preserve_argv0 && !argv[0].contains('/') {
+                            argv[0] = path.clone();
+                        }
                         Some(crate::program::NativeProcess::Wasm(
                             crate::commands::WasmProcess::new(path, argv.clone()),
                         ))
@@ -1007,7 +1317,9 @@ impl Environment {
         };
         if let Some(native) = native {
             let trust = native.trust();
-            self.reset_for_exec(pid)?;
+            if !matches!(native, crate::program::NativeProcess::Failure { .. }) {
+                self.reset_for_exec(pid)?;
+            }
             self.process.set_program(
                 pid,
                 Some(crate::program::ProgramContinuation::Native(native)),
@@ -1022,6 +1334,7 @@ impl Environment {
             );
             return Ok(());
         }
+        self.reset_for_exec(pid)?;
         self.process.set_continuation(
             pid,
             Some(crate::exec::ShellContinuation::new(
@@ -1046,6 +1359,16 @@ impl Environment {
         state.err_trap_active = true;
         state.handling_error = false;
         state.handling_signal = false;
+        let endpoints = state
+            .fds
+            .iter()
+            .filter(|(fd, _)| state.fds.close_on_exec(*fd).unwrap_or(false))
+            .filter_map(|(_, id)| self.descriptors.pipe_endpoint(id).ok().flatten())
+            .collect::<Vec<_>>();
+        state.fds.close_for_exec(&mut self.descriptors);
+        for endpoint in endpoints {
+            self.wake_pipe_endpoint(Some(endpoint));
+        }
         Ok(())
     }
 
@@ -1522,6 +1845,7 @@ impl Environment {
         let fork_allocation_bytes = self
             .process
             .fork_allocation_bytes
+            .saturating_add(self.process.exec_allocation_bytes)
             .saturating_add(self.process.state_reserved)
             .saturating_add(self.process.expansion_reserved);
         let parent_pid = self.process.ppid;
@@ -1548,6 +1872,7 @@ impl Environment {
             })
             .collect::<Vec<_>>();
         self.process.fds.close_all(&mut self.descriptors);
+        self.release_closed_pipe_memory();
         self.vfs.retain_orphans(&self.descriptors.live_orphans());
         for (pipe, reader) in endpoints {
             let reason = if reader {
@@ -1764,6 +2089,27 @@ impl Environment {
         }
     }
 
+    /// Apply a pending default termination at a guest kernel return boundary, before user
+    /// instructions can turn a self-signal into an ordinary exit. Caught and stop signals
+    /// remain pending for the scheduler's continuation machinery.
+    pub(crate) fn take_default_termination(&mut self) -> Option<Signal> {
+        let signal = self
+            .process
+            .pending_signals
+            .iter()
+            .copied()
+            .find(|signal| {
+                signal.terminates()
+                    && (*signal == Signal::Kill
+                        || !self.process.signal_dispositions.contains_key(signal))
+            })?;
+        self.process.pending_signals.remove(&signal);
+        self.clock.cancel_task_events(u64::from(self.process.pid));
+        self.processes
+            .mark_signal_termination(self.process.pid, signal);
+        Some(signal)
+    }
+
     /// Release the memory charged for words the previous node expanded.
     ///
     /// Expansion results stay charged while the command that consumed them runs; by the time
@@ -1797,6 +2143,16 @@ impl Environment {
         true
     }
 
+    /// Release a completed root image's launch metadata after charging any surviving bindings.
+    pub(crate) fn release_exec_metadata(&mut self) {
+        if self.process.exec_allocation_bytes == 0 {
+            return;
+        }
+        self.sync_shell_memory();
+        let bytes = std::mem::take(&mut self.process.exec_allocation_bytes);
+        self.resources.release_memory(bytes);
+    }
+
     /// Mark the active shell's caught-signal handler complete.
     pub(crate) fn finish_signal_handler(&mut self) {
         self.process.handling_signal = false;
@@ -1806,10 +2162,12 @@ impl Environment {
     pub(crate) fn cancel_unstarted_child(&mut self, pid: ProcessId) {
         if let Some(mut child) = self.process.remove(pid) {
             child.fds.close_all(&mut self.descriptors);
+            self.release_closed_pipe_memory();
             self.vfs.retain_orphans(&self.descriptors.live_orphans());
             self.resources.release_memory(
                 child
                     .fork_allocation_bytes
+                    .saturating_add(child.exec_allocation_bytes)
                     .saturating_add(child.state_reserved)
                     .saturating_add(child.expansion_reserved),
             );
@@ -1871,6 +2229,9 @@ impl Environment {
                     )
                 }
                 crate::syscalls::SyscallError::NoSuchProcess => "no such process".to_string(),
+                crate::syscalls::SyscallError::ExecutableFormat => {
+                    "unsupported executable format".to_string()
+                }
                 crate::syscalls::SyscallError::Process(error) => error,
             })
     }
@@ -1948,7 +2309,18 @@ impl Environment {
             if !file.writable {
                 return Err(SyscallError::Permission);
             }
-            let cursor = usize::try_from(file.cursor).map_err(|_| SyscallError::InvalidArgument)?;
+            let position = if file.append {
+                match file.orphan {
+                    Some(id) => match &self.vfs.orphan_metadata(id)?.kind {
+                        crate::vfs::NodeKind::File(bytes) => bytes.len() as u64,
+                        _ => return Err(SyscallError::InvalidArgument),
+                    },
+                    None => self.vfs.file_len("/", &file.path)? as u64,
+                }
+            } else {
+                file.cursor
+            };
+            let cursor = usize::try_from(position).map_err(|_| SyscallError::InvalidArgument)?;
             self.sync_vfs_time();
             let result = match file.orphan {
                 Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
@@ -1960,7 +2332,8 @@ impl Environment {
                 }
                 return Err(error.into());
             }
-            self.descriptors.advance_file(description, bytes.len())?;
+            self.descriptors
+                .seek_file(description, position.saturating_add(bytes.len() as u64))?;
             return Ok(IoPoll::Ready(bytes.len()));
         }
         let result = self.descriptors.write(description, bytes)?;
@@ -2402,7 +2775,6 @@ impl Environment {
                 env.insert(k.clone(), v.clone());
             }
         }
-        env.insert("PWD".to_string(), self.cwd.clone());
         env
     }
 
@@ -2469,6 +2841,9 @@ pub(crate) fn write_error_message(error: crate::syscalls::SyscallError) -> Strin
         crate::syscalls::SyscallError::IsDirectory => "is a directory".to_string(),
         crate::syscalls::SyscallError::ResourceExhausted => "resource limit exceeded".to_string(),
         crate::syscalls::SyscallError::NoSuchProcess => "no such process".to_string(),
+        crate::syscalls::SyscallError::ExecutableFormat => {
+            "unsupported executable format".to_string()
+        }
         crate::syscalls::SyscallError::Process(error) => error,
     }
 }
@@ -2505,6 +2880,44 @@ pub type Interp = Environment;
 #[cfg(test)]
 mod process_state_tests {
     use super::*;
+
+    #[test]
+    fn exec_closes_only_flagged_child_aliases_for_native_and_wasm_images() {
+        for executable in ["true", "/guest.wasm"] {
+            let mut environment = Environment::new();
+            let bytes = wat::parse_str("(module (func (export \"_start\")))").unwrap();
+            environment
+                .vfs
+                .write("/", "/guest.wasm", &bytes, 0o755)
+                .unwrap();
+            let input = environment
+                .descriptors
+                .open_input(b"shared".to_vec())
+                .unwrap();
+            environment.install_new_description(5, input).unwrap();
+            environment
+                .process
+                .fds
+                .duplicate(5, 6, &mut environment.descriptors)
+                .unwrap();
+            environment.process.fds.set_close_on_exec(5, true).unwrap();
+            let parent = environment.pid;
+            let child = environment.start_child("probe", false).unwrap();
+            environment
+                .exec_argv_image(child, vec![executable.to_string()])
+                .unwrap();
+            assert!(environment.process.fds.get(5).is_err());
+            assert_eq!(
+                environment.read_fd(6, 6).unwrap(),
+                IoPoll::Ready(b"shared".to_vec())
+            );
+            assert!(environment.process.states[&parent].fds.get(5).is_ok());
+            assert!(environment.process.states[&parent]
+                .fds
+                .close_on_exec(5)
+                .unwrap());
+        }
+    }
 
     #[test]
     fn inactive_parent_context_remains_machine_owned_while_child_runs() {

@@ -1,0 +1,58 @@
+{
+  "name": "wasi-pthreads",
+  "version": "1",
+  "scheduler_namespace": "shellsim_threads_v1",
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "wasi_libc": {
+    "commit": "2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f"
+  },
+  "llvm_commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
+  "llvm_patch_inputs": {
+    "Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+    "Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+    "Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+    "Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+  },
+  "sdk_binaries": {
+    "clang": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+    "llvm-objdump": "7b36433d726cd16a13ffe59e24300f9be2f02a78c9c31c444e8b96c57e3ac947",
+    "wasm-ld": "ec1daef61bc84256bf7c4a8491b3ea9abcc7163d9aaf6aa8e8bc6faa18f99043",
+    "llvm-ar": "aff24388a6589b45837cff1b50c7efaa203efa0e5f1e5f679b70b2d8feded9cf",
+    "llvm-ranlib": "aff24388a6589b45837cff1b50c7efaa203efa0e5f1e5f679b70b2d8feded9cf"
+  },
+  "build_scripts": [
+    {
+      "file": "llvm-serial-memory-init.patch",
+      "sha256": "5877b9c5e2b36d92ad84155e21d9a6006b6a424779de8b20d50391654debca17"
+    },
+    {
+      "file": "wasi-libc-scheduler.patch",
+      "sha256": "44bf26564a6bda5480393e6cb31c1672d869965ed9a2916d8483e693019ec734"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "build.py",
+      "sha256": "67bd9736939b334b9e2acce016d5b05aca4a727b41e70bd5dd11b20b04c72eb5"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ],
+  "llvm_source": {
+    "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
+    "sha256": "b4525499be9ccd65a0da8c9efbeb59a5955130b302a190a51883727d8c5c7542"
+  },
+  "sdk_files": {
+    "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a": "258840a0ce51e4b9f16a518ce2fe80d4a960bf7f31762d2e743fd6a43063197e"
+  }
+}

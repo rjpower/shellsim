@@ -1,5 +1,6 @@
 """Build explicit TrueType/CFF FreeType modules against declared WASI zlib."""
 
+import re
 import shutil
 from pathlib import Path
 
@@ -54,6 +55,39 @@ FT_USE_MODULE( FT_Renderer_Class, ft_raster1_renderer_class )
 """
 
 
+def pkg_config(source, recipe):
+    """Render upstream's template with its libtool version and declared links.
+
+    FreeType's pkg-config Version is its libtool version, not the semantic
+    release version used by FT_Library_Version and our source recipe.
+    """
+    header = (source / "include/freetype/freetype.h").read_text()
+    release = [
+        re.search(r"^#define FREETYPE_" + part + r"\s+(\d+)$", header, re.M) for part in ("MAJOR", "MINOR", "PATCH")
+    ]
+    if any(match is None for match in release) or ".".join(match[1] for match in release) != recipe["version"]:
+        raise ValueError("FreeType source release differs from the recipe")
+    configure = (source / "builds/unix/configure.raw").read_text()
+    versions = re.findall(r"^version_info='(\d+):(\d+):(\d+)'$", configure, re.M)
+    if len(versions) != 1 or "ft_version=`echo $version_info | tr : .`" not in configure:
+        raise ValueError("FreeType pkg-config version derivation changed")
+    values = {
+        "prefix": "${pcfiledir}/../..",
+        "exec_prefix": "${prefix}",
+        "libdir": "${exec_prefix}/lib",
+        "includedir": "${prefix}/include",
+        "ft_version": ".".join(versions[0]),
+        "PKGCONFIG_REQUIRES": "",
+        "PKGCONFIG_REQUIRES_PRIVATE": "zlib",
+        "PKGCONFIG_LIBS": "-L${libdir} -lfreetype",
+        "PKGCONFIG_LIBS_PRIVATE": " ".join(recipe["transitive_link_flags"]),
+    }
+    template = (source / "builds/unix/freetype2.in").read_text()
+    if set(re.findall(r"%([A-Za-z_]+)%", template)) != set(values):
+        raise ValueError("FreeType pkg-config template fields changed")
+    return re.sub(r"%([A-Za-z_]+)%", lambda match: values[match[1]], template)
+
+
 def build_freetype(recipe, source, sdk, work, toolchain, providers, run):
     """Seal headers and static archive with their exact zlib dependency identity."""
     build = work / "freetype-build"
@@ -70,6 +104,10 @@ def build_freetype(recipe, source, sdk, work, toolchain, providers, run):
             if p.is_file()
         }
     )
+    inputs["pkg_config_sources"] = {
+        name: file_hash(source / name) for name in ("builds/unix/configure.raw", "builds/unix/freetype2.in")
+    }
+    package_metadata = pkg_config(source, recipe)
     prefix = work / "native-artifacts" / digest(inputs)
     if prefix.exists():
         return prefix, verify_artifact(prefix, inputs)
@@ -120,11 +158,7 @@ def build_freetype(recipe, source, sdk, work, toolchain, providers, run):
         shutil.copyfile(
             source / name if name == "LICENSE.TXT" else source / "docs" / name, temporary / "licenses" / name
         )
-    (temporary / "lib/pkgconfig/freetype2.pc").write_text(
-        "prefix=${pcfiledir}/../..\nlibdir=${prefix}/lib\nincludedir=${prefix}/include/freetype2\n"
-        "Name: FreeType 2\nDescription: Minimal TrueType/CFF font rasterizer\nVersion: 2.13.3\n"
-        "Requires.private: zlib\nLibs: -L${libdir} -lfreetype\nLibs.private: -lm\nCflags: -I${includedir}\n"
-    )
+    (temporary / "lib/pkgconfig/freetype2.pc").write_text(package_metadata)
     seal_artifact(temporary, inputs)
     temporary.rename(prefix)
     return prefix, verify_artifact(prefix, inputs)

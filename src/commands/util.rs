@@ -306,24 +306,23 @@ pub(crate) fn resolve_executable_in(
     // An absent PATH uses the guest's default utility search path. An explicit empty PATH
     // still names the current directory, as it does in a shell path list.
     let path_value = path_value.unwrap_or("/bin:/usr/bin");
-    let candidates = if name.contains('/') {
-        vec![crate::vfs::resolve_against(cwd, name)]
-    } else {
-        path_value
-            .split(':')
-            .map(|directory| {
-                let directory = if directory.is_empty() {
-                    cwd.to_string()
-                } else {
-                    crate::vfs::resolve_against(cwd, directory)
-                };
-                crate::vfs::resolve_against(&directory, name)
-            })
-            .collect()
-    };
+    let direct = name.contains('/');
+    let absolute = direct.then(|| crate::vfs::resolve_against(cwd, name));
+    // Stream PATH candidates: retaining their cross product with a guest name can otherwise
+    // allocate far more than either bounded input string.
+    let candidates = absolute
+        .into_iter()
+        .chain(path_value.split(':').filter(|_| !direct).map(|directory| {
+            let directory = if directory.is_empty() {
+                cwd.to_string()
+            } else {
+                crate::vfs::resolve_against(cwd, directory)
+            };
+            crate::vfs::resolve_against(&directory, name)
+        }));
     let mut denied = None;
     for path in candidates {
-        let Ok(metadata) = vfs.metadata("/", &path, true) else {
+        let Ok(metadata) = vfs.metadata_ref("/", &path, true) else {
             continue;
         };
         if matches!(
@@ -347,28 +346,34 @@ pub(crate) fn try_exec_script(
     err: &mut Vec<u8>,
 ) -> Option<crate::commands::CommandPoll> {
     let data = interp.vfs.read("/", path).ok()?;
-    let text = String::from_utf8_lossy(&data);
-    let first = text.lines().next().unwrap_or("");
+    let first = data.split(|byte| *byte == b'\n').next().unwrap_or_default();
     // Wasm executables load as their own process image. Interpreted scripts run as a child that
     // loads the interpreter image with the script path as its operand, as the kernel does for a
     // `#!` line.
     let mut argv = if data.starts_with(b"\0asm") {
         vec![path.to_string()]
-    } else if first.starts_with("#!") && first.contains("python") {
-        let mut argv = vec!["/usr/bin/python3.14".to_string()];
-        if first != "#!shellsim-python" {
-            argv.push(path.to_string());
-        }
+    } else if first == b"#!shellsim-python" {
+        vec!["/usr/bin/python3.14".to_string()]
+    } else if first.starts_with(b"#!") {
+        let Ok(line) = std::str::from_utf8(first) else {
+            ewln(err, &format!("{path}: unsupported script interpreter"));
+            return Some(crate::commands::CommandPoll::Ready(126));
+        };
+        let mut words = line[2..].split_whitespace();
+        let Some(interpreter) = words.next().filter(|name| name.starts_with('/')) else {
+            ewln(err, &format!("{path}: unsupported script interpreter"));
+            return Some(crate::commands::CommandPoll::Ready(126));
+        };
+        let ExecutableLookup::Found(interpreter) = resolve_executable(interp, interpreter) else {
+            ewln(err, &format!("{path}: unsupported script interpreter"));
+            return Some(crate::commands::CommandPoll::Ready(126));
+        };
+        let mut argv = vec![interpreter];
+        argv.extend(words.map(str::to_string));
+        argv.push(path.to_string());
         argv
-    } else if !first.starts_with("#!")
-        || first.split_whitespace().next().is_some_and(|interpreter| {
-            matches!(interpreter, "#!/bin/sh" | "#!/bin/bash" | "#!/usr/bin/bash")
-        })
-    {
-        vec!["/usr/bin/sh".to_string(), path.to_string()]
     } else {
-        ewln(err, &format!("{path}: unsupported script interpreter"));
-        return Some(crate::commands::CommandPoll::Ready(126));
+        vec!["/usr/bin/sh".to_string(), path.to_string()]
     };
     argv.extend(args.iter().cloned());
     let code = crate::commands::start_child_sequence(

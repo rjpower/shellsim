@@ -1,0 +1,92 @@
+{
+  "kind": "native-library",
+  "name": "openblas",
+  "version": "0.3.31",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "linkage": "shared",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "soname": "libopenblas.so",
+  "source": {
+    "url": "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.31/OpenBLAS-0.3.31.tar.gz",
+    "sha256": "6dd2a63ac9d32643b7cc636eab57bf4e57d0ed1fff926dfbc5d3d97f2d2be3a6"
+  },
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang",
+    "wasi-sdk-wasm-ld"
+  ],
+  "static_provider": {
+    "port": "native/openblas",
+    "version": "0.3.31"
+  },
+  "features": {
+    "threads": false,
+    "integer_bits": 32,
+    "scalar_generic_kernels": true,
+    "lapack": true,
+    "lapacke": false,
+    "fortran_compiler": false,
+    "complex_return": "hidden-pointer",
+    "subroutine_return": "int",
+    "runtime_owner": "main-executable"
+  },
+  "compiler_support": {
+    "path": "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a",
+    "linkage": "referenced-members-only",
+    "source": {
+      "repository": "llvm/llvm-project",
+      "commit": "895aa2c896ada719451be2e3673c83da8ddf1141"
+    }
+  },
+  "link_flags": [
+    "-fPIC",
+    "-nostdlib",
+    "-shared",
+    "-Wl,--no-entry,--unresolved-symbols=import-dynamic,--export-all,-soname,libopenblas.so,--fatal-warnings"
+  ],
+  "needed_libraries": [],
+  "exports": {
+    "headers": [
+      "include/cblas.h",
+      "include/openblas_config.h"
+    ],
+    "libraries": [
+      "lib/libopenblas.so"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/openblas.pc"
+    ],
+    "licenses": [
+      "licenses/openblas.txt",
+      "licenses/compiler-rt.txt"
+    ]
+  },
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "abb986995ba3b3e627162863efd36e7be2965cdeb1475deca89bca675ecde020"
+    },
+    {
+      "file": "../recipe.json",
+      "sha256": "2beb48dde6cdab1a4f9ca82abd9ed46de6daa4e345eda98cc5c134fc4a768f37"
+    },
+    {
+      "file": "../../dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
+    },
+    {
+      "file": "../../../toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    }
+  ]
+}

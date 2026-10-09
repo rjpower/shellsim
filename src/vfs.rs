@@ -967,6 +967,26 @@ impl Vfs {
         Ok(())
     }
 
+    /// Resize an existing regular file under the disk budget, preserving its inode metadata.
+    pub(crate) fn resize_file(&mut self, cwd: &str, path: &str, size: usize) -> Result<()> {
+        let target = self.write_target(cwd, path)?;
+        let old_size = self.file_len("/", &target)?;
+        let used = self
+            .usage_after_adding(size.saturating_sub(old_size) as u64)?
+            .saturating_sub(old_size.saturating_sub(size) as u64);
+        let node = self
+            .nodes
+            .get_mut(&target)
+            .expect("existing file was checked");
+        let NodeKind::File(bytes) = &mut node.kind else {
+            unreachable!("regular file was checked");
+        };
+        bytes.resize(size, 0);
+        node.mtime = self.mutation_time_ms;
+        self.record_usage(used);
+        Ok(())
+    }
+
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
         let target = self.write_target(cwd, path)?;
         if self.nodes.contains_key(&target) {
@@ -1086,6 +1106,25 @@ impl Vfs {
         bytes[offset..end].copy_from_slice(data);
         node.mtime = self.mutation_time_ms;
         self.record_usage(self.disk_used.saturating_add(growth));
+        Ok(())
+    }
+
+    /// Resize detached storage without recreating an unlinked pathname.
+    pub(crate) fn resize_orphan(&mut self, id: u64, size: usize) -> Result<()> {
+        let old_size = match &self.orphan_metadata(id)?.kind {
+            NodeKind::File(bytes) => bytes.len(),
+            _ => unreachable!("orphan is always a file"),
+        };
+        let used = self
+            .usage_after_adding(size.saturating_sub(old_size) as u64)?
+            .saturating_sub(old_size.saturating_sub(size) as u64);
+        let node = self.orphaned.get_mut(&id).expect("orphan was checked");
+        let NodeKind::File(bytes) = &mut node.kind else {
+            unreachable!("orphan is always a file");
+        };
+        bytes.resize(size, 0);
+        node.mtime = self.mutation_time_ms;
+        self.record_usage(used);
         Ok(())
     }
 
@@ -1450,6 +1489,30 @@ fn node_payload_len(node: &Node) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resize_preserves_data_and_unlinked_identity_and_rolls_back_disk_failure() {
+        let mut vfs = super::Vfs::with_disk_limit(4096);
+        vfs.write("/", "/file", b"abc", 0o640).unwrap();
+        let before = vfs.disk_used();
+        vfs.resize_file("/", "/file", 5).unwrap();
+        assert_eq!(vfs.read("/", "/file").unwrap(), b"abc\0\0");
+        assert_eq!(vfs.disk_used(), before + 2);
+        assert!(matches!(
+            vfs.resize_file("/", "/file", 5000),
+            Err(super::VfsError::NoSpace)
+        ));
+        assert_eq!(vfs.read("/", "/file").unwrap(), b"abc\0\0");
+        assert_eq!(vfs.disk_used(), before + 2);
+        let orphan = vfs.unlink_open_file("/", "/file").unwrap();
+        vfs.resize_orphan(orphan, 1).unwrap();
+        assert_eq!(vfs.read_orphan_range(orphan, 0, 10).unwrap(), b"a");
+        assert!(!vfs.exists("/", "/file"));
+        assert!(matches!(
+            vfs.resize_orphan(orphan, 5000),
+            Err(super::VfsError::NoSpace)
+        ));
+        assert_eq!(vfs.read_orphan_range(orphan, 0, 10).unwrap(), b"a");
+    }
     use super::*;
 
     #[test]

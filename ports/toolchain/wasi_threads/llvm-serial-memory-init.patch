@@ -1,0 +1,122 @@
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -70,6 +70,7 @@
+   std::optional<std::pair<llvm::StringRef, llvm::StringRef>> memoryImport;
+   std::optional<llvm::StringRef> memoryExport;
+   bool sharedMemory;
++  bool serialMemoryInit;
+   bool importTable;
+   bool importUndefined;
+   std::optional<bool> is64;
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -223,6 +223,9 @@
+ 
+ def shared_memory: FF<"shared-memory">,
+   HelpText<"Use shared linear memory">;
++
++def serial_memory_init: FF<"serial-memory-init">,
++  HelpText<"Require serialized shared memory initialization; trap on concurrent initialization">;
+ 
+ defm soname: Eq<"soname", "Set the module name in the generated name section">;
+ 
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -558,6 +558,7 @@
+   }
+ 
+   ctx.arg.sharedMemory = args.hasArg(OPT_shared_memory);
++  ctx.arg.serialMemoryInit = args.hasArg(OPT_serial_memory_init);
+   ctx.arg.soName = args.getLastArgValue(OPT_soname);
+   ctx.arg.importTable = args.hasArg(OPT_import_table);
+   ctx.arg.importUndefined = args.hasArg(OPT_import_undefined);
+@@ -755,6 +756,9 @@
+   if (!ctx.arg.memoryExport.has_value() && !ctx.arg.memoryImport.has_value()) {
+     ctx.arg.memoryExport = memoryName;
+   }
++  if (ctx.arg.serialMemoryInit && !ctx.arg.sharedMemory)
++    error("--serial-memory-init requires --shared-memory");
++
+   if (ctx.arg.cooperativeThreading) {
+     if (ctx.arg.sharedMemory)
+       error("--cooperative-threading is incompatible with --shared-memory");
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -1472,13 +1472,15 @@
+       writeUleb128(os, WASM_OPCODE_I32_ATOMIC_STORE, "i32.atomic.store");
+       writeMemArg(os, 2, 0);
+ 
+-      // Notify any waiters that memory initialization is complete
+-      writeGetFlagAddress();
+-      writeI32Const(os, -1, "number of waiters");
+-      writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
+-      writeUleb128(os, WASM_OPCODE_ATOMIC_NOTIFY, "atomic.notify");
+-      writeMemArg(os, 2, 0);
+-      writeU8(os, WASM_OPCODE_DROP, "drop");
++      if (!ctx.arg.serialMemoryInit) {
++        // Notify any waiters that memory initialization is complete
++        writeGetFlagAddress();
++        writeI32Const(os, -1, "number of waiters");
++        writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
++        writeUleb128(os, WASM_OPCODE_ATOMIC_NOTIFY, "atomic.notify");
++        writeMemArg(os, 2, 0);
++        writeU8(os, WASM_OPCODE_DROP, "drop");
++      }
+ 
+       // Branch to drop the segments
+       writeU8(os, WASM_OPCODE_BR, "br");
+@@ -1486,14 +1488,20 @@
+ 
+       // Wait for the winning thread to initialize memory
+       writeU8(os, WASM_OPCODE_END, "end $wait");
+-      writeGetFlagAddress();
+-      writeI32Const(os, 1, "expected flag value");
+-      writeI64Const(os, -1, "timeout");
+-
+-      writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
+-      writeUleb128(os, WASM_OPCODE_I32_ATOMIC_WAIT, "i32.atomic.wait");
+-      writeMemArg(os, 2, 0);
+-      writeU8(os, WASM_OPCODE_DROP, "drop");
++      if (ctx.arg.serialMemoryInit) {
++        // The embedding runtime holds its process initialization gate across
++        // suspension. Observing an active initializer violates that contract.
++        writeU8(os, 0x00, "unreachable: concurrent initialization");
++      } else {
++        writeGetFlagAddress();
++        writeI32Const(os, 1, "expected flag value");
++        writeI64Const(os, -1, "timeout");
++
++        writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomics prefix");
++        writeUleb128(os, WASM_OPCODE_I32_ATOMIC_WAIT, "i32.atomic.wait");
++        writeMemArg(os, 2, 0);
++        writeU8(os, WASM_OPCODE_DROP, "drop");
++      }
+ 
+       // Unconditionally drop passive data segments
+       writeU8(os, WASM_OPCODE_END, "end $drop");
+--- /dev/null
++++ b/lld/test/wasm/serial-memory-init.s
+@@ -0,0 +1,23 @@
++# RUN: llvm-mc -filetype=obj -triple=wasm32-unknown-unknown -mattr=+atomics,+bulk-memory %s -o %t.o
++# RUN: wasm-ld --no-entry --shared-memory --features=atomics,bulk-memory,mutable-globals --max-memory=131072 --export=value %t.o -o %t.default.wasm
++# RUN: llvm-objdump -d %t.default.wasm | FileCheck %s --check-prefix=DEFAULT
++# RUN: wasm-ld --no-entry --shared-memory --serial-memory-init --features=atomics,bulk-memory,mutable-globals --max-memory=131072 --export=value %t.o -o %t.serial.wasm
++# RUN: llvm-objdump -d %t.serial.wasm | FileCheck %s --check-prefix=SERIAL
++# RUN: not wasm-ld --no-entry --serial-memory-init %t.o -o %t.invalid.wasm 2>&1 | FileCheck %s --check-prefix=ERROR
++
++# DEFAULT: memory.atomic.notify
++# DEFAULT: memory.atomic.wait32
++# SERIAL: i32.atomic.rmw.cmpxchg
++# SERIAL-NOT: memory.atomic.notify
++# SERIAL-NOT: memory.atomic.wait32
++# SERIAL: unreachable
++# SERIAL-NOT: memory.atomic.notify
++# SERIAL-NOT: memory.atomic.wait32
++# ERROR: --serial-memory-init requires --shared-memory
++
++.section .data.value,"",@
++.globl value
++.p2align 2
++value:
++.int32 17
++.size value, 4

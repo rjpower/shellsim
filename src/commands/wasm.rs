@@ -18,14 +18,17 @@ use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Memory,
-    Module, Store, StoreContextMut, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Module,
+    Store, StoreContextMut, StoreLimitsBuilder,
 };
 
-use crate::descriptors::{DescriptorError, IoPoll};
+use crate::descriptors::{
+    DescriptorError, DescriptorKind, DescriptorState, IoPoll, MAX_FDS_PER_PROCESS,
+};
 use crate::display::DisplayError;
 use crate::exec::ShellPoll;
 use crate::interp::Interp;
@@ -37,7 +40,16 @@ use crate::vfs::{resolve_against, VfsError};
 use super::util::ewln;
 
 mod dynamic;
+mod ffi;
+mod fibers;
+mod guest_memory;
+mod threads;
+
+use guest_memory::GuestMemory;
 mod limits;
+mod posix_exec;
+mod posix_open;
+mod posix_process;
 
 // The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
 const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
@@ -50,8 +62,6 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_MODULES: usize = 4;
-// Directory handles occupy an adapter-only range above the kernel's bounded regular fds.
-const FIRST_DIRECTORY_FD: u32 = 1024;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
@@ -77,7 +87,9 @@ const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
+const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
 const ERRNO_NOSPC: i32 = 51;
+const ERRNO_RANGE: i32 = 68;
 
 struct CachedModule {
     source: Vec<u8>,
@@ -135,7 +147,10 @@ fn command_engine() -> &'static Engine {
         let mut config = Config::default();
         config
             .consume_fuel(true)
+            .async_stack_size(ASYNC_STACK_BYTES)
             .wasm_exceptions(true)
+            .wasm_threads(true)
+            .shared_memory(true)
             .wasm_gc(false)
             .collector(Collector::DeferredReferenceCounting);
         Engine::new(&config).expect("valid Wasmtime configuration")
@@ -143,6 +158,7 @@ fn command_engine() -> &'static Engine {
 }
 
 fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
+    threads::reject_raw_waits(source)?;
     static CACHE: OnceLock<Mutex<ModuleCache>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(ModuleCache::default()));
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
@@ -167,12 +183,11 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
 /// borrow the machine from the slot; a second simultaneous borrow is a bug and panics rather
 /// than deadlocking.
 #[derive(Clone, Default)]
-pub(crate) struct MachineAccess(Arc<MachineShared>);
+pub(crate) struct MachineAccess(Arc<MachineShared>, Arc<Mutex<Signals>>);
 
 #[derive(Default)]
 struct MachineShared {
     machine: Mutex<Option<Interp>>,
-    signals: Mutex<Signals>,
 }
 
 /// State passed between host calls and the poller across a guest suspension.
@@ -278,8 +293,12 @@ impl MachineAccess {
         MachineGuard(self.slot())
     }
 
+    fn fork_thread(&self) -> Self {
+        Self(self.0.clone(), Arc::default())
+    }
+
     fn signals(&self) -> std::sync::MutexGuard<'_, Signals> {
-        self.0.signals.lock().expect("wasm signal lock")
+        self.1.lock().expect("wasm signal lock")
     }
 
     /// Return `Pending` once so the poller can report `suspension` to the scheduler.
@@ -340,11 +359,15 @@ struct Host {
     initial_fuel: u64,
     closed_stdio: BTreeSet<i32>,
     open_files: BTreeSet<i32>,
-    append_files: BTreeSet<i32>,
-    directories: BTreeMap<u32, String>,
+    /// Buffered aliases retain the original stream when dup2 redirects a standard fd.
+    buffered_streams: BTreeMap<i32, i32>,
     limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
     dynamic: dynamic::Dynamic,
+    ffi: ffi::State,
+    fibers: fibers::Budget,
+    thread: Option<threads::ThreadContext>,
+    retained: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -390,6 +413,7 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::Permission => ERRNO_PERM,
         SyscallError::ResourceExhausted => ERRNO_INVAL,
         SyscallError::NoSuchProcess | SyscallError::Process(_) => ERRNO_INVAL,
+        SyscallError::ExecutableFormat => 45,
     }
 }
 
@@ -406,20 +430,130 @@ fn guest_file(
     caller: &mut Caller<'_, Host>,
     fd: i32,
 ) -> Result<crate::descriptors::FileState, i32> {
-    if !caller.data().open_files.contains(&fd) {
-        return Err(ERRNO_BADF);
-    }
+    guest_descriptor(caller, fd)?;
     ActiveSystem::new(&mut caller.data_mut().machine.get())
         .file_state(fd)
         .map_err(|error| syscall_errno(&error))
 }
 
-fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
+fn guest_descriptor(caller: &mut Caller<'_, Host>, fd: i32) -> Result<DescriptorState, i32> {
+    if caller.data().closed_stdio.contains(&fd)
+        || (fd > 2 && !caller.data().open_files.contains(&fd))
+    {
+        return Err(ERRNO_BADF);
+    }
+    ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .descriptor_state(fd)
+        .map_err(|error| syscall_errno(&error))
+}
+
+/// POSIX descriptor operations use virtual aliases, never host handles. Operations are
+/// 1=get CLOEXEC, 2=set CLOEXEC, 3=dup above minimum, 4=dup with CLOEXEC,
+/// 5=dup2, 6=dup3 with CLOEXEC.
+fn descriptor_control(
+    mut caller: Caller<'_, Host>,
+    fd: i32,
+    operation: u32,
+    argument: i32,
+    result: u32,
+) -> Result<i32, Error> {
+    if !write_u32(&mut caller, result, 0) {
+        return Ok(ERRNO_FAULT);
+    }
+    if let Err(error) = guest_descriptor(&mut caller, fd) {
+        return Ok(error);
+    }
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu(MAX_FDS_PER_PROCESS as u64)
+    {
+        return Err(exhausted());
+    }
+    if operation == 1 || operation == 2 {
+        if operation == 2 && !(0..=1).contains(&argument) {
+            return Ok(ERRNO_INVAL);
+        }
+        let flags = {
+            let mut machine = caller.data_mut().machine.get();
+            if operation == 2 {
+                machine
+                    .process
+                    .fds
+                    .set_close_on_exec(fd, argument != 0)
+                    .map(|()| 0)
+            } else {
+                machine.process.fds.close_on_exec(fd).map(i32::from)
+            }
+        };
+        return Ok(match flags {
+            Ok(flags) if write_u32(&mut caller, result, flags as u32) => ERRNO_SUCCESS,
+            Ok(_) => ERRNO_FAULT,
+            Err(_) => ERRNO_BADF,
+        });
+    }
+    let upper = MAX_FDS_PER_PROCESS as i32 + 5;
+    if !(3..=6).contains(&operation)
+        || !(0..upper).contains(&argument)
+        || (operation >= 5 && (argument == 3 || argument == 4))
+        || (operation == 6 && argument == fd)
+    {
+        return Ok(ERRNO_INVAL);
+    }
+    let destination = if operation >= 5 {
+        argument
+    } else {
+        let host = caller.data_mut();
+        let machine = host.machine.get();
+        let Some(destination) = (argument..upper).find(|candidate| {
+            *candidate != 3 && *candidate != 4 && machine.process.fds.get(*candidate).is_err()
+        }) else {
+            return Ok(ERRNO_NOSPC);
+        };
+        destination
+    };
+    let buffered = caller.data().buffered_streams.get(&fd).copied();
+    if let Err(error) =
+        ActiveSystem::new(&mut caller.data_mut().machine.get()).duplicate(fd, destination)
+    {
+        return Ok(syscall_errno(&error));
+    }
+    if operation == 4 || operation == 6 {
+        caller
+            .data_mut()
+            .machine
+            .get()
+            .process
+            .fds
+            .set_close_on_exec(destination, true)
+            .expect("new descriptor is installed");
+    }
+    let host = caller.data_mut();
+    host.open_files.insert(destination);
+    host.closed_stdio.remove(&destination);
+    host.buffered_streams.remove(&destination);
+    if let Some(stream) = buffered {
+        host.buffered_streams.insert(destination, stream);
+    }
+    Ok(if write_u32(&mut caller, result, destination as u32) {
+        ERRNO_SUCCESS
+    } else {
+        ERRNO_FAULT
+    })
+}
+
+fn memory(caller: &mut Caller<'_, Host>) -> Option<GuestMemory> {
+    if let Some(thread) = &caller.data().thread {
+        return Some(GuestMemory::Shared(thread.memory()));
+    }
     caller
         .data()
         .dynamic
         .shared_memory
-        .or_else(|| caller.get_export("memory").and_then(Extern::into_memory))
+        .map(GuestMemory::Ordinary)
+        .or_else(|| match caller.get_export("memory")? {
+            Extern::Memory(memory) => Some(GuestMemory::Ordinary(memory)),
+            Extern::SharedMemory(memory) => Some(GuestMemory::Shared(memory)),
+            _ => None,
+        })
 }
 
 fn read_u32(caller: &mut Caller<'_, Host>, address: u32) -> Option<u32> {
@@ -533,12 +667,9 @@ fn preopen_base(caller: &Caller<'_, Host>, fd: u32) -> Result<String, i32> {
     match fd {
         3 => Ok(caller.data().cwd.clone()),
         4 => Ok("/".to_string()),
-        _ => caller
-            .data()
-            .directories
-            .get(&fd)
-            .cloned()
-            .ok_or(ERRNO_BADF),
+        _ => ActiveSystem::new(&mut caller.data().machine.get())
+            .directory_path(fd as i32)
+            .map_err(|error| syscall_errno(&error)),
     }
 }
 
@@ -559,27 +690,63 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         if request.oflags & !2 != 0 || request.fdflags & !4 != 0 {
             return ERRNO_INVAL;
         }
-        let Some(fd) = (FIRST_DIRECTORY_FD..FIRST_DIRECTORY_FD + MAX_DIRECTORY_HANDLES)
-            .find(|fd| !caller.data().directories.contains_key(fd))
-        else {
-            return ERRNO_NOSPC;
+        let directory_count = {
+            let machine = caller.data().machine.get();
+            machine
+                .process
+                .fds
+                .iter()
+                .filter(|(_, id)| {
+                    machine
+                        .descriptors
+                        .state(*id)
+                        .is_ok_and(|state| state.kind == DescriptorKind::Directory)
+                })
+                .count()
         };
+        if directory_count >= MAX_DIRECTORY_HANDLES as usize {
+            return ERRNO_NOSPC;
+        }
         let path = resolve_against(&cwd, &path);
         if path.len() > 4096 {
             return ERRNO_INVAL;
         }
-        if !write_u32(&mut caller, request.result, fd) {
+        let fd = match ActiveSystem::new(&mut caller.data_mut().machine.get()).open_file(
+            "/",
+            &path,
+            OpenFile {
+                readable: true,
+                writable: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        ) {
+            Ok(fd) => fd,
+            Err(error) => return syscall_errno(&error),
+        };
+        if request.fdflags & 4 != 0 {
+            let mut machine = caller.data_mut().machine.get();
+            let description = machine
+                .process
+                .fds
+                .get(fd)
+                .expect("new directory descriptor");
+            machine
+                .descriptors
+                .set_nonblocking(description, true)
+                .expect("new directory description");
+        }
+        if !write_u32(&mut caller, request.result, fd as u32) {
+            let _ = ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd);
             return ERRNO_FAULT;
         }
-        // Paths and handle count are bounded independently of guest-controlled allocation.
-        caller.data_mut().directories.insert(fd, path);
+        caller.data_mut().open_files.insert(fd);
         return ERRNO_SUCCESS;
     }
     if request.oflags & 2 != 0 {
         return info.map_or_else(|error| syscall_errno(&error), |_| ERRNO_NOTDIR);
-    }
-    if request.fdflags & 4 != 0 {
-        return ERRNO_INVAL;
     }
     let readable = request.rights_base & 2 != 0;
     let writable = request.rights_base & 64 != 0;
@@ -603,8 +770,13 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
     }
     let host = caller.data_mut();
     host.open_files.insert(fd);
-    if options.append {
-        host.append_files.insert(fd);
+    if request.fdflags & 4 != 0 {
+        let mut machine = host.machine.get();
+        let description = machine.process.fds.get(fd).expect("new file descriptor");
+        machine
+            .descriptors
+            .set_nonblocking(description, true)
+            .expect("new open description");
     }
     ERRNO_SUCCESS
 }
@@ -773,32 +945,34 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
     }
     let mut value = [0; 24];
     let rights = match fd {
-        0 => {
-            value[0] = 2;
-            2_u64
-        }
-        1 | 2 => {
-            value[0] = 2;
-            64_u64
-        }
         3 | 4 => {
             value[0] = 3;
             u64::MAX
         }
-        _ if caller.data().directories.contains_key(&fd) => {
-            value[0] = 3;
-            u64::MAX
-        }
-        _ => match guest_file(&mut caller, fd as i32) {
-            Ok(file) => {
-                value[0] = 4;
-                (if file.readable { 2 } else { 0 }) | (if file.writable { 64 } else { 0 })
+        _ => match guest_descriptor(&mut caller, fd as i32) {
+            Ok(state) => {
+                value[0] = match state.kind {
+                    DescriptorKind::File => 4,
+                    DescriptorKind::Directory => 3,
+                    _ => 2,
+                };
+                if state.kind == DescriptorKind::Directory {
+                    u64::MAX
+                } else {
+                    (if state.readable { 2 } else { 0 }) | (if state.writable { 64 } else { 0 })
+                }
             }
             Err(error) => return error,
         },
     };
     value[8..16].copy_from_slice(&rights.to_le_bytes());
     value[16..24].copy_from_slice(&rights.to_le_bytes());
+    if guest_file(&mut caller, fd as i32).is_ok_and(|file| file.append) {
+        value[2] = 1;
+    }
+    if guest_descriptor(&mut caller, fd as i32).is_ok_and(|state| state.nonblocking) {
+        value[2] |= 4;
+    }
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
@@ -809,26 +983,82 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
     }
 }
 
-fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
-    if caller.data_mut().directories.remove(&fd).is_some() {
-        return ERRNO_SUCCESS;
+fn fd_filestat_set_size(mut caller: Caller<'_, Host>, fd: i32, size: u64) -> Result<i32, Error> {
+    match guest_descriptor(&mut caller, fd) {
+        Ok(state) if state.writable && state.kind == DescriptorKind::File => {}
+        Ok(_) => return Ok(ERRNO_BADF),
+        Err(error) => return Ok(error),
     }
+    let Ok(size) = usize::try_from(size) else {
+        return Ok(ERRNO_NOSPC);
+    };
+    let mut machine = caller.data_mut().machine.get();
+    let system = &mut ActiveSystem::new(&mut machine);
+    let old_size = match system.metadata_fd(fd) {
+        Ok(info) => info.size,
+        Err(error) => return Ok(syscall_errno(&error)),
+    };
+    let growth = (size as u64).saturating_sub(old_size);
+    if !system.charge_cpu(growth.saturating_add(1)) {
+        return Err(exhausted());
+    }
+    if !system.reserve_memory(growth) {
+        return Err(exhausted());
+    }
+    let resized = system.resize_file(fd, size);
+    system.release_memory(growth);
+    Ok(match resized {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    })
+}
+
+fn fd_fdstat_set_flags(mut caller: Caller<'_, Host>, fd: i32, flags: u32) -> Result<i32, Error> {
+    if flags & !5 != 0 {
+        return Ok(ERRNO_INVAL);
+    }
+    let state = match guest_descriptor(&mut caller, fd) {
+        Ok(state) => state,
+        Err(error) => return Ok(error),
+    };
+    if flags & 1 != 0 && state.kind != DescriptorKind::File {
+        return Ok(ERRNO_INVAL);
+    }
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu(MAX_FDS_PER_PROCESS as u64)
+    {
+        return Err(exhausted());
+    }
+    let mut machine = caller.data_mut().machine.get();
+    let description = machine.process.fds.get(fd).expect("validated descriptor");
+    if state.kind == DescriptorKind::File {
+        machine
+            .descriptors
+            .set_append(description, flags & 1 != 0)
+            .expect("validated regular file");
+    }
+    machine
+        .descriptors
+        .set_nonblocking(description, flags & 4 != 0)
+        .expect("validated descriptor");
+    Ok(ERRNO_SUCCESS)
+}
+
+fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
     let fd = fd as i32;
+    caller.data_mut().buffered_streams.remove(&fd);
     if (0..=2).contains(&fd) {
         let host = caller.data_mut();
         if !host.closed_stdio.insert(fd) {
             return ERRNO_BADF;
         }
         // Closing a real standard descriptor lets a pipe reader see EOF before the guest exits.
-        if matches!(host.stdio, Stdio::Descriptors) {
-            let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
-        }
+        let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
         return ERRNO_SUCCESS;
     }
     if !caller.data_mut().open_files.remove(&fd) {
         return ERRNO_BADF;
     }
-    caller.data_mut().append_files.remove(&fd);
     match ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
@@ -886,10 +1116,10 @@ fn filestat(info: &FileInfo) -> [u8; 64] {
 }
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    if fd <= 2 {
-        if caller.data().closed_stdio.contains(&(fd as i32)) {
-            return ERRNO_BADF;
-        }
+    let descriptor = guest_descriptor(&mut caller, fd as i32);
+    if descriptor.as_ref().is_ok_and(|state| {
+        state.kind != DescriptorKind::File && state.kind != DescriptorKind::Directory
+    }) {
         // Standard streams can be pipes, captures, or terminals; they have no regular-file size.
         let mut value = [0; 64];
         value[16] = 2;
@@ -904,7 +1134,7 @@ fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
         };
     }
     let directory = preopen_base(&caller, fd).ok();
-    let regular_file = caller.data().open_files.contains(&(fd as i32));
+    let regular_file = descriptor.is_ok_and(|state| state.kind == DescriptorKind::File);
     let info = {
         let mut machine = caller.data_mut().machine.get();
         let system = &mut ActiveSystem::new(&mut machine);
@@ -989,7 +1219,7 @@ fn fd_readdir(
         return ERRNO_FAULT;
     };
     let end = (pointer as usize).saturating_add(length as usize);
-    if end > memory.data(&caller).len() {
+    if end > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = {
@@ -1110,7 +1340,7 @@ fn path_readlink(
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
-    if (buffer as usize).saturating_add(buffer_length as usize) > memory.data(&caller).len() {
+    if (buffer as usize).saturating_add(buffer_length as usize) > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = u64::from(buffer_length);
@@ -1236,7 +1466,7 @@ fn random_get(mut caller: Caller<'_, Host>, pointer: u32, length: u32) -> i32 {
     let Some(end) = (pointer as usize).checked_add(length as usize) else {
         return ERRNO_FAULT;
     };
-    if end > memory.data(&caller).len() {
+    if end > memory.data_size(&caller) {
         return ERRNO_FAULT;
     }
     let reservation = u64::from(length);
@@ -1272,7 +1502,7 @@ fn exhausted() -> Error {
 /// reads and writes, so a larger request transfers a prefix instead of failing.
 fn iovecs(
     caller: &mut Caller<'_, Host>,
-    memory: &Memory,
+    memory: &GuestMemory,
     iovs: u32,
     count: u32,
 ) -> Result<Vec<(usize, usize)>, i32> {
@@ -1294,7 +1524,7 @@ fn iovecs(
         let end = (pointer as usize)
             .checked_add(length as usize)
             .ok_or(ERRNO_FAULT)?;
-        if end > memory.data(&*caller).len() {
+        if end > memory.data_size(&*caller) {
             return Err(ERRNO_FAULT);
         }
         let length = (length as usize).min(MAX_IO_BYTES - total);
@@ -1314,14 +1544,12 @@ fn fd_write(
     if caller.data().closed_stdio.contains(&fd) {
         return Ok(StreamCall::Done(ERRNO_BADF));
     }
-    let standard = fd == 1 || fd == 2;
-    if !standard {
-        match guest_file(caller, fd) {
-            Ok(file) if file.writable => {}
-            Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
-            Err(error) => return Ok(StreamCall::Done(error)),
-        }
-    }
+    let state = match guest_descriptor(caller, fd) {
+        Ok(state) if state.writable => state,
+        Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
+        Err(error) => return Ok(StreamCall::Done(error)),
+    };
+    let standard = fd == 1 || fd == 2 || state.kind == DescriptorKind::Stream;
     let Some(memory) = memory(caller) else {
         return Ok(StreamCall::Done(ERRNO_FAULT));
     };
@@ -1331,9 +1559,10 @@ fn fd_write(
     };
     let mut bytes = Vec::new();
     for (pointer, length) in vectors {
-        bytes.extend_from_slice(&memory.data(&*caller)[pointer..pointer + length]);
+        bytes.extend_from_slice(&memory.bytes(&*caller, pointer, length)?);
     }
     let host = caller.data_mut();
+    let buffered = host.buffered_streams.get(&fd).copied();
     if standard {
         let remaining = ActiveSystem::new(&mut host.machine.get()).output_remaining();
         if remaining == 0 && !bytes.is_empty() {
@@ -1341,27 +1570,44 @@ fn fd_write(
             return Err(exhausted());
         }
         bytes.truncate(remaining.min(bytes.len() as u64) as usize);
-    } else if host.append_files.contains(&fd) {
-        if let Err(error) = ActiveSystem::new(&mut host.machine.get()).seek(fd, 0, 2) {
-            return Ok(StreamCall::Done(syscall_errno(&error)));
-        }
     }
     let count = match &mut host.stdio {
-        Stdio::Buffered { stdout, stderr, .. } if standard => {
-            let destination = if fd == 1 { stdout } else { stderr };
+        Stdio::Buffered { stdout, stderr, .. } if matches!(buffered, Some(1 | 2)) => {
+            let destination = if buffered == Some(1) { stdout } else { stderr };
             destination.extend_from_slice(&bytes);
             bytes.len()
         }
-        _ => match ActiveSystem::new(&mut host.machine.get()).write(fd, &bytes) {
-            Ok(IoPoll::Ready(count)) => count,
-            Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
-            // WASI has no signals. Writing to a pipe without readers ends the guest as the
-            // default SIGPIPE disposition would, so a guest that ignores EPIPE cannot spin.
-            Err(SyscallError::Descriptor(DescriptorError::BrokenPipe)) => {
-                return Err(Error::new(GuestExit(141)));
+        _ => {
+            let outcome = {
+                let mut machine = host.machine.get();
+                ActiveSystem::new(&mut machine).write(fd, &bytes)
+            };
+            match outcome {
+                Ok(IoPoll::Ready(count)) => count,
+                Ok(IoPoll::Blocked(_)) if state.nonblocking => {
+                    return Ok(StreamCall::Done(ERRNO_AGAIN));
+                }
+                Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
+                Err(SyscallError::Descriptor(DescriptorError::BrokenPipe)) => {
+                    let mut machine = host.machine.get();
+                    if matches!(
+                        machine
+                            .process
+                            .signal_dispositions
+                            .get(&crate::process::Signal::Pipe),
+                        Some(crate::interp::ShellSignalDisposition::Ignore)
+                    ) {
+                        return Ok(StreamCall::Done(64)); // WASI EPIPE.
+                    }
+                    let pid = machine.process.pid;
+                    machine
+                        .processes
+                        .mark_signal_termination(pid, crate::process::Signal::Pipe);
+                    return Err(Error::new(GuestExit(141)));
+                }
+                Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
             }
-            Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
-        },
+        }
     };
     let charged = {
         let mut machine = host.machine.get();
@@ -1390,13 +1636,11 @@ fn fd_read(
     if caller.data().closed_stdio.contains(&fd) {
         return Ok(StreamCall::Done(ERRNO_BADF));
     }
-    if fd != 0 {
-        match guest_file(caller, fd) {
-            Ok(file) if file.readable => {}
-            Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
-            Err(error) => return Ok(StreamCall::Done(error)),
-        }
-    }
+    let state = match guest_descriptor(caller, fd) {
+        Ok(state) if state.readable => state,
+        Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
+        Err(error) => return Ok(StreamCall::Done(error)),
+    };
     let Some(memory) = memory(caller) else {
         return Ok(StreamCall::Done(ERRNO_FAULT));
     };
@@ -1406,8 +1650,9 @@ fn fd_read(
     };
     let total = vectors.iter().map(|(_, length)| length).sum::<usize>();
     let host = caller.data_mut();
+    let buffered = host.buffered_streams.get(&fd).copied();
     let input = match &mut host.stdio {
-        Stdio::Buffered { stdin, offset, .. } if fd == 0 => {
+        Stdio::Buffered { stdin, offset, .. } if buffered == Some(0) => {
             let end = offset.saturating_add(total).min(stdin.len());
             let bytes = stdin[*offset..end].to_vec();
             *offset = end;
@@ -1415,6 +1660,9 @@ fn fd_read(
         }
         _ => match ActiveSystem::new(&mut host.machine.get()).read(fd, total) {
             Ok(IoPoll::Ready(bytes)) => bytes,
+            Ok(IoPoll::Blocked(_)) if state.nonblocking => {
+                return Ok(StreamCall::Done(ERRNO_AGAIN));
+            }
             Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
             Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
         },
@@ -1445,19 +1693,19 @@ fn fd_read(
     ))
 }
 
-/// A `poll_oneoff` clock subscription resolved to a monotonic deadline.
-struct ClockWait {
+/// One bounded WASI subscription over virtual time or a process descriptor.
+struct PollWait {
     userdata: u64,
-    deadline: u64,
+    kind: PollKind,
 }
 
-/// Decode `poll_oneoff` subscriptions. Only clock subscriptions are supported; descriptor
-/// readiness subscriptions fail with `ENOTSUP` rather than reporting readiness they cannot know.
-fn clock_waits(
-    caller: &mut Caller<'_, Host>,
-    input: u32,
-    count: u32,
-) -> Result<Vec<ClockWait>, i32> {
+enum PollKind {
+    Clock(u64),
+    Descriptor { fd: i32, writing: bool },
+}
+
+/// Decode bounded subscriptions before any scheduler or descriptor side effects.
+fn poll_waits(caller: &mut Caller<'_, Host>, input: u32, count: u32) -> Result<Vec<PollWait>, i32> {
     if count == 0 || count > MAX_POLL_SUBSCRIPTIONS {
         return Err(ERRNO_INVAL);
     }
@@ -1481,7 +1729,15 @@ fn clock_waits(
         .map(|record| {
             match record[8] {
                 0 => {}
-                1 | 2 => return Err(ERRNO_NOTSUP),
+                1 | 2 => {
+                    return Ok(PollWait {
+                        userdata: field(record, 0, 8),
+                        kind: PollKind::Descriptor {
+                            fd: field(record, 16, 4) as i32,
+                            writing: record[8] == 2,
+                        },
+                    });
+                }
                 _ => return Err(ERRNO_INVAL),
             }
             let timeout = field(record, 24, 8);
@@ -1497,98 +1753,145 @@ fn clock_waits(
                 }
                 _ => return Err(ERRNO_INVAL),
             };
-            Ok(ClockWait {
+            Ok(PollWait {
                 userdata: field(record, 0, 8),
-                deadline,
+                kind: PollKind::Clock(deadline),
             })
         })
         .collect()
 }
 
-/// One check of a clock wait against the virtual clock.
-enum ClockStep {
-    Reached(u64),
-    Advanced,
-    Wait,
-}
-
-/// Sleep until the earliest clock subscription expires, then report every expired one.
-///
-/// A scheduled process blocks on a virtual timer like native `sleep`, so other processes run and
-/// a signal can end the wait. A display session has no other processes, so on virtual time it
-/// advances its own clock to the deadline; on real time it suspends until physical time passes.
+/// Wait for virtual descriptor readiness or the earliest clock subscription.
+/// Output ranges are validated before scheduling; readiness checks never perform I/O.
 async fn poll_oneoff(
     mut caller: Caller<'_, Host>,
     (input, output, count, result): (u32, u32, u32, u32),
 ) -> Result<i32, Error> {
-    let waits = match clock_waits(&mut caller, input, count) {
+    let waits = match poll_waits(&mut caller, input, count) {
         Ok(waits) => waits,
         Err(error) => return Ok(error),
-    };
-    let deadline = waits
-        .iter()
-        .map(|wait| wait.deadline)
-        .min()
-        .expect("count > 0");
-    let mut scheduled = false;
-    let now = loop {
-        let host = caller.data_mut();
-        let buffered = matches!(host.stdio, Stdio::Buffered { .. });
-        // The guard is confined to this block: the poller takes the machine back while the
-        // guest is suspended below.
-        let step = {
-            let mut interp = host.machine.get();
-            let now = interp.clock.monotonic_ns();
-            if now >= deadline {
-                ClockStep::Reached(now)
-            } else if buffered && interp.real_time.is_none() {
-                // A virtual session is the only process on its clock, so it jumps to the
-                // deadline. A real-time session waits for physical time, which the session poll
-                // syncs.
-                if interp.clock.advance_to(deadline).is_err() {
-                    return Ok(ERRNO_INVAL);
-                }
-                ClockStep::Advanced
-            } else {
-                if !buffered && !scheduled {
-                    if let Err(error) = ActiveSystem::new(&mut interp).schedule_wake(deadline - now)
-                    {
-                        return Ok(syscall_errno(&error));
-                    }
-                    scheduled = true;
-                }
-                ClockStep::Wait
-            }
-        };
-        match step {
-            ClockStep::Reached(now) => break now,
-            ClockStep::Advanced => continue,
-            ClockStep::Wait => {}
-        }
-        let machine = host.machine.clone();
-        machine
-            .suspend(Suspension::Blocked(WaitReason::Timer(deadline)))
-            .await;
     };
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
-    let mut events = 0u32;
-    for wait in waits.iter().filter(|wait| wait.deadline <= now) {
-        // Event layout: userdata, errno (0), and event type (0 = clock); the rest is zero.
-        let mut event = [0; EVENT_BYTES as usize];
-        event[..8].copy_from_slice(&wait.userdata.to_le_bytes());
-        let address = output as usize + (events * EVENT_BYTES) as usize;
-        if memory.write(&mut caller, address, &event).is_err() {
-            return Ok(ERRNO_FAULT);
-        }
-        events += 1;
+    let length = memory.data_size(&caller);
+    if (output as usize)
+        .checked_add(count as usize * EVENT_BYTES as usize)
+        .is_none_or(|end| end > length)
+        || (result as usize)
+            .checked_add(4)
+            .is_none_or(|end| end > length)
+    {
+        return Ok(ERRNO_FAULT);
     }
-    Ok(if write_u32(&mut caller, result, events) {
-        ERRNO_SUCCESS
-    } else {
-        ERRNO_FAULT
-    })
+    let mut scheduled = None;
+    loop {
+        let mut events = Vec::new();
+        let mut reasons = Vec::new();
+        let now = caller.data_mut().machine.get().clock.monotonic_ns();
+        let mut earliest = None::<u64>;
+        for wait in &waits {
+            let mut available = 0;
+            let mut hangup = false;
+            let (kind, status) = match wait.kind {
+                PollKind::Clock(deadline) => {
+                    earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
+                    (
+                        0u8,
+                        if now >= deadline {
+                            Some(ERRNO_SUCCESS)
+                        } else {
+                            None
+                        },
+                    )
+                }
+                PollKind::Descriptor { fd, writing } => {
+                    let status = match guest_descriptor(&mut caller, fd) {
+                        Err(error) => Some(error),
+                        Ok(_) => {
+                            let ready = ActiveSystem::new(&mut caller.data_mut().machine.get())
+                                .descriptor_readiness(fd, writing);
+                            match ready {
+                                Ok(IoPoll::Ready(ready)) => {
+                                    available = ready.bytes;
+                                    hangup = ready.hangup;
+                                    Some(ERRNO_SUCCESS)
+                                }
+                                Ok(IoPoll::Blocked(reason)) => {
+                                    reasons.push(wait_reason(reason));
+                                    None
+                                }
+                                Err(error) => Some(syscall_errno(&error)),
+                            }
+                        }
+                    };
+                    (if writing { 2 } else { 1 }, status)
+                }
+            };
+            if let Some(errno) = status {
+                let mut event = [0u8; EVENT_BYTES as usize];
+                event[..8].copy_from_slice(&wait.userdata.to_le_bytes());
+                event[8..10].copy_from_slice(&(errno as u16).to_le_bytes());
+                event[10] = kind;
+                if kind != 0 && errno == ERRNO_SUCCESS {
+                    event[16..24].copy_from_slice(&available.to_le_bytes());
+                    event[24..26].copy_from_slice(&u16::from(hangup).to_le_bytes());
+                }
+                events.push(event);
+            }
+        }
+        if !ActiveSystem::new(&mut caller.data_mut().machine.get()).charge_cpu(waits.len() as u64) {
+            return Err(exhausted());
+        }
+        if !events.is_empty() {
+            if let Some(event) = scheduled {
+                caller.data_mut().machine.get().clock.cancel(event);
+            }
+            for (index, event) in events.iter().enumerate() {
+                memory.write(
+                    &mut caller,
+                    output as usize + index * EVENT_BYTES as usize,
+                    event,
+                )?;
+            }
+            return Ok(if write_u32(&mut caller, result, events.len() as u32) {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            });
+        }
+        let host = caller.data_mut();
+        if let Some(deadline) = earliest {
+            let buffered = matches!(host.stdio, Stdio::Buffered { .. });
+            let mut interp = host.machine.get();
+            if buffered && reasons.is_empty() && interp.real_time.is_none() {
+                if interp.clock.advance_to(deadline).is_err() {
+                    return Ok(ERRNO_INVAL);
+                }
+                continue;
+            }
+            if !buffered && scheduled.is_none() {
+                let pid = interp.process.pid;
+                scheduled = match interp
+                    .clock
+                    .schedule_wake_after(u64::from(pid), deadline.saturating_sub(now))
+                {
+                    Ok(event) => Some(event),
+                    Err(_) => return Ok(ERRNO_INVAL),
+                };
+            }
+            reasons.push(WaitReason::Timer(deadline));
+        }
+        let reason = if reasons.len() == 1 {
+            reasons.pop().expect("one wait reason")
+        } else {
+            WaitReason::Any(reasons)
+        };
+        host.machine
+            .clone()
+            .suspend(Suspension::Blocked(reason))
+            .await;
+    }
 }
 
 /// `fd_read` or `fd_write`: descriptor, iovec array, iovec count, and result address.
@@ -1618,8 +1921,123 @@ fn wrap_stream_call(linker: &mut Linker<Host>, name: &str, call: StreamFn) {
         .expect("unique WASI import");
 }
 
+fn cwd_get(mut caller: Caller<'_, Host>, pointer: u32, capacity: u32) -> Result<i32, Error> {
+    let path = caller.data().cwd.as_bytes();
+    if path.len() >= capacity as usize || capacity > 4096 {
+        return Ok(ERRNO_RANGE);
+    }
+    let length = path.len();
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get()).charge_cpu(length as u64 + 1) {
+        return Err(exhausted());
+    }
+    let mut bytes = caller.data().cwd.as_bytes().to_vec();
+    bytes.push(0);
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    Ok(
+        if memory.write(&mut caller, pointer as usize, &bytes).is_ok() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        },
+    )
+}
+
+fn cwd_set(
+    mut caller: Caller<'_, Host>,
+    pointer: u32,
+    length: u32,
+    output: u32,
+    capacity: u32,
+) -> Result<i32, Error> {
+    if capacity > 4096 {
+        return Ok(ERRNO_RANGE);
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (output as usize)
+        .checked_add(capacity as usize)
+        .is_none_or(|end| end > memory.data_size(&caller))
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    let path = match read_path(&mut caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return Ok(error),
+    };
+    if path.is_empty() {
+        return Ok(ERRNO_NOENT);
+    }
+    let base = caller.data().cwd.clone();
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu((base.len() + path.len() + 1) as u64)
+    {
+        return Err(exhausted());
+    }
+    let resolved = {
+        let mut machine = caller.data_mut().machine.get();
+        let system = &mut ActiveSystem::new(&mut machine);
+        let resolved = match system.canonicalize(&base, &path, true) {
+            Ok(path) => path,
+            Err(error) => return Ok(syscall_errno(&error)),
+        };
+        if resolved.len() >= capacity as usize {
+            return Ok(ERRNO_RANGE);
+        }
+        if let Err(error) = system.chdir(&resolved) {
+            return Ok(syscall_errno(&error));
+        }
+        resolved
+    };
+    let mut bytes = resolved.as_bytes().to_vec();
+    bytes.push(0);
+    caller.data_mut().cwd = resolved;
+    Ok(
+        if memory.write(&mut caller, output as usize, &bytes).is_ok() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        },
+    )
+}
+
 fn build_linker(engine: &Engine) -> Linker<Host> {
     let mut linker = Linker::<Host>::new(engine);
+    ffi::register(&mut linker);
+    posix_process::register(&mut linker);
+    linker
+        .func_wrap("shellsim_posix_v1", "cwd_get", cwd_get)
+        .expect("unique POSIX import");
+    linker
+        .func_wrap("shellsim_posix_v1", "cwd_set", cwd_set)
+        .expect("unique POSIX import");
+    linker
+        .func_wrap(
+            "shellsim_posix_v1",
+            "umask",
+            |mut caller: Caller<'_, Host>, mask: u32| -> Result<u32, Error> {
+                let mut machine = caller.data_mut().machine.get();
+                let system = &mut ActiveSystem::new(&mut machine);
+                if !system.charge_cpu(1) {
+                    return Err(exhausted());
+                }
+                let previous = system.umask();
+                system
+                    .set_umask((mask & 0o777) as u16)
+                    .expect("permission mask is bounded");
+                Ok(u32::from(previous))
+            },
+        )
+        .expect("unique POSIX import");
+    linker
+        .func_wrap(
+            "shellsim_posix_v1",
+            "descriptor_control",
+            descriptor_control,
+        )
+        .expect("unique POSIX import");
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
@@ -1678,6 +2096,20 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
         .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_fdstat_get", fd_fdstat_get)
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_fdstat_set_flags",
+            fd_fdstat_set_flags,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_filestat_set_size",
+            fd_filestat_set_size,
+        )
         .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_readdir", fd_readdir)
@@ -1861,16 +2293,47 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
 
 /// A started guest, advanced one poll at a time inside [`MachineAccess::enter`].
 struct Guest {
-    execution: Pin<Box<dyn Future<Output = GuestOutcome> + Send>>,
+    execution: Execution,
     machine: MachineAccess,
     /// Memory reserved for the guest's store until the owner releases it.
-    reserved: u64,
+    reserved: GuestReservation,
+}
+
+enum Execution {
+    Single(Pin<Box<dyn Future<Output = GuestOutcome> + Send>>),
+    Threads(Box<threads::ThreadGroup>),
+}
+
+/// Retained images and v2 heap growth share an accounting counter with the guest owner, so cancellation
+/// can release them even when the suspended Store cannot return its host state.
+#[derive(Clone, Default)]
+struct GuestReservation {
+    fixed: u64,
+    dynamic: Arc<AtomicU64>,
+}
+
+impl GuestReservation {
+    fn snapshot(&self) -> Self {
+        Self {
+            fixed: self.fixed,
+            dynamic: Arc::new(AtomicU64::new(self.dynamic.load(Ordering::Relaxed))),
+        }
+    }
 }
 
 /// A stopped guest and the host state it leaves behind.
-struct GuestOutcome {
-    status: i32,
-    host: Host,
+enum GuestOutcome {
+    Exit {
+        status: i32,
+        host: Host,
+    },
+    ThreadReturn {
+        host: Host,
+    },
+    Exec {
+        spec: posix_exec::ExecSpec,
+        host: Host,
+    },
 }
 
 enum GuestPoll {
@@ -1891,7 +2354,12 @@ struct Launch<'a> {
 
 impl Guest {
     fn poll(&mut self, interp: &mut Interp) -> GuestPoll {
-        let execution = &mut self.execution;
+        if let Execution::Threads(group) = &mut self.execution {
+            return group.poll(interp);
+        }
+        let Execution::Single(execution) = &mut self.execution else {
+            unreachable!()
+        };
         let outcome = self.machine.enter(interp, || {
             execution
                 .as_mut()
@@ -1920,6 +2388,55 @@ impl Guest {
     }
 }
 
+/// Apply the same namespace boundary before initial launch and exec preflight.
+/// Broad WASI imports may remain unused; unavailable operations trap on use.
+pub(super) fn validate_imports(module: &Module, threaded: bool) -> Result<(), Error> {
+    for import in module.imports() {
+        let allowed = import.module() == "wasi_snapshot_preview1"
+            || (threaded
+                && ((import.module() == "env" && import.name() == "memory")
+                    || (import.module() == "wasi" && import.name() == "thread-spawn")
+                    || (import.module() == threads::NAMESPACE
+                        && matches!(import.name(), "wait32" | "notify"))))
+            || (import.module() == "shellsim_posix_v1"
+                && matches!(
+                    import.name(),
+                    "descriptor_control"
+                        | "descriptor_open"
+                        | "umask"
+                        | "cwd_get"
+                        | "cwd_set"
+                        | "process_pipe"
+                        | "process_spawn"
+                        | "process_wait"
+                        | "process_kill"
+                        | "process_signal_disposition"
+                        | "process_identity"
+                        | "process_exec"
+                ))
+            || (dynamic::Abi::from_namespace(import.module()).is_some()
+                && matches!(import.name(), "open" | "symbol" | "error"))
+            || (!threaded && import.module() == ffi::NAMESPACE && ffi::supported(import.name()))
+            || (import.module() == "shellsim"
+                && matches!(
+                    import.name(),
+                    "path_chmod"
+                        | "display_open"
+                        | "display_present"
+                        | "input_poll_key"
+                        | "display_close"
+                ));
+        if !allowed {
+            return Err(Error::msg(format!(
+                "unsupported wasm import: {}.{}",
+                import.module(),
+                import.name()
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Validate and compile a Wasm command and prepare its execution without running guest code.
 ///
 /// Failures return an exit status and a diagnostic without a trailing newline.
@@ -1943,47 +2460,61 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     {
         return Err((137, format!("{path}: wasm compilation budget exhausted")));
     }
-    let module = compiled_command_module(&wasm)
-        .map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
-    // Toolchains import a broad libc surface even when a particular compile does not call it.
-    // An unavailable WASI operation must trap if reached, never touch the host or return fake
-    // success. Non-WASI namespaces must still be rejected at instantiation.
+    threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let thread_profile =
+        threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let scratch = if thread_profile.is_some() {
+        (wasm.len() as u64).saturating_mul(65).saturating_add(4096)
+    } else {
+        0
+    };
+    if !interp.resources.reserve_memory(scratch) {
+        return Err((
+            137,
+            format!("{path}: thread compilation memory budget exhausted"),
+        ));
+    }
+    let compiled = compiled_command_module(&wasm);
+    interp.resources.release_memory(scratch);
+    let module =
+        compiled.map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
+    validate_imports(&module, thread_profile.is_some())
+        .map_err(|error| (126, format!("{path}: {error}")))?;
+    let mut linker = build_linker(command_engine());
+    let mut dynamic_abi = None;
+    let mut ffi_requested = false;
     for import in module.imports() {
-        if import.module() != "wasi_snapshot_preview1"
-            && !(import.module() == dynamic::NAMESPACE
-                && matches!(import.name(), "open" | "symbol" | "error"))
-            && !(import.module() == "shellsim"
-                && matches!(
-                    import.name(),
-                    "path_chmod"
-                        | "display_open"
-                        | "display_present"
-                        | "input_poll_key"
-                        | "display_close"
-                ))
-        {
-            return Err((
-                126,
-                format!(
-                    "{path}: unsupported wasm import: {}.{}",
-                    import.module(),
-                    import.name()
-                ),
-            ));
+        if import.module() == ffi::NAMESPACE {
+            ffi_requested = true;
+        }
+        if let Some(abi) = dynamic::Abi::from_namespace(import.module()) {
+            if dynamic_abi.is_some_and(|old| old != abi) {
+                return Err((
+                    126,
+                    format!("{path}: mixed dynamic loading ABIs are unsupported"),
+                ));
+            }
+            dynamic_abi = Some(abi);
         }
     }
-    let mut linker = build_linker(command_engine());
-    let dynamic_enabled = module
-        .imports()
-        .any(|import| import.module() == dynamic::NAMESPACE);
-    if dynamic_enabled {
-        dynamic::compatible_main(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    if ffi_requested {
+        if thread_profile.is_some() || dynamic_abi.is_some_and(|abi| abi != dynamic::Abi::V2) {
+            return Err((126, format!("{path}: FFI requires dynamic loading ABI v2")));
+        }
+        dynamic_abi = Some(dynamic::Abi::V2);
+    }
+    if let Some(abi) = dynamic_abi {
+        dynamic::compatible_main(&wasm, abi).map_err(|error| (126, format!("{path}: {error}")))?;
     }
     dynamic::register(&mut linker);
+    posix_exec::register(&mut linker);
+    posix_open::register(&mut linker);
     register_frame_yield(&mut linker);
-    linker
-        .define_unknown_imports_as_traps(&module)
-        .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
+    if thread_profile.is_none() {
+        linker
+            .define_unknown_imports_as_traps(&module)
+            .map_err(|error| (126, format!("{path}: invalid wasm imports: {error}")))?;
+    }
     let minimum_memory = module
         .exports()
         .filter_map(|export| match export.ty() {
@@ -1995,8 +2526,26 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     // Small utilities retain their existing reservation, allowing several in one pipeline.
     // Larger static interpreter images receive a larger bounded heap reservation.
     let large_image = minimum_memory > DEFAULT_WASM_MEMORY as u64;
-    let table_memory = if large_image { LARGE_TABLE_MEMORY } else { 0 };
-    let memory_cap = if large_image {
+    let table_memory = if dynamic_abi == Some(dynamic::Abi::V2) {
+        0
+    } else if large_image {
+        LARGE_TABLE_MEMORY
+    } else {
+        0
+    };
+    let loader_memory = dynamic_abi.map_or(0, dynamic::Abi::fixed_reservation);
+    // Every async Store owns one live or cached Wasmtime fiber stack. Thread slots
+    // already prepay theirs in THREAD_HOST_BYTES.
+    let main_stack_memory = if thread_profile.is_some() {
+        0
+    } else {
+        ASYNC_STACK_BYTES as u64
+    };
+    let memory_cap = if thread_profile.is_some() {
+        MAX_WASM_MEMORY as u64
+    } else if dynamic_abi == Some(dynamic::Abi::V2) {
+        256 * 1024 * 1024
+    } else if large_image {
         MAX_WASM_MEMORY as u64
     } else {
         DEFAULT_WASM_MEMORY as u64
@@ -2006,30 +2555,89 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .memory_remaining()
         .saturating_sub(DIRECTORY_MEMORY)
         .saturating_sub(table_memory)
-        .saturating_sub(if dynamic_enabled {
-            dynamic::MEMORY_RESERVATION
-        } else {
+        .saturating_sub(loader_memory)
+        .saturating_sub(main_stack_memory)
+        // Only v1 prepays its Store reservation. V2 heap and host scratch compete for the
+        // same remaining environment budget when they actually allocate.
+        .saturating_sub(if dynamic_abi == Some(dynamic::Abi::V2) {
             0
+        } else {
+            MAX_IO_BYTES as u64
         })
-        // Keep bounded host-call scratch (including random_get) outside the store reservation.
-        .saturating_sub(MAX_IO_BYTES as u64)
         .min(memory_cap);
-    let reserved = memory_limit
+    let linear_reservation = if let Some(profile) = &thread_profile {
+        let maximum = profile.maximum_pages.saturating_mul(65_536);
+        if !interp.resources.charge_cpu(maximum) {
+            return Err((
+                137,
+                format!("{path}: thread shared memory initialization budget exhausted"),
+            ));
+        }
+        if maximum > memory_limit {
+            return Err((
+                137,
+                format!("{path}: thread shared memory budget exhausted"),
+            ));
+        }
+        maximum
+    } else if dynamic_abi == Some(dynamic::Abi::V2) {
+        0
+    } else {
+        memory_limit
+    };
+    let reserved = linear_reservation
         .saturating_add(DIRECTORY_MEMORY)
         .saturating_add(table_memory);
-    let reserved = reserved.saturating_add(if dynamic_enabled {
-        dynamic::MEMORY_RESERVATION
+    let thread_memory = if thread_profile.is_some() {
+        let mut metadata = (interp.process.cwd.len() as u64).saturating_add(96);
+        for value in &launch.argv {
+            metadata = metadata
+                .saturating_add(value.len() as u64)
+                .saturating_add(96);
+        }
+        for name in &interp.exported {
+            if let Some(value) = interp.vars.get(name) {
+                metadata = metadata
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(value.len() as u64)
+                    .saturating_add(96);
+            }
+        }
+        let metadata = metadata.saturating_mul(threads::MAX_THREADS as u64 + 2);
+        if !interp.resources.charge_cpu(metadata) {
+            return Err((137, format!("{path}: thread metadata budget exhausted")));
+        }
+        let image = module.image_range();
+        threads::THREAD_HOST_BYTES * threads::MAX_THREADS as u64
+            + metadata
+            + (image.end as usize).saturating_sub(image.start as usize) as u64
+            + (wasm.len() as u64).saturating_mul(2)
+            + 4096
     } else {
         0
-    });
+    };
+    let reserved = reserved
+        .saturating_add(loader_memory)
+        .saturating_add(thread_memory)
+        .saturating_add(main_stack_memory);
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
+    let reserved = GuestReservation {
+        fixed: reserved,
+        dynamic: Arc::default(),
+    };
     let machine = MachineAccess::default();
     let initial_fuel = interp
         .resources
         .cpu_remaining()
         .saturating_mul(WASM_FUEL_PER_CPU_UNIT);
+    let inherited_files = interp
+        .process
+        .fds
+        .iter()
+        .filter_map(|(fd, _)| (fd > 4).then_some(fd))
+        .collect();
     let system = ActiveSystem::new(interp);
     let host = Host {
         machine: machine.clone(),
@@ -2040,15 +2648,18 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             .iter()
             .map(|(name, value)| format!("{name}={value}").into_bytes())
             .collect(),
-        stdio: launch.stdio,
         diagnostic: Vec::new(),
         initial_fuel,
         closed_stdio: BTreeSet::new(),
-        open_files: BTreeSet::new(),
-        append_files: BTreeSet::new(),
-        directories: BTreeMap::new(),
-        limits: limits::GuestLimits::new(
-            StoreLimitsBuilder::new()
+        open_files: inherited_files,
+        buffered_streams: if matches!(launch.stdio, Stdio::Buffered { .. }) {
+            BTreeMap::from([(0, 0), (1, 1), (2, 2)])
+        } else {
+            BTreeMap::new()
+        },
+        stdio: launch.stdio,
+        limits: {
+            let store = StoreLimitsBuilder::new()
                 .memory_size(memory_limit as usize)
                 .table_elements(if large_image {
                     LARGE_TABLE_ELEMENTS
@@ -2058,14 +2669,35 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
                 .memories(1)
                 .tables(16)
                 .instances(dynamic::MAX_LOADS + 1)
-                .build(),
-            memory_limit as usize,
-        ),
+                .build();
+            if dynamic_abi == Some(dynamic::Abi::V2) {
+                limits::GuestLimits::incremental(
+                    store,
+                    memory_limit as usize,
+                    machine.clone(),
+                    reserved.dynamic.clone(),
+                )
+            } else {
+                limits::GuestLimits::new(store, memory_limit as usize)
+            }
+        },
         interaction: launch.interaction,
-        dynamic: dynamic::Dynamic::new(dynamic_enabled),
+        dynamic: dynamic::Dynamic::new(dynamic_abi, reserved.dynamic.clone()),
+        ffi: ffi::State::default(),
+        fibers: fibers::Budget::default(),
+        thread: None,
+        retained: reserved.dynamic.clone(),
     };
+    if let Some(profile) = thread_profile {
+        return threads::start(host, module, path.to_string(), profile, reserved.clone()).map_err(
+            |error| {
+                interp.resources.release_memory(reserved.fixed);
+                (126, format!("{path}: {error}"))
+            },
+        );
+    }
     Ok(Guest {
-        execution: Box::pin(execute(host, linker, module, path.to_string())),
+        execution: Execution::Single(Box::pin(execute(host, linker, module, path.to_string()))),
         machine,
         reserved,
     })
@@ -2121,9 +2753,21 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
         .expect("fuel configured");
     // Concurrent processes share one CPU budget. Charging before each host call keeps a guest
     // from acting after that budget is spent; fuel yields charge compute-only stretches.
-    store.call_hook(|store, hook| {
+    store.call_hook(|mut store, hook| {
         if matches!(hook, CallHook::CallingHost) {
             charge_consumed_fuel(store)
+        } else if matches!(hook, CallHook::ReturningFromHost) {
+            let mut machine = store.data_mut().machine.get();
+            // Cancellation can unwind a suspended host call after the poller has reclaimed
+            // the machine. Signal delivery belongs only to an active guest poll.
+            if let Some(signal) = machine
+                .0
+                .as_mut()
+                .and_then(Interp::take_default_termination)
+            {
+                return Err(Error::new(GuestExit(128 + signal.number())));
+            }
+            Ok(())
         } else {
             Ok(())
         }
@@ -2143,11 +2787,34 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
     let _ = charge_consumed_fuel(store.as_context_mut());
     let out_of_fuel = store.get_fuel().unwrap_or(0) == 0;
     let host = store.data_mut();
-    for fd in std::mem::take(&mut host.open_files) {
-        let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
+    if !result
+        .as_ref()
+        .is_err_and(|error| error.is::<posix_exec::GuestExec>())
+    {
+        for fd in std::mem::take(&mut host.open_files) {
+            let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
+        }
     }
+    finish_guest(result, store.into_data(), out_of_fuel, &path, false)
+}
+
+/// Preserve process-wide termination and exec separately from a worker return.
+fn finish_guest(
+    result: Result<(), Error>,
+    mut host: Host,
+    out_of_fuel: bool,
+    path: &str,
+    worker: bool,
+) -> GuestOutcome {
+    let returned = result.is_ok();
     let status = match result {
         Ok(()) => 0,
+        Err(error) if error.is::<posix_exec::GuestExec>() => {
+            let posix_exec::GuestExec(spec) = error
+                .downcast::<posix_exec::GuestExec>()
+                .expect("checked exec transfer");
+            return GuestOutcome::Exec { spec, host };
+        }
         Err(error) => match error.downcast_ref::<GuestExit>() {
             Some(exit) => exit.0,
             None => {
@@ -2169,15 +2836,19 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
         .resources
         .stop_reason()
         .map_or(status, |reason| reason.exit_status());
-    GuestOutcome {
-        status,
-        host: store.into_data(),
+    if worker && returned && status == 0 {
+        fibers::release_store(&mut host);
+        GuestOutcome::ThreadReturn { host }
+    } else {
+        GuestOutcome::Exit { status, host }
     }
 }
 
 /// Return the guest's memory reservation and display surfaces to the machine.
-fn release_guest_resources(interp: &mut Interp, reserved: &mut u64) {
-    interp.resources.release_memory(std::mem::take(reserved));
+fn release_guest_resources(interp: &mut Interp, reserved: &mut GuestReservation) {
+    let total = std::mem::take(&mut reserved.fixed)
+        .saturating_add(reserved.dynamic.swap(0, Ordering::Relaxed));
+    interp.resources.release_memory(total);
     let pid = interp.process.pid;
     interp.display.close_owner(pid);
 }
@@ -2196,7 +2867,7 @@ pub(crate) struct WasmProcess {
     path: String,
     state: WasmState,
     /// Memory reserved by a guest that this image, or the snapshot it was cloned from, started.
-    reserved: u64,
+    reserved: GuestReservation,
 }
 
 enum WasmState {
@@ -2235,7 +2906,7 @@ impl Clone for WasmProcess {
         Self {
             path: self.path.clone(),
             state,
-            reserved: self.reserved,
+            reserved: self.reserved.snapshot(),
         }
     }
 }
@@ -2246,13 +2917,20 @@ impl WasmProcess {
         Self {
             path,
             state: WasmState::Starting(argv),
-            reserved: 0,
+            reserved: GuestReservation::default(),
         }
     }
 
     /// Release the guest's reservations when the process ends, including when it is killed.
     pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
-        if self.reserved > 0 {
+        if let WasmState::Running(Guest {
+            execution: Execution::Threads(group),
+            ..
+        }) = &mut self.state
+        {
+            group.cancel_timer(interp);
+        }
+        if self.reserved.fixed > 0 || self.reserved.dynamic.load(Ordering::Relaxed) > 0 {
             release_guest_resources(interp, &mut self.reserved);
         }
     }
@@ -2271,7 +2949,7 @@ impl WasmProcess {
             };
             self.state = match start_guest(interp, launch) {
                 Ok(guest) => {
-                    self.reserved = guest.reserved;
+                    self.reserved = guest.reserved.clone();
                     WasmState::Running(guest)
                 }
                 Err((status, message)) => WasmState::Exiting {
@@ -2286,8 +2964,41 @@ impl WasmProcess {
                 GuestPoll::Pending => return ShellPoll::Pending,
                 GuestPoll::Blocked(reason) => return ShellPoll::Blocked(reason),
                 GuestPoll::Exhausted => (ActiveSystem::new(interp).stop_status(), Vec::new()),
-                GuestPoll::Ready(outcome) => (outcome.status, outcome.host.diagnostic),
+                GuestPoll::Ready(outcome) => match *outcome {
+                    GuestOutcome::Exit { status, host } => (status, host.diagnostic),
+                    GuestOutcome::ThreadReturn { host } => (0, host.diagnostic),
+                    GuestOutcome::Exec { spec, host } => {
+                        self.reserved
+                            .dynamic
+                            .fetch_sub(spec.reserved_bytes, Ordering::Relaxed);
+                        if let Execution::Threads(group) = &mut guest.execution {
+                            group.cancel_timer(interp);
+                        }
+                        drop(host);
+                        self.state = WasmState::Exiting {
+                            status: 0,
+                            message: Vec::new(),
+                            offset: 0,
+                        };
+                        self.release_owned_memory(interp);
+                        match posix_exec::apply(spec, interp) {
+                            Ok(()) => return ShellPoll::Replaced,
+                            Err(error) => {
+                                self.state = WasmState::Exiting {
+                                    status: 126,
+                                    message: format!("{}: exec failed: {error}\n", self.path)
+                                        .into_bytes(),
+                                    offset: 0,
+                                };
+                                return self.poll(interp);
+                            }
+                        }
+                    }
+                },
             };
+            if let Execution::Threads(group) = &mut guest.execution {
+                group.cancel_timer(interp);
+            }
             self.state = WasmState::Exiting {
                 status,
                 message,
@@ -2414,7 +3125,13 @@ impl WasmSession {
         release_guest_resources(&mut environment, &mut guest.reserved);
         let (status, stdout, stderr) = match outcome {
             Some(outcome) => {
-                let GuestOutcome { status, host } = *outcome;
+                let (status, host) = match *outcome {
+                    GuestOutcome::Exit { status, host } => (status, host),
+                    GuestOutcome::ThreadReturn { host } => (0, host),
+                    GuestOutcome::Exec { .. } => {
+                        unreachable!("buffered exec is rejected before transfer")
+                    }
+                };
                 let Stdio::Buffered {
                     stdout, mut stderr, ..
                 } = host.stdio
@@ -2478,6 +3195,30 @@ impl WasmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_process_snapshots_release_independent_dynamic_reservations() {
+        let mut original = Interp::new();
+        assert!(original.resources.reserve_memory(300));
+        let mut process = WasmProcess::new("/fixture".into(), Vec::new());
+        process.reserved = GuestReservation {
+            fixed: 100,
+            dynamic: Arc::new(AtomicU64::new(200)),
+        };
+        let guest_owner = process.reserved.clone();
+        let mut snapshot = original.clone();
+        let mut snapshot_process = process.clone();
+        process.release_owned_memory(&mut original);
+        assert_eq!(original.resources.memory_mark(), 0);
+        assert_eq!(guest_owner.dynamic.load(Ordering::Relaxed), 0);
+        assert_eq!(snapshot.resources.memory_mark(), 300);
+        snapshot_process.release_owned_memory(&mut snapshot);
+        assert_eq!(snapshot.resources.memory_mark(), 0);
+        process.release_owned_memory(&mut original);
+        snapshot_process.release_owned_memory(&mut snapshot);
+        assert_eq!(original.resources.memory_mark(), 0);
+        assert_eq!(snapshot.resources.memory_mark(), 0);
+    }
 
     #[test]
     fn cache_reuses_exact_module_bytes_and_evicts_oldest_entry() {

@@ -1,0 +1,241 @@
+--- a/Modules/posixmodule.c
++++ b/Modules/posixmodule.c
+@@ -6708,7 +6708,7 @@
+ #define EXECV_CHAR char
+ #endif
+
+-#if defined(HAVE_EXECV) || defined(HAVE_SPAWNV) || defined(HAVE_RTPSPAWN)
++#if defined(HAVE_EXECV) || defined(HAVE_SPAWNV) || defined(HAVE_RTPSPAWN) || defined(HAVE_POSIX_SPAWN)
+ static void
+ free_string_array(EXECV_CHAR **array, Py_ssize_t count)
+ {
+@@ -6746,7 +6746,7 @@
+ }
+ #endif
+
+-#if defined(HAVE_EXECV) || defined (HAVE_FEXECVE) || defined(HAVE_RTPSPAWN)
++#if defined(HAVE_EXECV) || defined (HAVE_FEXECVE) || defined(HAVE_RTPSPAWN) || defined(HAVE_POSIX_SPAWN)
+ static EXECV_CHAR**
+ parse_envlist(PyObject* env, Py_ssize_t *envc_ptr)
+ {
+@@ -7053,6 +7053,9 @@
+ #ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+     ,POSIX_SPAWN_CLOSEFROM
+ #endif
++#ifdef __wasi__
++    ,POSIX_SPAWN_CHDIR
++#endif
+ };
+
+ #if defined(HAVE_SCHED_SETPARAM) || defined(HAVE_SCHED_SETSCHEDULER) || defined(POSIX_SPAWN_SETSCHEDULER) || defined(POSIX_SPAWN_SETSCHEDPARAM)
+@@ -7113,7 +7116,39 @@
+
+     }
+
+-#ifdef HAVE_SIGSET_T
++#ifdef __wasi__
++    if (setsigmask) {
++        PyErr_SetString(PyExc_NotImplementedError,
++                        "setsigmask is not supported by shellsim WASI");
++        goto fail;
++    }
++    if (setsigdef) {
++        PyObject *signals = PySequence_Fast(setsigdef,
++                            "setsigdef must be a sequence of signal numbers");
++        if (!signals) {
++            goto fail;
++        }
++        uint32_t mask = 0;
++        for (Py_ssize_t i = 0; i < PySequence_Fast_GET_SIZE(signals); ++i) {
++            long signum = PyLong_AsLong(PySequence_Fast_GET_ITEM(signals, i));
++            if ((signum == -1 && PyErr_Occurred()) || signum < 1 || signum > 31) {
++                if (!PyErr_Occurred()) {
++                    PyErr_SetString(PyExc_ValueError, "unsupported WASI signal number");
++                }
++                Py_DECREF(signals);
++                goto fail;
++            }
++            mask |= 1u << signum;
++        }
++        Py_DECREF(signals);
++        errno = posix_spawnattr_setsigdefault_mask_np(attrp, mask);
++        if (errno) {
++            posix_error();
++            goto fail;
++        }
++        all_flags |= POSIX_SPAWN_SETSIGDEF;
++    }
++#elif defined(HAVE_SIGSET_T)
+    if (setsigmask) {
+         sigset_t set;
+         if (!_Py_Sigset_Converter(setsigmask, &set)) {
+@@ -7311,6 +7346,29 @@
+                 break;
+             }
+ #endif
++#ifdef __wasi__
++            case POSIX_SPAWN_CHDIR: {
++                PyObject *path;
++                if (!PyArg_ParseTuple(file_action, "OO&"
++                        ";A chdir file_action tuple must have 2 elements",
++                        &tag_obj, PyUnicode_FSConverter, &path))
++                {
++                    goto fail;
++                }
++                if (PyList_Append(temp_buffer, path)) {
++                    Py_DECREF(path);
++                    goto fail;
++                }
++                errno = posix_spawn_file_actions_addchdir_np(file_actionsp,
++                                                              PyBytes_AS_STRING(path));
++                Py_DECREF(path);
++                if (errno) {
++                    posix_error();
++                    goto fail;
++                }
++                break;
++            }
++#endif
+             default: {
+                 PyErr_SetString(PyExc_TypeError,
+                                 "Unknown file_actions identifier");
+@@ -17443,6 +17501,9 @@
+ #ifdef HAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP
+     if (PyModule_AddIntMacro(m, POSIX_SPAWN_CLOSEFROM)) return -1;
+ #endif
++#ifdef __wasi__
++    if (PyModule_AddIntConstant(m, "POSIX_SPAWN_CHDIR", POSIX_SPAWN_CHDIR)) return -1;
++#endif
+ #endif
+
+ #if defined(HAVE_SPAWNV) || defined (HAVE_RTPSPAWN)
+--- a/Modules/signalmodule.c
++++ b/Modules/signalmodule.c
+@@ -1590,6 +1590,7 @@
+         Py_XDECREF(old_func);
+     }
+
++#ifndef __wasi__
+     // Install Python SIGINT handler which raises KeyboardInterrupt
+     PyObject* sigint_func = get_handler(SIGINT);
+     if (sigint_func == state->default_handler) {
+@@ -1603,6 +1604,7 @@
+         Py_DECREF(sigint_func);
+         PyOS_setsig(SIGINT, signal_handler);
+     }
++#endif
+     return 0;
+ }
+
+--- a/Lib/subprocess.py
++++ b/Lib/subprocess.py
+@@ -75,7 +75,8 @@
+     _mswindows = True
+
+ # some platforms do not support subprocesses
+-_can_fork_exec = sys.platform not in {"emscripten", "wasi", "ios", "tvos", "watchos"}
++# shellsim provides posix_spawn without fork on WASI.
++_can_fork_exec = sys.platform not in {"emscripten", "ios", "tvos", "watchos"}
+
+ if _mswindows:
+     import _winapi
+@@ -102,7 +102,8 @@
+                     "CREATE_DEFAULT_ERROR_MODE", "CREATE_BREAKAWAY_FROM_JOB"])
+ else:
+     if _can_fork_exec:
+-        from _posixsubprocess import fork_exec as _fork_exec
++        if sys.platform != "wasi":
++            from _posixsubprocess import fork_exec as _fork_exec
+         # used in methods that are called by __del__
+         class _del_safe:
+             waitpid = os.waitpid
+@@ -723,6 +723,10 @@
+         # and properly reports errors
+         return True
+
++    if sys.platform == 'wasi':
++        # shellsim's virtual kernel reports file-action and exec errors to the parent.
++        return True
++
+     # Check libc name and runtime libc version
+     try:
+         ver = os.confstr('CS_GNU_LIBC_VERSION')
+@@ -1765,7 +1769,7 @@
+                     errread, errwrite)
+
+
+-        def _posix_spawn(self, args, executable, env, restore_signals, close_fds,
++        def _posix_spawn(self, args, executable, env, restore_signals, close_fds, cwd,
+                          p2cread, p2cwrite,
+                          c2pread, c2pwrite,
+                          errread, errwrite):
+@@ -1781,6 +1785,8 @@
+                 kwargs['setsigdef'] = sigset
+
+             file_actions = []
++            if cwd is not None:
++                file_actions.append((os.POSIX_SPAWN_CHDIR, cwd))
+             for fd in (p2cwrite, c2pread, errread):
+                 if fd != -1:
+                     file_actions.append((os.POSIX_SPAWN_CLOSE, fd))
+@@ -1798,7 +1804,9 @@
+             if file_actions:
+                 kwargs['file_actions'] = file_actions
+
+-            self.pid = os.posix_spawn(executable, args, env, **kwargs)
++            spawn = (os.posix_spawnp if sys.platform == 'wasi' and
++                     not os.path.dirname(executable) else os.posix_spawn)
++            self.pid = spawn(executable, args, env, **kwargs)
+             self._child_created = True
+
+             self._close_pipe_fds(p2cread, p2cwrite,
+@@ -1840,11 +1848,11 @@
+             sys.audit("subprocess.Popen", executable, args, cwd, env)
+
+             if (_USE_POSIX_SPAWN
+-                    and os.path.dirname(executable)
++                    and (os.path.dirname(executable) or sys.platform == 'wasi')
+                     and preexec_fn is None
+                     and (not close_fds or _HAVE_POSIX_SPAWN_CLOSEFROM)
+                     and not pass_fds
+-                    and cwd is None
++                    and (cwd is None or sys.platform == 'wasi')
+                     and (p2cread == -1 or p2cread > 2)
+                     and (c2pwrite == -1 or c2pwrite > 2)
+                     and (errwrite == -1 or errwrite > 2)
+@@ -1854,12 +1862,16 @@
+                     and gids is None
+                     and uid is None
+                     and umask < 0):
+-                self._posix_spawn(args, executable, env, restore_signals, close_fds,
++                self._posix_spawn(args, executable, env, restore_signals, close_fds, cwd,
+                                   p2cread, p2cwrite,
+                                   c2pread, c2pwrite,
+                                   errread, errwrite)
+                 return
+
++            if sys.platform == 'wasi':
++                raise NotImplementedError(
++                    'this subprocess option requires fork, which is unavailable on WASI')
++
+             orig_executable = executable
+
+             # For transferring possible exec failure from child to parent.
+diff --git a/Modules/faulthandler.c b/Modules/faulthandler.c
+--- a/Modules/faulthandler.c
++++ b/Modules/faulthandler.c
+@@ -21,8 +21,14 @@
+ #ifdef HAVE_SYS_RESOURCE_H
+ #  include <sys/resource.h>       // setrlimit()
+ #endif
+
++/* WASI libc emulates signal()/raise() callbacks but has no sigaction().
++   Use CPython's existing signal() path for synchronous raised fatal signals. */
++#ifdef __wasi__
++#  undef HAVE_SIGACTION
++#endif
++
+ #if defined(FAULTHANDLER_USE_ALT_STACK) && defined(HAVE_LINUX_AUXVEC_H) && defined(HAVE_SYS_AUXV_H)
+ #  include <linux/auxvec.h>       // AT_MINSIGSTKSZ
+ #  include <sys/auxv.h>           // getauxval()
+ #endif

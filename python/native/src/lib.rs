@@ -316,6 +316,138 @@ fn container_vfs_path(path: &str) -> Result<String, String> {
     Ok(shellsim::vfs::resolve_against("/work", path))
 }
 
+fn cpython_link(
+    vfs: &mut shellsim::vfs::Vfs,
+    path: &str,
+    image: &str,
+    native_name: Option<&str>,
+) -> Result<(), String> {
+    use shellsim::vfs::{NativeProgram, NodeKind};
+
+    match vfs.metadata("/", path, false).ok().map(|node| node.kind) {
+        Some(NodeKind::Symlink(target)) if target == image => return Ok(()),
+        Some(NodeKind::NativeExecutable(NativeProgram::LegacyRegistered(name)))
+            if native_name == Some(name) =>
+        {
+            vfs.remove_file("/", path)
+                .map_err(|error| error.to_string())?;
+        }
+        None => {}
+        _ => {
+            return Err(format!(
+                "CPython launcher conflicts with an existing VFS node: {path}"
+            ))
+        }
+    }
+    vfs.symlink("/", image, path)
+        .map_err(|error| error.to_string())
+}
+
+fn configure_cpython_vfs(
+    environment: &mut shellsim::Environment,
+    venv: Option<String>,
+) -> Result<(), String> {
+    const IMAGE: &str = "/usr/bin/python3.wasm";
+    if !environment.vfs.is_file("/", IMAGE) {
+        return Err("CPython WASI image is not mounted".to_string());
+    }
+    let mut staged = environment.vfs.clone();
+    staged.set_mutation_time(environment.clock.unix_ms());
+    for directory in ["/bin", "/usr/bin"] {
+        for name in ["python", "python3", "python3.13"] {
+            cpython_link(
+                &mut staged,
+                &format!("{directory}/{name}"),
+                IMAGE,
+                Some(name),
+            )?;
+        }
+    }
+    if let Some(root) = venv.as_deref() {
+        if !root.starts_with('/')
+            || root == "/"
+            || root.len() > 4096
+            || ["/usr", "/bin", "/dev", "/proc"]
+                .iter()
+                .any(|reserved| root == *reserved || root.starts_with(&format!("{reserved}/")))
+            || root.contains('\0')
+            || root[1..]
+                .split('/')
+                .any(|part| part.is_empty() || part == ".." || part == ".")
+        {
+            return Err("CPython venv must have a separate absolute VFS path".to_string());
+        }
+        staged
+            .mkdir_all("/", &format!("{root}/bin"))
+            .map_err(|error| error.to_string())?;
+        staged
+            .mkdir_all("/", &format!("{root}/lib/python3.13/site-packages"))
+            .map_err(|error| error.to_string())?;
+        let config = b"home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.13.7\nexecutable = /usr/bin/python3.wasm\n";
+        let config_path = format!("{root}/pyvenv.cfg");
+        if staged.is_file("/", &config_path) {
+            if staged
+                .read("/", &config_path)
+                .map_err(|error| error.to_string())?
+                .as_slice()
+                != config
+            {
+                return Err(
+                    "CPython venv configuration conflicts with an existing file".to_string()
+                );
+            }
+        } else {
+            staged
+                .put_file(&config_path, config.to_vec(), 0o644)
+                .map_err(|error| error.to_string())?;
+        }
+        for name in ["python", "python3", "python3.13"] {
+            cpython_link(&mut staged, &format!("{root}/bin/{name}"), IMAGE, None)?;
+        }
+        let activate_path = format!("{root}/bin/activate");
+        let activate = format!(
+            "VIRTUAL_ENV='{}'; export VIRTUAL_ENV; PATH=\"$VIRTUAL_ENV/bin:$PATH\"; export PATH\n",
+            root.replace('\'', "'\\''")
+        );
+        if staged.is_file("/", &activate_path) {
+            if staged
+                .read("/", &activate_path)
+                .map_err(|error| error.to_string())?
+                != activate.as_bytes()
+            {
+                return Err("CPython venv activation conflicts with an existing file".to_string());
+            }
+        } else {
+            staged
+                .put_file(&activate_path, activate.into_bytes(), 0o644)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    environment.vfs = staged;
+    if let Some(root) = venv {
+        let venv_bin = format!("{root}/bin");
+        let previous = environment.get_var("PATH");
+        let remaining = previous
+            .as_deref()
+            .map(|path| {
+                path.split(':')
+                    .filter(|entry| *entry != venv_bin)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let path = if remaining.is_empty() {
+            venv_bin
+        } else {
+            format!("{venv_bin}:{}", remaining.join(":"))
+        };
+        environment.set_var("PATH", path);
+        environment.export("PATH");
+        environment.set_var("VIRTUAL_ENV", root);
+        environment.export("VIRTUAL_ENV");
+    }
+    Ok(())
+}
+
 fn serialize_result(result: serde_json::Value) -> PyResult<String> {
     serde_json::to_string(&result).map_err(|error| SimulationError::new_err(error.to_string()))
 }
@@ -427,6 +559,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 let cwd = environment.cwd.clone();
                 environment
                     .vfs
@@ -458,6 +591,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 let cwd = environment.cwd.clone();
                 let result = if parents {
                     environment.vfs.mkdir_all(&cwd, &path)
@@ -465,6 +599,36 @@ impl NativeEnvironment {
                     environment.vfs.mkdir(&cwd, &path)
                 };
                 result.map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
+    /// Import one verified WASI bundle and configure its launchers in a single VFS transaction.
+    /// A venv receives ordinary CPython prefix metadata and its own site-packages directory.
+    fn mount_cpython(
+        &self,
+        py: Python<'_>,
+        host_root: String,
+        venv: Option<String>,
+    ) -> PyResult<()> {
+        py.detach(|| {
+            let mut environment = self.lock_environment()?;
+            on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
+                let before = environment.vfs.clone();
+                let result = (|| {
+                    shellsim::host_ingest::mount_host_tree_report(
+                        environment,
+                        Path::new(&host_root),
+                        "/",
+                    )?;
+                    configure_cpython_vfs(environment, venv)
+                })();
+                if result.is_err() {
+                    environment.vfs = before;
+                }
+                result
             })
         })
         .map_err(SimulationError::new_err)
@@ -511,6 +675,7 @@ impl NativeEnvironment {
             .detach(|| {
                 let mut environment = self.lock_environment()?;
                 on_worker(&mut environment, move |environment| {
+                    environment.sync_vfs_time();
                     shellsim::host_ingest::mount_host_tree_report(
                         environment,
                         Path::new(&host_root),
@@ -524,6 +689,23 @@ impl NativeEnvironment {
             skipped_directories: report.skipped_directories,
         })
         .map_err(|error| SimulationError::new_err(error.to_string()))
+    }
+
+    /// Import a verified package staging tree exactly, including its `.venv` directory.
+    fn mount_package_tree(&self, py: Python<'_>, host_root: String) -> PyResult<()> {
+        py.detach(|| {
+            let mut environment = self.lock_environment()?;
+            on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
+                shellsim::host_ingest::mount_host_tree_report_exact(
+                    environment,
+                    Path::new(&host_root),
+                    "/",
+                )
+                .map(|_| ())
+            })
+        })
+        .map_err(SimulationError::new_err)
     }
 
     #[getter]

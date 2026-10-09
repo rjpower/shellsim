@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import threading
+from pathlib import Path
 
 import pytest
 import shellsim
@@ -110,6 +111,33 @@ def test_environment_preserves_state_and_vfs_bytes() -> None:
     assert first.returncode == 0
     assert second.stdout == b"42 \x00\xffvalue"
     assert environment.read_file("data") == b"\x00\xffvalue"
+
+
+@pytest.mark.parametrize("operation", ("new-file", "updated-file", "directory", "parents", "mount"))
+def test_host_vfs_mutations_use_current_virtual_time(operation: str, tmp_path: Path) -> None:
+    environment = shellsim.Environment()
+    environment.write_file("/reference", b"before")
+    if operation == "updated-file":
+        environment.write_file("/node", b"before")
+    before = int(environment.run("stat -c %Y /reference").stdout)
+    assert environment.run("sleep 1").returncode == 0
+
+    target = "/node"
+    if operation in ("new-file", "updated-file"):
+        environment.write_file(target, b"after")
+    elif operation == "directory":
+        environment.mkdir(target)
+    elif operation == "parents":
+        target = "/node/child"
+        environment.mkdir(target, parents=True)
+    else:
+        (tmp_path / "input").write_bytes(b"after")
+        environment.mount(tmp_path, target)
+        target += "/input"
+
+    observed = environment.run(f"stat -c %Y {target}")
+    assert observed.returncode == 0, observed.stderr
+    assert int(observed.stdout) == before + 1
 
 
 def test_multiple_shell_sessions_share_files_but_not_shell_state() -> None:

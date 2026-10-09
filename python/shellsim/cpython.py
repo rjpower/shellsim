@@ -1,6 +1,6 @@
 """Explicitly mount and run a source-built CPython WASI bundle.
 
-Build bundles with ``uv run ports/cpython/build.py``. Host filesystem access is
+Build bundles with ``uv run ports/python/cpython/build.py``. Host filesystem access is
 confined to this trusted setup API; interpreter execution uses the virtual WASI
 process boundary and the environment's cumulative resource limits.
 """
@@ -10,6 +10,7 @@ from __future__ import annotations
 import email
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -27,6 +28,26 @@ _EXECUTABLE = "/usr/bin/python3.wasm"
 _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
 _MAX_BYTES = 128 * 1024 * 1024
 _MAX_FILES = 10000
+_MAX_REQUIREMENTS = 256
+
+
+def _requirements(value: Union[str, Sequence[str]]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        requirements = (value,)
+    elif isinstance(value, Sequence) and not isinstance(value, bytes):
+        if len(value) > _MAX_REQUIREMENTS:
+            raise ValueError("requirements must contain between 1 and 256 PyPI specs")
+        requirements = tuple(value)
+    else:
+        raise TypeError("requirements must be a PyPI spec or a sequence of specs")
+    if not requirements or len(requirements) > _MAX_REQUIREMENTS:
+        raise ValueError("requirements must contain between 1 and 256 PyPI specs")
+    for requirement in requirements:
+        if not isinstance(requirement, str):
+            raise TypeError("each requirement must be str")
+        if len(requirement) > 2048 or _REQUIREMENT.fullmatch(requirement) is None:
+            raise ValueError("each requirement must name a PyPI distribution with optional extras or version")
+    return requirements
 
 
 class CPythonRuntime:
@@ -36,8 +57,19 @@ class CPythonRuntime:
     and ``rootfs``. Keep that directory unchanged while mounting it.
     """
 
-    def __init__(self, bundle: Union[str, Path]) -> None:
+    def __init__(
+        self,
+        bundle: Union[str, Path],
+        *,
+        universe: Union[str, Path, None] = None,
+        uv: Union[str, Path, None] = None,
+        venv: Union[str, Path, None] = None,
+    ) -> None:
         self.bundle = Path(bundle)
+        self.universe = Path(universe) if universe is not None else None
+        self.uv = Path(uv).resolve() if uv is not None else None
+        if (self.universe is None) != (self.uv is None):
+            raise ValueError("a CPython package universe requires an explicit patched uv executable")
         manifest_path = self.bundle / "manifest.json"
         if manifest_path.stat().st_size > 1024 * 1024:
             raise ValueError("CPython manifest exceeds 1 MiB")
@@ -48,7 +80,25 @@ class CPythonRuntime:
         if self.manifest["site_packages"] != _SITE_PACKAGES:
             raise ValueError("unsupported CPython site-packages path")
         self.version = recipe["version"]
-        self.site_packages = _SITE_PACKAGES
+        if self.manifest.get("dynamic_abi"):
+            raw_venv = os.fspath(venv) if venv is not None else "/work/.venv"
+            if (
+                not isinstance(raw_venv, str)
+                or not raw_venv.startswith("/")
+                or raw_venv in {"/", "/usr", "/bin"}
+                or raw_venv.startswith(("/usr/", "/bin/", "/dev/", "/proc/"))
+                or len(raw_venv) > 4096
+                or "\0" in raw_venv
+                or any(part in {".", "..", ""} for part in raw_venv[1:].split("/"))
+            ):
+                raise ValueError("CPython venv must have a separate absolute VFS path")
+            self.venv = raw_venv
+            self.site_packages = self.venv + "/lib/python3.13/site-packages"
+        else:
+            if venv is not None:
+                raise ValueError("a task venv requires a dynamic CPython bundle")
+            self.venv = None
+            self.site_packages = _SITE_PACKAGES
         self.builtin_modules = tuple(self.manifest.get("builtin_modules", ()))
         self._verify()
 
@@ -85,16 +135,23 @@ class CPythonRuntime:
             raise ValueError("CPython executable has no execute permission")
 
     def mount(self, environment: Environment) -> None:
-        """Verify again, then atomically copy the bundle into the bounded VFS."""
+        """Mount the verified bundle and select its VFS Python launchers."""
+        if environment._cpython_runtime is not None and environment._cpython_runtime is not self:
+            raise SimulationError("a different CPython runtime is already mounted")
         self._verify()
-        environment.mount(self.bundle / "rootfs", "/")
+        environment._native.mount_cpython(str(self.bundle / "rootfs"), self.venv)
+        environment._cpython_runtime = self
 
     def run(self, environment: Environment, argv: Sequence[str], *, stdin: bytes = b"") -> RunResult:
         """Run interpreter arguments such as ``('-c', 'print(42)')`` in the VFS."""
         if isinstance(argv, (str, bytes)) or any(not isinstance(arg, str) for arg in argv):
             raise TypeError("argv must be a sequence of str")
-        command = " ".join(shlex.quote(arg) for arg in [_EXECUTABLE, *argv])
-        return environment.run("PYTHONHOME=/usr PYTHONDONTWRITEBYTECODE=1 " + command, stdin)
+        executable = self.venv + "/bin/python" if self.venv is not None else _EXECUTABLE
+        command = " ".join(shlex.quote(arg) for arg in [executable, *argv])
+        prefix = "PYTHONDONTWRITEBYTECODE=1 "
+        if self.venv is None:
+            prefix += "PYTHONHOME=/usr "
+        return environment.run(prefix + command, stdin)
 
     def _stage(self, environment: Environment, target: Path) -> None:
         """Reject file conflicts before atomic import; the environment must be idle."""
@@ -112,19 +169,23 @@ class CPythonRuntime:
                     raise PackageInstallError(f"package file would overwrite an existing VFS file: {destination}")
         environment.mount(target, self.site_packages)
 
-    def install_pypi(self, environment: Environment, requirement: str) -> None:
-        """Resolve pure wheels and dependencies with host uv for Python 3.13.
+    def install_pypi(self, environment: Environment, requirement: Union[str, Sequence[str]]) -> None:
+        """Resolve one or more specs together for the bundle's Python and WASI ABI.
 
-        Source distributions may execute trusted build code on the host. Native
-        wheels require separate WASI source recipes.
-        The environment must be idle throughout staging. Guest imports use the
-        installed files without shellsim VM module substitutions.
+        A dynamic bundle requires an explicit local universe and patched uv.
+        Static bundles retain their existing pure-wheel installation path.
         """
-        if not isinstance(requirement, str):
-            raise TypeError("requirement must be str")
-        if _REQUIREMENT.fullmatch(requirement) is None:
-            raise ValueError("requirement must name a PyPI distribution with optional extras or version")
+        requirements = _requirements(requirement)
         self._verify()
+        if self.manifest.get("dynamic_abi"):
+            if self.universe is None or self.uv is None:
+                raise PackageInstallError("dynamic CPython packages require a local universe and patched uv executable")
+            from ._cpython_universe import install
+
+            install(self, environment, requirements)
+            return
+        if self.universe is not None:
+            raise PackageInstallError("a package universe requires a dynamic CPython bundle")
         with tempfile.TemporaryDirectory(prefix="shellsim-cpython-pypi-") as temp:
             target = Path(temp) / "site-packages"
             target.mkdir()
@@ -180,21 +241,42 @@ class CPythonRuntime:
                 constraint_file = Path(temp) / "native-constraints.txt"
                 constraint_file.write_text("\n".join(constraints) + "\n")
                 command += ["--constraint", str(constraint_file)]
-            command += ["--", requirement]
+            command += ["--", *requirements]
             try:
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
             except FileNotFoundError as error:
                 raise PackageInstallError("uv is required to install PyPI packages on the host") from error
             except subprocess.TimeoutExpired as error:
-                raise PackageInstallError(f"timed out resolving {requirement}") from error
+                raise PackageInstallError("timed out resolving PyPI requirements") from error
             if completed.returncode:
-                raise PackageInstallError(f"cannot resolve {requirement}: {completed.stderr.strip()[-8000:]}")
+                raise PackageInstallError("cannot resolve PyPI requirements: " + completed.stderr.strip()[-8000:])
             blockers = _compatibility_blockers(target, python_version="3.13")
             if blockers:
                 raise PackageInstallError(
                     "CPython WASI cannot stage incompatible distributions: " + "; ".join(blockers)
                 )
             self._stage(environment, target)
+
+    def install_lock(
+        self,
+        environment: Environment,
+        lock: Union[str, Path],
+        *,
+        extras: Sequence[str] = (),
+        groups: Sequence[str] = (),
+        project_mounted: bool = False,
+    ) -> None:
+        """Install selected ``uv.lock`` dependencies for the WASI guest target.
+
+        Set ``project_mounted`` when the root project source is separately mounted
+        into the VFS. Local and VCS dependency packages are unsupported.
+        """
+        self._verify()
+        if not self.manifest.get("dynamic_abi") or self.universe is None or self.uv is None:
+            raise PackageInstallError("uv.lock installation requires a dynamic bundle, local universe, and patched uv")
+        from ._cpython_lock import install_lock
+
+        install_lock(self, environment, Path(lock), extras=extras, groups=groups, project_mounted=project_mounted)
 
     def install_wheel(self, environment: Environment, wheel: Union[str, Path]) -> None:
         """Stage a pure Python wheel without resolving dependencies or running builds.

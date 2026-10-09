@@ -191,7 +191,7 @@ def test_pillow_source_lists_include_upstream_internal_library(tmp_path, monkeyp
         "_IMAGING = ('encode',)\n_LIB_IMAGING = ('ZipEncode',)\n"
         "libraries: list = [('pil_imaging_mode', {'sources': ['src/libImaging/Mode.c']})]\n"
     )
-    path = Path(__file__).parents[2] / "ports/pillow/build.py"
+    path = Path(__file__).parents[2] / "ports/python/pillow/build.py"
     spec = importlib.util.spec_from_file_location("pillow_build", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)

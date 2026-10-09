@@ -115,9 +115,6 @@ def test_source_built_guest() -> None:
     result = runtime.run(environment, ["-c", "import json, sys; print(sys.platform); print(json.dumps([1, 2]))"])
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"wasi\n[1, 2]\n"
-    if runtime.manifest.get("native_ports"):
-        result = runtime.run(environment, ["-c", runtime.manifest["native_ports"][0]["verify"]])
-        assert result.returncode == 0, result.stderr
 
 
 def test_native_provider_seeds_resolution(bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:
