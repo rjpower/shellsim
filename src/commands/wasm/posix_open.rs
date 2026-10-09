@@ -67,10 +67,17 @@ fn open(
         if flags & (0x1000 | 0x4000) == (0x1000 | 0x4000) && existing.is_ok() {
             return Err(ERRNO_EXIST);
         }
-        let target_missing = matches!(
-            machine.vfs.metadata(&base, &path, true),
-            Err(VfsError::NotFound(_))
-        );
+        let virtual_device = machine
+            .vfs
+            .realpath(&resolve_against(&base, &path), true)
+            .is_ok_and(|resolved| {
+                resolved == "/dev/null" || crate::pseudo_fs::device_kind("/", &resolved).is_some()
+            });
+        let target_missing = !virtual_device
+            && matches!(
+                machine.vfs.metadata(&base, &path, true),
+                Err(VfsError::NotFound(_))
+            );
         if flags & O_NOFOLLOW != 0
             && existing
                 .as_ref()

@@ -169,6 +169,53 @@ fn killed_replacement_releases_image_metadata_and_guest_memory() {
 }
 
 #[test]
+fn creating_virtual_null_does_not_chmod_or_materialize_it() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        "/first",
+        r#"(module
+        (import "shellsim_posix_v1" "descriptor_open" (func $open (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_write" (func $write (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 128) "/dev/null\00")
+        (data (i32.const 160) "/created\00")
+        (data (i32.const 256) "payload")
+        (func (export "_start") (local $fd i32)
+            (local.set $fd (call $open (i32.const -2) (i32.const 128)
+                (i32.const 268472320) (i32.const 438)))
+            (if (i32.lt_s (local.get $fd) (i32.const 0)) (then unreachable))
+            (i32.store (i32.const 64) (i32.const 256))
+            (i32.store (i32.const 68) (i32.const 7))
+            (if (call $write (local.get $fd) (i32.const 64) (i32.const 1) (i32.const 80))
+                (then unreachable))
+            (if (i32.ne (i32.load (i32.const 80)) (i32.const 7)) (then unreachable))
+            (if (call $close (local.get $fd)) (then unreachable))
+            (local.set $fd (call $open (i32.const -2) (i32.const 160)
+                (i32.const 268472320) (i32.const 438)))
+            (if (i32.lt_s (local.get $fd) (i32.const 0)) (then unreachable))
+            (if (call $close (local.get $fd)) (then unreachable))))"#,
+    );
+    assert_eq!(
+        environment
+            .run_script_capture("umask 027; /first")
+            .0
+            .exit_status,
+        0
+    );
+    assert!(environment.vfs.metadata("/", "/dev/null", true).is_err());
+    assert_eq!(
+        environment
+            .vfs
+            .metadata("/", "/created", true)
+            .unwrap()
+            .mode,
+        0o640
+    );
+}
+
+#[test]
 fn creating_through_dangling_symlink_applies_mode_without_changing_existing_target() {
     let mut environment = Environment::new();
     environment.vfs.symlink("/", "/target", "/link").unwrap();
