@@ -14,9 +14,10 @@ uv run pytest tests/tooling/test_native_artifacts.py
 ```
 
 `--with-pillow` selects all three libraries automatically. `--with-zlib` builds only the stdlib
-consumer. The default profile has no external target libraries. Native package
-selection happens before the final static interpreter link; the public pure-wheel
-installer cannot add a new native library to an assembled interpreter.
+consumer. The default profile has no external target libraries. In this static
+profile, native package selection happens before the final interpreter link.
+The separate [dynamic profile](../dynamic/README.md) loads independent extensions
+and shared native dependencies into a fixed interpreter.
 
 ## Recipe and artifact contract
 
@@ -30,16 +31,21 @@ are enabled; floating-point warning and exception policy remains unsupported.
 The SDK 24 v1 profile remains selectable with `--target-profile wasi-cpython-v1`
 for bare CPython or pycosat and the existing dynamic C-extension ABI. Its added
 empty flag lists do not change that ABI. The migrated native library recipes
-require v2; cross-profile artifacts are rejected. The dynamic loader explicitly
-rejects v2 inputs. Upstream SDK 34 does not support C++ exceptions across shared
-libraries; cross-library claims here cover separately compiled static archives.
+require v2; cross-profile artifacts are rejected. Dynamic ABI v1 accepts only
+SDK 24 libraries. Dynamic ABI v2 uses SDK 34 with one main-owned C++ runtime
+and PIC side modules importing its symbols and exception tag. Typed catches,
+rethrows, destructors, RTTI identity and setjmp/longjmp across those modules
+have separate guest proofs. See the [toolchain recipe](../toolchain/wasi_sdk/README.md)
+for the exact linker contract; generic SDK shared-runtime support is not assumed.
 
 Each library recipe declares its source URL and SHA256, target profile, host
 tools, exact target dependencies, selected features, exported headers/archives/
 pkg-config files/licenses, approved transitive toolchain flags, and build-script
 hashes. Python extension recipes separately declare the target CPython development
 configuration and guest distribution metadata. The native catalog uses exact
-versions; this small implementation has no version-range solver.
+versions. The host package installer resolves Python version constraints against
+a curated set of native wheels; each selected native-library provider has an
+exact version and artifact identity.
 
 An artifact lives in `native-artifacts/<input-sha256>`. Its `artifact.json` records
 the recipe, source archive and consumed source-tree hashes, verified build-script
@@ -97,5 +103,8 @@ and [C++ exceptions](https://github.com/WebAssembly/wasi-sdk/blob/wasi-sdk-34/Cp
 The artifacts are integrity records for trusted builds, not an untrusted package
 build sandbox. The build host executes reviewed scripts and native helper tools.
 Pillow's [imaging profile](../pillow/README.md) does not establish compatibility for
-all Pillow APIs or optional libraries. Dynamic loading and a general package
-resolver remain separate work.
+all Pillow APIs or optional libraries. The [shared OpenBLAS port](openblas/shared/README.md)
+supplies an independent `libopenblas.so`; the dynamic profile also proves shared
+zlib. The [package universe installer](../README.md) resolves Python requirements
+and stages the selected native closure without relinking CPython. Arbitrary
+native builds and a public artifact service remain outside this prototype.
