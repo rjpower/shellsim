@@ -1,0 +1,75 @@
+--- a/py/src/constraint.cpp
++++ b/py/src/constraint.cpp
+@@ -127 +127 @@
+-Constraint_expression(Constraint *self)
++Constraint_expression(Constraint *self, PyObject*)
+@@ -133 +133 @@
+-Constraint_op(Constraint *self)
++Constraint_op(Constraint *self, PyObject*)
+@@ -157 +157 @@
+-Constraint_strength(Constraint *self)
++Constraint_strength(Constraint *self, PyObject*)
+@@ -166 +166 @@
+-Constraint_violated(Constraint *self)
++Constraint_violated(Constraint *self, PyObject*)
+--- a/py/src/expression.cpp
++++ b/py/src/expression.cpp
+@@ -104 +104 @@
+-Expression_terms( Expression* self )
++Expression_terms( Expression* self , PyObject*)
+@@ -111 +111 @@
+-Expression_constant( Expression* self )
++Expression_constant( Expression* self , PyObject*)
+@@ -118 +118 @@
+-Expression_value( Expression* self )
++Expression_value( Expression* self , PyObject*)
+--- a/py/src/solver.cpp
++++ b/py/src/solver.cpp
+@@ -211 +211 @@
+-Solver_updateVariables( Solver* self )
++Solver_updateVariables( Solver* self , PyObject*)
+@@ -221 +221 @@
+-Solver_reset( Solver* self )
++Solver_reset( Solver* self , PyObject*)
+@@ -231 +231 @@
+-Solver_dump( Solver* self )
++Solver_dump( Solver* self , PyObject*)
+@@ -242 +242 @@
+-Solver_dumps( Solver* self )
++Solver_dumps( Solver* self , PyObject*)
+--- a/py/src/strength.cpp
++++ b/py/src/strength.cpp
+@@ -38 +38 @@
+-strength_weak( strength* self )
++strength_weak( strength* self , void*)
+@@ -45 +45 @@
+-strength_medium( strength* self )
++strength_medium( strength* self , void*)
+@@ -52 +52 @@
+-strength_strong( strength* self )
++strength_strong( strength* self , void*)
+@@ -59 +59 @@
+-strength_required( strength* self )
++strength_required( strength* self , void*)
+--- a/py/src/term.cpp
++++ b/py/src/term.cpp
+@@ -90 +90 @@
+-Term_variable( Term* self )
++Term_variable( Term* self , PyObject*)
+@@ -97 +97 @@
+-Term_coefficient( Term* self )
++Term_coefficient( Term* self , PyObject*)
+@@ -104 +104 @@
+-Term_value( Term* self )
++Term_value( Term* self , PyObject*)
+--- a/py/src/variable.cpp
++++ b/py/src/variable.cpp
+@@ -106 +106 @@
+-Variable_name( Variable* self )
++Variable_name( Variable* self , PyObject*)
+@@ -142 +142 @@
+-Variable_context( Variable* self )
++Variable_context( Variable* self , PyObject*)
+@@ -173 +173 @@
+-Variable_value( Variable* self )
++Variable_value( Variable* self , PyObject*)
