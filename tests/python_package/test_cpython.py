@@ -63,6 +63,55 @@ def test_bundle_rejects_other_target(bundle: Path) -> None:
         shellsim.CPythonRuntime(bundle)
 
 
+@pytest.mark.parametrize(
+    ("target", "abi", "accepted"),
+    [
+        ("wasm32-wasip1", "shellsim-wasi-sdk34-cpython3137-v2", True),
+        ("wasm32-wasip1-threads", "shellsim-wasi-sdk34-cpython3137-threads-v3", True),
+        ("wasm32-wasip1", "shellsim-wasi-sdk34-cpython3137-threads-v3", False),
+        ("wasm32-wasip1-threads", "shellsim-wasi-sdk34-cpython3137-v2", False),
+        ("wasm32-wasip1-threads", None, False),
+        ("wasm32-wasip1", "unknown-dynamic-abi", False),
+    ],
+)
+def test_bundle_admits_only_matched_runtime_profiles(
+    bundle: Path, target: str, abi: str | None, accepted: bool
+) -> None:
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["recipe"]["target"] = target
+    if abi is not None:
+        manifest["dynamic_abi"] = abi
+        manifest["recipe"]["dynamic_abi"] = abi
+    manifest_path.write_text(json.dumps(manifest))
+    if accepted:
+        assert shellsim.CPythonRuntime(bundle).manifest["dynamic_abi"] == abi
+    else:
+        with pytest.raises(ValueError):
+            shellsim.CPythonRuntime(bundle)
+
+
+def test_bundle_rejects_recipe_abi_disagreement(bundle: Path) -> None:
+    manifest_path = bundle / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-v2"
+    manifest["recipe"]["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-threads-v3"
+    manifest_path.write_text(json.dumps(manifest))
+    with pytest.raises(ValueError):
+        shellsim.CPythonRuntime(bundle)
+
+
+def test_runtime_manifest_read_is_bounded_before_json_decode(bundle: Path) -> None:
+    manifest_path = bundle / "manifest.json"
+    manifest = manifest_path.read_bytes()
+    manifest_path.write_bytes(manifest + b" " * (1024 * 1024))
+    shellsim.CPythonRuntime(bundle)
+
+    manifest_path.write_bytes(b"invalid JSON" + b" " * (4 * 1024 * 1024))
+    with pytest.raises(ValueError, match="exceeds 4 MiB"):
+        shellsim.CPythonRuntime(bundle)
+
+
 @pytest.mark.parametrize("native", [False, True])
 def test_local_wheel_staging(bundle: Path, tmp_path: Path, native: bool) -> None:
     wheel = tmp_path / "example.whl"

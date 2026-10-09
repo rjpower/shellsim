@@ -1,7 +1,7 @@
 # Native package catalog
 
-`NativePackageUniverse(catalog_path).install(environment, specs)` resolves bare
-names, exact pins and PEP440 version ranges from a bounded local catalog. It checks
+The native package resolver handles bare names, exact pins and PEP440 version
+ranges from a bounded local catalog. It checks
 all transitive version constraints together, including exact compiled-provider
 artifact identities, before mounting one staged rootfs transaction. Unavailable
 releases are errors; installation never builds packages or invokes host programs.
@@ -30,3 +30,11 @@ Run the producer with `PYTHONPATH=.:toolchain/src uv run --no-project --python 3
 python -m ports.native.catalog.build MAKE_ARTIFACT ZLIB_ARTIFACT C_ZLIB_PROOF OUTPUT`. The output catalog
 installs make at `/usr/bin/make`, cc at `/usr/bin/cc`, compiler/sysroot files at `/tcc`
 and `/wasi-sysroot`, and zlib development files at `/opt/zlib`.
+
+The CPython release producer can seal this catalog as an optional `native.zip`
+asset using `--native-catalog /path/to/catalog.json`. Prepare an environment
+with `Environment.from_release(trusted_descriptor, tools=["make", "shellsim-c-toolchain"])`.
+The native asset validator checks all listed artifacts and each version's
+dependency closure before setup. The archive stays separate from the Python
+cohort for independent integrity checks, while the public setup call selects
+both when tools are requested.

@@ -16,6 +16,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any
 
 from ._cpython_universe import Universe, _inspect_wheel, _verify_file, _verify_wasm
+from .cpython import _DYNAMIC_RUNTIME_PROFILES, _MAX_MANIFEST_BYTES, _PYTHON_PACKAGE_PLATFORM
 from .pypi import PackageInstallError
 
 _MAX_DESCRIPTOR = 1024 * 1024
@@ -76,20 +77,39 @@ def _asset(value: Any, limit: int) -> dict[str, Any]:
     return value
 
 
-def _descriptor(path: Path) -> dict[str, Any]:
+def _read_descriptor(path: Path) -> dict[str, Any]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > _MAX_DESCRIPTOR:
         raise PackageInstallError("trusted release descriptor is missing, linked, or oversized")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (UnicodeError, ValueError) as error:
         raise PackageInstallError("trusted release descriptor is invalid JSON") from error
+    if not isinstance(data, dict):
+        raise PackageInstallError("trusted release descriptor must be an object")
+    return data
+
+
+def _native_asset(data: dict[str, Any]) -> dict[str, Any]:
+    native = data.get("native")
+    if not isinstance(native, dict):
+        raise PackageInstallError("release has no native package catalog")
+    digest = native.get("catalog_sha256")
+    if not isinstance(digest, str) or _HASH.fullmatch(digest) is None:
+        raise PackageInstallError("invalid native release catalog SHA-256")
+    _asset(native.get("archive"), _MAX_ARCHIVE)
+    return native
+
+
+def _descriptor(path: Path) -> dict[str, Any]:
+    data = _read_descriptor(path)
     if (
-        not isinstance(data, dict)
-        or data.get("schema_version") != 1
-        or data.get("target") != "wasm32-wasip1"
+        data.get("schema_version") != 1
+        or data.get("target") != _PYTHON_PACKAGE_PLATFORM
         or data.get("python_version") != "3.13.7"
         or not isinstance(data.get("abi"), str)
         or not 0 < len(data["abi"]) <= 128
+        or not isinstance(data.get("runtime_target", _PYTHON_PACKAGE_PLATFORM), str)
+        or (data.get("runtime_target", _PYTHON_PACKAGE_PLATFORM), data["abi"]) not in _DYNAMIC_RUNTIME_PROFILES
         or any(
             not isinstance(data.get(name), str) or _HASH.fullmatch(data[name]) is None
             for name in ("runtime_manifest_sha256", "catalog_sha256")
@@ -107,6 +127,8 @@ def _descriptor(path: Path) -> dict[str, Any]:
         version = resolver.get("min_glibc")
         if not isinstance(version, str) or re.fullmatch(r"[0-9]+\.[0-9]+", version) is None:
             raise PackageInstallError("invalid release resolver libc requirement")
+    if "native" in data:
+        _native_asset(data)
     return data
 
 
@@ -155,7 +177,7 @@ def _fetch(asset: dict[str, Any], descriptor: Path, output: Path) -> None:
         raise PackageInstallError("release asset size or SHA-256 mismatch")
 
 
-def _member(name: str) -> PurePosixPath:
+def _member(name: str, allowed_roots: frozenset[str]) -> PurePosixPath:
     path = PurePosixPath(name)
     if (
         not name
@@ -164,7 +186,7 @@ def _member(name: str) -> PurePosixPath:
         or path.is_absolute()
         or path.as_posix() != name
         or any(part in {"", ".", ".."} for part in path.parts)
-        or path.parts[0] not in {"runtime", "universe"}
+        or path.parts[0] not in allowed_roots
         or len(name.encode("utf-8")) > 4096
         or len(path.parts) > 32
     ):
@@ -172,7 +194,9 @@ def _member(name: str) -> PurePosixPath:
     return path
 
 
-def _extract(archive: Path, destination: Path) -> None:
+def _extract(
+    archive: Path, destination: Path, *, allowed_roots: frozenset[str] = frozenset({"runtime", "universe"})
+) -> None:
     try:
         with zipfile.ZipFile(archive) as source:
             members = source.infolist()
@@ -180,7 +204,7 @@ def _extract(archive: Path, destination: Path) -> None:
                 raise PackageInstallError("release archive exceeds its file or unpacked size limit")
             seen: set[PurePosixPath] = set()
             for item in members:
-                path = _member(item.filename)
+                path = _member(item.filename, allowed_roots)
                 mode = item.external_attr >> 16
                 if path in seen or item.is_dir() or (stat.S_IFMT(mode) not in {0, stat.S_IFREG}):
                     raise PackageInstallError("release archive contains duplicate or non-regular members")
@@ -218,7 +242,7 @@ def _validate_entry(entry: Path, descriptor: dict[str, Any], resolver: dict[str,
             if total > _MAX_UNPACKED + _MAX_RESOLVER:
                 raise PackageInstallError("release cache exceeds its size limit")
             actual.add(path.relative_to(entry).as_posix())
-    if _digest(runtime_dir / "manifest.json", _MAX_DESCRIPTOR) != descriptor["runtime_manifest_sha256"]:
+    if _digest(runtime_dir / "manifest.json", _MAX_MANIFEST_BYTES) != descriptor["runtime_manifest_sha256"]:
         raise PackageInstallError("cached runtime manifest differs from the release descriptor")
     if _digest(universe_dir / "catalog.json", _MAX_DESCRIPTOR) != descriptor["catalog_sha256"]:
         raise PackageInstallError("cached catalog differs from the release descriptor")
@@ -230,8 +254,12 @@ def _validate_entry(entry: Path, descriptor: dict[str, Any], resolver: dict[str,
         runtime = CPythonRuntime(runtime_dir, universe=universe_dir, uv=uv)
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise PackageInstallError("release runtime manifest or rootfs is invalid") from error
-    if runtime.manifest.get("dynamic_abi") != descriptor["abi"] or runtime.version != descriptor["python_version"]:
-        raise PackageInstallError("release runtime ABI or Python version differs from its descriptor")
+    if (
+        runtime.manifest.get("dynamic_abi") != descriptor["abi"]
+        or runtime.manifest["recipe"]["target"] != descriptor.get("runtime_target", _PYTHON_PACKAGE_PLATFORM)
+        or runtime.version != descriptor["python_version"]
+    ):
+        raise PackageInstallError("release runtime target, ABI, or Python version differs from its descriptor")
     try:
         universe = Universe(universe_dir, abi=descriptor["abi"], python_version=runtime.version)
     except (OSError, ValueError, KeyError, TypeError) as error:

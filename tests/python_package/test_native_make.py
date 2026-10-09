@@ -5,14 +5,15 @@ from pathlib import Path
 
 import pytest
 import shellsim
+from shellsim.native_packages import _NativePackageUniverse
 
 
-def test_public_native_make_zlib_graph():
+def test_native_make_zlib_graph():
     catalog = os.environ.get("SHELLSIM_NATIVE_CATALOG")
     if not catalog:
         pytest.skip("set SHELLSIM_NATIVE_CATALOG to the verified native artifact catalog")
     env = shellsim.Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
-    selected = shellsim.NativePackageUniverse(catalog).install(
+    selected = _NativePackageUniverse(catalog).install(
         env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"]
     )
     assert selected["zlib-devel"] == "1.3.1"

@@ -5,7 +5,7 @@ import json
 
 import pytest
 import shellsim
-from shellsim.native_packages import _digest
+from shellsim.native_packages import _digest, _NativePackageUniverse
 
 
 @pytest.fixture
@@ -55,7 +55,7 @@ def catalog(tmp_path):
     def universe():
         path = tmp_path / "catalog.json"
         path.write_text(json.dumps({"format": 1, "target": "wasm32-wasip1", "packages": records}))
-        return shellsim.NativePackageUniverse(path)
+        return _NativePackageUniverse(path)
 
     return add, universe, tmp_path
 
@@ -94,7 +94,7 @@ def test_global_constraints_backtrack(catalog):
     value = json.loads(path.read_text())
     value["packages"][-1]["artifact_sha256"] = manifest["artifact_sha256"]
     path.write_text(json.dumps(value))
-    assert shellsim.NativePackageUniverse(path).install(shellsim.Environment(), "consumer") == {
+    assert _NativePackageUniverse(path).install(shellsim.Environment(), "consumer") == {
         "consumer": "1",
         "provider": "1",
     }
@@ -198,7 +198,7 @@ def test_sequential_provider_replacement_rejected_across_universes(catalog):
     env = shellsim.Environment()
     assert universe().install(env, "consumer") == {"consumer": "1", "provider": "1"}
     with pytest.raises(ValueError):
-        shellsim.NativePackageUniverse(root / "catalog.json").install(env, "provider==2")
+        _NativePackageUniverse(root / "catalog.json").install(env, "provider==2")
     assert env.read_file("/usr/local/bin/provider") == b"provider1"
     assert env.read_file("/usr/local/bin/consumer") == b"consumer1"
     before = env.run("stat -c %i /usr/local/bin/provider").stdout

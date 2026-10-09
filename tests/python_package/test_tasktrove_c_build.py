@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 import shellsim
 import shellsim_c_toolchain
+from shellsim.native_packages import _NativePackageUniverse
 
 
 @pytest.fixture(params=("compiler", "native-packages"))
@@ -38,7 +39,7 @@ def c_task_environment(c_build_mode: str) -> shellsim.Environment:
     runtime.mount(environment)
     runtime.install_pypi(environment, "pytest==8.4.1")
     if c_build_mode == "native-packages":
-        selected = shellsim.NativePackageUniverse(catalog).install(
+        selected = _NativePackageUniverse(catalog).install(
             environment, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30"]
         )
         assert {"make", "shellsim-c-toolchain"} <= selected.keys()

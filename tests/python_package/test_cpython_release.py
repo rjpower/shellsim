@@ -12,8 +12,11 @@ from pathlib import Path
 import pytest
 import shellsim
 from shellsim._cpython_release import _fetch, _ReleaseRedirect
+from shellsim.native_packages import _digest, _NativePackageUniverse
 
 from ports.python.cpython import release
+
+ABI = "shellsim-wasi-sdk34-cpython3137-v2"
 
 
 def _sha(path: Path) -> str:
@@ -32,7 +35,7 @@ def release_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
             {
                 "recipe": {"version": "3.13.7", "target": "wasm32-wasip1", "prefix": "/usr"},
                 "site_packages": "/usr/lib/python3.13/site-packages",
-                "dynamic_abi": "test-wasi-abi",
+                "dynamic_abi": ABI,
                 "files": {"/usr/bin/python3.wasm": _sha(binary)},
             }
         )
@@ -43,7 +46,7 @@ def release_inputs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
         json.dumps(
             {
                 "schema_version": 1,
-                "abi": "test-wasi-abi",
+                "abi": ABI,
                 "target": "wasm32-wasip1",
                 "python_version": "3.13.7",
                 "packages": [],
@@ -66,7 +69,7 @@ def _built(release_inputs: tuple[Path, Path, Path], destination: Path) -> Path:
 
 
 def _marked_wasm() -> bytes:
-    marker = b"\x0cshellsim.abi" + b"test-wasi-abi"
+    marker = b"\x0cshellsim.abi" + ABI.encode()
     return b"\0asm\x01\0\0\0" + bytes((0, len(marker))) + marker
 
 
@@ -80,6 +83,49 @@ def _provider(universe: Path, name: str, dependencies: list[str]) -> dict:
         "sha256": _sha(path),
         "native_dependencies": dependencies,
     }
+
+
+def _native_catalog(root: Path, *, variants: list[tuple[str, bool]] | None = None) -> Path:
+    root.mkdir()
+    records = []
+    for version, unresolved in variants or [("4.4.1", False)]:
+        artifact = root / "artifacts" / version
+        tool = artifact / "bin/make"
+        tool.parent.mkdir(parents=True)
+        tool.write_bytes(("guest make " + version).encode())
+        recipe = {
+            "name": "make",
+            "version": version,
+            "target": "wasm32-wasip1",
+            "target_profile": "fixture-v1",
+            "exports": {"tools": ["bin/make"]},
+            "target_dependencies": [],
+        }
+        inputs = {
+            "recipe": recipe,
+            "recipe_sha256": _digest(recipe),
+            "toolchain": {"profile": {"name": "fixture-v1", "target": "wasm32-wasip1"}},
+            "dependency_artifacts": {},
+        }
+        manifest = {"inputs": inputs, "files": {"bin/make": _sha(tool)}}
+        manifest["artifact_sha256"] = _digest(manifest)
+        (artifact / "artifact.json").write_text(json.dumps(manifest))
+        records.append(
+            {
+                "name": "make",
+                "version": version,
+                "kind": "build-tool",
+                "artifact": "artifacts/" + version,
+                "artifact_sha256": manifest["artifact_sha256"],
+                "destinations": {"bin/make": "/usr/bin/make"},
+                "dependencies": ([{"requirement": "missing-provider==1", "kind": "build-tool"}] if unresolved else []),
+                "recipe_name": "make",
+                "target_profile": "fixture-v1",
+                "toolchain_sha256": _digest(inputs["toolchain"]),
+            }
+        )
+    (root / "catalog.json").write_text(json.dumps({"format": 1, "target": "wasm32-wasip1", "packages": records}))
+    return root / "catalog.json"
 
 
 def _edit_archive(descriptor: Path, edit) -> None:
@@ -102,13 +148,61 @@ def test_release_is_deterministic_and_offline_cache_is_verified(release_inputs, 
     assert first.read_bytes() == second.read_bytes()
     cache = tmp_path / "cache"
     runtime = shellsim.CPythonRuntime.from_release(first, cache_dir=cache)
-    assert runtime.manifest["dynamic_abi"] == "test-wasi-abi"
+    assert runtime.manifest["dynamic_abi"] == ABI
     (first.parent / "cohort.zip").unlink()
     (first.parent / "uv-linux-x86_64-glibc").unlink()
     assert shellsim.CPythonRuntime.from_release(first, cache_dir=cache, offline=True).bundle == runtime.bundle
     (runtime.bundle / "rootfs/usr/bin/python3.wasm").write_bytes(b"changed")
     with pytest.raises(shellsim.PackageInstallError, match="cached CPython release is corrupt"):
         shellsim.CPythonRuntime.from_release(first, cache_dir=cache, offline=True)
+
+
+def test_threaded_release_keeps_wheel_platform_and_pins_runtime_target(release_inputs, tmp_path):
+    runtime, universe, _ = release_inputs
+    manifest_path = runtime / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["recipe"]["target"] = "wasm32-wasip1-threads"
+    manifest["recipe"]["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-threads-v3"
+    manifest["dynamic_abi"] = manifest["recipe"]["dynamic_abi"]
+    manifest_path.write_text(json.dumps(manifest))
+    catalog_path = universe / "catalog.json"
+    catalog = json.loads(catalog_path.read_text())
+    catalog["abi"] = manifest["dynamic_abi"]
+    catalog_path.write_text(json.dumps(catalog))
+
+    descriptor = _built(release_inputs, tmp_path / "release")
+    data = json.loads(descriptor.read_text())
+    assert data["target"] == "wasm32-wasip1"
+    assert data["runtime_target"] == "wasm32-wasip1-threads"
+    loaded = shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+    assert loaded.manifest["dynamic_abi"] == manifest["dynamic_abi"]
+
+    data["runtime_target"] = "wasm32-wasip1"
+    descriptor.write_text(json.dumps(data))
+    with pytest.raises(shellsim.PackageInstallError):
+        shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "other-cache")
+
+
+def test_base_release_descriptor_without_runtime_target_still_loads(release_inputs, tmp_path):
+    descriptor = _built(release_inputs, tmp_path / "release")
+    data = json.loads(descriptor.read_text())
+    del data["runtime_target"]
+    descriptor.write_text(json.dumps(data))
+    runtime = shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+    assert runtime.manifest["recipe"]["target"] == "wasm32-wasip1"
+
+
+def test_release_rejects_threaded_runtime_with_base_catalog(release_inputs, tmp_path):
+    runtime, _, _ = release_inputs
+    manifest_path = runtime / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["recipe"]["target"] = "wasm32-wasip1-threads"
+    manifest["dynamic_abi"] = "shellsim-wasi-sdk34-cpython3137-threads-v3"
+    manifest_path.write_text(json.dumps(manifest))
+    output = tmp_path / "release"
+    with pytest.raises(shellsim.PackageInstallError):
+        _built(release_inputs, output)
+    assert not output.exists()
 
 
 def test_cached_runtime_cannot_be_changed_with_its_manifest(release_inputs, tmp_path):
@@ -209,7 +303,7 @@ def test_release_rejects_native_wheel_with_missing_provider(release_inputs, tmp_
                     "schema_version": 1,
                     "name": "probe",
                     "version": "1.0",
-                    "abi": "test-wasi-abi",
+                    "abi": ABI,
                     "recipe": {},
                     "artifacts": [
                         {
@@ -247,6 +341,92 @@ def test_release_rejects_broken_unselected_provider_closure(release_inputs, tmp_
     with pytest.raises(shellsim.PackageInstallError, match=error):
         release.build_release(runtime, universe, uv, output)
     assert not output.exists()
+
+
+def test_native_release_loads_without_python_resolver_and_installs_tool(release_inputs, tmp_path, monkeypatch):
+    native = _native_catalog(tmp_path / "native")
+    descriptor = release.build_release(*release_inputs, tmp_path / "release", native_catalog=native)
+    data = json.loads(descriptor.read_text())
+    descriptor.write_text(json.dumps({key: data[key] for key in ("schema_version", "target", "native")}))
+    monkeypatch.setattr("shellsim._cpython_release.platform.system", lambda: "Darwin")
+    cache = tmp_path / "cache"
+    with pytest.raises(shellsim.PackageInstallError, match="not cached"):
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
+    universe = _NativePackageUniverse.from_release(descriptor, cache_dir=cache)
+    environment = shellsim.Environment()
+    assert universe.install(environment, "make>=4.4,<5") == {"make": "4.4.1"}
+    assert environment.read_file("/usr/bin/make") == b"guest make 4.4.1"
+    (descriptor.parent / "native.zip").unlink()
+    assert _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True).catalog_path.is_file()
+    (universe.root / "artifacts/4.4.1/bin/make").write_bytes(b"changed")
+    with pytest.raises(shellsim.PackageInstallError, match="cached native release is corrupt"):
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
+
+
+def test_python_only_release_has_no_native_catalog(release_inputs, tmp_path):
+    descriptor = _built(release_inputs, tmp_path / "release")
+    with pytest.raises(shellsim.PackageInstallError, match="no native package catalog"):
+        _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
+
+
+def test_cached_native_artifact_cannot_be_resealed_without_descriptor(release_inputs, tmp_path):
+    native = _native_catalog(tmp_path / "native")
+    descriptor = release.build_release(*release_inputs, tmp_path / "release", native_catalog=native)
+    universe = _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache")
+    tool = universe.root / "artifacts/4.4.1/bin/make"
+    tool.write_bytes(b"changed")
+    manifest_path = universe.root / "artifacts/4.4.1/artifact.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"]["bin/make"] = _sha(tool)
+    manifest.pop("artifact_sha256")
+    manifest["artifact_sha256"] = _digest(manifest)
+    manifest_path.write_text(json.dumps(manifest))
+    catalog = json.loads(universe.catalog_path.read_text())
+    catalog["packages"][0]["artifact_sha256"] = manifest["artifact_sha256"]
+    universe.catalog_path.write_text(json.dumps(catalog))
+    with pytest.raises(shellsim.PackageInstallError, match="cached native release is corrupt"):
+        _NativePackageUniverse.from_release(descriptor, cache_dir=tmp_path / "cache", offline=True)
+
+
+def test_native_release_rejects_unsatisfied_candidate_before_publication(release_inputs, tmp_path):
+    native = _native_catalog(tmp_path / "native", variants=[("4.4.1", False), ("4.4.2", True)])
+    output = tmp_path / "release"
+    with pytest.raises(ValueError, match="no compatible native package closure"):
+        release.build_release(*release_inputs, output, native_catalog=native)
+    assert not output.exists()
+
+
+def test_native_release_checks_base_version_despite_valid_local_version(release_inputs, tmp_path):
+    native = _native_catalog(tmp_path / "native", variants=[("1.0", True), ("1.0+local", False)])
+    output = tmp_path / "release"
+    with pytest.raises(ValueError, match="no compatible native package closure"):
+        release.build_release(*release_inputs, output, native_catalog=native)
+    assert not output.exists()
+
+
+def test_release_preserves_broken_output_symlink(release_inputs, tmp_path):
+    output = tmp_path / "release"
+    missing = tmp_path / "missing"
+    output.symlink_to(missing, target_is_directory=True)
+    with pytest.raises(ValueError, match="output already exists"):
+        release.build_release(*release_inputs, output)
+    assert output.is_symlink()
+    assert output.resolve() == missing
+
+
+def test_native_release_archive_cannot_add_python_files(release_inputs, tmp_path):
+    native = _native_catalog(tmp_path / "native")
+    descriptor = release.build_release(*release_inputs, tmp_path / "release", native_catalog=native)
+    archive = descriptor.parent / "native.zip"
+    with zipfile.ZipFile(archive, "a") as output:
+        output.writestr("runtime/host-escape", b"unexpected")
+    data = json.loads(descriptor.read_text())
+    data["native"]["archive"].update({"sha256": _sha(archive), "size": archive.stat().st_size})
+    descriptor.write_text(json.dumps(data))
+    cache = tmp_path / "cache"
+    with pytest.raises(shellsim.PackageInstallError, match="unsafe path"):
+        _NativePackageUniverse.from_release(descriptor, cache_dir=cache)
+    assert not list(cache.iterdir())
 
 
 def test_unsupported_host_and_offline_miss_do_not_fetch(release_inputs, tmp_path, monkeypatch):

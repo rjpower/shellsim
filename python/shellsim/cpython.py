@@ -29,6 +29,12 @@ _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
 _MAX_BYTES = 128 * 1024 * 1024
 _MAX_FILES = 10000
 _MAX_REQUIREMENTS = 256
+_MAX_MANIFEST_BYTES = 4 * 1024 * 1024
+_PYTHON_PACKAGE_PLATFORM = "wasm32-wasip1"
+_DYNAMIC_RUNTIME_PROFILES = {
+    ("wasm32-wasip1", "shellsim-wasi-sdk34-cpython3137-v2"),
+    ("wasm32-wasip1-threads", "shellsim-wasi-sdk34-cpython3137-threads-v3"),
+}
 
 
 def _requirements(value: Union[str, Sequence[str]]) -> tuple[str, ...]:
@@ -71,12 +77,25 @@ class CPythonRuntime:
         if (self.universe is None) != (self.uv is None):
             raise ValueError("a CPython package universe requires an explicit patched uv executable")
         manifest_path = self.bundle / "manifest.json"
-        if manifest_path.stat().st_size > 1024 * 1024:
-            raise ValueError("CPython manifest exceeds 1 MiB")
-        self.manifest = json.loads(manifest_path.read_text())
+        with manifest_path.open("rb") as source:
+            manifest_bytes = source.read(_MAX_MANIFEST_BYTES + 1)
+        if len(manifest_bytes) > _MAX_MANIFEST_BYTES:
+            raise ValueError("CPython manifest exceeds 4 MiB")
+        self.manifest = json.loads(manifest_bytes)
         recipe = self.manifest["recipe"]
-        if recipe["version"] != "3.13.7" or recipe["target"] != "wasm32-wasip1" or recipe["prefix"] != "/usr":
+        if recipe["version"] != "3.13.7" or recipe["prefix"] != "/usr":
             raise ValueError("unsupported CPython bundle version, target, or prefix")
+        target = recipe["target"]
+        abi = self.manifest.get("dynamic_abi")
+        if not isinstance(target, str) or (abi is not None and not isinstance(abi, str)):
+            raise ValueError("invalid CPython runtime target or dynamic ABI")
+        if abi is None:
+            if target != _PYTHON_PACKAGE_PLATFORM:
+                raise ValueError("unsupported static CPython bundle target")
+        elif (target, abi) not in _DYNAMIC_RUNTIME_PROFILES:
+            raise ValueError("unsupported CPython runtime target and dynamic ABI")
+        if "dynamic_abi" in recipe and recipe["dynamic_abi"] != abi:
+            raise ValueError("CPython recipe and runtime dynamic ABI differ")
         if self.manifest["site_packages"] != _SITE_PACKAGES:
             raise ValueError("unsupported CPython site-packages path")
         self.version = recipe["version"]
