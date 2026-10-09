@@ -149,6 +149,46 @@ ABI markers, declared provider closure, and file conflicts before one VFS
 mount. It requires an idle environment and never installs host-platform wheels.
 The local catalog and patched uv executable are explicit trusted host inputs.
 
+## Native tools and development libraries
+
+Install guest tools and development files from a verified
+[native catalog](native/catalog/README.md) in the same environment as CPython:
+
+```python
+from shellsim import NativePackageUniverse
+
+native = NativePackageUniverse("/tmp/shellsim-native-tools/catalog/catalog.json")
+selected = native.install(
+    env,
+    ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
+)
+result = env.run("cd /work; make -j2")
+assert result.returncode == 0, result.stderr
+```
+
+Mount the project and its Makefile at `/work` before running the build. The
+catalog installs GNU make and the C compiler as `/usr/bin/make` and
+`/usr/bin/cc`; zlib headers and its static archive go under `/opt/zlib`.
+Guest compiler invocations can use `-I/opt/zlib/include` and
+`/opt/zlib/lib/libz.a`. Python requirements still use `env.install_pypi(...)`
+or `env.install_lock(...)`; native requirements use the native catalog above.
+
+Native installation resolves the complete requested dependency graph, checks
+compiled provider identities and exported files, and mounts it atomically.
+Later native installs preserve already installed artifact identities, including
+across catalog instances. A compatible installed version is reused; a conflicting
+version or destination fails before mutation. Upgrade and uninstall operations
+are not implemented. Native package setup requires an idle environment.
+
+The current native catalog contains make, the TinyCC C toolchain, and zlib
+development files. Make executes parallel recipes and Makefile-remake exec
+through the virtual process kernel. Recursive jobserver coordination remains
+unsupported. This graph does not yet supply a C++ compiler or a complete
+build-essential collection. Catalogs and runtime bundles remain explicit local
+setup inputs.
+
+## Static bundle installation
+
 For a static bundle, `install_pypi` uses host uv to resolve Python 3.13 requirements and dependencies.
 Pure source distributions may execute build code on the trusted host. All
 resulting distributions must be pure wheels before atomic VFS import. Native

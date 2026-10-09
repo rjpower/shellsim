@@ -1,0 +1,111 @@
+{
+  "kind": "native-tool",
+  "name": "make",
+  "version": "4.4.1",
+  "target": "wasm32-wasip1",
+  "target_profile": "wasi-posix-tools-v1",
+  "abi": "shellsim-posix-v1-exec",
+  "linkage": "static",
+  "source": {
+    "url": "https://ftp.gnu.org/gnu/make/make-4.4.1.tar.gz",
+    "sha256": "dd16fb1d67bfab79a72f5e8390735c49e3e8e70b4945a15ab1f81ddb78658fb3"
+  },
+  "sdk": {
+    "version": "34.0",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz"
+  },
+  "target_dependencies": [],
+  "features": {
+    "nls": false,
+    "guile": false,
+    "parallel_jobs": true,
+    "recursive_jobserver": false,
+    "asynchronous_signal_callbacks": false,
+    "host_execution": false
+  },
+  "configure_cache": {
+    "ac_cv_func_sigaction": "no",
+    "ac_cv_func_pselect": "no",
+    "ac_cv_func_sigprocmask": "no",
+    "ac_cv_func_sigsetmask": "no",
+    "ac_cv_have_decl_bsd_signal": "no",
+    "ac_cv_func_posix_spawnattr_setsigmask": "no",
+    "make_cv_synchronous_posix_spawn": "yes"
+  },
+  "patch_sha256": "999a594b1af99474348cdf8a521c32805a8cdfc3729d82a9f8bd3aa92148c11a",
+  "patch_inputs_sha256": {
+    "src/main.c": "7f0b8a02a6449507c751cdf3315a11bb0e99f22dc75a33a8b82b9e78c9f0bff0",
+    "src/job.c": "c1c32d4bd7fd56d898e952ed094a488edf2d4333a02058a3302d28f5e3f8ca09",
+    "src/dir.c": "748174d6a59e0c1d626854b76aefecea61025e38d810fe297fbf1e81026758ff"
+  },
+  "port_inputs_sha256": {
+    "ports/toolchain/wasi_process/process.c": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272",
+    "ports/toolchain/wasi_process/process_abi.h": "2469b06987ee082c407b100d941f60d57245c69d2f5a842ad423cced50474063",
+    "ports/toolchain/wasi_process/process_port.h": "2089b30e1ad2f57bdcc91bbfc70a0fdd87399e0355afa6e71c0645b093437ee0",
+    "ports/toolchain/wasi_process/spawn.h": "099b12b83babaa658eada6b8848a49822e7d0c3ba9c2d548d0a5cc60fd235108",
+    "ports/toolchain/wasi_process/sys/wait.h": "aabcb78324279b198a4599bc9e800e04ac639ea4fff695409bbec9c3bd3b1698",
+    "ports/toolchain/wasi_process/exec.c": "3f152fe442b57e0c65acd4b71635a3755f52097c26d21659633f1e323fe2d10b",
+    "ports/toolchain/wasi_process/exec_port.h": "abf9c66beacab26c85cdef1b58a3f9a5ae224317af7a2623b2f51ac8187f0031",
+    "ports/toolchain/wasi_process/tempfile.c": "2e9a332923ecdd89088fe52b9118e32245ff6767c819b3d47a4763be8e659b4f",
+    "ports/toolchain/wasi_process/tempfile_port.h": "66afdf586b9830eb7912b57b32a5b118cbf6fc7022cebeed27e3a2c9032c2a54",
+    "ports/toolchain/wasi_sdk/posix.c": "dee9ca54df32cdad13b6c6cb343dabf18a15cfc3ceb6a817281c026e6ffee450",
+    "ports/toolchain/wasi_sdk/posix.h": "031eac921644625f3f6923c224fe1341831e4340fc2d13bea7fee7ad3ccd38ee",
+    "ports/toolchain/wasi_accounts/accounts.c": "b57ef20fe45093d5512ef7c69d401d136516b4f22ffae938a5232739f4a3350a",
+    "ports/toolchain/wasi_accounts/pwd.h": "f52923825eb970392213654965a2ce8508e52fc67586deed68a7af396e622d97",
+    "ports/native/wasi-posix-tools-v1.json": "06466b4ad68d9c9b0f015f5251406218130b3817a0658d8ad561d58c28a15e1b",
+    "ports/toolchain/wasi_sdk/notices/llvm-LICENSE.TXT": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE-LLVM": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-MIT": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-dlmalloc-src-malloc.txt": "5791fb3131f2e81e8065cd8080b62c155eb292b3fc1de26eb85150ab1aafb890",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-emmalloc-emmalloc.txt": "ac80caba8cb45681c047889e8d123e8ec15f02267dcf50328162592bcd725b4a",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-fts-musl-fts-COPYING": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0",
+    "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-top-half-musl-COPYRIGHT": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+  },
+  "license_inputs": {
+    "licenses/llvm-LICENSE.TXT": "ports/toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",
+    "licenses/wasi-libc-LICENSE": "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE",
+    "licenses/wasi-libc-LICENSE-APACHE": "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE",
+    "licenses/wasi-libc-LICENSE-APACHE-LLVM": "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE-LLVM",
+    "licenses/wasi-libc-LICENSE-MIT": "ports/toolchain/wasi_sdk/notices/wasi-libc-LICENSE-MIT",
+    "licenses/wasi-libc-dlmalloc-src-malloc.txt": "ports/toolchain/wasi_sdk/notices/wasi-libc-dlmalloc-src-malloc.txt",
+    "licenses/wasi-libc-emmalloc-emmalloc.txt": "ports/toolchain/wasi_sdk/notices/wasi-libc-emmalloc-emmalloc.txt",
+    "licenses/wasi-libc-fts-musl-fts-COPYING": "ports/toolchain/wasi_sdk/notices/wasi-libc-fts-musl-fts-COPYING",
+    "licenses/wasi-libc-libc-bottom-half-cloudlibc-LICENSE": "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+    "licenses/wasi-libc-libc-top-half-musl-COPYRIGHT": "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-top-half-musl-COPYRIGHT",
+    "licenses/shellsim-LICENSE": "LICENSE"
+  },
+  "exports": {
+    "tools": [
+      "bin/make"
+    ],
+    "licenses": [
+      "licenses/make-COPYING",
+      "licenses/llvm-LICENSE.TXT",
+      "licenses/wasi-libc-LICENSE",
+      "licenses/wasi-libc-LICENSE-APACHE",
+      "licenses/wasi-libc-LICENSE-APACHE-LLVM",
+      "licenses/wasi-libc-LICENSE-MIT",
+      "licenses/wasi-libc-dlmalloc-src-malloc.txt",
+      "licenses/wasi-libc-emmalloc-emmalloc.txt",
+      "licenses/wasi-libc-fts-musl-fts-COPYING",
+      "licenses/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+      "licenses/wasi-libc-libc-top-half-musl-COPYRIGHT",
+      "licenses/shellsim-LICENSE"
+    ]
+  },
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "ed7d796caa56ec1ebde8751cc5c9ed5d0d35dec1b1196d41370cc3deea2fd29f"
+    },
+    {
+      "file": "../dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    }
+  ]
+}

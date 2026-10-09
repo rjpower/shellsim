@@ -559,6 +559,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 let cwd = environment.cwd.clone();
                 environment
                     .vfs
@@ -590,6 +591,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 let cwd = environment.cwd.clone();
                 let result = if parents {
                     environment.vfs.mkdir_all(&cwd, &path)
@@ -613,6 +615,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 let before = environment.vfs.clone();
                 let result = (|| {
                     shellsim::host_ingest::mount_host_tree_report(
@@ -672,6 +675,7 @@ impl NativeEnvironment {
             .detach(|| {
                 let mut environment = self.lock_environment()?;
                 on_worker(&mut environment, move |environment| {
+                    environment.sync_vfs_time();
                     shellsim::host_ingest::mount_host_tree_report(
                         environment,
                         Path::new(&host_root),
@@ -692,6 +696,7 @@ impl NativeEnvironment {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
+                environment.sync_vfs_time();
                 shellsim::host_ingest::mount_host_tree_report_exact(
                     environment,
                     Path::new(&host_root),

@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shlex
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
@@ -22,6 +23,14 @@ ToolHandler = Callable[[Mapping[str, Any]], Mapping[str, Any]]
 
 class ToolError(Exception):
     """An intentional tool failure whose message may be returned to the guest."""
+
+
+@dataclass
+class _NativeInstallation:
+    """Immutable native export identities owned by one environment."""
+
+    artifacts: dict[str, str]
+    files: dict[str, tuple[str, int, int]]
 
 
 _MAX_U64 = (1 << 64) - 1
@@ -203,6 +212,8 @@ class Environment:
             resolved.disk,
             resolved.output,
         )
+        self._native_installation = _NativeInstallation({}, {})
+        self._native_install_lock = threading.RLock()
         self._cpython_runtime: Optional[CPythonRuntime] = None
         if http is not None:
             if not isinstance(http, Mapping):

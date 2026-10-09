@@ -1,0 +1,14 @@
+{
+  "name": "wasi-posix-tools-v1",
+  "target": "wasm32-wasip1",
+  "sdk_version": "34.0",
+  "sdk_sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+  "linkage": "static",
+  "threads": false,
+  "cpp_exceptions": false,
+  "setjmp_longjmp": false,
+  "sysroot_libraries": "pinned-sdk-only",
+  "compiler_flags": ["-O2", "-g0"],
+  "link_flags": ["-lwasi-emulated-signal"],
+  "required_host_imports": "shellsim_posix_v1"
+}

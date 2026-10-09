@@ -22,6 +22,7 @@ from ._api import (
 )
 from .cpython import CPythonRuntime
 from .display_host import DisplayHost
+from .native_packages import NativePackageUniverse
 from .package import Package, PackageSpec
 from .pypi import PackageInstallError
 
@@ -39,6 +40,7 @@ __all__ = [
     "Invocation",
     "Limits",
     "MountResult",
+    "NativePackageUniverse",
     "Package",
     "PackageInstallError",
     "PackageSpec",
