@@ -4,5 +4,7 @@ tests/corpus/oils-spec/cases/** -whitespace
 tests/corpus/whole-programs/modernish/probes/** -whitespace
 tests/corpus/whole-programs/zlib/{configure,Makefile.in,zconf.h.in,zlib.h} -whitespace
 tests/fixtures/tinycc/COPYING -whitespace
+# Runtime license notices retain the upstream bytes verified by the toolchain recipe.
+ports/toolchain/wasi_sdk/notices/** -whitespace
 python/shellsim/_assets/tcc/** -whitespace
 python/shellsim/_assets/wasi-sysroot/** -whitespace

@@ -18,6 +18,7 @@ use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
@@ -1864,7 +1865,24 @@ struct Guest {
     execution: Pin<Box<dyn Future<Output = GuestOutcome> + Send>>,
     machine: MachineAccess,
     /// Memory reserved for the guest's store until the owner releases it.
-    reserved: u64,
+    reserved: GuestReservation,
+}
+
+/// Retained images and v2 heap growth share an accounting counter with the guest owner, so cancellation
+/// can release them even when the suspended Store cannot return its host state.
+#[derive(Clone, Default)]
+struct GuestReservation {
+    fixed: u64,
+    dynamic: Arc<AtomicU64>,
+}
+
+impl GuestReservation {
+    fn snapshot(&self) -> Self {
+        Self {
+            fixed: self.fixed,
+            dynamic: Arc::new(AtomicU64::new(self.dynamic.load(Ordering::Relaxed))),
+        }
+    }
 }
 
 /// A stopped guest and the host state it leaves behind.
@@ -1950,7 +1968,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     // success. Non-WASI namespaces must still be rejected at instantiation.
     for import in module.imports() {
         if import.module() != "wasi_snapshot_preview1"
-            && !(import.module() == dynamic::NAMESPACE
+            && !(dynamic::Abi::from_namespace(import.module()).is_some()
                 && matches!(import.name(), "open" | "symbol" | "error"))
             && !(import.module() == "shellsim"
                 && matches!(
@@ -1973,11 +1991,20 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         }
     }
     let mut linker = build_linker(command_engine());
-    let dynamic_enabled = module
-        .imports()
-        .any(|import| import.module() == dynamic::NAMESPACE);
-    if dynamic_enabled {
-        dynamic::compatible_main(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let mut dynamic_abi = None;
+    for import in module.imports() {
+        if let Some(abi) = dynamic::Abi::from_namespace(import.module()) {
+            if dynamic_abi.is_some_and(|old| old != abi) {
+                return Err((
+                    126,
+                    format!("{path}: mixed dynamic loading ABIs are unsupported"),
+                ));
+            }
+            dynamic_abi = Some(abi);
+        }
+    }
+    if let Some(abi) = dynamic_abi {
+        dynamic::compatible_main(&wasm, abi).map_err(|error| (126, format!("{path}: {error}")))?;
     }
     dynamic::register(&mut linker);
     register_frame_yield(&mut linker);
@@ -1995,8 +2022,17 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     // Small utilities retain their existing reservation, allowing several in one pipeline.
     // Larger static interpreter images receive a larger bounded heap reservation.
     let large_image = minimum_memory > DEFAULT_WASM_MEMORY as u64;
-    let table_memory = if large_image { LARGE_TABLE_MEMORY } else { 0 };
-    let memory_cap = if large_image {
+    let table_memory = if dynamic_abi == Some(dynamic::Abi::V2) {
+        0
+    } else if large_image {
+        LARGE_TABLE_MEMORY
+    } else {
+        0
+    };
+    let loader_memory = dynamic_abi.map_or(0, dynamic::Abi::fixed_reservation);
+    let memory_cap = if dynamic_abi == Some(dynamic::Abi::V2) {
+        256 * 1024 * 1024
+    } else if large_image {
         MAX_WASM_MEMORY as u64
     } else {
         DEFAULT_WASM_MEMORY as u64
@@ -2006,25 +2042,31 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .memory_remaining()
         .saturating_sub(DIRECTORY_MEMORY)
         .saturating_sub(table_memory)
-        .saturating_sub(if dynamic_enabled {
-            dynamic::MEMORY_RESERVATION
-        } else {
+        .saturating_sub(loader_memory)
+        // Only v1 prepays its Store reservation. V2 heap and host scratch compete for the
+        // same remaining environment budget when they actually allocate.
+        .saturating_sub(if dynamic_abi == Some(dynamic::Abi::V2) {
             0
+        } else {
+            MAX_IO_BYTES as u64
         })
-        // Keep bounded host-call scratch (including random_get) outside the store reservation.
-        .saturating_sub(MAX_IO_BYTES as u64)
         .min(memory_cap);
-    let reserved = memory_limit
+    let linear_reservation = if dynamic_abi == Some(dynamic::Abi::V2) {
+        0
+    } else {
+        memory_limit
+    };
+    let reserved = linear_reservation
         .saturating_add(DIRECTORY_MEMORY)
         .saturating_add(table_memory);
-    let reserved = reserved.saturating_add(if dynamic_enabled {
-        dynamic::MEMORY_RESERVATION
-    } else {
-        0
-    });
+    let reserved = reserved.saturating_add(loader_memory);
     if !interp.resources.reserve_memory(reserved) {
         return Err((137, format!("{path}: wasm memory budget exhausted")));
     }
+    let reserved = GuestReservation {
+        fixed: reserved,
+        dynamic: Arc::default(),
+    };
     let machine = MachineAccess::default();
     let initial_fuel = interp
         .resources
@@ -2047,8 +2089,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         open_files: BTreeSet::new(),
         append_files: BTreeSet::new(),
         directories: BTreeMap::new(),
-        limits: limits::GuestLimits::new(
-            StoreLimitsBuilder::new()
+        limits: {
+            let store = StoreLimitsBuilder::new()
                 .memory_size(memory_limit as usize)
                 .table_elements(if large_image {
                     LARGE_TABLE_ELEMENTS
@@ -2058,11 +2100,20 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
                 .memories(1)
                 .tables(16)
                 .instances(dynamic::MAX_LOADS + 1)
-                .build(),
-            memory_limit as usize,
-        ),
+                .build();
+            if dynamic_abi == Some(dynamic::Abi::V2) {
+                limits::GuestLimits::incremental(
+                    store,
+                    memory_limit as usize,
+                    machine.clone(),
+                    reserved.dynamic.clone(),
+                )
+            } else {
+                limits::GuestLimits::new(store, memory_limit as usize)
+            }
+        },
         interaction: launch.interaction,
-        dynamic: dynamic::Dynamic::new(dynamic_enabled),
+        dynamic: dynamic::Dynamic::new(dynamic_abi, reserved.dynamic.clone()),
     };
     Ok(Guest {
         execution: Box::pin(execute(host, linker, module, path.to_string())),
@@ -2176,8 +2227,10 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
 }
 
 /// Return the guest's memory reservation and display surfaces to the machine.
-fn release_guest_resources(interp: &mut Interp, reserved: &mut u64) {
-    interp.resources.release_memory(std::mem::take(reserved));
+fn release_guest_resources(interp: &mut Interp, reserved: &mut GuestReservation) {
+    let total = std::mem::take(&mut reserved.fixed)
+        .saturating_add(reserved.dynamic.swap(0, Ordering::Relaxed));
+    interp.resources.release_memory(total);
     let pid = interp.process.pid;
     interp.display.close_owner(pid);
 }
@@ -2196,7 +2249,7 @@ pub(crate) struct WasmProcess {
     path: String,
     state: WasmState,
     /// Memory reserved by a guest that this image, or the snapshot it was cloned from, started.
-    reserved: u64,
+    reserved: GuestReservation,
 }
 
 enum WasmState {
@@ -2235,7 +2288,7 @@ impl Clone for WasmProcess {
         Self {
             path: self.path.clone(),
             state,
-            reserved: self.reserved,
+            reserved: self.reserved.snapshot(),
         }
     }
 }
@@ -2246,13 +2299,13 @@ impl WasmProcess {
         Self {
             path,
             state: WasmState::Starting(argv),
-            reserved: 0,
+            reserved: GuestReservation::default(),
         }
     }
 
     /// Release the guest's reservations when the process ends, including when it is killed.
     pub(crate) fn release_owned_memory(&mut self, interp: &mut Interp) {
-        if self.reserved > 0 {
+        if self.reserved.fixed > 0 || self.reserved.dynamic.load(Ordering::Relaxed) > 0 {
             release_guest_resources(interp, &mut self.reserved);
         }
     }
@@ -2271,7 +2324,7 @@ impl WasmProcess {
             };
             self.state = match start_guest(interp, launch) {
                 Ok(guest) => {
-                    self.reserved = guest.reserved;
+                    self.reserved = guest.reserved.clone();
                     WasmState::Running(guest)
                 }
                 Err((status, message)) => WasmState::Exiting {
@@ -2478,6 +2531,30 @@ impl WasmSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cancelled_process_snapshots_release_independent_dynamic_reservations() {
+        let mut original = Interp::new();
+        assert!(original.resources.reserve_memory(300));
+        let mut process = WasmProcess::new("/fixture".into(), Vec::new());
+        process.reserved = GuestReservation {
+            fixed: 100,
+            dynamic: Arc::new(AtomicU64::new(200)),
+        };
+        let guest_owner = process.reserved.clone();
+        let mut snapshot = original.clone();
+        let mut snapshot_process = process.clone();
+        process.release_owned_memory(&mut original);
+        assert_eq!(original.resources.memory_mark(), 0);
+        assert_eq!(guest_owner.dynamic.load(Ordering::Relaxed), 0);
+        assert_eq!(snapshot.resources.memory_mark(), 300);
+        snapshot_process.release_owned_memory(&mut snapshot);
+        assert_eq!(snapshot.resources.memory_mark(), 0);
+        process.release_owned_memory(&mut original);
+        snapshot_process.release_owned_memory(&mut snapshot);
+        assert_eq!(original.resources.memory_mark(), 0);
+        assert_eq!(snapshot.resources.memory_mark(), 0);
+    }
 
     #[test]
     fn cache_reuses_exact_module_bytes_and_evicts_oldest_entry() {

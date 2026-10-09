@@ -1,0 +1,189 @@
+{
+  "name": "wasi-sdk-dynamic",
+  "version": "34.0",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "loader_namespace": "shellsim_dylink_v2",
+  "cpython": "3.13.7",
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "features": {
+    "cpp_exceptions": "standard",
+    "side_modules": "PIC",
+    "runtime_owner": "main-executable",
+    "exception_tag": "env.__cpp_exception",
+    "longdouble_printf": true,
+    "threads": false
+  },
+  "runtime_archives": [
+    "../libc.a",
+    "../libc-printscan-long-double.a",
+    "libc++.a",
+    "libc++abi.a",
+    "libunwind.a"
+  ],
+  "main_link_flags": [
+    "-Wl,--export-all,--export-table,--growable-table,--export=__stack_pointer,--export=__cpp_exception",
+    "-Wl,--wrap=dlopen,--wrap=dlsym,--wrap=dlerror,--wrap=dlclose"
+  ],
+  "side_link_flags": [
+    "-fPIC",
+    "-nostdlib",
+    "-shared",
+    "-Wl,--no-entry,--unresolved-symbols=import-dynamic"
+  ],
+  "patches": [],
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "e7be5dee2c17abe747d95e3a7845600aa5b64445b971e9a0328234f27c4e29ef"
+    },
+    {
+      "file": "../../dynamic/build_v2.py",
+      "sha256": "1cf7b7cf79f0d1954e4dbd28cca111bcb280a62b618ac784faf5d217659b24a4"
+    },
+    {
+      "file": "../../dynamic/build.py",
+      "sha256": "04233ccffa2b2ab33667a2caf2eb512c4a71f04ef0b450b64426da643bf28ef7"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../dynamic/fixtures/bridge.c",
+      "sha256": "be7b9455df9d179e1ff9fe0c364e57ddebbd06b2e86b58f59eac64901f48b26f"
+    },
+    {
+      "file": "../../dynamic/fixtures/cpp_extension.cpp",
+      "sha256": "281577fb9f7100f466316169ab33fbf392507f2378f01161ee8dab879f2fb4e1"
+    },
+    {
+      "file": "../../dynamic/fixtures/exception_main.cpp",
+      "sha256": "b9841fbdae5ded5475596661d209d0c2e8fa565baf7d88b4ee79cbd1112914b0"
+    },
+    {
+      "file": "../../dynamic/fixtures/exception_side.cpp",
+      "sha256": "2928230164b5a966865c76f0c8fcffe954891111f7cac89709decf003e20cc41"
+    },
+    {
+      "file": "../../dynamic/fixtures/exception_types.hpp",
+      "sha256": "5cd42e91b7f053a52bcc0486af803b85699abe688c8ccee54e6f68408f26a8c7"
+    },
+    {
+      "file": "../../dynamic/fixtures/extension.c",
+      "sha256": "3a4f4173e6efa7b51f99518904cfdb5c7cabd1715609aeb44abb6f43553f413a"
+    },
+    {
+      "file": "../../dynamic/fixtures/jump_main.c",
+      "sha256": "2db953cada48a24f54d3a7e1288c53c41dc9ba9682a744d01c345b992cc4ea83"
+    },
+    {
+      "file": "../../dynamic/fixtures/jump_side.c",
+      "sha256": "98158c781b286fba3a0e0142ca1ecfd8d545d6d6224c7dae2278e7e30d1929c9"
+    },
+    {
+      "file": "../../dynamic/fixtures/library.c",
+      "sha256": "604c17e09c515451de990313c58cee6427f0c1d09e7d841805d5854fc56821c1"
+    },
+    {
+      "file": "../../dynamic/fixtures/main.c",
+      "sha256": "9b32c58fc9c08fd0b036f6c80aa935448fa64aa6b4b316ec1396a21e5734ac45"
+    },
+    {
+      "file": "../../dynamic/fixtures/zlib_extension.c",
+      "sha256": "d7d2cc048d9709a63409000cf45049e068da8a898115dbdc7d7c380b422d8da1"
+    }
+  ],
+  "runtime_sources": {
+    "llvm": {
+      "repository": "llvm/llvm-project",
+      "commit": "895aa2c896ada719451be2e3673c83da8ddf1141"
+    },
+    "wasi-libc": {
+      "repository": "WebAssembly/wasi-libc",
+      "commit": "2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13"
+    }
+  },
+  "notices": [
+    {
+      "file": "notices/llvm-LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/895aa2c896ada719451be2e3673c83da8ddf1141/LICENSE.TXT",
+      "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+    },
+    {
+      "file": "notices/llvm-libcxx-LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/895aa2c896ada719451be2e3673c83da8ddf1141/libcxx/LICENSE.TXT",
+      "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+    },
+    {
+      "file": "notices/llvm-libcxxabi-LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/895aa2c896ada719451be2e3673c83da8ddf1141/libcxxabi/LICENSE.TXT",
+      "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c"
+    },
+    {
+      "file": "notices/llvm-libunwind-LICENSE.TXT",
+      "url": "https://raw.githubusercontent.com/llvm/llvm-project/895aa2c896ada719451be2e3673c83da8ddf1141/libunwind/LICENSE.TXT",
+      "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+    },
+    {
+      "file": "notices/wasi-libc-LICENSE",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE",
+      "sha256": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a"
+    },
+    {
+      "file": "notices/wasi-libc-LICENSE-APACHE-LLVM",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE-APACHE-LLVM",
+      "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+    },
+    {
+      "file": "notices/wasi-libc-LICENSE-APACHE",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE-APACHE",
+      "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+    },
+    {
+      "file": "notices/wasi-libc-LICENSE-MIT",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/LICENSE-MIT",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+    },
+    {
+      "file": "notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/libc-bottom-half/cloudlibc/LICENSE",
+      "sha256": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
+    },
+    {
+      "file": "notices/wasi-libc-libc-top-half-musl-COPYRIGHT",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/libc-top-half/musl/COPYRIGHT",
+      "sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b"
+    },
+    {
+      "file": "notices/wasi-libc-fts-musl-fts-COPYING",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/fts/musl-fts/COPYING",
+      "sha256": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046"
+    },
+    {
+      "file": "notices/wasi-libc-dlmalloc-src-malloc.txt",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/dlmalloc/src/malloc.c",
+      "sha256": "5791fb3131f2e81e8065cd8080b62c155eb292b3fc1de26eb85150ab1aafb890",
+      "source_sha256": "9e7ce51d813331ae87ef235f6ca2d5ce2167692e30bb51a173513e3754a67f8f",
+      "source_lines": [
+        2,
+        5
+      ]
+    },
+    {
+      "file": "notices/wasi-libc-emmalloc-emmalloc.txt",
+      "url": "https://raw.githubusercontent.com/WebAssembly/wasi-libc/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13/emmalloc/emmalloc.c",
+      "sha256": "ac80caba8cb45681c047889e8d123e8ec15f02267dcf50328162592bcd725b4a",
+      "source_sha256": "c5b52c424c9101ba9b2d1338997e1758c9fdf369ab0450d9b72e9544fe482166",
+      "source_lines": [
+        2,
+        5
+      ]
+    }
+  ]
+}

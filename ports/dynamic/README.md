@@ -1,4 +1,67 @@
-# Experimental WASI dynamic loading
+# WASI dynamic loading
+
+## SDK 34 ABI v2
+
+Build a bare SDK 34 CPython bundle, then the fixed dynamic interpreter and
+independent proof modules:
+
+```sh
+uv run --no-project ports/cpython/build.py --work-dir /tmp/shellsim-dynamic-v2/base --build-python /path/to/trusted/python3.13
+uv run --no-project ports/dynamic/build.py --abi v2 --bundle /tmp/shellsim-dynamic-v2/base --output /tmp/shellsim-dynamic-v2
+SHELLSIM_DYNAMIC_V2_ARTIFACTS=/tmp/shellsim-dynamic-v2 cargo test --test wasm_dynamic -- --include-ignored
+```
+
+The v2 marker is `shellsim-wasi-sdk34-cpython3137-v2`; loader imports use
+`shellsim_dylink_v2`. The fixed executable owns SDK libc, libc++, libc++abi,
+libunwind and the canonical `__cpp_exception` tag. Standard C library print/scan
+support includes long double. The SDK's long-double archive is selected before
+default libc through ordinary linker symbol selection, preserving one canonical
+definition per runtime symbol. Side modules compile with
+`-fPIC -nostdlib -shared --unresolved-symbols=import-dynamic` and import that
+runtime. They contain no private C++ runtime. This uses the pinned SDK 34
+archives without modifying LLVM or rewriting binary symbols.
+
+The builder rejects bundles with compiled package providers. It emits a standard
+CPython rootfs and file-hash manifest, plus separate proof artifacts: two C
+extensions, two C++ extensions, a shared `libz.so` and its Python consumer,
+typed cross-module exception and destructor fixtures, and a cross-module
+`setjmp`/`longjmp` fixture. The zlib consumer records `libz.so` as a needed library.
+The toolchain recipe pins builders and fixture sources; the output records the
+actual compiler, sysroot archives and upstream source hashes. Package artifacts
+are absent from the interpreter's link inputs and rootfs.
+
+The SDK 34 guest proofs establish normal CPython imports of both C extensions,
+then installation and import of a second C/C++ pair while that interpreter is
+already running. The interpreter bytes remain unchanged. Two-way
+`std::runtime_error` catches and rethrows run each extension's private
+destructors. A separate fixture checks a main-owned custom exception's typeinfo
+pointer identity, catches in both directions and destructor execution. The
+shared zlib consumer roundtrips nonempty and empty bytes through native zlib and
+rejects a non-bytes argument with `TypeError`.
+
+V2 resolves declared needed libraries only from `/lib` in the VFS and rejects
+dependency cycles. Library identity is its canonical VFS path; distinct package
+directories may contain libraries with the same basename. Provider version and
+file conflicts are rejected by catalog selection and staging. Symbol lookup searches
+the main executable and global libraries, then the deterministic dependency
+closure. All side EH tags are imported; C++ runtime symbols belong to the main
+executable. Compiler-emitted start initializers run under the process's
+metering; external GOT imports must resolve before instantiation, and unresolved
+self GOT imports are rejected. SDK 34 mutable exported globals contain absolute
+addresses; immutable exported data globals retain relative offsets. A side
+module cannot define a private canonical C++ exception tag or runtime. TLS,
+unloading, guest-initiated nested loading and arbitrary native-wheel
+compatibility remain outside this proof. SDK 24 libraries cannot enter a v2
+process, and SDK 34 libraries cannot enter a v1 process.
+
+V2 permits 32 load attempts and side modules up to 16 MiB. Compiler scratch is
+charged at 65 times source length plus 4 KiB before compilation, including cache
+hits, and compilation consumes ten CPU units per source byte. Retained costs
+include the actual image, twice the source length, 4 KiB and table entries.
+Actual linear memory plus EH heap growth is limited to an aggregate 256 MiB
+within the environment's memory budget.
+
+## SDK 24 ABI v1
 
 The spike builds a loader-enabled CPython 3.13.7 interpreter once, then imports two
 separately compiled C extensions. The second extension is written into the VFS
@@ -58,13 +121,12 @@ reservation. The loader reservation is released with the process, including
 cancellation. Libraries receive the same virtual WASI boundary as the main
 module; loading never reads a host library or grants host execution capabilities.
 
-## Current frontier
+## Current v1 frontier
 
 The loader ABI retains SDK 24 and the v1 static profile. Build its base interpreter
 with `--target-profile wasi-cpython-v1` or use an existing verified v1 bundle.
-The build driver rejects the SDK 34 exception profile before relinking. SDK 34's
-C++ exception runtime does not support shared libraries, so the v2 static
-cross-archive exception proof does not extend this dynamic ABI.
+The default v1 build driver rejects SDK 34 bundles. Select `--abi v2` explicitly
+for the separate SDK 34 contract above.
 
 The profile retains libraries and data for the process lifetime; `dlclose` does
 not unload them. A failed load disables further loads in that process because

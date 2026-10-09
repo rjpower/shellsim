@@ -11,6 +11,7 @@ import hashlib
 import json
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 ABI = b"shellsim-wasi-sdk24-cpython3137-v1"
@@ -32,8 +33,8 @@ def mark_abi(path: Path, abi: bytes = ABI) -> None:
     path.write_bytes(path.read_bytes() + b"\0" + leb(len(payload)) + payload)
 
 
-def run(command: list[str], cwd: Path | None = None) -> None:
-    subprocess.run(command, cwd=cwd, check=True)
+def run(command: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    subprocess.run(command, cwd=cwd, env=env, check=True)
 
 
 def build(bundle: Path, output: Path) -> None:
@@ -131,7 +132,14 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bundle", type=Path, default=Path("/tmp/shellsim-cpython"))
     parser.add_argument("--output", type=Path, default=Path("/tmp/shellsim-dynamic"))
+    parser.add_argument("--abi", choices=("v1", "v2"), default="v1")
     args = parser.parse_args()
+    if args.abi == "v2":
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from ports.dynamic.build_v2 import build_v2
+
+        build_v2(args.bundle.resolve(), args.output.resolve())
+        return
     build(args.bundle.resolve(), args.output.resolve())
 
 

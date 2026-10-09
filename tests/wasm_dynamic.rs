@@ -122,6 +122,8 @@ fn dynamic_execution_obeys_cpu_and_memory_limits() {
 }
 
 fn mount_tree(environment: &mut Environment, root: &Path, directory: &Path) {
+    let target = format!("/{}", directory.strip_prefix(root).unwrap().display());
+    environment.vfs.mkdir_all("/", &target).unwrap();
     let mut entries = std::fs::read_dir(directory)
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -207,17 +209,27 @@ fn marked(source: &str) -> Vec<u8> {
 }
 
 fn synthetic_main(body: &str) -> Vec<u8> {
+    synthetic_main_profile(false, body, "")
+}
+
+fn synthetic_main_profile(v2: bool, body: &str, extra: &str) -> Vec<u8> {
+    let (abi, namespace) = if v2 {
+        ("shellsim-wasi-sdk34-cpython3137-v2", "shellsim_dylink_v2")
+    } else {
+        ("shellsim-wasi-sdk24-cpython3137-v1", "shellsim_dylink_v1")
+    };
     marked(&format!(
         r#"(module
-        (@custom "shellsim.abi" "shellsim-wasi-sdk24-cpython3137-v1")
-        (import "shellsim_dylink_v1" "open" (func $open (param i32 i32 i32) (result i32)))
-        (import "shellsim_dylink_v1" "symbol" (func $symbol (param i32 i32 i32) (result i32)))
+        (@custom "shellsim.abi" "{abi}")
+        (import "{namespace}" "open" (func $open (param i32 i32 i32) (result i32)))
+        (import "{namespace}" "symbol" (func $symbol (param i32 i32 i32) (result i32)))
         (memory (export "memory") 1)
         (table (export "__indirect_function_table") 1 funcref)
         (global (export "__stack_pointer") (mut i32) (i32.const 65536))
         (global $heap (mut i32) (i32.const 4096))
         (data (i32.const 32) "/lib.so")
         (data (i32.const 64) "answer")
+        {extra}
         (export "fixture_open" (func $open))
         (func (export "malloc") (param $bytes i32) (result i32) (local $base i32)
             (local.set $base (global.get $heap))
@@ -228,9 +240,18 @@ fn synthetic_main(body: &str) -> Vec<u8> {
 }
 
 fn synthetic_library(metadata: &str, extra: &str) -> Vec<u8> {
+    synthetic_library_profile(false, metadata, extra)
+}
+
+fn synthetic_library_profile(v2: bool, metadata: &str, extra: &str) -> Vec<u8> {
+    let abi = if v2 {
+        "shellsim-wasi-sdk34-cpython3137-v2"
+    } else {
+        "shellsim-wasi-sdk24-cpython3137-v1"
+    };
     marked(&format!(
         r#"(module
-        (@custom "shellsim.abi" "shellsim-wasi-sdk24-cpython3137-v1")
+        (@custom "shellsim.abi" "{abi}")
         (@custom "dylink.0" "{metadata}")
         (import "env" "memory" (memory 1))
         {extra}
@@ -410,4 +431,634 @@ fn dynamic_constructor_proc_exit_terminates_the_process() {
         .write("/", "/lib.so", &library, 0o644)
         .unwrap();
     assert_eq!(run(&mut environment, "/app"), (7, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn v2_side_exception_uses_the_main_tag_identity() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (local.set $handle (call $open (i32.const 32) (i32.const 7) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne
+          (block $caught (result i32)
+            (try_table (catch $cpp $caught)
+              (call_indirect
+                (call $symbol (local.get $handle) (i32.const 64) (i32.const 13))))
+            (i32.const 0))
+          (i32.const 42)) (then unreachable))
+        "#,
+        r#"(tag $cpp (export "__cpp_exception") (param i32))
+        (data (i32.const 64) "throw_fixture")"#,
+    );
+    let library = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(import "env" "__cpp_exception" (tag $cpp (param i32)))
+        (func (export "throw_fixture") (throw $cpp (i32.const 42)))"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_rejects_private_side_tags_without_names_or_exports() {
+    for extra in [
+        "(tag (param i32))",
+        r#"(tag (export "__cpp_exception") (param i32))"#,
+    ] {
+        let mut environment = environment();
+        let main = synthetic_main_profile(
+            true,
+            "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+            "",
+        );
+        let library = synthetic_library_profile(true, r"\01\04\00\00\00\00", extra);
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment
+            .vfs
+            .write("/", "/lib.so", &library, 0o644)
+            .unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+fn v2_rejects_a_v1_side_library_and_releases_compile_scratch() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+        "",
+    );
+    let library = synthetic_library(r"\01\04\00\00\00\00", "");
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_constructor_cancellation_releases_retained_images() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 50_000,
+        memory: 128 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let main = synthetic_main_profile(
+        true,
+        "(drop (call $open (i32.const 32) (i32.const 7) (i32.const 2)))",
+        "",
+    );
+    let library = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(func (export "__wasm_call_ctors") (loop $again (br $again)))"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app").0, 137);
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+#[ignore = "requires built SDK34 dynamic artifacts"]
+fn sdk34_cross_module_cpp_typed_catch_rethrow_and_destructors() {
+    let artifacts = PathBuf::from(
+        std::env::var_os("SHELLSIM_DYNAMIC_V2_ARTIFACTS")
+            .expect("set SHELLSIM_DYNAMIC_V2_ARTIFACTS to the verified SDK34 fixture directory"),
+    );
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000_000,
+        memory: 1024 * 1024 * 1024,
+        disk: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    put(&mut environment, &artifacts.join("main.wasm"), "/app", true);
+    put(
+        &mut environment,
+        &artifacts.join("exception.so"),
+        "/lib/exception.so",
+        false,
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (
+            0,
+            b"cross-module typed catch/rethrow/destructors: 3\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+#[ignore = "requires built SDK34 dynamic artifacts"]
+fn sdk34_cpython_imports_independent_c_and_cpp_extensions() {
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_DYNAMIC_V2_ARTIFACTS").unwrap());
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000_000,
+        memory: 1024 * 1024 * 1024,
+        disk: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let root = artifacts.join("rootfs");
+    mount_tree(&mut environment, &root, &root);
+    put(
+        &mut environment,
+        &artifacts.join("python3.wasm"),
+        "/usr/bin/python3.wasm",
+        true,
+    );
+    for name in ["tiny_one", "cpp_one"] {
+        put(
+            &mut environment,
+            &artifacts.join(format!("{name}.so")),
+            &format!("/usr/lib/python3.13/site-packages/{name}.so"),
+            false,
+        );
+    }
+    for name in ["tiny_two", "cpp_two"] {
+        put(
+            &mut environment,
+            &artifacts.join(format!("{name}.so")),
+            &format!("/tmp/{name}.pending"),
+            false,
+        );
+    }
+    let interpreter_before = environment.vfs.read("/", "/usr/bin/python3.wasm").unwrap();
+    let source = r#"import tiny_one, cpp_one, importlib
+for name in ('tiny_two', 'cpp_two'):
+    with open('/tmp/' + name + '.pending', 'rb') as incoming:
+        with open('/usr/lib/python3.13/site-packages/' + name + '.so', 'wb') as extension:
+            extension.write(incoming.read())
+importlib.invalidate_caches()
+import tiny_two, cpp_two
+assert tiny_one.value(2) == 19
+assert tiny_two.value(3) == 43
+assert cpp_one.catch_call(cpp_two.thrower()) == 'independent C++ extension'
+assert cpp_two.catch_call(cpp_one.thrower()) == 'independent C++ extension'
+assert cpp_one.destroyed() == 2
+assert cpp_two.destroyed() == 2
+print('independent C and C++ extension imports: ok')
+"#;
+    environment
+        .vfs
+        .write("/", "/probe.py", source.as_bytes(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "/usr/bin/python3.wasm /probe.py"),
+        (
+            0,
+            b"independent C and C++ extension imports: ok\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(environment.resources.memory_mark(), 0);
+    assert_eq!(
+        environment.vfs.read("/", "/usr/bin/python3.wasm").unwrap(),
+        interpreter_before
+    );
+}
+
+#[test]
+#[ignore = "requires built SDK34 dynamic artifacts"]
+fn sdk34_c_shared_data_and_callbacks() {
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_DYNAMIC_V2_ARTIFACTS").unwrap());
+    let mut environment = environment();
+    put(
+        &mut environment,
+        &artifacts.join("c_main.wasm"),
+        "/app",
+        true,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("library.so"),
+        "/lib/libfixture.so",
+        false,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0,
+        b"128 14\n230 15\nshared data, callback, constructor, repeat load, missing symbol: ok\n".to_vec(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_declared_diamond_dependencies_share_state_and_remain_local() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (local.set $handle (call $open (i32.const 32) (i32.const 7) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 5))) (i32.const 3)) (then unreachable))
+        (if (call $symbol (i32.const 0) (i32.const 80) (i32.const 4)) (then unreachable))
+    "#,
+        r#"(data (i32.const 64) "probe") (data (i32.const 80) "bump")"#,
+    );
+    let libraries = [
+        (
+            "/lib.so",
+            synthetic_library_profile(
+                true,
+                r"\01\04\00\00\00\00\02\12\02\07left.so\08right.so",
+                r#"(import "env" "left" (func $left (result i32)))
+            (import "env" "right" (func $right (result i32)))
+            (func (export "probe") (result i32) (i32.add (call $left) (call $right)))"#,
+            ),
+        ),
+        (
+            "/lib/left.so",
+            synthetic_library_profile(
+                true,
+                r"\01\04\00\00\00\00\02\09\01\07leaf.so",
+                r#"(import "env" "bump" (func $bump (result i32)))
+            (func (export "left") (result i32) (call $bump))"#,
+            ),
+        ),
+        (
+            "/lib/right.so",
+            synthetic_library_profile(
+                true,
+                r"\01\04\00\00\00\00\02\09\01\07leaf.so",
+                r#"(import "env" "bump" (func $bump (result i32)))
+            (func (export "right") (result i32) (call $bump))"#,
+            ),
+        ),
+        (
+            "/lib/leaf.so",
+            synthetic_library_profile(
+                true,
+                r"\01\04\00\00\00\00",
+                r#"(global $count (mut i32) (i32.const 0))
+            (func (export "bump") (result i32)
+                (global.set $count (i32.add (global.get $count) (i32.const 1)))
+                (global.get $count))"#,
+            ),
+        ),
+    ];
+    environment.vfs.mkdir_all("/", "/lib").unwrap();
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    for (path, source) in libraries {
+        environment.vfs.write("/", path, &source, 0o644).unwrap();
+    }
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_dependency_failures_release_memory() {
+    for failure in ["missing", "mismatch", "cycle", "filename"] {
+        let mut environment = environment();
+        let main = synthetic_main_profile(
+            true,
+            "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+            "",
+        );
+        let metadata = if failure == "filename" {
+            r"\01\04\00\00\00\00\02\0b\01\09../bad.so"
+        } else {
+            r"\01\04\00\00\00\00\02\09\01\07leaf.so"
+        };
+        let root = synthetic_library_profile(true, metadata, "");
+        environment.vfs.mkdir_all("/", "/lib").unwrap();
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &root, 0o644).unwrap();
+        let leaf = match failure {
+            "cycle" => {
+                synthetic_library_profile(true, r"\01\04\00\00\00\00\02\09\01\07leaf.so", "")
+            }
+            _ => synthetic_library_profile(false, r"\01\04\00\00\00\00", ""),
+        };
+        if failure != "missing" {
+            environment
+                .vfs
+                .write("/", "/lib/leaf.so", &leaf, 0o644)
+                .unwrap();
+        }
+        assert_eq!(
+            run(&mut environment, "/app"),
+            (0, Vec::new(), Vec::new()),
+            "{failure}"
+        );
+        assert_eq!(environment.resources.memory_mark(), 0, "{failure}");
+    }
+}
+
+#[test]
+fn v2_compile_scratch_has_the_same_limit_on_cold_and_cached_modules() {
+    let main = synthetic_main_profile(
+        true,
+        "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))",
+        "",
+    );
+    let side = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        &format!("(@custom \"padding\" \"{}\")", "x".repeat(300_000)),
+    );
+    for memory in [16 * 1024 * 1024, 128 * 1024 * 1024, 16 * 1024 * 1024] {
+        let mut environment = Environment::with_limits(Limits {
+            memory,
+            cpu: 10_000_000,
+            ..Limits::default()
+        });
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+        assert_eq!(
+            run(&mut environment, "/app").0,
+            if memory == 16 * 1024 * 1024 { 137 } else { 0 }
+        );
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires built SDK34 dynamic artifacts"]
+fn sdk34_cpython_loads_declared_shared_zlib_dependency() {
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_DYNAMIC_V2_ARTIFACTS").unwrap());
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000_000,
+        memory: 1024 * 1024 * 1024,
+        disk: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let root = artifacts.join("rootfs");
+    mount_tree(&mut environment, &root, &root);
+    put(
+        &mut environment,
+        &artifacts.join("python3.wasm"),
+        "/usr/bin/python3.wasm",
+        true,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("zlib_consumer.so"),
+        "/usr/lib/python3.13/site-packages/zlib_consumer.so",
+        false,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("libz.so"),
+        "/lib/libz.so",
+        false,
+    );
+    let source = r#"import zlib_consumer
+payload = bytes(range(256)) * 3
+assert zlib_consumer.roundtrip(payload) == payload
+assert zlib_consumer.roundtrip(b'') == b''
+try:
+    zlib_consumer.roundtrip('invalid')
+except TypeError:
+    pass
+else:
+    raise AssertionError('expected TypeError')
+print('declared shared zlib dependency: ok')
+"#;
+    environment
+        .vfs
+        .write("/", "/probe.py", source.as_bytes(), 0o644)
+        .unwrap();
+    assert_eq!(
+        run(&mut environment, "/usr/bin/python3.wasm /probe.py"),
+        (
+            0,
+            b"declared shared zlib dependency: ok\n".to_vec(),
+            Vec::new()
+        )
+    );
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_start_initializers_are_metered_and_cannot_load_recursively() {
+    for initializer in [
+        r#"(func $start (loop $forever (br $forever))) (start $start)"#,
+        r#"(import "env" "fixture_open" (func $open (param i32 i32 i32) (result i32)))
+        (func $start
+            (if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable)))
+        (start $start)"#,
+    ] {
+        let endless = initializer.contains("$forever");
+        let mut environment = Environment::with_limits(Limits {
+            cpu: 50_000,
+            memory: 128 * 1024 * 1024,
+            ..Limits::default()
+        });
+        let main = synthetic_main_profile(true,
+            "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))", "");
+        let side = synthetic_library_profile(true, r"\01\04\00\00\00\00", initializer);
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+        assert_eq!(
+            run(&mut environment, "/app").0,
+            if endless { 137 } else { 0 }
+        );
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+fn v2_start_observes_resolved_external_got_values() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))",
+        r#"(global (export "external_data") i32 (i32.const 123))"#,
+    );
+    let side = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(import "GOT.mem" "external_data" (global $external (mut i32)))
+        (func $start (if (i32.ne (global.get $external) (i32.const 123)) (then unreachable)))
+        (start $start)"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_small_executable_can_grow_above_sixteen_mebibytes() {
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (if (i32.lt_s (memory.grow (i32.const 320)) (i32.const 0)) (then unreachable))
+        (i32.store (i32.const 20_971_520) (i32.const 123))
+        (if (i32.ne (i32.load (i32.const 20_971_520)) (i32.const 123)) (then unreachable))
+    "#,
+        "",
+    );
+    for (budget, status) in [(128 * 1024 * 1024, 0), (8 * 1024 * 1024, 126)] {
+        let mut environment = Environment::with_limits(Limits {
+            memory: budget,
+            ..Limits::default()
+        });
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        assert_eq!(run(&mut environment, "/app").0, status);
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+fn v2_cancellation_releases_incrementally_grown_memory() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 50_000,
+        memory: 128 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let main = synthetic_main_profile(
+        true,
+        "(drop (memory.grow (i32.const 320))) (loop $forever (br $forever))",
+        "",
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    let (outcome, _, _) = environment.run_script_capture("/app");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(outcome.usage.memory_peak > 20 * 1024 * 1024);
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_rejects_private_runtime_and_unresolved_pre_start_got() {
+    for definition in [
+        r#"(func (export "__cxa_throw"))"#,
+        r#"(import "GOT.mem" "self_data" (global $self (mut i32)))
+        (global (export "self_data") (mut i32) (i32.const 0))
+        (func $start unreachable) (start $start)"#,
+    ] {
+        let mut environment = environment();
+        let main = synthetic_main_profile(
+            true,
+            "(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))",
+            "",
+        );
+        let side = synthetic_library_profile(true, r"\01\04\00\00\00\00", definition);
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &side, 0o644).unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
+#[ignore = "requires built SDK34 dynamic artifacts"]
+fn sdk34_cross_module_longjmp_uses_main_runtime_tag() {
+    let artifacts = PathBuf::from(std::env::var_os("SHELLSIM_DYNAMIC_V2_ARTIFACTS").unwrap());
+    let mut environment = environment();
+    put(
+        &mut environment,
+        &artifacts.join("jump_main.wasm"),
+        "/app",
+        true,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("jump.so"),
+        "/lib/jump.so",
+        false,
+    );
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (0, b"cross-module longjmp: 37\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_same_filename_in_distinct_package_paths_has_independent_local_state() {
+    let mut environment = environment();
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (local.set $handle (call $open (i32.const 32) (i32.const 12) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 4))) (i32.const 1)) (then unreachable))
+        (local.set $handle (call $open (i32.const 80) (i32.const 12) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 4))) (i32.const 1)) (then unreachable))
+        (if (call $symbol (i32.const 0) (i32.const 64) (i32.const 4)) (then unreachable))
+    "#,
+        r#"(data (i32.const 32) "/a/_zeros.so") (data (i32.const 80) "/b/_zeros.so")
+        (data (i32.const 64) "bump")"#,
+    );
+    let side = synthetic_library_profile(
+        true,
+        r"\01\04\00\00\00\00",
+        r#"(global $count (mut i32) (i32.const 0))
+        (func (export "bump") (result i32)
+            (global.set $count (i32.add (global.get $count) (i32.const 1)))
+            (global.get $count))"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    for directory in ["/a", "/b"] {
+        environment.vfs.mkdir_all("/", directory).unwrap();
+        environment
+            .vfs
+            .write("/", &format!("{directory}/_zeros.so"), &side, 0o644)
+            .unwrap();
+    }
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.resources.memory_mark(), 0);
+}
+
+#[test]
+fn v2_guest_table_growth_charges_environment_and_releases_on_exit() {
+    let main = synthetic_main_profile(
+        true,
+        r#"
+        (if (i32.lt_s (memory.grow (i32.const 26)) (i32.const 0)) (then unreachable))
+        (if (i32.ne (table.grow (ref.null func) (i32.const 9999)) (i32.const 1)) (then unreachable))
+    "#,
+        "",
+    );
+    for (budget, status) in [(4 * 1024 * 1024, 0), (2 * 1024 * 1024, 137)] {
+        let mut environment = Environment::with_limits(Limits {
+            memory: budget,
+            ..Limits::default()
+        });
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        let (outcome, _, _) = environment.run_script_capture("/app");
+        assert_eq!(outcome.exit_status, status);
+        assert_eq!(environment.resources.memory_mark(), 0);
+        if status == 0 {
+            assert!(outcome.usage.memory_peak > 2 * 1024 * 1024);
+        }
+    }
+}
+
+#[test]
+fn v2_cancellation_releases_guest_table_growth() {
+    let main = synthetic_main_profile(
+        true,
+        "(drop (table.grow (ref.null func) (i32.const 9999))) (loop $forever (br $forever))",
+        "",
+    );
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 50_000,
+        memory: 4 * 1024 * 1024,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    let (outcome, _, _) = environment.run_script_capture("/app");
+    assert_eq!(outcome.exit_status, 137);
+    assert!(outcome.usage.memory_peak > 400_000);
+    assert_eq!(environment.resources.memory_mark(), 0);
 }
