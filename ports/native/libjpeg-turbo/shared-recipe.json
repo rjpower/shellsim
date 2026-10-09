@@ -49,7 +49,7 @@
   "build_scripts": [
     {
       "file": "../imaging_shared.py",
-      "sha256": "7d7412173e7f78b014c19582f1e83809172a1de8e99f914559ca991b581dddb8"
+      "sha256": "a8e63ecf902a899dd6e8ebb9e9a81ac725e1fb31d3fe87ca4877d7e5ff050880"
     },
     {
       "file": "build.py",

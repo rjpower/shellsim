@@ -167,7 +167,7 @@ def build(downloads, cpython_source, cpython_build, sdk, runtime, output, llvm):
         raise ValueError("Pillow upstream package identity differs")
     build_directory = output / "extensions"
     build_directory.mkdir()
-    dependencies, _ = shared_dependencies(recipe, providers, build_directory / "dependencies")
+    dependencies, _ = shared_dependencies(recipe, providers, build_directory / "dependencies", toolchain)
     if any(item["inputs"]["toolchain"] != toolchain for item in dependencies.values()):
         raise ValueError("Shared imaging provider toolchain differs")
     inputs = artifact_input(recipe, PORT, toolchain, dependencies)

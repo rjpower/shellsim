@@ -1,0 +1,73 @@
+{
+  "kind": "native-library",
+  "name": "zlib",
+  "version": "1.3.1",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "linkage": "shared",
+  "soname": "libz.so",
+  "source": {
+    "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+    "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+    "subdirectory": "zlib-1.3.1"
+  },
+  "patches": [
+    {
+      "file": "cmake-wasi.patch",
+      "sha256": "797c24a676499bc5fe3d22841267981093836b7fac06aaa6015a07b2d36f054e"
+    }
+  ],
+  "target_dependencies": [],
+  "build_scripts": [],
+  "build": {
+    "adapter": "cmake",
+    "configure_args": [
+      "-DZLIB_BUILD_EXAMPLES=OFF"
+    ],
+    "build_targets": [
+      "zlib",
+      "zlibstatic"
+    ],
+    "install_targets": [
+      "install"
+    ],
+    "jobs": 2,
+    "install_prefix": "/usr/local"
+  },
+  "exports": {
+    "archives": [
+      "lib/libz.a"
+    ],
+    "shared_libraries": [
+      "lib/libz.so"
+    ],
+    "pkg_config": [
+      "share/pkgconfig/zlib.pc"
+    ],
+    "licenses": [
+      "licenses/zlib.txt"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include"
+    ]
+  },
+  "needed_libraries": [],
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/cmake_smoke.c",
+      "link_inputs": [
+        "lib/libz.a"
+      ]
+    }
+  ],
+  "source_exports": [
+    {
+      "source": "README",
+      "destination": "licenses/zlib.txt"
+    }
+  ]
+}

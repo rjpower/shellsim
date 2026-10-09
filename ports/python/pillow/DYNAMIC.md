@@ -11,7 +11,8 @@ The shared native products are zlib 1.3.1 (`libz.so`), libjpeg-turbo 2.1.5.1
 `libz.so` used by Pillow. Each provider is independently sealed; shared admission
 checks target, ABI, linkage, version, toolchain, exact transitive artifact
 identities and emitted dependencies. Static products remain separate recipes.
-The imaging helper admits at most one transitive level and rejects deeper graphs.
+Dependency admission follows the full declared provider graph, including shared
+providers reached through more than one dependency path.
 
 Build with the pinned source archives, SDK34, and the recipe's reviewed CPython
 source headers and target pyconfig:

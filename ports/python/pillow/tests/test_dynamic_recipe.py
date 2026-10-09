@@ -80,7 +80,7 @@ def test_shared_dependency_rejects_wrong_identity_before_copy(tmp_path, dependen
     consumer, providers, manifest = dependency_graph
     manifest["inputs"]["recipe"][field] = value
     with pytest.raises(ValueError):
-        imaging_shared.shared_dependencies(consumer, providers, tmp_path / "selected")
+        imaging_shared.shared_dependencies(consumer, providers, tmp_path / "selected", manifest["inputs"]["toolchain"])
     assert not (tmp_path / "selected").exists()
 
 
@@ -88,16 +88,16 @@ def test_shared_dependency_rejects_missing_declared_child(tmp_path, dependency_g
     consumer, providers, manifest = dependency_graph
     manifest["inputs"]["recipe"]["target_dependencies"] = [{"port": "native/missing", "version": "1.0"}]
     with pytest.raises(ValueError):
-        imaging_shared.shared_dependencies(consumer, providers, tmp_path / "selected")
+        imaging_shared.shared_dependencies(consumer, providers, tmp_path / "selected", manifest["inputs"]["toolchain"])
 
 
 def test_shared_dependency_rejects_conflicting_header(tmp_path, dependency_graph):
-    consumer, providers, _ = dependency_graph
+    consumer, providers, manifest = dependency_graph
     destination = tmp_path / "selected"
     (destination / "include").mkdir(parents=True)
     (destination / "include/zlib.h").write_bytes(b"conflicting header")
     with pytest.raises(ValueError):
-        imaging_shared.shared_dependencies(consumer, providers, destination)
+        imaging_shared.shared_dependencies(consumer, providers, destination, manifest["inputs"]["toolchain"])
     assert (destination / "include/zlib.h").read_bytes() == b"conflicting header"
 
 
