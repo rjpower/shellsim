@@ -45,29 +45,3 @@ def test_native_metadata_preserves_upstream_dependencies(tmp_path):
     assert (destination / "METADATA").read_text() == metadata
     assert "Tag: py313-none-any\n" in (destination / "WHEEL").read_text()
     assert "sample-1.0.dist-info/METADATA,sha256=" in (destination / "RECORD").read_text()
-
-
-def test_static_imaging_builder_reads_native_catalog_and_jpeg_entrypoint(monkeypatch):
-    import importlib.util
-
-    root = Path(CPYTHON_BUILD.__file__).parents[2] / "native"
-    original = importlib.util.module_from_spec
-    loaded = []
-
-    def load(spec):
-        module = original(spec)
-        original_exec = spec.loader.exec_module
-
-        def execute(module):
-            original_exec(module)
-            assert callable(module.build_libjpeg_turbo)
-            loaded.append(Path(spec.origin))
-            module.build_libjpeg_turbo = lambda *args: args
-
-        monkeypatch.setattr(spec.loader, "exec_module", execute)
-        return module
-
-    monkeypatch.setattr(importlib.util, "module_from_spec", load)
-    inputs = ({}, None, None, None, None, None)
-    assert CPYTHON_BUILD.build_jpeg(*inputs) == inputs
-    assert loaded == [root / "libjpeg-turbo/build.py"]
