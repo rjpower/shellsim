@@ -1,0 +1,25 @@
+{
+  "name": "wasmtime-fuel-resume",
+  "version": "49.0.0",
+  "source": {
+    "url": "https://static.crates.io/crates/wasmtime/wasmtime-49.0.0.crate",
+    "sha256": "c28a746e47c5683ec1233967948c729c18e978a59fda2b964ac6d8fae9f8f3f8"
+  },
+  "patch": {
+    "file": "fuel-resume.patch",
+    "sha256": "73be72e15c21878ccc9ead12d9f8aa0b9d13f6613a8e057a990f70c863e90a33",
+    "inputs": {
+      "src/runtime/store.rs": "0fc153b8ec77707258b11a744204a4098524d057c371576bd5fbbd6df2da8530",
+      "src/runtime/vm/libcalls.rs": "3dcdcaf8ce7281a0498c794275fa5cd0adc0e77f3891ea6b9fbc96ca2802f105",
+      "src/runtime/profiling.rs": "a4a41f43231dfd2ac2a9746cea0567c1ccf4f462d57643eb79f450727711677c"
+    }
+  },
+  "contract": "CallHook::FuelResume after fuel yield and before guest continuation",
+  "licenses": [
+    "LICENSE"
+  ],
+  "build_driver_sha256": "017de5755debd510532249c955826cfefe674a9588c20283f9a7070e2cafe453",
+  "omitted_packaging_files": [
+    "Cargo.toml.orig"
+  ]
+}

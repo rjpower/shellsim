@@ -1,0 +1,31 @@
+--- a/src/runtime/store.rs
++++ b/src/runtime/store.rs
+@@ -212,0 +213,4 @@
++    /// Indicates that a fuel-yield suspension has completed. The hook runs
++    /// before generated WebAssembly code resumes and can synchronize Store-local
++    /// state. This event does not change the host/guest protection-key state.
++    FuelResume,
+@@ -1417,0 +1422 @@
++                CallHook::FuelResume => {}
+--- a/src/runtime/vm/libcalls.rs
++++ b/src/runtime/vm/libcalls.rs
+@@ -678 +678 @@
+-    block_on!(store, async |store, _| {
++    let resumed = block_on!(store, async |store, _| {
+@@ -685,3 +685,8 @@
+-        }
+-        Ok(())
+-    })?
++            return Ok(true);
++        }
++        Ok::<bool, crate::Error>(false)
++    })??;
++    if resumed {
++        store.call_hook(crate::CallHook::FuelResume)?;
++    }
++    Ok(())
+--- a/src/runtime/profiling.rs
++++ b/src/runtime/profiling.rs
+@@ -225 +225 @@
+-            CallHook::CallingWasm | CallHook::ReturningFromWasm => {}
++            CallHook::CallingWasm | CallHook::ReturningFromWasm | CallHook::FuelResume => {}

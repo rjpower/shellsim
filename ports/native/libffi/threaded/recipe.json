@@ -1,0 +1,99 @@
+{
+  "kind": "native-library",
+  "name": "libffi",
+  "version": "3.5.2",
+  "target_profile": "wasi-cpython-threads-v3",
+  "target": "wasm32-wasip1-threads",
+  "linkage": "shared",
+  "source": {
+    "url": "https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz",
+    "sha256": "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
+  },
+  "host_tools": [
+    "sh",
+    "sed",
+    "awk",
+    "grep",
+    "expr",
+    "make"
+  ],
+  "target_dependencies": [],
+  "features": {
+    "primitive_scalars": true,
+    "closures": true,
+    "aggregates": false,
+    "variadic": false,
+    "shared": true
+  },
+  "transitive_link_flags": [],
+  "exports": {
+    "headers": [
+      "include/ffi.h",
+      "include/ffitarget.h"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/libffi.pc"
+    ],
+    "licenses": [
+      "licenses/libffi.txt"
+    ],
+    "libraries": [
+      "lib/libffi.so"
+    ]
+  },
+  "backend_sha256": "6b018972f550914cc2c7f6df823183765c216f3533a6a59225451a82486e036b",
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "72f241ca7e9b78349a0d22fb598e3221680a810670ce732454376846822b8ad3"
+    },
+    {
+      "file": "toolchain.py",
+      "sha256": "0461cc50dca64fcdc314e8be18b54d22bce1ef4c896f1e6e2844afb6d3ebb8d2"
+    },
+    {
+      "file": "../shellsim_wasi.c",
+      "sha256": "6b018972f550914cc2c7f6df823183765c216f3533a6a59225451a82486e036b"
+    },
+    {
+      "file": "../../dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "../../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
+    },
+    {
+      "file": "../../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    },
+    {
+      "file": "../../../toolchain/wasi_threads/dynamic.py",
+      "sha256": "02ff79b545d533dafc1f60a9c70d4bde5ba6c9d9e8fd7abc9fed0485f61ad06c"
+    },
+    {
+      "file": "../../../toolchain/wasi_threads/build.py",
+      "sha256": "67bd9736939b334b9e2acce016d5b05aca4a727b41e70bd5dd11b20b04c72eb5"
+    },
+    {
+      "file": "../../../toolchain/llvm/build.py",
+      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
+    }
+  ],
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "compiler_recipe_sha256": "f644162ef795d914637ca8fd7cea9628cdc07aad6fcb87d699ac096e01b7c27b",
+  "overlay_recipe_sha256": "4efb14821341356da5100ffe3bc2d86a6f432702465d5a3fade50d23b9d664cd",
+  "needed_libraries": [],
+  "link_flags": [
+    "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic,--fatal-warnings,-soname,libffi.so"
+  ]
+}

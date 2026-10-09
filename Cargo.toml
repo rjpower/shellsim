@@ -6,8 +6,11 @@ description = "In-process BusyBox-like environment for RL rollouts and agent tes
 license = "Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/rjpower/shellsim"
+# Registry publishing would drop the required runtime source overlay.
+publish = false
 include = [
     "/src/**",
+    "/vendor/wasmtime/**",
     "/Cargo.toml",
     "/Cargo.lock",
     "/rust-toolchain.toml",
@@ -40,8 +43,9 @@ base64 = "0.22"
 crc32fast = "1"
 flate2 = "1"
 memchr = "2"
-wasmtime = { version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook", "threads"] }
+wasmtime = { path = "vendor/wasmtime", version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook", "threads"] }
 wasmparser = "0.258.0"
+async-trait = "0.1.92"
 num-bigint = "0.4"
 num-traits = "0.2"
 libm = "0.2"
