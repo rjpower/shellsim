@@ -73,3 +73,10 @@ notices under `/TOOLCHAIN-LICENSES`.
 
 Build commands are in [the CPython port](../../python/cpython/README.md).
 Guest ABI checks are in [the runtime fixtures](../../../tests/fixtures/wasm/dynamic/README.md).
+
+The canonical main also retains the SDK's `libsetjmp.a` and explicitly exports
+`__wasm_setjmp`, `__wasm_setjmp_test`, `__wasm_longjmp`, and the `__c_longjmp`
+exception tag. Side modules import these definitions. Both the package-free
+CPython link and the process overlay use the same runtime archive contract;
+packages do not carry a private setjmp runtime. This adds main-runtime symbols
+within ABI v2. Older main images lacking them fail with an unresolved import.

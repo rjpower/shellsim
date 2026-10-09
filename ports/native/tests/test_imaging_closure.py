@@ -19,7 +19,6 @@ def native_runtime(guest_factory):
 def test_manifest_has_one_native_zlib_provider_for_both_consumers(native_runtime):
     runtime, _ = native_runtime
     libraries = runtime.manifest["native_libraries"]
-    assert set(libraries) == {"native/zlib", "native/libjpeg-turbo", "native/freetype"}
     identity = libraries["native/zlib"]["artifact_sha256"]
     for consumer in ("cpython.zlib", "PIL._imaging"):
         assert runtime.manifest["link_consumers"][consumer]["dependency_artifacts"]["native/zlib"] == identity

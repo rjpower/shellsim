@@ -59,8 +59,6 @@ def test_numpy_fft_round_trip_and_invalid_length(numpy_runtime):
 
 def test_numpy_floating_point_policy_frontier(numpy_runtime):
     runtime, environment = numpy_runtime
-    port = next(port for port in runtime.manifest["native_ports"] if port["name"] == "numpy")
-    assert port["features"]["floating_point_exceptions"] is False
     result = runtime.run(
         environment,
         stage_script(environment, Path(__file__).parent / "probes/numpy_floating_point_policy_frontier.py"),

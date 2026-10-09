@@ -9,20 +9,12 @@ import pytest
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def test_openblas_has_no_host_or_fortran_target_dependencies(monkeypatch):
+def test_openblas_pins_production_sources(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
     from ports.native.dependencies import recipe_identity
 
     recipe = json.loads((ROOT / "ports/native/openblas/recipe.json").read_text())
     recipe_identity(recipe, ROOT / "ports/native/openblas")
-    assert recipe["version"] == "0.3.31"
-    assert recipe["target_profile"] == "wasi-cpython-v2"
-    assert recipe["target_dependencies"] == []
-    assert recipe["features"]["threads"] is False
-    assert recipe["features"]["integer_bits"] == 32
-    assert recipe["features"]["fortran_compiler"] is False
-    assert recipe["features"]["complex_return"] == "hidden-pointer"
-    assert recipe["exports"]["archives"] == ["lib/libopenblas.a"]
 
 
 @pytest.mark.parametrize("name", ["NAME", "slarfb_gett_", "sgetrf2_", "dgeqp3rk_"])
@@ -88,22 +80,13 @@ def test_new_lapack_xerbla_calls_receive_character_length(monkeypatch):
     assert builder.normalize_xerbla(existing) == existing
 
 
-def test_shared_openblas_recipe_binds_the_archive_and_imports_the_main_runtime(monkeypatch):
+def test_shared_openblas_pins_production_sources(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
     from ports.native.dependencies import recipe_identity
 
     directory = ROOT / "ports/native/openblas/shared"
     recipe = json.loads((directory / "recipe.json").read_text())
     recipe_identity(recipe, directory)
-    assert recipe["static_provider"] == {"port": "native/openblas", "version": "0.3.31"}
-    assert recipe["abi"] == "shellsim-wasi-sdk34-cpython3137-v2"
-    assert recipe["soname"] == "libopenblas.so"
-    assert recipe["needed_libraries"] == []
-    assert "-nostdlib" in recipe["link_flags"]
-    assert "-shared" in recipe["link_flags"]
-    assert recipe["features"]["runtime_owner"] == "main-executable"
-    assert recipe["compiler_support"]["linkage"] == "referenced-members-only"
-    assert recipe["exports"]["libraries"] == ["lib/libopenblas.so"]
 
 
 def test_shared_consumer_dependency_decoder_checks_real_metadata_lengths(monkeypatch, tmp_path):

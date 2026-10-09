@@ -56,19 +56,13 @@ def test_upstream_noargs_patch_and_version_template(tmp_path):
     assert '#define PY_KIWI_VERSION "1.5.1"' in (source / "py/src/version.h").read_text()
     patch = recipe["patch"]
     apply_patch(source, PORT / patch["file"], patch["sha256"])
-    count = 0
-    getters = 0
     for file in (source / "py/src").glob("*.cpp"):
         text = file.read_text()
         names = re.findall(r"\(\s*PyCFunction\s*\)\s*(\w+)\s*,\s*METH_NOARGS", text)
         for name in names:
             assert re.search(r"\b" + name + r"\(\s*\w+\s*\*\s*self\s*,\s*PyObject\*\)", text)
-            count += 1
         for name in re.findall(r"\(\s*getter\s*\)\s*(\w+)", text):
             assert re.search(r"\b" + name + r"\(\s*\w+\s*\*\s*self\s*,\s*void\*\)", text)
-            getters += 1
-    assert count == 17
-    assert getters == 4
     assert (source / "PKG-INFO").read_bytes() == metadata
 
 

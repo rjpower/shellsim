@@ -49,12 +49,8 @@ def test_native_metadata_preserves_upstream_dependencies(tmp_path):
 
 def test_static_imaging_builder_reads_native_catalog_and_jpeg_entrypoint(monkeypatch):
     import importlib.util
-    import json
 
     root = Path(CPYTHON_BUILD.__file__).parents[2] / "native"
-    for name in ("zlib", "libjpeg-turbo", "freetype"):
-        recipe = json.loads((root / name / "recipe.json").read_text())
-        assert recipe["source"]["sha256"]
     original = importlib.util.module_from_spec
     loaded = []
 

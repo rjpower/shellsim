@@ -1,0 +1,79 @@
+{
+  "kind": "native-library",
+  "name": "libffi",
+  "version": "3.5.2",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "source": {
+    "url": "https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz",
+    "sha256": "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
+  },
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "linkage": "shared",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "soname": "libffi.so",
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang",
+    "wasi-sdk-wasm-ld"
+  ],
+  "static_provider": {
+    "port": "native/libffi",
+    "version": "3.5.2"
+  },
+  "features": {
+    "primitive_scalars": true,
+    "closures": true,
+    "aggregates": false,
+    "variadic": false,
+    "threads": false
+  },
+  "link_flags": [
+    "-fPIC",
+    "-nostdlib",
+    "-shared",
+    "-Wl,--no-entry,--unresolved-symbols=import-dynamic,--export-all,-soname,libffi.so,--fatal-warnings"
+  ],
+  "needed_libraries": [],
+  "exports": {
+    "headers": [
+      "include/ffi.h",
+      "include/ffitarget.h"
+    ],
+    "libraries": [
+      "lib/libffi.so"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/libffi.pc"
+    ],
+    "licenses": [
+      "licenses/libffi.txt"
+    ]
+  },
+  "build_scripts": [
+    {
+      "file": "build.py",
+      "sha256": "6e5520725dd5629fbe33ca053dcf43d5bb893b8c8bdb74cdce0f232be6c7a045"
+    },
+    {
+      "file": "../recipe.json",
+      "sha256": "f1801ac5788424c82f35895caf80da910931f93e707f5ea8d97a78ed640cb403"
+    },
+    {
+      "file": "../../dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
+    },
+    {
+      "file": "../../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    }
+  ]
+}

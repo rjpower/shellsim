@@ -22,6 +22,34 @@ pinned shared zlib provider. It consumes the runtime's verified source bundle,
 not test artifacts. The module manifest records destination paths, hashes,
 ABI and the `libz.so` dependency; installing it does not relink the interpreter.
 
+`stdlib_ctypes.py` compiles the unmodified CPython 3.13.7 `_ctypes` C sources
+against the [shared libffi port](../../native/libffi/README.md). Its recipe pins
+all headers under `Include` and `Modules/_ctypes`, the generated `pyconfig.h`,
+the C sources, and the exact SDK profile. The resulting side module declares
+`libffi.so` as its sole native dependency. It uses the canonical main bridge
+recorded in the process runtime manifest to resolve `ctypes.pythonapi`.
+
+`assembly.py` combines a process-enabled dynamic runtime, the verified stdlib
+zlib artifact, `libffi.so`, and `_ctypes.so` into a new runtime bundle. It
+checks the exact dependency identities, ABI, target paths, source manifests,
+and copied file hashes before publishing the bundle. The interpreter executable
+is copied unchanged. The public `CPythonRuntime` mounts the resulting bundle;
+ordinary `python` commands and child interpreters use the selected environment.
+
+```sh
+uv run --no-project --python 3.13 python -m ports.python.cpython.stdlib_ctypes \
+  /path/to/cpython-base /path/to/process-runtime \
+  /path/to/shared-libffi-artifact /tmp/ctypes-build
+uv run --no-project --python 3.13 python -m ports.python.cpython.assembly \
+  /path/to/process-runtime /path/to/stdlib-zlib-artifact \
+  /path/to/shared-libffi-artifact /path/to/ctypes-artifact \
+  /tmp/cpython-with-ctypes
+```
+
+The current libffi ABI covers primitive and pointer calls and callbacks. It
+rejects aggregates and variadic signatures. Threaded callback replay is not
+part of this v2 runtime.
+
 Dynamic loader proofs and their catalog builder live under
 `tests/fixtures/wasm/dynamic`. Their manifest records fixture inputs and artifacts
 separately from the production runtime. See that directory's README for opt-in

@@ -42,6 +42,9 @@ uv run --no-project --python 3.13 python -m ports.python.cpython.dynamic \
 The [process overlay](toolchain/wasi_process/README.md) adds upstream CPython
 subprocess support through the virtual process kernel. The
 [zlib extension](python/cpython/STDLIB_ZLIB.md) supplies shared native compression.
+CPython's `_ctypes` extension uses the [libffi port](native/libffi/README.md).
+The [runtime assembler](python/cpython/README.md) combines those verified stdlib
+extensions and providers with a process runtime without relinking its interpreter.
 Build tools and native helper interpreters stay on the host. Runtime bundles
 contain the guest interpreter, standard library, license notices, and a manifest
 of file hashes. Verification checks integrity against trusted build inputs.
@@ -161,7 +164,9 @@ verifiers because those behaviors span ports. Repository gates are
 ## Supported profiles and remaining work
 
 SDK 34 dynamic linking supports separate C/C++ extensions, shared libraries,
-canonical C++ exceptions, NumPy and Kiwi. Library loading uses only the VFS and
+canonical C++ exceptions and setjmp/longjmp, NumPy and Kiwi. The libffi backend
+supports primitive and pointer calls and callbacks, with up to 16 arguments;
+aggregate and variadic signatures are explicitly rejected. Library loading uses only the VFS and
 is bounded by resource accounting. TLS, unloading, cyclic native dependencies,
 and live loading across threads remain unsupported by this cohort.
 
@@ -174,5 +179,5 @@ contract. ABI identifiers prevent mixing these profiles.
 The tested task set includes two Codeelo tasks, one CalibForge task, and a native
 build variant of a Codeelo task. It does not establish broad Tasktrove coverage.
 NumPy retains documented floating-point warning/exception-policy limits. Static
-Pillow omits several optional codecs. SciPy, dynamic Pillow, upstream ctypes,
+Pillow omits several optional codecs. SciPy, dynamic Pillow,
 threaded dynamic loading, and Reasoning Gym still require further acceptance.

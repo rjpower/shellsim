@@ -20,18 +20,22 @@
     "threads": false,
     "virtual_posix_descriptors": "shellsim_posix_v1",
     "virtual_umask": true,
-    "virtual_cwd": true
+    "virtual_cwd": true,
+    "sjlj_exception_tag": "env.__c_longjmp",
+    "sjlj_runtime_owner": "main-executable"
   },
   "runtime_archives": [
     "../libc.a",
     "../libc-printscan-long-double.a",
     "libc++.a",
     "libc++abi.a",
-    "libunwind.a"
+    "libunwind.a",
+    "../libsetjmp.a"
   ],
   "main_link_flags": [
     "-Wl,--export-all,--export-table,--growable-table,--export=__stack_pointer,--export=__cpp_exception",
-    "-Wl,--wrap=dlopen,--wrap=dlsym,--wrap=dlerror,--wrap=dlclose"
+    "-Wl,--wrap=dlopen,--wrap=dlsym,--wrap=dlerror,--wrap=dlclose",
+    "-Wl,--export=__wasm_setjmp,--export=__wasm_setjmp_test,--export=__wasm_longjmp,--export=__c_longjmp"
   ],
   "side_link_flags": [
     "-fPIC",
@@ -47,7 +51,7 @@
     },
     {
       "file": "../../python/cpython/dynamic.py",
-      "sha256": "dc4f25e943b36fdc93a6b99f22a5e2028937bc39e4d0648f83cca086a211455c"
+      "sha256": "175a6f570851e3318dac7345a5b2aa410475b6ed862765b74623ed8051de2df1"
     },
     {
       "file": "../../_support/wasm.py",
@@ -68,6 +72,10 @@
     {
       "file": "posix.h",
       "sha256": "031eac921644625f3f6923c224fe1341831e4340fc2d13bea7fee7ad3ccd38ee"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
     }
   ],
   "runtime_sources": {
