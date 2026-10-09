@@ -101,11 +101,11 @@ static int control(int fd, unsigned operation, int argument) {
 int dup(int fd) { return control(fd, 3, 0); }
 int dup2(int fd, int destination) { return control(fd, 5, destination); }
 int __dup3(int fd, int destination, int flags) {
-    if (fd == destination || flags) {
+    if (fd == destination || (flags & ~O_CLOEXEC)) {
         errno = EINVAL;
         return -1;
     }
-    return dup2(fd, destination);
+    return flags ? control(fd, 6, destination) : dup2(fd, destination);
 }
 int dup3(int fd, int destination, int flags) { return __dup3(fd, destination, flags); }
 
@@ -131,8 +131,8 @@ int fcntl(int fd, int command, ...) {
                  | state.fs_flags;
         }
         case F_SETFL: {
-            if (argument & ~(O_APPEND | O_ACCMODE)) { errno = EINVAL; return -1; }
-            int error = __wasi_fd_fdstat_set_flags(fd, argument & O_APPEND);
+            if (argument & ~(O_APPEND | O_NONBLOCK | O_ACCMODE)) { errno = EINVAL; return -1; }
+            int error = __wasi_fd_fdstat_set_flags(fd, argument & (O_APPEND | O_NONBLOCK));
             if (error) { errno = error; return -1; }
             return 0;
         }

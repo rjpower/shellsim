@@ -27,12 +27,15 @@ pub struct DescriptorState {
     pub readable: bool,
     pub writable: bool,
     pub kind: DescriptorKind,
+    /// File status shared by all aliases of this open description.
+    pub nonblocking: bool,
 }
 
 /// Types needed by guest descriptor APIs without exposing arena identities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorKind {
     File,
+    Directory,
     Device,
     Stream,
 }
@@ -105,6 +108,13 @@ pub enum IoPoll<T> {
     Blocked(IoWait),
 }
 
+/// Non-consuming readiness information for WASI poll events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DescriptorReady {
+    pub bytes: u64,
+    pub hangup: bool,
+}
+
 /// Exact pipe condition needed to resume a blocked descriptor operation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoWait {
@@ -115,6 +125,9 @@ pub enum IoWait {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum OpenDescription {
+    Directory {
+        path: String,
+    },
     Input {
         bytes: Vec<u8>,
         cursor: usize,
@@ -150,6 +163,7 @@ enum OpenDescription {
 struct DescriptionEntry {
     description: OpenDescription,
     references: u32,
+    nonblocking: bool,
 }
 
 #[derive(Clone)]
@@ -188,6 +202,27 @@ impl Default for DescriptorArena {
 }
 
 impl DescriptorArena {
+    pub(crate) fn open_directory(
+        &mut self,
+        path: String,
+    ) -> Result<DescriptionId, DescriptorError> {
+        self.allocate(OpenDescription::Directory { path })
+    }
+
+    pub(crate) fn directory_path(&self, id: DescriptionId) -> Result<&str, DescriptorError> {
+        match &self
+            .descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .description
+        {
+            OpenDescription::Directory { path } => Ok(path),
+            _ => Err(DescriptorError::WrongAccess),
+        }
+    }
+    pub(crate) fn contains_pipe(&self, id: PipeId) -> bool {
+        self.pipes.contains_key(&id)
+    }
     pub fn new() -> Self {
         Self {
             next_description: 1,
@@ -422,6 +457,7 @@ impl DescriptorArena {
             DescriptionEntry {
                 description,
                 references: 0,
+                nonblocking: false,
             },
         );
         Ok(id)
@@ -443,15 +479,9 @@ impl DescriptorArena {
         if entry.references != 0 {
             return Err(DescriptorError::WrongAccess);
         }
-        let description = self
-            .descriptions
-            .remove(&id)
-            .expect("description was checked above")
-            .description;
-        if let OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) = description {
-            self.pipes.remove(&pipe);
-        }
-        Ok(())
+        // Use endpoint lifetime accounting even when its sibling was already installed.
+        self.retain(id)?;
+        self.release(id)
     }
 
     fn retain(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
@@ -674,7 +704,9 @@ impl DescriptorArena {
                 DeviceKind::Urandom => "/dev/urandom",
             }
             .to_string(),
-            OpenDescription::File { path, .. } => path.clone(),
+            OpenDescription::File { path, .. } | OpenDescription::Directory { path } => {
+                path.clone()
+            }
             OpenDescription::PipeReader(pipe) | OpenDescription::PipeWriter(pipe) => {
                 format!("pipe:[{pipe}]")
             }
@@ -689,6 +721,7 @@ impl DescriptorArena {
             .ok_or(DescriptorError::InvalidFd)?
             .description;
         let (readable, writable, kind) = match description {
+            OpenDescription::Directory { .. } => (true, false, DescriptorKind::Directory),
             OpenDescription::Input { .. } | OpenDescription::PipeReader(_) => {
                 (true, false, DescriptorKind::Stream)
             }
@@ -709,7 +742,75 @@ impl DescriptorArena {
             readable,
             writable,
             kind,
+            nonblocking: self.descriptions[&id].nonblocking,
         })
+    }
+
+    /// Change the shared blocking flag without changing access rights or endpoint lifetime.
+    pub(crate) fn set_nonblocking(
+        &mut self,
+        id: DescriptionId,
+        enabled: bool,
+    ) -> Result<(), DescriptorError> {
+        self.descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .nonblocking = enabled;
+        Ok(())
+    }
+
+    /// Check readiness without consuming bytes, moving cursors, or writing to a pipe.
+    pub(crate) fn readiness(
+        &self,
+        id: DescriptionId,
+        writing: bool,
+    ) -> Result<IoPoll<DescriptorReady>, DescriptorError> {
+        let state = self.state(id)?;
+        if (writing && !state.writable) || (!writing && !state.readable) {
+            return Err(DescriptorError::WrongAccess);
+        }
+        let description = &self.descriptions[&id].description;
+        match description {
+            OpenDescription::Input { .. } if !self.input_readable(id) => {
+                Ok(IoPoll::Blocked(IoWait::InputReadable(id)))
+            }
+            OpenDescription::PipeReader(pipe) if !self.pipe_readable(*pipe) => {
+                Ok(IoPoll::Blocked(IoWait::PipeReadable(*pipe)))
+            }
+            OpenDescription::PipeWriter(pipe) if !self.pipe_writable(*pipe) => {
+                Ok(IoPoll::Blocked(IoWait::PipeWritable(*pipe)))
+            }
+            _ => {
+                let (bytes, hangup) = match description {
+                    OpenDescription::Input {
+                        bytes,
+                        cursor,
+                        closed,
+                    } => (bytes.len().saturating_sub(*cursor) as u64, *closed),
+                    OpenDescription::PipeReader(pipe) => {
+                        let pipe = &self.pipes[pipe];
+                        (pipe.bytes.len() as u64, pipe.writers == 0)
+                    }
+                    OpenDescription::PipeWriter(pipe) => {
+                        let pipe = &self.pipes[pipe];
+                        (
+                            if pipe.readers == 0 {
+                                0
+                            } else {
+                                pipe.capacity.saturating_sub(pipe.bytes.len()) as u64
+                            },
+                            pipe.readers == 0,
+                        )
+                    }
+                    OpenDescription::Capture { bytes, .. } => {
+                        (MAX_CAPTURE_BYTES.saturating_sub(bytes.len()) as u64, false)
+                    }
+                    OpenDescription::Device { .. } => (DEVICE_READ_QUANTUM as u64, false),
+                    _ => (0, false),
+                };
+                Ok(IoPoll::Ready(DescriptorReady { bytes, hangup }))
+            }
+        }
     }
 
     /// Return the VFS-specific state for a file description.
@@ -1107,4 +1208,63 @@ mod tests {
             })
         );
     }
+}
+#[test]
+fn readiness_is_non_consuming_and_nonblocking_is_shared() {
+    let mut arena = DescriptorArena::new();
+    let (reader, writer) = arena.open_pipe(2).unwrap();
+    let mut fds = FdTable::new();
+    fds.install(5, reader, &mut arena).unwrap();
+    fds.install(6, writer, &mut arena).unwrap();
+    fds.duplicate(5, 7, &mut arena).unwrap();
+    arena.set_nonblocking(reader, true).unwrap();
+    assert!(arena.state(fds.get(7).unwrap()).unwrap().nonblocking);
+    assert_eq!(
+        arena.readiness(reader, false).unwrap(),
+        IoPoll::Blocked(IoWait::PipeReadable(1))
+    );
+    assert_eq!(
+        arena.readiness(writer, true).unwrap(),
+        IoPoll::Ready(DescriptorReady {
+            bytes: 2,
+            hangup: false
+        })
+    );
+    assert_eq!(arena.write(writer, b"ab").unwrap(), IoPoll::Ready(2));
+    assert_eq!(
+        arena.readiness(reader, false).unwrap(),
+        IoPoll::Ready(DescriptorReady {
+            bytes: 2,
+            hangup: false
+        })
+    );
+    assert_eq!(
+        arena.readiness(writer, true).unwrap(),
+        IoPoll::Blocked(IoWait::PipeWritable(1))
+    );
+    assert_eq!(
+        arena.read(reader, 2).unwrap(),
+        IoPoll::Ready(b"ab".to_vec())
+    );
+    fds.close(6, &mut arena).unwrap();
+    assert_eq!(
+        arena.readiness(reader, false).unwrap(),
+        IoPoll::Ready(DescriptorReady {
+            bytes: 0,
+            hangup: true
+        })
+    );
+    assert_eq!(arena.read(reader, 2).unwrap(), IoPoll::Ready(Vec::new()));
+}
+
+#[test]
+fn discarding_uninstalled_endpoint_preserves_installed_sibling() {
+    let mut arena = DescriptorArena::new();
+    let (reader, writer) = arena.open_pipe(2).unwrap();
+    let mut fds = FdTable::new();
+    fds.install(5, reader, &mut arena).unwrap();
+    arena.discard_unreferenced(writer).unwrap();
+    assert_eq!(arena.read(reader, 1).unwrap(), IoPoll::Ready(Vec::new()));
+    fds.close(5, &mut arena).unwrap();
+    assert!(arena.pipes.is_empty());
 }

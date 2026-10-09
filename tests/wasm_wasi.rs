@@ -621,7 +621,7 @@ fn wasi_rejects_unsupported_open_flags_explicitly() {
           (func (export "_start")
             (call $exit
               (call $open (i32.const 3) (i32.const 0) (i32.const 64) (i32.const 4)
-                (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 4) (i32.const 0)))))
+                (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 2) (i32.const 0)))))
     "#,
     );
     assert_eq!(run(&mut environment, "/app").0, 28);
@@ -1016,11 +1016,78 @@ fn timeout_interrupts_a_guest_clock_wait() {
 }
 
 #[test]
-fn guest_descriptor_poll_is_explicitly_unsupported() {
+fn guest_descriptor_poll_reports_access_errors_in_events() {
     let mut environment = Environment::new();
-    install(&mut environment, &sleeper(1, 0));
-    // WASI errno 58 is ENOTSUP.
-    assert_eq!(run(&mut environment, "/app"), (58, Vec::new(), Vec::new()));
+    let fixture = sleeper(1, 0).replace("(i32.store (i32.const 500)",
+        "(if (i32.ne (i32.load16_u (i32.const 208)) (i32.const 8)) (then unreachable)) (i32.store (i32.const 500)");
+    install(&mut environment, &fixture);
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (17, b"done\n".to_vec(), Vec::new())
+    );
+}
+
+#[test]
+fn guest_descriptor_poll_reports_eof_without_waiting_for_clock() {
+    let mut environment = Environment::new();
+    let fixture = sleeper(1, 0).replacen(
+        "(i32.store (i32.const 16) (i32.const 1))",
+        "(i32.store (i32.const 16) (i32.const 0))",
+        1,
+    );
+    install(&mut environment, &fixture);
+    assert_eq!(
+        run(&mut environment, "/app"),
+        (17, b"done\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.clock.monotonic_ns(), 0);
+}
+
+#[test]
+fn posix_spawn_pipe_poll_and_wait_use_virtual_child_readiness() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+        (import "shellsim_posix_v1" "process_pipe" (func $pipe (param i32 i32 i32) (result i32)))
+        (import "shellsim_posix_v1" "process_spawn" (func $spawn (param i32 i32 i32 i32 i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "shellsim_posix_v1" "process_wait" (func $wait (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 1000) "/bin/sh\00-c\00sleep 1; printf z\00")
+        (func (export "_start")
+            (if (call $pipe (i32.const 4) (i32.const 40) (i32.const 44)) (then unreachable))
+            (i32.store (i32.const 64) (i32.const 1000))
+            (i32.store (i32.const 68) (i32.const 1008))
+            (i32.store (i32.const 72) (i32.const 1011))
+            (i32.store (i32.const 200) (i32.const 2))
+            (i32.store (i32.const 204) (i32.load (i32.const 44)))
+            (i32.store (i32.const 208) (i32.const 1))
+            (i32.store (i32.const 224) (i32.const 3))
+            (i32.store (i32.const 228) (i32.const 3))
+            (if (call $spawn (i32.const 1000) (i32.const 64) (i32.const 3) (i32.const 84) (i32.const 0)
+                (i32.const 200) (i32.const 2) (i32.const 0) (i32.const 0) (i32.const 32)) (then unreachable))
+            (if (call $close (i32.load (i32.const 44))) (then unreachable))
+            (i64.store (i32.const 0) (i64.const 7))
+            (i32.store8 (i32.const 8) (i32.const 1))
+            (i32.store (i32.const 16) (i32.load (i32.const 40)))
+            (i64.store (i32.const 48) (i64.const 9))
+            (i32.store (i32.const 64) (i32.const 1))
+            (i64.store (i32.const 72) (i64.const 2000000000))
+            (if (call $poll (i32.const 0) (i32.const 120) (i32.const 2) (i32.const 96)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 120)) (i64.const 7)) (then unreachable))
+            (i32.store (i32.const 300) (i32.const 400))
+            (i32.store (i32.const 304) (i32.const 1))
+            (if (call $read (i32.load (i32.const 40)) (i32.const 300) (i32.const 1) (i32.const 308)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 400)) (i32.const 122)) (then unreachable))
+            (if (call $wait (i32.load (i32.const 32)) (i32.const 0) (i32.const 312) (i32.const 316)) (then unreachable))
+            (if (i32.load (i32.const 312)) (then unreachable))
+            (if (call $close (i32.load (i32.const 40))) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(environment.clock.monotonic_ns(), 1_000_000_000);
 }
 
 #[test]

@@ -1,0 +1,27 @@
+{
+  "name": "shellsim-wasi-process",
+  "version": "1",
+  "status": "integration-in-progress",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "target": "wasm32-wasip1",
+  "cpython": "3.13.7",
+  "sdk": {
+    "version": "34.0",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "cpython_source_sha256": {
+    "Modules/posixmodule.c": "d7c234fe19bf204c9c776caf9e4619a0327ff535e6f4fc29f5bcd6f9b1a98eaf",
+    "Modules/signalmodule.c": "6e96fc7d9bec3b56687deb90bdd9644f26450cf9cd5693278777ebc1f0370090",
+    "Lib/subprocess.py": "21ecc4c8f4fcf641974fc0d9cc28e97b07670ed1cef7e9d96769b31bb8345586",
+    "Modules/faulthandler.c": "d9db230f54d4c5d16e176a32cb7f3dc654fa6570f3ebef989bb50377343f8c30"
+  },
+  "patch_sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
+  "port_sources_sha256": {
+    "build.py": "a6309f16ec8c7c7a0fda492f11cad9397f368230dc1dd2bf20b78d5a9c762ae5",
+    "process.c": "004243b456e116ac756fba7a8ecc9c0bff4164cab1586921e23480f136ae2d26",
+    "process_abi.h": "2469b06987ee082c407b100d941f60d57245c69d2f5a842ad423cced50474063",
+    "process_port.h": "2089b30e1ad2f57bdcc91bbfc70a0fdd87399e0355afa6e71c0645b093437ee0",
+    "spawn.h": "099b12b83babaa658eada6b8848a49822e7d0c3ba9c2d548d0a5cc60fd235108",
+    "sys/wait.h": "aabcb78324279b198a4599bc9e800e04ac639ea4fff695409bbec9c3bd3b1698"
+  }
+}

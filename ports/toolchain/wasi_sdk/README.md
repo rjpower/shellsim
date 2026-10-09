@@ -46,10 +46,18 @@ Duplication shares virtual open descriptions and file cursors. CLOEXEC is a
 per-process descriptor flag: `dup` clears it, `F_DUPFD_CLOEXEC` sets it, fork
 copies it, and successful exec closes flagged aliases. `dup2(fd, fd)` preserves
 the entry. Append status belongs to the shared description and survives aliases
-and fork. Null-device reads return EOF and writes discard bytes, with the
+and fork. Nonblocking status also belongs to the shared description. Null-device reads return EOF and writes discard bytes, with the
 requested read/write access enforced. Descriptor 3 and 4 remain reserved WASI
 preopens; this profile rejects replacing them. Unsupported fcntl commands and
-nonzero dup3 flags fail explicitly. The adapter owns no host handles.
+dup3 flags fail explicitly. The adapter owns no host handles.
+
+The [process profile](../wasi_process/README.md) adds a pinned nonzero
+`O_CLOEXEC` flag, virtual pipes, process identity, spawn, wait, and signals.
+Its canonical wrappers and kernel use the same flag definition. Open directory
+descriptors are kernel-owned and survive duplication and child inheritance;
+WASI preopens are recreated separately for each guest. FD polling reports
+available bytes and pipe hangup without consuming input. Pipe capacity, launch
+arguments, and temporary spawn decoding are charged before allocation.
 
 WASI file resizing uses the VFS disk budget, meters growth before allocation,
 and preserves cursor and unlinked-file identity. Temporary growth reservations

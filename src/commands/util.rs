@@ -306,24 +306,23 @@ pub(crate) fn resolve_executable_in(
     // An absent PATH uses the guest's default utility search path. An explicit empty PATH
     // still names the current directory, as it does in a shell path list.
     let path_value = path_value.unwrap_or("/bin:/usr/bin");
-    let candidates = if name.contains('/') {
-        vec![crate::vfs::resolve_against(cwd, name)]
-    } else {
-        path_value
-            .split(':')
-            .map(|directory| {
-                let directory = if directory.is_empty() {
-                    cwd.to_string()
-                } else {
-                    crate::vfs::resolve_against(cwd, directory)
-                };
-                crate::vfs::resolve_against(&directory, name)
-            })
-            .collect()
-    };
+    let direct = name.contains('/');
+    let absolute = direct.then(|| crate::vfs::resolve_against(cwd, name));
+    // Stream PATH candidates: retaining their cross product with a guest name can otherwise
+    // allocate far more than either bounded input string.
+    let candidates = absolute
+        .into_iter()
+        .chain(path_value.split(':').filter(|_| !direct).map(|directory| {
+            let directory = if directory.is_empty() {
+                cwd.to_string()
+            } else {
+                crate::vfs::resolve_against(cwd, directory)
+            };
+            crate::vfs::resolve_against(&directory, name)
+        }));
     let mut denied = None;
     for path in candidates {
-        let Ok(metadata) = vfs.metadata("/", &path, true) else {
+        let Ok(metadata) = vfs.metadata_ref("/", &path, true) else {
             continue;
         };
         if matches!(

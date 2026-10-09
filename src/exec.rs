@@ -2968,6 +2968,7 @@ pub(crate) fn poll_machine(
     if let Some(delivery) = interp.take_signal_delivery() {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
+                interp.processes.mark_signal_termination(owner_pid, signal);
                 let status = 128 + signal.number();
                 if let Some(mut program) = interp.process.program.take() {
                     program.release_owned_memory(interp);
@@ -3159,6 +3160,7 @@ fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
     if let Some(delivery) = interp.take_signal_delivery() {
         match delivery {
             crate::interp::SignalDelivery::Terminate(signal) => {
+                interp.processes.mark_signal_termination(owner, signal);
                 let status = 128 + signal.number();
                 if let Some(mut program) = interp.process.program.take() {
                     program.release_owned_memory(interp);

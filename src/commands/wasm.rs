@@ -41,6 +41,7 @@ use super::util::ewln;
 
 mod dynamic;
 mod limits;
+mod posix_process;
 
 // The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
 const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
@@ -53,8 +54,6 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
 const MAX_CACHED_MODULES: usize = 4;
-// Directory handles occupy an adapter-only range above the kernel's bounded regular fds.
-const FIRST_DIRECTORY_FD: u32 = 1024;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
@@ -346,7 +345,6 @@ struct Host {
     open_files: BTreeSet<i32>,
     /// Buffered aliases retain the original stream when dup2 redirects a standard fd.
     buffered_streams: BTreeMap<i32, i32>,
-    directories: BTreeMap<u32, String>,
     limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
     dynamic: dynamic::Dynamic,
@@ -395,6 +393,7 @@ fn syscall_errno(error: &SyscallError) -> i32 {
         SyscallError::Permission => ERRNO_PERM,
         SyscallError::ResourceExhausted => ERRNO_INVAL,
         SyscallError::NoSuchProcess | SyscallError::Process(_) => ERRNO_INVAL,
+        SyscallError::ExecutableFormat => 45,
     }
 }
 
@@ -429,7 +428,8 @@ fn guest_descriptor(caller: &mut Caller<'_, Host>, fd: i32) -> Result<Descriptor
 }
 
 /// POSIX descriptor operations use virtual aliases, never host handles. Operations are
-/// 1=get CLOEXEC, 2=set CLOEXEC, 3=dup above minimum, 4=dup with CLOEXEC, 5=dup2.
+/// 1=get CLOEXEC, 2=set CLOEXEC, 3=dup above minimum, 4=dup with CLOEXEC,
+/// 5=dup2, 6=dup3 with CLOEXEC.
 fn descriptor_control(
     mut caller: Caller<'_, Host>,
     fd: i32,
@@ -471,13 +471,14 @@ fn descriptor_control(
         });
     }
     let upper = MAX_FDS_PER_PROCESS as i32 + 5;
-    if !(3..=5).contains(&operation)
+    if !(3..=6).contains(&operation)
         || !(0..upper).contains(&argument)
-        || (operation == 5 && (argument == 3 || argument == 4))
+        || (operation >= 5 && (argument == 3 || argument == 4))
+        || (operation == 6 && argument == fd)
     {
         return Ok(ERRNO_INVAL);
     }
-    let destination = if operation == 5 {
+    let destination = if operation >= 5 {
         argument
     } else {
         let host = caller.data_mut();
@@ -495,7 +496,7 @@ fn descriptor_control(
     {
         return Ok(syscall_errno(&error));
     }
-    if operation == 4 {
+    if operation == 4 || operation == 6 {
         caller
             .data_mut()
             .machine
@@ -638,12 +639,9 @@ fn preopen_base(caller: &Caller<'_, Host>, fd: u32) -> Result<String, i32> {
     match fd {
         3 => Ok(caller.data().cwd.clone()),
         4 => Ok("/".to_string()),
-        _ => caller
-            .data()
-            .directories
-            .get(&fd)
-            .cloned()
-            .ok_or(ERRNO_BADF),
+        _ => ActiveSystem::new(&mut caller.data().machine.get())
+            .directory_path(fd as i32)
+            .map_err(|error| syscall_errno(&error)),
     }
 }
 
@@ -664,27 +662,63 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
         if request.oflags & !2 != 0 || request.fdflags & !4 != 0 {
             return ERRNO_INVAL;
         }
-        let Some(fd) = (FIRST_DIRECTORY_FD..FIRST_DIRECTORY_FD + MAX_DIRECTORY_HANDLES)
-            .find(|fd| !caller.data().directories.contains_key(fd))
-        else {
-            return ERRNO_NOSPC;
+        let directory_count = {
+            let machine = caller.data().machine.get();
+            machine
+                .process
+                .fds
+                .iter()
+                .filter(|(_, id)| {
+                    machine
+                        .descriptors
+                        .state(*id)
+                        .is_ok_and(|state| state.kind == DescriptorKind::Directory)
+                })
+                .count()
         };
+        if directory_count >= MAX_DIRECTORY_HANDLES as usize {
+            return ERRNO_NOSPC;
+        }
         let path = resolve_against(&cwd, &path);
         if path.len() > 4096 {
             return ERRNO_INVAL;
         }
-        if !write_u32(&mut caller, request.result, fd) {
+        let fd = match ActiveSystem::new(&mut caller.data_mut().machine.get()).open_file(
+            "/",
+            &path,
+            OpenFile {
+                readable: true,
+                writable: false,
+                create: false,
+                exclusive: false,
+                truncate: false,
+                append: false,
+            },
+        ) {
+            Ok(fd) => fd,
+            Err(error) => return syscall_errno(&error),
+        };
+        if request.fdflags & 4 != 0 {
+            let mut machine = caller.data_mut().machine.get();
+            let description = machine
+                .process
+                .fds
+                .get(fd)
+                .expect("new directory descriptor");
+            machine
+                .descriptors
+                .set_nonblocking(description, true)
+                .expect("new directory description");
+        }
+        if !write_u32(&mut caller, request.result, fd as u32) {
+            let _ = ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd);
             return ERRNO_FAULT;
         }
-        // Paths and handle count are bounded independently of guest-controlled allocation.
-        caller.data_mut().directories.insert(fd, path);
+        caller.data_mut().open_files.insert(fd);
         return ERRNO_SUCCESS;
     }
     if request.oflags & 2 != 0 {
         return info.map_or_else(|error| syscall_errno(&error), |_| ERRNO_NOTDIR);
-    }
-    if request.fdflags & 4 != 0 {
-        return ERRNO_INVAL;
     }
     let readable = request.rights_base & 2 != 0;
     let writable = request.rights_base & 64 != 0;
@@ -708,6 +742,14 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
     }
     let host = caller.data_mut();
     host.open_files.insert(fd);
+    if request.fdflags & 4 != 0 {
+        let mut machine = host.machine.get();
+        let description = machine.process.fds.get(fd).expect("new file descriptor");
+        machine
+            .descriptors
+            .set_nonblocking(description, true)
+            .expect("new open description");
+    }
     ERRNO_SUCCESS
 }
 
@@ -879,18 +921,18 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
             value[0] = 3;
             u64::MAX
         }
-        _ if caller.data().directories.contains_key(&fd) => {
-            value[0] = 3;
-            u64::MAX
-        }
         _ => match guest_descriptor(&mut caller, fd as i32) {
             Ok(state) => {
-                value[0] = if state.kind == DescriptorKind::File {
-                    4
-                } else {
-                    2
+                value[0] = match state.kind {
+                    DescriptorKind::File => 4,
+                    DescriptorKind::Directory => 3,
+                    _ => 2,
                 };
-                (if state.readable { 2 } else { 0 }) | (if state.writable { 64 } else { 0 })
+                if state.kind == DescriptorKind::Directory {
+                    u64::MAX
+                } else {
+                    (if state.readable { 2 } else { 0 }) | (if state.writable { 64 } else { 0 })
+                }
             }
             Err(error) => return error,
         },
@@ -899,6 +941,9 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
     value[16..24].copy_from_slice(&rights.to_le_bytes());
     if guest_file(&mut caller, fd as i32).is_ok_and(|file| file.append) {
         value[2] = 1;
+    }
+    if guest_descriptor(&mut caller, fd as i32).is_ok_and(|state| state.nonblocking) {
+        value[2] |= 4;
     }
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
@@ -941,14 +986,14 @@ fn fd_filestat_set_size(mut caller: Caller<'_, Host>, fd: i32, size: u64) -> Res
 }
 
 fn fd_fdstat_set_flags(mut caller: Caller<'_, Host>, fd: i32, flags: u32) -> Result<i32, Error> {
-    if flags & !1 != 0 {
+    if flags & !5 != 0 {
         return Ok(ERRNO_INVAL);
     }
     let state = match guest_descriptor(&mut caller, fd) {
         Ok(state) => state,
         Err(error) => return Ok(error),
     };
-    if state.kind != DescriptorKind::File {
+    if flags & 1 != 0 && state.kind != DescriptorKind::File {
         return Ok(ERRNO_INVAL);
     }
     if !ActiveSystem::new(&mut caller.data_mut().machine.get())
@@ -958,17 +1003,20 @@ fn fd_fdstat_set_flags(mut caller: Caller<'_, Host>, fd: i32, flags: u32) -> Res
     }
     let mut machine = caller.data_mut().machine.get();
     let description = machine.process.fds.get(fd).expect("validated descriptor");
+    if state.kind == DescriptorKind::File {
+        machine
+            .descriptors
+            .set_append(description, flags & 1 != 0)
+            .expect("validated regular file");
+    }
     machine
         .descriptors
-        .set_append(description, flags == 1)
-        .expect("validated regular file");
+        .set_nonblocking(description, flags & 4 != 0)
+        .expect("validated descriptor");
     Ok(ERRNO_SUCCESS)
 }
 
 fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
-    if caller.data_mut().directories.remove(&fd).is_some() {
-        return ERRNO_SUCCESS;
-    }
     let fd = fd as i32;
     caller.data_mut().buffered_streams.remove(&fd);
     if (0..=2).contains(&fd) {
@@ -1041,10 +1089,9 @@ fn filestat(info: &FileInfo) -> [u8; 64] {
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
     let descriptor = guest_descriptor(&mut caller, fd as i32);
-    if descriptor
-        .as_ref()
-        .is_ok_and(|state| state.kind != DescriptorKind::File)
-    {
+    if descriptor.as_ref().is_ok_and(|state| {
+        state.kind != DescriptorKind::File && state.kind != DescriptorKind::Directory
+    }) {
         // Standard streams can be pipes, captures, or terminals; they have no regular-file size.
         let mut value = [0; 64];
         value[16] = 2;
@@ -1502,16 +1549,37 @@ fn fd_write(
             destination.extend_from_slice(&bytes);
             bytes.len()
         }
-        _ => match ActiveSystem::new(&mut host.machine.get()).write(fd, &bytes) {
-            Ok(IoPoll::Ready(count)) => count,
-            Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
-            // WASI has no signals. Writing to a pipe without readers ends the guest as the
-            // default SIGPIPE disposition would, so a guest that ignores EPIPE cannot spin.
-            Err(SyscallError::Descriptor(DescriptorError::BrokenPipe)) => {
-                return Err(Error::new(GuestExit(141)));
+        _ => {
+            let outcome = {
+                let mut machine = host.machine.get();
+                ActiveSystem::new(&mut machine).write(fd, &bytes)
+            };
+            match outcome {
+                Ok(IoPoll::Ready(count)) => count,
+                Ok(IoPoll::Blocked(_)) if state.nonblocking => {
+                    return Ok(StreamCall::Done(ERRNO_AGAIN))
+                }
+                Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
+                Err(SyscallError::Descriptor(DescriptorError::BrokenPipe)) => {
+                    let mut machine = host.machine.get();
+                    if matches!(
+                        machine
+                            .process
+                            .signal_dispositions
+                            .get(&crate::process::Signal::Pipe),
+                        Some(crate::interp::ShellSignalDisposition::Ignore)
+                    ) {
+                        return Ok(StreamCall::Done(64)); // WASI EPIPE.
+                    }
+                    let pid = machine.process.pid;
+                    machine
+                        .processes
+                        .mark_signal_termination(pid, crate::process::Signal::Pipe);
+                    return Err(Error::new(GuestExit(141)));
+                }
+                Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
             }
-            Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
-        },
+        }
     };
     let charged = {
         let mut machine = host.machine.get();
@@ -1540,11 +1608,11 @@ fn fd_read(
     if caller.data().closed_stdio.contains(&fd) {
         return Ok(StreamCall::Done(ERRNO_BADF));
     }
-    match guest_descriptor(caller, fd) {
-        Ok(state) if state.readable => {}
+    let state = match guest_descriptor(caller, fd) {
+        Ok(state) if state.readable => state,
         Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
         Err(error) => return Ok(StreamCall::Done(error)),
-    }
+    };
     let Some(memory) = memory(caller) else {
         return Ok(StreamCall::Done(ERRNO_FAULT));
     };
@@ -1564,6 +1632,9 @@ fn fd_read(
         }
         _ => match ActiveSystem::new(&mut host.machine.get()).read(fd, total) {
             Ok(IoPoll::Ready(bytes)) => bytes,
+            Ok(IoPoll::Blocked(_)) if state.nonblocking => {
+                return Ok(StreamCall::Done(ERRNO_AGAIN))
+            }
             Ok(IoPoll::Blocked(wait)) => return Ok(StreamCall::Blocked(wait_reason(wait))),
             Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
         },
@@ -1594,19 +1665,19 @@ fn fd_read(
     ))
 }
 
-/// A `poll_oneoff` clock subscription resolved to a monotonic deadline.
-struct ClockWait {
+/// One bounded WASI subscription over virtual time or a process descriptor.
+struct PollWait {
     userdata: u64,
-    deadline: u64,
+    kind: PollKind,
 }
 
-/// Decode `poll_oneoff` subscriptions. Only clock subscriptions are supported; descriptor
-/// readiness subscriptions fail with `ENOTSUP` rather than reporting readiness they cannot know.
-fn clock_waits(
-    caller: &mut Caller<'_, Host>,
-    input: u32,
-    count: u32,
-) -> Result<Vec<ClockWait>, i32> {
+enum PollKind {
+    Clock(u64),
+    Descriptor { fd: i32, writing: bool },
+}
+
+/// Decode bounded subscriptions before any scheduler or descriptor side effects.
+fn poll_waits(caller: &mut Caller<'_, Host>, input: u32, count: u32) -> Result<Vec<PollWait>, i32> {
     if count == 0 || count > MAX_POLL_SUBSCRIPTIONS {
         return Err(ERRNO_INVAL);
     }
@@ -1630,7 +1701,15 @@ fn clock_waits(
         .map(|record| {
             match record[8] {
                 0 => {}
-                1 | 2 => return Err(ERRNO_NOTSUP),
+                1 | 2 => {
+                    return Ok(PollWait {
+                        userdata: field(record, 0, 8),
+                        kind: PollKind::Descriptor {
+                            fd: field(record, 16, 4) as i32,
+                            writing: record[8] == 2,
+                        },
+                    })
+                }
                 _ => return Err(ERRNO_INVAL),
             }
             let timeout = field(record, 24, 8);
@@ -1646,98 +1725,145 @@ fn clock_waits(
                 }
                 _ => return Err(ERRNO_INVAL),
             };
-            Ok(ClockWait {
+            Ok(PollWait {
                 userdata: field(record, 0, 8),
-                deadline,
+                kind: PollKind::Clock(deadline),
             })
         })
         .collect()
 }
 
-/// One check of a clock wait against the virtual clock.
-enum ClockStep {
-    Reached(u64),
-    Advanced,
-    Wait,
-}
-
-/// Sleep until the earliest clock subscription expires, then report every expired one.
-///
-/// A scheduled process blocks on a virtual timer like native `sleep`, so other processes run and
-/// a signal can end the wait. A display session has no other processes, so on virtual time it
-/// advances its own clock to the deadline; on real time it suspends until physical time passes.
+/// Wait for virtual descriptor readiness or the earliest clock subscription.
+/// Output ranges are validated before scheduling; readiness checks never perform I/O.
 async fn poll_oneoff(
     mut caller: Caller<'_, Host>,
     (input, output, count, result): (u32, u32, u32, u32),
 ) -> Result<i32, Error> {
-    let waits = match clock_waits(&mut caller, input, count) {
+    let waits = match poll_waits(&mut caller, input, count) {
         Ok(waits) => waits,
         Err(error) => return Ok(error),
-    };
-    let deadline = waits
-        .iter()
-        .map(|wait| wait.deadline)
-        .min()
-        .expect("count > 0");
-    let mut scheduled = false;
-    let now = loop {
-        let host = caller.data_mut();
-        let buffered = matches!(host.stdio, Stdio::Buffered { .. });
-        // The guard is confined to this block: the poller takes the machine back while the
-        // guest is suspended below.
-        let step = {
-            let mut interp = host.machine.get();
-            let now = interp.clock.monotonic_ns();
-            if now >= deadline {
-                ClockStep::Reached(now)
-            } else if buffered && interp.real_time.is_none() {
-                // A virtual session is the only process on its clock, so it jumps to the
-                // deadline. A real-time session waits for physical time, which the session poll
-                // syncs.
-                if interp.clock.advance_to(deadline).is_err() {
-                    return Ok(ERRNO_INVAL);
-                }
-                ClockStep::Advanced
-            } else {
-                if !buffered && !scheduled {
-                    if let Err(error) = ActiveSystem::new(&mut interp).schedule_wake(deadline - now)
-                    {
-                        return Ok(syscall_errno(&error));
-                    }
-                    scheduled = true;
-                }
-                ClockStep::Wait
-            }
-        };
-        match step {
-            ClockStep::Reached(now) => break now,
-            ClockStep::Advanced => continue,
-            ClockStep::Wait => {}
-        }
-        let machine = host.machine.clone();
-        machine
-            .suspend(Suspension::Blocked(WaitReason::Timer(deadline)))
-            .await;
     };
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
-    let mut events = 0u32;
-    for wait in waits.iter().filter(|wait| wait.deadline <= now) {
-        // Event layout: userdata, errno (0), and event type (0 = clock); the rest is zero.
-        let mut event = [0; EVENT_BYTES as usize];
-        event[..8].copy_from_slice(&wait.userdata.to_le_bytes());
-        let address = output as usize + (events * EVENT_BYTES) as usize;
-        if memory.write(&mut caller, address, &event).is_err() {
-            return Ok(ERRNO_FAULT);
-        }
-        events += 1;
+    let length = memory.data(&caller).len();
+    if (output as usize)
+        .checked_add(count as usize * EVENT_BYTES as usize)
+        .is_none_or(|end| end > length)
+        || (result as usize)
+            .checked_add(4)
+            .is_none_or(|end| end > length)
+    {
+        return Ok(ERRNO_FAULT);
     }
-    Ok(if write_u32(&mut caller, result, events) {
-        ERRNO_SUCCESS
-    } else {
-        ERRNO_FAULT
-    })
+    let mut scheduled = None;
+    loop {
+        let mut events = Vec::new();
+        let mut reasons = Vec::new();
+        let now = caller.data_mut().machine.get().clock.monotonic_ns();
+        let mut earliest = None::<u64>;
+        for wait in &waits {
+            let mut available = 0;
+            let mut hangup = false;
+            let (kind, status) = match wait.kind {
+                PollKind::Clock(deadline) => {
+                    earliest = Some(earliest.map_or(deadline, |old| old.min(deadline)));
+                    (
+                        0u8,
+                        if now >= deadline {
+                            Some(ERRNO_SUCCESS)
+                        } else {
+                            None
+                        },
+                    )
+                }
+                PollKind::Descriptor { fd, writing } => {
+                    let status = match guest_descriptor(&mut caller, fd) {
+                        Err(error) => Some(error),
+                        Ok(_) => {
+                            let ready = ActiveSystem::new(&mut caller.data_mut().machine.get())
+                                .descriptor_readiness(fd, writing);
+                            match ready {
+                                Ok(IoPoll::Ready(ready)) => {
+                                    available = ready.bytes;
+                                    hangup = ready.hangup;
+                                    Some(ERRNO_SUCCESS)
+                                }
+                                Ok(IoPoll::Blocked(reason)) => {
+                                    reasons.push(wait_reason(reason));
+                                    None
+                                }
+                                Err(error) => Some(syscall_errno(&error)),
+                            }
+                        }
+                    };
+                    (if writing { 2 } else { 1 }, status)
+                }
+            };
+            if let Some(errno) = status {
+                let mut event = [0u8; EVENT_BYTES as usize];
+                event[..8].copy_from_slice(&wait.userdata.to_le_bytes());
+                event[8..10].copy_from_slice(&(errno as u16).to_le_bytes());
+                event[10] = kind;
+                if kind != 0 && errno == ERRNO_SUCCESS {
+                    event[16..24].copy_from_slice(&available.to_le_bytes());
+                    event[24..26].copy_from_slice(&u16::from(hangup).to_le_bytes());
+                }
+                events.push(event);
+            }
+        }
+        if !ActiveSystem::new(&mut caller.data_mut().machine.get()).charge_cpu(waits.len() as u64) {
+            return Err(exhausted());
+        }
+        if !events.is_empty() {
+            if let Some(event) = scheduled {
+                caller.data_mut().machine.get().clock.cancel(event);
+            }
+            for (index, event) in events.iter().enumerate() {
+                memory.write(
+                    &mut caller,
+                    output as usize + index * EVENT_BYTES as usize,
+                    event,
+                )?;
+            }
+            return Ok(if write_u32(&mut caller, result, events.len() as u32) {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            });
+        }
+        let host = caller.data_mut();
+        if let Some(deadline) = earliest {
+            let buffered = matches!(host.stdio, Stdio::Buffered { .. });
+            let mut interp = host.machine.get();
+            if buffered && reasons.is_empty() && interp.real_time.is_none() {
+                if interp.clock.advance_to(deadline).is_err() {
+                    return Ok(ERRNO_INVAL);
+                }
+                continue;
+            }
+            if !buffered && scheduled.is_none() {
+                let pid = interp.process.pid;
+                scheduled = match interp
+                    .clock
+                    .schedule_wake_after(u64::from(pid), deadline.saturating_sub(now))
+                {
+                    Ok(event) => Some(event),
+                    Err(_) => return Ok(ERRNO_INVAL),
+                };
+            }
+            reasons.push(WaitReason::Timer(deadline));
+        }
+        let reason = if reasons.len() == 1 {
+            reasons.pop().expect("one wait reason")
+        } else {
+            WaitReason::Any(reasons)
+        };
+        host.machine
+            .clone()
+            .suspend(Suspension::Blocked(reason))
+            .await;
+    }
 }
 
 /// `fd_read` or `fd_write`: descriptor, iovec array, iovec count, and result address.
@@ -1851,6 +1977,7 @@ fn cwd_set(
 
 fn build_linker(engine: &Engine) -> Linker<Host> {
     let mut linker = Linker::<Host>::new(engine);
+    posix_process::register(&mut linker);
     linker
         .func_wrap("shellsim_posix_v1", "cwd_get", cwd_get)
         .expect("unique POSIX import");
@@ -2246,7 +2373,16 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             && !(import.module() == "shellsim_posix_v1"
                 && matches!(
                     import.name(),
-                    "descriptor_control" | "umask" | "cwd_get" | "cwd_set"
+                    "descriptor_control"
+                        | "umask"
+                        | "cwd_get"
+                        | "cwd_set"
+                        | "process_pipe"
+                        | "process_spawn"
+                        | "process_wait"
+                        | "process_kill"
+                        | "process_signal_disposition"
+                        | "process_identity"
                 ))
             && !(dynamic::Abi::from_namespace(import.module()).is_some()
                 && matches!(import.name(), "open" | "symbol" | "error"))
@@ -2378,7 +2514,6 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             BTreeMap::new()
         },
         stdio: launch.stdio,
-        directories: BTreeMap::new(),
         limits: {
             let store = StoreLimitsBuilder::new()
                 .memory_size(memory_limit as usize)
@@ -2462,9 +2597,21 @@ async fn execute(host: Host, linker: Linker<Host>, module: Module, path: String)
         .expect("fuel configured");
     // Concurrent processes share one CPU budget. Charging before each host call keeps a guest
     // from acting after that budget is spent; fuel yields charge compute-only stretches.
-    store.call_hook(|store, hook| {
+    store.call_hook(|mut store, hook| {
         if matches!(hook, CallHook::CallingHost) {
             charge_consumed_fuel(store)
+        } else if matches!(hook, CallHook::ReturningFromHost) {
+            let mut machine = store.data_mut().machine.get();
+            // Cancellation can unwind a suspended host call after the poller has reclaimed
+            // the machine. Signal delivery belongs only to an active guest poll.
+            if let Some(signal) = machine
+                .0
+                .as_mut()
+                .and_then(Interp::take_default_termination)
+            {
+                return Err(Error::new(GuestExit(128 + signal.number())));
+            }
+            Ok(())
         } else {
             Ok(())
         }
