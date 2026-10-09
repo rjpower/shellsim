@@ -1,0 +1,88 @@
+{
+  "name": "numpy",
+  "version": "2.3.5",
+  "target": "wasm32-wasip1",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "wheel_tag": "cp313-cp313-wasm32_wasip1",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/76/65/21b3bc86aac7b8f2862db1e808f1ea22b028e30a225a34a5ede9bf8678f2/numpy-2.3.5.tar.gz",
+    "sha256": "784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0"
+  },
+  "archive_provider_sha256": "16324c0afb368d3d541229cfd86636b1d9abc5df1e0fc13aff924ac14749ab0c",
+  "features": {
+    "blas": "none",
+    "lapack": "internal-c-fallback",
+    "threading": false,
+    "simd": false,
+    "cpp_exceptions": true,
+    "longdouble_format": "IEEE_QUAD_LE",
+    "fft": true,
+    "longdouble_printf": true,
+    "floating_point_exceptions": false
+  },
+  "modules": {
+    "numpy._core._multiarray_umath": [
+      "npymath"
+    ],
+    "numpy.linalg.lapack_lite": [],
+    "numpy.linalg._umath_linalg": [
+      "npymath"
+    ],
+    "numpy.random._bounded_integers": [
+      "npyrandom",
+      "npymath"
+    ],
+    "numpy.random._common": [
+      "npyrandom"
+    ],
+    "numpy.random._mt19937": [
+      "npyrandom"
+    ],
+    "numpy.random._philox": [
+      "npyrandom"
+    ],
+    "numpy.random._pcg64": [
+      "npyrandom"
+    ],
+    "numpy.random._sfc64": [
+      "npyrandom"
+    ],
+    "numpy.random.bit_generator": [
+      "npyrandom"
+    ],
+    "numpy.random._generator": [
+      "npyrandom",
+      "npymath"
+    ],
+    "numpy.random.mtrand": [
+      "npymath"
+    ],
+    "numpy.fft._pocketfft_umath": []
+  },
+  "build_scripts": [
+    {
+      "file": "dynamic.py",
+      "sha256": "2b43787c9e70c1b6caf0ec90879e67e04e3a80c5989068208fb3910304294e44"
+    },
+    {
+      "file": "build.py",
+      "sha256": "939ece342a6d25a054fe7a5b0c1f884d860c78baaeeb9eaec097045e4be82d14"
+    },
+    {
+      "file": "../dynamic/build.py",
+      "sha256": "04233ccffa2b2ab33667a2caf2eb512c4a71f04ef0b450b64426da643bf28ef7"
+    },
+    {
+      "file": "../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../cpython/build.py",
+      "sha256": "52cad42c23d167f16990e68e5a0448ab5e87d83add052e801777691ce7623ec9"
+    },
+    {
+      "file": "../toolchain/wasi_sdk/build.py",
+      "sha256": "e7be5dee2c17abe747d95e3a7845600aa5b64445b971e9a0328234f27c4e29ef"
+    }
+  ]
+}
