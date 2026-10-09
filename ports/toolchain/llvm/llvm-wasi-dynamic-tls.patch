@@ -1,0 +1,24 @@
+--- a/llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp
++++ b/llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp
+@@ -36,0 +37 @@
++#include "llvm/Support/CommandLine.h"
+@@ -42,0 +44,4 @@
++
++static cl::opt<bool> EnableWasiDynamicTLS(
++    "wasm-enable-wasi-dynamic-tls", cl::Hidden, cl::init(false),
++    cl::desc("Enable dynamic TLS lowering for a WASI dynamic-loader ABI"));
+@@ -2074,4 +2079,5 @@
+-  // Currently only Emscripten supports dynamic linking with threads. Therefore,
+-  // on other targets, if we have thread-local storage, only the local-exec
+-  // model is possible.
+-  auto model = Subtarget->getTargetTriple().isOSEmscripten()
++  // WASI dynamic TLS requires an explicitly opted-in loader cohort. Preserve
++  // the upstream static TLS model for ordinary WASI builds.
++  auto model = (Subtarget->getTargetTriple().isOSEmscripten() ||
++                (EnableWasiDynamicTLS &&
++                 Subtarget->getTargetTriple().isOSWASI()))
+@@ -2079,0 +2086,4 @@
++
++  if (EnableWasiDynamicTLS && Subtarget->getTargetTriple().isOSWASI() &&
++      model == GlobalValue::InitialExecTLSModel)
++    report_fatal_error("WASI dynamic TLS does not support initial-exec TLS", false);

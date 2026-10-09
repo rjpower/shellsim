@@ -1,0 +1,32 @@
+--- a/libc-top-half/musl/src/thread/wasi-threads/futex.c
++++ b/libc-top-half/musl/src/thread/wasi-threads/futex.c
+@@ -6 +6,5 @@
+-weak int __wasilibc_futex_wait_maybe_busy(volatile void *addr, int val, int64_t max_wait_ns);
++/* These imports suspend guest execution through the virtual scheduler. */
++__attribute__((import_module("shellsim_threads_v2"), import_name("wait32")))
++int __shellsim_threads_wait32(volatile int *addr, int val, int64_t timeout_ns);
++__attribute__((import_module("shellsim_threads_v2"), import_name("notify")))
++int __shellsim_threads_notify(volatile int *addr, int count);
+@@ -17 +21 @@
+-    int ret = __builtin_wasm_memory_atomic_wait32((int *)addr, val, max_wait_ns);
++    int ret = __shellsim_threads_wait32((volatile int *)addr, val, max_wait_ns);
+@@ -74,3 +77,0 @@
+-  if (__wasilibc_futex_wait_maybe_busy) {
+-    return __wasilibc_futex_wait_maybe_busy(addr, val, max_wait_ns);
+-  }
+@@ -89 +90 @@
+-	return __builtin_wasm_memory_atomic_notify((int *)addr, count);
++	return __shellsim_threads_notify(addr, count);
+--- a/libc-top-half/musl/src/thread/wasi-threads/wasi_thread_start.s
++++ b/libc-top-half/musl/src/thread/wasi-threads/wasi_thread_start.s
+@@ -7,0 +8,3 @@
++	.functype	__shellsim_threads_notify (i32, i32) -> (i32)
++	.import_module __shellsim_threads_notify, shellsim_threads_v2
++	.import_name __shellsim_threads_notify, notify
+@@ -45 +48 @@
+-	memory.atomic.notify 0
++	call __shellsim_threads_notify
+--- a/libc-top-half/CMakeLists.txt
++++ b/libc-top-half/CMakeLists.txt
+@@ -459 +458,0 @@
+-    musl/src/thread/wasi-threads/__wasilibc_busywait.c

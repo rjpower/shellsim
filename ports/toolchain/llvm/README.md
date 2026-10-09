@@ -44,3 +44,23 @@ initializers is unsupported and must be rejected explicitly.
 The default SDK linker and older runtime cohorts remain separate. A binary
 built with this protocol must be admitted by a matching loader; removing the
 start section without the protocol would skip required initialization.
+
+## Threaded compiler profile
+
+`threaded.py` builds a separate `threaded-recipe.json` cohort with `llc` and
+`wasm-ld`. It preserves the accepted default linker recipe and artifact. The
+threaded recipe adds opt-in WASI dynamic TLS lowering and executable TLS export
+classification; it does not change the default static TLS model.
+
+The executable option `--emit-main-tls-info` requires shared memory and forbids
+shared-library output. It emits a raw uint8 dylink subsection 129 containing the
+vendor string `shellsim.main-tls` and version 1, followed by standard export
+flags identifying every exported TLS symbol. The threaded loader requires this
+classification and resolves those offsets against each Store's `__tls_base`.
+Ordinary data exports retain their normal address convention.
+
+Build the profile with the same host tool and archive arguments as `build.py`,
+using `threaded.py` and a fresh work directory. The output manifest records all
+four patches, the complete driver/helper identity, host tool hashes, both
+compiler binaries and the upstream license. Diagnostic binaries built before
+this driver are evidence only and are not admitted as products of this recipe.

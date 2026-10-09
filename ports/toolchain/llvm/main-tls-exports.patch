@@ -1,0 +1,30 @@
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -74,0 +75 @@
++  bool emitMainTLSInfo;
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -334,0 +335,3 @@
++
++def emit_main_tls_info: FF<"emit-main-tls-info">,
++  HelpText<"Emit versioned main-image TLS export classification">;
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -562,0 +563 @@
++  ctx.arg.emitMainTLSInfo = args.hasArg(OPT_emit_main_tls_info);
+@@ -759,0 +761,2 @@
++  if (ctx.arg.emitMainTLSInfo && (ctx.arg.shared || !ctx.arg.sharedMemory))
++    error("--emit-main-tls-info requires a shared-memory executable");
+--- a/lld/wasm/SyntheticSections.cpp
++++ b/lld/wasm/SyntheticSections.cpp
+@@ -68 +68 @@
+-  return ctx.isPic ||
++  return ctx.arg.emitMainTLSInfo || ctx.isPic ||
+@@ -74,0 +75,7 @@
++
++  if (ctx.arg.emitMainTLSInfo) {
++    SubSection sub(129);
++    writeStr(sub.os, "shellsim.main-tls", "vendor TLS classification protocol");
++    writeUleb128(sub.os, 1, "main TLS protocol version");
++    sub.writeTo(os);
++  }
