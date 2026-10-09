@@ -87,6 +87,7 @@ class CPythonRuntime:
                 or not raw_venv.startswith("/")
                 or raw_venv in {"/", "/usr", "/bin"}
                 or raw_venv.startswith(("/usr/", "/bin/", "/dev/", "/proc/"))
+                or len(raw_venv) > 4096
                 or "\0" in raw_venv
                 or any(part in {".", "..", ""} for part in raw_venv[1:].split("/"))
             ):
@@ -135,8 +136,11 @@ class CPythonRuntime:
 
     def mount(self, environment: Environment) -> None:
         """Mount the verified bundle and select its VFS Python launchers."""
+        if environment._cpython_runtime is not None and environment._cpython_runtime is not self:
+            raise SimulationError("a different CPython runtime is already mounted")
         self._verify()
         environment._native.mount_cpython(str(self.bundle / "rootfs"), self.venv)
+        environment._cpython_runtime = self
 
     def run(self, environment: Environment, argv: Sequence[str], *, stdin: bytes = b"") -> RunResult:
         """Run interpreter arguments such as ``('-c', 'print(42)')`` in the VFS."""

@@ -363,9 +363,10 @@ fn configure_cpython_vfs(
             )?;
         }
     }
-    if let Some(root) = venv {
+    if let Some(root) = venv.as_deref() {
         if !root.starts_with('/')
             || root == "/"
+            || root.len() > 4096
             || ["/usr", "/bin", "/dev", "/proc"]
                 .iter()
                 .any(|reserved| root == *reserved || root.starts_with(&format!("{reserved}/")))
@@ -423,6 +424,27 @@ fn configure_cpython_vfs(
         }
     }
     environment.vfs = staged;
+    if let Some(root) = venv {
+        let venv_bin = format!("{root}/bin");
+        let previous = environment.get_var("PATH");
+        let remaining = previous
+            .as_deref()
+            .map(|path| {
+                path.split(':')
+                    .filter(|entry| *entry != venv_bin)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let path = if remaining.is_empty() {
+            venv_bin
+        } else {
+            format!("{venv_bin}:{}", remaining.join(":"))
+        };
+        environment.set_var("PATH", path);
+        environment.export("PATH");
+        environment.set_var("VIRTUAL_ENV", root);
+        environment.export("VIRTUAL_ENV");
+    }
     Ok(())
 }
 

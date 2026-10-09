@@ -115,18 +115,23 @@ the guest. No default dependency groups are selected; pass each wanted
 group by name. VCS, URL, local path, and non-root editable packages are rejected.
 All installed wheels must pass the same bounded verification and atomic import
 as direct PyPI specs. Both APIs require an idle environment.
+After mounting, `env.install_pypi(...)` and `env.install_lock(...)` use that
+CPython runtime and its WASI package universe. An environment without a
+CPython mount retains its existing Python VM package path.
 
 Mounting a dynamic bundle creates a real isolated venv at `/work/.venv` by
 default. Pass `venv="/app/.venv"` to put it at a task's workspace. The venv has
 `pyvenv.cfg`, its own Python 3.13 site-packages, and `bin/python` launchers;
 CPython reports the venv as `sys.prefix` and `/usr` as `sys.base_prefix`.
 Mounted `/bin` and `/usr/bin` `python`, `python3`, and `python3.13` select the
-WASI interpreter through VFS links. `python3.14` and `Environment.run_python`
-still select shellsim's Python VM. Activate the venv before ordinary task
-commands, or invoke its absolute interpreter path:
+WASI interpreter through VFS links. Mounting also exports `VIRTUAL_ENV` and
+prepends the venv `bin` directory to the environment's existing `PATH`.
+Ordinary shell commands, console scripts, and child processes use this venv
+without an activation command. `python3.14` explicitly selects shellsim's
+Python VM; `Environment.run_python` selects the mounted CPython when present.
 
 ```python
-result = env.run("cd /work; . .venv/bin/activate; python -c 'import sys; print(sys.prefix)'")
+result = env.run("cd /work; python -c 'import sys; print(sys.prefix)'")
 assert result.returncode == 0, result.stderr
 assert result.stdout == b"/work/.venv\n"
 ```
@@ -135,8 +140,8 @@ Installed packages go to the venv site-packages directory. The installer puts
 declared Python console entry points such as `pytest` in the venv `bin` directory
 with a guest interpreter shebang. It rejects raw or non-Python scripts, reserved
 venv command names, and file conflicts before importing package files. Bundle
-mounting and launcher setup form one VFS transaction; a conflict leaves the
-preexisting VFS intact.
+mounting and launcher setup form one transaction; a conflict leaves the
+preexisting VFS and environment variables intact.
 
 Dynamic installation resolves the requirement and dependencies for the exact
 CPython 3.13.7 WASI target. It verifies wheel hashes, wheel contents, native
@@ -188,8 +193,8 @@ The [native dependency foundation](native/README.md) supplies zlib
 when selected, sharing its verified target artifact with Pillow's PNG profile.
 Other optional CPython modules requiring external libraries, including
 ssl, ctypes, and readline, are absent from this build. Unsupported
-WASI capabilities fail explicitly. `Environment.run_python` continues to select
-shellsim's existing Python VM.
+WASI capabilities fail explicitly. Without an explicit CPython mount,
+`Environment.run_python` selects shellsim's existing Python VM.
 
 Run the opt-in package integration test against a built bundle:
 

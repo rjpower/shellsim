@@ -32,14 +32,14 @@ def test_calibforge_candidate_and_original_pytest_in_guest() -> None:
     environment.write_file("/app/reconcile.py", candidate.read_bytes())
     runtime.install_pypi(environment, "pytest==8.4.1")
 
-    empty = environment.run("cd /app; . .venv/bin/activate; python -m pytest -q /tests/test_outputs.py")
+    empty = environment.run("cd /app; python -m pytest -q /tests/test_outputs.py")
     assert empty.returncode == 1, empty.stdout + empty.stderr
     assert b"test_reconciliation_report_exists" in empty.stdout + empty.stderr
     assert b"failed" in empty.stdout + empty.stderr
 
-    candidate_run = environment.run("cd /app; . .venv/bin/activate; python reconcile.py")
+    candidate_run = environment.run("cd /app; python reconcile.py")
     assert candidate_run.returncode == 0, candidate_run.stderr
-    verified = environment.run("cd /app; . .venv/bin/activate; pytest -q /tests/test_outputs.py")
+    verified = environment.run("cd /app; pytest -q /tests/test_outputs.py")
     assert verified.returncode == 0, verified.stdout + verified.stderr
     assert b"17 passed" in verified.stdout
     print(verified.stdout.decode())

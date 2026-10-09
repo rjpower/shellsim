@@ -208,7 +208,7 @@ def test_lock_selects_extras_and_groups_explicitly(tmp_path: Path) -> None:
 def test_dependency_free_lock_is_valid_noop(tmp_path: Path) -> None:
     runtime, environment = _live_runtime()
     lock = _lock_project(tmp_path, runtime, [])
-    runtime.install_lock(environment, lock, project_mounted=True)
+    environment.install_lock(lock, project_mounted=True)
     result = runtime.run(environment, ["-c", "import sys; print(sys.platform)"])
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"wasi\n"

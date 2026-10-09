@@ -73,27 +73,26 @@ def test_original_task_verifier_accepts_solution_and_rejects_wrong_output(
     environment.mount(fixtures / task / "tests", "/tests")
     environment.mkdir("/app", parents=True)
     environment.write_file("/app/solution.py", candidate)
-    activate = "source /work/.venv/bin/activate; "
-    identity = environment.run(activate + "python -c 'import sys; print(sys.platform); print(sys.prefix)'")
+    identity = environment.run("python -c 'import sys; print(sys.platform); print(sys.prefix)'")
     assert identity.returncode == 0, identity.stderr
     assert identity.stdout == b"wasi\n/work/.venv\n"
 
-    result = environment.run(activate + "bash /tests/test.sh")
+    result = environment.run("bash /tests/test.sh")
     assert result.returncode == 0, result.stderr
     assert result.stderr == b""
     assert b"Results: 20/20 passed" in result.stdout
     assert environment.read_file("/logs/verifier/reward.txt").strip() == b"1"
     # The upstream wrapper suppresses pytest's exit; check it independently.
-    verified = environment.run(activate + "python -m pytest -q /tests/test_state.py")
+    verified = environment.run("python -m pytest -q /tests/test_state.py")
     assert verified.returncode == 0, verified.stderr + verified.stdout
     assert b"1 passed" in verified.stdout
 
     environment.write_file("/app/solution.py", "print('incorrect')\n")
-    rejected = environment.run(activate + "bash /tests/test.sh")
+    rejected = environment.run("bash /tests/test.sh")
     assert rejected.returncode == 0, rejected.stderr
     assert rejected.stderr == b""
     assert b"Results: 0/20 passed" in rejected.stdout
     assert environment.read_file("/logs/verifier/reward.txt").strip() == b"0"
-    failed = environment.run(activate + "pytest -q /tests/test_state.py")
+    failed = environment.run("pytest -q /tests/test_state.py")
     assert failed.returncode == 1, failed.stderr + failed.stdout
     assert b"1 failed" in failed.stdout

@@ -78,6 +78,41 @@ def test_dynamic_mount_selects_real_venv_launchers(tmp_path: Path) -> None:
         b"/usr/bin/python3.wasm\n/usr/bin/python3.wasm\n"
     )
     assert environment.run("python3.14 -c 'print(42)'").stdout == b"42\n"
+    assert environment.run('printf \'%s\\n\' "$PATH" "$VIRTUAL_ENV"').stdout == (
+        b"/work/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n/work/.venv\n"
+    )
+    runtime.mount(environment)
+    assert environment.run("printf '%s\\n' \"$PATH\"").stdout.count(b"/work/.venv/bin") == 1
+    with pytest.raises(shellsim.SimulationError, match="different CPython runtime"):
+        shellsim.CPythonRuntime(runtime.bundle).mount(environment)
+
+
+def test_mount_preserves_custom_path_and_failed_mount_environment(tmp_path: Path) -> None:
+    runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
+    environment = shellsim.Environment()
+    environment.run("export PATH=/custom/bin:/usr/bin:/bin")
+    runtime.mount(environment)
+    assert environment.run('printf \'%s\\n\' "$PATH" "$VIRTUAL_ENV"').stdout == (
+        b"/work/.venv/bin:/custom/bin:/usr/bin:/bin\n/work/.venv\n"
+    )
+
+    empty_path = shellsim.Environment()
+    empty_path.run("export PATH=''")
+    runtime.mount(empty_path)
+    assert empty_path.run("printf '%s\\n' \"$PATH\"").stdout == b"/work/.venv/bin:\n"
+    runtime.mount(empty_path)
+    assert empty_path.run("printf '%s\\n' \"$PATH\"").stdout == b"/work/.venv/bin:\n"
+
+    conflicting = shellsim.Environment()
+    conflicting.run("export PATH=/custom/bin:/usr/bin:/bin")
+    conflicting.write_file("/usr/bin/python", b"custom launcher")
+    with pytest.raises(shellsim.SimulationError, match="conflicts"):
+        runtime.mount(conflicting)
+    assert conflicting.run('printf \'%s\\n\' "$PATH" "${VIRTUAL_ENV-unset}"').stdout == (
+        b"/custom/bin:/usr/bin:/bin\nunset\n"
+    )
+    with pytest.raises(shellsim.SimulationError, match="mounted CPython"):
+        conflicting.install_lock("/tmp/uv.lock", project_mounted=True)
 
 
 def test_dynamic_mount_rolls_back_launcher_conflict(tmp_path: Path) -> None:
@@ -284,6 +319,25 @@ def test_magiccube_resolves_transitive_native_numpy(live_universe) -> None:
     )
     assert result.returncode == 0, result.stderr
     assert hashlib.sha256(interpreter.read_bytes()).hexdigest() == before
+
+
+def test_environment_uses_mounted_cpython_for_python_and_console_commands(live_universe) -> None:
+    runtime, environment = live_universe
+    environment.install_pypi("pytest==8.4.1")
+    result = environment.run_python(
+        "import sys; print(sys.prefix); print(sys.argv); print(sys.stdin.read())",
+        argv=("argument with spaces",),
+        stdin=b"guest input",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"/work/.venv\n['-c', 'argument with spaces']\nguest input\n"
+    assert environment.run("pytest --version").stdout == b"pytest 8.4.1\n"
+    child = environment.run(
+        'python -c \'import subprocess; r=subprocess.run(["pytest", "--version"], '
+        "capture_output=True, text=True); print(r.returncode); print(r.stdout.strip())'"
+    )
+    assert child.returncode == 0, child.stderr
+    assert child.stdout == b"0\npytest 8.4.1\n"
 
 
 def test_unavailable_curated_numpy_version_does_not_mutate_vfs(live_universe) -> None:

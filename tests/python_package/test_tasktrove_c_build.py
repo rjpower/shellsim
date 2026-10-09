@@ -46,13 +46,12 @@ def test_guest_compiled_c_candidate_passes_original_verifier(c_task_environment:
     original_binary = environment.read_file("/app/solver")
     assert original_binary.startswith(b"\0asm")
 
-    activate = "source /work/.venv/bin/activate; "
-    result = environment.run(activate + "bash /tests/test.sh")
+    result = environment.run("bash /tests/test.sh")
     assert result.returncode == 0, result.stderr
     assert result.stderr == b""
     assert b"Results: 20/20 passed" in result.stdout
     assert environment.read_file("/logs/verifier/reward.txt").strip() == b"1"
-    verified = environment.run(activate + "pytest -q /tests/test_state.py")
+    verified = environment.run("pytest -q /tests/test_state.py")
     assert verified.returncode == 0, verified.stdout + verified.stderr
     assert b"1 passed" in verified.stdout
 
@@ -60,11 +59,11 @@ def test_guest_compiled_c_candidate_passes_original_verifier(c_task_environment:
     rebuilt = environment.run(build)
     assert rebuilt.returncode == 0, rebuilt.stderr
     assert environment.read_file("/app/solver") != original_binary
-    rejected = environment.run(activate + "bash /tests/test.sh")
+    rejected = environment.run("bash /tests/test.sh")
     assert rejected.returncode == 0, rejected.stderr
     assert rejected.stderr == b""
     assert b"Results: 0/20 passed" in rejected.stdout
     assert environment.read_file("/logs/verifier/reward.txt").strip() == b"0"
-    failed = environment.run(activate + "pytest -q /tests/test_state.py")
+    failed = environment.run("pytest -q /tests/test_state.py")
     assert failed.returncode == 1, failed.stdout + failed.stderr
     assert b"1 failed" in failed.stdout
