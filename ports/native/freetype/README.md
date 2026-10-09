@@ -25,3 +25,21 @@ SHELLSIM_FREETYPE_ARTIFACTS=/tmp/shellsim-freetype \
 The font and license in `tests/fixtures/fonts` come from the pinned Pillow source
 archive. That directory records their hashes and redistribution terms. This
 subset does not claim arbitrary font format or shaping compatibility.
+
+## pkg-config version
+
+The native artifact renders the pinned upstream `builds/unix/freetype2.in`
+template. FreeType 2.13.3 defines `version_info='26:2:20'` in `configure.raw`
+and converts it to `26.2.20` for pkg-config. This is the upstream libtool
+version. The source recipe and `FT_Library_Version` report the semantic release
+`2.13.3`.
+
+Both metadata source files are hashed in artifact inputs. The template preserves
+upstream description and URL; relocatable paths and private dependencies describe
+the selected static TrueType/CFF profile with zlib and libm. A consumer can use
+the upstream version checks without changing package release metadata.
+
+Set `SHELLSIM_FREETYPE_SOURCE`, `SHELLSIM_FREETYPE_PREFIX` and
+`SHELLSIM_FREETYPE_ZLIB_PREFIX` to run the pinned-source and actual pkg-config
+checks in `tests/tooling/test_freetype_port.py`. This metadata correction does
+not enable additional font formats, HarfBuzz or Matplotlib providers.

@@ -159,7 +159,7 @@
   "build_scripts": [
     {
       "file": "build.py",
-      "sha256": "7a2a25f84f4ff495d5626a1c5809a1fa654ed09f13a237482302ccc89452e714"
+      "sha256": "04f219113ef614f0633bd73c82c7b913430dc3422743013a705de5cbb8842684"
     },
     {
       "file": "../dependencies.py",
