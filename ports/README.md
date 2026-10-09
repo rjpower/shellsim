@@ -49,7 +49,7 @@ built zlib extension and provider; optional wheel arguments add the independentl
 built NumPy wheel and the pinned upstream magiccube pure wheel:
 
 ```sh
-uv run --no-project --python 3.13 python ports/dynamic/package_spike.py \
+uv run --no-project --python 3.13 ports/dynamic/package_spike.py \
   --bundle /tmp/shellsim-dynamic-v2 \
   --output /tmp/shellsim-package-universe \
   --numpy-wheel /tmp/shellsim-numpy-dynamic/numpy-2.3.5-cp313-cp313-wasm32_wasip1.whl \
@@ -57,16 +57,20 @@ uv run --no-project --python 3.13 python ports/dynamic/package_spike.py \
 ```
 
 The output contains `catalog.json`, native wheels and providers, and a local
-pure-wheel Simple index for this offline fixture. The installer generates a
-native Simple index from the catalog. A catalog declares `schema_version: 1`,
+pure-wheel Simple index for this offline fixture. The installer generates an
+authoritative Simple index from the catalog. A catalog declares `schema_version: 1`,
 `abi` matching the bundle's `dynamic_abi`, `target: wasm32-wasip1`,
 `python_version: 3.13.7`, `packages` with distribution name, version, relative
 wheel path, and whole-wheel SHA256, and `native_providers` with soname, relative
-path, `/lib` destination, SHA256, and declared native dependencies. Curated
+path, `/lib` destination, SHA256, and declared native dependencies. Curated native
 wheels carry `<distribution>.dist-info/shellsim-native.json` with the same ABI,
 name/version, source and compiler provenance, and each native file's relative
-path, SHA256, and native dependencies. The `pure_index` key can select a local
-Simple index; otherwise pure wheels resolve from PyPI. A curated distribution
+path, SHA256, and native dependencies. The same catalog can contain approved pure
+wheels, including wheels built by the [CellPyLib recipe](cellpylib/README.md).
+Those retain their standard pure tags and need no native manifest. Their source,
+identity and hash remain authoritative, and native files inside them are rejected.
+The `pure_index` key can select a local Simple index; otherwise ordinary pure
+dependencies resolve from PyPI. A curated distribution
 name is authoritative: its unavailable versions do not fall back to PyPI.
 
 ```python
@@ -107,9 +111,9 @@ runtime.install_lock(
 `.`. `project_mounted=True` states that this root is already in the virtual
 filesystem. The installer reads the lock's dependency graph through a frozen,
 offline uv export, then resolves its exact selected pins again for CPython
-3.13.7 on WASI. It uses the local native catalog and configured pure-wheel
+3.13.7 on WASI. It uses the local curated catalog and configured pure-wheel
 index, rather than wheel URLs chosen for the lock creator's host. A missing
-curated native version is an error. A lock with no selected registry dependencies
+curated version is an error. A lock with no selected registry dependencies
 is a valid no-op when its Python range and supported environment markers include
 the guest. No default dependency groups are selected; pass each wanted
 group by name. VCS, URL, local path, and non-root editable packages are rejected.
