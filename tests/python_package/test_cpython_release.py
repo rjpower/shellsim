@@ -65,6 +65,23 @@ def _built(release_inputs: tuple[Path, Path, Path], destination: Path) -> Path:
     return release.build_release(*release_inputs, destination)
 
 
+def _marked_wasm() -> bytes:
+    marker = b"\x0cshellsim.abi" + b"test-wasi-abi"
+    return b"\0asm\x01\0\0\0" + bytes((0, len(marker))) + marker
+
+
+def _provider(universe: Path, name: str, dependencies: list[str]) -> dict:
+    path = universe / name
+    path.write_bytes(_marked_wasm())
+    return {
+        "name": name,
+        "path": name,
+        "destination": "/lib/" + name,
+        "sha256": _sha(path),
+        "native_dependencies": dependencies,
+    }
+
+
 def _edit_archive(descriptor: Path, edit) -> None:
     archive = descriptor.parent / "cohort.zip"
     with zipfile.ZipFile(archive) as source:
@@ -173,6 +190,63 @@ def test_release_rejects_missing_catalogued_wheel(release_inputs, tmp_path):
     descriptor.write_text(json.dumps(data))
     with pytest.raises(shellsim.PackageInstallError, match="curated artifact"):
         shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+
+
+def test_release_rejects_native_wheel_with_missing_provider(release_inputs, tmp_path):
+    runtime, universe, uv = release_inputs
+    wheel = universe / "probe-1.0-cp313-cp313-wasm32_wasip1.whl"
+    extension = _marked_wasm()
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("probe/extension.so", extension)
+        archive.writestr("probe-1.0.dist-info/METADATA", "Name: probe\nVersion: 1.0\n")
+        archive.writestr(
+            "probe-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: false\nTag: cp313-cp313-wasm32_wasip1\n"
+        )
+        archive.writestr(
+            "probe-1.0.dist-info/shellsim-native.json",
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "name": "probe",
+                    "version": "1.0",
+                    "abi": "test-wasi-abi",
+                    "recipe": {},
+                    "artifacts": [
+                        {
+                            "path": "probe/extension.so",
+                            "sha256": hashlib.sha256(extension).hexdigest(),
+                            "native_dependencies": ["libmissing.so"],
+                        }
+                    ],
+                }
+            ),
+        )
+        archive.writestr("probe-1.0.dist-info/RECORD", "")
+    catalog = json.loads((universe / "catalog.json").read_text())
+    catalog["packages"] = [{"name": "probe", "version": "1.0", "wheel": wheel.name, "sha256": _sha(wheel)}]
+    (universe / "catalog.json").write_text(json.dumps(catalog))
+    output = tmp_path / "release"
+    with pytest.raises(shellsim.PackageInstallError, match="missing native provider"):
+        release.build_release(runtime, universe, uv, output)
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    ("providers", "error"),
+    [
+        ([("liborphan.so", ["libmissing.so"])], "missing native provider"),
+        ([("liba.so", ["libb.so"]), ("libb.so", ["liba.so"])], "native provider dependency cycle"),
+    ],
+)
+def test_release_rejects_broken_unselected_provider_closure(release_inputs, tmp_path, providers, error):
+    runtime, universe, uv = release_inputs
+    catalog = json.loads((universe / "catalog.json").read_text())
+    catalog["native_providers"] = [_provider(universe, name, dependencies) for name, dependencies in providers]
+    (universe / "catalog.json").write_text(json.dumps(catalog))
+    output = tmp_path / "release"
+    with pytest.raises(shellsim.PackageInstallError, match=error):
+        release.build_release(runtime, universe, uv, output)
+    assert not output.exists()
 
 
 def test_unsupported_host_and_offline_miss_do_not_fetch(release_inputs, tmp_path, monkeypatch):

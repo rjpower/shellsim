@@ -240,15 +240,19 @@ def _validate_entry(entry: Path, descriptor: dict[str, Any], resolver: dict[str,
         raise PackageInstallError("downloadable release requires catalogued pure wheels")
     expected = {"runtime/manifest.json", "universe/catalog.json", "uv"}
     expected.update("runtime/rootfs/" + name.lstrip("/") for name in runtime.manifest["files"])
+    needed_providers: set[str] = set()
     for (name, version), package in universe.packages.items():
         path = package["path"]
         _verify_file(path, package["sha256"], 128 * 1024 * 1024)
-        _inspect_wheel(path, name=name, version=version, abi=universe.abi, curated=True)
+        needed_providers.update(
+            _inspect_wheel(path, name=name, version=version, abi=universe.abi, curated=True).dependencies
+        )
         expected.add(path.relative_to(entry).as_posix())
     for provider in universe.providers.values():
         path = provider["path"]
         _verify_wasm(_verify_file(path, provider["sha256"], 16 * 1024 * 1024), universe.abi)
         expected.add(path.relative_to(entry).as_posix())
+    universe.provider_closure(needed_providers | set(universe.providers))
     if actual != expected:
         raise PackageInstallError("release cache contains missing or undeclared files")
 
