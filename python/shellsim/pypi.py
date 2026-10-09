@@ -165,7 +165,7 @@ def _remove_bundled_distributions(target: Path) -> int:
     return omitted
 
 
-def _compatibility_blockers(target: Path, bundled_count: int = 0) -> list[str]:
+def _compatibility_blockers(target: Path, bundled_count: int = 0, *, python_version: str = "3.14") -> list[str]:
     distributions = sorted(target.glob("*.dist-info"))
     if not distributions and not bundled_count:
         return ["uv installed no wheel metadata"]
@@ -183,7 +183,9 @@ def _compatibility_blockers(target: Path, bundled_count: int = 0) -> list[str]:
         if "Root-Is-Purelib: true" not in metadata:
             blockers.append(f"{distribution.name}: wheel is not purelib")
         if not any(
-            tag.endswith("-none-any") and {"py3", "py314"}.intersection(tag.split("-")[0].split(".")) for tag in tags
+            tag.endswith("-none-any")
+            and {"py3", "py" + python_version.replace(".", "")}.intersection(tag.split("-")[0].split("."))
+            for tag in tags
         ):
             blockers.append(f"{distribution.name}: incompatible wheel tags {', '.join(tags) or '(none)'}")
     paths = []

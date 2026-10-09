@@ -715,6 +715,15 @@ mod tests {
             unreachable!("native writer does not read links")
         }
 
+        fn read_link_prefix(
+            &mut self,
+            _base: &str,
+            _path: &str,
+            _maximum: usize,
+        ) -> Result<Vec<u8>, SyscallError> {
+            unreachable!("native writer does not read links")
+        }
+
         fn canonicalize(
             &mut self,
             _base: &str,

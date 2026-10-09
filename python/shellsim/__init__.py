@@ -20,6 +20,7 @@ from ._api import (
     Usage,
     run,
 )
+from .cpython import CPythonRuntime
 from .display_host import DisplayHost
 from .package import Package, PackageSpec
 from .pypi import PackageInstallError
@@ -29,6 +30,7 @@ __all__ = [
     "ActionPoll",
     "CommandUsage",
     "Container",
+    "CPythonRuntime",
     "DisplayFrame",
     "DisplayHost",
     "Environment",

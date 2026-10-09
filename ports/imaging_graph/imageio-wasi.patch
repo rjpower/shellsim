@@ -1,0 +1,42 @@
+--- a/imageio/core/findlib.py
++++ b/imageio/core/findlib.py
+@@ -7,7 +7,6 @@
+ 
+ import os
+ import sys
+-import ctypes
+ 
+ 
+ LOCALDIR = os.path.abspath(os.path.dirname(__file__))
+@@ -88,6 +87,11 @@
+     Returns ``(ctypes_library, library_path)``
+     """
+ 
++    if sys.platform == "wasi":
++        raise NotImplementedError("imageio dynamic libraries are unsupported on WASI")
++
++    import ctypes
++
+     # Checks
+     assert isinstance(exact_lib_names, list)
+     assert isinstance(lib_names, list)
+--- a/imageio/plugins/pillow.py
++++ b/imageio/plugins/pillow.py
+@@ -34,7 +34,7 @@
+ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union, cast
+ 
+ import numpy as np
+-from PIL import ExifTags, GifImagePlugin, Image, ImageSequence, UnidentifiedImageError
++from PIL import ExifTags, Image, ImageSequence, UnidentifiedImageError
+ from PIL import __version__ as pil_version  # type: ignore
+ 
+ from ..core.request import URI_BYTES, InitializationError, IOMode, Request
+@@ -232,6 +232,8 @@
+             )
+ 
+         if self._image.format == "GIF":
++            from PIL import GifImagePlugin
++
+             # Converting GIF P frames to RGB
+             # https://github.com/python-pillow/Pillow/pull/6150
+             GifImagePlugin.LOADING_STRATEGY = (

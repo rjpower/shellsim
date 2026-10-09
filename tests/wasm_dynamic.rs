@@ -1,0 +1,413 @@
+// Synthetic ABI failures run everywhere. Real SDK/CPython artifacts are opt-in and come from
+// ports/dynamic/build.py; guest file reads and writes use only the virtual filesystem.
+use shellsim::{Environment, Limits};
+use std::path::{Path, PathBuf};
+
+fn environment() -> Environment {
+    Environment::with_limits(Limits {
+        cpu: 2_000_000_000,
+        memory: 256 * 1024 * 1024,
+        disk: 64 * 1024 * 1024,
+        ..Limits::default()
+    })
+}
+
+fn artifacts() -> PathBuf {
+    PathBuf::from(
+        std::env::var_os("SHELLSIM_DYNAMIC_ARTIFACTS")
+            .expect("set SHELLSIM_DYNAMIC_ARTIFACTS to the built fixture directory"),
+    )
+}
+
+fn put(environment: &mut Environment, source: &Path, target: &str, executable: bool) {
+    let parent = target.rsplit_once('/').unwrap().0;
+    environment.vfs.mkdir_all("/", parent).unwrap();
+    environment
+        .vfs
+        .write(
+            "/",
+            target,
+            &std::fs::read(source).unwrap(),
+            if executable { 0o755 } else { 0o644 },
+        )
+        .unwrap();
+}
+
+fn run(environment: &mut Environment, command: &str) -> (i32, Vec<u8>, Vec<u8>) {
+    let (outcome, stdout, stderr) = environment.run_script_capture(command);
+    (outcome.exit_status, stdout, stderr)
+}
+
+#[test]
+fn dynamic_bridge_rejects_an_unmarked_executable() {
+    let mut environment = environment();
+    let bytes = wat::parse_str(
+        r#"(module
+        (import "shellsim_dylink_v1" "open" (func (param i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (func (export "_start")))"#,
+    )
+    .unwrap();
+    environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
+    let (status, _, stderr) = run(&mut environment, "/app");
+    assert_eq!(status, 126);
+    assert!(String::from_utf8(stderr)
+        .unwrap()
+        .contains("dynamic loading ABI mismatch"));
+}
+
+#[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
+fn c_library_shares_data_callbacks_constructors_and_handles() {
+    let artifacts = artifacts();
+    let mut environment = environment();
+    put(&mut environment, &artifacts.join("main.wasm"), "/app", true);
+    put(
+        &mut environment,
+        &artifacts.join("library.so"),
+        "/lib/libfixture.so",
+        false,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0,
+        b"128 14\n230 15\nshared data, callback, constructor, repeat load, missing symbol: ok\n".to_vec(), Vec::new()));
+}
+
+#[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
+fn c_library_rejects_wrong_abi_and_missing_imports() {
+    let artifacts = artifacts();
+    let mut environment = environment();
+    put(&mut environment, &artifacts.join("main.wasm"), "/app", true);
+    put(
+        &mut environment,
+        &artifacts.join("wrong-abi.so"),
+        "/bad.so",
+        false,
+    );
+    let (status, stdout, stderr) = run(&mut environment, "/app /bad.so");
+    assert_eq!((status, stderr), (1, Vec::new()));
+    assert!(String::from_utf8(stdout)
+        .unwrap()
+        .contains("dynamic loading ABI mismatch"));
+    put(
+        &mut environment,
+        &artifacts.join("tiny_one.so"),
+        "/missing.so",
+        false,
+    );
+    let (status, stdout, stderr) = run(&mut environment, "/app /missing.so");
+    assert_eq!((status, stderr), (1, Vec::new()));
+    assert!(String::from_utf8(stdout)
+        .unwrap()
+        .contains("missing dynamic symbol: Py"));
+}
+
+#[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
+fn dynamic_execution_obeys_cpu_and_memory_limits() {
+    let artifacts = artifacts();
+    let main = std::fs::read(artifacts.join("main.wasm")).unwrap();
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 10,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    assert_eq!(run(&mut environment, "/app").0, 137);
+    let mut environment = Environment::with_limits(Limits {
+        memory: 1024 * 1024,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    assert_eq!(run(&mut environment, "/app").0, 137);
+}
+
+fn mount_tree(environment: &mut Environment, root: &Path, directory: &Path) {
+    let mut entries = std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    entries.sort();
+    for entry in entries {
+        if entry.is_dir() {
+            mount_tree(environment, root, &entry);
+        } else {
+            let target = format!("/{}", entry.strip_prefix(root).unwrap().display());
+            put(environment, &entry, &target, target.ends_with(".wasm"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires built SDK24 dynamic artifacts"]
+fn cpython_imports_two_independent_extensions_into_one_live_interpreter() {
+    let artifacts = artifacts();
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(artifacts.join("manifest.json")).unwrap()).unwrap();
+    let root = PathBuf::from(manifest["source_bundle"].as_str().unwrap()).join("rootfs");
+    let interpreter = std::fs::read(artifacts.join("python3.wasm")).unwrap();
+    let interpreter_hash = <sha2::Sha256 as sha2::Digest>::digest(&interpreter);
+    assert_eq!(
+        format!("{interpreter_hash:x}"),
+        manifest["interpreter_sha256"].as_str().unwrap()
+    );
+    let mut environment = environment();
+    mount_tree(&mut environment, &root, &root);
+    put(
+        &mut environment,
+        &artifacts.join("python3.wasm"),
+        "/usr/bin/python3.wasm",
+        true,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("tiny_one.so"),
+        "/usr/lib/python3.13/site-packages/tiny_one.so",
+        false,
+    );
+    put(
+        &mut environment,
+        &artifacts.join("tiny_two.so"),
+        "/tmp/tiny_two.pending",
+        false,
+    );
+    let source = r#"import importlib, sys
+import tiny_one
+assert tiny_one.value(2) == 19
+try:
+    tiny_one.value('invalid')
+except TypeError:
+    pass
+else:
+    raise AssertionError('expected TypeError')
+with open('/tmp/tiny_two.pending', 'rb') as incoming:
+    with open('/usr/lib/python3.13/site-packages/tiny_two.so', 'wb') as extension:
+        extension.write(incoming.read())
+importlib.invalidate_caches()
+import tiny_two
+assert tiny_two.value(3) == 43
+assert tiny_one.value(1) == 20
+assert importlib.import_module('tiny_one') is tiny_one
+assert tiny_two.value(2) == 45
+print('two independent C extensions, late VFS staging, shared Python API and preserved state: ok')
+"#;
+    environment
+        .vfs
+        .write("/", "/proof.py", source.as_bytes(), 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "PYTHONHOME=/usr /usr/bin/python3.wasm /proof.py"), (0,
+        b"two independent C extensions, late VFS staging, shared Python API and preserved state: ok\n".to_vec(), Vec::new()));
+    assert_eq!(
+        environment.vfs.read("/", "/usr/bin/python3.wasm").unwrap(),
+        interpreter
+    );
+}
+
+fn marked(source: &str) -> Vec<u8> {
+    wat::parse_str(source).unwrap()
+}
+
+fn synthetic_main(body: &str) -> Vec<u8> {
+    marked(&format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk24-cpython3137-v1")
+        (import "shellsim_dylink_v1" "open" (func $open (param i32 i32 i32) (result i32)))
+        (import "shellsim_dylink_v1" "symbol" (func $symbol (param i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global $heap (mut i32) (i32.const 4096))
+        (data (i32.const 32) "/lib.so")
+        (data (i32.const 64) "answer")
+        (export "fixture_open" (func $open))
+        (func (export "malloc") (param $bytes i32) (result i32) (local $base i32)
+            (local.set $base (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $bytes)))
+            (local.get $base))
+        (func (export "_start") (local $handle i32) {body}))"#
+    ))
+}
+
+fn synthetic_library(metadata: &str, extra: &str) -> Vec<u8> {
+    marked(&format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk24-cpython3137-v1")
+        (@custom "dylink.0" "{metadata}")
+        (import "env" "memory" (memory 1))
+        {extra}
+        (func (export "answer") (result i32) (i32.const 42)))"#
+    ))
+}
+
+#[test]
+fn synthetic_late_load_resolves_exported_function_and_repeated_handle() {
+    let mut environment = environment();
+    let main = synthetic_main(
+        r#"
+        (local.set $handle (call $open (i32.const 32) (i32.const 7) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (local.get $handle)) (then unreachable))
+        (if (i32.ne (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 6))) (i32.const 42)) (then unreachable))
+    "#,
+    );
+    let library = synthetic_library(r"\01\04\00\00\00\00", "");
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn dynamic_constructor_cpu_is_charged() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 50_000,
+        memory: 128 * 1024 * 1024,
+        ..Limits::default()
+    });
+    let main = synthetic_main("(drop (call $open (i32.const 32) (i32.const 7) (i32.const 2)))");
+    let library = synthetic_library(
+        r"\01\04\00\00\00\00",
+        r#"(func (export "__wasm_call_ctors") (loop $again (br $again)))"#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app").0, 137);
+}
+
+#[test]
+fn dynamic_constructor_cannot_recursively_load_a_library() {
+    let mut environment = environment();
+    let main = synthetic_main(
+        "(if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (then unreachable))",
+    );
+    let library = synthetic_library(
+        r"\01\04\00\00\00\00",
+        r#"
+        (import "env" "fixture_open" (func $open (param i32 i32 i32) (result i32)))
+        (func (export "__wasm_call_ctors")
+            (if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable)))
+        "#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn dynamic_compile_cpu_is_charged_on_cache_hits() {
+    let main = synthetic_main("(drop (call $open (i32.const 32) (i32.const 7) (i32.const 2)))");
+    let library = synthetic_library(r"\01\04\00\00\00\00", "");
+    let mut warm = environment();
+    warm.vfs.write("/", "/app", &main, 0o755).unwrap();
+    warm.vfs.write("/", "/lib.so", &library, 0o644).unwrap();
+    assert_eq!(run(&mut warm, "/app").0, 0);
+    let mut limited = Environment::with_limits(Limits {
+        cpu: main.len() as u64 * 10 + library.len() as u64 * 5,
+        memory: 128 * 1024 * 1024,
+        ..Limits::default()
+    });
+    limited.vfs.write("/", "/app", &main, 0o755).unwrap();
+    limited.vfs.write("/", "/lib.so", &library, 0o644).unwrap();
+    assert_eq!(run(&mut limited, "/app").0, 137);
+}
+
+#[test]
+fn dynamic_loader_rejects_extra_memory_needed_libraries_and_overflow() {
+    for (metadata, extra) in [
+        (r"\01\04\00\00\00\00", "(memory 1)"),
+        (r"\01\04\00\00\00\00\02\03\01\01x", ""),
+        (r"\01\08\ff\ff\ff\ff\10\00\00\00", ""),
+    ] {
+        let mut environment = environment();
+        let main = synthetic_main(
+            r#"(if (call $open (i32.const 32) (i32.const 7) (i32.const 2)) (then unreachable))"#,
+        );
+        let library = synthetic_library(metadata, extra);
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment
+            .vfs
+            .write("/", "/lib.so", &library, 0o644)
+            .unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    }
+}
+
+#[test]
+fn dynamic_library_symbols_follow_local_and_global_scope() {
+    for global in [false, true] {
+        let mut environment = environment();
+        let flags = if global { 258 } else { 2 };
+        let expected = if global { 0 } else { 1 };
+        let body = format!(
+            r#"
+            (if (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const {flags}))) (then unreachable))
+            (i32.store8 (i32.const 33) (i32.const 117))
+            (if (i32.ne (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (i32.const {expected})) (then unreachable))
+        "#
+        );
+        let main = synthetic_main(&body);
+        let provider = synthetic_library(r"\01\04\00\00\00\00", "");
+        let consumer = synthetic_library(
+            r"\01\04\00\00\00\00",
+            r#"(import "env" "answer" (func (result i32)))"#,
+        );
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment
+            .vfs
+            .write("/", "/lib.so", &provider, 0o644)
+            .unwrap();
+        environment
+            .vfs
+            .write("/", "/uib.so", &consumer, 0o644)
+            .unwrap();
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    }
+}
+
+#[test]
+fn dynamic_library_count_is_bounded() {
+    let mut environment = environment();
+    let mut body = String::new();
+    let library = synthetic_library(r"\01\04\00\00\00\00", "");
+    for index in 0..33 {
+        let name = format!("{index:02}");
+        let value = u16::from_le_bytes(name.as_bytes().try_into().unwrap());
+        body.push_str(&format!("(i32.store16 (i32.const 33) (i32.const {value}))"));
+        let expected = if index < 32 { 0 } else { 1 };
+        body.push_str(&format!("(if (i32.ne (i32.eqz (call $open (i32.const 32) (i32.const 7) (i32.const 2))) (i32.const {expected})) (then unreachable))"));
+        environment
+            .vfs
+            .write("/", &format!("/{name}b.so"), &library, 0o644)
+            .unwrap();
+    }
+    let main = synthetic_main(&body);
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn dynamic_constructor_proc_exit_terminates_the_process() {
+    let mut environment = environment();
+    let main = synthetic_main("(drop (call $open (i32.const 32) (i32.const 7) (i32.const 2)))");
+    let library = synthetic_library(
+        r"\01\04\00\00\00\00",
+        r#"
+        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+        (func (export "__wasm_call_ctors") (call $exit (i32.const 7)))
+    "#,
+    );
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+        .vfs
+        .write("/", "/lib.so", &library, 0o644)
+        .unwrap();
+    assert_eq!(run(&mut environment, "/app"), (7, Vec::new(), Vec::new()));
+}

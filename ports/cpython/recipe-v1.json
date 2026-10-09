@@ -1,0 +1,33 @@
+{
+  "name": "cpython",
+  "version": "3.13.7",
+  "target": "wasm32-wasip1",
+  "prefix": "/usr",
+  "source": {
+    "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
+    "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
+  },
+  "sdk": {
+    "version": "24.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-24/wasi-sdk-24.0-x86_64-linux.tar.gz",
+    "sha256": "c6c38aab56e5de88adf6c1ebc9c3ae8da72f88ec2b656fb024eda8d4167a0bc5"
+  },
+  "target_profile": "wasi-cpython-v1",
+  "host_tools": [
+    "native-c-compiler",
+    "make",
+    "python-build-helper",
+    "wasi-sdk-clang",
+    "wasi-sdk-llvm-ar",
+    "wasi-sdk-llvm-strip"
+  ],
+  "target_dependencies": [],
+  "optional_target_dependencies": {
+    "zlib": [
+      {
+        "port": "native/zlib",
+        "version": "1.3.1"
+      }
+    ]
+  }
+}

@@ -53,7 +53,7 @@ commands without changing unrelated entries in the base image.
 |---|---|---|
 | Open/close/seek regular file | WASI `path_open`, `fd_close`, `fd_seek` | Redirections and external command I/O |
 | Read/write descriptor | WASI `fd_read`, `fd_write` | Process-scoped native handle backed by `Interp::read_fd` / `write_fd` |
-| Stat and directory enumeration | WASI `path_filestat_get` / `fd_filestat_get`, future `fd_readdir` | Native `ls`, then shell globbing |
+| Stat and directory enumeration | WASI `path_filestat_get`, `fd_filestat_get`, `fd_readdir` | Native `ls`, then shell globbing |
 | Spawn/wait/signal | Future versioned shellsim extension | Shell executor and process scheduler |
 | Clock/random | WASI clock/random imports | Virtual clock and deterministic stream |
 
@@ -62,6 +62,29 @@ would block. The guest ABI layer is responsible only for pointer validation, dat
 rights checks, and errno translation. It must not perform host I/O or silently return success
 for unsupported operations. Resource charges belong at the kernel operation or machine dispatch
 point so both native and Wasm work count against the same budget.
+
+The preview1 adapter owns up to 64 directory handles in a range separate from regular-file
+descriptors. Directory opens accept libc's nonblocking flag because enumeration never waits.
+Relative path operations and sorted directory cookies use the VFS. Enumeration charges the
+whole VFS scan and reserves names, transient symlink metadata, and output before copying them.
+`path_readlink` copies a bounded byte prefix. Kernel stat queries borrow regular-file contents
+rather than copying their payloads. Directory handles retain resolved paths; renaming a directory
+does not retarget an existing handle.
+
+Wasm images are limited to 16 MiB, enough for the measured 15.2 MB static CPython + NumPy + Pillow image.
+Compilation is charged at ten CPU units per image byte, including cache hits.
+Modules with an exported memory minimum of at most 16 MiB
+retain the 16 MiB memory cap. Larger static images, including the source-built CPython
+guest, may reserve up to 64 MiB. Both caps are clamped by the machine's remaining memory, with
+264 KiB reserved for directory handles and 1 MiB left for temporary host-call buffers. These are
+conservative reservations for the lifetime of the process, not measurements of its live heap.
+Standard Wasm exception handling uses a deferred reference collector. Linear memory and
+the exception heap share this aggregate cap; approved growth is counted once and rolled back
+on allocation failure. Unreachable exception objects are reclaimed, allowing repeated
+setjmp/longjmp recovery. The Wasm GC language proposal remains disabled.
+Small images retain the 10,000-element table limit. Larger static images may use
+16,384 elements per table, with an additional 4 MiB reservation covering all sixteen
+permitted tables. The measured NumPy image requires 10,771 elements.
 
 ## Current limits and next gate
 

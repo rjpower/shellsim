@@ -1,0 +1,15 @@
+{
+  "name": "pycosat",
+  "version": "0.6.6",
+  "target": "wasm32-wasip1",
+  "linkage": "cpython-builtin",
+  "builtin_modules": ["pycosat"],
+  "dist_info": "/usr/lib/python3.13/site-packages/pycosat-0.6.6.dist-info",
+  "requires_dist": [],
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/5b/81/cf8ebf77fc4f06f680ad3ee43d0d01826f6d6054828f1cf3b42d944b82a1/pycosat-0.6.6.tar.gz",
+    "sha256": "a376cfae20b16fcfbef24bf3c047a8a294c35032bb051fa98842c12bbab6f0ff"
+  },
+  "setup": "pycosat pycosat.c -DNGETRUSAGE",
+  "verify": "import pycosat; assert pycosat.solve([[1], [-1]]) == 'UNSAT'; assert pycosat.solve([[1]]) == [1]"
+}
