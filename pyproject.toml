@@ -8,6 +8,7 @@ dynamic = ["version"]
 description = "In-process BusyBox-like environment for RL rollouts and agent tests"
 readme = "README.md"
 requires-python = ">=3.9"
+dependencies = ["packaging>=24"]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [{ name = "The shellsim authors" }]

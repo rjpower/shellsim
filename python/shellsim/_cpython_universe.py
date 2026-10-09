@@ -10,6 +10,7 @@ import configparser
 import email
 import hashlib
 import json
+import os
 import re
 import stat
 import subprocess
@@ -20,7 +21,7 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Any, Protocol, Sequence
 
 from ._api import Environment, SimulationError
 from .pypi import PackageInstallError
@@ -263,8 +264,22 @@ class Universe:
 
 
 def _run_uv(uv: Path, args: list[str], *, cwd: Path) -> None:
+    environment = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith(("UV_", "PIP_")) and name not in {"PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV"}
+    }
+    environment["UV_CACHE_DIR"] = str(cwd / "uv-cache")
     try:
-        completed = subprocess.run([str(uv), *args], cwd=cwd, capture_output=True, text=True, timeout=300, check=False)
+        completed = subprocess.run(
+            [str(uv), "--no-config", *args],
+            cwd=cwd,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
     except FileNotFoundError as error:
         raise PackageInstallError("patched uv executable is missing") from error
     except subprocess.TimeoutExpired as error:
@@ -484,7 +499,45 @@ def _stage_console_scripts(site: Path, staging: Path, venv: str) -> None:
     scripts.rmdir()
 
 
-def install(runtime: _Runtime, environment: Environment, requirement: str) -> None:
+def _lock_versions(lock: dict[str, Any]) -> set[tuple[str, str]]:
+    packages = lock.get("packages")
+    if not isinstance(packages, list) or len(packages) > _MAX_PACKAGES:
+        raise PackageInstallError("uv returned an oversized WASI wheel lock")
+    versions: set[tuple[str, str]] = set()
+    for package in packages:
+        if not isinstance(package, dict) or not isinstance(package.get("version"), str):
+            raise PackageInstallError("invalid package in uv's WASI wheel lock")
+        pair = (_name(package.get("name")), package["version"])
+        if pair in versions:
+            raise PackageInstallError("duplicate package in uv's WASI wheel lock")
+        versions.add(pair)
+    return versions
+
+
+def _curated_cohorts(
+    universe: Universe, requirements: Sequence[str], locked_versions: set[tuple[str, str]] | None
+) -> str:
+    requested = {
+        _name(match.group())
+        for requirement in requirements
+        if (match := re.match(r"[A-Za-z0-9][A-Za-z0-9._-]*", requirement))
+    }
+    requested.update(name for name, _ in locked_versions or ())
+    cohorts = []
+    for name in sorted(requested):
+        versions = sorted(version for package, version in universe.packages if package == name)
+        if versions:
+            cohorts.append(f"{name}: {', '.join(versions[:8])}")
+    return "; curated WASI versions available: " + "; ".join(cohorts[:8]) if cohorts else ""
+
+
+def install(
+    runtime: _Runtime,
+    environment: Environment,
+    requirements: Sequence[str],
+    *,
+    locked_versions: set[tuple[str, str]] | None = None,
+) -> None:
     """Resolve, verify, and atomically stage a dynamic package set."""
     if runtime.universe is None or runtime.uv is None or runtime.venv is None:
         raise PackageInstallError("dynamic CPython installs need a local universe and patched uv")
@@ -492,8 +545,8 @@ def install(runtime: _Runtime, environment: Environment, requirement: str) -> No
     with tempfile.TemporaryDirectory(prefix="shellsim-cpython-universe-") as temporary:
         work = Path(temporary)
         index = universe.index(work)
-        requirements = work / "requirements.in"
-        requirements.write_text(requirement + "\n")
+        requirements_file = work / "requirements.in"
+        requirements_file.write_text("\n".join(requirements) + "\n")
         pylock = work / "pylock.toml"
         common = [
             "--python",
@@ -509,28 +562,47 @@ def install(runtime: _Runtime, environment: Environment, requirement: str) -> No
             "--index-strategy",
             "first-index",
         ]
-        _run_uv(
-            runtime.uv,
-            [
-                "pip",
-                "compile",
-                "--format",
-                "pylock.toml",
-                "--output-file",
-                str(pylock),
-                "--index",
-                index.as_uri(),
-                "--default-index",
-                universe.default_index,
-                *common,
-                str(requirements),
-            ],
-            cwd=work,
-        )
+        compile_args = [
+            "pip",
+            "compile",
+            "--format",
+            "pylock.toml",
+            "--index",
+            index.as_uri(),
+            "--default-index",
+            universe.default_index,
+            *common,
+        ]
+        active_versions = None
+        try:
+            if locked_versions is not None:
+                active_lock = work / "pylock.active.toml"
+                _run_uv(
+                    runtime.uv,
+                    [*compile_args, "--no-deps", "--output-file", str(active_lock), str(requirements_file)],
+                    cwd=work,
+                )
+                active_versions = _lock_versions(_parse_pylock(active_lock))
+                if not active_versions <= locked_versions:
+                    raise PackageInstallError("uv.lock exports a package version absent from its package table")
+            _run_uv(
+                runtime.uv,
+                [*compile_args, "--output-file", str(pylock), str(requirements_file)],
+                cwd=work,
+            )
+        except PackageInstallError as error:
+            cohorts = _curated_cohorts(universe, requirements, locked_versions)
+            if cohorts:
+                raise PackageInstallError(str(error) + cohorts) from error
+            raise
         lock = _parse_pylock(pylock)
         packages = lock.get("packages")
         if not isinstance(packages, list) or not packages or len(packages) > _MAX_PACKAGES:
             raise PackageInstallError("uv returned an empty or oversized WASI wheel lock")
+        if active_versions is not None and _lock_versions(lock) != active_versions:
+            raise PackageInstallError(
+                "uv.lock dependency closure differs for WASI; regenerate the lock for this target"
+            )
         wheel_dir = work / "wheels"
         selected: list[tuple[str, str, Path, str]] = []
         native_artifacts: dict[str, str] = {}

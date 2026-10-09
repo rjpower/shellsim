@@ -28,6 +28,26 @@ _EXECUTABLE = "/usr/bin/python3.wasm"
 _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
 _MAX_BYTES = 128 * 1024 * 1024
 _MAX_FILES = 10000
+_MAX_REQUIREMENTS = 256
+
+
+def _requirements(value: Union[str, Sequence[str]]) -> tuple[str, ...]:
+    if isinstance(value, str):
+        requirements = (value,)
+    elif isinstance(value, Sequence) and not isinstance(value, bytes):
+        if len(value) > _MAX_REQUIREMENTS:
+            raise ValueError("requirements must contain between 1 and 256 PyPI specs")
+        requirements = tuple(value)
+    else:
+        raise TypeError("requirements must be a PyPI spec or a sequence of specs")
+    if not requirements or len(requirements) > _MAX_REQUIREMENTS:
+        raise ValueError("requirements must contain between 1 and 256 PyPI specs")
+    for requirement in requirements:
+        if not isinstance(requirement, str):
+            raise TypeError("each requirement must be str")
+        if len(requirement) > 2048 or _REQUIREMENT.fullmatch(requirement) is None:
+            raise ValueError("each requirement must name a PyPI distribution with optional extras or version")
+    return requirements
 
 
 class CPythonRuntime:
@@ -145,23 +165,20 @@ class CPythonRuntime:
                     raise PackageInstallError(f"package file would overwrite an existing VFS file: {destination}")
         environment.mount(target, self.site_packages)
 
-    def install_pypi(self, environment: Environment, requirement: str) -> None:
-        """Resolve packages for the bundle's Python and WASI ABI.
+    def install_pypi(self, environment: Environment, requirement: Union[str, Sequence[str]]) -> None:
+        """Resolve one or more specs together for the bundle's Python and WASI ABI.
 
         A dynamic bundle requires an explicit local universe and patched uv.
         Static bundles retain their existing pure-wheel installation path.
         """
-        if not isinstance(requirement, str):
-            raise TypeError("requirement must be str")
-        if _REQUIREMENT.fullmatch(requirement) is None:
-            raise ValueError("requirement must name a PyPI distribution with optional extras or version")
+        requirements = _requirements(requirement)
         self._verify()
         if self.manifest.get("dynamic_abi"):
             if self.universe is None or self.uv is None:
                 raise PackageInstallError("dynamic CPython packages require a local universe and patched uv executable")
             from ._cpython_universe import install
 
-            install(self, environment, requirement)
+            install(self, environment, requirements)
             return
         if self.universe is not None:
             raise PackageInstallError("a package universe requires a dynamic CPython bundle")
@@ -220,21 +237,42 @@ class CPythonRuntime:
                 constraint_file = Path(temp) / "native-constraints.txt"
                 constraint_file.write_text("\n".join(constraints) + "\n")
                 command += ["--constraint", str(constraint_file)]
-            command += ["--", requirement]
+            command += ["--", *requirements]
             try:
                 completed = subprocess.run(command, capture_output=True, text=True, timeout=300, check=False)
             except FileNotFoundError as error:
                 raise PackageInstallError("uv is required to install PyPI packages on the host") from error
             except subprocess.TimeoutExpired as error:
-                raise PackageInstallError(f"timed out resolving {requirement}") from error
+                raise PackageInstallError("timed out resolving PyPI requirements") from error
             if completed.returncode:
-                raise PackageInstallError(f"cannot resolve {requirement}: {completed.stderr.strip()[-8000:]}")
+                raise PackageInstallError("cannot resolve PyPI requirements: " + completed.stderr.strip()[-8000:])
             blockers = _compatibility_blockers(target, python_version="3.13")
             if blockers:
                 raise PackageInstallError(
                     "CPython WASI cannot stage incompatible distributions: " + "; ".join(blockers)
                 )
             self._stage(environment, target)
+
+    def install_lock(
+        self,
+        environment: Environment,
+        lock: Union[str, Path],
+        *,
+        extras: Sequence[str] = (),
+        groups: Sequence[str] = (),
+        project_mounted: bool = False,
+    ) -> None:
+        """Install selected ``uv.lock`` dependencies for the WASI guest target.
+
+        Set ``project_mounted`` when the root project source is separately mounted
+        into the VFS. Local and VCS dependency packages are unsupported.
+        """
+        self._verify()
+        if not self.manifest.get("dynamic_abi") or self.universe is None or self.uv is None:
+            raise PackageInstallError("uv.lock installation requires a dynamic bundle, local universe, and patched uv")
+        from ._cpython_lock import install_lock
+
+        install_lock(self, environment, Path(lock), extras=extras, groups=groups, project_mounted=project_mounted)
 
     def install_wheel(self, environment: Environment, wheel: Union[str, Path]) -> None:
         """Stage a pure Python wheel without resolving dependencies or running builds.

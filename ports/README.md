@@ -83,6 +83,39 @@ assert result.returncode == 0, result.stderr
 assert result.stdout == b"6\n"
 ```
 
+Pass several PyPI specs as a list to solve them in one WASI dependency graph
+and import the result in one VFS transaction:
+
+```python
+runtime.install_pypi(env, ["pytest==8.4.1", "numpy==2.3.5"])
+```
+
+An existing `uv.lock` can also supply exact versions. Mount the project source
+separately, then select the lock's extras and groups explicitly:
+
+```python
+runtime.install_lock(
+    env,
+    "/tmp/task/uv.lock",  # path on the trusted host
+    extras=("plot",),
+    groups=("test",),
+    project_mounted=True,
+)
+```
+
+`install_lock` accepts a standalone uv lock with one virtual or editable root at
+`.`. `project_mounted=True` states that this root is already in the virtual
+filesystem. The installer reads the lock's dependency graph through a frozen,
+offline uv export, then resolves its exact selected pins again for CPython
+3.13.7 on WASI. It uses the local native catalog and configured pure-wheel
+index, rather than wheel URLs chosen for the lock creator's host. A missing
+curated native version is an error. A lock with no selected registry dependencies
+is a valid no-op when its Python range and supported environment markers include
+the guest. No default dependency groups are selected; pass each wanted
+group by name. VCS, URL, local path, and non-root editable packages are rejected.
+All installed wheels must pass the same bounded verification and atomic import
+as direct PyPI specs. Both APIs require an idle environment.
+
 Mounting a dynamic bundle creates a real isolated venv at `/work/.venv` by
 default. Pass `venv="/app/.venv"` to put it at a task's workspace. The venv has
 `pyvenv.cfg`, its own Python 3.13 site-packages, and `bin/python` launchers;
@@ -145,10 +178,12 @@ result = runtime.run(env, ["-c", "import pycosat; assert pycosat.solve([[1], [-1
 assert result.returncode == 0, result.stderr
 ```
 
-This establishes a static native source recipe. The separate
-[dynamic loader experiment](dynamic/README.md) imports small C extensions into
-a live interpreter built for its explicit ABI. Arbitrary host native wheels,
-threads, process spawning, and sockets are unsupported.
+This establishes a static native source recipe. The
+[dynamic loader](dynamic/README.md) imports ABI-matched WASI extension wheels
+into the v2 interpreter; arbitrary host native wheels remain unsupported. The
+[process port](toolchain/wasi_process/README.md) adds virtual POSIX spawn and
+`subprocess.Popen` to a separately built interpreter overlay. The base static
+bundle has neither process spawning nor threads; sockets remain unsupported.
 The [native dependency foundation](native/README.md) supplies zlib
 when selected, sharing its verified target artifact with Pillow's PNG profile.
 Other optional CPython modules requiring external libraries, including
