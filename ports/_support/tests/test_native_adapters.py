@@ -4,6 +4,7 @@ from dataclasses import replace
 from pathlib import PurePosixPath
 
 import pytest
+
 from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
 
 

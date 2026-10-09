@@ -20,7 +20,6 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from ports._support.native_adapters import NativeBuildCommand, NativeBuildContext
-
 from ports._support.pure_wheel import verified_files
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
@@ -106,6 +105,25 @@ def _source_file(root: Path, raw: str) -> Path:
     return path
 
 
+def _dependency_path(root: Path, raw: str, *, directory: bool) -> Path:
+    """Admit an exact file or include directory from the merged native closure."""
+    if not isinstance(raw, str) or not raw or len(raw) > 4096 or "\\" in raw or "\0" in raw:
+        raise ValueError("invalid extension dependency path")
+    relative = PurePosixPath(raw)
+    if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != raw:
+        raise ValueError("extension dependency path escapes merged sysroot")
+    prefix = root / "usr/local"
+    path = prefix.joinpath(*relative.parts)
+    if path.is_symlink() or not path.resolve().is_relative_to(prefix.resolve()):
+        raise ValueError("extension dependency path escapes merged sysroot")
+    if directory:
+        if not path.is_dir():
+            raise ValueError("declared extension include directory is missing")
+    elif not path.is_file() or path.stat().st_size > _MAX_EXTENSION_SOURCE:
+        raise ValueError("declared extension link input is missing or oversized")
+    return path
+
+
 def _wheel(stage: Path, destination: Path, record: str) -> None:
     """Seal staged wheel files with deterministic member order and RECORD."""
     rows = []
@@ -152,6 +170,8 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
         or ("target_profile" in recipe and recipe["target_profile"] != abi)
     ):
         raise ValueError("extension target or ABI differs from admitted CPython")
+    if not context.shared_library_flags:
+        raise ValueError("extension build needs admitted shared-library link flags")
     paths = (context.source, context.build, context.staging_prefix, cpython.include_dir, cpython.generated_config_dir)
     if any(not path.is_absolute() for path in paths):
         raise ValueError("extension build paths must be absolute")
@@ -179,6 +199,41 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     dependencies = build.get("native_dependencies", [])
     if not isinstance(dependencies, list) or any(not isinstance(item, str) or not item for item in dependencies):
         raise ValueError("invalid extension native dependency list")
+    declared_ports = recipe.get("target_dependencies", [])
+    native_ports = (
+        [
+            item["port"]
+            for item in declared_ports
+            if isinstance(item, dict) and isinstance(item.get("port"), str) and item["port"].startswith("native/")
+        ]
+        if isinstance(declared_ports, list)
+        else []
+    )
+    if (
+        not isinstance(declared_ports, list)
+        or any(not isinstance(item, dict) or not isinstance(item.get("port"), str) for item in declared_ports)
+        or set(native_ports) != set(context.dependencies)
+        or len(native_ports) != len(context.dependencies)
+    ):
+        raise ValueError("extension native dependencies differ from the admitted graph")
+    include_entries = build.get("include_directories", [])
+    link_entries = build.get("link_inputs", [])
+    if (
+        not isinstance(include_entries, list)
+        or not isinstance(link_entries, list)
+        or len(include_entries) > _MAX_EXTENSION_FILES
+        or len(link_entries) > _MAX_EXTENSION_FILES
+    ):
+        raise ValueError("invalid extension native build input list")
+    includes = [_dependency_path(context.dependency_sysroot, raw, directory=True) for raw in include_entries]
+    links = [_dependency_path(context.dependency_sysroot, raw, directory=False) for raw in link_entries]
+    if len(set(includes)) != len(includes) or len(set(links)) != len(links):
+        raise ValueError("repeated extension native build input")
+    if any(path.suffix not in {".a", ".so"} for path in links):
+        raise ValueError("extension link input must be an archive or shared library")
+    linked_shared = {path.name for path in links if path.suffix == ".so"}
+    if not linked_shared.issubset(set(dependencies)):
+        raise ValueError("extension shared link input lacks a declared native dependency")
     if context.build.exists() or context.staging_prefix.exists():
         raise ValueError("extension build output already exists")
     context.build.mkdir(parents=True)
@@ -186,6 +241,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     wheel_stage.mkdir()
     (context.staging_prefix / "wheels").mkdir(parents=True)
     environment = target_environment(context.sdk)
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
     commands = []
     objects = []
     with (context.build / "build.log").open("wb") as log:
@@ -199,6 +255,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
                     "-fPIC",
                     "-I" + str(cpython.include_dir),
                     "-I" + str(cpython.generated_config_dir),
+                    *("-I" + str(path) for path in includes),
                     *("-D" + item for item in defines),
                     "-c",
                     str(source),
@@ -219,11 +276,13 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
         command = NativeBuildCommand(
             (
                 str(linker),
+                *context.compiler_flags,
                 *context.linker_flags,
-                "-shared",
+                *context.shared_library_flags,
                 "-Wl,--export=PyInit_" + module,
                 "-Wl,--export-all,--fatal-warnings",
                 *(str(obj) for obj in objects),
+                *(str(path) for path in links),
                 "-o",
                 str(extension),
             ),

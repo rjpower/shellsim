@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import zipfile
 from pathlib import Path
 
 import pytest
+
 from ports._support.native_adapters import NativeBuildContext
 from ports._support.python_adapters import (
     CPythonBuildContext,
@@ -79,6 +81,7 @@ def _extension_request(tmp_path: Path) -> ExtensionBuildRequest:
         host_tools={},
         target_tools={"cc": tmp_path / "cc", "cxx": tmp_path / "cxx"},
         dependency_sysroot=tmp_path / "dependency-sysroot",
+        shared_library_flags=("-shared",),
     )
     cpython = CPythonBuildContext(
         include_dir=tmp_path / "include",
@@ -116,3 +119,28 @@ def test_extension_rejects_wrong_abi_and_source_escape_before_compiler(
         build_extension(ExtensionBuildRequest(request.context, request.cpython, {**request.recipe, "build": bad_build}))
     assert not request.context.build.exists()
     assert not request.context.staging_prefix.exists()
+
+
+def test_extension_requires_exact_declared_native_link_inputs_before_compiler(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _extension_request(tmp_path)
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: pytest.fail("compiler ran before admission"))
+    context = dataclasses.replace(request.context, dependencies={"native/zlib": tmp_path / "zlib-artifact"})
+    recipe = {**request.recipe, "target_dependencies": [{"port": "native/zlib", "version": "1.3.1"}]}
+    with pytest.raises(ValueError, match="missing or oversized"):
+        build_extension(
+            ExtensionBuildRequest(
+                context, request.cpython, {**recipe, "build": {**recipe["build"], "link_inputs": ["lib/libz.a"]}}
+            )
+        )
+    with pytest.raises(ValueError, match="escapes merged sysroot"):
+        build_extension(
+            ExtensionBuildRequest(
+                context, request.cpython, {**recipe, "build": {**recipe["build"], "link_inputs": ["../host.a"]}}
+            )
+        )
+    with pytest.raises(ValueError, match="admitted graph"):
+        build_extension(ExtensionBuildRequest(request.context, request.cpython, recipe))
+    assert not context.build.exists()
+    assert not context.staging_prefix.exists()

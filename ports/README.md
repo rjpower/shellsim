@@ -26,6 +26,50 @@ artifacts retain exact compiled-provider identities. Pure wheels keep upstream
 metadata and tags; curated source builds retain their provenance. A recipe or
 builder change invalidates the corresponding build cache.
 
+## Build and check a port graph
+
+From the repository root, select a verified build cohort and one or more recipes:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports python/packaging \
+  --cohort /path/to/cohort.json \
+  --store /path/to/ports-build-cache \
+  --output /path/to/packaging-release \
+  --check
+```
+
+The output path must be absent. A directory argument selects its `recipe.json`;
+name another recipe file explicitly to select a variant, for example
+`python/pycosat/recipe-dynamic.json`. Dependencies declare `port`, exact
+`version`, and optional `recipe` variant. The graph rejects missing providers,
+cycles, version conflicts, and target-profile changes before it builds. It
+builds dependencies first and reuses cached results only after checking their
+bytes against their build receipts. `--offline` requires pinned source archives
+to be in that cache. It does not promise offline package resolution for pure
+dependencies outside the graph.
+
+Use `build.adapter` to choose one of `pure-wheel`, `python-extension`, `cmake`,
+`meson`, or `configure-make`. The first stages an unchanged, verified upstream
+wheel. The extension adapter compiles a declared single-module C/C++ extension
+against the cohort's CPython headers. Native adapters install to a private
+`/usr/local` staging tree through the admitted compiler and verified dependency
+sysroot. Recipe `source` pins the upstream URL and SHA256; `patches` pin local
+patch files. `source_exports` copies declared source files, such as licenses,
+that an upstream install omits. Port-specific build hooks must also be pinned.
+
+Each recipe declares guest checks under `tests`, using a port-local Python
+`script` or native C `source`. Native probes may name exact package
+`link_inputs` and exact `cohort_link_inputs` from the verified SDK sysroot;
+`include_directories` come from the verified package dependency tree. For
+example, an archive path can be `lib/libz.a`, avoiding ambiguous `-l` search.
+`--check` installs the sealed graph in fresh guest environments and requires
+every declared probe to exit successfully. Missing tests, build failures,
+unsupported inputs, and guest failures fail the command. The release appears
+at `--output` only after all checks pass; failed work remains available for
+diagnosis. This command creates local release assets and does not publish them
+to a remote registry.
+
 ## Python environment setup
 
 Build a bare CPython bundle and its SDK 34 dynamic runtime from the repository

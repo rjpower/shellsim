@@ -1,0 +1,99 @@
+{
+  "name": "llvm-wasi-compiler",
+  "version": "23-sdk34-threaded-compiler-1",
+  "source": {
+    "commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
+    "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
+    "sha256": "b4525499be9ccd65a0da8c9efbeb59a5955130b302a190a51883727d8c5c7542"
+  },
+  "protocol": {
+    "dylink_subsection_type": 128,
+    "type_encoding": "uint8",
+    "vendor": "shellsim.deferred-init",
+    "version": 1,
+    "reject_module_start": true
+  },
+  "patches": [
+    {
+      "file": "serial-memory-init.patch",
+      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
+      "inputs": {
+        "lld/wasm/Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+        "lld/wasm/Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+        "lld/wasm/Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+        "lld/wasm/Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+      }
+    },
+    {
+      "file": "deferred-shared-init.patch",
+      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
+      "inputs": {
+        "lld/wasm/Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
+        "lld/wasm/Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
+        "lld/wasm/Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
+        "lld/wasm/Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
+        "lld/wasm/SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
+      }
+    },
+    {
+      "file": "llvm-wasi-dynamic-tls.patch",
+      "sha256": "393441b4b3e85faf93badae7ad152a6e8b11a9f6138f71dbea0923114d21649f",
+      "inputs": {
+        "llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp": "4e33c6df76cc32cacbeac45f7f03562f61567d83d1a138233e1a8222077223fa"
+      }
+    },
+    {
+      "file": "main-tls-exports.patch",
+      "sha256": "e0fbee17b79a28833e89494b55da2ad340984f6c2b926ebafaa3b14c927d3c64",
+      "inputs": {
+        "lld/wasm/Config.h": "0d1c923bfcaff7bbbb4c22937afa1ff9a62f65f584e22fad20026e4e732a7296",
+        "lld/wasm/Driver.cpp": "cae03917f2e1eeac3d1f1d7e20135ac0ab78cececa406672622690a759891b22",
+        "lld/wasm/Options.td": "1c04d302078a3adf032dbdbebd5f75daa0543ec291a7995dc080acc2995c2f78",
+        "lld/wasm/SyntheticSections.cpp": "6d806f6d168a2e48584db64ca1da7cae460bb0f04ca14a79517ea237f8d17f60"
+      }
+    }
+  ],
+  "build_limits": {
+    "compile_jobs": 4,
+    "link_jobs": 1,
+    "address_space_bytes_per_process": 12884901888,
+    "command_timeout_seconds": 3600
+  },
+  "build_scripts": [
+    {
+      "file": "compiler.py",
+      "sha256": "6d875ed7476f29525ed540383a2b62bf49fb2b45b40a0dfca2fd461d67f3e3c6"
+    },
+    {
+      "file": "build.py",
+      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
+    },
+    {
+      "file": "serial-memory-init.patch",
+      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522"
+    },
+    {
+      "file": "deferred-shared-init.patch",
+      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7"
+    },
+    {
+      "file": "llvm-wasi-dynamic-tls.patch",
+      "sha256": "393441b4b3e85faf93badae7ad152a6e8b11a9f6138f71dbea0923114d21649f"
+    },
+    {
+      "file": "main-tls-exports.patch",
+      "sha256": "e0fbee17b79a28833e89494b55da2ad340984f6c2b926ebafaa3b14c927d3c64"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ],
+  "main_tls_protocol": {
+    "dylink_subsection_type": 129,
+    "type_encoding": "uint8",
+    "vendor": "shellsim.main-tls",
+    "version": 1,
+    "exhaustive_tls_export_classification": true
+  }
+}

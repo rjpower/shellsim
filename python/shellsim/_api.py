@@ -283,7 +283,8 @@ class Environment:
         if tool_specs:
             native = _NativePackageUniverse.from_release(descriptor, cache_dir=cache_dir, offline=offline)
 
-        environment = cls(limits=limits or Limits(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=256 * 1024 * 1024))
+        # Threaded CPython also accounts for transient host compilation memory.
+        environment = cls(limits=limits or Limits(cpu=4_000_000_000, memory=1024**3, disk=256 * 1024 * 1024))
         if project is not None:
             environment.mount(project, "/work")
         runtime.mount(environment)

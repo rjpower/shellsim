@@ -34,6 +34,7 @@ class NativeBuildContext:
     host_tools: Mapping[str, Path]
     target_tools: Mapping[str, Path]
     dependency_sysroot: Path
+    shared_library_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -136,6 +137,10 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             + "    command += "
             + repr(list(context.linker_flags))
             + "\n"
+            + 'if "-shared" in arguments:\n'
+            + "    command += "
+            + repr(list(context.shared_library_flags))
+            + "\n"
             + "os.execv(command[0], command + arguments)\n"
         )
         wrapper.chmod(0o755)
@@ -143,6 +148,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     environment = target_environment(context.sdk)
     environment.update(
         {
+            "PYTHONDONTWRITEBYTECODE": "1",
             "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
             "CC": shlex.quote(str(wrappers["cc"])),
             "CXX": shlex.quote(str(wrappers["cxx"])),

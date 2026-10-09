@@ -1,0 +1,14 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -167,6 +167,11 @@
+     set_target_properties(zlib PROPERTIES VERSION ${ZLIB_FULL_VERSION})
+ endif()
+
++# WASI keeps the upstream pkg-config interface's -lz library name without
++# enabling Unix-only linker options such as GNU version scripts.
++if(CMAKE_SYSTEM_NAME STREQUAL "WASI")
++    set_target_properties(zlib zlibstatic PROPERTIES OUTPUT_NAME z)
++endif()
+ if(UNIX)
+     # On unix-like platforms the library is almost always called libz
+    set_target_properties(zlib zlibstatic PROPERTIES OUTPUT_NAME z)

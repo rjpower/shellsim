@@ -1,0 +1,54 @@
+{
+  "kind": "native-library",
+  "name": "zlib",
+  "version": "1.3.1",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "linkage": "static",
+  "source": {
+    "url": "https://zlib.net/fossils/zlib-1.3.1.tar.gz",
+    "sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+    "subdirectory": "zlib-1.3.1"
+  },
+  "target_dependencies": [],
+  "build_scripts": [],
+  "build": {
+    "adapter": "configure-make",
+    "configure_args": [
+      "--static"
+    ],
+    "jobs": 2,
+    "install_prefix": "/usr/local"
+  },
+  "exports": {
+    "archives": [
+      "lib/libz.a"
+    ],
+    "headers": [
+      "include/zlib.h",
+      "include/zconf.h"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/zlib.pc"
+    ],
+    "licenses": [
+      "licenses/zlib.txt"
+    ]
+  },
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/cmake_smoke.c",
+      "link_inputs": [
+        "lib/libz.a"
+      ]
+    }
+  ],
+  "source_exports": [
+    {
+      "source": "README",
+      "destination": "licenses/zlib.txt"
+    }
+  ]
+}

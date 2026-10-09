@@ -40,3 +40,26 @@ probe. These stock-SDK probes establish adapter behavior; they do not certify
 threaded dynamic TLS lowering. zlib's upstream CMake script also needs an
 explicit WASI library-name portability patch before its generated `-lz`
 pkg-config interface can be published.
+
+`NativeBuildContext.shared_library_flags` contains the cohort's side-module
+flags. The compiler flag wrapper adds them only when the upstream build requests
+its explicit `-shared` mode. Executable compiler checks receive common
+`linker_flags` instead.
+
+`native_artifacts.NativeArtifact` holds a prefix and its verified envelope.
+`NativeTarget` carries exact target, profile, ABI and toolchain identity.
+`merge_dependency_sysroot` validates the direct dependencies and all their
+reachable descendants, then atomically writes their exports under
+`destination/usr/local`. Extra independent results in the supplied mapping are
+not staged. Identical file exports may share a path; differing bytes or a
+file/directory collision reject the merge before publication.
+
+`seal_native_install` reads `staging/usr/local`. Recipe `exports` lists exact
+payload-relative files; `export_directories` lists payload-relative directories
+by group. For example, headers may declare `include` while shared libraries
+name `lib/libexample.so` explicitly. Contained file links become regular file
+snapshots. Shared library exports receive the exact cohort ABI marker and must
+have the declared direct providers in their emitted dependency list. The
+artifact envelope retains the original graph recipe and digest separately from
+the effective recipe with expanded exact file exports. Source and cache
+admission stay with the runner.
