@@ -8,18 +8,15 @@ from pathlib import Path
 
 import pytest
 
+from ports.native.dependencies import recipe_identity
 from ports.native.freetype.build import pkg_config
 
 ROOT = Path(__file__).resolve().parents[4]
 
 
-def test_freetype_declares_only_pinned_zlib_dependency():
+def test_freetype_pins_production_sources():
     recipe = json.loads((ROOT / "ports/native/freetype/recipe.json").read_text())
-    assert recipe["target_profile"] == "wasi-cpython-v2"
-    assert recipe["sdk"]["version"] == "34.0"
-    assert recipe["target_dependencies"] == [{"port": "native/zlib", "version": "1.3.1"}]
-    for optional in ("png", "bzip2", "brotli", "harfbuzz", "host_discovery"):
-        assert recipe["features"][optional] is False
+    recipe_identity(recipe, ROOT / "ports/native/freetype")
 
 
 @pytest.fixture
@@ -40,7 +37,6 @@ def test_pkg_config_uses_upstream_libtool_version(upstream_metadata):
     assert "Version: 26.2.20\n" in rendered
     assert "Cflags: -I${includedir}/freetype2\n" in rendered
     assert "Requires.private: zlib\n" in rendered
-    assert recipe["version"] == "2.13.3"
 
 
 @pytest.mark.parametrize("field", ["version", "template", "release"])

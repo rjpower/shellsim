@@ -48,6 +48,8 @@ def build(bundle, output):
             str(bridge),
         ]
     )
+    # Retain the SDK SJLJ archive with the C++ runtime so side libraries import
+    # the main-owned longjmp tag even when CPython has no setjmp call itself.
     # Pull the complete C symbol surface through normal archive selection. This
     # selects the SDK's long-double stdio implementations before default libc,
     # while leaving exactly one definition of each canonical runtime symbol.

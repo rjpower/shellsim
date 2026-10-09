@@ -1,0 +1,41 @@
+{
+  "kind": "cpython-runtime-closure",
+  "name": "shellsim-cpython-ctypes",
+  "version": "3.13.7",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "target": "wasm32-wasip1",
+  "main_bridge_sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
+  "process_patch_sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
+  "cpython_source_sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a",
+  "zlib_source_sha256": "9a93b2b7dfdac77ceba5a558a580e74667dd6fede4585b91eefb60f03b72df23",
+  "native_dependencies": [
+    "libz.so",
+    "libffi.so"
+  ],
+  "build_scripts": [
+    {
+      "file": "assembly.py",
+      "sha256": "310596051ce0856ca2f5099068898740863a3e38a8a77b238f5b263b458ff7e5"
+    },
+    {
+      "file": "stdlib_ctypes_recipe.json",
+      "sha256": "32edc2f751f808e3c4fce600191b9e83a061c99d16ffd706138ea4236edfe96d"
+    },
+    {
+      "file": "../../native/libffi/shared/recipe.json",
+      "sha256": "510e7331c693aa3a8b49c2f0952819ed70ade9e773c26a17a17764b55a5ede32"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ]
+}

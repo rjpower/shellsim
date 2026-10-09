@@ -1,0 +1,90 @@
+{
+  "kind": "cpython-extension",
+  "name": "_ctypes",
+  "version": "3.13.7",
+  "target_profile": "wasi-cpython-v2",
+  "target": "wasm32-wasip1",
+  "linkage": "side-module-shared-libffi",
+  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "source": {
+    "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
+    "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
+  },
+  "host_tools": [
+    "python-build-driver",
+    "wasi-sdk-clang"
+  ],
+  "target_dependencies": [
+    {
+      "port": "native/libffi/shared",
+      "version": "3.5.2"
+    }
+  ],
+  "features": {
+    "upstream_cpython_sources": true,
+    "primitive_ffi": true,
+    "aggregate_ffi": false,
+    "variadic_ffi": false
+  },
+  "transitive_link_flags": [],
+  "exports": {
+    "extensions": [
+      "lib-dynload/_ctypes.so"
+    ],
+    "licenses": [
+      "licenses/cpython.txt",
+      "licenses/libffi.txt"
+    ]
+  },
+  "main_bridge_sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
+  "python_files_sha256": {
+    "Modules/_ctypes/_ctypes.c": "3fb8e8dda97767d8743271e8f647ffb2c2abbea96ff86196ea1af180374af1a7",
+    "Modules/_ctypes/callbacks.c": "53c1cc13df9c293aaedde1952073f8a7676ef87fb29c4200c95ca7955cf82ab8",
+    "Modules/_ctypes/callproc.c": "0517b9365c6eff87781ebb3fa3da099cb9ed8cccb50f2aad4c82dd47e0020090",
+    "Modules/_ctypes/stgdict.c": "42737e02db0c29c8b4f82a82d80877e1b46027a5fb3da94d873f21f4993be127",
+    "Modules/_ctypes/cfield.c": "15f9873a7fae591b225cf8333b0856f3bca065fd2d91d4222bc3d30ee5a757f8",
+    "wasi-build/pyconfig.h": "2884e3e9833f5c7a8c6832b9e79d5ab01b323685c07ecd718b6c8eb9a7fda46c"
+  },
+  "build_scripts": [
+    {
+      "file": "stdlib_ctypes.py",
+      "sha256": "495246e0f0a20c09d8bb5efdf097e8e684160d61f06fb2e87c106478effc299c"
+    },
+    {
+      "file": "../../native/dependencies.py",
+      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+    },
+    {
+      "file": "../../native/libffi/shared/recipe.json",
+      "sha256": "510e7331c693aa3a8b49c2f0952819ed70ade9e773c26a17a17764b55a5ede32"
+    },
+    {
+      "file": "../../_support/wasm.py",
+      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
+    },
+    {
+      "file": "../../_support/wasm_metadata.py",
+      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "../../toolchain/wasi_sdk/build.py",
+      "sha256": "97e424ec9fb67f59d0c029cd547dba4cb1c16e47fda0a62651cadf652b4fddad"
+    }
+  ],
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "native_dependencies": [
+    "libffi.so"
+  ],
+  "python_headers": {
+    "count": 265,
+    "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
+  }
+}
