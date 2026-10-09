@@ -26,7 +26,9 @@ use wasmtime::{
     Module, Store, StoreContextMut, StoreLimitsBuilder,
 };
 
-use crate::descriptors::{DescriptorError, IoPoll};
+use crate::descriptors::{
+    DescriptorError, DescriptorKind, DescriptorState, IoPoll, MAX_FDS_PER_PROCESS,
+};
 use crate::display::DisplayError;
 use crate::exec::ShellPoll;
 use crate::interp::Interp;
@@ -79,6 +81,7 @@ const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
 const ERRNO_NOSPC: i32 = 51;
+const ERRNO_RANGE: i32 = 68;
 
 struct CachedModule {
     source: Vec<u8>,
@@ -341,7 +344,8 @@ struct Host {
     initial_fuel: u64,
     closed_stdio: BTreeSet<i32>,
     open_files: BTreeSet<i32>,
-    append_files: BTreeSet<i32>,
+    /// Buffered aliases retain the original stream when dup2 redirects a standard fd.
+    buffered_streams: BTreeMap<i32, i32>,
     directories: BTreeMap<u32, String>,
     limits: limits::GuestLimits,
     interaction: Option<Arc<Mutex<Interaction>>>,
@@ -407,12 +411,112 @@ fn guest_file(
     caller: &mut Caller<'_, Host>,
     fd: i32,
 ) -> Result<crate::descriptors::FileState, i32> {
-    if !caller.data().open_files.contains(&fd) {
-        return Err(ERRNO_BADF);
-    }
+    guest_descriptor(caller, fd)?;
     ActiveSystem::new(&mut caller.data_mut().machine.get())
         .file_state(fd)
         .map_err(|error| syscall_errno(&error))
+}
+
+fn guest_descriptor(caller: &mut Caller<'_, Host>, fd: i32) -> Result<DescriptorState, i32> {
+    if caller.data().closed_stdio.contains(&fd)
+        || (fd > 2 && !caller.data().open_files.contains(&fd))
+    {
+        return Err(ERRNO_BADF);
+    }
+    ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .descriptor_state(fd)
+        .map_err(|error| syscall_errno(&error))
+}
+
+/// POSIX descriptor operations use virtual aliases, never host handles. Operations are
+/// 1=get CLOEXEC, 2=set CLOEXEC, 3=dup above minimum, 4=dup with CLOEXEC, 5=dup2.
+fn descriptor_control(
+    mut caller: Caller<'_, Host>,
+    fd: i32,
+    operation: u32,
+    argument: i32,
+    result: u32,
+) -> Result<i32, Error> {
+    if !write_u32(&mut caller, result, 0) {
+        return Ok(ERRNO_FAULT);
+    }
+    if let Err(error) = guest_descriptor(&mut caller, fd) {
+        return Ok(error);
+    }
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu(MAX_FDS_PER_PROCESS as u64)
+    {
+        return Err(exhausted());
+    }
+    if operation == 1 || operation == 2 {
+        if operation == 2 && !(0..=1).contains(&argument) {
+            return Ok(ERRNO_INVAL);
+        }
+        let flags = {
+            let mut machine = caller.data_mut().machine.get();
+            if operation == 2 {
+                machine
+                    .process
+                    .fds
+                    .set_close_on_exec(fd, argument != 0)
+                    .map(|()| 0)
+            } else {
+                machine.process.fds.close_on_exec(fd).map(i32::from)
+            }
+        };
+        return Ok(match flags {
+            Ok(flags) if write_u32(&mut caller, result, flags as u32) => ERRNO_SUCCESS,
+            Ok(_) => ERRNO_FAULT,
+            Err(_) => ERRNO_BADF,
+        });
+    }
+    let upper = MAX_FDS_PER_PROCESS as i32 + 5;
+    if !(3..=5).contains(&operation)
+        || !(0..upper).contains(&argument)
+        || (operation == 5 && (argument == 3 || argument == 4))
+    {
+        return Ok(ERRNO_INVAL);
+    }
+    let destination = if operation == 5 {
+        argument
+    } else {
+        let host = caller.data_mut();
+        let machine = host.machine.get();
+        let Some(destination) = (argument..upper).find(|candidate| {
+            *candidate != 3 && *candidate != 4 && machine.process.fds.get(*candidate).is_err()
+        }) else {
+            return Ok(ERRNO_NOSPC);
+        };
+        destination
+    };
+    let buffered = caller.data().buffered_streams.get(&fd).copied();
+    if let Err(error) =
+        ActiveSystem::new(&mut caller.data_mut().machine.get()).duplicate(fd, destination)
+    {
+        return Ok(syscall_errno(&error));
+    }
+    if operation == 4 {
+        caller
+            .data_mut()
+            .machine
+            .get()
+            .process
+            .fds
+            .set_close_on_exec(destination, true)
+            .expect("new descriptor is installed");
+    }
+    let host = caller.data_mut();
+    host.open_files.insert(destination);
+    host.closed_stdio.remove(&destination);
+    host.buffered_streams.remove(&destination);
+    if let Some(stream) = buffered {
+        host.buffered_streams.insert(destination, stream);
+    }
+    Ok(if write_u32(&mut caller, result, destination as u32) {
+        ERRNO_SUCCESS
+    } else {
+        ERRNO_FAULT
+    })
 }
 
 fn memory(caller: &mut Caller<'_, Host>) -> Option<Memory> {
@@ -604,9 +708,6 @@ fn path_open(mut caller: Caller<'_, Host>, request: PathOpen) -> i32 {
     }
     let host = caller.data_mut();
     host.open_files.insert(fd);
-    if options.append {
-        host.append_files.insert(fd);
-    }
     ERRNO_SUCCESS
 }
 
@@ -774,14 +875,6 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
     }
     let mut value = [0; 24];
     let rights = match fd {
-        0 => {
-            value[0] = 2;
-            2_u64
-        }
-        1 | 2 => {
-            value[0] = 2;
-            64_u64
-        }
         3 | 4 => {
             value[0] = 3;
             u64::MAX
@@ -790,16 +883,23 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
             value[0] = 3;
             u64::MAX
         }
-        _ => match guest_file(&mut caller, fd as i32) {
-            Ok(file) => {
-                value[0] = 4;
-                (if file.readable { 2 } else { 0 }) | (if file.writable { 64 } else { 0 })
+        _ => match guest_descriptor(&mut caller, fd as i32) {
+            Ok(state) => {
+                value[0] = if state.kind == DescriptorKind::File {
+                    4
+                } else {
+                    2
+                };
+                (if state.readable { 2 } else { 0 }) | (if state.writable { 64 } else { 0 })
             }
             Err(error) => return error,
         },
     };
     value[8..16].copy_from_slice(&rights.to_le_bytes());
     value[16..24].copy_from_slice(&rights.to_le_bytes());
+    if guest_file(&mut caller, fd as i32).is_ok_and(|file| file.append) {
+        value[2] = 1;
+    }
     let Some(memory) = memory(&mut caller) else {
         return ERRNO_FAULT;
     };
@@ -810,26 +910,79 @@ fn fd_fdstat_get(mut caller: Caller<'_, Host>, fd: u32, pointer: u32) -> i32 {
     }
 }
 
+fn fd_filestat_set_size(mut caller: Caller<'_, Host>, fd: i32, size: u64) -> Result<i32, Error> {
+    match guest_descriptor(&mut caller, fd) {
+        Ok(state) if state.writable && state.kind == DescriptorKind::File => {}
+        Ok(_) => return Ok(ERRNO_BADF),
+        Err(error) => return Ok(error),
+    }
+    let Ok(size) = usize::try_from(size) else {
+        return Ok(ERRNO_NOSPC);
+    };
+    let mut machine = caller.data_mut().machine.get();
+    let system = &mut ActiveSystem::new(&mut machine);
+    let old_size = match system.metadata_fd(fd) {
+        Ok(info) => info.size,
+        Err(error) => return Ok(syscall_errno(&error)),
+    };
+    let growth = (size as u64).saturating_sub(old_size);
+    if !system.charge_cpu(growth.saturating_add(1)) {
+        return Err(exhausted());
+    }
+    if !system.reserve_memory(growth) {
+        return Err(exhausted());
+    }
+    let resized = system.resize_file(fd, size);
+    system.release_memory(growth);
+    Ok(match resized {
+        Ok(()) => ERRNO_SUCCESS,
+        Err(error) => syscall_errno(&error),
+    })
+}
+
+fn fd_fdstat_set_flags(mut caller: Caller<'_, Host>, fd: i32, flags: u32) -> Result<i32, Error> {
+    if flags & !1 != 0 {
+        return Ok(ERRNO_INVAL);
+    }
+    let state = match guest_descriptor(&mut caller, fd) {
+        Ok(state) => state,
+        Err(error) => return Ok(error),
+    };
+    if state.kind != DescriptorKind::File {
+        return Ok(ERRNO_INVAL);
+    }
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu(MAX_FDS_PER_PROCESS as u64)
+    {
+        return Err(exhausted());
+    }
+    let mut machine = caller.data_mut().machine.get();
+    let description = machine.process.fds.get(fd).expect("validated descriptor");
+    machine
+        .descriptors
+        .set_append(description, flags == 1)
+        .expect("validated regular file");
+    Ok(ERRNO_SUCCESS)
+}
+
 fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
     if caller.data_mut().directories.remove(&fd).is_some() {
         return ERRNO_SUCCESS;
     }
     let fd = fd as i32;
+    caller.data_mut().buffered_streams.remove(&fd);
     if (0..=2).contains(&fd) {
         let host = caller.data_mut();
         if !host.closed_stdio.insert(fd) {
             return ERRNO_BADF;
         }
         // Closing a real standard descriptor lets a pipe reader see EOF before the guest exits.
-        if matches!(host.stdio, Stdio::Descriptors) {
-            let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
-        }
+        let _ = ActiveSystem::new(&mut host.machine.get()).close(fd);
         return ERRNO_SUCCESS;
     }
     if !caller.data_mut().open_files.remove(&fd) {
         return ERRNO_BADF;
     }
-    caller.data_mut().append_files.remove(&fd);
     match ActiveSystem::new(&mut caller.data_mut().machine.get()).close(fd) {
         Ok(()) => ERRNO_SUCCESS,
         Err(error) => syscall_errno(&error),
@@ -887,10 +1040,11 @@ fn filestat(info: &FileInfo) -> [u8; 64] {
 }
 
 fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    if fd <= 2 {
-        if caller.data().closed_stdio.contains(&(fd as i32)) {
-            return ERRNO_BADF;
-        }
+    let descriptor = guest_descriptor(&mut caller, fd as i32);
+    if descriptor
+        .as_ref()
+        .is_ok_and(|state| state.kind != DescriptorKind::File)
+    {
         // Standard streams can be pipes, captures, or terminals; they have no regular-file size.
         let mut value = [0; 64];
         value[16] = 2;
@@ -905,7 +1059,7 @@ fn fd_filestat_get(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
         };
     }
     let directory = preopen_base(&caller, fd).ok();
-    let regular_file = caller.data().open_files.contains(&(fd as i32));
+    let regular_file = descriptor.is_ok_and(|state| state.kind == DescriptorKind::File);
     let info = {
         let mut machine = caller.data_mut().machine.get();
         let system = &mut ActiveSystem::new(&mut machine);
@@ -1315,14 +1469,12 @@ fn fd_write(
     if caller.data().closed_stdio.contains(&fd) {
         return Ok(StreamCall::Done(ERRNO_BADF));
     }
-    let standard = fd == 1 || fd == 2;
-    if !standard {
-        match guest_file(caller, fd) {
-            Ok(file) if file.writable => {}
-            Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
-            Err(error) => return Ok(StreamCall::Done(error)),
-        }
-    }
+    let state = match guest_descriptor(caller, fd) {
+        Ok(state) if state.writable => state,
+        Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
+        Err(error) => return Ok(StreamCall::Done(error)),
+    };
+    let standard = fd == 1 || fd == 2 || state.kind == DescriptorKind::Stream;
     let Some(memory) = memory(caller) else {
         return Ok(StreamCall::Done(ERRNO_FAULT));
     };
@@ -1335,6 +1487,7 @@ fn fd_write(
         bytes.extend_from_slice(&memory.data(&*caller)[pointer..pointer + length]);
     }
     let host = caller.data_mut();
+    let buffered = host.buffered_streams.get(&fd).copied();
     if standard {
         let remaining = ActiveSystem::new(&mut host.machine.get()).output_remaining();
         if remaining == 0 && !bytes.is_empty() {
@@ -1342,14 +1495,10 @@ fn fd_write(
             return Err(exhausted());
         }
         bytes.truncate(remaining.min(bytes.len() as u64) as usize);
-    } else if host.append_files.contains(&fd) {
-        if let Err(error) = ActiveSystem::new(&mut host.machine.get()).seek(fd, 0, 2) {
-            return Ok(StreamCall::Done(syscall_errno(&error)));
-        }
     }
     let count = match &mut host.stdio {
-        Stdio::Buffered { stdout, stderr, .. } if standard => {
-            let destination = if fd == 1 { stdout } else { stderr };
+        Stdio::Buffered { stdout, stderr, .. } if matches!(buffered, Some(1 | 2)) => {
+            let destination = if buffered == Some(1) { stdout } else { stderr };
             destination.extend_from_slice(&bytes);
             bytes.len()
         }
@@ -1391,12 +1540,10 @@ fn fd_read(
     if caller.data().closed_stdio.contains(&fd) {
         return Ok(StreamCall::Done(ERRNO_BADF));
     }
-    if fd != 0 {
-        match guest_file(caller, fd) {
-            Ok(file) if file.readable => {}
-            Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
-            Err(error) => return Ok(StreamCall::Done(error)),
-        }
+    match guest_descriptor(caller, fd) {
+        Ok(state) if state.readable => {}
+        Ok(_) => return Ok(StreamCall::Done(ERRNO_BADF)),
+        Err(error) => return Ok(StreamCall::Done(error)),
     }
     let Some(memory) = memory(caller) else {
         return Ok(StreamCall::Done(ERRNO_FAULT));
@@ -1407,8 +1554,9 @@ fn fd_read(
     };
     let total = vectors.iter().map(|(_, length)| length).sum::<usize>();
     let host = caller.data_mut();
+    let buffered = host.buffered_streams.get(&fd).copied();
     let input = match &mut host.stdio {
-        Stdio::Buffered { stdin, offset, .. } if fd == 0 => {
+        Stdio::Buffered { stdin, offset, .. } if buffered == Some(0) => {
             let end = offset.saturating_add(total).min(stdin.len());
             let bytes = stdin[*offset..end].to_vec();
             *offset = end;
@@ -1619,8 +1767,121 @@ fn wrap_stream_call(linker: &mut Linker<Host>, name: &str, call: StreamFn) {
         .expect("unique WASI import");
 }
 
+fn cwd_get(mut caller: Caller<'_, Host>, pointer: u32, capacity: u32) -> Result<i32, Error> {
+    let path = caller.data().cwd.as_bytes();
+    if path.len() >= capacity as usize || capacity > 4096 {
+        return Ok(ERRNO_RANGE);
+    }
+    let length = path.len();
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get()).charge_cpu(length as u64 + 1) {
+        return Err(exhausted());
+    }
+    let mut bytes = caller.data().cwd.as_bytes().to_vec();
+    bytes.push(0);
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    Ok(
+        if memory.write(&mut caller, pointer as usize, &bytes).is_ok() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        },
+    )
+}
+
+fn cwd_set(
+    mut caller: Caller<'_, Host>,
+    pointer: u32,
+    length: u32,
+    output: u32,
+    capacity: u32,
+) -> Result<i32, Error> {
+    if capacity > 4096 {
+        return Ok(ERRNO_RANGE);
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (output as usize)
+        .checked_add(capacity as usize)
+        .is_none_or(|end| end > memory.data(&caller).len())
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    let path = match read_path(&mut caller, pointer, length) {
+        Ok(path) => path,
+        Err(error) => return Ok(error),
+    };
+    if path.is_empty() {
+        return Ok(ERRNO_NOENT);
+    }
+    let base = caller.data().cwd.clone();
+    if !ActiveSystem::new(&mut caller.data_mut().machine.get())
+        .charge_cpu((base.len() + path.len() + 1) as u64)
+    {
+        return Err(exhausted());
+    }
+    let resolved = {
+        let mut machine = caller.data_mut().machine.get();
+        let system = &mut ActiveSystem::new(&mut machine);
+        let resolved = match system.canonicalize(&base, &path, true) {
+            Ok(path) => path,
+            Err(error) => return Ok(syscall_errno(&error)),
+        };
+        if resolved.len() >= capacity as usize {
+            return Ok(ERRNO_RANGE);
+        }
+        if let Err(error) = system.chdir(&resolved) {
+            return Ok(syscall_errno(&error));
+        }
+        resolved
+    };
+    let mut bytes = resolved.as_bytes().to_vec();
+    bytes.push(0);
+    caller.data_mut().cwd = resolved;
+    Ok(
+        if memory.write(&mut caller, output as usize, &bytes).is_ok() {
+            ERRNO_SUCCESS
+        } else {
+            ERRNO_FAULT
+        },
+    )
+}
+
 fn build_linker(engine: &Engine) -> Linker<Host> {
     let mut linker = Linker::<Host>::new(engine);
+    linker
+        .func_wrap("shellsim_posix_v1", "cwd_get", cwd_get)
+        .expect("unique POSIX import");
+    linker
+        .func_wrap("shellsim_posix_v1", "cwd_set", cwd_set)
+        .expect("unique POSIX import");
+    linker
+        .func_wrap(
+            "shellsim_posix_v1",
+            "umask",
+            |mut caller: Caller<'_, Host>, mask: u32| -> Result<u32, Error> {
+                let mut machine = caller.data_mut().machine.get();
+                let system = &mut ActiveSystem::new(&mut machine);
+                if !system.charge_cpu(1) {
+                    return Err(exhausted());
+                }
+                let previous = system.umask();
+                system
+                    .set_umask((mask & 0o777) as u16)
+                    .expect("permission mask is bounded");
+                Ok(u32::from(previous))
+            },
+        )
+        .expect("unique POSIX import");
+    linker
+        .func_wrap(
+            "shellsim_posix_v1",
+            "descriptor_control",
+            descriptor_control,
+        )
+        .expect("unique POSIX import");
     linker
         .func_wrap(
             "wasi_snapshot_preview1",
@@ -1679,6 +1940,20 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
         .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_fdstat_get", fd_fdstat_get)
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_fdstat_set_flags",
+            fd_fdstat_set_flags,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "fd_filestat_set_size",
+            fd_filestat_set_size,
+        )
         .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_readdir", fd_readdir)
@@ -1968,6 +2243,11 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     // success. Non-WASI namespaces must still be rejected at instantiation.
     for import in module.imports() {
         if import.module() != "wasi_snapshot_preview1"
+            && !(import.module() == "shellsim_posix_v1"
+                && matches!(
+                    import.name(),
+                    "descriptor_control" | "umask" | "cwd_get" | "cwd_set"
+                ))
             && !(dynamic::Abi::from_namespace(import.module()).is_some()
                 && matches!(import.name(), "open" | "symbol" | "error"))
             && !(import.module() == "shellsim"
@@ -2072,6 +2352,12 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         .resources
         .cpu_remaining()
         .saturating_mul(WASM_FUEL_PER_CPU_UNIT);
+    let inherited_files = interp
+        .process
+        .fds
+        .iter()
+        .filter_map(|(fd, _)| (fd > 4).then_some(fd))
+        .collect();
     let system = ActiveSystem::new(interp);
     let host = Host {
         machine: machine.clone(),
@@ -2082,12 +2368,16 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             .iter()
             .map(|(name, value)| format!("{name}={value}").into_bytes())
             .collect(),
-        stdio: launch.stdio,
         diagnostic: Vec::new(),
         initial_fuel,
         closed_stdio: BTreeSet::new(),
-        open_files: BTreeSet::new(),
-        append_files: BTreeSet::new(),
+        open_files: inherited_files,
+        buffered_streams: if matches!(launch.stdio, Stdio::Buffered { .. }) {
+            BTreeMap::from([(0, 0), (1, 1), (2, 2)])
+        } else {
+            BTreeMap::new()
+        },
+        stdio: launch.stdio,
         directories: BTreeMap::new(),
         limits: {
             let store = StoreLimitsBuilder::new()

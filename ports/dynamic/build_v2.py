@@ -38,6 +38,8 @@ def build_v2(bundle, output):
     clang = str(sdk / "bin/clang")
     clang_cpp = str(sdk / "bin/clang++")
     compile_flags = [*profile["compiler_flags"], *profile["cpp_flags"]]
+    posix = output / "posix.o"
+    run([clang, *compile_flags, "-c", str(Path(__file__).parents[1] / "toolchain/wasi_sdk/posix.c"), "-o", str(posix)])
     bridge = output / "bridge.o"
     run(
         [
@@ -67,7 +69,7 @@ def build_v2(bundle, output):
         *("-Wl,--undefined=" + name for name in definitions),
         str(libc),
     ]
-    main_flags = [*runtime_flags, *profile["link_flags"], *recipe["main_link_flags"]]
+    main_flags = [str(posix), *runtime_flags, *profile["link_flags"], *recipe["main_link_flags"]]
     for name, compiler, fixture in (
         ("main.wasm", clang_cpp, "exception_main.cpp"),
         ("c_main.wasm", clang, "main.c"),
@@ -104,8 +106,28 @@ def build_v2(bundle, output):
         text=True,
         env=environment,
     )
+    # Enable upstream os.umask against the canonical virtual libc definition.
+    # Replace only this object in private output; the trusted base is untouched.
+    posix_rule = "shellsim_posix_compile:; @echo $(CC) $(PY_CORE_CFLAGS) -c $(srcdir)/Modules/posixmodule.c"
+    posix_compile = shlex.split(
+        subprocess.check_output(
+            ["make", "--no-print-directory", "--eval", posix_rule, "shellsim_posix_compile"],
+            cwd=guest,
+            text=True,
+            env=environment,
+        )
+    )
+    posix_module = output / "posixmodule.o"
+    posix_header = Path(__file__).parents[1] / "toolchain/wasi_sdk/posix.h"
+    posix_compile.extend(["-DHAVE_UMASK=1", "-include", str(posix_header.resolve()), "-o", str(posix_module.resolve())])
+    run(posix_compile, cwd=guest)
+    link_args = shlex.split(link)
+    original_posix = "Modules/posixmodule.o"
+    if link_args.count(original_posix) != 1:
+        raise ValueError("CPython link does not contain exactly one upstream posix object")
+    link_args[link_args.index(original_posix)] = str(posix_module.resolve())
     python = output / "python3.wasm"
-    run([*shlex.split(link), *profile["cpp_flags"], str(bridge), *main_flags, "-o", str(python)], cwd=guest)
+    run([*link_args, *profile["cpp_flags"], str(bridge), *main_flags, "-o", str(python)], cwd=guest)
     run([str(sdk / "bin/llvm-strip"), str(python)])
     mark_abi(python, abi)
     for name, value in (("tiny_one", 17), ("tiny_two", 40)):
@@ -189,6 +211,14 @@ def build_v2(bundle, output):
     manifest = {
         **base,
         "dynamic_abi": recipe["abi"],
+        "runtime_capabilities": ["shellsim_posix_v1"],
+        "cpython_posix": {
+            "capabilities": ["umask"],
+            "source_sha256": file_hash(source / "Modules/posixmodule.c"),
+            "base_object_sha256": file_hash(guest / original_posix),
+            "object_sha256": file_hash(posix_module),
+            "compiler_command": posix_compile,
+        },
         "dynamic_toolchain": {"recipe": recipe, "identity": identity},
         "source_bundle": str(bundle),
         "source_bundle_sha256": file_hash(bundle / "manifest.json"),

@@ -17,7 +17,10 @@
     "runtime_owner": "main-executable",
     "exception_tag": "env.__cpp_exception",
     "longdouble_printf": true,
-    "threads": false
+    "threads": false,
+    "virtual_posix_descriptors": "shellsim_posix_v1",
+    "virtual_umask": true,
+    "virtual_cwd": true
   },
   "runtime_archives": [
     "../libc.a",
@@ -44,7 +47,7 @@
     },
     {
       "file": "../../dynamic/build_v2.py",
-      "sha256": "1cf7b7cf79f0d1954e4dbd28cca111bcb280a62b618ac784faf5d217659b24a4"
+      "sha256": "2a528b0e3da236464501d6cf77098d6e59db1104e8655dfd690585d1b842f527"
     },
     {
       "file": "../../dynamic/build.py",
@@ -97,6 +100,14 @@
     {
       "file": "../../dynamic/fixtures/zlib_extension.c",
       "sha256": "d7d2cc048d9709a63409000cf45049e068da8a898115dbdc7d7c380b422d8da1"
+    },
+    {
+      "file": "posix.c",
+      "sha256": "52d04038e03a4c14062aaff8099d5af3629aef5bb674031662bd6769ac0bb2ae"
+    },
+    {
+      "file": "posix.h",
+      "sha256": "031eac921644625f3f6923c224fe1341831e4340fc2d13bea7fee7ad3ccd38ee"
     }
   ],
   "runtime_sources": {

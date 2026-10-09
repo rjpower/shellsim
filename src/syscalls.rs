@@ -3,7 +3,9 @@
 //! Paths resolve only in the virtual filesystem. Open files live in the process descriptor
 //! table, so a guest cannot keep a second, unaccounted set of file handles or cursors.
 
-use crate::descriptors::{DescriptorError, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS};
+use crate::descriptors::{
+    DescriptorError, DescriptorState, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS,
+};
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
 use crate::net::{HttpPoll, HttpRequest, NetworkRequest, RequestError, RouteError};
@@ -105,6 +107,10 @@ pub(crate) trait System {
     ) -> Result<(), SyscallError>;
     /// Duplicate a process descriptor, sharing its open description and cursor.
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError>;
+    /// Inspect the access and type of any virtual descriptor, including streams and devices.
+    fn descriptor_state(&self, fd: Fd) -> Result<DescriptorState, SyscallError>;
+    /// Resize a writable regular-file description, retaining its shared cursor.
+    fn resize_file(&mut self, fd: Fd, size: usize) -> Result<(), SyscallError>;
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError>;
     fn close(&mut self, fd: Fd) -> Result<(), SyscallError>;
     fn seek(&mut self, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError>;
@@ -464,6 +470,26 @@ impl System for ActiveSystem<'_> {
             .duplicate(source, destination, &mut self.interp.descriptors)?;
         self.interp
             .refresh_descriptor_snapshot(self.interp.process.pid);
+        Ok(())
+    }
+
+    fn descriptor_state(&self, fd: Fd) -> Result<DescriptorState, SyscallError> {
+        Ok(self
+            .interp
+            .descriptors
+            .state(self.interp.process.fds.get(fd)?)?)
+    }
+
+    fn resize_file(&mut self, fd: Fd, size: usize) -> Result<(), SyscallError> {
+        let file = file_state(self.interp, fd)?;
+        if !file.writable {
+            return Err(SyscallError::Permission);
+        }
+        self.interp.sync_vfs_time();
+        match file.orphan {
+            Some(id) => self.interp.vfs.resize_orphan(id, size)?,
+            None => self.interp.vfs.resize_file("/", &file.path, size)?,
+        }
         Ok(())
     }
 
@@ -1049,7 +1075,9 @@ fn open_file_at(
                     .descriptors
                     .open_device(kind, options.readable, options.writable)?
             }
-            None => interp.descriptors.open_null()?,
+            None => interp
+                .descriptors
+                .open_null_with_access(options.readable, options.writable)?,
         };
         interp.install_new_description(fd, description)?;
         return Ok(());
@@ -1102,6 +1130,7 @@ fn open_file_at(
         cursor,
         options.readable,
         options.writable,
+        options.append,
         created_by_open,
     )?;
     interp.install_new_description(fd, description)?;
@@ -1159,7 +1188,11 @@ fn unlink(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError
 /// Create one directory; unlike `mkdir_all`, this retains POSIX's existing-parent requirement.
 fn mkdir(interp: &mut Interp, cwd: &str, path: &str) -> Result<(), SyscallError> {
     interp.sync_vfs_time();
-    interp.vfs.mkdir(cwd, path).map_err(Into::into)
+    interp.vfs.mkdir(cwd, path)?;
+    interp
+        .vfs
+        .chmod(cwd, path, 0o777 & !u32::from(interp.process.umask))
+        .map_err(Into::into)
 }
 
 /// Remove only an empty virtual directory.

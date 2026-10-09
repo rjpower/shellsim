@@ -643,6 +643,17 @@ mod tests {
             unreachable!("native writer does not duplicate descriptors")
         }
 
+        fn resize_file(&mut self, _fd: i32, _size: usize) -> Result<(), SyscallError> {
+            unreachable!("native writer does not resize files")
+        }
+
+        fn descriptor_state(
+            &self,
+            _fd: i32,
+        ) -> Result<crate::descriptors::DescriptorState, SyscallError> {
+            unreachable!("native writer does not inspect descriptors")
+        }
+
         fn file_state(&self, _fd: i32) -> Result<crate::descriptors::FileState, SyscallError> {
             unreachable!("native writer does not inspect files")
         }

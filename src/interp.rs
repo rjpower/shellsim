@@ -977,6 +977,9 @@ impl Environment {
                     Some(crate::vfs::NodeKind::File(_))
                         if crate::commands::is_wasm_executable(&self.vfs, &path) =>
                     {
+                        if !argv[0].contains('/') {
+                            argv[0] = path.clone();
+                        }
                         Some(crate::program::NativeProcess::Wasm(
                             crate::commands::WasmProcess::new(path, argv.clone()),
                         ))
@@ -1007,7 +1010,9 @@ impl Environment {
         };
         if let Some(native) = native {
             let trust = native.trust();
-            self.reset_for_exec(pid)?;
+            if !matches!(native, crate::program::NativeProcess::Failure { .. }) {
+                self.reset_for_exec(pid)?;
+            }
             self.process.set_program(
                 pid,
                 Some(crate::program::ProgramContinuation::Native(native)),
@@ -1022,6 +1027,7 @@ impl Environment {
             );
             return Ok(());
         }
+        self.reset_for_exec(pid)?;
         self.process.set_continuation(
             pid,
             Some(crate::exec::ShellContinuation::new(
@@ -1046,6 +1052,7 @@ impl Environment {
         state.err_trap_active = true;
         state.handling_error = false;
         state.handling_signal = false;
+        state.fds.close_for_exec(&mut self.descriptors);
         Ok(())
     }
 
@@ -1948,7 +1955,18 @@ impl Environment {
             if !file.writable {
                 return Err(SyscallError::Permission);
             }
-            let cursor = usize::try_from(file.cursor).map_err(|_| SyscallError::InvalidArgument)?;
+            let position = if file.append {
+                match file.orphan {
+                    Some(id) => match &self.vfs.orphan_metadata(id)?.kind {
+                        crate::vfs::NodeKind::File(bytes) => bytes.len() as u64,
+                        _ => return Err(SyscallError::InvalidArgument),
+                    },
+                    None => self.vfs.file_len("/", &file.path)? as u64,
+                }
+            } else {
+                file.cursor
+            };
+            let cursor = usize::try_from(position).map_err(|_| SyscallError::InvalidArgument)?;
             self.sync_vfs_time();
             let result = match file.orphan {
                 Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
@@ -1960,7 +1978,8 @@ impl Environment {
                 }
                 return Err(error.into());
             }
-            self.descriptors.advance_file(description, bytes.len())?;
+            self.descriptors
+                .seek_file(description, position.saturating_add(bytes.len() as u64))?;
             return Ok(IoPoll::Ready(bytes.len()));
         }
         let result = self.descriptors.write(description, bytes)?;
@@ -2505,6 +2524,44 @@ pub type Interp = Environment;
 #[cfg(test)]
 mod process_state_tests {
     use super::*;
+
+    #[test]
+    fn exec_closes_only_flagged_child_aliases_for_native_and_wasm_images() {
+        for executable in ["true", "/guest.wasm"] {
+            let mut environment = Environment::new();
+            let bytes = wat::parse_str("(module (func (export \"_start\")))").unwrap();
+            environment
+                .vfs
+                .write("/", "/guest.wasm", &bytes, 0o755)
+                .unwrap();
+            let input = environment
+                .descriptors
+                .open_input(b"shared".to_vec())
+                .unwrap();
+            environment.install_new_description(5, input).unwrap();
+            environment
+                .process
+                .fds
+                .duplicate(5, 6, &mut environment.descriptors)
+                .unwrap();
+            environment.process.fds.set_close_on_exec(5, true).unwrap();
+            let parent = environment.pid;
+            let child = environment.start_child("probe", false).unwrap();
+            environment
+                .exec_argv_image(child, vec![executable.to_string()])
+                .unwrap();
+            assert!(environment.process.fds.get(5).is_err());
+            assert_eq!(
+                environment.read_fd(6, 6).unwrap(),
+                IoPoll::Ready(b"shared".to_vec())
+            );
+            assert!(environment.process.states[&parent].fds.get(5).is_ok());
+            assert!(environment.process.states[&parent]
+                .fds
+                .close_on_exec(5)
+                .unwrap());
+        }
+    }
 
     #[test]
     fn inactive_parent_context_remains_machine_owned_while_child_runs() {
