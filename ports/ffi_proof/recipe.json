@@ -6,8 +6,8 @@
   "build_script_sha256": "73c580b5de851bd65941143edd6a55423d73f365c31351a24f9ea7f3a0b60520",
   "bridge_sha256": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
   "sources_sha256": {
-    "fixtures/main.c": "e308799d26bae780bc8d84130451b33f7e05893e6af8e0630b174541383bfaef",
-    "fixtures/provider.c": "89e1e78245560eb85c2059c57a57469b6c0f1293c10f5364257a3609aff125c5",
+    "fixtures/main.c": "035b73dff2d3b6a89e03ac580a074a90a0ad741e69951676987c5f800ba9703d",
+    "fixtures/provider.c": "57484db1c9e63a467551ed1e91e37d41ef560e64fb15470f27b28a3b2e11d6ee",
     "fixtures/python_main_handle.c": "e8c5331da342803d54629482ee02f73304cd36dcfb19ce805f4ff065fe9c7221"
   }
 }

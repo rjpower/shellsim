@@ -254,6 +254,286 @@ fn callback_exception_can_be_caught_by_guest_caller() {
     assert_eq!(run(wat), (0, Vec::new()));
 }
 
+#[test]
+fn typed_callbacks_preserve_double_and_mixed_scalar_bits() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $double (func (param f64) (result f64)))
+        (type $mixed (func (param i32 f32 f64 i64) (result i64)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_release" (func $release (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 2 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $double_dispatch (param i32 i32 i32) (result i32)
+            (f64.store (local.get 2)
+                (f64.add (f64.load (local.get 1)) (f64.convert_i32_s (local.get 0))))
+            (i32.const 0))
+        (func $mixed_dispatch (param i32 i32 i32) (result i32)
+            (i64.store (local.get 2)
+                (i64.add (i64.load offset=24 (local.get 1))
+                    (i64.extend_i32_s
+                        (i32.add (i32.load (local.get 1))
+                            (i32.trunc_f32_s (f32.load offset=8 (local.get 1)))))))
+            (i32.const 0))
+        (elem (i32.const 0) $double_dispatch $mixed_dispatch)
+        (func (export "_start") (local $double_slot i32) (local $mixed_slot i32)
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (call $alloc (i32.const 0) (i32.const 2) (i32.const 32)
+                    (i32.const 1) (i32.const 4) (i32.const 256)) (then unreachable))
+            (local.set $double_slot (i32.load (i32.const 256)))
+            (if (f64.ne
+                    (call_indirect (type $double) (f64.const 1.5) (local.get $double_slot))
+                    (f64.const 3.5)) (then unreachable))
+            (i32.store8 (i32.const 32) (i32.const 1))
+            (i32.store8 (i32.const 33) (i32.const 3))
+            (i32.store8 (i32.const 34) (i32.const 4))
+            (i32.store8 (i32.const 35) (i32.const 2))
+            (if (call $alloc (i32.const 1) (i32.const 0) (i32.const 32)
+                    (i32.const 4) (i32.const 2) (i32.const 260)) (then unreachable))
+            (local.set $mixed_slot (i32.load (i32.const 260)))
+            (if (i64.ne
+                    (call_indirect (type $mixed)
+                        (i32.const 3) (f32.const 4) (f64.const 9.5) (i64.const 20)
+                        (local.get $mixed_slot))
+                    (i64.const 27)) (then unreachable))
+            (if (i32.ne (global.get 0) (i32.const 65536)) (then unreachable))
+            (if (call $release (local.get $double_slot)) (then unreachable))
+            (if (call $release (local.get $mixed_slot)) (then unreachable))
+            (if (i32.eqz (ref.is_null (table.get (local.get $double_slot))))
+                (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn typed_callback_rejects_bad_tags_signatures_and_output_without_allocating() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $wrong (param i32 i32) (result i32) (i32.const 0))
+        (elem (i32.const 0) $wrong)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 5))
+            (if (i32.ne
+                    (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                        (i32.const 1) (i32.const 4) (i32.const 256))
+                    (i32.const 28)) (then unreachable))
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (i32.ne
+                    (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                        (i32.const 1) (i32.const 4) (i32.const 256))
+                    (i32.const 28)) (then unreachable))
+            (if (i32.ne
+                    (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                        (i32.const 1) (i32.const 4) (i32.const 65534))
+                    (i32.const 21)) (then unreachable))
+            (if (i32.ne (table.size) (i32.const 1)) (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn typed_callback_nesting_restores_c_stack_and_tombstones_release() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_release" (func $release (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (if (i32.eqz (i32.load (local.get 1)))
+                (then (i32.store (local.get 2) (i32.const 0)))
+                (else (i32.store (local.get 2)
+                    (i32.add (i32.const 1)
+                        (call_indirect (type $callback)
+                            (i32.sub (i32.load (local.get 1)) (i32.const 1))
+                            (i32.load (i32.const 256)))))))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start") (local $slot i32)
+            (i32.store8 (i32.const 32) (i32.const 1))
+            (if (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                    (i32.const 1) (i32.const 1) (i32.const 256)) (then unreachable))
+            (local.set $slot (i32.load (i32.const 256)))
+            (if (i32.ne (call_indirect (type $callback) (i32.const 4) (local.get $slot))
+                    (i32.const 4)) (then unreachable))
+            (if (i32.ne (global.get $sp) (i32.const 65536)) (then unreachable))
+            (if (call $release (local.get $slot)) (then unreachable))
+            (if (i32.eqz (ref.is_null (table.get (local.get $slot))))
+                (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn typed_callback_restores_c_stack_after_guest_exception() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param f64) (result f64)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (tag $error (param i32))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (throw $error (i32.const 17)))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                    (i32.const 1) (i32.const 4) (i32.const 256)) (then unreachable))
+            (if (i32.ne
+                    (block $caught (result i32)
+                        (try_table (catch $error $caught)
+                            (drop (call_indirect (type $callback)
+                                (f64.const 2) (i32.load (i32.const 256)))))
+                        (i32.const 0))
+                    (i32.const 17)) (then unreachable))
+            (if (i32.ne (global.get $sp) (i32.const 65536)) (then unreachable))))"#;
+    assert_eq!(run(wat), (0, Vec::new()));
+}
+
+#[test]
+fn typed_callback_rejects_a_frame_below_the_static_stack_floor() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (i32.store (local.get 2) (i32.load (local.get 1)))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 1))
+            (if (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                    (i32.const 1) (i32.const 1) (i32.const 256)) (then unreachable))
+            (global.set $sp (i32.const 1100))
+            (drop (call_indirect (type $callback)
+                (i32.const 5) (i32.load (i32.const 256))))))"#;
+    let (status, stderr) = run(wat);
+    assert_eq!(status, 126);
+    assert!(String::from_utf8(stderr)
+        .unwrap()
+        .contains("FFI callback C stack exhausted"));
+}
+
+#[test]
+fn typed_callback_rejects_a_stack_pointer_in_the_heap() {
+    let wat = r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param i32) (result i32)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 2)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global $sp (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (i32.store (local.get 2) (i32.load (local.get 1)))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 1))
+            (if (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                    (i32.const 1) (i32.const 1) (i32.const 256)) (then unreachable))
+            (global.set $sp (i32.const 70000))
+            (drop (call_indirect (type $callback)
+                (i32.const 5) (i32.load (i32.const 256))))))"#;
+    let (status, stderr) = run(wat);
+    assert_eq!(status, 126);
+    assert!(String::from_utf8(stderr)
+        .unwrap()
+        .contains("FFI callback C stack pointer is outside linker bounds"));
+}
+
+fn typed_callback_wait_guest(wait_ns: u64) -> Vec<u8> {
+    wat::parse_str(format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")
+        (type $callback (func (param f64) (result f64)))
+        (import "shellsim_ffi_v1" "closure_alloc_typed"
+            (func $alloc (param i32 i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "poll_oneoff"
+            (func $poll (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 1024))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (func $dispatch (param i32 i32 i32) (result i32)
+            (i32.store (i32.const 16) (i32.const 1))
+            (i64.store (i32.const 24) (i64.const {wait_ns}))
+            (if (call $poll (i32.const 0) (i32.const 100) (i32.const 1) (i32.const 200))
+                (then unreachable))
+            (f64.store (local.get 2)
+                (f64.add (f64.load (local.get 1)) (f64.const 2)))
+            (i32.const 0))
+        (elem (i32.const 0) $dispatch)
+        (func (export "_start")
+            (i32.store8 (i32.const 32) (i32.const 4))
+            (if (call $alloc (i32.const 0) (i32.const 0) (i32.const 32)
+                    (i32.const 1) (i32.const 4) (i32.const 256)) (then unreachable))
+            (if (f64.ne
+                    (call_indirect (type $callback)
+                        (f64.const 1.5) (i32.load (i32.const 256)))
+                    (f64.const 3.5)) (then unreachable))))"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn timeout_cancels_a_typed_callback_without_retaining_its_stack() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 2_000_000,
+        memory: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    environment
+        .vfs
+        .write(
+            "/",
+            "/app",
+            &typed_callback_wait_guest(10_000_000_000),
+            0o755,
+        )
+        .unwrap();
+    let first = environment.run_script_capture("timeout 1 /app; echo $?");
+    assert_eq!(
+        (first.0.exit_status, first.1, first.2),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+    let first_retained = environment.resources.memory_mark();
+    let second = environment.run_script_capture("timeout 1 /app; echo $?");
+    assert_eq!(
+        (second.0.exit_status, second.1, second.2),
+        (0, b"124\n".to_vec(), Vec::new())
+    );
+    assert_eq!(environment.resources.memory_mark(), first_retained);
+    assert_eq!(environment.clock.monotonic_ns(), 2_000_000_000);
+}
+
 fn recursive_invoke_guest(depth: u32) -> Vec<u8> {
     wat::parse_str(format!(r#"(module
         (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-v2")

@@ -6,9 +6,13 @@ The provider takes the address of its own exported function and imports the
 versioned `shellsim_ffi_v1` boundary. The loader fills its own-symbol GOT
 entry before running relocations and constructors; modules with a start
 section cannot use such deferred entries. The boundary calls table entries
-after checking their exact Wasm scalar signature. A fixed
-`i32 -> i32` closure slot calls a guest
-dispatcher and can be released. The host receives raw Wasm values and guest
+after checking their exact Wasm scalar signature. Fixed `i32 -> i32` and typed
+primitive closure slots call guest dispatchers and can be released. Typed
+callbacks use a checked frame below the main image's `__stack_pointer`, with
+`__stack_low + 64` as the linker-defined floor and `__stack_high` as the ceiling.
+The host restores the pointer
+after a normal return or guest exception; cancellation tears down the Store.
+The host receives raw Wasm values and guest
 addresses only; it never dereferences guest pointers as host pointers.
 
 ```sh
@@ -33,7 +37,9 @@ SHELLSIM_FFI_PROOF_ARTIFACTS=/tmp/shellsim-ffi-proof \
 
 The ordinary test cases also check invalid signatures and output pointers,
 closure capacity, slot invalidation, exception unwinding, a nested virtual
-clock wait, and cancellation by `timeout`. The proof interface accepts only
+clock wait, and cancellation by `timeout`. The separately compiled C proof
+passes a `double(double)` callback from the main image to a loaded provider.
+The proof interface accepts only
 `i32`, `i64`, `f32`, and `f64` slots, at most 16 arguments and 64 closures per
 process. A released slot remains allocated and charged until process exit.
 The outer async stack is prepaid; nested guest calls reserve up to eight more

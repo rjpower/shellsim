@@ -9,15 +9,19 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use wasmtime::{Caller, Error, Func, FuncType, Linker, Ref, Val, ValType};
+use wasmtime::{Caller, Error, Func, FuncType, Global, Linker, Mutability, Ref, Val, ValType};
 
 pub(super) const NAMESPACE: &str = "shellsim_ffi_v1";
 const MAX_PARAMS: usize = 16;
 const MAX_CLOSURES: usize = 64;
 const CLOSURE_METADATA_BYTES: u64 = 4096;
+const STACK_GUARD_BYTES: u32 = 64;
 
 pub(super) fn supported(name: &str) -> bool {
-    matches!(name, "invoke" | "closure_alloc" | "closure_release")
+    matches!(
+        name,
+        "invoke" | "closure_alloc" | "closure_alloc_typed" | "closure_release"
+    )
 }
 
 struct Closure {
@@ -84,6 +88,45 @@ fn same_types(mut actual: impl Iterator<Item = ValType>, expected: &[ValType]) -
             .next()
             .is_some_and(|actual| ValType::eq(&actual, expected))
     }) && actual.next().is_none()
+}
+
+fn stack_contract(caller: &mut Caller<'_, Host>) -> Result<(Global, u32, u32), Error> {
+    let main = caller
+        .data()
+        .dynamic
+        .main
+        .ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
+    let stack = main
+        .get_global(&mut *caller, "__stack_pointer")
+        .ok_or_else(|| Error::msg("FFI callback stack is unavailable"))?;
+    let stack_low = main
+        .get_global(&mut *caller, "__stack_low")
+        .ok_or_else(|| Error::msg("FFI callback stack floor is unavailable"))?;
+    let stack_high = main
+        .get_global(&mut *caller, "__stack_high")
+        .ok_or_else(|| Error::msg("FFI callback stack ceiling is unavailable"))?;
+    if stack.ty(&*caller).mutability() != Mutability::Var
+        || stack_low.ty(&*caller).mutability() != Mutability::Const
+        || stack_high.ty(&*caller).mutability() != Mutability::Const
+    {
+        return Err(Error::msg("FFI callback stack contract is invalid"));
+    }
+    let floor = stack_low
+        .get(&mut *caller)
+        .i32()
+        .map(|value| value as u32)
+        .and_then(|value| value.checked_add(STACK_GUARD_BYTES))
+        .ok_or_else(|| Error::msg("FFI callback stack floor is invalid"))?;
+    let high = stack_high
+        .get(&mut *caller)
+        .i32()
+        .map(|value| value as u32)
+        .filter(|value| *value > floor)
+        .ok_or_else(|| Error::msg("FFI callback stack ceiling is invalid"))?;
+    if stack.get(&mut *caller).i32().is_none() {
+        return Err(Error::msg("FFI callback stack pointer is invalid"));
+    }
+    Ok((stack, floor, high))
 }
 
 async fn invoke(
@@ -221,6 +264,97 @@ async fn dispatch_callback(
     Ok(value)
 }
 
+async fn dispatch_callback_typed(
+    mut caller: Caller<'_, Host>,
+    dispatch_index: u32,
+    userdata: u32,
+    params: &[Val],
+    tags: &[Scalar],
+    result_tag: Option<Scalar>,
+    active: Arc<AtomicBool>,
+) -> Result<Option<Val>, Error> {
+    if !active.load(Ordering::Acquire) {
+        return Err(Error::msg("released FFI callback"));
+    }
+    if !caller
+        .data()
+        .machine
+        .get()
+        .resources
+        .charge_cpu(params.len() as u64 + 8)
+    {
+        return Err(super::exhausted());
+    }
+    let main = caller
+        .data()
+        .dynamic
+        .main
+        .ok_or_else(|| Error::msg("FFI callback runtime vanished"))?;
+    let table = main
+        .get_table(&mut caller, "__indirect_function_table")
+        .ok_or_else(|| Error::msg("FFI callback table vanished"))?;
+    let Some(Ref::Func(Some(function))) = table.get(&mut caller, dispatch_index as u64) else {
+        return Err(Error::msg("FFI callback dispatcher vanished"));
+    };
+    let dispatcher = function.typed::<(u32, u32, u32), i32>(&caller)?;
+    let (stack, floor, high) = stack_contract(&mut caller)?;
+    let memory =
+        memory(&mut caller).ok_or_else(|| Error::msg("FFI callback memory is unavailable"))?;
+    let old_sp = stack
+        .get(&mut caller)
+        .i32()
+        .ok_or_else(|| Error::msg("FFI callback stack pointer is invalid"))?
+        as u32;
+    let frame_size = u32::try_from((tags.len() + 1) * 8)?;
+    let new_sp = old_sp
+        .checked_sub(frame_size)
+        .map(|pointer| pointer & !15)
+        .filter(|pointer| *pointer >= floor)
+        .ok_or_else(|| Error::msg("FFI callback C stack exhausted"))?;
+    if old_sp > high {
+        return Err(Error::msg(
+            "FFI callback C stack pointer is outside linker bounds",
+        ));
+    }
+    if high as usize > memory.data_size(&caller)
+        || new_sp
+            .checked_add(frame_size)
+            .is_none_or(|end| end as usize > memory.data_size(&caller))
+    {
+        return Err(Error::msg("FFI callback stack frame exceeds memory"));
+    }
+    let mut slots = [0u8; MAX_PARAMS * 8];
+    for (position, (tag, value)) in tags.iter().zip(params).enumerate() {
+        let bits = tag
+            .bits(value)
+            .ok_or_else(|| Error::msg("FFI callback argument type changed"))?;
+        slots[position * 8..position * 8 + 8].copy_from_slice(&bits.to_le_bytes());
+    }
+    let _fiber = fibers::begin(&mut caller)?;
+    let call = async {
+        stack.set(&mut caller, Val::I32(new_sp as i32))?;
+        memory.write(&mut caller, new_sp as usize, &slots[..tags.len() * 8])?;
+        let result_ptr = new_sp + u32::try_from(tags.len() * 8)?;
+        memory.write(&mut caller, result_ptr as usize, &[0; 8])?;
+        let status = dispatcher
+            .call_async(&mut caller, (userdata, new_sp, result_ptr))
+            .await?;
+        if status != 0 {
+            return Err(Error::msg("FFI callback dispatcher failed"));
+        }
+        if let Some(tag) = result_tag {
+            let mut bytes = [0; 8];
+            memory.read(&caller, result_ptr as usize, &mut bytes)?;
+            Ok(Some(tag.value(u64::from_le_bytes(bytes))))
+        } else {
+            Ok(None)
+        }
+    }
+    .await;
+    stack.set(&mut caller, Val::I32(old_sp as i32))?;
+    call
+}
+
 async fn closure_alloc(
     mut caller: Caller<'_, Host>,
     dispatch_index: u32,
@@ -303,6 +437,131 @@ async fn closure_alloc(
     Ok(ERRNO_SUCCESS)
 }
 
+async fn closure_alloc_typed(
+    mut caller: Caller<'_, Host>,
+    dispatch_index: u32,
+    userdata: u32,
+    tags_ptr: u32,
+    count: u32,
+    result_tag: u32,
+    output_ptr: u32,
+) -> Result<i32, Error> {
+    if count as usize > MAX_PARAMS || result_tag > 4 {
+        return Ok(ERRNO_INVAL);
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (output_ptr as usize)
+        .checked_add(4)
+        .is_none_or(|end| end > memory.data_size(&caller))
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    let mut codes = [0; MAX_PARAMS];
+    if memory
+        .read(&caller, tags_ptr as usize, &mut codes[..count as usize])
+        .is_err()
+    {
+        return Ok(ERRNO_FAULT);
+    }
+    let mut tags = Vec::with_capacity(count as usize);
+    for code in &codes[..count as usize] {
+        let Some(tag) = Scalar::parse(*code) else {
+            return Ok(ERRNO_INVAL);
+        };
+        tags.push(tag);
+    }
+    let result = if result_tag == 0 {
+        None
+    } else {
+        Some(Scalar::parse(result_tag as u8).expect("bounded scalar tag"))
+    };
+    if caller.data().ffi.closures.len() >= MAX_CLOSURES {
+        return Ok(ERRNO_NOSPC);
+    }
+    let Some(main) = caller.data().dynamic.main else {
+        return Ok(ERRNO_INVAL);
+    };
+    let Some(table) = main.get_table(&mut caller, "__indirect_function_table") else {
+        return Ok(ERRNO_INVAL);
+    };
+    let Some(Ref::Func(Some(dispatcher))) = table.get(&mut caller, dispatch_index as u64) else {
+        return Ok(ERRNO_INVAL);
+    };
+    let signature = dispatcher.ty(&caller);
+    if !same_types(
+        signature.params(),
+        &[ValType::I32, ValType::I32, ValType::I32],
+    ) || !same_types(signature.results(), &[ValType::I32])
+        || table.size(&caller) > u32::MAX as u64
+        || stack_contract(&mut caller).is_err()
+    {
+        return Ok(ERRNO_INVAL);
+    }
+    if !caller
+        .data()
+        .machine
+        .get()
+        .resources
+        .charge_cpu(count as u64 + 16)
+    {
+        return Err(super::exhausted());
+    }
+    let reservation = CLOSURE_METADATA_BYTES;
+    dynamic::reserve(&mut caller, reservation)?;
+    let slot = match table.grow(&mut caller, 1, Ref::Func(None)) {
+        Ok(slot) => slot,
+        Err(_) => {
+            dynamic::unreserve(&mut caller, reservation);
+            return if caller.data().machine.get().resources.is_stopped() {
+                Err(super::exhausted())
+            } else {
+                Ok(ERRNO_NOSPC)
+            };
+        }
+    };
+    let active = Arc::new(AtomicBool::new(true));
+    let closure_active = active.clone();
+    let tags: Arc<[Scalar]> = tags.into();
+    let signature = FuncType::new(
+        caller.engine(),
+        tags.iter().map(|tag| tag.ty()),
+        result.iter().map(|tag| tag.ty()),
+    );
+    let function = Func::new_async(&mut caller, signature, move |caller, params, results| {
+        let active = closure_active.clone();
+        let tags = tags.clone();
+        Box::new(async move {
+            let value = dispatch_callback_typed(
+                caller,
+                dispatch_index,
+                userdata,
+                params,
+                &tags,
+                result,
+                active,
+            )
+            .await?;
+            if let Some(value) = value {
+                results[0] = value;
+            }
+            Ok(())
+        })
+    });
+    table.set(&mut caller, slot, Ref::Func(Some(function)))?;
+    caller.data_mut().ffi.closures.push(Closure {
+        index: slot as u32,
+        active,
+    });
+    memory.write(
+        &mut caller,
+        output_ptr as usize,
+        &(slot as u32).to_le_bytes(),
+    )?;
+    Ok(ERRNO_SUCCESS)
+}
+
 fn closure_release(mut caller: Caller<'_, Host>, index: u32) -> Result<i32, Error> {
     let Some(position) = caller
         .data()
@@ -345,6 +604,25 @@ pub(super) fn register(linker: &mut Linker<Host>) {
             "closure_alloc",
             |caller: Caller<'_, Host>, (dispatch, userdata, output): (u32, u32, u32)| {
                 Box::new(closure_alloc(caller, dispatch, userdata, output))
+            },
+        )
+        .expect("unique FFI import");
+    linker
+        .func_wrap_async(
+            NAMESPACE,
+            "closure_alloc_typed",
+            |caller: Caller<'_, Host>,
+             (dispatch, userdata, tags, count, result_tag, output): (
+                u32,
+                u32,
+                u32,
+                u32,
+                u32,
+                u32,
+            )| {
+                Box::new(closure_alloc_typed(
+                    caller, dispatch, userdata, tags, count, result_tag, output,
+                ))
             },
         )
         .expect("unique FFI import");
