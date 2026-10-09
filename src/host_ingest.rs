@@ -66,6 +66,25 @@ pub fn mount_host_tree_report(
     host_root: &Path,
     destination_root: &str,
 ) -> Result<MountReport, String> {
+    mount_host_tree_report_with_policy(environment, host_root, destination_root, true)
+}
+
+/// Import a verified package staging tree without omitting `.venv` or other project directories.
+/// This is for trusted package installers that require every staged file to reach the VFS.
+pub fn mount_host_tree_report_exact(
+    environment: &mut Environment,
+    host_root: &Path,
+    destination_root: &str,
+) -> Result<MountReport, String> {
+    mount_host_tree_report_with_policy(environment, host_root, destination_root, false)
+}
+
+fn mount_host_tree_report_with_policy(
+    environment: &mut Environment,
+    host_root: &Path,
+    destination_root: &str,
+    skip_project_directories: bool,
+) -> Result<MountReport, String> {
     let host_root = host_root
         .canonicalize()
         .map_err(|error| format!("cannot resolve host root {}: {error}", host_root.display()))?;
@@ -80,6 +99,9 @@ pub fn mount_host_tree_report(
     }
     let destination_root = crate::vfs::normalize(destination_root);
     let import_git = has_git_metadata(&host_root)?;
+    if import_git && !skip_project_directories {
+        return Err("verified package staging tree contains Git metadata".to_string());
+    }
     let before = environment.vfs.clone();
     let result = (|| {
         if !environment.vfs.exists("/", &destination_root) {
@@ -88,7 +110,15 @@ pub fn mount_host_tree_report(
                 .put_dir(&destination_root, 0o755)
                 .map_err(|error| format!("cannot create {destination_root}: {error}"))?;
         }
-        let mut report = mount_inner(environment, &host_root, &destination_root)?;
+        let mut report = mount_inner(
+            environment,
+            &host_root,
+            &destination_root,
+            skip_project_directories,
+        )?;
+        if !skip_project_directories && !report.skipped_directories.is_empty() {
+            return Err("verified package staging tree contains Git metadata".to_string());
+        }
         if import_git {
             let history = crate::commands::git::import::import_head_history(
                 environment,
@@ -139,6 +169,7 @@ fn mount_inner(
     environment: &mut Environment,
     host_root: &Path,
     destination_root: &str,
+    skip_project_directories: bool,
 ) -> Result<MountReport, String> {
     let mut pending = vec![(host_root.to_path_buf(), PathBuf::new())];
     let mut files = 0usize;
@@ -168,7 +199,11 @@ fn mount_inner(
                     .to_str()
                     .ok_or_else(|| format!("non-UTF-8 host path below {}", host.display()))?;
                 let is_directory = entry.file_type().is_ok_and(|kind| kind.is_dir());
-                if name == ".git" || (DEFAULT_SKIPPED_DIRECTORIES.contains(&name) && is_directory) {
+                if name == ".git"
+                    || (skip_project_directories
+                        && DEFAULT_SKIPPED_DIRECTORIES.contains(&name)
+                        && is_directory)
+                {
                     skipped_directories.insert(name.to_string());
                     continue;
                 }

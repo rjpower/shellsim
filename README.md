@@ -149,8 +149,10 @@ environment's working directory. Resolution failures and native wheels raise
 `shellsim.PackageInstallError`; source distributions may run build code on the host.
 
 An opt-in `shellsim.CPythonRuntime` mounts a source-built upstream CPython 3.13.7
-WASI interpreter and runs it through the virtual process boundary. It supports
-portable pure PyPI dependencies and a pinned static pycosat native source port.
+WASI interpreter and runs it through the virtual process boundary. Dynamic
+bundles create an isolated guest venv and install ABI-verified native or pure
+wheel dependencies from an explicit package universe. Mounting selects CPython
+for shell `python` and `python3` commands; `python3.14` remains the modeled VM.
 See [CPython WASI ports](ports/README.md) for build, mount, package installation,
 resource limits, and current capability limits. `Environment.run_python`
 continues to use shellsim's Python VM.

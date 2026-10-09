@@ -10,6 +10,7 @@ from __future__ import annotations
 import email
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -42,6 +43,7 @@ class CPythonRuntime:
         *,
         universe: Union[str, Path, None] = None,
         uv: Union[str, Path, None] = None,
+        venv: Union[str, Path, None] = None,
     ) -> None:
         self.bundle = Path(bundle)
         self.universe = Path(universe) if universe is not None else None
@@ -58,7 +60,24 @@ class CPythonRuntime:
         if self.manifest["site_packages"] != _SITE_PACKAGES:
             raise ValueError("unsupported CPython site-packages path")
         self.version = recipe["version"]
-        self.site_packages = _SITE_PACKAGES
+        if self.manifest.get("dynamic_abi"):
+            raw_venv = os.fspath(venv) if venv is not None else "/work/.venv"
+            if (
+                not isinstance(raw_venv, str)
+                or not raw_venv.startswith("/")
+                or raw_venv in {"/", "/usr", "/bin"}
+                or raw_venv.startswith(("/usr/", "/bin/", "/dev/", "/proc/"))
+                or "\0" in raw_venv
+                or any(part in {".", "..", ""} for part in raw_venv[1:].split("/"))
+            ):
+                raise ValueError("CPython venv must have a separate absolute VFS path")
+            self.venv = raw_venv
+            self.site_packages = self.venv + "/lib/python3.13/site-packages"
+        else:
+            if venv is not None:
+                raise ValueError("a task venv requires a dynamic CPython bundle")
+            self.venv = None
+            self.site_packages = _SITE_PACKAGES
         self.builtin_modules = tuple(self.manifest.get("builtin_modules", ()))
         self._verify()
 
@@ -95,16 +114,20 @@ class CPythonRuntime:
             raise ValueError("CPython executable has no execute permission")
 
     def mount(self, environment: Environment) -> None:
-        """Verify again, then atomically copy the bundle into the bounded VFS."""
+        """Mount the verified bundle and select its VFS Python launchers."""
         self._verify()
-        environment.mount(self.bundle / "rootfs", "/")
+        environment._native.mount_cpython(str(self.bundle / "rootfs"), self.venv)
 
     def run(self, environment: Environment, argv: Sequence[str], *, stdin: bytes = b"") -> RunResult:
         """Run interpreter arguments such as ``('-c', 'print(42)')`` in the VFS."""
         if isinstance(argv, (str, bytes)) or any(not isinstance(arg, str) for arg in argv):
             raise TypeError("argv must be a sequence of str")
-        command = " ".join(shlex.quote(arg) for arg in [_EXECUTABLE, *argv])
-        return environment.run("PYTHONHOME=/usr PYTHONDONTWRITEBYTECODE=1 " + command, stdin)
+        executable = self.venv + "/bin/python" if self.venv is not None else _EXECUTABLE
+        command = " ".join(shlex.quote(arg) for arg in [executable, *argv])
+        prefix = "PYTHONDONTWRITEBYTECODE=1 "
+        if self.venv is None:
+            prefix += "PYTHONHOME=/usr "
+        return environment.run(prefix + command, stdin)
 
     def _stage(self, environment: Environment, target: Path) -> None:
         """Reject file conflicts before atomic import; the environment must be idle."""

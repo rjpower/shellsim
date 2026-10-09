@@ -14,6 +14,7 @@ from shellsim._cpython_universe import (
     Universe,
     _add_wheel_to_set,
     _inspect_wheel,
+    _stage_console_scripts,
     _stage_provider,
     _verify_file,
     _verify_wasm,
@@ -66,6 +67,67 @@ def test_dynamic_bundle_requires_explicit_universe(tmp_path: Path) -> None:
     runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
     with pytest.raises(shellsim.PackageInstallError, match="local universe"):
         runtime.install_pypi(shellsim.Environment(), "numpy==2.3.5")
+
+
+def test_dynamic_mount_selects_real_venv_launchers(tmp_path: Path) -> None:
+    runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
+    environment = shellsim.Environment()
+    runtime.mount(environment)
+    assert environment.read_file("/work/.venv/pyvenv.cfg").startswith(b"home = /usr/bin\n")
+    assert environment.run("readlink /usr/bin/python3; readlink /work/.venv/bin/python").stdout == (
+        b"/usr/bin/python3.wasm\n/usr/bin/python3.wasm\n"
+    )
+    assert environment.run("python3.14 -c 'print(42)'").stdout == b"42\n"
+
+
+def test_dynamic_mount_rolls_back_launcher_conflict(tmp_path: Path) -> None:
+    runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
+    environment = shellsim.Environment()
+    environment.write_file("/usr/bin/python", b"custom launcher")
+    with pytest.raises(shellsim.SimulationError, match="conflicts"):
+        runtime.mount(environment)
+    assert environment.read_file("/usr/bin/python") == b"custom launcher"
+    with pytest.raises(shellsim.SimulationError):
+        environment.read_file("/usr/bin/python3.wasm")
+
+
+def test_console_script_relocation_uses_guest_venv_shebang(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    site = staging / "work/.venv/lib/python3.13/site-packages"
+    scripts = site / "bin"
+    scripts.mkdir(parents=True)
+    script = scripts / "sample-tool"
+    script.write_bytes(b"#!/host/path/python\nprint('ready')\n")
+    script.chmod(0o755)
+    metadata = site / "sample_tool-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "entry_points.txt").write_text("[console_scripts]\nsample-tool = sample_tool:main\n")
+    _stage_console_scripts(site, staging, "/work/.venv")
+    staged = staging / "work/.venv/bin/sample-tool"
+    assert staged.read_bytes() == b"#!/work/.venv/bin/python\nprint('ready')\n"
+    assert staged.stat().st_mode & 0o111
+    assert not scripts.exists()
+
+
+@pytest.mark.parametrize(
+    ("name", "shebang"),
+    [("activate", b"#!/host/path/python\n"), ("sample-tool", b"#!/bin/sh\n")],
+)
+def test_console_script_relocation_rejects_reserved_or_non_python_scripts(
+    tmp_path: Path, name: str, shebang: bytes
+) -> None:
+    staging = tmp_path / "staging"
+    site = staging / "work/.venv/lib/python3.13/site-packages"
+    scripts = site / "bin"
+    scripts.mkdir(parents=True)
+    script = scripts / name
+    script.write_bytes(shebang + b"echo ready\n")
+    metadata = site / "sample_tool-1.0.dist-info"
+    metadata.mkdir()
+    (metadata / "entry_points.txt").write_text(f"[console_scripts]\n{name} = sample_tool:main\n")
+    with pytest.raises(shellsim.PackageInstallError):
+        _stage_console_scripts(site, staging, "/work/.venv")
+    assert script.read_bytes() == shebang + b"echo ready\n"
 
 
 def test_universe_rejects_mismatched_abi_and_path_traversal(tmp_path: Path) -> None:
@@ -235,13 +297,19 @@ def test_unavailable_curated_numpy_version_does_not_mutate_vfs(live_universe) ->
     assert result.stdout == b"wasi\n"
 
 
-def test_conflict_preserves_existing_files_and_skips_provider(live_universe) -> None:
+def test_conflict_preserves_existing_files_and_skips_extension(live_universe) -> None:
     runtime, environment = live_universe
+    assert runtime.universe is not None
+    catalog = Universe(runtime.universe, abi=runtime.manifest["dynamic_abi"], python_version=runtime.version)
+    existing_provider = catalog.providers["libz.so"]["path"].read_bytes()
+    environment.mkdir("/lib", parents=True)
+    environment.write_file("/lib/libz.so", existing_provider)
     conflict = runtime.site_packages + "/wasm_zlib_wrapper/__init__.py"
     environment.mkdir(runtime.site_packages + "/wasm_zlib_wrapper", parents=True)
     environment.write_file(conflict, b"user data")
     with pytest.raises(shellsim.PackageInstallError, match="overwrite"):
         runtime.install_pypi(environment, "wasm-zlib-wrapper==0.1")
     assert environment.read_file(conflict) == b"user data"
+    assert environment.read_file("/lib/libz.so") == existing_provider
     with pytest.raises(shellsim.SimulationError):
-        environment.read_file("/lib/libz.so")
+        environment.read_file(runtime.site_packages + "/zlib_consumer.so")

@@ -83,6 +83,28 @@ assert result.returncode == 0, result.stderr
 assert result.stdout == b"6\n"
 ```
 
+Mounting a dynamic bundle creates a real isolated venv at `/work/.venv` by
+default. Pass `venv="/app/.venv"` to put it at a task's workspace. The venv has
+`pyvenv.cfg`, its own Python 3.13 site-packages, and `bin/python` launchers;
+CPython reports the venv as `sys.prefix` and `/usr` as `sys.base_prefix`.
+Mounted `/bin` and `/usr/bin` `python`, `python3`, and `python3.13` select the
+WASI interpreter through VFS links. `python3.14` and `Environment.run_python`
+still select shellsim's Python VM. Activate the venv before ordinary task
+commands, or invoke its absolute interpreter path:
+
+```python
+result = env.run("cd /work; . .venv/bin/activate; python -c 'import sys; print(sys.prefix)'")
+assert result.returncode == 0, result.stderr
+assert result.stdout == b"/work/.venv\n"
+```
+
+Installed packages go to the venv site-packages directory. The installer puts
+declared Python console entry points such as `pytest` in the venv `bin` directory
+with a guest interpreter shebang. It rejects raw or non-Python scripts, reserved
+venv command names, and file conflicts before importing package files. Bundle
+mounting and launcher setup form one VFS transaction; a conflict leaves the
+preexisting VFS intact.
+
 Dynamic installation resolves the requirement and dependencies for the exact
 CPython 3.13.7 WASI target. It verifies wheel hashes, wheel contents, native
 ABI markers, declared provider closure, and file conflicts before one VFS

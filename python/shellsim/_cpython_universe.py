@@ -6,6 +6,7 @@ unpacking happen before one atomic VFS mount; guest code never sees host paths.
 
 from __future__ import annotations
 
+import configparser
 import email
 import hashlib
 import json
@@ -34,8 +35,9 @@ _MAX_NATIVE_BYTES = 16 * 1024 * 1024
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 _PROVIDER = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.+-]*\.so(?:\.[0-9]+)*\Z")
+_SCRIPT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*\Z")
+_PYTHON_INTERPRETER = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)?)?\Z")
 _NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib", ".a", ".wasm")
-_SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
 
 
 class _Runtime(Protocol):
@@ -43,6 +45,8 @@ class _Runtime(Protocol):
     universe: Path | None
     uv: Path | None
     version: str
+    venv: str | None
+    site_packages: str
 
 
 @dataclass
@@ -431,9 +435,58 @@ def _stage_provider(universe: Universe, name: str, source: Path, destination: Pa
     destination.write_bytes(data)
 
 
+def _stage_console_scripts(site: Path, staging: Path, venv: str) -> None:
+    scripts = site / "bin"
+    if not scripts.exists():
+        return
+    declared: set[str] = set()
+    for metadata in site.glob("*.dist-info/entry_points.txt"):
+        if metadata.stat().st_size > 65536:
+            raise PackageInstallError("installed entry point metadata exceeds 64 KiB")
+        config = configparser.ConfigParser(interpolation=None)
+        config.optionxform = str
+        try:
+            config.read_string(metadata.read_text(encoding="utf-8"))
+        except (configparser.Error, UnicodeError) as error:
+            raise PackageInstallError("installed entry point metadata is invalid") from error
+        if config.has_section("console_scripts"):
+            declared.update(config.options("console_scripts"))
+    destination = staging / venv.lstrip("/") / "bin"
+    destination.mkdir(parents=True, exist_ok=True)
+    for script in scripts.iterdir():
+        if (
+            not script.is_file()
+            or script.is_symlink()
+            or _SCRIPT_NAME.fullmatch(script.name) is None
+            or ".." in script.name
+            or script.name in {"python", "python3", "python3.13", "activate"}
+            or script.name not in declared
+        ):
+            raise PackageInstallError("installed script is not a supported console entry point")
+        source = script.read_bytes()
+        first, separator, body = source.partition(b"\n")
+        try:
+            interpreter = first[2:].decode("utf-8").split()[0]
+        except (UnicodeError, IndexError) as error:
+            raise PackageInstallError("installed console script has no Python shebang") from error
+        if (
+            not separator
+            or not first.startswith(b"#!/")
+            or _PYTHON_INTERPRETER.fullmatch(Path(interpreter).name) is None
+        ):
+            raise PackageInstallError("installed console script has no Python shebang")
+        target = destination / script.name
+        if target.exists():
+            raise PackageInstallError("installed console script conflicts with the CPython venv")
+        target.write_bytes(b"#!" + (venv + "/bin/python").encode() + b"\n" + body)
+        target.chmod(script.stat().st_mode & 0o777)
+        script.unlink()
+    scripts.rmdir()
+
+
 def install(runtime: _Runtime, environment: Environment, requirement: str) -> None:
     """Resolve, verify, and atomically stage a dynamic package set."""
-    if runtime.universe is None or runtime.uv is None:
+    if runtime.universe is None or runtime.uv is None or runtime.venv is None:
         raise PackageInstallError("dynamic CPython installs need a local universe and patched uv")
     universe = Universe(runtime.universe, abi=runtime.manifest["dynamic_abi"], python_version=runtime.version)
     with tempfile.TemporaryDirectory(prefix="shellsim-cpython-universe-") as temporary:
@@ -541,13 +594,15 @@ def install(runtime: _Runtime, environment: Environment, requirement: str) -> No
             )
         local_lock.write_text("\n".join(lines) + "\n")
         staging = work / "root"
-        site = staging / _SITE_PACKAGES.lstrip("/")
+        site = staging / runtime.site_packages.lstrip("/")
         site.mkdir(parents=True)
         _run_uv(
             runtime.uv,
             ["pip", "sync", str(local_lock), "--target", str(site), "--require-hashes", *common],
             cwd=work,
         )
+        _stage_console_scripts(site, staging, runtime.venv)
+        (site / ".lock").unlink(missing_ok=True)
         if any(path.is_symlink() for path in staging.rglob("*")):
             raise PackageInstallError("staged package set contains links")
         staged_artifacts = {
@@ -574,4 +629,4 @@ def install(runtime: _Runtime, environment: Environment, requirement: str) -> No
             else:
                 if existing != path.read_bytes():
                     raise PackageInstallError(f"package file would overwrite an existing VFS file: {destination}")
-        environment.mount(staging, "/")
+        environment._native.mount_package_tree(str(staging))
