@@ -17,11 +17,24 @@ checks every package file against the source, preserves the upstream license,
 checks dependency metadata and pure tags, and verifies all RECORD hashes. Two
 fresh builds produced identical wheel bytes in the measured host profile.
 
-Output contains `pure-wheels/cellpylib-2.4.0-py3-none-any.whl` and
-`pure-simple/cellpylib/index.html` with a SHA256 link. Merge these into an existing
-universe's `pure-wheels` and `pure_index` Simple tree. Its catalog `packages` list
-is reserved for native WASI wheels; this pure distribution needs no new registry,
-WASI wheel retagging or native ABI manifest.
+Output contains `pure-wheels/cellpylib-2.4.0-py3-none-any.whl` and a hashed
+Simple index entry. Add the verified wheel to an existing universe's `packages`
+list, preserving its standard pure tag and recorded hash:
+
+```json
+{
+  "name": "cellpylib",
+  "version": "2.4.0",
+  "wheel": "pure-wheels/cellpylib-2.4.0-py3-none-any.whl",
+  "sha256": "ab415a8ce67ad94377096ee109915acc1fa1a16cd5928287ea9c62a234dafac7"
+}
+```
+
+The catalog is authoritative for this release; ordinary pure dependencies still
+resolve through PyPI or an explicitly selected local `pure_index`. Curated
+provenance and wheel kind are checked independently. No retagging, native ABI
+manifest or separate registry is needed. The generated Simple entry remains useful
+for a wholly local dependency index.
 
 The unchanged runtime dependencies are numpy>=1.15.4 and matplotlib>=3.0.2;
 Requires-Python is >3.6. The initializer eagerly imports Matplotlib plotting,

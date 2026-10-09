@@ -378,7 +378,18 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             raise PackageInstallError("resolved wheel identity differs from uv's resolution")
         wheel_text = archive.read(f"{dist_info}/WHEEL").decode()
         wheel_lines = {line.strip() for line in wheel_text.splitlines()}
-        if curated:
+        pure = "Root-Is-Purelib: true" in wheel_lines and any(
+            line.startswith("Tag: ")
+            and line[5:].split("-")[-2:] == ["none", "any"]
+            and ("py3" in line[5:].split("-")[0].split(".") or "py313" in line[5:].split("-")[0].split("."))
+            for line in wheel_lines
+        )
+        # Curated provenance controls which source/hash is authoritative. Wheel
+        # metadata controls kind; approved source-only releases stay pure wheels.
+        if pure:
+            if any(_native_path(member.filename) for member in members if not member.is_dir()):
+                raise PackageInstallError("pure wheel contains native files")
+        elif curated:
             if "Tag: cp313-cp313-wasm32_wasip1" not in wheel_lines:
                 raise PackageInstallError("curated wheel has an incompatible WASI tag")
             native_path = f"{dist_info}/shellsim-native.json"
@@ -413,15 +424,7 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             if present != set(artifacts):
                 raise PackageInstallError("native wheel has undeclared native files")
         else:
-            if "Root-Is-Purelib: true" not in wheel_lines or not any(
-                line.startswith("Tag: ")
-                and line[5:].split("-")[-2:] == ["none", "any"]
-                and ("py3" in line[5:].split("-")[0].split(".") or "py313" in line[5:].split("-")[0].split("."))
-                for line in wheel_lines
-            ):
-                raise PackageInstallError("non-curated wheel is not pure Python")
-            if any(_native_path(member.filename) for member in members if not member.is_dir()):
-                raise PackageInstallError("non-curated wheel contains native files")
+            raise PackageInstallError("non-curated wheel is not pure Python")
     return _WheelInspection(dependencies, artifacts, file_members, len(members), uncompressed_bytes)
 
 
