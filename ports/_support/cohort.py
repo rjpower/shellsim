@@ -144,6 +144,15 @@ class BuildCohort:
         return (*self.flags, "-Wl,--shared-memory,--serial-memory-init")
 
     @property
+    def executable_flags(self) -> tuple[str, ...]:
+        """Process-owned memory and TLS exports for threaded guest executables."""
+        return (
+            "-Wl,--import-memory,--export-memory,--initial-memory=16777216,--max-memory=67108864",
+            "-Wl,--export-all,--export-table,--growable-table,--export=__stack_pointer,--export=__tls_base",
+            "-Wl,--emit-main-tls-info,--undefined=pthread_create",
+        )
+
+    @property
     def shared_library_flags(self) -> tuple[str, ...]:
         """Additional flags only for independently loaded native libraries."""
         return (

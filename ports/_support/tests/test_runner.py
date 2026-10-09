@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import pytest
 
 from ports._support import runner
+from ports._support.graph import Graph, Port
 
 
 @dataclass(frozen=True)
@@ -71,3 +72,62 @@ def test_graph_reuses_verified_builds_and_rebuilds_dependents(tmp_path, monkeypa
     with pytest.raises(ValueError):
         runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
     assert not calls
+
+
+def test_build_cache_ignores_acceptance_code_but_tracks_selected_adapter(tmp_path, monkeypatch):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    calls = []
+    real_build = runner.build_pure_wheel
+
+    def observed_build(request):
+        calls.append(request.recipe["name"])
+        return real_build(request)
+
+    monkeypatch.setattr(runner, "build_pure_wheel", observed_build)
+    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    assert calls == ["example"]
+
+    real_hash = runner.file_hash
+
+    def changed_acceptance(path, **kwargs):
+        return "a" * 64 if path.name == "acceptance.py" else real_hash(path, **kwargs)
+
+    monkeypatch.setattr(runner, "file_hash", changed_acceptance)
+    calls.clear()
+    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    assert not calls
+
+    def changed_adapter(path, **kwargs):
+        return "b" * 64 if path.name == "pure_wheel.py" else real_hash(path, **kwargs)
+
+    monkeypatch.setattr(runner, "file_hash", changed_adapter)
+    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    assert calls == ["example"]
+
+
+def test_acceptance_uses_port_namespace_when_names_collide(tmp_path, monkeypatch):
+    from ports._support import acceptance, native_artifacts
+    from ports.native import dependencies
+
+    native = Port("native/example/recipe.json", tmp_path, "example", "1", "a" * 64, (), {})
+    python = Port("python/example/recipe.json", tmp_path, "example", "1", "b" * 64, (), {})
+    native_result = tmp_path / "native-result"
+    (native_result / "native").mkdir(parents=True)
+    build = runner.GraphBuild(
+        Graph((native.reference, python.reference), (native, python)),
+        {native.reference: native_result, python.reference: tmp_path / "python-result"},
+    )
+    kinds = []
+
+    def observed_accept(request):
+        kinds.append((request.port.reference, request.install_kind))
+        request.output.mkdir(parents=True)
+
+    monkeypatch.setattr(acceptance, "accept_port", observed_accept)
+    monkeypatch.setattr(native_artifacts, "merge_dependency_sysroot", lambda *_args: None)
+    monkeypatch.setattr(dependencies, "verify_artifact", lambda *_args: {})
+    descriptor = tmp_path / "release.json"
+    descriptor.write_text("{}")
+    runner.accept_graph(build, PureCohort(), descriptor, tmp_path / "proof")
+    assert kinds == [(native.reference, "native"), (python.reference, "pypi")]

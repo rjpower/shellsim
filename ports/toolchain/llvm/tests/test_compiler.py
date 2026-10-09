@@ -1,10 +1,13 @@
 """Exercise the standard patched Clang driver and its WASI TLS backend."""
 
+import json
 import os
 import subprocess
 from pathlib import Path
 
 import pytest
+
+from ports.toolchain.llvm import compiler as producer
 
 
 @pytest.fixture
@@ -46,3 +49,24 @@ def test_clang_passes_the_opt_in_tls_policy_to_its_backend(compiler, tmp_path, e
     result = subprocess.run(command, text=True, capture_output=True, check=True)
     assert relocation in result.stdout
     assert "local_tls@TLSREL" in result.stdout
+
+
+def test_identical_producer_invocation_reuses_verified_product_without_compilation(monkeypatch):
+    workspace = os.environ.get("SHELLSIM_LLVM_COMPILER_WORK")
+    archive = os.environ.get("SHELLSIM_LLVM_ARCHIVE")
+    product = os.environ.get("SHELLSIM_THREADED_CLANG")
+    if not all((workspace, archive, product)):
+        pytest.skip("requires a sealed normal compiler and its retained workspace")
+    inputs = json.loads((Path(workspace) / "workspace.json").read_text())["compatibility"]
+    tools = inputs["tools"]
+
+    def reject_command(*args):
+        pytest.fail("an identical sealed product must not execute build commands")
+
+    monkeypatch.setattr(producer, "run", reject_command)
+    result = producer.build(
+        Path(archive),
+        *(Path(tools[name]["path"]) for name in ("cc", "cxx", "cmake", "ninja")),
+        Path(workspace),
+    )
+    assert result == Path(product)

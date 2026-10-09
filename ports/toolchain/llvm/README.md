@@ -1,5 +1,10 @@
 # LLVM WASI linker
 
+New threaded port builds use the full [Clang compiler](COMPILER.md). Build that
+compiler once and reuse its sealed output through the graph's cohort descriptor.
+The linker-only and backend-only profiles below describe the earlier producers
+whose outputs remain inputs to existing runtime and sysroot artifacts.
+
 This port builds upstream LLVM/LLD at the exact revision used by wasi-sdk 34.
 Two recorded source patches add explicit shared-library initialization and a
 serialized shared-memory initializer. Existing linker behavior remains the

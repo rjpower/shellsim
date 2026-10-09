@@ -17,7 +17,23 @@ uv run --no-project python -m ports.toolchain.llvm.compiler \
 
 The producer verifies source, patch and driver identities, uses four compile
 jobs and one link job, and records host tool hashes. Each command is limited to
-one hour and 12 GiB of address space. An existing output directory is rejected.
+one hour and 12 GiB of address space. `--work` is a persistent Ninja workspace;
+its source, patches and host tools must remain compatible. Configuration or
+driver changes reconfigure that workspace and let Ninja invalidate affected
+objects. Source or tool changes require a different workspace.
+
+Outputs are immutable products under `work/products/<input digest>`. An
+identical invocation verifies declared inputs and product bytes and returns
+the existing product without running CMake or a compiler. It does not depend
+on the current mutable source tree. Cache misses verify retained source bytes
+before building. The workspace lock serializes concurrent invocations, and
+the configuration receipt rejects cache edits outside the producer. Failed commands
+retain their logs and intermediates; rerunning resumes the same Ninja tree.
+The producer can adopt an earlier normal build from its recorded manifest,
+after checking all source bytes against the pinned archive and patches. Its
+previous `prefix` remains untouched. Archive builds disable enclosing Git
+repository discovery in version strings with `LLVM_APPEND_VC_REV=OFF`.
+
 The manifest hashes the produced binaries and resource headers and records
 aliases such as `clang++` and `wasm-ld`. Upstream licensing is retained.
 

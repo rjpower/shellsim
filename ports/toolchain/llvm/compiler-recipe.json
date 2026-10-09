@@ -62,7 +62,7 @@
   "build_scripts": [
     {
       "file": "compiler.py",
-      "sha256": "6d875ed7476f29525ed540383a2b62bf49fb2b45b40a0dfca2fd461d67f3e3c6"
+      "sha256": "ec0ac152fb1deced7bc4823004bb04fb4a27be3616e24fed3f85719dc09d616f"
     },
     {
       "file": "build.py",

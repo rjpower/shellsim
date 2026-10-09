@@ -19,6 +19,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Literal
 
 from ports._support.graph import Port
+from ports._support.wasm import mark_abi
 from ports.native.dependencies import target_environment
 
 if TYPE_CHECKING:
@@ -156,6 +157,7 @@ def _native_command(
         str(cohort.compiler()),
         *cohort.compiler_flags,
         *cohort.linker_flags,
+        *cohort.executable_flags,
         "-I" + str(dependency_sysroot / "usr/local/include"),
         *includes,
         "-L" + str(dependency_sysroot / "usr/local/lib"),
@@ -262,6 +264,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
+                mark_abi(artifact, request.cohort.dynamic_abi.encode())
                 (proof / "build-command.json").write_text(json.dumps(command) + "\n")
                 with artifact.open("rb") as stream:
                     wasm_header = stream.read(8)

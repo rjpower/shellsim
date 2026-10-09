@@ -130,6 +130,7 @@ def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path) -> None:
         compiler=lambda: tmp_path / "cc",
         compiler_flags=(),
         linker_flags=(),
+        executable_flags=(),
         sysroot=SimpleNamespace(
             root=root, contents={"artifacts": {"sysroot/" + relative: hashlib.sha256(archive.read_bytes()).hexdigest()}}
         ),

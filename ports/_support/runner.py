@@ -28,6 +28,16 @@ from ports._support.python_adapters import (
 )
 from ports._support.store import build_slot, extract, fetch, file_hash, relative_path
 
+_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py")
+_NATIVE_BUILD_MODULES = (
+    "native_adapters.py",
+    "native_artifacts.py",
+    "wasm.py",
+    "wasm_metadata.py",
+    "native/dependencies.py",
+)
+_PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
+
 if TYPE_CHECKING:
     from ports._support.cohort import BuildCohort
 
@@ -100,6 +110,20 @@ def _strings(build: dict, field: str, default: tuple[str, ...] = ()) -> tuple[st
     return tuple(values)
 
 
+def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
+    """Bind cached outputs to the code that actually stages and seals them."""
+    modules = [*_COMMON_BUILD_MODULES]
+    if adapter == "pure-wheel":
+        modules.extend(_PURE_BUILD_MODULES)
+    elif adapter == "python-extension":
+        modules.extend(("build.py", "python_adapters.py", *_NATIVE_BUILD_MODULES))
+    else:
+        modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
+    return {
+        name: file_hash(support.parent / name if name.startswith("native/") else support / name) for name in modules
+    }
+
+
 def _source_exports(port: Port, context: NativeBuildContext) -> None:
     """Stage declared source files, such as licenses omitted by upstream install."""
     declarations = port.recipe.get("source_exports", [])
@@ -143,8 +167,10 @@ def build_graph(
     if any(port.recipe["build"]["adapter"] != "pure-wheel" for port in graph.ports):
         cohort.compiler()  # Refuse an incomplete cohort before fetching any source.
     support = Path(__file__).parent
-    implementation = {path.name: file_hash(path) for path in sorted(support.glob("*.py"))}
-    implementation["native/dependencies.py"] = file_hash(support.parent / "native/dependencies.py")
+    implementations = {
+        adapter: _build_implementation(support, adapter)
+        for adapter in {port.recipe["build"]["adapter"] for port in graph.ports}
+    }
     results: dict[str, Path] = {}
     native: dict[str, NativeArtifact] = {}
     keys: dict[str, str] = {}
@@ -155,13 +181,21 @@ def build_graph(
         {"cohort": cohort.identity, "target": cohort.target, "abi": cohort.dynamic_abi},
     )
     for port in graph.ports:
+        adapter = port.recipe["build"]["adapter"]
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
-            "implementation": implementation,
+            "implementation": implementations[adapter],
             "cohort": cohort.identity,
             "dependencies": {dependency.port: keys[dependency.recipe] for dependency in port.dependencies},
         }
+        if adapter != "pure-wheel":
+            inputs["target_flags"] = {
+                "compiler": list(cohort.compiler_flags),
+                "linker": list(cohort.linker_flags),
+                "shared_library": list(cohort.shared_library_flags),
+                "executable": list(cohort.executable_flags),
+            }
         with build_slot(store, inputs) as slot:
             keys[port.reference] = slot.key
             if not slot.cached:
@@ -198,6 +232,7 @@ def build_graph(
                         target_tools={name: tool.path for name, tool in cohort.target_tools.items()},
                         dependency_sysroot=prefix,
                         shared_library_flags=cohort.shared_library_flags,
+                        executable_flags=cohort.executable_flags,
                     )
                     _hooks(port, "before_build", context, cohort)
                     if build["adapter"] == "python-extension":
@@ -341,9 +376,11 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
     )
     for port in build.graph.ports:
         proof = output / Path(port.reference).with_suffix("")
-        kind = "native" if "native/" + port.name in native else "pypi"
+        kind = "native" if port.reference.startswith("native/") else "pypi"
         dependencies = None
         if kind == "native":
+            if "native/" + port.name not in native:
+                raise ValueError(f"native port has no sealed artifact: {port.reference}")
             dependencies = proof.parent / (proof.name + "-dependencies")
             merge_dependency_sysroot(
                 {"native/" + port.name: native["native/" + port.name]}, native, dependencies, target

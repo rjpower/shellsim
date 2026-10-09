@@ -35,6 +35,7 @@ class NativeBuildContext:
     target_tools: Mapping[str, Path]
     dependency_sysroot: Path
     shared_library_flags: tuple[str, ...] = ()
+    executable_flags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,10 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             + 'if "-shared" in arguments:\n'
             + "    command += "
             + repr(list(context.shared_library_flags))
+            + "\n"
+            + 'elif not any(flag in arguments for flag in ("-c", "-S", "-E")):\n'
+            + "    command += "
+            + repr(list(context.executable_flags))
             + "\n"
             + "os.execv(command[0], command + arguments)\n"
         )

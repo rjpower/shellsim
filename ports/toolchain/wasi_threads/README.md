@@ -20,8 +20,9 @@ It builds no pthread test programs or standalone runner.
 Fixture programs, their builder, standalone diagnostic runner and proof recipe
 live in `tests`. Their manifest records the production toolchain recipe and
 fixture provenance separately. See `tests/README.md` for guest acceptance and
-the static threaded ABI's supported behavior. Threaded dynamic v3 remains
-separate unfinished work and is not enabled by this recipe.
+the static threaded ABI's supported behavior. Threaded dynamic v3 uses the
+separate dynamic sysroot below and the matching CPython/runtime cohort; the
+static recipe does not enable dynamic loading.
 
 ## Threaded dynamic sysroot
 
