@@ -118,6 +118,12 @@ Worker acknowledgement persists immediately; private workspace/log cleanup is
 asynchronous and resumes after restart. Acknowledged attempts report `UNKNOWN`
 and cannot be dispatched again, even before cleanup completes.
 
+`Coordinator.cleanup_complete()` checks the current journal claim and returns
+true only after request acknowledgement and every attempt's acknowledgement is
+durably confirmed. It performs no writes or worker RPCs and raises
+`CoordinatorFenced` for a stale coordinator. Services can then retire the request
+from active cleanup history; private worker deletion may still be pending.
+
 Output bundles are cache references. Successful execution records do not promise
 release durability, cache retention or a TTL. Retrieving an expired manifest or
 chunk raises `FileNotFoundError`; corruption raises `ValueError`. The caller must

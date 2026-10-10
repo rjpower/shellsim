@@ -364,3 +364,15 @@ class Coordinator:
         self._journal["acknowledged"] = True
         self._save()
         self._ack_workers()
+
+    def cleanup_complete(self) -> bool:
+        """Confirm durable request acknowledgement and all worker acknowledgements.
+
+        Check the current journal claim without mutation or worker RPCs. True
+        permits removing this request from the service's active cleanup history;
+        it does not wait for asynchronous private workspace deletion.
+        """
+        self._check()
+        return self._journal["acknowledged"] and all(
+            not record["ack_pending"] for record in self._journal["attempts"].values()
+        )

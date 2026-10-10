@@ -392,6 +392,7 @@ def test_confirmed_terminal_worker_is_fenced_before_retry_and_after_reopen(store
     fresh.complete("a", bundle)
     assert reopened.tick().state == BuildState.SUCCEEDED
     reopened.acknowledge()
+    assert reopened.cleanup_complete()
     assert not old.acknowledged
     assert fresh.acknowledged == set(fresh.attempts)
     with pytest.raises(CoordinatorFenced):
@@ -433,20 +434,62 @@ def test_cancellation_tombstones_unconfirmed_dispatch(store):
     coordinator.acknowledge()
 
 
-def test_acknowledgement_retries_after_restart(store, bundle):
+@pytest.mark.parametrize("delivered", [False, True])
+def test_cleanup_requires_confirmed_acknowledgements_after_restart(store, bundle, monkeypatch, delivered):
+    left, right = FakeWorker(store), FakeWorker(store)
+    workers = {"left": left, "right": right}
+    coordinator = Coordinator(store, "build", workers)
+    coordinator.submit(request(action("a"), action("b"), workers=2))
+    assert not coordinator.cleanup_complete()
+    coordinator.tick()
+    assert not coordinator.cleanup_complete()
+    left.complete("a", bundle)
+    right.complete("b", bundle)
+    coordinator.tick()
+    assert not coordinator.cleanup_complete()
+    acknowledge = right.acknowledge
+
+    def uncertain_ack(attempt_id):
+        if delivered:
+            acknowledge(attempt_id)
+        raise TimeoutError("ack response unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(right, "acknowledge", uncertain_ack)
+        assert coordinator.acknowledge() is None
+    assert left.acknowledged == set(left.attempts)
+    assert bool(right.acknowledged) == delivered
+    assert not coordinator.cleanup_complete()
+    new = Coordinator(store, "build", workers)
+    assert not new.cleanup_complete()
+    with pytest.raises(CoordinatorFenced):
+        coordinator.cleanup_complete()
+    new.tick()
+    assert right.acknowledged == set(right.attempts)
+    assert new.cleanup_complete()
+    assert Coordinator(store, "build", workers).cleanup_complete()
+    with pytest.raises(CoordinatorFenced):
+        new.cleanup_complete()
+
+
+def test_cleanup_check_does_not_write_or_call_workers(store, bundle, monkeypatch):
     worker = FakeWorker(store)
     coordinator = Coordinator(store, "build", {"worker": worker})
     coordinator.submit(request(action("a")))
     coordinator.tick()
     worker.complete("a", bundle)
     coordinator.tick()
-    worker.fail_ack = True
     coordinator.acknowledge()
-    assert not worker.acknowledged
-    worker.fail_ack = False
-    new = Coordinator(store, "build", {"worker": worker})
-    new.tick()
-    assert worker.acknowledged == set(worker.attempts)
+    before = store.read_journal("build")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("cleanup check must only read the journal")
+
+    monkeypatch.setattr(store, "write_journal", forbidden)
+    monkeypatch.setattr(worker, "acknowledge", forbidden)
+    monkeypatch.setattr(worker, "poll", forbidden)
+    assert coordinator.cleanup_complete()
+    assert store.read_journal("build") == before
 
 
 def test_independent_request_journals_remain_unaffected(store):
