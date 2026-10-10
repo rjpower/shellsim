@@ -1103,6 +1103,8 @@ pub(crate) enum FileChange {
 /// number. `blocks` is reported in 512-byte units, matching POSIX `st_blocks` and `stat`'s `%b`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FileInfo {
+    pub device: u64,
+    pub inode: u64,
     pub kind: FileKind,
     pub mode: u32,
     pub size: u64,
@@ -1157,6 +1159,8 @@ impl From<&crate::vfs::Node> for FileInfo {
             NodeKind::NativeExecutable(_) => (FileKind::File, 0, 0, None, true),
         };
         Self {
+            device: u64::from(node.inode != 0),
+            inode: node.inode,
             kind,
             mode: node.mode,
             size,
@@ -1177,6 +1181,7 @@ impl FileInfo {
     /// Generated file content (e.g. `/proc/meminfo`) keeps its real content length.
     fn pseudo_from(node: crate::vfs::Node) -> Self {
         let mut info = Self::from(&node);
+        info.device = 2;
         info.blocks = 0;
         if info.kind == FileKind::Directory {
             info.size = 0;
@@ -1464,6 +1469,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pseudo_inode_identity_is_distinct_and_matches_self_aliases() {
+        let mut interp = Interp::new();
+        let pid = interp.pid;
+        let mut system = ActiveSystem::new(&mut interp);
+        let null = system.metadata("/", "/dev/null", true).unwrap();
+        let zero = system.metadata("/", "/dev/zero", true).unwrap();
+        assert_eq!(null.device, 2);
+        assert_ne!(null.inode, zero.inode);
+        let self_info = system.metadata("/", "/proc/self/status", true).unwrap();
+        let pid_info = system
+            .metadata("/", &format!("/proc/{pid}/status"), true)
+            .unwrap();
+        assert_eq!(
+            (self_info.device, self_info.inode),
+            (pid_info.device, pid_info.inode)
+        );
+    }
+
+    #[test]
     fn file_batch_rolls_back_every_change_on_failure() {
         let mut interp = Interp::new();
         let mut system = ActiveSystem::new(&mut interp);
@@ -1688,7 +1712,16 @@ mod tests {
             },
         )
         .unwrap();
+        let original = ActiveSystem::new(&mut interp).metadata_fd(fd).unwrap();
+        assert_ne!(original.inode, 0);
         unlink(&mut interp, "/work", "temp").unwrap();
+        assert_eq!(
+            ActiveSystem::new(&mut interp)
+                .metadata_fd(fd)
+                .unwrap()
+                .inode,
+            original.inode
+        );
         assert!(!interp.vfs.lexists("/", "/work/temp"));
         assert_eq!(
             ActiveSystem::new(&mut interp).metadata_fd(fd).unwrap().size,

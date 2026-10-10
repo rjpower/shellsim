@@ -1321,3 +1321,41 @@ fn wasi_readlink_copies_only_a_bounded_target_prefix() {
     );
     assert_eq!(run(&mut environment, "/app"), (21, Vec::new(), Vec::new()));
 }
+
+#[test]
+fn wasi_reports_distinct_stable_nodes_and_matching_descriptor_identity() {
+    let guest = wat::parse_str(r#"(module
+        (import "wasi_snapshot_preview1" "path_filestat_get" (func $path (param i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_filestat_get" (func $fd (param i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_readdir" (func $dir (param i32 i32 i32 i64 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "/file/a/b/a/leaf")
+        (func (export "_start")
+            (if (call $path (i32.const 4) (i32.const 1) (i32.const 0) (i32.const 5) (i32.const 128)) (then unreachable))
+            (if (call $fd (i32.const 0) (i32.const 192)) (then unreachable))
+            (if (i64.eqz (i64.load (i32.const 128))) (then unreachable))
+            (if (i64.eqz (i64.load (i32.const 136))) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 128)) (i64.load (i32.const 192))) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 136)) (i64.load (i32.const 200))) (then unreachable))
+            (if (call $path (i32.const 4) (i32.const 1) (i32.const 5) (i32.const 2) (i32.const 256)) (then unreachable))
+            (if (call $path (i32.const 4) (i32.const 1) (i32.const 7) (i32.const 2) (i32.const 320)) (then unreachable))
+            (if (i64.eq (i64.load (i32.const 264)) (i64.load (i32.const 328))) (then unreachable))
+            (if (call $path (i32.const 4) (i32.const 1) (i32.const 9) (i32.const 7) (i32.const 512)) (then unreachable))
+            (if (call $dir (i32.const 3) (i32.const 400) (i32.const 28) (i64.const 0) (i32.const 600)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 408)) (i64.load (i32.const 520))) (then unreachable))))"#).unwrap();
+    let mut env = Environment::new();
+    env.vfs.put_file("/probe", guest, 0o755).unwrap();
+    env.vfs
+        .put_file("/file", b"payload".to_vec(), 0o644)
+        .unwrap();
+    env.vfs.mkdir("/", "/a").unwrap();
+    env.vfs.mkdir("/", "/b").unwrap();
+    env.vfs.put_file("/a/leaf", vec![], 0o644).unwrap();
+    let (result, _, stderr) = env.run_script_capture("cd /a; /probe < /file");
+    assert_eq!(
+        result.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+}

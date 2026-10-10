@@ -1106,6 +1106,8 @@ fn fd_tell(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
 
 fn filestat(info: &FileInfo) -> [u8; 64] {
     let mut value = [0; 64];
+    value[0..8].copy_from_slice(&info.device.to_le_bytes());
+    value[8..16].copy_from_slice(&info.inode.to_le_bytes());
     value[16] = match info.kind {
         FileKind::Directory => 3,
         FileKind::File => 4,
@@ -1299,6 +1301,7 @@ fn fd_readdir(
             };
             let mut entry = [0; 24];
             entry[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            entry[8..16].copy_from_slice(&info.inode.to_le_bytes());
             entry[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
             entry[20] = match info.kind {
                 FileKind::Directory => 3,
