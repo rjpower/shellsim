@@ -144,3 +144,16 @@ def test_extension_requires_exact_declared_native_link_inputs_before_compiler(
         build_extension(ExtensionBuildRequest(request.context, request.cpython, recipe))
     assert not context.build.exists()
     assert not context.staging_prefix.exists()
+
+
+@pytest.mark.parametrize(
+    "change", [{"output": "unknown"}, {"output": "stdlib", "cpython_include_directories": ["../host"]}]
+)
+def test_stdlib_extension_rejects_unsupported_output_and_header_escape(tmp_path, monkeypatch, change):
+    request = _extension_request(tmp_path)
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: pytest.fail("compiler ran before admission"))
+    recipe = {**request.recipe, "version": request.cpython.version, "build": {**request.recipe["build"], **change}}
+    with pytest.raises(ValueError):
+        build_extension(ExtensionBuildRequest(request.context, request.cpython, recipe))
+    assert not request.context.build.exists()
+    assert not request.context.staging_prefix.exists()
