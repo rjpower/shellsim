@@ -93,9 +93,15 @@ Compiler caching is opt-in through the typed `CompilerCacheLauncher` binding.
 Its worker-image executable is hash-admitted and only `-c` calls use it. Linking
 uses the real compiler. Public S3/GCS configuration is allowlisted; credentials
 belong to the worker's cache daemon and never enter code bundles or receipts.
-Source, build and dependency roots enter `SCCACHE_BASEDIRS` at execution time so
-private attempt paths stay outside product identities. The daemon may use its own
-path configuration; this setting alone does not establish reuse across attempts.
+Cached compiles expand bounded GNU response arguments and rewrite source, build,
+dependency and output path operands relative to the compilation working directory.
+External SDK paths and the compiler driver symlink remain exact. Cached Clang
+debug compiles use `-fdebug-compilation-dir=.`; GCC debug paths remain unchanged
+and may prevent reuse. Link commands retain their original response arguments.
+The opt-in acceptance test uses `SHELLSIM_TEST_SCCACHE` for the pinned v0.18.0
+binary and `SHELLSIM_TEST_WASM_CLANG` for an existing Clang. It proves an initial
+miss/write and a cross-workspace hit through generated C and Wasm wrappers,
+compares direct compiler bytes, and verifies linking leaves counters unchanged.
 
 ## Author a port
 

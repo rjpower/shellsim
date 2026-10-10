@@ -180,6 +180,7 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + str(python)
         + "\n"
         + response_source
+        + (_CACHE_COMPILE_ARGUMENTS if cache else "")
         + "\nimport os, sys\n"
         + "command = "
         + repr(base)
@@ -201,9 +202,14 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "\n"
         + (
             "if '-c' in options and not any(flag in options for flag in ('-S', '-E')):\n"
-            + "    command.insert(0, "
-            + repr(cache["path"])
+            + "    arguments = cached_compile_arguments(command[1:] + options, "
+            + repr([str(context.source), str(context.build), str(context.dependency_sysroot)])
+            + ", Path.cwd(), "
+            + repr(context.target_tools[role].name.startswith("clang"))
             + ")\n"
+            + "    command = ["
+            + repr(cache["path"])
+            + ", command[0]]\n"
             if cache
             else ""
         )
@@ -213,6 +219,53 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + repr([str(path) for path in context.executable_link_inputs])
         + " if is_link else []))\n"
     )
+
+
+# Embedded in the standalone compiler wrapper so private build processes do not
+# need to import the caller's repository. Response expansion uses the bounded
+# LLVM GNU parser above; only admitted compile operands change.
+_CACHE_COMPILE_ARGUMENTS = """
+import os, re
+
+def cached_compile_arguments(arguments, roots, directory, clang):
+    def relative(value):
+        if not os.path.isabs(value) or '..' in Path(value).parts:
+            return value
+        path = Path(value)
+        if any(path.is_relative_to(Path(root)) for root in roots):
+            return os.path.relpath(value, directory)
+        return value
+
+    separate = {'-I', '-isystem', '-iquote', '-idirafter', '-include',
+                '-include-pch', '-imacros', '-o', '-MF', '-MJ', '-MT', '-MQ',
+                '-isysroot', '-serialize-diagnostics', '--sysroot'}
+    joined = ('--sysroot=', '-isystem', '-iquote', '-idirafter',
+              '-include-pch', '-include', '-imacros', '-isysroot',
+              '-I', '-MF', '-MJ', '-MT', '-MQ', '-o')
+    result, operand, debug = [], False, False
+    for argument in arguments:
+        if operand:
+            result.append(relative(argument))
+            operand = False
+            continue
+        if argument in separate:
+            result.append(argument)
+            operand = True
+            continue
+        if argument in {'-g0', '-ggdb0'}:
+            debug = False
+        elif re.fullmatch(r'-g(?:[123]|gdb[0-3]?|line-tables-only|dwarf(?:-[0-9]+)?|full|codeview)?', argument):
+            debug = True
+        for flag in joined:
+            if argument.startswith(flag) and len(argument) > len(flag):
+                result.append(flag + relative(argument[len(flag):]))
+                break
+        else:
+            result.append(relative(argument) if not argument.startswith('-') else argument)
+    if clang and debug:
+        result.append('-fdebug-compilation-dir=.')
+    return result
+"""
 
 
 def build_environment(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict[str, str]:
