@@ -1,5 +1,7 @@
 """Exercise the installed upstream array, random, FFT and linear algebra modules."""
 
+import threading
+
 import numpy as np
 
 assert np.__version__ == "2.3.5"
@@ -21,3 +23,28 @@ except ValueError:
 else:
     raise AssertionError("invalid reshape accepted")
 print("numpy arrays, linalg, FFT, random and target types passed")
+
+
+barrier = threading.Barrier(3)
+results, errors = {}, []
+
+
+def calculate(index):
+    try:
+        barrier.wait()
+        values = np.arange(1024, dtype=np.float64) + index
+        results[index] = float(np.square(values).sum())
+    except BaseException as error:
+        errors.append(error)
+
+
+workers = [threading.Thread(target=calculate, args=(index,)) for index in range(2)]
+for worker in workers:
+    worker.start()
+barrier.wait()
+for worker in workers:
+    worker.join()
+assert not errors and len(results) == 2
+for index in range(2):
+    assert results[index] == sum((value + index) ** 2 for value in range(1024))
+print("numpy concurrent ufunc threads passed")

@@ -54,7 +54,7 @@
       "--buildtype=release",
       "-Dblas=none",
       "-Dlapack=none",
-      "-Ddisable-threading=true",
+      "-Ddisable-threading=false",
       "-Ddisable-optimization=true",
       "-Ddisable-highway=true",
       "-Ddisable-intel-sort=true",
