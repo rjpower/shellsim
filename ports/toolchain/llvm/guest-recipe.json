@@ -54,7 +54,7 @@
     },
     {
       "file": "../runtime_profile.py",
-      "sha256": "8dd4a55f317408d7f0ddc373ce26d14e7580d34bdd52d1ac55e54c603af7730b"
+      "sha256": "8c7d377a75e46f9c578dbe3e6b2064a990edc5705898e96be35fd30b71f91b8a"
     },
     {
       "file": "runtime-ctors-opcodes.patch",
@@ -262,7 +262,17 @@
   "tests": [
     {
       "kind": "shell",
-      "script": "tests/guest-compiler.sh"
+      "script": "tests/guest-compiler.sh",
+      "files": [
+        {
+          "source": "tests/fixtures/runtime_ctors_main.cpp",
+          "destination": "runtime_ctors_main.cpp"
+        },
+        {
+          "source": "tests/fixtures/runtime_ctors_side.cpp",
+          "destination": "runtime_ctors_side.cpp"
+        }
+      ]
     }
   ],
   "test_limits": {

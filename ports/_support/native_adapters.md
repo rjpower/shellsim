@@ -278,3 +278,8 @@ inputs and still runs as a native guest executable.
 Executable archives also apply to executable links made by upstream configure
 probes. Their feature checks see the same executable archive inputs as the final
 commands. Shared links receive their independently declared shared inputs.
+
+Declared acceptance `files` stage bounded, regular port files below `/work`
+before the probe runs. Each entry names `source` and a canonical relative
+`destination`; duplicate destinations and path escapes are rejected. Proofs
+record the SHA-256 of each staged file alongside the probe script hash.

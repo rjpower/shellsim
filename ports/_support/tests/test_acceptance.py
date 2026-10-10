@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ports._support.acceptance import AcceptanceRequest, _native_command, accept_port
+from ports._support.acceptance import AcceptanceRequest, _fixtures, _native_command, accept_port
 from ports._support.graph import Port
 
 
@@ -107,6 +107,16 @@ def test_successful_acceptance_does_not_publish_asset_cache(
     descriptor.write_text("{}")
     (tmp_path / "probe.py").write_text("print('ok')\n")
     port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
+    (tmp_path / "input.txt").write_bytes(b"fixture input")
+    port = dataclasses.replace(
+        port,
+        recipe={
+            "tests": [
+                {"kind": "python", "script": "probe.py", "files": [{"source": "input.txt", "destination": "input.txt"}]}
+            ]
+        },
+    )
+    written = {}
     cache = None
 
     @dataclasses.dataclass
@@ -126,13 +136,16 @@ def test_successful_acceptance_does_not_publish_asset_cache(
 
         def write_file(self, _path: str, _data: bytes, *, mode: int) -> None:
             assert mode == 0o644
+            written[_path] = _data
 
         def run(self, _command: str) -> SimpleNamespace:
             return SimpleNamespace(stdout=b"ok\n", stderr=b"", returncode=0, stop_reason=None, usage=Usage())
 
     monkeypatch.setitem(sys.modules, "shellsim", SimpleNamespace(Environment=FakeEnvironment))
     output = tmp_path / "proof"
-    accept_port(AcceptanceRequest(port, descriptor, output, installation_kind))
+    result = accept_port(AcceptanceRequest(port, descriptor, output, installation_kind))
+    assert written["/work/input.txt"] == b"fixture input"
+    assert result[0].fixture_sha256 == {"input.txt": hashlib.sha256(b"fixture input").hexdigest()}
     assert cache is not None and not cache.exists()
     assert not (output / "cache").exists()
 
@@ -223,3 +236,17 @@ def test_native_probe_links_declared_shared_provider_with_real_lld(tmp_path):
         [argument for argument in command if argument != "-Wl,-Bdynamic"], capture_output=True, check=False
     )
     assert rejected.returncode != 0
+
+
+def test_acceptance_fixtures_preserve_bytes_and_reject_destination_aliases(tmp_path):
+    (tmp_path / "fixture.cpp").write_bytes(b"int supplied() { return 37; }\n")
+    port = _port(tmp_path, [])
+    declaration = {"source": "fixture.cpp", "destination": "fixture.cpp"}
+    assert _fixtures(port, [declaration]) == {"fixture.cpp": (tmp_path / "fixture.cpp").read_bytes()}
+    with pytest.raises(ValueError, match="duplicated"):
+        _fixtures(port, [declaration, declaration])
+    for destination in ("../escape", "/host", "a/../b", "shellsim-acceptance.sh"):
+        with pytest.raises(ValueError):
+            _fixtures(port, [{**declaration, "destination": destination}])
+    with pytest.raises(ValueError, match="regular port file"):
+        _fixtures(port, [{"source": "missing.cpp", "destination": "input.cpp"}])

@@ -51,7 +51,7 @@
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "a155956e315c93aca36aaea3c8e242310983d9437a560348b1f35a73590b9b90"
+      "sha256": "fab20ce9f2e654ee835a3997e1b808f4d4ca81827a36f9cae074491ae38aa743"
     },
     {
       "file": "../../native/libffi/threaded/toolchain.py",
@@ -99,6 +99,6 @@
     "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
   },
   "cpython_manifest_sha256": "f8af21159020c3a2e2699d74f0693688a673ec31d1f35ab42da3dd99c4e3b2ed",
-  "cpython_recipe_sha256": "2f3cffe8ddd7991cf10f29ecede2a5f19f60c3d5705c631c7d2450f7eb3e5cdf",
+  "cpython_recipe_sha256": "0b8117c15acc6264eb94ddb0c710cad67f6185d4ab87e0c670c78bc6c46e8d78",
   "cpython_recipe_digest": "74471c016146d590021c3f3b3baa614d88f5cd674b5d11db04f9b7ff7ff8dbf0"
 }

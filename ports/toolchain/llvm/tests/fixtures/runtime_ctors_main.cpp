@@ -14,8 +14,8 @@ int main_callback(int value) { return value + 5; }
 }
 
 static std::atomic<int> bootstrap_count{0};
-static int *side_data_with_addend = &side_data[1];
-static int (*ready)(void) = side_ready;
+static int *volatile side_data_with_addend = &side_data[1];
+static int (*volatile ready)(void) = side_ready;
 static bool app_initialized;
 
 __attribute__((constructor(85))) static void count_bootstrap(void) {

@@ -52,7 +52,7 @@
     },
     {
       "file": "../../toolchain/wasi_threads/dynamic-recipe.json",
-      "sha256": "a38096ef2364370abc7ec9e0d4403130c923d003b2de1f1502aa9d0542af58e3"
+      "sha256": "927dc5addf622c1be6b7e0e28dcf26d07f67dcd43a680c1d5334ee33e156c3a9"
     },
     {
       "file": "../../toolchain/llvm/build.py",

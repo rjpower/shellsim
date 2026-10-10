@@ -13,8 +13,8 @@ int main_callback(int);
 int side_data[2] = {31, 43};
 }
 
-static int *data_with_addend = &main_data[1];
-static int (*callback)(int) = main_callback;
+static int *volatile data_with_addend = &main_data[1];
+static int (*volatile callback)(int) = main_callback;
 static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static int initialized;
 

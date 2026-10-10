@@ -123,7 +123,7 @@ def guest_runtime_profile(sysroot: Path, target: str) -> dict:
             *MAIN_LINKER_FLAGS,
             SYSROOT_TOKEN + "/lib/" + target + "/shellsim-abi.o",
         ],
-        "shared": list(SIDE_LINKER_FLAGS),
+        "shared": [*SIDE_LINKER_FLAGS, SYSROOT_TOKEN + "/lib/" + target + "/shellsim-abi.o"],
     }
 
 

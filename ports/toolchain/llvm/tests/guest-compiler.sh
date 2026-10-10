@@ -69,4 +69,8 @@ fi
 if clang missing.c -o missing.wasm > missing.stdout 2> missing.stderr; then
   exit 1
 fi
+clang++ -shared runtime_ctors_side.cpp -Wl,-soname,libctor-runtime.so -o libctor-runtime.so
+clang++ runtime_ctors_main.cpp ./libctor-runtime.so '-Wl,-rpath,$ORIGIN' -o runtime-ctors.wasm
+chmod +x runtime-ctors.wasm
+BOOTSTRAP_TEST=present ./runtime-ctors.wasm
 printf 'guest compiler acceptance passed\n'

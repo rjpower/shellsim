@@ -54,6 +54,7 @@ class AcceptanceResult:
     kind: str
     source_sha256: str
     artifact_sha256: str | None
+    fixture_sha256: dict[str, str]
     returncode: int
     stop_reason: str | None
     stdout_sha256: str
@@ -110,6 +111,38 @@ def _source(port: Port, raw: object) -> tuple[Path, bytes]:
     if len(data) > _MAX_SOURCE_BYTES:
         raise ValueError("acceptance source exceeds its size limit")
     return path, data
+
+
+def _fixtures(port: Port, raw: object) -> dict[str, bytes]:
+    """Admit bounded test inputs below /work before materializing a release."""
+    if not isinstance(raw, list) or len(raw) > 32:
+        raise ValueError("acceptance fixtures must be a bounded list")
+    files = {}
+    size = 0
+    for item in raw:
+        if not isinstance(item, dict) or set(item) != {"source", "destination"}:
+            raise ValueError("acceptance fixture needs source and destination")
+        destination = item["destination"]
+        if not isinstance(destination, str) or not destination or len(destination) > 4096:
+            raise ValueError("acceptance fixture destination is invalid")
+        relative = PurePosixPath(destination)
+        if (
+            "\\" in destination
+            or "\0" in destination
+            or relative.is_absolute()
+            or any(part in {".", ".."} for part in relative.parts)
+            or relative.as_posix() != destination
+            or destination.startswith("shellsim-acceptance")
+        ):
+            raise ValueError("acceptance fixture destination escapes its work directory")
+        if destination in files:
+            raise ValueError("acceptance fixture destination is duplicated")
+        _, data = _source(port, item["source"])
+        size += len(data)
+        if size > _MAX_SOURCE_BYTES:
+            raise ValueError("acceptance fixtures exceed their aggregate size limit")
+        files[destination] = data
+    return files
 
 
 def _native_command(
@@ -239,6 +272,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         include_directories = test.get("include_directories", [])
         link_flags = test.get("link_flags", [])
         args = test.get("args", [])
+        fixtures = _fixtures(request.port, test.get("files", []))
         if (
             not isinstance(args, list)
             or len(args) > 32
@@ -274,7 +308,9 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             raise ValueError("Python acceptance does not take native compiler options")
         if "libraries" in test:
             raise ValueError("native acceptance requires exact link_inputs rather than -l search")
-        prepared.append((kind, path, data, link_inputs, cohort_link_inputs, include_directories, link_flags, args))
+        prepared.append(
+            (kind, path, data, link_inputs, cohort_link_inputs, include_directories, link_flags, args, fixtures)
+        )
 
     request.output.mkdir(parents=True)
     from shellsim import Environment
@@ -294,6 +330,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             include_directories,
             link_flags,
             args,
+            fixtures,
         ) in enumerate(prepared):
             proof = request.output / f"probe-{index}"
             proof.mkdir()
@@ -336,6 +373,8 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 artifact.read_bytes() if kind == "native" else data,
                 mode=0o755 if kind == "native" else 0o644,
             )
+            for destination, contents in fixtures.items():
+                env.write_file("/work/" + destination, contents, mode=0o644)
             guest_command = {"python": "python ", "shell": "sh ", "native": ""}[kind] + shlex.quote(guest_path)
             result = env.run(" ".join((guest_command, *(shlex.quote(arg) for arg in args))))
             (proof / "stdout").write_bytes(result.stdout)
@@ -343,6 +382,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             outcome = AcceptanceResult(
                 script=path.relative_to(request.port.directory).as_posix(),
                 kind=kind,
+                fixture_sha256={name: _digest(contents) for name, contents in fixtures.items()},
                 source_sha256=_digest(data),
                 artifact_sha256=_digest(artifact.read_bytes()) if kind == "native" else None,
                 returncode=result.returncode,
