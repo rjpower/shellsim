@@ -8,8 +8,10 @@ That default also applies when `pyproject.toml` has no `build-system` table.
 Declared tables must provide a valid `requires` list; absent `build-backend`
 selects the setuptools legacy backend.
 
-Declare exact backend wheels as `build_dependencies`. Their runtime dependencies
-are part of the host import closure, so setuptools_scm also selects packaging.
+Declare exact backend wheels as `build_dependencies`. Include the pinned
+`packaging` wheel in that closure: the hook runner uses it to validate requirements.
+Backend wheels' runtime dependencies are also part of the host import closure,
+so setuptools_scm selects packaging.
 An unchanged `pure-wheel` can serve a host build edge and a separately selected
 guest root when its complete runtime dependency closure is guest-compatible.
 CPPy and setuptools_scm currently cannot be selected as guest packages because

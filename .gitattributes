@@ -11,3 +11,5 @@ ports/toolchain/wasi_threads/llvm-serial-memory-init.patch -whitespace
 ports/toolchain/wasi_threads/wasi-libc-scheduler.patch -whitespace
 python/shellsim/_assets/tcc/** -whitespace
 python/shellsim/_assets/wasi-sysroot/** -whitespace
+# Unified-diff context retains the pinned Pillow source bytes.
+ports/python/pillow/target-search.patch -whitespace
