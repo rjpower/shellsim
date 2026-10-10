@@ -523,6 +523,38 @@ def test_worker_image_cache_identity_does_not_require_caller_executable(tmp_path
         compiler_cache_identity(launcher)
 
 
+@pytest.mark.parametrize(
+    "environment",
+    [
+        (("SCCACHE_SERVER_UDS", "/app/.buildomatic/sccache.sock"),),
+        (("SCCACHE_SERVER_PORT", "4226"),),
+        (("SCCACHE_DIR", "/local/cache"),),
+    ],
+)
+def test_cache_launcher_accepts_one_endpoint_or_default_local_cache(tmp_path, environment):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-sccache", "a" * 64, environment)
+    identity = compiler_cache_identity(launcher, verify_executable=False)
+    assert identity["environment"] == {**dict(environment), "SCCACHE_CLIENT_SIDE": "1"}
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        (("SCCACHE_SERVER_PORT", "4226"), ("SCCACHE_SERVER_UDS", "/app/.buildomatic/sccache.sock")),
+        (("SCCACHE_SERVER_UDS", "relative.sock"),),
+        (("SCCACHE_SERVER_UDS", ""),),
+    ],
+)
+def test_cache_launcher_rejects_conflicting_or_relative_socket_endpoints(tmp_path, environment):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-sccache", "a" * 64, environment)
+    with pytest.raises(ValueError):
+        compiler_cache_identity(launcher, verify_executable=False)
+
+
 def test_cache_launcher_rejects_changed_binary_and_endpoint_credentials(tmp_path):
     from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
     from ports._support.store import file_hash

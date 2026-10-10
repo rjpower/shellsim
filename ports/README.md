@@ -110,6 +110,9 @@ With pinned sccache v0.18.0, cached build environments select
 inherit its resource limits, while the daemon handles storage. Disabling this
 mode, `SCCACHE_ERROR_LOG`, and distributed scheduler configuration are rejected
 because they can move compilation outside the action's cancellation boundary.
+Public daemon bindings select either `SCCACHE_SERVER_UDS` (an absolute socket
+path inside the worker's private filesystem) or `SCCACHE_SERVER_PORT`, never
+both. Omitting both preserves sccache's ordinary local disk-cache endpoint.
 Cached compiles expand bounded GNU response arguments and rewrite source, build,
 dependency and output path operands relative to the compilation working directory.
 External SDK paths and the compiler driver symlink remain exact. Cached Clang
