@@ -250,3 +250,35 @@ def test_executable_archive_admission_rejects_escaping_or_duplicate_inputs(tmp_p
     )
     with pytest.raises(ValueError):
         runner._executable_cohort_link_inputs(PlatformCohort(receipt), {"executable_cohort_link_inputs": declared})
+
+
+def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
+    """Exercise real graph publication and loading when stdlib also owns zlib."""
+    import os
+    from pathlib import Path
+
+    import shellsim
+    from shellsim._cpython_universe import Universe
+
+    from ports._support.cohort import load_cohort
+
+    cohort_path = os.environ.get("SHELLSIM_PILLOW_GRAPH_COHORT")
+    store_path = os.environ.get("SHELLSIM_PILLOW_GRAPH_STORE")
+    if cohort_path is None or store_path is None:
+        pytest.skip("real Pillow graph inputs were not supplied")
+    cohort = load_cohort(Path(cohort_path))
+    build = runner.build_graph(
+        Path(__file__).parents[2], ["python/pillow/graph-recipe.json"], cohort, Path(store_path), offline=True
+    )
+    release = runner.publish_graph(build, cohort, tmp_path / "release")
+    runtime = shellsim.CPythonRuntime.from_release(release, cache_dir=tmp_path / "cache")
+    universe = Universe(runtime.universe, abi=cohort.dynamic_abi, python_version=cohort.python.version)
+    providers = universe.provider_closure({"libfreetype.so"})
+    assert "libz.so" in providers
+    assert providers["libz.so"].read_bytes() == (runtime.bundle / "rootfs/lib/libz.so").read_bytes()
+    environment = shellsim.Environment.from_release(release, pypi=["pillow==12.3.0"], cache_dir=tmp_path / "cache")
+    environment.write_file(
+        "/work/raster.py", b"from PIL import ImageFont\nassert sum(ImageFont.load_default(size=24).getmask('A')) > 0\n"
+    )
+    result = environment.run("python /work/raster.py")
+    assert result.returncode == 0 and result.stop_reason is None, result.stderr
