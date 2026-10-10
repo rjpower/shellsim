@@ -33,6 +33,16 @@ def test_acceptance_requires_existing_declared_probe_before_release_fetch(tmp_pa
     assert not output.exists()
 
 
+@pytest.mark.parametrize("limits", [{"cpu": -1}, {"memory": True}, {"disk": 2**32}, {"host": 1}, []])
+def test_acceptance_rejects_invalid_resource_budgets_before_release_fetch(tmp_path, limits):
+    port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
+    port = dataclasses.replace(port, recipe={**port.recipe, "test_limits": limits})
+    output = tmp_path / "proof"
+    with pytest.raises(ValueError, match="test_limits"):
+        accept_port(AcceptanceRequest(port, tmp_path / "missing-release.json", output, "pypi"))
+    assert not output.exists()
+
+
 def test_acceptance_rejects_test_kind_mismatch_before_release_fetch(tmp_path: Path) -> None:
     descriptor = tmp_path / "release.json"
     descriptor.write_text("{}")

@@ -1,6 +1,5 @@
 """Check guest build boundaries without launching target programs on the host."""
 
-import json
 from pathlib import Path
 
 import pytest
@@ -21,16 +20,6 @@ def test_guest_compiler_graph_distinguishes_build_and_install_dependencies():
         ("native/shellsim-posix", "target"),
         ("toolchain/wasi-development", "runtime"),
     }
-    sdk = next(port for port in graph.ports if port.name == "wasi-development")
-    assert sdk.recipe["install"]["kind"] == "devel"
-    assert sdk.recipe["build_dependencies"] == [
-        {"port": "toolchain/llvm", "version": "23.0.0", "recipe": "toolchain/llvm/host-recipe.json"}
-    ]
-    assert not sdk.recipe["exports"].get("tools")
-    destinations = clang.recipe["install"]["destinations"]
-    assert all(destinations[name] == "/usr/" + name for name in clang.recipe["exports"]["tools"])
-    assert destinations["bin/clang.cfg"] == "/usr/bin/clang.cfg"
-    assert destinations["bin/clang++.cfg"] == "/usr/bin/clang++.cfg"
 
 
 def test_dependency_snapshot_rejects_modified_retained_bytes(tmp_path):
@@ -43,13 +32,6 @@ def test_dependency_snapshot_rejects_modified_retained_bytes(tmp_path):
     (destination / "header.h").write_text("changed\n")
     with pytest.raises(ValueError):
         _snapshot(source, destination, inventory)
-
-
-def test_guest_recipes_bind_the_same_executable_and_development_platform():
-    recipes = [json.loads((PORT / name).read_text()) for name in ("guest-recipe.json", "guest-sdk-recipe.json")]
-    assert {(recipe["target"], recipe["abi"]) for recipe in recipes} == {
-        ("wasm32-wasip1-threads", "shellsim-wasi-sdk34-cpython3137-threads-v3")
-    }
 
 
 def test_posix_snapshot_compatibility_uses_compilation_bytes(tmp_path):

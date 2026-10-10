@@ -26,7 +26,7 @@
   "build_scripts": [
     {
       "file": "guest.py",
-      "sha256": "763d1ee27722d8fc3112c841af0dea9f1488806780729b4cad35f9b345fbb793"
+      "sha256": "bb2dcadefd832fecc6b53e8d95dd6218aaf896f03d370eaf19f3581d7612c987"
     },
     {
       "file": "build.py",
@@ -213,5 +213,10 @@
       "kind": "shell",
       "script": "tests/guest-compiler.sh"
     }
-  ]
+  ],
+  "test_limits": {
+    "cpu": 500000000000,
+    "memory": 2147483648,
+    "disk": 402653184
+  }
 }

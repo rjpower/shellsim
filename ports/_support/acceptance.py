@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 
 _MAX_TESTS = 32
 _MAX_SOURCE_BYTES = 16 * 1024**2
+_MAX_TEST_LIMITS = {"cpu": 1_000_000_000_000, "memory": 4 * 1024**3, "disk": 2 * 1024**3}
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,25 @@ class AcceptanceResult:
 
 def _digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
+
+
+def _test_limits(recipe: dict) -> Limits | None:
+    """Admit explicit guest budgets for checks that exceed environment defaults."""
+    values = recipe.get("test_limits")
+    if values is None:
+        return None
+    if (
+        not isinstance(values, dict)
+        or not values
+        or any(
+            name not in _MAX_TEST_LIMITS or type(value) is not int or not 0 < value <= _MAX_TEST_LIMITS[name]
+            for name, value in values.items()
+        )
+    ):
+        raise ValueError("test_limits must contain bounded positive cpu, memory or disk integers")
+    from shellsim import Limits
+
+    return Limits(**values)
 
 
 def _bounded_digest(path: Path, limit: int) -> str:
@@ -194,6 +214,9 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         raise ValueError("port needs between one and 32 declared acceptance probes")
     if request.install_kind not in {"pypi", "native"}:
         raise ValueError("acceptance installation kind is invalid")
+    limits = _test_limits(request.port.recipe)
+    if request.limits is not None:
+        limits = request.limits
     if request.output.exists() or request.output.is_symlink():
         raise ValueError("acceptance proof output already exists")
     descriptor = request.descriptor
@@ -260,7 +283,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
     name = request.port.name if request.install_kind == "pypi" else installation(request.port)[0]
     spec = f"{name}=={request.port.version}"
     results = []
-    with tempfile.TemporaryDirectory(prefix="shellsim-port-acceptance-") as cache_dir:
+    with tempfile.TemporaryDirectory(prefix=".release-cache-", dir=request.output) as cache_dir:
         for index, (
             kind,
             path,
@@ -302,7 +325,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 if artifact.stat().st_size > 128 * 1024**2 or wasm_header != b"\0asm\x01\0\0\0":
                     raise ValueError("native acceptance compiler did not produce bounded core Wasm")
             setup = {"pypi" if request.install_kind == "pypi" else "tools": [spec]}
-            kwargs = {"limits": request.limits} if request.limits is not None else {}
+            kwargs = {"limits": limits} if limits is not None else {}
             env = Environment.from_release(descriptor, cache_dir=Path(cache_dir), **setup, **kwargs)
             guest_path = "/work/shellsim-acceptance" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[kind]
             env.write_file(
@@ -338,6 +361,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 "installed_requirement": spec,
                 "install_kind": request.install_kind,
                 "cohort": request.cohort.identity if request.cohort is not None else None,
+                "test_limits": dataclasses.asdict(limits) if limits is not None else None,
                 "results": [dataclasses.asdict(item) for item in results],
             },
             sort_keys=True,

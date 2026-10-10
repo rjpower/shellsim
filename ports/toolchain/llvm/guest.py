@@ -30,6 +30,27 @@ GENERATORS = ("llvm-tblgen", "llvm-min-tblgen", "clang-tblgen")
 HOST_TOOLS = ("clang", "clang++", "wasm-ld", "llvm-ar", "llvm-ranlib", *GENERATORS)
 
 
+def workspace_compatibility(recipe, compiler, sysroot, sdk, dependencies, host_tools, target):
+    """Select one persistent tree from the bytes that affect compiled objects.
+
+    Linker, archive, packaging and runner updates keep the same workspace;
+    full product identity independently records those exact admitted inputs.
+    """
+    roots = {
+        "posix": dependencies["native/shellsim-posix"],
+        "sysroot": sysroot,
+        "resources": sdk / "lib/clang/23",
+    }
+    return {
+        "source": recipe["source"],
+        "patches": recipe["patches"],
+        "target": target,
+        "compiler_tools": {name: digest(compiler.root / "bin" / name) for name in HOST_TOOLS if name != "wasm-ld"},
+        "headers": {name: _inventory(root, ("include",)) for name, root in roots.items()},
+        "host_tools": {name: digest(host_tools[name]) for name in ("cmake", "ninja")},
+    }
+
+
 def _inventory(root, directories=()):
     return {
         str(path.relative_to(root)): digest(path)
@@ -85,7 +106,21 @@ def _refresh_snapshot(source, destination, inventory, previous, directories=()):
         raise ValueError("guest LLVM replacement dependency snapshot differs")
 
 
-def build_guest(context, recipe, compiler):
+def _validate_guest_layout(recipe):
+    """Reject layouts that disagree with the compiler's fixed virtual SDK paths."""
+    destinations = recipe["install"]["destinations"]
+    for name in recipe["exports"]["tools"] + recipe["exports"]["configs"]:
+        if destinations.get(name) != "/usr/" + name:
+            raise ValueError("guest compiler commands and configs require /usr/bin")
+    edge = recipe["runtime_dependencies"][0]
+    sdk = json.loads((PORT.parents[1] / edge["recipe"]).read_text())
+    for field in ("destinations", "directories"):
+        for source, destination in sdk["install"].get(field, {}).items():
+            if destination != "/usr/local/" + source:
+                raise ValueError("guest development SDK requires /usr/local")
+
+
+def build_guest(context, recipe, compiler, *, jobs=None):
     """Build from an archive and return an unsealed graph staging result.
 
     ``context.source`` is the pinned LLVM archive. ``context.build`` must be a
@@ -96,11 +131,16 @@ def build_guest(context, recipe, compiler):
     workspace.mkdir(parents=True, exist_ok=True)
     with (workspace / ".guest-llvm.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _build_guest_locked(context, recipe, compiler, workspace)
+        return _build_guest_locked(context, recipe, compiler, workspace, jobs)
 
 
-def _build_guest_locked(context, recipe, compiler, workspace):
+def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
+    _validate_guest_layout(recipe)
+    requested_jobs = recipe["build"]["jobs"] if jobs is None else jobs
+    if not isinstance(requested_jobs, int) or not 1 <= requested_jobs <= 16:
+        raise ValueError("guest LLVM compile jobs must be between one and sixteen")
+    compile_jobs = min(requested_jobs, recipe["build_limits"]["compile_jobs"])
     if context.target != "wasm32-wasip1-threads":
         raise ValueError("guest compiler requires the admitted threaded WASI platform")
     if digest(context.source) != recipe["source"]["sha256"]:
@@ -125,21 +165,14 @@ def _build_guest_locked(context, recipe, compiler, workspace):
         "recipe": recipe,
         "host_compiler": compiler.sha256,
         "compiler_tools": compiler_tools,
+        "packaging_tools": {"llvm-strip": digest(compiler.root / "bin/llvm-strip")},
         "posix": posix_receipt["artifact_sha256"],
         "snapshots": {name: inventory for name, (_, inventory) in snapshots.items()},
         "host_tools": tools,
     }
-    compatibility = {
-        "source": recipe["source"],
-        "patches": recipe["patches"],
-        "target": context.target,
-        "compiler_tools": {name: sha for name, sha in compiler_tools.items() if name != "wasm-ld"},
-        "headers": {
-            name: {path: sha for path, sha in inventory.items() if path.startswith("include/")}
-            for name, inventory in inputs["snapshots"].items()
-        },
-        "host_tools": tools,
-    }
+    compatibility = workspace_compatibility(
+        recipe, compiler, context.sysroot, context.sdk, context.dependencies, context.host_tools, context.target
+    )
     receipt = workspace / "workspace.json"
     state = {"schema_version": 1, "compatibility": compatibility, "inputs": inputs}
     previous = inputs["snapshots"]
@@ -187,7 +220,7 @@ def _build_guest_locked(context, recipe, compiler, workspace):
         roots[0].rename(source)
         preparing.rmdir()
     source_hash = verify_source(context.source, source, recipe, PORT)
-    commands = _commands(context, workspace, source)
+    commands = _commands(context, workspace, source, compile_jobs)
     identity = {**inputs, "commands": commands}
     key = identity_hash(identity)
     prefix = workspace / "products" / key
@@ -199,7 +232,7 @@ def _build_guest_locked(context, recipe, compiler, workspace):
         staging = prefix.with_name(key + ".preparing")
         if staging.exists():
             shutil.rmtree(staging)
-        _install_commands(context.build, staging, source)
+        _install_commands(context.build, staging, source, compiler.root / "bin/llvm-strip", attempts)
         manifest = {
             "schema_version": 1,
             "identity": identity,
@@ -224,7 +257,7 @@ def _build_guest_locked(context, recipe, compiler, workspace):
     )
 
 
-def _commands(context, workspace, source):
+def _commands(context, workspace, source, jobs):
     posix = workspace / "inputs/posix"
     sysroot = workspace / "inputs/sysroot"
     resources = workspace / "inputs/resources"
@@ -255,6 +288,7 @@ def _commands(context, workspace, source):
         "-Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory",
         "-Wl,--initial-memory=134217728,--max-memory=1073741824,-z,stack-size=16777216",
         "-Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base",
+        "-Wl,--export-if-defined=__wasm_apply_global_tls_relocs",
     ]
     toolchain = workspace / "guest-toolchain.cmake"
     lines = [
@@ -328,17 +362,27 @@ def _commands(context, workspace, source):
             "CLANG_ENABLE_OBJC_REWRITER",
         )
     )
-    return [configure, [str(context.host_tools["ninja"]), "-C", str(context.build), "-j8", *TARGETS]]
+    return [configure, [str(context.host_tools["ninja"]), "-C", str(context.build), "-j" + str(jobs), *TARGETS]]
 
 
-def _install_commands(build, destination, source):
+def _install_commands(build, destination, source, strip, attempts):
     (destination / "bin").mkdir(parents=True)
     (destination / "licenses").mkdir()
     for name in TARGETS:
         shutil.copyfile(build / "bin" / name, destination / "bin" / name)
         (destination / "bin" / name).chmod(0o755)
+        run(
+            [
+                str(strip),
+                "--strip-all",
+                "--keep-section=dylink.0",
+                "--keep-section=shellsim.abi",
+                str(destination / "bin" / name),
+            ],
+            attempts / (name + "-strip.log"),
+            {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
     for alias, name in {
-        "wasm-ld": "lld",
         "llvm-ranlib": "llvm-ar",
         "llvm-strip": "llvm-objcopy",
     }.items():
@@ -346,6 +390,7 @@ def _install_commands(build, destination, source):
         (destination / "bin" / alias).chmod(0o755)
     for alias, command in {
         "clang++": "clang --driver-mode=g++",
+        "wasm-ld": "lld -flavor wasm",
         "cc": "clang",
         "c++": "clang++",
         "ar": "llvm-ar",
@@ -368,6 +413,7 @@ def _install_commands(build, destination, source):
 -Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory
 -Wl,--initial-memory=16777216,--max-memory=67108864
 -Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base
+-Wl,--export-if-defined=__wasm_apply_global_tls_relocs
 """
     for name in ("clang.cfg", "clang++.cfg"):
         (destination / "bin" / name).write_text(flags)

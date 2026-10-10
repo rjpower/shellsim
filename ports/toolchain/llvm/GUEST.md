@@ -32,10 +32,13 @@ logs and interrupted objects. Each retained source is checked against the
 pinned archive and exact patches before a build. Changed inputs require a
 new workspace when source, generators or headers change. Verified library
 updates replace archives at stable paths and let Ninja relink existing objects.
+Installed commands are stripped with the admitted host `llvm-strip`, preserving
+the main TLS classification in `dylink.0` and the `shellsim.abi` section.
 Completed command products are immutable and verified before
 being copied into the graph's private staging directory.
 
-The producer uses eight compilation jobs and one link job. Build commands have
+The producer honors the requested compilation job count, up to eight jobs,
+and uses one link job. Build commands have
 a one-hour timeout and a 12 GiB address-space limit per process. The guest
 compiler executable reserves a 16 MiB C stack, starts with 128 MiB of linear
 memory and permits growth to 1 GiB, subject to Shellsim's memory budget.

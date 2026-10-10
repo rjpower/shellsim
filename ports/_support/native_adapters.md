@@ -133,3 +133,11 @@ input cohort and those two receipts. Graph acceptance retains that per-node
 context and compiles probes with the same selected compiler and sysroot; it
 also records the resolved receipts in `graph.json`. Bootstrap-selected products
 therefore cannot retain the original cohort toolchain label.
+
+Port checks may declare `test_limits` with positive integer `cpu`, `memory` and
+`disk` guest budgets. Omitted fields retain the public environment defaults.
+The harness caps declarations at one trillion CPU units, 4 GiB memory and 2 GiB
+disk, and records the effective explicit budget in the acceptance receipt.
+These budgets allow compiler and SDK checks to include installation and execution
+costs. Temporary release materialization lives under the proof directory and is
+removed after the checks.
