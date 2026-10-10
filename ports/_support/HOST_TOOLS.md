@@ -7,10 +7,14 @@ unmodified upstream Meson 1.8.3. The producer applies the separately pinned
 WASI archive-group patch and checks its exact input and output bytes.
 
 Host receipts include every regular environment file and each internal alias.
+Production can copy the explicit base and environments into a private read-only
+tree. Other sessions using the shared uv interpreter cannot change that closure.
 Python-backed tools also bind the explicit base Python 3.13.15 executable,
 standard library, extension modules and internal aliases. Admission rejects
 changed code, missing receipts, an unpinned source definition, a different base
-interpreter, or system site packages. No ambient Python discovery is used.
+interpreter, a writable base tree, or system site packages. Version verification
+reads the bound Python header; admission never executes an interpreter. No
+ambient Python discovery is used.
 
 Set the repository cache variables and prevent bytecode writes when creating or
 using these environments:
@@ -48,8 +52,13 @@ uv run --no-project --python "$HOST_ENV/bin/python" python -B -m ports._support.
   --cohort "$INPUT_COHORT" --output "$NEW_RECEIPTS" --cache "$SOURCE_CACHE" \
   --base-python "$BASE_PYTHON" --python-environment "$HOST_ENV" \
   --meson-root "$NEW_MESON" --meson-python-environment "$HOST_ENV" \
-  --materialize-meson
+  --private-python "$PRIVATE_PYTHON" --materialize-meson
 ```
+
+`--private-python` creates fresh read-only base and environment copies, updates
+`pyvenv.cfg` and script paths, and uses those copies in the new descriptor.
+Existing destinations are rejected. Omit this option only when the supplied
+base is already a private read-only tree.
 
 Omit `--materialize-meson` to verify an existing Meson installation against the
 same pinned source and patch. `--offline` requires all pinned archives in the

@@ -10,9 +10,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shlex
 import shutil
-import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -55,6 +55,65 @@ def inventory(root: Path, *, symlinks: dict[str, str] | None = None) -> dict[str
     return files
 
 
+def verify_read_only(root: Path) -> None:
+    """Reject host code trees that ordinary interpreter use could mutate."""
+    for path in (root, *root.rglob("*")):
+        if not path.is_symlink() and path.stat().st_mode & 0o222:
+            raise ValueError("base Python code tree is writable")
+
+
+def make_read_only(root: Path) -> None:
+    """Preserve execute bits while removing write permissions from a snapshot."""
+    for path in (*root.rglob("*"), root):
+        if not path.is_symlink():
+            path.chmod(path.stat().st_mode & ~0o222)
+
+
+def snapshot_python(base: Path, environments: tuple[Path, ...], destination: Path) -> tuple[Path, tuple[Path, ...]]:
+    """Copy explicit Python inputs coherently, rebinding venv launch paths.
+
+    These private copies keep shared uv interpreter use from invalidating host
+    receipts. Existing trees are preserved; no interpreter is executed here.
+    """
+    if destination.exists():
+        raise FileExistsError(destination)
+    destination.mkdir(parents=True)
+    base = base.resolve()
+    private_base = destination.resolve() / "base"
+    aliases = {}
+    expected = inventory(base, symlinks=aliases)
+    shutil.copytree(base, private_base, symlinks=True)
+    copied_aliases = {}
+    if inventory(private_base, symlinks=copied_aliases) != expected or aliases != copied_aliases:
+        raise ValueError("base Python changed while copying")
+    make_read_only(private_base)
+    copied = []
+    for index, original in enumerate(environments):
+        original = original.resolve()
+        environment = destination.resolve() / ("environment-" + str(index))
+        aliases = {}
+        expected = inventory(original, symlinks=aliases)
+        shutil.copytree(original, environment, symlinks=True)
+        copied_aliases = {}
+        if inventory(environment, symlinks=copied_aliases) != expected or aliases != copied_aliases:
+            raise ValueError("Python environment changed while copying")
+        config_path = environment / "pyvenv.cfg"
+        config = dict(line.split(" = ", 1) for line in config_path.read_text().splitlines())
+        if Path(config["home"]).resolve() != base / "bin":
+            raise ValueError("Python environment has a different base")
+        config["home"] = str(private_base / "bin")
+        config_path.write_text("".join(name + " = " + value + "\n" for name, value in config.items()))
+        for script in (environment / "bin").iterdir():
+            if script.is_file() and not script.is_symlink() and not script.name.startswith("python"):
+                data = script.read_bytes()
+                rewritten = data.replace(str(original).encode(), str(environment).encode())
+                if rewritten != data:
+                    script.write_bytes(rewritten)
+        make_read_only(environment)
+        copied.append(environment)
+    return private_base, tuple(copied)
+
+
 def python_closure(environment: Path, base: Path) -> dict:
     """Bind a venv's explicit base interpreter, stdlib and extension modules."""
     environment, base = environment.resolve(), base.resolve()
@@ -63,14 +122,17 @@ def python_closure(environment: Path, base: Path) -> dict:
         raise ValueError("Python environment uses a different base or system packages")
     if file_hash(environment / "bin/python") != file_hash(base / "bin/python3.13"):
         raise ValueError("Python environment interpreter differs from its base")
-    version = subprocess.run(
-        [environment / "bin/python", "-I", "-B", "-c", "import sys; print('.'.join(map(str, sys.version_info[:3])))"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
+    version = re.search(
+        r'^#define\s+PY_VERSION\s+"([^"\n]+)"',
+        (base / "include/python3.13/patchlevel.h").read_text(),
+        re.MULTILINE,
+    )
+    if version is None:
+        raise ValueError("base Python version header is missing")
+    version = version.group(1)
     if version != definition()["python"]["version"]:
         raise ValueError("base Python version differs")
+    verify_read_only(base)
     aliases = {}
     files = inventory(base, symlinks=aliases)
     return {"root": str(base), "files": files, "symlinks": aliases}
@@ -244,6 +306,9 @@ def main() -> None:
     parser.add_argument("--meson-python-environment", type=Path, required=True)
     parser.add_argument("--offline", action="store_true")
     parser.add_argument(
+        "--private-python", type=Path, help="Create private read-only base and environment copies at a new directory"
+    )
+    parser.add_argument(
         "--materialize-meson",
         action="store_true",
         help="Create the pinned Meson tree at a previously absent --meson-root",
@@ -251,6 +316,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
+    if args.private_python is not None:
+        args.base_python, environments = snapshot_python(
+            args.base_python, (args.python_environment, args.meson_python_environment), args.private_python
+        )
+        args.python_environment, args.meson_python_environment = environments
     receipts = generator_receipts(args.python_environment, args.base_python, args.cache, offline=args.offline)
     receipts["meson"] = meson_receipt(
         args.meson_root,
