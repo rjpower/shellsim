@@ -59,6 +59,13 @@
         "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
         "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
       }
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
+      "inputs": {
+        "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
+      }
     }
   ],
   "build_limits": {
@@ -70,7 +77,7 @@
   "build_scripts": [
     {
       "file": "compiler.py",
-      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+      "sha256": "1891f15e7ab941731e2a565afc648342ecae2e2e3017a29debe442602520a8a6"
     },
     {
       "file": "build.py",
@@ -99,6 +106,10 @@
     {
       "file": "tls-reloc-symbol.patch",
       "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117"
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231"
     }
   ],
   "main_tls_protocol": {

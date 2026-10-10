@@ -145,6 +145,118 @@ def verify_product(prefix, identity):
     return prefix
 
 
+def replace_patch_input(snapshot, destination, work):
+    """Replace one retained file atomically without staging inside its source tree."""
+    staged = tempfile.NamedTemporaryFile(dir=work, prefix=".patch-input-", delete=False)
+    temporary = Path(staged.name)
+    try:
+        with staged as output, snapshot.open("rb") as stream:
+            shutil.copyfileobj(stream, output)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def update_workspace_patches(archive, source, recipe, directory, work, workspace, compatibility):
+    """Admit an append-only patch update under the producer's workspace lock.
+
+    Snapshot only changed pinned files before mutation. A durable journal lets
+    an interrupted update restore the old exact source, reverify it, and apply
+    the same new bytes. Unrelated source and object mtimes remain untouched.
+    """
+    old = workspace["compatibility"]
+    old_patches, new_patches = old["patches"], compatibility["patches"]
+    if (
+        old["source"] != compatibility["source"]
+        or old["tools"] != compatibility["tools"]
+        or new_patches[: len(old_patches)] != old_patches
+        or len(new_patches) <= len(old_patches)
+    ):
+        raise ValueError("LLVM workspace update requires appended patches and identical source/tools")
+    if digest(archive) != recipe["source"]["sha256"]:
+        raise ValueError("LLVM source archive identity differs")
+    if workspace.get("phase", "ready") != "ready":
+        raise ValueError("finish the prior LLVM build before updating patches")
+    if digest(work / "build/CMakeCache.txt") != workspace["configuration_sha256"]:
+        raise ValueError("LLVM workspace configuration changed outside its producer")
+    journal = work / "patch-update.json"
+    snapshot = work / "patch-update-files"
+    if journal.exists():
+        update = json.loads(journal.read_text())
+        if update["old"] != old or update["new"] != compatibility:
+            raise ValueError("pending LLVM patch update differs")
+        for name, hashes in update["files"].items():
+            relative = Path(name)
+            path = source / name
+            if relative.is_absolute() or ".." in relative.parts or not path.resolve().is_relative_to(source.resolve()):
+                raise ValueError("LLVM patch journal path escapes source")
+            actual = digest(path) if path.exists() else None
+            if actual not in hashes.values():
+                raise ValueError("interrupted LLVM patch input changed: " + name)
+            for phase in ("before", "after"):
+                pinned = snapshot / phase / name
+                if hashes[phase] is not None and digest(pinned) != hashes[phase]:
+                    raise ValueError("LLVM patch snapshot changed: " + name)
+        for name, hashes in update["files"].items():
+            path = source / name
+            if hashes["before"] is None:
+                path.unlink(missing_ok=True)
+            else:
+                replace_patch_input(snapshot / "before" / name, path, work)
+        previous_hash = verify_source(archive, source, old, directory)
+    else:
+        previous_hash = verify_source(archive, source, old, directory)
+        if snapshot.exists():
+            shutil.rmtree(snapshot)
+        before, after = snapshot / "before", snapshot / "after"
+        after.mkdir(parents=True)
+        names = {name for patch in new_patches[len(old_patches) :] for name in patch["inputs"]}
+        for name in names:
+            original = source / name
+            if (
+                not original.is_file()
+                or original.is_symlink()
+                or not original.resolve().is_relative_to(source.resolve())
+            ):
+                raise ValueError("invalid appended LLVM patch input: " + name)
+            for root in (before, after):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(original, path)
+        for patch in new_patches[len(old_patches) :]:
+            for name, expected in patch["inputs"].items():
+                if digest(after / name) != expected:
+                    raise ValueError("appended LLVM patch input differs: " + name)
+            apply_patch(after, directory / patch["file"], patch["sha256"])
+        files = {}
+        for path in after.rglob("*"):
+            if not path.is_file():
+                continue
+            name = path.relative_to(after).as_posix()
+            original = source / name
+            files[name] = {"before": digest(original) if original.exists() else None, "after": digest(path)}
+        update = {"old": old, "new": compatibility, "files": files}
+        write_workspace(journal, update)
+    for name in update["files"]:
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        replace_patch_input(snapshot / "after" / name, path, work)
+    source_hash = verify_source(archive, source, recipe, directory)
+    workspace["compatibility"] = compatibility
+    workspace.setdefault("patch_updates", []).append(
+        {
+            "old_source_sha256": previous_hash,
+            "new_source_sha256": source_hash,
+            "patches": new_patches[len(old_patches) :],
+        }
+    )
+    write_workspace(work / "workspace.json", workspace)
+    journal.unlink()
+    return source_hash
+
+
 def build(archive, cc, cxx, cmake, ninja, work):
     """Serialize workspace mutation while keeping sealed products immutable."""
     work.mkdir(parents=True, exist_ok=True)
@@ -165,10 +277,15 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     work.mkdir(parents=True, exist_ok=True)
     receipt = work / "workspace.json"
     workspace = {"schema_version": 1, "compatibility": compatibility}
+    updated_source_hash = None
     if receipt.exists():
         workspace = json.loads(receipt.read_text())
         if workspace["compatibility"] != compatibility:
-            raise ValueError("LLVM workspace source, patches or host tools differ; select another workspace")
+            with tarfile.open(archive) as upstream:
+                root_name = Path(next(iter(upstream)).name).parts[0]
+            updated_source_hash = update_workspace_patches(
+                archive, work / "source" / root_name, recipe, directory, work, workspace, compatibility
+            )
     elif (work / "prefix/manifest.json").exists():
         old = json.loads((work / "prefix/manifest.json").read_text())["identity"]
         previous = {"source": old["recipe"]["source"], "patches": old["recipe"]["patches"], "tools": old["tools"]}
@@ -241,7 +358,12 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
                     raise ValueError("LLVM patch source identity differs: " + name)
             apply_patch(roots[0], directory / item["file"], item["sha256"])
         preparing.rename(work / "source")
-    source_hash = verify_source(archive, source, recipe, directory)
+    source_hash = updated_source_hash or verify_source(archive, source, recipe, directory)
+    journal = work / "patch-update.json"
+    if journal.exists():
+        if json.loads(journal.read_text())["new"] != compatibility:
+            raise ValueError("pending LLVM patch update differs")
+        journal.unlink()
     attempts = work / "attempts" / key
     attempts.mkdir(parents=True, exist_ok=True)
     configure_and_build(commands, output, workspace, receipt, attempts, environment)
@@ -270,6 +392,7 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
         "configuration_sha256": workspace["configuration_sha256"],
         "commands": commands,
         "build_limits": recipe["build_limits"],
+        "patch_updates": workspace.get("patch_updates", []),
         "artifacts": {
             str(path.relative_to(prefix)): digest(path)
             for path in sorted(prefix.rglob("*"))
