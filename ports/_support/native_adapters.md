@@ -192,9 +192,12 @@ receipt are rejected. Each resume verifies exact source bytes and executable
 modes, configuration, target product receipts, host tool code, compiler flags
 and dependency exports. Receipts also bind both generated compiler wrappers,
 the target Python pkg-config launcher when used, and the effective build
-environment. Only the installation destination (`DESTDIR`) is excluded; paths
-in compiler or configure bindings remain exact. A changed compilation input
-rejects that workspace without deleting it. Recipes with mutable hooks cannot use this mode.
+environment. Effective setup arguments, cross and native machine files,
+properties, installation prefix and fixed setup flags are also bound, including
+options appended by Python Meson. Only the installation destination (`DESTDIR`)
+is excluded; paths in compiler or configure bindings remain exact. A changed
+compilation input rejects that workspace without deleting it. Recipes with
+mutable hooks cannot use this mode.
 
 Jobs, install tags, licenses and development-export selections remain packaging
 inputs rather than compilation-workspace inputs. The runner still keys and

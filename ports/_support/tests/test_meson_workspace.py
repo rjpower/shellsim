@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ports._support import native_adapters
+from ports._support import meson_adapter, native_adapters
 from ports._support.meson_workspace import retained_meson
 from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
 from ports._support.store import file_hash
@@ -93,7 +93,7 @@ def test_real_build_reuses_objects_when_only_packaging_changes(meson_project):
     assert (object_file.read_bytes(), object_file.stat().st_mtime_ns) == before
 
 
-@pytest.mark.parametrize("change", ["cc-wrapper", "cxx-wrapper", "environment"])
+@pytest.mark.parametrize("change", ["cc-wrapper", "cxx-wrapper", "environment", "meson-setup"])
 def test_changed_driver_rejects_stale_objects_and_changes_fresh_output(meson_project, monkeypatch, change):
     context, ninja, products, tools = meson_project
     cxx = change == "cxx-wrapper"
@@ -126,7 +126,16 @@ def test_changed_driver_rejects_stale_objects_and_changes_fresh_output(meson_pro
     assert observed_value(context.staging_prefix) == 19
     object_file = next(ninja.rglob("*.o"))
     before = object_file.read_bytes(), object_file.stat().st_mtime_ns
-    if change == "environment":
+    if change == "meson-setup":
+        original = meson_adapter.meson_configuration
+
+        def changed_configuration(request):
+            configuration = original(request)
+            configuration["setup_command"].append("-Dc_args=-DBIAS=7")
+            return configuration
+
+        monkeypatch.setattr(meson_adapter, "meson_configuration", changed_configuration)
+    elif change == "environment":
         original = native_adapters.build_environment
 
         def changed_environment(context, bindings):

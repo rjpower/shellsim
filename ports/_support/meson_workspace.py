@@ -82,7 +82,9 @@ def retained_meson(
             "driver": (
                 driver_inputs(stable)
                 if driver_inputs is not None
-                else native_adapters.compilation_driver_inputs(stable, configuration.get("configure_environment", {}))
+                else native_adapters.compilation_driver_inputs(
+                    native_adapters.native_build_request(stable, {**configuration, "adapter": "meson"}, None)
+                )
             ),
             "source": _inventory(context.source),
             "dependencies": _inventory(context.dependency_sysroot),

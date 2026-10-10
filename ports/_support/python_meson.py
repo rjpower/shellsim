@@ -176,6 +176,34 @@ def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Pat
     return wrapper
 
 
+def python_meson_native_request(request: PythonMesonBuildRequest) -> NativeBuildRequest:
+    """Use one effective cross-build request for compilation and admission."""
+    context, build = request.context, request.recipe["build"]
+    properties = dict(build.get("cross_properties", {}))
+    for name, spec in build.get("dependency_properties", {}).items():
+        root = context.dependencies[spec["port"]]
+        path = root / spec["path"]
+        if not path.resolve().is_relative_to(root.resolve()):
+            raise ValueError("Meson dependency property escapes admitted export")
+        properties[name] = str(path)
+    tools = {**context.host_tools, "pkg-config": context.build / "target-pkg-config"}
+    tags = tuple(build.get("install_tags", ["runtime", "python-runtime", "devel"]))
+    return NativeBuildRequest(
+        NativeAdapter.MESON,
+        replace(context, host_tools=tools),
+        configure_args=tuple(build.get("configure_args", []))
+        + (
+            "-Dpython.bytecompile=-1",
+            "-Dpython.platlibdir=/usr/local/lib/python3.13/site-packages",
+            "-Dpython.purelibdir=/usr/local/lib/python3.13/site-packages",
+            "-Db_lundef=false",
+        ),
+        jobs=build.get("jobs", 2),
+        meson_properties=properties,
+        meson_install_tags=tags,
+    )
+
+
 def python_meson_driver_inputs(
     context: NativeBuildContext,
     *,
@@ -185,8 +213,7 @@ def python_meson_driver_inputs(
 ) -> dict:
     """Bind the effective native driver after target Python tool substitution."""
     request = PythonMesonBuildRequest(context, cpython, recipe, host_packages)
-    tools = {**context.host_tools, "pkg-config": context.build / "target-pkg-config"}
-    inputs = compilation_driver_inputs(replace(context, host_tools=tools), {})
+    inputs = compilation_driver_inputs(python_meson_native_request(request))
     inputs["target_pkg_config"] = target_pkg_config_text(request)
     return inputs
 
@@ -253,32 +280,13 @@ def build_python_meson(request: PythonMesonBuildRequest) -> PythonBuildOutput:
     if context.staging_prefix.exists() or (context.build.exists() and not context.retained_workspace):
         raise ValueError("Python Meson build output already exists")
     context.build.mkdir(parents=True, exist_ok=True)
-    package_config = _target_pkg_config(request, context.build)
-    properties = dict(build.get("cross_properties", {}))
-    for name, spec in build.get("dependency_properties", {}).items():
-        root = context.dependencies[spec["port"]]
-        path = root / spec["path"]
-        if not path.resolve().is_relative_to(root.resolve()) or not path.is_dir():
+    _target_pkg_config(request, context.build)
+    native_request = python_meson_native_request(request)
+    for name in build.get("dependency_properties", {}):
+        if not Path(native_request.meson_properties[name]).is_dir():
             raise ValueError("Meson dependency property escapes admitted export")
-        properties[name] = str(path)
-    tools = {**context.host_tools, "pkg-config": package_config}
-    tags = tuple(build.get("install_tags", ["runtime", "python-runtime", "devel"]))
-    output = build_native(
-        NativeBuildRequest(
-            NativeAdapter.MESON,
-            replace(context, host_tools=tools),
-            configure_args=tuple(build.get("configure_args", []))
-            + (
-                "-Dpython.bytecompile=-1",
-                "-Dpython.platlibdir=/usr/local/lib/python3.13/site-packages",
-                "-Dpython.purelibdir=/usr/local/lib/python3.13/site-packages",
-                "-Db_lundef=false",
-            ),
-            jobs=build.get("jobs", 2),
-            meson_properties=properties,
-            meson_install_tags=tags,
-        )
-    )
+    tags = native_request.meson_install_tags
+    output = build_native(native_request)
     started = time.perf_counter()
     meson_build = context.build / "meson-build"
     plan = json.loads((meson_build / "meson-info/intro-install_plan.json").read_text())

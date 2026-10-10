@@ -1,7 +1,7 @@
 """Configure Meson cross projects and retain verified compilation state."""
 
 import json
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from ports._support.native_adapters import NativeBuildRequest, write_build_file
@@ -11,17 +11,13 @@ def _literal(value: object) -> str:
     return repr(str(value))
 
 
-def build_meson(
-    request: NativeBuildRequest,
-    wrappers: Mapping[str, Path],
-    tools: Path,
-    run: Callable[[Sequence[object], Path], None],
-) -> None:
+def meson_configuration(request: NativeBuildRequest) -> dict:
+    """Generate the exact machine files and setup command used by Meson."""
     context = request.context
     python = context.host_tools["python"]
-    cross = tools / "cross.ini"
-    write_build_file(
-        cross,
+    tools = context.build / "adapter-tools"
+    wrappers = {role: tools / role for role in ("cc", "cxx")}
+    cross_text = (
         "[binaries]\nc = "
         + _literal(wrappers["cc"])
         + "\ncpp = "
@@ -43,11 +39,9 @@ def build_meson(
         + "".join(
             name + " = " + (str(value).lower() if isinstance(value, (bool, int)) else _literal(value)) + "\n"
             for name, value in sorted(request.meson_properties.items())
-        ),
+        )
     )
-    native_file = tools / "native.ini"
-    write_build_file(
-        native_file,
+    native_text = (
         "[binaries]\npython = "
         + _literal(python)
         + "\n"
@@ -55,28 +49,44 @@ def build_meson(
             name + " = " + _literal(context.host_tools[name]) + "\n"
             for name in ("cython", "f2py")
             if name in context.host_tools
-        ),
+        )
     )
+    return {
+        "cross_file": cross_text,
+        "native_file": native_text,
+        "configure_args": list(request.configure_args),
+        "meson_properties": dict(request.meson_properties),
+        "install_prefix": str(request.install_prefix),
+        "setup_command": [
+            str(context.host_tools["meson"]),
+            "setup",
+            str(context.build / "meson-build"),
+            str(context.source),
+            *request.configure_args,
+            "--cross-file",
+            str(tools / "cross.ini"),
+            "--native-file",
+            str(tools / "native.ini"),
+            "--prefix",
+            str(request.install_prefix),
+            "--wrap-mode=nodownload",
+        ],
+    }
+
+
+def build_meson(
+    request: NativeBuildRequest,
+    tools: Path,
+    run: Callable[[Sequence[object], Path], None],
+) -> None:
+    context = request.context
+    configuration = meson_configuration(request)
+    write_build_file(tools / "cross.ini", configuration["cross_file"])
+    write_build_file(tools / "native.ini", configuration["native_file"])
     meson = context.host_tools["meson"]
     build = context.build / "meson-build"
     if not context.retained_workspace or not (build / "meson-private/coredata.dat").exists():
-        run(
-            [
-                meson,
-                "setup",
-                build,
-                context.source,
-                *request.configure_args,
-                "--cross-file",
-                cross,
-                "--native-file",
-                native_file,
-                "--prefix",
-                request.install_prefix,
-                "--wrap-mode=nodownload",
-            ],
-            context.build,
-        )
+        run(configuration["setup_command"], context.build)
     if request.meson_install_tags:
         plan = json.loads((build / "meson-info/intro-install_plan.json").read_text())
         selected = []

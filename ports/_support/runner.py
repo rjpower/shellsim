@@ -21,7 +21,13 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, plan
-from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
+from ports._support.native_adapters import (
+    NativeAdapter,
+    NativeBuildContext,
+    build_native,
+    compilation_driver_inputs,
+    native_build_request,
+)
 from ports._support.python_adapters import (
     CPythonBuildContext,
     ExtensionBuildRequest,
@@ -133,11 +139,8 @@ def _hooks(port: Port, phase: str, context: NativeBuildContext, cohort: BuildCoh
             )
 
 
-def _strings(build: dict, field: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-    values = build.get(field, list(default))
-    if not isinstance(values, list) or len(values) > 256 or any(not isinstance(value, str) for value in values):
-        raise ValueError(f"adapter {field} must be a bounded string array")
-    return tuple(values)
+def _native_driver_inputs(context: NativeBuildContext, *, build: dict, jobs: int | None) -> dict:
+    return compilation_driver_inputs(native_build_request(context, build, jobs))
 
 
 def _build_implementation(support: Path, adapter: str, *, stdlib: bool = False) -> dict[str, str]:
@@ -481,7 +484,7 @@ def build_graph(
                                     )
                                 )
                                 if adapter == "python-meson"
-                                else None,
+                                else partial(_native_driver_inputs, build=build, jobs=jobs),
                             )
                         )
                         # The sealed result inventories this exact compilation receipt.
@@ -523,19 +526,7 @@ def build_graph(
 
                             output = build_guest(context, recipe, compiler, jobs=jobs)
                         else:
-                            output = build_native(
-                                NativeBuildRequest(
-                                    NativeAdapter(build["adapter"]),
-                                    context,
-                                    _strings(build, "configure_args"),
-                                    _strings(build, "build_targets"),
-                                    _strings(build, "install_targets", ("install",)),
-                                    jobs if jobs is not None else build.get("jobs", 1),
-                                    PurePosixPath(build.get("install_prefix", "/usr/local")),
-                                    build.get("configure_environment", {}),
-                                    _strings(build, "build_args"),
-                                )
-                            )
+                            output = build_native(native_build_request(context, build, jobs))
                         _hooks(port, "after_install", context, cohort)
                         _source_exports(port, context)
                         seal_native_install(

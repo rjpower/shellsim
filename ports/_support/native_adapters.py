@@ -79,6 +79,29 @@ class NativeBuildOutput:
     install_prefix: PurePosixPath
 
 
+def _strings(build: Mapping, field: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    values = build.get(field, list(default))
+    if not isinstance(values, list) or len(values) > 256 or any(not isinstance(value, str) for value in values):
+        raise ValueError(f"adapter {field} must be a bounded string array")
+    return tuple(values)
+
+
+def native_build_request(context: NativeBuildContext, build: Mapping, jobs: int | None) -> NativeBuildRequest:
+    """Resolve one native request for both execution and retained admission."""
+    return NativeBuildRequest(
+        NativeAdapter(build["adapter"]),
+        context,
+        _strings(build, "configure_args"),
+        _strings(build, "build_targets"),
+        _strings(build, "install_targets", ("install",)),
+        jobs if jobs is not None else build.get("jobs", 1),
+        PurePosixPath(build.get("install_prefix", "/usr/local")),
+        build.get("configure_environment", {}),
+        _strings(build, "build_args"),
+        meson_properties=build.get("cross_properties", {}),
+    )
+
+
 def compiler_wrapper_text(context: NativeBuildContext, role: str, response_source: str) -> str:
     """Generate the exact compiler driver consumed by every native adapter."""
     python = context.host_tools["python"]
@@ -145,18 +168,25 @@ def build_environment(context: NativeBuildContext, configure_environment: Mappin
     return environment
 
 
-def compilation_driver_inputs(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict:
+def compilation_driver_inputs(request: NativeBuildRequest) -> dict:
     """Bind generated drivers and effective compilation settings to retained state."""
+    context = request.context
     response_source = Path(__file__).with_name("compiler_response.py").read_text()
-    environment = build_environment(context, configure_environment)
+    environment = build_environment(context, request.configure_environment)
     # DESTDIR is consumed only during installation. All other environment values
     # remain exact, including any paths embedded in configure bindings.
     del environment["DESTDIR"]
-    return {
+    inputs = {
         "wrappers": {role: compiler_wrapper_text(context, role, response_source) for role in ("cc", "cxx")},
         "environment": environment,
-        "configure_environment": dict(configure_environment),
+        "configure_environment": dict(request.configure_environment),
     }
+
+    if request.adapter is NativeAdapter.MESON:
+        from ports._support.meson_adapter import meson_configuration
+
+        inputs["meson_configuration"] = meson_configuration(request)
+    return inputs
 
 
 def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
@@ -291,7 +321,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     elif request.adapter is NativeAdapter.MESON:
         from ports._support.meson_adapter import build_meson
 
-        build_meson(request, wrappers, tools, run)
+        build_meson(request, tools, run)
     else:
         from ports._support.make_adapter import build_make
 
