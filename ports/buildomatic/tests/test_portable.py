@@ -17,7 +17,7 @@ import pytest
 from ports._support.host_tools import definition, make_read_only, python_closure
 from ports._support.import_sdk import load_legacy_cohort
 from ports._support.sdk_products import admit_sdk, file_hash, json_hash, receipt
-from ports.buildomatic.portable import PortableLimits, descriptor_digest, export_sdk, import_sdk
+from ports.buildomatic.portable import PortableLimits, descriptor_digest, export_sdk, import_sdk, original_root_bindings
 from ports.toolchain.wasi_threads.dynamic import sdk_tooling
 
 
@@ -335,6 +335,32 @@ def test_stable_mount_requires_explicit_restore_and_preserves_bytes(tmp_path, sd
     assert (tmp_path / "host-environment/pyvenv.cfg").read_bytes() == expected
     assert imported.host_tools["python"].path == tmp_path / "host-environment/bin/python"
     assert not (tmp_path / "host-base").stat().st_mode & 0o222
+
+
+def test_original_root_bindings_restore_all_roots_on_a_fresh_worker(tmp_path, sdk_fixture):
+    context = sdk_fixture(python=True, host_python=True)
+    descriptor = export_sdk(context, tmp_path / "export")
+    bindings = original_root_bindings(descriptor)
+    assert bindings == {name: Path(root["path"]) for name, root in load(descriptor)["roots"].items()}
+    config = (tmp_path / "host-environment/pyvenv.cfg").read_bytes()
+    for root in bindings.values():
+        for path in (root, *root.rglob("*")):
+            if path.is_dir() and not path.is_symlink():
+                path.chmod(0o755)
+        shutil.rmtree(root)
+    with pytest.raises(ValueError):
+        import_sdk(descriptor, tmp_path / "unused", original_bindings=True)
+    imported = import_sdk(descriptor, tmp_path / "unused", bindings=bindings, original_bindings=True)
+    assert imported.flags == context.flags
+    assert imported.host_tools == context.host_tools
+    assert (tmp_path / "host-environment/pyvenv.cfg").read_bytes() == config
+    assert not (tmp_path / "unused").exists()
+    assert original_root_bindings(descriptor) == bindings
+    value = load(descriptor)
+    value["roots"]["sdk"]["path"] = "../unsafe"
+    rewrite(descriptor, value)
+    with pytest.raises(ValueError):
+        original_root_bindings(descriptor)
 
 
 @pytest.mark.parametrize("kind", ["blob", "receipt", "alias", "escape", "parent", "mode", "identity", "unknown"])

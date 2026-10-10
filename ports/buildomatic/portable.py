@@ -499,6 +499,20 @@ def _verify(root: Path, inventory: RootInventory, *, exact: bool) -> None:
             raise ValueError("portable product mount contains unrelated files")
 
 
+def original_root_bindings(descriptor: Path, *, limits: PortableLimits = _DEFAULT_LIMITS) -> Mapping[str, Path]:
+    """Return validated original mount paths for every product and host root.
+
+    Passing this mapping to ``import_sdk(..., bindings=...)`` explicitly allows
+    restoring missing host mounts at their recorded paths. It also preserves
+    product paths used in build flags. Existing mounts are verified unchanged.
+    The descriptor must come from the enclosing trusted input bundle.
+    """
+    if descriptor.stat().st_size > limits.metadata_bytes:
+        raise ValueError("portable descriptor exceeds metadata bound")
+    roots = _validate(json.loads(descriptor.read_text()), limits)
+    return {name: Path(root.path) for name, root in roots.items()}
+
+
 def import_sdk(
     descriptor: Path,
     destination: Path,
@@ -513,7 +527,8 @@ def import_sdk(
     the recorded product roots, preserving path-sensitive build cache identity.
     ``bindings`` overrides individual roots by descriptor name. Stable host
     roots cannot relocate, and are restored only when explicitly bound at their
-    original path. Existing mounts must verify and are never overwritten.
+    original path. ``original_root_bindings`` supplies those explicit bindings
+    for a fresh worker. Existing mounts must verify and are never overwritten.
     Restored trees are read-only. Failed imports may leave a rejected tree for
     diagnosis; they never return a partially admitted context.
     """
