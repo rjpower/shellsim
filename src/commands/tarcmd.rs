@@ -1,7 +1,7 @@
 //! Deterministic, bounded tar container support over the VFS.
 //!
-//! Creation, listing, and extraction support regular files and directories plus optional gzip
-//! composition. Extraction validates every header and destination before mutating a cloned VFS,
+//! Creation and listing support regular files, directories, and symbolic links plus optional gzip
+//! composition. Extraction supports files and directories, validates every header and destination,
 //! rejects traversal and special-file entries, and rolls the entire operation back on failure.
 
 use std::collections::{BTreeSet, HashMap};
@@ -48,6 +48,7 @@ pub(crate) struct Entry {
 pub(crate) enum EntryKind {
     File(Vec<u8>),
     Directory,
+    Symlink(String),
 }
 
 fn cmd_tar(context: &mut ProcessContext<'_>, io: &mut Io) -> ShellPoll {
@@ -156,7 +157,7 @@ fn collect_entries(
                 paths.insert(absolute);
             }
             FileKind::Symlink => {
-                return Err(format!("{operand}: symbolic links are not supported"));
+                paths.insert(absolute);
             }
             FileKind::File => {
                 return Err(format!("{operand}: native executables cannot be archived"));
@@ -179,9 +180,11 @@ fn collect_entries(
                     .read_file_limited("/", &path, MAX_ARCHIVE_BYTES)
                     .map_err(|error| error.to_string())?,
             ),
-            FileKind::Symlink => {
-                return Err(format!("{path}: symbolic links are not supported"));
-            }
+            FileKind::Symlink => EntryKind::Symlink(
+                system
+                    .read_link("/", &path)
+                    .map_err(|error| error.to_string())?,
+            ),
             FileKind::File => {
                 return Err(format!("{path}: native executables cannot be archived"));
             }
@@ -211,7 +214,7 @@ pub(crate) fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u
     let estimated = entries.iter().try_fold(BLOCK * 2, |total, entry| {
         let data = match &entry.kind {
             EntryKind::File(data) => data.len(),
-            EntryKind::Directory => 0,
+            EntryKind::Directory | EntryKind::Symlink(_) => 0,
         };
         total.checked_add(BLOCK)?.checked_add(round_block(data))
     });
@@ -229,7 +232,7 @@ pub(crate) fn encode(system: &mut dyn System, entries: &[Entry]) -> Result<Vec<u
     for entry in entries {
         let data = match &entry.kind {
             EntryKind::File(data) => data.as_slice(),
-            EntryKind::Directory => &[],
+            EntryKind::Directory | EntryKind::Symlink(_) => &[],
         };
         output.extend_from_slice(&header(entry, data.len())?);
         output.extend_from_slice(data);
@@ -252,10 +255,21 @@ fn header(entry: &Entry, size: usize) -> Result<[u8; BLOCK], String> {
     write_octal(&mut header[124..136], size as u64)?;
     write_octal(&mut header[136..148], 0)?;
     header[148..156].fill(b' ');
-    header[156] = if matches!(entry.kind, EntryKind::Directory) {
-        b'5'
-    } else {
-        b'0'
+    header[156] = match &entry.kind {
+        EntryKind::File(_) => b'0',
+        EntryKind::Directory => b'5',
+        EntryKind::Symlink(target) => {
+            if target.contains('\0') {
+                return Err("link target contains NUL".to_string());
+            }
+            let linkname = &mut header[157..257];
+            if target.len() > linkname.len() {
+                return Err("link target is too long for the tar format".to_string());
+            }
+            // Ustar permits a full-width linkname without a terminating NUL.
+            linkname[..target.len()].copy_from_slice(target.as_bytes());
+            b'2'
+        }
     };
     header[257..263].copy_from_slice(b"ustar\0");
     header[263..265].copy_from_slice(b"00");
@@ -309,6 +323,10 @@ fn read_archive(system: &mut dyn System, options: &Options, base: &str, io: &mut
             return 2;
         }
         match &entry.kind {
+            EntryKind::Symlink(_) => {
+                ewln(io.err, "tar: extracting symbolic links is not supported");
+                return 2;
+            }
             EntryKind::Directory => changes.push(FileChange::MkdirAll(destination)),
             EntryKind::File(data) => {
                 if let Some(parent) = parent_of(&destination) {
@@ -404,6 +422,11 @@ fn decode(system: &mut dyn System, archive: &[u8]) -> Result<Vec<Entry>, String>
                 name,
                 mode,
                 kind: EntryKind::Directory,
+            }),
+            b'2' if size == 0 => entries.push(Entry {
+                name,
+                mode,
+                kind: EntryKind::Symlink(field_string(&header[157..257])?),
             }),
             b'g' => parse_pax_global(&archive[start..end])?,
             _ => return Err(format!("unsupported entry type for {name}")),
@@ -637,7 +660,37 @@ fn set_mode(current: &mut Option<Mode>, next: Mode) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pax_global;
+    use super::{header, parse_octal, parse_pax_global, validate_checksum, Entry, EntryKind};
+
+    #[test]
+    fn symlink_header_preserves_target_and_has_no_payload() {
+        let entry = Entry {
+            name: "link".to_string(),
+            mode: 0o777,
+            kind: EntryKind::Symlink("../outside".to_string()),
+        };
+        let encoded = header(&entry, 0).unwrap();
+        assert_eq!(encoded[156], b'2');
+        assert_eq!(&encoded[157..168], b"../outside\0");
+        assert_eq!(parse_octal(&encoded[124..136]).unwrap(), 0);
+        validate_checksum(&encoded).unwrap();
+    }
+
+    #[test]
+    fn symlink_header_rejects_unrepresentable_targets() {
+        for (target, valid) in [
+            ("x".repeat(100), true),
+            ("x".repeat(101), false),
+            ("a\0b".to_string(), false),
+        ] {
+            let entry = Entry {
+                name: "link".to_string(),
+                mode: 0o777,
+                kind: EntryKind::Symlink(target),
+            };
+            assert_eq!(header(&entry, 0).is_ok(), valid);
+        }
+    }
 
     #[test]
     fn pax_global_comments_are_accepted_but_semantic_overrides_are_not() {

@@ -26,7 +26,7 @@ classifiers = [
 keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simulation", "testing"]
 
 [project.optional-dependencies]
-c = ["shellsim-c-toolchain==0.1.30"]
+c = ["shellsim-c-toolchain==0.1.31"]
 pypi = ["uv>=0.12,<1", "tomli>=2; python_version < '3.11'"]
 
 [project.urls]
