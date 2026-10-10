@@ -22,9 +22,12 @@ import sys
 import threading
 import zipfile
 from dataclasses import asdict, dataclass
+from importlib.metadata import requires
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping
 from urllib.parse import urlsplit
+
+import tomllib
 
 from ports.buildomatic.remote_store import DEFAULT_PREFIX, MAX_METADATA_BYTES, RemoteStore, validate_prefix
 
@@ -122,7 +125,7 @@ def _decode_request(data: bytes) -> BuildRequest:
 class CoordinatorService:
     """Durable service index, with generic core owning each build journal.
 
-    Accepted requests are immutable blobs referenced by a CAS index before the
+    Accepted requests are immutable journals referenced by a CAS index before the
     RPC returns. A replacement coordinator reconstructs submit from that index.
     One Iris coordinator task must own this service; replicas are not supported.
     The first cut retains at most 4096 build records per named service.
@@ -137,6 +140,7 @@ class CoordinatorService:
         self._coordinators = {}
         self._released = set()
         self._lock = threading.RLock()
+        self._drive_lock = threading.Lock()
 
     def _index(self):
         found = self._store.read_journal(self._index_key)
@@ -160,14 +164,14 @@ class CoordinatorService:
             self._coordinators[build_id] = coordinator
         return self._coordinators[build_id]
 
-    def _lookup(self, build_id: str):
+    def _lookup_record(self, build_id: str):
         if _BUILD_ID.fullmatch(build_id) is None:
             raise ValueError("invalid service build ID")
         index, _ = self._index()
         record = next((item for item in index["builds"] if item["id"] == build_id), None)
         if record is None:
             raise KeyError(build_id)
-        return self._coordinator(build_id, record["request"])
+        return record
 
     def submit(self, request: BuildRequest) -> str:
         """Durably accept a request; reject reuse of a key for different content."""
@@ -192,7 +196,6 @@ class CoordinatorService:
                 if previous is not None:
                     if previous["request"] != digest:
                         raise IdempotencyConflict("service idempotency key owns another request")
-                    self._coordinator(build_id, digest)
                     return build_id
                 if len(index["builds"]) >= _MAX_BUILDS:
                     raise ValueError("service build index is full")
@@ -201,41 +204,85 @@ class CoordinatorService:
                     self._store.write_journal(self._index_key, _encode(index), version)
                 except ConditionalWriteError:
                     continue
-                self._coordinator(build_id, digest)
                 return build_id
         raise ConditionalWriteError("service index remained contended")
 
     def get(self, build_id: str) -> BuildResult:
         """Return durable state using the service ID returned from Submit."""
-        with self._lock:
-            return self._lookup(build_id).result()
+        from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, read_build_result, request_id
+
+        record = self._lookup_record(build_id)
+        result = read_build_result(self._store, f"{self._base}/builds/{build_id}.json")
+        if result is not None:
+            return result
+        found = self._store.read_journal(f"{self._base}/requests/{build_id}.json")
+        if found is None or hashlib.sha256(found.data).hexdigest() != record["request"]:
+            raise ValueError("accepted request journal is missing or corrupt")
+        request = _decode_request(found.data)
+        return BuildResult(
+            request_id(request),
+            BuildState.PENDING,
+            tuple(NodeResult(action.id, NodeState.PENDING, 0) for action in request.actions),
+        )
 
     def cancel(self, build_id: str) -> BuildResult:
-        """Cancel only the chosen build's attempts; keep the worker jobs alive."""
-        with self._lock:
-            return self._lookup(build_id).cancel()
+        """Durably queue cancellation; the scheduler delivers worker RPCs."""
+        self._control(build_id, "cancelled")
+        return self.get(build_id)
 
     def acknowledge(self, build_id: str) -> None:
+        self._control(build_id, "acknowledged")
+
+    def _control(self, build_id: str, flag: str) -> None:
+        from ports.buildomatic import ConditionalWriteError
+
+        self._lookup_record(build_id)
+        key = f"{self._base}/control/{build_id}.json"
         with self._lock:
-            self._lookup(build_id).acknowledge()
+            for _ in range(16):
+                found = self._store.read_journal(key)
+                intent = json.loads(found.data) if found else {}
+                if intent.get(flag):
+                    return
+                intent[flag] = True
+                try:
+                    self._store.write_journal(key, _encode(intent), found.version if found else None)
+                except ConditionalWriteError:
+                    continue
+                return
+        raise ConditionalWriteError("control intent remained contended")
 
     def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
-        """Return bounded diagnostic tails retained before worker cleanup."""
-        with self._lock:
-            request_id = self._lookup(build_id).result().request_id
-            found = self._store.read_journal(f"{self._base}/diagnostics/{request_id}.json")
-            if found is None:
-                return ()
-            result = []
-            for record in json.loads(found.data):
-                tail = self._store.read_journal(f"{self._base}/logs/{record['attempt_id']}")
-                result.append({**record, "tail": "" if tail is None else tail.data.decode(errors="replace")})
-            return tuple(result)
+        """Return newest 64 attempt tails, bounded to 64 KiB of log bytes."""
+        request_id = self.get(build_id).request_id
+        found = self._store.read_journal(f"{self._base}/diagnostics/{request_id}.json")
+        if found is None:
+            return ()
+        result = []
+        remaining = 65536
+        for record in reversed(json.loads(found.data)[-64:]):
+            tail = self._store.read_journal(f"{self._base}/logs/{record['attempt_id']}")
+            data = b"" if tail is None else tail.data[-min(16384, remaining) :] if remaining else b""
+            remaining -= len(data)
+            result.append({**record, "tail": data.decode(errors="replace")})
+        return tuple(reversed(result))
 
     def tick_once(self) -> None:
         """Advance the oldest unfinished build, skipping terminal builds without ack."""
-        with self._lock:
+        with self._drive_lock:
             index, _ = self._index()
+            # Process control for queued builds too, without dispatching their
+            # nodes while another build owns the worker pool.
+            for record in index["builds"]:
+                found = self._store.read_journal(f"{self._base}/control/{record['id']}.json")
+                if found is None:
+                    continue
+                intent = json.loads(found.data)
+                coordinator = self._coordinator(record["id"], record["request"])
+                if intent.get("cancelled"):
+                    coordinator.cancel()
+                if intent.get("acknowledged") and coordinator.result().state.value in _TERMINAL:
+                    self._release(record["id"], coordinator)
             for record in index["builds"]:
                 coordinator = self._coordinator(record["id"], record["request"])
                 if coordinator.result().state.value in _TERMINAL:
@@ -352,9 +399,12 @@ class _WorkerActor:
         self._executor.acknowledge(attempt_id)
 
     def read_log(self, attempt_id: str, max_bytes: int = 16384) -> bytes:
-        if type(max_bytes) is not int or not 0 <= max_bytes <= 16384:
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 16384:
             raise ValueError("diagnostics require a bounded read")
-        return self._executor.read_log(attempt_id, max_bytes=max_bytes)
+        try:
+            return self._executor.read_log(attempt_id, max_bytes=max_bytes)
+        except FileNotFoundError:
+            return b""
 
 
 def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = None) -> dict[str, str]:
@@ -422,19 +472,29 @@ def _runtime_files() -> dict[str, bytes]:
     from rigging.config_discovery import find_project_root, resolve_cluster_config
     from rigging.filesystem.cluster_config import MARIN_CLUSTER_CONFIG_DIRS
 
-    result = {
-        "pyproject.toml": (
-            '[project]\nname = "buildomatic-iris-runtime"\nversion = "0.0.0"\n'
-            'requires-python = ">=3.12,<3.14"\n'
-            'dependencies = ["marin-iris>=0.2.0", "marin-rigging>=0.2.0", "google-cloud-storage>=2.0"]\n'
-        ).encode()
-    }
+    result = {}
+    dependencies = {"google-cloud-storage>=2.0"}
     for package, root in (
         ("iris", Path(iris.client.client.__file__).resolve().parents[1]),
         ("rigging", Path(rigging.filesystem.factory.__file__).resolve().parents[1]),
     ):
+        project = root.parent.parent / "pyproject.toml"
+        requirements = (
+            tomllib.loads(project.read_text())["project"]["dependencies"]
+            if project.is_file()
+            else requires(f"marin-{package}") or []
+        )
+        # The transported package already supplies its Python modules. Resolve
+        # its own runtime requirements, including checkout-only additions that
+        # may not yet appear in the latest published package metadata.
+        dependencies.update(requirement for requirement in requirements if not requirement.startswith("marin-rigging"))
         for path in root.rglob("*.py"):
             result[f"{package}/{path.relative_to(root).as_posix()}"] = path.read_bytes()
+    result["pyproject.toml"] = (
+        '[project]\nname = "buildomatic-iris-runtime"\nversion = "0.0.0"\n'
+        'requires-python = ">=3.12,<3.14"\n'
+        f"dependencies = {json.dumps(sorted(dependencies))}\n"
+    ).encode()
     checkout = find_project_root(Path(rigging.filesystem.factory.__file__).parent)
     directories = tuple(
         checkout / entry if checkout and entry == "config" else entry for entry in MARIN_CLUSTER_CONFIG_DIRS
@@ -468,6 +528,12 @@ def _entrypoint(role: str, config: IrisConfig, *, worker_id: str | None = None, 
     if "pyproject.toml" in files:
         staged["pyproject.toml"] = files["pyproject.toml"]
     return Entrypoint(command=command, workdir_files=staged)
+
+
+def _deployed_files() -> dict[str, bytes]:
+    """Reuse the admitted runtime payload verbatim for child worker tasks."""
+    with zipfile.ZipFile(Path(os.environ["IRIS_WORKDIR"]) / "_buildomatic_runtime.zip") as archive:
+        return {name: archive.read(name) for name in archive.namelist()}
 
 
 def launch(client, config: IrisConfig, *, environment=None):
@@ -666,7 +732,7 @@ def _run_coordinator(config: IrisConfig) -> None:
     from rigging.timing import Duration
 
     ctx = iris_ctx()
-    files = {**_runtime_files(), **_source_files()}
+    files = _deployed_files()
     store = RemoteStore(config.cache_prefix or config.prefix, journal_prefix=config.prefix)
     workers = {}
     for index in range(config.workers):

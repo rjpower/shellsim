@@ -8,6 +8,8 @@ import hashlib
 import io
 import json
 import sys
+import threading
+import zipfile
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
@@ -16,15 +18,18 @@ from ports.buildomatic.contracts import request_id
 
 from ports.buildomatic import (
     Action,
+    Attempt,
     AttemptResult,
     AttemptState,
     BuildRequest,
     BuildState,
     ConditionalWriteError,
     IdempotencyConflict,
+    InputMount,
     LocalStore,
     NodeState,
     TreeBundle,
+    WorkerExecutor,
     WorkerReport,
     WorkerState,
     capture_tree,
@@ -35,6 +40,9 @@ from ports.buildomatic.backends.iris import (
     IrisConfig,
     WorkerProxy,
     _CapabilityResolver,
+    _deployed_files,
+    _entrypoint,
+    _WorkerActor,
     compiler_cache_environment,
 )
 from ports.buildomatic.remote_store import DEFAULT_PREFIX, RemoteStore
@@ -300,13 +308,131 @@ def test_service_cancel_is_per_build_and_survives_restart(service_parts):
     first = service.submit(request("first"))
     second = service.submit(request("second"))
     service.tick_once()
-    assert service.cancel(second).state == BuildState.CANCELLED
+    assert service.cancel(second).state == BuildState.PENDING
     assert all(not worker.cancelled for worker in workers.values())
     assert service.get(first).state == BuildState.RUNNING
     recovered = CoordinatorService(store, "test", workers)
+    assert recovered.get(second).state == BuildState.PENDING
+    assert recovered.cancel(first).state == BuildState.RUNNING
+    recovered.tick_once()
     assert recovered.get(second).state == BuildState.CANCELLED
-    assert recovered.cancel(first).state == BuildState.CANCELLED
+    assert recovered.get(first).state == BuildState.CANCELLED
     assert all(worker.cancelled for worker in workers.values())
+
+
+def test_short_rpcs_do_not_wait_for_worker_submit(service_parts, monkeypatch):
+    store, workers = service_parts
+    entered, release = threading.Event(), threading.Event()
+    failures = []
+    original = workers["worker-0"].submit
+
+    def blocked(attempt):
+        entered.set()
+        assert release.wait(10)
+        original(attempt)
+
+    monkeypatch.setattr(workers["worker-0"], "submit", blocked)
+    service = CoordinatorService(store, "test", workers)
+    first = service.submit(request("first"))
+
+    def drive():
+        try:
+            service.tick_once()
+        except BaseException as error:
+            failures.append(error)
+
+    scheduler = threading.Thread(target=drive)
+    scheduler.start()
+    try:
+        assert entered.wait(10)
+        completed = threading.Event()
+
+        def rpc():
+            try:
+                assert service.get(first).request_id == request_id(request("first"))
+                second = service.submit(request("second"))
+                service.cancel(first)
+                service.acknowledge(first)
+                assert service.get(second).state == BuildState.PENDING
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                completed.set()
+
+        caller = threading.Thread(target=rpc)
+        caller.start()
+        assert completed.wait(10)
+        caller.join()
+    finally:
+        release.set()
+        scheduler.join(10)
+    assert not scheduler.is_alive()
+    assert not failures
+    service.tick_once()
+    assert service.get(first).state == BuildState.CANCELLED
+
+
+@pytest.mark.parametrize("preparation_failure", [True, False])
+def test_completed_worker_without_log_remains_observable(tmp_path, preparation_failure):
+    store = LocalStore(tmp_path / "store")
+    executor = WorkerExecutor(store, tmp_path / "worker")
+    actor = _WorkerActor(executor)
+    proxy = WorkerProxy(actor, store=store, service_id="test", worker_id="worker-0")
+    attempt = Attempt("attempt", "b" * 64, Action("a", ("true",)), (InputMount("missing", TreeBundle("a" * 64)),), 1)
+    if preparation_failure:
+        proxy.submit(attempt)
+    else:
+        proxy.cancel(attempt.id)
+    report = proxy.poll(attempt.id)
+    assert report.state == WorkerState.COMPLETED
+    assert report.result.state == (AttemptState.FAILED if preparation_failure else AttemptState.CANCELLED)
+    assert store.read_journal("iris/test/logs/attempt").data == b""
+
+
+def test_worker_diagnostic_errors_propagate_and_bounds_match(monkeypatch):
+    def denied(attempt_id, max_bytes):
+        raise PermissionError()
+
+    actor = _WorkerActor(SimpleNamespace(read_log=denied))
+    with pytest.raises(PermissionError):
+        actor.read_log("a")
+    for bound in (0, 16385, True):
+        with pytest.raises(ValueError):
+            actor.read_log("a", max_bytes=bound)
+
+
+def test_runtime_archive_preserves_nested_modules_for_child_workers(tmp_path, monkeypatch):
+    module = ModuleType("iris.cluster.types")
+    module.Entrypoint = lambda **kwargs: SimpleNamespace(**kwargs)
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    files = {
+        "ports/buildomatic/__init__.py": b"",
+        "ports/buildomatic/remote_store.py": b"small module",
+        "iris/client/__init__.py": b"",
+        "pyproject.toml": b"[project]",
+    }
+    entrypoint = _entrypoint("coordinator", IrisConfig("test"), files=files)
+    assert set(entrypoint.workdir_files) == {"_buildomatic_runtime.zip", "pyproject.toml"}
+    archive = entrypoint.workdir_files["_buildomatic_runtime.zip"]
+    with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+        assert {name: bundle.read(name) for name in bundle.namelist()} == files
+    (tmp_path / "_buildomatic_runtime.zip").write_bytes(archive)
+    monkeypatch.setenv("IRIS_WORKDIR", str(tmp_path))
+    assert _deployed_files() == files
+
+
+def test_get_logs_retains_bounded_newest_tails(service_parts):
+    store, workers = service_parts
+    service = CoordinatorService(store, "test", workers)
+    build_id = service.submit(request())
+    records = [{"attempt_id": f"a{i}", "action_id": "a", "worker_id": "worker-0"} for i in range(70)]
+    store.write_journal(f"iris/test/diagnostics/{request_id(request())}.json", json.dumps(records).encode(), None)
+    for record in records:
+        store.write_journal(f"iris/test/logs/{record['attempt_id']}", b"x" * 16384, None)
+    logs = service.get_logs(build_id)
+    assert len(logs) == 64
+    assert logs[-1]["attempt_id"] == "a69"
+    assert sum(len(log["tail"]) for log in logs) == 65536
 
 
 def test_service_retries_index_cas_without_losing_request(service_parts, monkeypatch):

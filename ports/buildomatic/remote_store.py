@@ -47,6 +47,11 @@ class RemoteStore:
 
     A failed conditional write is a concurrency conflict, not permission to
     overwrite. Network and authorization failures propagate to the caller.
+    Rigging's native conditional read returns the entire journal and offers no
+    bounded read parameter. Journal objects therefore require an operator-owned
+    namespace with writes restricted to these bounded metadata writers; the
+    post-read bound detects corruption but cannot bound that native allocation.
+    Blob reads use a bounded stream and do not share this trust assumption.
     """
 
     def __init__(self, prefix: str = DEFAULT_PREFIX, *, journal_prefix: str | None = None, local_cache=None):
