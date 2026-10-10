@@ -164,6 +164,191 @@
         "writes": 0
       },
       "target": "wasm"
+    },
+    {
+      "backend": "local",
+      "case": "host-release-client-side",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "4b4287bc3b2269f7f246b8ee91289a4f10ab341f219eac9674368dcdacb78505",
+      "client_side": true,
+      "compiler_sha256": "b5f1b773a7c733738352000c92a077dc5852a1a2fc6d836b1e411be1e9ec5f88",
+      "compiler_version": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "containment": null,
+      "debug": false,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "d2ee6f355a13473fbbf8247da1a3da57",
+      "object_sha256": "8ef7cd97d3c687de39aceaf707b6c8721956b64d252160d8bda8030e7f8906aa",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "host"
+    },
+    {
+      "backend": "local",
+      "case": "upstream-wasm-release-client-side",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "a8b2f40ffa5df856ace2f311f286858d367d1b762eff344c52da2307132d4ca8",
+      "client_side": true,
+      "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+      "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+      "containment": {
+        "cancelled": true,
+        "compiler_in_action_group": true,
+        "cpu_seconds": 13,
+        "file_bytes": 16777216,
+        "independent_compile_succeeded": true,
+        "memory_bytes": 8589934592
+      },
+      "debug": false,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "a26a404a36c741c5bbfc312e7cd4e8f1",
+      "object_sha256": "57c7de419a662a15aede25d1de839e16ab7a205a46997535357ce782d562349c",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "wasm"
+    },
+    {
+      "backend": "local",
+      "case": "upstream-wasm-debug-client-side",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "68a17d029ab6e14a174a015239d7ff9861ddd6bdba995d201ee409d69178f7dc",
+      "client_side": true,
+      "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+      "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+      "containment": {
+        "cancelled": true,
+        "compiler_in_action_group": true,
+        "cpu_seconds": 13,
+        "file_bytes": 16777216,
+        "independent_compile_succeeded": true,
+        "memory_bytes": 8589934592
+      },
+      "debug": true,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "d7d1f25bbcbc4b28ad243263c19922de",
+      "object_sha256": "5da065b081c64957e3ce8292f7b0d8fc5a0012baaedc3361b7a9aad40b07ec28",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "wasm"
     }
   ],
   "client_environment_keys": [
@@ -171,6 +356,18 @@
     "LC_ALL",
     "PATH",
     "SCCACHE_SERVER_PORT"
+  ],
+  "client_side_environment_keys": [
+    "HOME",
+    "LC_ALL",
+    "PATH",
+    "SCCACHE_SERVER_PORT",
+    "SCCACHE_CLIENT_SIDE"
+  ],
+  "containment_mode_restrictions": [
+    "No SCCACHE_ERROR_LOG",
+    "No distributed scheduler configuration",
+    "Prestarted daemon, explicit endpoint, credentials daemon-only"
   ],
   "daemon_basedirs": [],
   "debug_dwarf_verified": {

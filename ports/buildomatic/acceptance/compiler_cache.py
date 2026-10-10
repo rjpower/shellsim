@@ -20,6 +20,8 @@ from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 from typing import Mapping
 
+from .compiler_containment import ContainmentResult, probe_compiler_containment
+
 SCCACHE_VERSION = "0.18.0"
 SCCACHE_SHA256 = "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59"
 SCCACHE_ARCHIVE_SHA256 = "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89"
@@ -53,6 +55,7 @@ class CacheProbeResult:
     nonce: str
     target: str
     debug: bool
+    client_side: bool
     object_sha256: str
     changed_object_sha256: str
     backend: str
@@ -62,6 +65,7 @@ class CacheProbeResult:
     link: CacheCounters
     local_missing: CacheCounters | None = None
     local_corrupt: CacheCounters | None = None
+    containment: ContainmentResult | None = None
 
 
 def _file_hash(path: Path) -> str:
@@ -106,13 +110,14 @@ def _stats(sccache: Path, environment: Mapping[str, str], root: Path) -> tuple[C
     ), report
 
 
-def _client_environment(endpoint: Mapping[str, str], home: Path) -> dict[str, str]:
+def _client_environment(endpoint: Mapping[str, str], home: Path, *, client_side: bool = True) -> dict[str, str]:
     if not endpoint or endpoint.keys() - _ENDPOINT_KEYS or len(endpoint) != 1:
         raise ValueError("provide exactly one public daemon port or Unix socket, without backend settings")
     return {
         "PATH": os.defpath,
         "HOME": str(home),
         "LC_ALL": "C",
+        **({"SCCACHE_CLIENT_SIDE": "1"} if client_side else {}),
         **endpoint,
     }
 
@@ -126,6 +131,8 @@ def probe_compiler_cache(
     expected_backend: str = "local",
     target: str = "host",
     debug: bool = False,
+    client_side: bool = True,
+    containment: bool = False,
 ) -> CacheProbeResult:
     """Require miss/write, cross-workspace hit, flag invalidation and correct links.
 
@@ -146,7 +153,7 @@ def probe_compiler_cache(
     binary_hash = _file_hash(sccache)
     if binary_hash != SCCACHE_SHA256:
         raise ValueError("sccache executable differs from pinned acceptance binary")
-    control = _client_environment(endpoint, root)
+    control = _client_environment(endpoint, root, client_side=client_side)
     version = _run([sccache, "--version"], environment=control, cwd=root).decode().strip()
     if version != "sccache " + SCCACHE_VERSION:
         raise ValueError("unexpected sccache version")
@@ -182,7 +189,7 @@ def probe_compiler_cache(
         include.mkdir(parents=True)
         (include / "value.h").write_text("#ifndef PROBE_VALUE\n#define PROBE_VALUE 42\n#endif\n")
         (workspace / "source" / "probe.c").write_text(source)
-        environment = _client_environment(endpoint, work)
+        environment = _client_environment(endpoint, work, client_side=client_side)
         args = _compile_arguments(sccache, compiler, target=target, debug=debug)
         _run(args, environment=environment, cwd=work)
         after, _ = _stats(sccache, control, root)
@@ -220,7 +227,7 @@ def probe_compiler_cache(
     linked, _ = _stats(sccache, control, root)
     if linked - after != CacheCounters(0, 0, 0, 0, 0):
         raise ValueError("direct linking changed compiler-cache statistics")
-    return CacheProbeResult(
+    result = CacheProbeResult(
         SCCACHE_VERSION,
         binary_hash,
         compiler_version,
@@ -228,6 +235,7 @@ def probe_compiler_cache(
         nonce,
         target,
         debug,
+        client_side,
         objects[0],
         changed_object,
         backend,
@@ -236,6 +244,13 @@ def probe_compiler_cache(
         changed,
         links,
     )
+    if containment:
+        if not client_side or target != "wasm":
+            raise ValueError("containment acceptance requires client-side Wasm Clang")
+        result = replace(
+            result, containment=probe_compiler_containment(sccache, compiler, root / "containment", endpoint=endpoint)
+        )
+    return result
 
 
 def _compile_arguments(sccache: Path, compiler: Path, *, target: str, debug: bool) -> list:
@@ -258,7 +273,7 @@ def _local_recovery(
 ) -> CacheProbeResult:
     """Fault only this probe's private local cache, never an attached backend."""
     work = root / ("workspace-two-" + result.nonce) / "build"
-    environment = _client_environment(endpoint, work)
+    environment = _client_environment(endpoint, work, client_side=result.client_side)
     args = _compile_arguments(sccache, compiler, target=result.target, debug=result.debug)
     outcomes = []
     for corrupt in (False, True):
@@ -277,9 +292,10 @@ def _local_recovery(
         delta = after - before
         if delta.hits or delta.compilations != 1 or delta.writes != 1:
             raise ValueError(f"missing/corrupt cache did not recompile and repair; counters={delta}")
-        # The live local daemon remembers the entry: deletion or truncation
-        # records a read error before recompiling. This differs from a cold miss.
-        if delta != CacheCounters(0, 1, 1, 1, 1):
+        # Client-side retrieval can reject the local entry or use IPC fallback;
+        # local rejection is a miss without a daemon-side read-error increment.
+        allowed_errors = {0, 1} if result.client_side else {1}
+        if delta.misses != 1 or delta.errors not in allowed_errors:
             raise ValueError(f"cache fault was not recorded before recovery; counters={delta}")
         if _file_hash(work / "probe.o") != result.object_sha256:
             raise ValueError("missing/corrupt cache changed recovered compiler output")
@@ -319,7 +335,14 @@ def _link_and_check(
 
 
 def local_probe(
-    sccache: Path, compiler: Path, root: Path, *, target: str = "host", debug: bool = False
+    sccache: Path,
+    compiler: Path,
+    root: Path,
+    *,
+    target: str = "host",
+    debug: bool = False,
+    client_side: bool = True,
+    containment: bool = False,
 ) -> CacheProbeResult:
     """Own an isolated local-disk daemon, leaving other worker daemons untouched."""
     root = Path(root).resolve()
@@ -343,7 +366,16 @@ def local_probe(
     (root / "cache").mkdir(exist_ok=False)
     _run([sccache, "--start-server"], environment=environment, cwd=root)
     try:
-        result = probe_compiler_cache(sccache, compiler, root, endpoint=endpoint, target=target, debug=debug)
+        result = probe_compiler_cache(
+            sccache,
+            compiler,
+            root,
+            endpoint=endpoint,
+            target=target,
+            debug=debug,
+            client_side=client_side,
+            containment=containment,
+        )
         return _local_recovery(sccache, Path(compiler).absolute(), root, endpoint, result)
     finally:
         _run([sccache, "--stop-server"], environment=environment, cwd=root)
@@ -358,11 +390,23 @@ def main() -> None:
     parser.add_argument("--backend", default="local", choices=("local", "s3", "gcs"))
     parser.add_argument("--target", default="host", choices=("host", "wasm"))
     parser.add_argument("--debug", action="store_true", help="use -g and Clang -fdebug-compilation-dir=.")
+    parser.add_argument(
+        "--server-side", action="store_true", help="comparison only: compile outside action containment"
+    )
+    parser.add_argument("--containment", action="store_true", help="verify real Clang limits/group and cancellation")
     args = parser.parse_args()
     if args.local:
         if args.backend != "local":
             parser.error("--local requires local backend")
-        result = local_probe(args.sccache, args.compiler, args.root, target=args.target, debug=args.debug)
+        result = local_probe(
+            args.sccache,
+            args.compiler,
+            args.root,
+            target=args.target,
+            debug=args.debug,
+            client_side=not args.server_side,
+            containment=args.containment,
+        )
     else:
         endpoint = {key: os.environ[key] for key in _ENDPOINT_KEYS if key in os.environ}
         result = probe_compiler_cache(
@@ -373,6 +417,8 @@ def main() -> None:
             expected_backend=args.backend,
             target=args.target,
             debug=args.debug,
+            client_side=not args.server_side,
+            containment=args.containment,
         )
     print(json.dumps(asdict(result), sort_keys=True))
 

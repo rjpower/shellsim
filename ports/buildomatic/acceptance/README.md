@@ -45,8 +45,9 @@ UV_CACHE_DIR=/home/power/.cache/uv uv run --no-project \
 
 `--local` creates a new private 32 MiB disk cache and starts/stops only its own
 daemon. Its cache directory must not exist. It also removes, then corrupts,
-its own entries: each fault must record one read error and miss, recompile,
-rewrite the entry, and reproduce the verified object. It never faults a remote
+its own entries: each fault must miss, recompile, rewrite the entry, and reproduce
+the verified object. Client-side local-path rejection may report no daemon read
+error; IPC fallback can record one. It never faults a remote
 cache or another worker's cache.
 
 On Iris, the runtime owner prestarts a daemon with backend read/write
@@ -60,21 +61,41 @@ SCCACHE_SERVER_PORT=4226 uv run --no-project --python /path/to/python \
 ```
 
 Use `--backend s3` for S3 and `--debug` for the additional Clang debug case.
+Add `--containment` to Wasm checks to verify real compiler placement and cancellation.
 `SCCACHE_SERVER_UDS` can replace the port; supply exactly one endpoint. The Python
 API is `probe_compiler_cache(sccache, compiler, root, *, endpoint,
-expected_backend="local", target="host", debug=False) -> CacheProbeResult`.
-`local_probe(sccache, compiler, root, *, target="host", debug=False)` owns a
+expected_backend="local", target="host", debug=False, client_side=True,
+containment=False) -> CacheProbeResult`.
+`local_probe(sccache, compiler, root, *, target="host", debug=False,
+client_side=True, containment=False)` owns a
 private local daemon and additionally tests cache faults. Both return JSON-safe
 dataclasses. Nonzero exit or an exception means acceptance failed.
 
 Action clients receive exactly `PATH=/bin:/usr/bin`, a private `HOME`,
-`LC_ALL=C`, and one public daemon endpoint. Backend credentials and configuration
+`LC_ALL=C`, `SCCACHE_CLIENT_SIDE=1`, and one public daemon endpoint. Backend credentials and configuration
 belong only in the daemon environment. Local daemon startup additionally sets
 `SCCACHE_DIR`, `SCCACHE_CACHE_SIZE=32M`, and `SCCACHE_IDLE_TIMEOUT=0`.
-The daemon must report `basedirs=[]`. The probe sets neither `SCCACHE_BASEDIRS`
-nor `SCCACHE_CLIENT_SIDE`. Per-action BASEDIRS did not normalize absolute paths
+The daemon must report `basedirs=[]`. The probe does not set `SCCACHE_BASEDIRS`.
+Per-action BASEDIRS did not normalize absolute paths
 with this pinned prestarted daemon; client-side mode did not remedy that.
-These controls are unnecessary for the proven relative-path identity.
+Relative arguments provide the proven path identity. Client-side mode provides
+compiler execution inside the action's process group and resource limits.
+`--server-side` permits a comparison run and makes no containment guarantee.
+
+The pinned release ignores client-side mode when `SCCACHE_ERROR_LOG` or a
+distributed scheduler is configured. Neither may be configured on the action
+client or daemon. This restriction comes from the
+[pinned architecture](https://github.com/mozilla/sccache/blob/v0.18.0/docs/Architecture.md#client-side-mode-sccache_client_side).
+Keep the daemon prestarted outside actions; clients must use its explicit public
+endpoint with `SCCACHE_CLIENT_SIDE=1` and credential-free environment.
+
+`--containment` uses a compiler shim which delegates detection/preprocessing,
+then execs the retained Clang on a FIFO at the actual cache-miss stage. The probe
+confirms `/proc/<pid>/exe` is Clang, its group equals the action group, and its
+memory, CPU and file-size limits match the worker's limits. Cancelling that
+action must stop Clang, while a concurrent independent Wasm compile succeeds
+through the same daemon. This verifies actual placement and cancellation;
+timeouts use the same worker process-group termination path.
 
 ## Proven adapter requirements
 
