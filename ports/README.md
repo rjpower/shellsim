@@ -59,6 +59,9 @@ verified predecessor trees, then run the ordinary driver offline for one node.
 Changed predecessor keys or absent results fail before predecessor execution.
 SDK producers use imported products; the bridge never bootstraps LLVM remotely.
 Retained `--workspace` directories are unsupported for distributed actions.
+Target graphs require `--sdk-descriptor`; the distributed CLI never calls the SDK
+materializer. `--max-workers` selects independent port actions; `--jobs` remains
+the per-port bound.
 
 For Iris, pass a connected persistent `IrisBackend` as `remote_backend` and its
 `RemoteStore` as `blob_store` to `run_graph(..., backend="iris")`. The service owns
@@ -68,12 +71,31 @@ request journals use independently configured storage; evicted blobs are cache
 misses and must be rebuilt. Iris imports occur only when explicitly connecting
 to that backend.
 
+The CLI can attach to an existing service with `--backend iris --iris-service
+/path/to/service.json`. Its public descriptor names `job_id`, the durable
+`prefix`, and `cache_prefix`, with optional `controller_url` (default
+`https://iris.oa.dev`), `cluster_name` (default `marin`) and runtime `workspace`.
+The workspace must supply the optional Iris and Rigging dependencies. The
+descriptor contains no credentials; authentication belongs to the Iris client.
+Public `config_sha256`, `task_image` (use an image digest pin) and `service_id`
+fields bind service provenance into the request and checked manifest. Backend
+worker journals record the actual task-image and implementation identity.
+
+Repeating an unchanged build resumes its content-derived request. After cache
+eviction, supply a new explicit `--build-key` to accept a fresh request and
+rebuild the missing blobs. A failed retrieval never creates a checked manifest.
+For clients that disconnect, reconstruct the unchanged prepared request and use
+the service's `get(build_id)` followed by `collect_graph`; acknowledge only after
+collection. Corrupt blobs fail verification and are never treated as valid
+results or repaired silently.
+
 Compiler caching is opt-in through the typed `CompilerCacheLauncher` binding.
 Its worker-image executable is hash-admitted and only `-c` calls use it. Linking
 uses the real compiler. Public S3/GCS configuration is allowlisted; credentials
 belong to the worker's cache daemon and never enter code bundles or receipts.
 Source, build and dependency roots enter `SCCACHE_BASEDIRS` at execution time so
-private attempt paths do not defeat cache reuse or enter product identities.
+private attempt paths stay outside product identities. The daemon may use its own
+path configuration; this setting alone does not establish reuse across attempts.
 
 ## Author a port
 

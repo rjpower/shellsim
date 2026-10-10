@@ -255,7 +255,7 @@ def build_graph(
             if compiler_cache is not None:
                 from ports._support.native_adapters import compiler_cache_identity
 
-                inputs["compiler_cache"] = compiler_cache_identity(compiler_cache)
+                inputs["compiler_cache"] = compiler_cache_identity(compiler_cache, verify_executable=False)
             inputs["sdk"] = build_sdk.identity
             inputs["host_tools"] = {
                 name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
@@ -610,6 +610,10 @@ def main() -> None:
     )
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--backend", choices=("local", "buildomatic", "iris"), default="local")
+    parser.add_argument("--sdk-descriptor", type=Path, help="admitted portable SDK for distributed builds")
+    parser.add_argument("--iris-service", type=Path, help="public connection descriptor for an existing Iris service")
+    parser.add_argument("--build-key", help="explicit distributed request identity; change to rebuild evicted blobs")
+    parser.add_argument("--max-workers", type=int, default=1, help="distributed port concurrency, between one and 32")
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
@@ -620,6 +624,8 @@ def main() -> None:
         )
     if args.check and args.output is None:
         parser.error("--check requires --output")
+    if args.backend == "iris" and args.iris_service is None:
+        parser.error("--backend iris requires --iris-service")
     workspaces = {}
     for declaration in args.workspace:
         reference, separator, directory = declaration.partition("=")
@@ -651,19 +657,33 @@ def main() -> None:
                 if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
                     raise ValueError("unsupported guest test kind")
                 _local_file(port, test.get("source" if test["kind"] == "native" else "script"))
-    sdk_context = (
-        materialize(
-            args.ports,
-            graph,
-            args.store,
-            default=args.sdk,
-            host_seed=args.host_seed,
-            python=needs_python,
-            offline=args.offline,
+    if args.backend == "local":
+        sdk_context = (
+            materialize(
+                args.ports,
+                graph,
+                args.store,
+                default=args.sdk,
+                host_seed=args.host_seed,
+                python=needs_python,
+                offline=args.offline,
+            )
+            if needs_target or needs_python
+            else None
         )
-        if needs_target or needs_python
-        else None
-    )
+    else:
+        if (needs_target or needs_python) and args.sdk_descriptor is None:
+            parser.error("distributed target builds require --sdk-descriptor; SDK products are never bootstrapped")
+        sdk_context = None
+        if args.sdk_descriptor is not None:
+            from ports.buildomatic.portable import import_sdk, original_root_bindings
+
+            sdk_context = import_sdk(
+                args.sdk_descriptor,
+                args.store / "sdk-import",
+                original_bindings=True,
+                bindings=original_root_bindings(args.sdk_descriptor),
+            )
 
     execute = build_graph
     if args.backend != "local":
@@ -679,7 +699,16 @@ def main() -> None:
         jobs=args.jobs,
         default_sdk=args.sdk,
         workspaces=workspaces,
-        **({"backend": args.backend} if args.backend != "local" else {}),
+        **(
+            {
+                "backend": args.backend,
+                "iris_service": args.iris_service,
+                "build_key": args.build_key,
+                "max_workers": args.max_workers,
+            }
+            if args.backend != "local"
+            else {}
+        ),
     )
     if args.output is not None:
         if args.check:

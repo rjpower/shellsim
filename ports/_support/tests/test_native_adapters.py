@@ -308,3 +308,28 @@ def test_cache_launcher_rejects_unadmitted_environment(tmp_path, binding):
     launcher.chmod(0o755)
     with pytest.raises(ValueError):
         compiler_cache_identity(CompilerCacheLauncher(launcher, file_hash(launcher), (binding,)))
+
+
+def test_worker_image_cache_identity_does_not_require_caller_executable(tmp_path):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-image-only-sccache", "a" * 64)
+    assert compiler_cache_identity(launcher, verify_executable=False)["sha256"] == "a" * 64
+    with pytest.raises(FileNotFoundError):
+        compiler_cache_identity(launcher)
+
+
+def test_cache_launcher_rejects_changed_binary_and_endpoint_credentials(tmp_path):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+    from ports._support.store import file_hash
+
+    path = tmp_path / "sccache"
+    path.write_bytes(b"admitted")
+    path.chmod(0o755)
+    launcher = CompilerCacheLauncher(path, file_hash(path))
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError):
+        compiler_cache_identity(launcher)
+    credential = replace(launcher, environment=(("SCCACHE_ENDPOINT", "https://user:secret@cache.invalid"),))
+    with pytest.raises(ValueError):
+        compiler_cache_identity(credential, verify_executable=False)

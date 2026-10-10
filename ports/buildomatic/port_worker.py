@@ -16,6 +16,7 @@ from pathlib import Path
 def execute(code: Path, recipe: Path, inputs: Path, output: Path, work: Path) -> None:
     """Preload verified predecessors, import an SDK, and build one selected node."""
     sys.path.insert(0, str(code))
+    from ports._support.graph import plan
     from ports._support.native_adapters import CompilerCacheLauncher
     from ports._support.runner import build_graph
     from ports._support.store import relative_path, verify
@@ -23,6 +24,9 @@ def execute(code: Path, recipe: Path, inputs: Path, output: Path, work: Path) ->
     specification = json.loads((recipe / "node.json").read_text())
     if specification["schema_version"] != 1:
         raise ValueError("unsupported port action schema")
+    graph = plan(code / "ports", [specification["reference"]], default_sdk=specification["default_sdk"])
+    if {port.reference: port.digest for port in graph.ports} != specification["recipes"]:
+        raise ValueError("transported recipe closure differs from the admitted graph")
     store = work / "store"
     store.mkdir(parents=True, exist_ok=False)
     if (recipe / "sources").exists():
@@ -45,12 +49,10 @@ def execute(code: Path, recipe: Path, inputs: Path, output: Path, work: Path) ->
         verify(destination, receipt["inputs"])
     sdk = None
     if (inputs / "sdk").exists():
-        from ports.buildomatic.portable import import_sdk
+        from ports.buildomatic.portable import import_sdk, original_root_bindings
 
         descriptor = inputs / "sdk/sdk.json"
-        inventories = json.loads(descriptor.read_text())["roots"]
-        bindings = {name: Path(inventory["path"]) for name, inventory in inventories.items() if inventory["stable"]}
-        sdk = import_sdk(descriptor, work / "sdk", original_bindings=True, bindings=bindings)
+        sdk = import_sdk(descriptor, work / "sdk", original_bindings=True, bindings=original_root_bindings(descriptor))
     cache = specification["compiler_cache"]
     launcher = (
         None

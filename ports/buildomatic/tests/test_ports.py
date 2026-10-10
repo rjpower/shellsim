@@ -4,6 +4,7 @@ import json
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 
 import pytest
 
@@ -11,7 +12,7 @@ from ports._support import runner
 from ports._support.graph import plan
 from ports._support.store import identity
 from ports._support.tests.test_runner import _wheel_port
-from ports.buildomatic.ports import code_files, prepare_graph, publish_manifest, run_graph
+from ports.buildomatic.ports import code_files, collect_graph, prepare_graph, publish_manifest, run_graph
 
 
 def test_local_cli_imports_no_iris():
@@ -145,3 +146,103 @@ def test_preparation_missing_source_fails_offline(tmp_path):
     shutil.rmtree(store / "sources")
     with pytest.raises(ValueError):
         prepare_graph(ports, ["python/example"], None, store, LocalStore(tmp_path / "blobs"), offline=True)
+
+
+@pytest.mark.parametrize("failure", ["request", "node", "duplicate"])
+def test_collection_rejects_wrong_request_or_action_closure(tmp_path, failure):
+    from ports.buildomatic.contracts import request_id
+
+    from ports.buildomatic import BuildResult, BuildState, LocalStore, NodeResult, NodeState
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    blobs = LocalStore(tmp_path / "blobs")
+    prepared = prepare_graph(ports, ["python/example"], None, store, blobs, offline=True)
+    action_id = next(iter(prepared.action_ids.values()))
+    node = NodeResult(action_id, NodeState.SUCCEEDED, 1)
+    result = BuildResult(request_id(prepared.request), BuildState.SUCCEEDED, (node,))
+    if failure == "request":
+        result = replace(result, request_id="0" * 64)
+    elif failure == "node":
+        result = replace(result, nodes=(replace(node, action_id="different"),))
+    else:
+        result = replace(result, nodes=(node, node))
+    with pytest.raises(ValueError):
+        collect_graph(prepared, result, blobs, store)
+    assert not (store / "results").exists()
+    assert not (store / "buildomatic/manifests").exists()
+
+
+def test_explicit_build_key_changes_request_but_not_action_inputs(tmp_path):
+    from ports.buildomatic.contracts import request_id
+
+    from ports.buildomatic import LocalStore
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    blobs = LocalStore(tmp_path / "blobs")
+    first = prepare_graph(ports, ["python/example"], None, store, blobs, offline=True, build_key="attempt-1")
+    second = prepare_graph(ports, ["python/example"], None, store, blobs, offline=True, build_key="attempt-2")
+    assert first.request.actions == second.request.actions
+    assert request_id(first.request) != request_id(second.request)
+
+
+def test_independent_ports_enter_ready_queue_concurrently(tmp_path, monkeypatch):
+    import ports.buildomatic as core
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "first", [])
+    _wheel_port(ports, store, "second", [])
+    states = []
+    original = core.Coordinator
+
+    class ObservedCoordinator(original):
+        def tick(self):
+            result = super().tick()
+            states.append(sum(node.state is core.NodeState.RUNNING for node in result.nodes))
+            return result
+
+    monkeypatch.setattr(core, "Coordinator", ObservedCoordinator)
+    run_graph(ports, ["python/first", "python/second"], None, store, offline=True, max_workers=2)
+    assert states[0] == 2
+
+
+def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
+    import ports.buildomatic as core
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    blobs = core.LocalStore(tmp_path / "blobs")
+    service = core.Coordinator(blobs, "remote-service", {"worker": core.WorkerExecutor(blobs, tmp_path / "worker")})
+    calls = []
+
+    class RemoteService:
+        def submit(self, request):
+            calls.append("submit")
+            return service.submit(request)
+
+        def get(self, build_id):
+            calls.append("get")
+            return service.tick()
+
+        def acknowledge(self, build_id):
+            calls.append("acknowledge")
+            service.acknowledge()
+
+    def reject_local_coordinator(*args, **kwargs):
+        raise AssertionError("Iris bridge cannot create a local coordinator")
+
+    monkeypatch.setattr(core, "Coordinator", reject_local_coordinator)
+    build = run_graph(
+        ports,
+        ["python/example"],
+        None,
+        store,
+        backend="iris",
+        blob_store=blobs,
+        remote_backend=RemoteService(),
+        offline=True,
+    )
+    assert len(build.results) == 1
+    assert calls[0] == "submit" and calls[-1] == "acknowledge"
+    assert "get" in calls

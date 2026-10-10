@@ -26,8 +26,15 @@ class CompilerCacheLauncher:
     environment: tuple[tuple[str, str], ...] = ()
 
 
-def compiler_cache_identity(launcher: CompilerCacheLauncher) -> dict:
-    """Admit executable bytes and a bounded cache configuration before use."""
+def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executable: bool = True) -> dict:
+    """Bind public cache identity; verify executable bytes on the worker before use.
+
+    Preparation may name a pinned worker-image binary absent on the caller.
+    Execution always verifies its bytes and executable mode.
+    """
+    import re
+    from urllib.parse import urlsplit
+
     from ports._support.store import file_hash
 
     allowed = {
@@ -46,9 +53,11 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher) -> dict:
         "SCCACHE_GCS_RW_MODE",
         "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE",
     }
-    if not launcher.path.is_absolute() or not launcher.path.stat().st_mode & 0o111:
+    if not launcher.path.is_absolute() or re.fullmatch(r"[a-f0-9]{64}", launcher.sha256) is None:
+        raise ValueError("compiler cache requires an absolute path and SHA256 identity")
+    if verify_executable and not launcher.path.stat().st_mode & 0o111:
         raise ValueError("compiler cache requires an absolute executable")
-    if file_hash(launcher.path) != launcher.sha256:
+    if verify_executable and file_hash(launcher.path) != launcher.sha256:
         raise ValueError("compiler cache executable differs from admitted bytes")
     environment = dict(launcher.environment)
     if (
@@ -57,6 +66,11 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher) -> dict:
         or any(not isinstance(value, str) or len(value) > 4096 or "\0" in value for value in environment.values())
     ):
         raise ValueError("unsupported compiler cache environment")
+    endpoint = urlsplit(environment.get("SCCACHE_ENDPOINT", ""))
+    if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+        raise ValueError("compiler cache endpoint must not contain credentials")
+    if "SCCACHE_ENDPOINT" in environment and (endpoint.scheme not in {"http", "https"} or not endpoint.netloc):
+        raise ValueError("compiler cache endpoint must be an HTTP or HTTPS URL")
     return {"path": str(launcher.path), "sha256": launcher.sha256, "environment": environment}
 
 

@@ -14,7 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -26,7 +26,8 @@ from ports.api import implementation
 
 if TYPE_CHECKING:
     from ports._support.sdk_products import MaterializedSDK
-    from ports.buildomatic import BuildRequest, BuildResult, Store
+    from ports.buildomatic import BuildRequest, BuildResult, Store, Worker
+    from ports.buildomatic.backends.iris import IrisBackend
 
 PRODUCT_SYSTEMS = frozenset({"llvm-host", "wasi-sysroot", "sdk-tooling", "cpython-threaded", "uv-host"})
 
@@ -44,6 +45,7 @@ class PreparedGraph:
     jobs: int | None
     default_sdk: str
     compiler_cache: CompilerCacheLauncher | None
+    worker_identity: dict[str, str]
 
 
 def _product_results(graph: Graph, sdk: MaterializedSDK | None) -> tuple[dict[str, Path], dict[str, str]]:
@@ -145,11 +147,9 @@ def code_files(ports: Path, graph: Graph, *, portable: bool = False) -> dict[str
                     module = ".".join([*parent, module]).rstrip(".")
                 modules = [module, *(module + "." + alias.name for alias in node.names)]
             for module in modules:
-                if not module.startswith("ports.") or module in {
-                    "ports.buildomatic.ports",
-                    "ports.buildomatic.backend",
-                    "ports.buildomatic.remote_store",
-                }:
+                if not module.startswith("ports."):
+                    continue
+                if module.startswith("ports.buildomatic") and not (portable and module == "ports.buildomatic.portable"):
                     continue
                 if ".tests" in module:
                     raise ValueError("worker code cannot import test modules")
@@ -164,6 +164,8 @@ def code_files(ports: Path, graph: Graph, *, portable: bool = False) -> dict[str
                         add(candidate, path, shared)
                         pending.append(candidate)
                         break
+    if "_support/producer_migration.py" in files:
+        add("_support/producer-migration-v1.json", shared / "_support/producer-migration-v1.json", shared)
     return dict(sorted(files.items()))
 
 
@@ -195,6 +197,8 @@ def prepare_graph(
     default_sdk: str = "default",
     max_workers: int = 1,
     compiler_cache: CompilerCacheLauncher | None = None,
+    build_key: str | None = None,
+    worker_identity: Mapping[str, str] | None = None,
 ) -> PreparedGraph:
     """Fetch sources and seal one generic action for every canonical consumer."""
     from ports._support.local_sources import local_source_files
@@ -205,6 +209,11 @@ def prepare_graph(
     )
     if jobs is not None and not 1 <= jobs <= 16:
         raise ValueError("build jobs must be between one and sixteen")
+    worker_identity = dict(worker_identity or {})
+    if worker_identity.keys() - {"config_sha256", "task_image", "service_id"} or any(
+        not isinstance(value, str) or len(value) > 4096 or "\0" in value for value in worker_identity.values()
+    ):
+        raise ValueError("unsupported public worker identity")
     products, product_keys = _product_results(graph, sdk_context)
     consumers = [port for port in graph.ports if port.recipe["build_system"] not in PRODUCT_SYSTEMS]
     if not consumers:
@@ -217,6 +226,16 @@ def prepare_graph(
         code = root / "code"
         code.mkdir()
         _stage_code(code_files(ports, graph, portable=sdk_context is not None), code)
+        transported = plan(
+            code / "ports",
+            graph.roots,
+            target_profile=sdk_context.dynamic_abi if sdk_context else None,
+            default_sdk=default_sdk,
+        )
+        if {port.reference: port.digest for port in transported.ports} != {
+            port.reference: port.digest for port in graph.ports
+        }:
+            raise ValueError("recipe closure changed during preparation")
         code_bundle = capture_tree(code, blob_store)
         sdk_mounts = ()
         if sdk_context is not None:
@@ -261,7 +280,15 @@ def prepare_graph(
                 "jobs": jobs,
                 "predecessors": {name: action_ids[name] for name in sorted(closure) if name in action_ids},
                 "products": {name: product_keys[name] for name in sorted(closure) if name in product_keys},
-                "compiler_cache": compiler_cache_identity(compiler_cache) if compiler_cache is not None else None,
+                "compiler_cache": compiler_cache_identity(compiler_cache, verify_executable=False)
+                if compiler_cache is not None
+                else None,
+                "worker_identity": worker_identity,
+                "recipes": {
+                    selected.reference: selected.digest
+                    for selected in graph.ports
+                    if selected.reference in closure or selected.reference == port.reference
+                },
             }
             (sources / "node.json").write_text(json.dumps(specification, sort_keys=True))
             actions.append(
@@ -278,28 +305,20 @@ def prepare_graph(
                 )
             )
     request = BuildRequest(
-        identity(
-            {
-                "bundles": [
-                    {
-                        "id": action.id,
-                        "inputs": [mount.bundle.digest for mount in action.inputs],
-                        "dependencies": action.dependencies,
-                    }
-                    for action in actions
-                ]
-            }
-        ),
+        build_key
+        if build_key is not None
+        else identity({"actions": [asdict(action) for action in actions], "max_workers": max_workers}),
         tuple(actions),
         max_workers=max_workers,
     )
-    return PreparedGraph(graph, request, action_ids, sdk_context, products, ports, jobs, default_sdk, compiler_cache)
+    return PreparedGraph(
+        graph, request, action_ids, sdk_context, products, ports, jobs, default_sdk, compiler_cache, worker_identity
+    )
 
 
 def collect_graph(prepared: PreparedGraph, result: BuildResult, blob_store: Store, ports_store: Path) -> GraphBuild:
     """Verify every returned tree before atomically publishing caller cache entries."""
-    from ports.buildomatic import BuildState, NodeState, extract_tree
-    from ports.buildomatic.contracts import request_id
+    from ports.buildomatic import BuildState, NodeState, extract_tree, request_id
 
     if result.state is not BuildState.SUCCEEDED:
         raise RuntimeError("Buildomatic graph did not succeed: " + str(result))
@@ -358,11 +377,12 @@ def collect_graph(prepared: PreparedGraph, result: BuildResult, blob_store: Stor
         "recipes": {port.reference: port.digest for port in build.graph.ports},
         "results": admitted,
         "bundles": {reference: nodes[action_id].bundle.digest for reference, action_id in prepared.action_ids.items()},
-        "compiler_cache": compiler_cache_identity(prepared.compiler_cache)
+        "compiler_cache": compiler_cache_identity(prepared.compiler_cache, verify_executable=False)
         if prepared.compiler_cache is not None
         else None,
+        "worker_identity": prepared.worker_identity,
     }
-    path = directory / (prepared.request.idempotency_key + ".json")
+    path = directory / (result.request_id + ".json")
     with tempfile.NamedTemporaryFile(mode="w", prefix=".manifest-", dir=directory, delete=False) as stream:
         temporary = Path(stream.name)
         try:
@@ -449,10 +469,13 @@ def run_graph(
     workspaces: Mapping[str, Path] | None = None,
     backend: str = "buildomatic",
     blob_store: Store | None = None,
-    workers=None,
+    workers: Mapping[str, Worker] | None = None,
     max_workers: int = 1,
     compiler_cache: CompilerCacheLauncher | None = None,
-    remote_backend=None,
+    remote_backend: IrisBackend | None = None,
+    iris_service: Path | None = None,
+    build_key: str | None = None,
+    worker_identity: Mapping[str, str] | None = None,
 ) -> GraphBuild:
     """Run through the core ready queue; optional Iris imports occur only here."""
     from ports.buildomatic import BuildState, Coordinator, LocalStore, ResourceLimits, WorkerExecutor
@@ -462,6 +485,58 @@ def run_graph(
     if backend not in {"buildomatic", "iris"}:
         raise ValueError("unsupported Buildomatic backend")
     if backend == "iris":
+        if remote_backend is None and iris_service is not None:
+            if iris_service.stat().st_size > 64 * 1024:
+                raise ValueError("Iris connection descriptor exceeds its size bound")
+            connection = json.loads(iris_service.read_text())
+            if set(connection) - {
+                "job_id",
+                "prefix",
+                "cache_prefix",
+                "controller_url",
+                "cluster_name",
+                "workspace",
+                "config_sha256",
+                "task_image",
+                "service_id",
+            }:
+                raise ValueError("unsupported Iris connection fields")
+            from iris.cli.connect import open_iris_client
+            from iris.cluster.types import Namespace
+
+            from ports.buildomatic.backends.iris import IrisBackend
+
+            with open_iris_client(
+                cluster_name=connection.get("cluster_name", "marin"),
+                workspace=Path(connection.get("workspace", Path.cwd())),
+            ) as client:
+                remote = IrisBackend(
+                    client,
+                    connection.get("controller_url", "https://iris.oa.dev"),
+                    str(Namespace.from_job_id(connection["job_id"])),
+                    prefix=connection["prefix"],
+                    cache_prefix=connection["cache_prefix"],
+                )
+                return run_graph(
+                    ports,
+                    requests,
+                    sdk_context,
+                    store,
+                    offline=offline,
+                    jobs=jobs,
+                    default_sdk=default_sdk,
+                    backend="iris",
+                    blob_store=remote.store,
+                    remote_backend=remote,
+                    max_workers=max_workers,
+                    compiler_cache=compiler_cache,
+                    build_key=build_key,
+                    worker_identity={
+                        name: connection[name]
+                        for name in ("config_sha256", "task_image", "service_id")
+                        if name in connection
+                    },
+                )
         if blob_store is None or remote_backend is None:
             raise ValueError("Iris builds require a connected remote service and its blob store")
     else:
@@ -489,12 +564,14 @@ def run_graph(
         default_sdk=default_sdk,
         max_workers=max_workers,
         compiler_cache=compiler_cache,
+        build_key=build_key,
+        worker_identity=worker_identity,
     )
     if backend == "iris":
         build_id = remote_backend.submit(prepared.request)
         print("ports: accepted remote build: " + build_id, file=sys.stderr, flush=True)
     else:
-        coordinator = Coordinator(blob_store, "ports-" + prepared.request.idempotency_key, workers)
+        coordinator = Coordinator(blob_store, "ports-" + identity(prepared.request.idempotency_key), workers)
         coordinator.submit(prepared.request)
     while True:
         result = remote_backend.get(build_id) if backend == "iris" else coordinator.tick()
@@ -525,11 +602,14 @@ def main() -> None:
     publish.add_argument("--output", type=Path, required=True)
     publish.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    from ports.buildomatic.portable import import_sdk
+    from ports.buildomatic.portable import import_sdk, original_root_bindings
 
-    descriptor = json.loads(args.sdk_descriptor.read_text())
-    bindings = {name: Path(inventory["path"]) for name, inventory in descriptor["roots"].items() if inventory["stable"]}
-    sdk = import_sdk(args.sdk_descriptor, args.store / "sdk-import", original_bindings=True, bindings=bindings)
+    sdk = import_sdk(
+        args.sdk_descriptor,
+        args.store / "sdk-import",
+        original_bindings=True,
+        bindings=original_root_bindings(args.sdk_descriptor),
+    )
     print(publish_manifest(args.manifest, args.ports, sdk, args.store, args.output, check=args.check))
 
 
