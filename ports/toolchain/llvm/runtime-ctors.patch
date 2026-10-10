@@ -1,0 +1,191 @@
+--- a/lld/wasm/Config.h
++++ b/lld/wasm/Config.h
+@@ -71,6 +71,7 @@
+   std::optional<llvm::StringRef> memoryExport;
+   bool sharedMemory;
+   bool serialMemoryInit;
++  bool splitRuntimeCtors;
+   bool deferSharedInit;
+   bool emitMainTLSInfo;
+   bool importTable;
+@@ -216,6 +217,8 @@
+     // __wasm_call_ctors
+     // Function that directly calls all ctors in priority order.
+     DefinedFunction *callCtors;
++    DefinedFunction *callRuntimeCtors;
++    DefinedData *runtimeCtorsFlag;
+ 
+     // __wasm_call_dtors
+     // Function that calls the libc/etc. cleanup function.
+--- a/lld/wasm/Options.td
++++ b/lld/wasm/Options.td
+@@ -226,6 +226,9 @@
+ 
+ def serial_memory_init: FF<"serial-memory-init">,
+   HelpText<"Require serialized shared memory initialization; trap on concurrent initialization">;
++
++def split_runtime_ctors: FF<"split-runtime-ctors">,
++  HelpText<"Export guarded implementation constructors before application constructors">;
+ 
+ def defer_shared_init: FF<"defer-shared-init">,
+   HelpText<"Export shared-library initialization thunks without a module start section">;
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -559,6 +559,8 @@
+ 
+   ctx.arg.sharedMemory = args.hasArg(OPT_shared_memory);
+   ctx.arg.serialMemoryInit = args.hasArg(OPT_serial_memory_init);
++  ctx.arg.splitRuntimeCtors = args.hasArg(OPT_split_runtime_ctors);
++
+   ctx.arg.deferSharedInit = args.hasArg(OPT_defer_shared_init);
+   ctx.arg.emitMainTLSInfo = args.hasArg(OPT_emit_main_tls_info);
+   ctx.arg.soName = args.getLastArgValue(OPT_soname);
+@@ -758,6 +760,10 @@
+   if (!ctx.arg.memoryExport.has_value() && !ctx.arg.memoryImport.has_value()) {
+     ctx.arg.memoryExport = memoryName;
+   }
++  if (ctx.arg.splitRuntimeCtors &&
++      (ctx.arg.shared || ctx.arg.relocatable || !ctx.arg.serialMemoryInit ||
++       ctx.arg.is64.value_or(false)))
++    error("--split-runtime-ctors requires a serialized wasm32 executable");
+   if (ctx.arg.emitMainTLSInfo && (ctx.arg.shared || !ctx.arg.sharedMemory))
+     error("--emit-main-tls-info requires a shared-memory executable");
+   if (ctx.arg.deferSharedInit && !ctx.arg.shared)
+@@ -958,6 +964,15 @@
+   ctx.sym.callCtors = symtab->addSyntheticFunction(
+       "__wasm_call_ctors", WASM_SYMBOL_VISIBILITY_HIDDEN,
+       make<SyntheticFunction>(nullSignature, "__wasm_call_ctors"));
++
++  if (ctx.arg.splitRuntimeCtors) {
++    ctx.sym.callRuntimeCtors = symtab->addSyntheticFunction(
++        "__wasm_call_runtime_ctors", WASM_SYMBOL_VISIBILITY_HIDDEN,
++        make<SyntheticFunction>(nullSignature, "__wasm_call_runtime_ctors"));
++    ctx.sym.callRuntimeCtors->markLive();
++    ctx.sym.callRuntimeCtors->forceExport = true;
++    ctx.sym.callCtors->markLive();
++  }
+ 
+   bool is64 = ctx.arg.is64.value_or(false);
+ 
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -66,6 +66,7 @@
+   void createApplyTLSRelocationsFunction();
+   void createApplyGlobalTLSRelocationsFunction();
+   void createCallCtorsFunction();
++  void createRuntimeCtorsFunction();
+   void createInitTLSFunction();
+   void createCommandExportWrappers();
+   void createCommandExportWrapper(uint32_t functionIndex, DefinedFunction *f);
+@@ -425,6 +426,17 @@
+   // return NULL).
+   if (!ctx.arg.isMultithreaded() && ctx.sym.tlsBase) {
+     setGlobalPtr(ctx.sym.tlsBase, fixedTLSBase);
++  }
++
++  // The implementation constructors belong to the process, not to a worker
++  // instance. Keep their once state in shared linear memory.
++  if (ctx.arg.splitRuntimeCtors) {
++    memoryPtr = alignTo(memoryPtr, 4);
++    ctx.sym.runtimeCtorsFlag = symtab->addSyntheticDataSymbol(
++        "__wasm_runtime_ctors_flag", WASM_SYMBOL_VISIBILITY_HIDDEN);
++    ctx.sym.runtimeCtorsFlag->markLive();
++    ctx.sym.runtimeCtorsFlag->setVA(memoryPtr);
++    memoryPtr += 4;
+   }
+ 
+   // Make space for the memory initialization flag
+@@ -1639,6 +1651,68 @@
+   createFunction(ctx.sym.applyGlobalTLSRelocs, bodyContent);
+ }
+ 
++// Split only the explicitly opted-in canonical executable profile. Ordinary
++// static executables and independently initialized side modules are unchanged.
++void Writer::createRuntimeCtorsFunction() {
++  std::string body;
++  raw_string_ostream os(body);
++  writeUleb128(os, 1, "local groups");
++  writeUleb128(os, 2, "locals");
++  writeU8(os, WASM_TYPE_I32, "local type");
++  writeU8(os, WASM_OPCODE_I32_CONST, "flag address");
++  writeSleb128(os, ctx.sym.runtimeCtorsFlag->getVA(), "flag offset");
++  if (ctx.isPic) {
++    writeU8(os, WASM_OPCODE_GLOBAL_GET, "memory base");
++    writeUleb128(os, ctx.sym.memoryBase->getGlobalIndex(), "global index");
++    writeU8(os, WASM_OPCODE_I32_ADD, "flag address");
++  }
++  writeU8(os, WASM_OPCODE_LOCAL_SET, "flag address");
++  writeUleb128(os, 0, "local index");
++  writeU8(os, WASM_OPCODE_LOCAL_GET, "flag address");
++  writeUleb128(os, 0, "local index");
++  writeU8(os, WASM_OPCODE_I32_CONST, "expected uninitialized");
++  writeSleb128(os, 0, "value");
++  writeU8(os, WASM_OPCODE_I32_CONST, "initializing");
++  writeSleb128(os, 1, "value");
++  writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomic prefix");
++  writeUleb128(os, WASM_OPCODE_I32_RMW_CMPXCHG, "cmpxchg");
++  writeUleb128(os, 2, "alignment");
++  writeUleb128(os, 0, "offset");
++  writeU8(os, WASM_OPCODE_LOCAL_TEE, "previous state");
++  writeUleb128(os, 1, "local index");
++  writeU8(os, WASM_OPCODE_IF, "already started");
++  writeU8(os, WASM_TYPE_NORESULT, "block type");
++  writeU8(os, WASM_OPCODE_LOCAL_GET, "previous state");
++  writeUleb128(os, 1, "local index");
++  writeU8(os, WASM_OPCODE_I32_CONST, "complete");
++  writeSleb128(os, 2, "value");
++  writeU8(os, WASM_OPCODE_I32_NE, "incomplete");
++  writeU8(os, WASM_OPCODE_IF, "reject recursive or concurrent initialization");
++  writeU8(os, WASM_TYPE_NORESULT, "block type");
++  writeU8(os, WASM_OPCODE_UNREACHABLE, "serialized initialization violation");
++  writeU8(os, WASM_OPCODE_END, "END");
++  writeU8(os, WASM_OPCODE_RETURN, "already initialized");
++  writeU8(os, WASM_OPCODE_END, "END");
++  for (const WasmInitEntry &f : initFunctions) {
++    if (f.priority > 100)
++      continue;
++    writeU8(os, WASM_OPCODE_CALL, "CALL");
++    writeUleb128(os, f.sym->getFunctionIndex(), "function index");
++    for (size_t i = 0; i < f.sym->signature->Returns.size(); ++i)
++      writeU8(os, WASM_OPCODE_DROP, "DROP");
++  }
++  writeU8(os, WASM_OPCODE_LOCAL_GET, "flag address");
++  writeUleb128(os, 0, "local index");
++  writeU8(os, WASM_OPCODE_I32_CONST, "complete");
++  writeSleb128(os, 2, "value");
++  writeU8(os, WASM_OPCODE_ATOMICS_PREFIX, "atomic prefix");
++  writeUleb128(os, WASM_OPCODE_I32_ATOMIC_STORE, "store");
++  writeUleb128(os, 2, "alignment");
++  writeUleb128(os, 0, "offset");
++  writeU8(os, WASM_OPCODE_END, "END");
++  createFunction(ctx.sym.callRuntimeCtors, body);
++}
++
+ // Create synthetic "__wasm_call_ctors" function based on ctor functions
+ // in input object.
+ void Writer::createCallCtorsFunction() {
+@@ -1653,8 +1727,14 @@
+     raw_string_ostream os(bodyContent);
+     writeUleb128(os, 0, "num locals");
+ 
+-    // Call constructors
++    if (ctx.sym.callRuntimeCtors) {
++      writeU8(os, WASM_OPCODE_CALL, "CALL");
++      writeUleb128(os, ctx.sym.callRuntimeCtors->getFunctionIndex(), "function index");
++    }
++    // Priorities through 100 are reserved for this pinned implementation.
+     for (const WasmInitEntry &f : initFunctions) {
++      if (ctx.arg.splitRuntimeCtors && f.priority <= 100)
++        continue;
+       writeU8(os, WASM_OPCODE_CALL, "CALL");
+       writeUleb128(os, f.sym->getFunctionIndex(), "function index");
+       for (size_t i = 0; i < f.sym->signature->Returns.size(); i++) {
+@@ -1893,6 +1973,8 @@
+     }
+     createStartFunction();
+ 
++    if (ctx.arg.splitRuntimeCtors)
++      createRuntimeCtorsFunction();
+     createCallCtorsFunction();
+ 
+     // Create export wrappers for commands if needed.

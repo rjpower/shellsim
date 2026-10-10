@@ -153,7 +153,120 @@ def libc_symbol_exports(sdk, libc, environment):
     return sorted({line.split()[0] for line in definitions.splitlines() if len(line.split()) >= 2})
 
 
-def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment):
+def admit_process_refresh(previous, current, requested):
+    """Only explicitly rebuilt facade C/headers may differ on a retained link."""
+    changed = {name for name in previous.keys() | current.keys() if previous.get(name) != current.get(name)}
+    if not changed:
+        return
+    if not requested:
+        raise ValueError("CPython relink facade sources changed")
+    allowed = {
+        name
+        for name in changed
+        if (name.startswith("../../toolchain/wasi_process/") and Path(name).suffix in {".c", ".h"})
+        or name in {"threaded_posix.c", "../../toolchain/wasi_sdk/posix.c", "../../toolchain/wasi_sdk/posix.h"}
+    }
+    if changed != allowed or previous.keys() - current.keys():
+        raise ValueError("CPython facade refresh requires unchanged upstream compilation inputs")
+
+
+def compile_process_facades(work, make, cc, environment, directory):
+    """Compile the explicit process facade objects from admitted source and Makefile.
+
+    A retained Makefile can name an earlier source directory and linker. Bind
+    its directory variables and CC to the verified copy and selected command;
+    leave configuration flags intact. Fresh and retained builds share this path.
+    """
+    toolchain = directory.parents[1] / "toolchain/wasi_sdk"
+    process = toolchain.parent / "wasi_process"
+    source, guest = work / "Python-3.13.7", work / "wasi-build"
+    staging = work / "process-source/patched-source"
+    process_objects = {}
+    for name, input_source, flags in [
+        ("process", process / "process.c", ["-D_WASI_EMULATED_SIGNAL=1"]),
+        ("posix", directory / "threaded_posix.c", ["-include", str(process / "process_abi.h")]),
+    ]:
+        obj = work / (name + ".o")
+        run(
+            [*cc, "-O2", "-I", str(process), *flags, "-c", str(input_source), "-o", str(obj)],
+            guest,
+            environment,
+            work / (name + ".log"),
+        )
+        process_objects[name] = obj
+    for name, extra in [
+        (
+            "posixmodule",
+            [
+                "-DHAVE_UMASK=1",
+                "-DHAVE_PIPE=1",
+                "-DHAVE_WAITPID=1",
+                "-DHAVE_SYS_WAIT_H=1",
+                "-DHAVE_KILL=1",
+                "-DHAVE_GETPID=1",
+                "-DHAVE_GETPPID=1",
+                "-DHAVE_POSIX_SPAWN=1",
+                "-DHAVE_POSIX_SPAWNP=1",
+                "-DHAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP=1",
+                "-include",
+                str(toolchain / "posix.h"),
+                "-include",
+                str(process / "process_port.h"),
+            ],
+        ),
+        ("signalmodule", []),
+        ("faulthandler", []),
+    ]:
+        flags = (
+            "$(MODULE_FAULTHANDLER_CFLAGS) $(PY_BUILTIN_MODULE_CFLAGS)"
+            if name == "faulthandler"
+            else "$(PY_CORE_CFLAGS)"
+        )
+        compile_rule = f"shellsim_process_compile:; @echo $(CC) {flags} -c $(srcdir)/Modules/{name}.c"
+        command = shlex.split(
+            subprocess.check_output(
+                [
+                    str(make),
+                    "--no-print-directory",
+                    "--old-file=Makefile",
+                    "--eval",
+                    compile_rule,
+                    "CC=" + shlex.join(cc),
+                    "srcdir=" + str(source),
+                    "abs_srcdir=" + str(source),
+                    "abs_builddir=" + str(guest),
+                    "shellsim_process_compile",
+                ],
+                cwd=guest,
+                env=environment,
+                text=True,
+            )
+        )
+        original = str(source / "Modules" / (name + ".c"))
+        if command.count(original) != 1:
+            raise ValueError("CPython process module source or link differs: " + name)
+        command[command.index(original)] = str(staging / "Modules" / (name + ".c"))
+        obj = work / (name + ".o")
+        command.extend(["-I", str(process), "-I", str(source / "Modules"), *extra, "-o", str(obj)])
+        run(command, guest, environment, work / (name + ".log"))
+        process_objects[name] = obj
+    return process_objects
+
+
+def relink(
+    previous,
+    recipe,
+    overlay,
+    compiler,
+    sdk,
+    sysroot_prefix,
+    llvm_prefix,
+    work,
+    environment,
+    *,
+    recompile_process=False,
+    make=None,
+):
     """Reuse only a sealed compile receipt; publish a distinct relinked runtime."""
     manifest_path = previous / "manifest.json"
     old = json.loads(manifest_path.read_text())
@@ -180,8 +293,11 @@ def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix
         for item in recipe["build_scripts"]
         if Path(item["file"]).suffix in {".c", ".h", ".patch"}
     }
-    if old_compile_sources != new_compile_sources:
-        raise ValueError("CPython relink facade sources changed")
+    admit_process_refresh(old_compile_sources, new_compile_sources, recompile_process)
+    if recompile_process and make is None:
+        raise ValueError("process recompilation requires an admitted Make tool")
+    if recompile_process and profile["compiler"] != compiler:
+        raise ValueError("CPython facade refresh requires the same frontend compiler receipt")
     if compile_receipt(previous, profile["link"], old_sysroot) != profile["compile_inputs"]:
         raise ValueError("CPython retained compile inputs changed")
     if tree_identity(sysroot_prefix / "sysroot/include") != profile["compile_inputs"]["sysroot_headers_sha256"]:
@@ -209,6 +325,30 @@ def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix
         elif argument.startswith(str(previous) + "/"):
             argument = str(work) + argument[len(str(previous)) :]
         link.append(argument)
+    if recompile_process:
+        process = Path(__file__).resolve().parents[2] / "toolchain/wasi_process"
+        process_recipe = json.loads((process / "recipe.json").read_text())
+        for name, expected in process_recipe["port_sources_sha256"].items():
+            if file_hash(process / name) != expected:
+                raise ValueError("virtual process source differs: " + name)
+        old_process = profile["process_source_recipe"]
+        if {k: v for k, v in old_process.items() if k != "port_sources_sha256"} != {
+            k: v for k, v in process_recipe.items() if k != "port_sources_sha256"
+        }:
+            raise ValueError("CPython facade refresh process patch or source differs")
+        objects = compile_process_facades(
+            work,
+            make,
+            link[:5],
+            environment,
+            Path(__file__).resolve().parent,
+        )
+        profile = {
+            **profile,
+            "process_objects": {name: file_hash(path) for name, path in objects.items()},
+            "process_source_recipe": process_recipe,
+            "process_recompile_from": {"manifest_sha256": file_hash(manifest_path), "sources": old_compile_sources},
+        }
     # A newly admitted platform can add public libc APIs without changing headers.
     # Refresh retention on relink rather than replaying only the old archive's symbols.
     libc = sysroot_prefix / "sysroot/lib/wasm32-wasip1-threads/libc.a"
@@ -249,7 +389,7 @@ def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix
     return work
 
 
-def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_from=None):
+def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_from=None, recompile_process=False):
     directory = Path(__file__).resolve().parent
     recipe = json.loads((directory / "threaded-recipe.json").read_text())
     check_build_scripts(recipe, directory)
@@ -273,7 +413,21 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
     if work.exists():
         raise ValueError("use a fresh threaded CPython output directory")
     if relink_from is not None:
-        return relink(relink_from, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment)
+        return relink(
+            relink_from,
+            recipe,
+            overlay,
+            compiler,
+            sdk,
+            sysroot_prefix,
+            llvm_prefix,
+            work,
+            environment,
+            recompile_process=recompile_process,
+            make=make,
+        )
+    if recompile_process:
+        raise ValueError("process recompilation requires --relink-from")
     work.mkdir(parents=True)
     source = work / "Python-3.13.7"
     extract(archive, source, recipe["source"]["sha256"], set())
@@ -344,65 +498,12 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
             text=True,
         )
     )
-    process_objects = {}
-    for name, input_source, flags in [
-        ("process", process / "process.c", ["-D_WASI_EMULATED_SIGNAL=1"]),
-        ("posix", directory / "threaded_posix.c", ["-include", str(process / "process_abi.h")]),
-    ]:
-        obj = work / (name + ".o")
-        run(
-            [*cc, "-O2", "-I", str(process), *flags, "-c", str(input_source), "-o", str(obj)],
-            guest,
-            environment,
-            work / (name + ".log"),
-        )
-        process_objects[name] = obj
-    for name, extra in [
-        (
-            "posixmodule",
-            [
-                "-DHAVE_UMASK=1",
-                "-DHAVE_PIPE=1",
-                "-DHAVE_WAITPID=1",
-                "-DHAVE_SYS_WAIT_H=1",
-                "-DHAVE_KILL=1",
-                "-DHAVE_GETPID=1",
-                "-DHAVE_GETPPID=1",
-                "-DHAVE_POSIX_SPAWN=1",
-                "-DHAVE_POSIX_SPAWNP=1",
-                "-DHAVE_POSIX_SPAWN_FILE_ACTIONS_ADDCLOSEFROM_NP=1",
-                "-include",
-                str(toolchain / "posix.h"),
-                "-include",
-                str(process / "process_port.h"),
-            ],
-        ),
-        ("signalmodule", []),
-        ("faulthandler", []),
-    ]:
-        flags = (
-            "$(MODULE_FAULTHANDLER_CFLAGS) $(PY_BUILTIN_MODULE_CFLAGS)"
-            if name == "faulthandler"
-            else "$(PY_CORE_CFLAGS)"
-        )
-        compile_rule = f"shellsim_process_compile:; @echo $(CC) {flags} -c $(srcdir)/Modules/{name}.c"
-        command = shlex.split(
-            subprocess.check_output(
-                [str(make), "--no-print-directory", "--eval", compile_rule, "shellsim_process_compile"],
-                cwd=guest,
-                env=environment,
-                text=True,
-            )
-        )
-        original = str(source / "Modules" / (name + ".c"))
-        if command.count(original) != 1 or link.count("Modules/" + name + ".o") != 1:
-            raise ValueError("CPython process module source or link differs: " + name)
-        command[command.index(original)] = str(staging / "Modules" / (name + ".c"))
-        obj = work / (name + ".o")
-        command.extend(["-I", str(process), "-I", str(source / "Modules"), *extra, "-o", str(obj)])
-        run(command, guest, environment, work / (name + ".log"))
-        link[link.index("Modules/" + name + ".o")] = str(obj)
-        process_objects[name] = obj
+    process_objects = compile_process_facades(work, make, cc, environment, directory)
+    for name in ("posixmodule", "signalmodule", "faulthandler"):
+        original = "Modules/" + name + ".o"
+        if link.count(original) != 1:
+            raise ValueError("CPython process module link differs: " + name)
+        link[link.index(original)] = str(process_objects[name])
     if link.count("-lwasi-emulated-getpid") != 1:
         raise ValueError("CPython PID stub link differs")
     link.remove("-lwasi-emulated-getpid")
@@ -495,6 +596,7 @@ def main():
     for name in ("archive", "helper", "sdk", "sysroot-prefix", "llvm-prefix", "make", "work"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--relink-from", type=Path)
+    parser.add_argument("--recompile-process", action="store_true")
     args = parser.parse_args()
     print(
         build(
@@ -503,6 +605,7 @@ def main():
                 for name in ("archive", "helper", "sdk", "sysroot_prefix", "llvm_prefix", "make", "work")
             ),
             relink_from=args.relink_from.resolve() if args.relink_from else None,
+            recompile_process=args.recompile_process,
         )
     )
 

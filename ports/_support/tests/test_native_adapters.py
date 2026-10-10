@@ -195,3 +195,42 @@ def test_extracted_source_vcs_fallback_ignores_parent_commits(build_request, mon
     expected = subprocess.check_output([git, "describe", "--always"], cwd=source).decode()
     build_native(request)
     assert (source / "source-version").read_text() == expected
+
+
+def test_executable_archive_tail_resolves_real_symbol_only_for_links(build_request):
+    from ports._support.native_adapters import compiler_wrapper_text
+
+    context = build_request.context
+    context.source.mkdir()
+    provider = context.source / "provider.c"
+    provider.write_text("int supplied(void) { return 37; }\n")
+    consumer = context.source / "consumer.c"
+    consumer.write_text("extern int supplied(void); int main(void) { return supplied() != 37; }\n")
+    compiler, archiver = shutil.which("cc"), shutil.which("ar")
+    assert compiler is not None and archiver is not None
+    object_file, archive = context.source / "provider.o", context.source / "provider.a"
+    subprocess.run([compiler, "-c", str(provider), "-o", str(object_file)], check=True)
+    subprocess.run([archiver, "rcs", str(archive), str(object_file)], check=True)
+    context = replace(
+        context,
+        host_tools={"python": Path(sys.executable)},
+        target_tools={"cc": Path(compiler)},
+        executable_link_inputs=(archive,),
+    )
+    response = Path(__file__).parents[1] / "compiler_response.py"
+    wrapper = context.source / "cc"
+    wrapper.write_text(compiler_wrapper_text(context, "cc", response.read_text()))
+    wrapper.chmod(0o755)
+    output = context.source / "consumer.o"
+    subprocess.run([str(wrapper), "-Werror", "-c", str(consumer), "-o", str(output)], check=True)
+    executable = context.source / "consumer"
+    subprocess.run([str(wrapper), str(output), "-o", str(executable)], check=True)
+    assert subprocess.run([str(executable)], check=False).returncode == 0
+    # A shared link receives only its shared inputs, and must not silently borrow
+    # an archive declared for executable ownership.
+    result = subprocess.run(
+        [str(wrapper), "-shared", "-Wl,--no-undefined", str(output), "-o", str(context.source / "consumer.so")],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode != 0

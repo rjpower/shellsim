@@ -6,7 +6,7 @@
   "build": {
     "adapter": "wasi-sysroot",
     "producer_recipe": "dynamic-recipe.json",
-    "producer_sha256": "62743e684e4428ddaa91750792de60ddb877090aea9c9ed11858a44751426234"
+    "producer_sha256": "927dc5addf622c1be6b7e0e28dcf26d07f67dcd43a680c1d5334ee33e156c3a9"
   },
   "build_dependencies": [
     {

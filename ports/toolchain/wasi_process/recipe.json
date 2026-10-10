@@ -18,14 +18,15 @@
   "patch_sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
   "port_sources_sha256": {
     "build.py": "69a190ca77bc58ba9ba0adae2b917e8a16a5de23964a59f86e60de29fdcc2c5d",
-    "process.c": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272",
-    "process_abi.h": "157c02f5fd5ebba9fc74aa03f7209e9c5ca9d040e969f50e14ea0190a3e7c862",
+    "process.c": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7",
+    "process_abi.h": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73",
     "process_port.h": "42f5b24baa92c300dee0756d4faff51364274c6cac977978581f6d7ccc06714f",
     "spawn.h": "099b12b83babaa658eada6b8848a49822e7d0c3ba9c2d548d0a5cc60fd235108",
     "sys/wait.h": "aabcb78324279b198a4599bc9e800e04ac639ea4fff695409bbec9c3bd3b1698",
-    "exec.c": "3f152fe442b57e0c65acd4b71635a3755f52097c26d21659633f1e323fe2d10b",
+    "exec.c": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7",
     "exec_port.h": "9fcd6343589ef58d8e2e1d4395f017fbe357c9eccf736b18a05583897b53a56a",
     "tempfile.c": "2e9a332923ecdd89088fe52b9118e32245ff6767c819b3d47a4763be8e659b4f",
-    "tempfile_port.h": "ff9d96e030f707bff65b96491532965fb6968a4b8f1c60a0ee6a1bec6c630325"
+    "tempfile_port.h": "ff9d96e030f707bff65b96491532965fb6968a4b8f1c60a0ee6a1bec6c630325",
+    "process_limits.h": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
   }
 }

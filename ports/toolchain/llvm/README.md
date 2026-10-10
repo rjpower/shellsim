@@ -69,3 +69,63 @@ using `threaded.py` and a fresh work directory. The output manifest records all
 four patches, the complete driver/helper identity, host tool hashes, both
 compiler binaries and the upstream license. Diagnostic binaries built before
 this driver are evidence only and are not admitted as products of this recipe.
+
+The host and guest compiler producers can retain their Ninja trees when a pinned patch is
+appended to the existing patch sequence. Admission requires the same source
+archive and all non-patch compilation inputs, the exact old patch prefix, an unchanged CMake cache,
+and a full comparison of the retained source against the old pinned inputs.
+A failed build may receive a verified appended correction after configuration
+completed; configuring or unknown phases are rejected. Only a successful
+actual build marks the workspace ready.
+Only the declared affected files and patch markers move to the new admitted
+source. Atomic file replacement and a hash-bound journal make an interrupted
+update recoverable; unrelated source edits are rejected. New products record
+both source identities and keep the earlier immutable products.
+
+The guest producer also exposes `prepare_guest`: it admits the same inputs,
+configures the retained tree and records a Ninja dry-run. Preparation leaves
+the workspace unfinished and creates no sealed product. The normal graph
+build must complete the actual Ninja actions and seal the new output.
+
+Optional linker-synthesized data symbols belong to the current image. A symbol
+exported by a linked shared library cannot supply the main executable's heap or
+first-page boundary; explicit definitions in the current object's inputs still
+take precedence. The host linker ownership correction also needs to be applied
+to the guest linker before guest compilation against shared providers is admitted.
+
+## Canonical executable runtime
+
+Native main links retain one admitted C/C++ runtime. The shared runtime-profile
+generator selects the public libc definitions from its GNU archive index and
+retains the EH, setjmp and long-double archives before ordinary link inputs.
+Shared libraries import process state instead of retaining their own libc.
+Executable archive inputs also apply to configure-time executable probes.
+
+Installed guest Clang selects this policy from the versioned
+`lib/wasm32-wasip1-threads/shellsim-executable-runtime-v1.json` in its selected
+SDK. The driver bounds and validates the profile before replacing `@SYSROOT@`
+archive prefixes. The opt-in applies only to wasm32 WASI preview1 shared-memory
+links. Compilation and preprocessing do not insert linker inputs. Shared links
+omit CRT/default runtime inputs; relocatable and explicitly suppressed-runtime
+main links retain the upstream policy.
+
+The canonical main profile requests `--split-runtime-ctors`. This explicitly
+opts into the pinned implementation's constructor-priority convention: priorities
+through 100 initialize libc and libc++ before side constructors; higher
+priorities remain application constructors. The linker exports
+`__wasm_call_runtime_ctors`, and ordinary `__wasm_call_ctors` calls this guarded
+bootstrap before application constructors. The guard lives in process linear
+memory, so worker instantiation cannot reset it. Completed initialization is
+idempotent; recursive or concurrent initialization traps under the required
+serialized startup contract. The loader binds imports and applies data
+relocations before calling the hook, then runs side constructors before the
+main command starts. Static mains without this opt-in keep their existing
+constructor sequence.
+
+Guest retained builds can update admitted native dependency headers after
+verifying the old source, configuration and snapshots. Source patches, target,
+compiler, platform/resource headers and build tools stay exact. Atomic header
+replacement and an old/new inventory journal permit interrupted updates to
+resume; changed files receive fresh mtimes. Ninja recompiles their dependants
+before the normal producer seals a new product. Header updates never certify
+previous object bytes as outputs of the changed inputs.

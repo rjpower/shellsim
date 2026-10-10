@@ -10,6 +10,7 @@ import json
 import shlex
 import shutil
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from ports._support.build import apply_patch, check_build_scripts
@@ -20,10 +21,12 @@ from ports.toolchain.llvm.build import digest, run
 from ports.toolchain.llvm.compiler import (
     configure_and_build,
     identity_hash,
+    update_workspace_patches,
     verify_product,
     verify_source,
     write_workspace,
 )
+from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, PROFILE_NAME, guest_runtime_profile
 
 PORT = Path(__file__).resolve().parent
 TARGETS = ("clang", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy")
@@ -224,6 +227,90 @@ def _refresh_snapshot(source, destination, inventory, previous, directories=()):
         raise ValueError("guest LLVM replacement dependency snapshot differs")
 
 
+def _update_dependency_headers(context, recipe, workspace, state, compatibility, snapshots):
+    """Refresh admitted native headers and let Ninja invalidate their dependants.
+
+    Source, compiler, platform headers and configuration remain exact. The
+    journal authorizes only old/new dependency bytes across an interruption;
+    changed files get fresh mtimes, and no compiled object is blessed or edited.
+    """
+    old = state["compatibility"]
+
+    def fixed(value):
+        return {**value, "headers": {k: v for k, v in value["headers"].items() if k != "posix"}}
+
+    if fixed(old) != fixed(compatibility) or old["headers"]["posix"] == compatibility["headers"]["posix"]:
+        raise ValueError("guest header update requires identical source, tools and platform inputs")
+    if state.get("phase", "ready") not in {"ready", "building"}:
+        raise ValueError("guest header update requires a completed configuration")
+    if digest(context.build / "CMakeCache.txt") != state["configuration_sha256"]:
+        raise ValueError("guest LLVM configuration differs")
+    if digest(context.source) != recipe["source"]["sha256"]:
+        raise ValueError("guest LLVM source archive differs")
+    source_hash = verify_source(context.source, workspace / "source", recipe, PORT)
+    for name, expected in state["inputs"]["compiler_tools"].items():
+        if digest(workspace / "inputs/compiler" / name) != expected:
+            raise ValueError("guest previous compiler snapshot differs: " + name)
+    previous = state["inputs"]["snapshots"]
+    for name in previous:
+        if name != "posix" and _inventory(workspace / "inputs" / name) != previous[name]:
+            raise ValueError("guest previous dependency snapshot differs: " + name)
+    origin, current = snapshots["posix"]
+    before = previous["posix"]
+    for expected, inventory in ((old["headers"]["posix"], before), (compatibility["headers"]["posix"], current)):
+        if expected != {name: value for name, value in inventory.items() if Path(name).parts[0] == "include"}:
+            raise ValueError("guest header compatibility differs from dependency snapshot")
+    changed = {name for name in before.keys() | current.keys() if before.get(name) != current.get(name)}
+    if len(changed) > 128:
+        raise ValueError("guest dependency update exceeds bounds")
+    for name in changed:
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in {"include", "lib"}:
+            raise ValueError("guest dependency update path escapes snapshot")
+        if not (workspace / "inputs/posix" / name).resolve().is_relative_to((workspace / "inputs/posix").resolve()):
+            raise ValueError("guest dependency update follows an escaping symlink")
+        if name in current and (origin / name).is_symlink():
+            raise ValueError("guest dependency update source is linked")
+    if sum((origin / name).stat().st_size for name in changed if name in current) > 16 * 1024**2:
+        raise ValueError("guest dependency update exceeds bounds")
+    journal = workspace / "header-update.json"
+    update = {"old": old, "new": compatibility, "before": before, "after": current}
+    if journal.exists():
+        if json.loads(journal.read_text()) != update:
+            raise ValueError("pending guest dependency update differs")
+    else:
+        if _inventory(workspace / "inputs/posix", ("include", "lib")) != before:
+            raise ValueError("guest previous native snapshot differs")
+        write_workspace(journal, update)
+    destination = workspace / "inputs/posix"
+    actual = _inventory(destination, ("include", "lib"))
+    if actual.keys() - (before.keys() | current.keys()):
+        raise ValueError("guest dependency snapshot has unrecorded files")
+    for name in before.keys() | current.keys():
+        if actual.get(name) not in {before.get(name), current.get(name)}:
+            raise ValueError("guest dependency snapshot is neither admitted old nor new bytes")
+    for name in sorted(changed):
+        output = destination / name
+        if name not in current:
+            output.unlink(missing_ok=True)
+        elif actual.get(name) != current[name]:
+            if digest(origin / name) != current[name]:
+                raise ValueError("guest new dependency changed during update")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = workspace / "header-update-file.preparing"
+            shutil.copyfile(origin / name, temporary)
+            temporary.replace(output)
+    if _inventory(destination, ("include", "lib")) != current:
+        raise ValueError("guest updated native snapshot differs")
+    state["compatibility"] = compatibility
+    state["phase"] = "building"
+    state["inputs"]["snapshots"]["posix"] = current
+    state.setdefault("dependency_header_updates", []).append({"before": before, "after": current})
+    write_workspace(workspace / "workspace.json", state)
+    journal.unlink()
+    return source_hash
+
+
 def _validate_guest_layout(recipe):
     """Reject layouts that disagree with the compiler's fixed virtual SDK paths."""
     destinations = recipe["install"]["destinations"]
@@ -236,6 +323,44 @@ def _validate_guest_layout(recipe):
         for source, destination in sdk["install"].get(field, {}).items():
             if destination != "/usr/local/" + source:
                 raise ValueError("guest development SDK requires /usr/local")
+
+
+@dataclass(frozen=True)
+class GuestBuildPreparation:
+    """Verified source/configuration and dry-run evidence, never a published product."""
+
+    source: Path
+    source_sha256: str
+    commands: list[list[str]]
+    identity: dict
+    prefix: Path
+    state: dict
+
+
+def prepare_guest(context, recipe, compiler, *, jobs=None) -> GuestBuildPreparation:
+    """Admit source updates and snapshots, configure, then stop after Ninja dry-run.
+
+    The receipt remains in building phase. Normal build_guest must perform the
+    actual build and seal a new product before the graph can consume it.
+    """
+    workspace = context.build.parent
+    workspace.mkdir(parents=True, exist_ok=True)
+    with (workspace / ".guest-llvm.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
+        attempts = workspace / "attempts" / plan.prefix.name
+        attempts.mkdir(parents=True, exist_ok=True)
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
+        configure_and_build(
+            plan.commands,
+            context.build,
+            plan.state,
+            workspace / "workspace.json",
+            attempts,
+            environment,
+            prepare_only=True,
+        )
+        return plan
 
 
 def build_guest(context, recipe, compiler, *, jobs=None):
@@ -252,7 +377,36 @@ def build_guest(context, recipe, compiler, *, jobs=None):
         return _build_guest_locked(context, recipe, compiler, workspace, jobs)
 
 
-def _build_guest_locked(context, recipe, compiler, workspace, jobs):
+def _invalidate_final_outputs(build, recipe, state, receipt, changed):
+    """Keep link invalidation durable until a successful actual Ninja build.
+
+    Clang's public executable is a symlink to its versioned binary. Record both
+    paths before updating snapshots so interrupted preparation cannot forget
+    the real output that must consume the newly admitted linker and archives.
+    """
+    root = (build / "bin").resolve()
+    if changed or state.get("phase") == "building":
+        paths = [build / "bin" / name for name in TARGETS]
+        paths.append(build / "bin" / ("clang-" + recipe["version"].split(".")[0]))
+        outputs = set(state.get("pending_final_outputs", []))
+        for path in paths:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
+                raise ValueError("guest LLVM final output escapes build/bin")
+            outputs.update((str(path.relative_to(build)), str(resolved.relative_to(build.resolve()))))
+        state["pending_final_outputs"] = sorted(outputs)
+        write_workspace(receipt, state)
+    for name in state.get("pending_final_outputs", []):
+        relative = Path(name)
+        path = build / relative
+        if relative.is_absolute() or ".." in relative.parts or relative.parent != Path("bin"):
+            raise ValueError("invalid pending guest LLVM final output")
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("pending guest LLVM final output escapes build/bin")
+        path.unlink(missing_ok=True)
+
+
+def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
     requested_jobs = recipe["build"]["jobs"] if jobs is None else jobs
@@ -295,14 +449,45 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     state = {"schema_version": 1, "compatibility": compatibility, "inputs": inputs}
     previous = inputs["snapshots"]
     previous_tools = compiler_tools
+    updated_source_hash = None
     if receipt.exists():
         state = json.loads(receipt.read_text())
+        pending_headers = workspace / "header-update.json"
+        if pending_headers.exists() and state["compatibility"] == compatibility:
+            pending = json.loads(pending_headers.read_text())
+            if (
+                pending["new"] != compatibility
+                or _inventory(workspace / "inputs/posix", ("include", "lib")) != pending["after"]
+            ):
+                raise ValueError("completed guest header update differs")
+            pending_headers.unlink()
         if state["compatibility"] != compatibility:
-            raise ValueError("guest LLVM workspace inputs differ; choose another workspace")
+            if state["compatibility"]["patches"] == compatibility["patches"]:
+                updated_source_hash = _update_dependency_headers(
+                    context, recipe, workspace, state, compatibility, snapshots
+                )
+            else:
+                updated_source_hash = update_workspace_patches(
+                    context.source,
+                    workspace / "source",
+                    recipe,
+                    PORT,
+                    workspace,
+                    state,
+                    compatibility,
+                    build_directory=context.build,
+                )
         previous = state["inputs"]["snapshots"]
         previous_tools = state["inputs"]["compiler_tools"]
     elif context.build.exists() or (workspace / "source").exists():
         raise ValueError("guest LLVM workspace has no input receipt")
+    _invalidate_final_outputs(
+        context.build,
+        recipe,
+        state,
+        receipt,
+        previous != inputs["snapshots"] or previous_tools["wasm-ld"] != compiler_tools["wasm-ld"],
+    )
     for name, (source, inventory) in snapshots.items():
         _refresh_snapshot(
             source,
@@ -314,11 +499,6 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     state["inputs"] = inputs
     write_workspace(receipt, state)
     _snapshot_tools(compiler.root / "bin", workspace / "inputs/compiler", compiler_tools, previous_tools)
-    if previous != inputs["snapshots"] or previous_tools["wasm-ld"] != compiler_tools["wasm-ld"]:
-        # Driver-selected sysroot archives and -fuse-ld are not Ninja link
-        # dependencies. Remove only final binaries to relink with admitted bytes.
-        for name in TARGETS:
-            (context.build / "bin" / name).unlink(missing_ok=True)
     source = workspace / "source"
     if not source.exists():
         preparing = workspace / "source.preparing"
@@ -337,16 +517,38 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
             apply_patch(roots[0], PORT / patch["file"], patch["sha256"])
         roots[0].rename(source)
         preparing.rmdir()
-    source_hash = verify_source(context.source, source, recipe, PORT)
+    source_hash = updated_source_hash or verify_source(context.source, source, recipe, PORT)
+    journal = workspace / "patch-update.json"
+    if journal.exists():
+        if json.loads(journal.read_text())["new"] != compatibility:
+            raise ValueError("pending guest LLVM patch update differs")
+        journal.unlink()
     commands = _commands(context, workspace, source, compile_jobs)
     identity = {**inputs, "commands": commands}
     key = identity_hash(identity)
     prefix = workspace / "products" / key
+    return GuestBuildPreparation(source, source_hash, commands, identity, prefix, state)
+
+
+def _build_guest_locked(context, recipe, compiler, workspace, jobs):
+    plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
+    source, source_hash, commands, identity, prefix, state = (
+        plan.source,
+        plan.source_sha256,
+        plan.commands,
+        plan.identity,
+        plan.prefix,
+        plan.state,
+    )
+    key = prefix.name
+    receipt = workspace / "workspace.json"
     if not prefix.exists():
         attempts = workspace / "attempts" / key
         attempts.mkdir(parents=True, exist_ok=True)
         environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
         configure_and_build(commands, context.build, state, receipt, attempts, environment)
+        state.pop("pending_final_outputs", None)
+        write_workspace(receipt, state)
         staging = prefix.with_name(key + ".preparing")
         if staging.exists():
             shutil.rmtree(staging)
@@ -355,6 +557,8 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
             "schema_version": 1,
             "identity": identity,
             "source_tree_sha256": source_hash,
+            "patch_updates": state.get("patch_updates", []),
+            "dependency_header_updates": state.get("dependency_header_updates", []),
             "artifacts": _inventory(staging),
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
@@ -525,23 +729,19 @@ def _install_commands(build, destination, source, strip, attempts):
         output = destination / "bin" / alias
         output.write_text(f'#!/bin/sh\nexec /usr/bin/{command} "$@"\n')
         output.chmod(0o755)
-    flags = """--target=wasm32-wasip1-threads
--pthread
---sysroot=/usr/local/wasi-sysroot
--resource-dir=/usr/local/lib/clang/23
--fuse-ld=/usr/bin/wasm-ld
--fwasm-exceptions
--mllvm
--wasm-use-legacy-eh=false
--lunwind
--Wl,/usr/local/wasi-sysroot/lib/wasm32-wasip1-threads/shellsim-abi.o
--Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory
--Wl,--initial-memory=16777216,--max-memory=67108864
--Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base
--Wl,--export-table,--growable-table,--export=__tls_size,--export=__tls_align
--Wl,--export=__wasm_init_tls,--export=wasi_thread_start,--undefined=pthread_create
--Wl,--export-if-defined=__wasm_apply_global_tls_relocs
-"""
+    flags = (
+        "\n".join(
+            (
+                "--target=wasm32-wasip1-threads",
+                "-pthread",
+                "--sysroot=/usr/local/wasi-sysroot",
+                "-resource-dir=/usr/local/lib/clang/23",
+                "-fuse-ld=/usr/bin/wasm-ld",
+                *COMMON_COMPILER_FLAGS,
+            )
+        )
+        + "\n"
+    )
     for name in ("clang.cfg", "clang++.cfg"):
         (destination / "bin" / name).write_text(flags)
     shutil.copyfile(source / "LICENSE.TXT", destination / "licenses/LLVM-LICENSE.txt")
@@ -554,6 +754,9 @@ def install_guest_sdk(context, recipe):
     destination.mkdir(parents=True, exist_ok=True)
     for name in ("include/c++", "include/wasm32-wasip1-threads", "lib/wasm32-wasip1-threads"):
         shutil.copytree(context.sysroot / name, destination / "wasi-sysroot" / name, symlinks=False)
+    profile = guest_runtime_profile(context.sysroot, context.target)
+    profile_path = destination / "wasi-sysroot/lib" / context.target / PROFILE_NAME
+    profile_path.write_text(json.dumps(profile, sort_keys=True, indent=2) + "\n")
     resources = context.sdk / "lib/clang/23"
     for name in ("include", "lib/wasm32-unknown-wasip1-threads", "lib/wasm32-unknown-wasi-threads"):
         shutil.copytree(resources / name, destination / "lib/clang/23" / name, symlinks=False)

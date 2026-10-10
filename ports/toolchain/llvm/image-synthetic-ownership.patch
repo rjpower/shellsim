@@ -1,0 +1,11 @@
+--- a/lld/wasm/SymbolTable.cpp
++++ b/lld/wasm/SymbolTable.cpp
+@@ -272,7 +272,7 @@
+   Symbol *s = find(name);
+   if (!s && (ctx.arg.exportAll || ctx.arg.exportedSymbols.contains(name)))
+     s = insertName(name).first;
+-  else if (!s || s->isDefined())
++  else if (!s || (s->isDefined() && !s->isShared()))
+     return nullptr;
+   LLVM_DEBUG(dbgs() << "addOptionalDataSymbol: " << name << "\n");
+   auto *rtn = replaceSymbol<DefinedData>(

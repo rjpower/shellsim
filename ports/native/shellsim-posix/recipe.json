@@ -12,7 +12,7 @@
       {
         "path": "native/shellsim-posix/CMakeLists.txt",
         "destination": "CMakeLists.txt",
-        "sha256": "3a3f67622ed20c7e8514f0c803d7e527a313288fdb69a8c4acd78536e2e3c05d"
+        "sha256": "6108439ff07080795afc2c1669a466bc714d537f2017efea48cc405bf31553f9"
       },
       {
         "path": "native/shellsim-posix/shellsim-posix.pc",
@@ -27,12 +27,12 @@
       {
         "path": "toolchain/wasi_process/process.c",
         "destination": "process.c",
-        "sha256": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272"
+        "sha256": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7"
       },
       {
         "path": "toolchain/wasi_process/exec.c",
         "destination": "exec.c",
-        "sha256": "3f152fe442b57e0c65acd4b71635a3755f52097c26d21659633f1e323fe2d10b"
+        "sha256": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7"
       },
       {
         "path": "toolchain/wasi_process/tempfile.c",
@@ -47,7 +47,7 @@
       {
         "path": "toolchain/wasi_process/process_abi.h",
         "destination": "include/process_abi.h",
-        "sha256": "157c02f5fd5ebba9fc74aa03f7209e9c5ca9d040e969f50e14ea0190a3e7c862"
+        "sha256": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73"
       },
       {
         "path": "toolchain/wasi_process/exec_port.h",
@@ -81,16 +81,26 @@
       },
       {
         "path": "toolchain/wasi_sdk/posix.c",
-        "destination": "posix.c",
+        "destination": "toolchain/wasi_sdk/posix.c",
         "sha256": "dee9ca54df32cdad13b6c6cb343dabf18a15cfc3ceb6a817281c026e6ffee450"
       },
       {
         "path": "toolchain/wasi_sdk/posix.h",
         "destination": "include/posix.h",
         "sha256": "9001c6f4658d236bee3f7ee355b67d757792373ce770d306d0260fc99978704c"
+      },
+      {
+        "path": "python/cpython/threaded_posix.c",
+        "destination": "python/cpython/threaded_posix.c",
+        "sha256": "cf01e3775e38e133faff965bdcf22f9a026f22e4d23b380f9f03226c052ca0e0"
+      },
+      {
+        "path": "toolchain/wasi_process/process_limits.h",
+        "destination": "process_limits.h",
+        "sha256": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
       }
     ],
-    "sha256": "9407cf9561a9b1fdbabc0813a66845fa5ce2883f54b1f858f8a3e4cb54d3272d"
+    "sha256": "d809141b2ddfe1865bbe066df84225570c1465e865f0cc47bcd364f72af4a6c7"
   },
   "build_dependencies": [
     {

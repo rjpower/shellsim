@@ -46,6 +46,7 @@ _NATIVE_BUILD_MODULES = (
     "wasm.py",
     "wasm_metadata.py",
     "native/dependencies.py",
+    "toolchain/runtime_profile.py",
 )
 _PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
 
@@ -120,6 +121,34 @@ def _admit_recipe(port: Port) -> dict[str, str]:
         if hook.get("phase") not in {"before_build", "after_install"}:
             raise ValueError("unsupported port hook phase")
     return files
+
+
+def _executable_cohort_link_inputs(cohort: BuildCohort, build: Mapping) -> tuple[Path, ...]:
+    """Resolve declared executable archives only from the verified platform product."""
+    declared = build.get("executable_cohort_link_inputs", [])
+    if not isinstance(declared, list) or len(declared) > 32:
+        raise ValueError("executable cohort link inputs must be a bounded array")
+    if not declared:
+        return ()
+    root = cohort.sysroot.root / "sysroot"
+    inputs = []
+    for raw in declared:
+        name = relative_path(raw)
+        if len(name) > 4096 or not name.endswith(".a") or name in inputs:
+            raise ValueError("executable cohort link input must be a unique archive path")
+        path = root / name
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not path.resolve().is_relative_to(root.resolve())
+            or path.stat().st_size > 128 * 1024**2
+        ):
+            raise ValueError("executable cohort archive is missing or unsupported")
+        expected = cohort.sysroot.contents["artifacts"].get("sysroot/" + name)
+        if not isinstance(expected, str) or file_hash(path) != expected:
+            raise ValueError("executable cohort archive differs from admitted platform")
+        inputs.append(name)
+    return tuple(root / name for name in inputs)
 
 
 def _hooks(port: Port, phase: str, context: NativeBuildContext, cohort: BuildCohort) -> None:
@@ -324,6 +353,7 @@ def build_graph(
             build_cohort = resolved_toolchain(cohort, compiler, sysroot)
             target = _native_target(build_cohort)
         cohorts[port.reference] = build_cohort
+        executable_inputs = _executable_cohort_link_inputs(build_cohort, port.recipe["build"])
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
@@ -345,6 +375,9 @@ def build_graph(
                     }
                 ],
                 "executable": list(build_cohort.executable_flags),
+                "executable_link_inputs": [
+                    {"path": str(path), "sha256": file_hash(path)} for path in executable_inputs
+                ],
             }
         with build_slot(store, inputs) as slot, ExitStack() as workspace_stack:
             keys[port.reference] = slot.key
@@ -425,6 +458,7 @@ def build_graph(
                         shared_library_flags=build_cohort.shared_library_flags,
                         executable_flags=build_cohort.executable_flags,
                         shared_library_inputs=(build_cohort.compiler_runtime_archive,),
+                        executable_link_inputs=executable_inputs,
                     )
                     if adapter in {"python-extension", "python-meson", "python-pep517"}:
                         python = cohort.python

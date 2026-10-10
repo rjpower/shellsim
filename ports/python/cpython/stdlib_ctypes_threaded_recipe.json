@@ -51,7 +51,7 @@
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "46cf695de3349f1ee1cc1b1f24a414c395c02431e6f7c160aed23cadad5fea9c"
+      "sha256": "fab20ce9f2e654ee835a3997e1b808f4d4ca81827a36f9cae074491ae38aa743"
     },
     {
       "file": "../../native/libffi/threaded/toolchain.py",
@@ -98,7 +98,7 @@
     "count": 265,
     "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
   },
-  "cpython_manifest_sha256": "592fa85e2fbaaf47ffab162b8f63a5a89ebb49a1464cc3bacd69478685ab4914",
-  "cpython_recipe_sha256": "775ea746f5153c9c188c4a8a4978b067c01f46e73b872734e399007184acb846",
-  "cpython_recipe_digest": "3a7c739227b2952e6c36ce8ace1b7b0cd1b4bb136c770ad9dcce0c9cf781c089"
+  "cpython_manifest_sha256": "8b46ecc864510ed9c796476acd2c867cabd37aa8661cf031c5833dbb3031f962",
+  "cpython_recipe_sha256": "fcdebc0fcde49b4752051e32ed47820590ac0710453637e946d089f53e226f1b",
+  "cpython_recipe_digest": "44a4463764ec967262cdb49d539da98f700a1dfa2f5c444395a8a9ea614d94b4"
 }

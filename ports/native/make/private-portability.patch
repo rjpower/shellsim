@@ -1,0 +1,23 @@
+--- a/src/config.h.in
++++ b/src/config.h.in
+@@ -1,5 +1,20 @@
+ /* src/config.h.in.  Generated from configure.ac by autoheader.  */
+ 
++#ifdef __wasi__
++/* Keep bundled GNU semantics private to Make, alongside the runtime libc. */
++# define getopt shellsim_make_getopt
++# define getopt_long shellsim_make_getopt_long
++# define getopt_long_only shellsim_make_getopt_long_only
++# define _getopt_internal shellsim_make__getopt_internal
++# define optarg shellsim_make_optarg
++# define optind shellsim_make_optind
++# define opterr shellsim_make_opterr
++# define optopt shellsim_make_optopt
++# define glob shellsim_make_glob
++# define globfree shellsim_make_globfree
++# define fnmatch shellsim_make_fnmatch
++#endif
++
+ /* CPU and C ABI indicator */
+ #ifndef __i386__
+ #undef __i386__

@@ -1,6 +1,7 @@
 /* Exec transfers control to a new virtual image; no host process is involved. */
 #include "exec_port.h"
 #include "process_abi.h"
+#include "process_limits.h"
 #include <errno.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -14,12 +15,12 @@ extern int shellsim_process_exec(const char *path, char *const argv[], uint32_t 
                                 char *const environment[], uint32_t environment_count,
                                 uint32_t flags);
 
-static int vector_count(char *const values[], uint32_t *count) {
+static int vector_count(char *const values[], uint32_t maximum, uint32_t *count) {
     if (values == NULL) {
         *count = 0;
         return 0;
     }
-    for (uint32_t index = 0; index <= SHELLSIM_PROCESS_MAX_ARGUMENTS; ++index) {
+    for (uint32_t index = 0; index <= maximum; ++index) {
         if (values[index] == NULL) {
             *count = index;
             return 0;
@@ -35,7 +36,8 @@ static int replace(const char *path, char *const argv[], char *const environment
         errno = EFAULT;
         return -1;
     }
-    if (vector_count(argv, &argc) || vector_count(environment, &environment_count)) return -1;
+    if (vector_count(argv, SHELLSIM_PROCESS_MAX_ARGUMENTS, &argc) ||
+        vector_count(environment, SHELLSIM_PROCESS_MAX_ENVIRONMENT, &environment_count)) return -1;
     int error = shellsim_process_exec(path, argv, argc, environment, environment_count, flags);
     /* Success unwinds the old image inside the host import and cannot return. */
     errno = error != 0 ? error : EIO;

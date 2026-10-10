@@ -13,7 +13,7 @@
     "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
     "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f"
   },
-  "compiler_recipe_sha256": "44051f1674acd83ca8f59466920507929ee36330c6190e140284663533177126",
+  "compiler_recipe_sha256": "382f0fedebdcb774a21215e205652559e7ba44f1e1cb3c57d1b777100d926157",
   "patches": [
     {
       "file": "wasi-libc-scheduler-v2.patch",
@@ -87,7 +87,7 @@
     },
     {
       "file": "../llvm/compiler.py",
-      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+      "sha256": "0be2583f1646f70167514f9b17101ffd1d5fc524a5d7b4cf4adb8d320caf826a"
     },
     {
       "file": "wasi-libc-atfork.patch",

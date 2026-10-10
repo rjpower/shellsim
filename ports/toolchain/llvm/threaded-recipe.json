@@ -59,6 +59,30 @@
         "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
         "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
       }
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
+      "inputs": {
+        "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
+      }
+    },
+    {
+      "file": "runtime-ctors.patch",
+      "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10",
+      "inputs": {
+        "lld/wasm/Config.h": "ed372be1e01c7b6da82b8ba6a23736469fa1c674ea47368f1024aa2f6c925ec0",
+        "lld/wasm/Options.td": "eeaab5b15bee6337c92cc532f9676f6fbffed0bd7b9f8355d2bc77bc34caf80f",
+        "lld/wasm/Driver.cpp": "300fa30ffb7c6f1bd58885ffd6df8a57f390f908942abe72fde827495db70802",
+        "lld/wasm/Writer.cpp": "074ed90ec1b2cf59df617fe34c182e0a927aa9389af9452e29291c72a3bbcf55"
+      }
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035",
+      "inputs": {
+        "lld/wasm/Writer.cpp": "33b00cbf116dd29c4e1abc3ec3c31d2106b089bbb007413c052fe838ee6801c4"
+      }
     }
   ],
   "build_limits": {
@@ -99,6 +123,18 @@
     {
       "file": "tls-reloc-symbol.patch",
       "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117"
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231"
+    },
+    {
+      "file": "runtime-ctors.patch",
+      "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10"
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035"
     }
   ],
   "main_tls_protocol": {

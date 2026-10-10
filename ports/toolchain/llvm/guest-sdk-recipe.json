@@ -26,7 +26,7 @@
   "build_scripts": [
     {
       "file": "guest.py",
-      "sha256": "137a62f2702d8cd4995d0fae8795fe70e0937fb58af7251a642c5a1054cad88d"
+      "sha256": "51048336ccf5960bd1966e5d2a537c25e3aa927440da256d17da9c79fe3dff2c"
     },
     {
       "file": "build.py",
@@ -34,11 +34,15 @@
     },
     {
       "file": "compiler.py",
-      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+      "sha256": "0be2583f1646f70167514f9b17101ffd1d5fc524a5d7b4cf4adb8d320caf826a"
     },
     {
       "file": "../../_support/build.py",
       "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "../runtime_profile.py",
+      "sha256": "52650530d477fe1fbf4e5aa1776b288107b0f7db4710b9aa796502ecce8d741c"
     }
   ],
   "name": "wasi-development",
@@ -154,7 +158,7 @@
   ],
   "test_limits": {
     "cpu": 2000000000,
-    "memory": 268435456,
+    "memory": 1073741824,
     "disk": 201326592
   }
 }

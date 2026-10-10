@@ -1,6 +1,7 @@
 /* Canonical libc process entry points backed by virtual PIDs and descriptors.
  * The Rust kernel repeats every bound check before touching process state. */
 #define _GNU_SOURCE
+#include "process_limits.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>

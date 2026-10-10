@@ -258,3 +258,28 @@ of the enclosing Shellsim commit. A pinned checkout inside the source tree
 remains discoverable. Inherited Git directory/work-tree overrides are excluded
 by the existing target environment allowlist. Retained generated VCS headers
 may change once when this boundary corrects a previously embedded parent hash.
+
+`build.executable_cohort_link_inputs` declares at most 32 static archives by
+canonical path relative to the resolved platform sysroot, for example
+`lib/wasm32-wasip1-threads/libsetjmp.a`. The runner rejects escaping paths,
+symlinks, missing files, duplicate entries, archives larger than 128 MiB, and
+bytes absent from the admitted platform inventory before consulting the result
+cache. Exact paths and hashes remain result inputs. The common compiler wrapper
+adds these archives after the original executable link arguments, preserving
+static archive order. Compilation and shared links do not consume them. Retained
+workspace admission binds the resulting compiler wrapper text.
+
+Native acceptance selects executable dynamic linking when its declared exact
+link inputs include a shared provider. Static-only probes keep the ordinary
+executable link policy. This selection is derived from admitted files rather
+than arbitrary test linker switches; the resulting command records the exact
+inputs and still runs as a native guest executable.
+
+Executable archives also apply to executable links made by upstream configure
+probes. Their feature checks see the same executable archive inputs as the final
+commands. Shared links receive their independently declared shared inputs.
+
+Declared acceptance `files` stage bounded, regular port files below `/work`
+before the probe runs. Each entry names `source` and a canonical relative
+`destination`; duplicate destinations and path escapes are rejected. Proofs
+record the SHA-256 of each staged file alongside the probe script hash.

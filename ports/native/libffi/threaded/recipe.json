@@ -90,8 +90,8 @@
     "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
   },
   "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "compiler_recipe_sha256": "44051f1674acd83ca8f59466920507929ee36330c6190e140284663533177126",
-  "overlay_recipe_sha256": "62743e684e4428ddaa91750792de60ddb877090aea9c9ed11858a44751426234",
+  "compiler_recipe_sha256": "382f0fedebdcb774a21215e205652559e7ba44f1e1cb3c57d1b777100d926157",
+  "overlay_recipe_sha256": "927dc5addf622c1be6b7e0e28dcf26d07f67dcd43a680c1d5334ee33e156c3a9",
   "needed_libraries": [],
   "link_flags": [
     "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic,--fatal-warnings,-soname,libffi.so"

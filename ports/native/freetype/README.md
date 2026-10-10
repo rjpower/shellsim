@@ -43,3 +43,18 @@ Set `SHELLSIM_FREETYPE_SOURCE`, `SHELLSIM_FREETYPE_PREFIX` and
 `SHELLSIM_FREETYPE_ZLIB_PREFIX` to run the pinned-source and actual pkg-config
 checks in `ports/native/freetype/tests/test_port.py`. This metadata correction does
 not enable additional font formats, HarfBuzz or Matplotlib providers.
+
+## Threaded shared graph
+
+`graph-recipe.json` uses upstream Meson to build FreeType 2.13.3 as
+`libfreetype.so`, linked to the graph's shared zlib provider from
+`native/zlib/cmake-recipe.json`. Both compilation and publication use the exact
+admitted LLVM/platform graph products. The recipe retains upstream font drivers
+and rasterizers and disables optional PNG, Brotli, bzip2 and HarfBuzz providers
+that this graph does not declare; system zlib is required.
+
+The native consumer links both actual shared libraries. It rejects malformed
+font data, loads an authored BDF font from memory, renders and checks an 8x8
+bitmap glyph, then exercises FreeType's gzip decompressor with valid input,
+invalid input and recovery. The font fixture uses no ambient host fonts.
+The static Meson pilot and serial shared recipes remain separate entrypoints.

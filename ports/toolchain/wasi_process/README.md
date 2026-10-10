@@ -5,8 +5,10 @@ This port adds ordinary `os.pipe`, `os.waitpid`, `os.posix_spawn`, and
 They call the versioned `shellsim_posix_v1` virtual kernel. A child is another
 simulated process; no guest call launches a host process.
 
-`process_abi.h` defines bounded argument, environment, file-action, and string
-limits. File actions run in order on the child's descriptor table before exec:
+`process_abi.h` defines the wire layout and its 64 file-action slots. Private
+`process_limits.h` bounds spawn and exec to 4,096 arguments, 256 environment
+entries and 131,072 combined string bytes, including terminators. This policy
+header is compiled into the process implementation rather than toolchain clients. File actions run in order on the child's descriptor table before exec:
 close, dup2, closefrom, open, and chdir. Open and chdir paths are copied when
 the action is added and freed when the action list is destroyed. The kernel must
 repeat bounds and pointer checks before creating a child. Reserved WASI
