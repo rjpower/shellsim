@@ -1,0 +1,186 @@
+{
+  "name": "scipy",
+  "version": "1.18.0",
+  "role": "target-library",
+  "kind": "python-project",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "requires_python": ">=3.12",
+  "requires_dist": [
+    "numpy<2.8,>=2.0.0",
+    "pytest>=8.0.0; extra == \"test\"",
+    "pytest-cov; extra == \"test\"",
+    "pytest-timeout; extra == \"test\"",
+    "pytest-xdist; extra == \"test\"",
+    "asv; extra == \"test\"",
+    "mpmath; extra == \"test\"",
+    "gmpy2; extra == \"test\"",
+    "threadpoolctl; extra == \"test\"",
+    "scikit-umfpack; extra == \"test\"",
+    "pooch; extra == \"test\"",
+    "hypothesis>=6.30; extra == \"test\"",
+    "array-api-strict>=2.3.1; extra == \"test\"",
+    "Cython; extra == \"test\"",
+    "meson; extra == \"test\"",
+    "ninja; sys_platform != \"emscripten\" and extra == \"test\"",
+    "scipy-doctest>=2.0.0; extra == \"test\"",
+    "sphinx<8.2.0,>=5.0.0; extra == \"doc\"",
+    "intersphinx_registry; extra == \"doc\"",
+    "pydata-sphinx-theme>=0.15.2; extra == \"doc\"",
+    "sphinx-copybutton; extra == \"doc\"",
+    "sphinx-design>=0.4.0; extra == \"doc\"",
+    "matplotlib>=3.5; extra == \"doc\"",
+    "numpydoc; extra == \"doc\"",
+    "jupytext; extra == \"doc\"",
+    "myst-nb>=1.2.0; extra == \"doc\"",
+    "pooch; extra == \"doc\"",
+    "jupyterlite-sphinx>=0.19.1; extra == \"doc\"",
+    "jupyterlite-pyodide-kernel; extra == \"doc\"",
+    "linkify-it-py; extra == \"doc\"",
+    "tabulate; extra == \"doc\"",
+    "click<8.3.0; extra == \"dev\"",
+    "spin; extra == \"dev\"",
+    "mypy==1.19.1; extra == \"dev\"",
+    "pyrefly==0.63.0; extra == \"dev\"",
+    "typing_extensions; extra == \"dev\"",
+    "types-psutil; extra == \"dev\"",
+    "pycodestyle; extra == \"dev\"",
+    "ruff>=0.12.0; extra == \"dev\"",
+    "cython-lint>=0.12.2; extra == \"dev\""
+  ],
+  "linkage": "shared",
+  "target_dependencies": [
+    {
+      "port": "python/numpy",
+      "version": "2.3.5",
+      "recipe": "python/numpy/graph-recipe.json"
+    },
+    {
+      "port": "native/openblas",
+      "version": "0.3.31",
+      "recipe": "native/openblas/graph-recipe.json"
+    }
+  ],
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/source/s/scipy/scipy-1.18.0.tar.gz",
+    "sha256": "67b2ad2ad54c72ca6d04975a9b2df8c3638c34ddd5b28738e94fc2b57929d378",
+    "subdirectory": "scipy-1.18.0"
+  },
+  "patches": [
+    {
+      "file": "fortran-abi.patch",
+      "sha256": "67bd54efa5aaabf44b561cec0363478c37f09e1b6cf72301a2e139ab407c4f33",
+      "inputs": {
+        "scipy/_build_utils/src/wrap_g77_abi.c": "7a1e218c6c3ffa38d38dfbd6df77156708bbf2a4a254a4716bc3dfda1d2bd6fd",
+        "scipy/integrate/src/blaslapack_declarations.h": "42f8799a8892d75dc4c29b5f3630c674419981a9a07d4cc0a449f1453f6659c6",
+        "scipy/interpolate/src/__fitpack.h": "4dfa9e1d280d40a5d1afe155bbda8a429ea1528411f517777d0e9d0e7b092438",
+        "scipy/linalg/cython_blas_signatures.txt": "97f4a79753c20148169482cd393e82339234912ab1e815dc8c5e5831e8d31d73",
+        "scipy/linalg/cython_lapack_signatures.txt": "2b5c6a5151602af99cbf499d8268c68e0c1bc97eb8497269efe0c0a84a2481eb",
+        "scipy/linalg/flapack_gen.pyf.src": "680631ba0dad285300d01b90bc49e08e834c28753dab141a9e4f44ae618f9fef",
+        "scipy/linalg/src/_common_array_utils.h": "2450cc698c9f607cafee52dcc35addbf21b87b474f5baf23ac5d747b0759479a",
+        "scipy/linalg/src/_common_array_utils.hh": "1c1e472b35ab54b48ca4b74c1ae1d73df9f802d3275bd58286e8f7ff79a8930c",
+        "scipy/optimize/_trlib/trlib_private.h": "67af20e6d335290c9404f6ef4ab3c43f2273e6af79a5a929a87e2976d0438b7d",
+        "scipy/optimize/src/blaslapack_declarations.h": "1a2bdd2d92851f1e9074ee69d51e27f6322da1847abe4afc2e47fdca40cbc95b",
+        "scipy/sparse/linalg/_propack/PROPACK/src/include/blaslapack_declarations.h": "6bc70c75e4e2263595b496c8ce28d29ff659ec2aaa2232e305d8290b911c2a8e",
+        "tools/generate_f2pymod.py": "652c0e11c1c1867fb97e4fab24fe436017390ce3ee9871397e293ac4b91dd365"
+      }
+    },
+    {
+      "file": "scipy-character-abi.patch",
+      "sha256": "94541cdec6d67b857aa9df4850a06a72143b19f62cb484b741da777ee28d0424",
+      "inputs": {
+        "scipy/_build_utils/_wrappers_common.py": "df98ef4c849971f8aa755ac0b5b0eabfc14526ea7df3fdbf3ab5d7f4d8cc72e6",
+        "scipy/_build_utils/src/wrap_g77_abi.c": "c393e0ebda6c28ef28fd793fa8d38945c5c7a059253ab03c5eba887fc6237f0e"
+      }
+    },
+    {
+      "file": "scipy-sparse-abi.patch",
+      "sha256": "a329ed9d5bafacdcc828658395b2f636efa055dadcd1c565c60581b5e041e890",
+      "inputs": {
+        "scipy/sparse/linalg/_eigen/arpack/arnaud/src/blaslapack_declarations.h": "5f963dbdab8b92c7d3918f9c706f2a312c562554b83a87b23cb33902b3cb2e18",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/clacon2.c": "e3f99ece3462ae2da834c065b8c31dbe375ced4f93893f79fd1c754386c857a6",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/dlacon2.c": "d017acdcf45935ba3b00253e14da8f12a3e74bd1ae7cc2f3cffcdba8cd790ccc",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ccopy_to_ucol.c": "3d765c27dd52793399f7694fa680df48d875747cc711b56e0856a63a3dfff154",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_cdrop_row.c": "f6b172864c97cc236d39561b1f524843547c7f329ced1efd94207e82c9b16563",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_dcopy_to_ucol.c": "9555d2789e8763117de04a0211b50f68e37269a803d1bb08887e0e2b94c686b8",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ddrop_row.c": "34dd2ecb0aff1169e522b7df247c3a4bbc0c440c74e5d769a8c15a5d41760f15",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_scopy_to_ucol.c": "b6740978d1dc5081d2710a51753acd38832b89549daca160bb8c851a2bf7dbfd",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_sdrop_row.c": "d7826210c50e1cc98a41f4104b5d25d404d0a336f4261bc42967c9d285ca92f1",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zcopy_to_ucol.c": "325046f725b80b1926414796082361e945c8eb804c80391ad9f1d1b1c837abde",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zdrop_row.c": "8b3e3a5aa47f340bed596210a331ac12e9956e62fcda9b01dd55e4c2dd3b0d4b",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/slacon2.c": "face63760b2c2d329d1591233bdfed3af8775b4cd04540de23cc475f81875a0f",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_cdefs.h": "54547d40c64b0d84ba0f695c853cce42b90ffaeb65b2bfa2a4636713db20c4c5",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_ddefs.h": "4310b08e5051aea4c1fb8fb8242d7bc2ecd3388a5594ac69be32cdf9d830af5a",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_sdefs.h": "aa684078fa8aed2670b55b0552192fe7d63087298e298c8989ba5389161977e5",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_zdefs.h": "db3481b725bb76e7ad203f9580c9644fbc36077eec280b41e43bba41f44a0cae",
+        "scipy/sparse/linalg/_dsolve/SuperLU/SRC/zlacon2.c": "78ca25e4ac71014d75f495efb01e9a159014ec69cb6cbf2b27814a91d3b3f347"
+      }
+    },
+    {
+      "file": "scipy-trlib-character-abi.patch",
+      "sha256": "d930011fececdfdd1ce2acd8bde59ce2caac25e8e866b374ec4ff112cc56f151",
+      "inputs": {
+        "scipy/optimize/_trlib/trlib_private.h": "b7e090df68d731b21038adba66db688bd6d35ce1a696145996d8a08f6941a649"
+      }
+    }
+  ],
+  "build": {
+    "adapter": "python-meson",
+    "jobs": 8,
+    "metadata": "PKG-INFO",
+    "licenses": [
+      "LICENSE.txt"
+    ],
+    "dependency_properties": {
+      "numpy-include-dir": {
+        "port": "python/numpy",
+        "path": "python/numpy/_core/include"
+      }
+    },
+    "host_header_packages": {
+      "pybind11": {
+        "tool": "pybind11-config",
+        "include": "lib/python3.13/site-packages/pybind11/include",
+        "version": "3.0.4"
+      }
+    },
+    "configure_args": [
+      "--buildtype=release",
+      "-D_without-fortran=true",
+      "-Duse-pythran=false",
+      "-Duse-g77-abi=true",
+      "-Dblas=openblas",
+      "-Dlapack=openblas",
+      "-Dcpp_args=-D_WASI_EMULATED_SIGNAL"
+    ],
+    "required_shared_libraries": [
+      "libopenblas.so"
+    ]
+  },
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/graph_smoke.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 4294967296,
+    "disk": 805306368
+  }
+}

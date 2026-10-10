@@ -8,7 +8,7 @@ use super::{
     MAX_TABLE_ELEMENTS,
 };
 use crate::commands::wasm::{compiled_command_module, fibers, memory, threads, Host};
-use crate::vfs::{resolve_against, NodeKind};
+use crate::vfs::{resolve_against, NodeKind, Vfs, VfsError, PATH_MAX};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
@@ -149,6 +149,68 @@ fn compile(
     compiled
 }
 
+fn append_path(output: &mut String, part: &str) -> Result<(), Error> {
+    if part.len() >= PATH_MAX.saturating_sub(output.len()) {
+        return Err(Error::msg("dylink runtime path exceeds VFS limit"));
+    }
+    output.push_str(part);
+    Ok(())
+}
+
+/// Expand only ORIGIN, checking the VFS limit before allocating each output segment.
+fn runtime_directory(directory: &str, origin: &str) -> Result<String, Error> {
+    let mut remaining = directory;
+    let mut output = String::new();
+    while let Some(index) = remaining.find('$') {
+        append_path(&mut output, &remaining[..index])?;
+        remaining = &remaining[index..];
+        remaining = if let Some(suffix) = remaining.strip_prefix("${ORIGIN}") {
+            suffix
+        } else if let Some(suffix) = remaining.strip_prefix("$ORIGIN") {
+            if !suffix.is_empty() && !suffix.starts_with('/') {
+                return Err(Error::msg("unsupported dylink runtime path"));
+            }
+            suffix
+        } else {
+            return Err(Error::msg("unsupported dylink runtime path"));
+        };
+        append_path(&mut output, origin)?;
+    }
+    append_path(&mut output, remaining)?;
+    if !output.starts_with('/') {
+        return Err(Error::msg("unsupported dylink runtime path"));
+    }
+    Ok(output)
+}
+
+/// Search only the guest VFS; emitted host build paths never grant host access.
+/// Relative paths and variables other than ORIGIN are explicit unsupported frontiers.
+fn dependency_path(
+    vfs: &Vfs,
+    importer: &str,
+    paths: &[String],
+    name: &str,
+) -> Result<String, Error> {
+    let origin = importer
+        .rsplit_once('/')
+        .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
+        .unwrap_or("/");
+    for directory in paths {
+        let directory = runtime_directory(directory, origin)?;
+        if directory.len().saturating_add(name.len()).saturating_add(1) >= PATH_MAX {
+            return Err(Error::msg("dylink dependency path exceeds VFS limit"));
+        }
+        let candidate = resolve_against(&directory, name);
+        match vfs.metadata_ref("/", &candidate, true) {
+            Ok(node) if matches!(node.kind, NodeKind::File(_)) => return Ok(candidate),
+            Ok(_) => return Err(Error::msg("threaded dependency must be a regular VFS file")),
+            Err(VfsError::NotFound(_) | VfsError::NotADir(_)) => {}
+            Err(error) => return Err(Error::msg(error.to_string())),
+        }
+    }
+    Ok(format!("/lib/{name}"))
+}
+
 impl Graph {
     fn discover(
         &mut self,
@@ -242,7 +304,26 @@ impl Graph {
         }
         let mut dependencies = Vec::with_capacity(layout.needed.len());
         for name in &layout.needed {
-            dependencies.push(self.discover(caller, format!("/lib/{name}"), process)?);
+            // Prepay each bounded path expansion and VFS lookup, including fallback.
+            let search_cost = (layout.runtime_paths.len() as u64 + 1)
+                .saturating_mul(PATH_MAX as u64)
+                .saturating_mul(16);
+            if !caller
+                .data()
+                .machine
+                .get()
+                .resources
+                .charge_cpu(search_cost)
+            {
+                return Err(super::super::exhausted());
+            }
+            let dependency = dependency_path(
+                &caller.data().machine.get().vfs,
+                &path,
+                &layout.runtime_paths,
+                name,
+            )?;
+            dependencies.push(self.discover(caller, dependency, process)?);
         }
         self.visiting.remove(&path);
         let index = self.nodes.len();
@@ -460,4 +541,85 @@ pub(super) async fn load(
         unreachable!()
     };
     Ok(handles[index])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn origin_expansion_is_bounded_before_allocation() {
+        assert!(runtime_directory(&"${ORIGIN}".repeat(32), &"/a".repeat(128)).is_err());
+        assert!(runtime_directory(&"/a".repeat(PATH_MAX), "/pkg").is_err());
+        assert_eq!(runtime_directory("$ORIGIN", "/").unwrap(), "/");
+    }
+
+    #[test]
+    fn dependency_search_uses_importer_origin_order_and_guest_vfs_only() {
+        let mut vfs = Vfs::new();
+        for directory in ["/pkg/lib", "/other", "/lib"] {
+            vfs.mkdir_all("/", directory).unwrap();
+            vfs.write("/", &format!("{directory}/provider.so"), b"wasm", 0o644)
+                .unwrap();
+        }
+        vfs.mkdir_all("/", "/pkg/modules").unwrap();
+        vfs.write("/", "/pkg/modules/extension.so", b"wasm", 0o644)
+            .unwrap();
+        vfs.symlink("/", "/pkg/modules/extension.so", "/alias.so")
+            .unwrap();
+        // Graph::discover canonicalizes the importer before resolving its dependencies.
+        let importer = vfs.realpath("/alias.so", true).unwrap();
+        assert_eq!(
+            dependency_path(&vfs, &importer, &["$ORIGIN/../lib".into()], "provider.so").unwrap(),
+            "/pkg/lib/provider.so"
+        );
+        let paths = vec![
+            "/host/build/absent".into(),
+            "$ORIGIN/../lib".into(),
+            "/other".into(),
+        ];
+        assert_eq!(
+            dependency_path(&vfs, "/pkg/modules/extension.so", &paths, "provider.so").unwrap(),
+            "/pkg/lib/provider.so"
+        );
+        assert_eq!(
+            dependency_path(
+                &vfs,
+                "/elsewhere/modules/extension.so",
+                &paths,
+                "provider.so"
+            )
+            .unwrap(),
+            "/other/provider.so"
+        );
+        assert_eq!(
+            dependency_path(
+                &vfs,
+                "/pkg/extension.so",
+                &["/host/build/absent".into()],
+                "provider.so"
+            )
+            .unwrap(),
+            "/lib/provider.so"
+        );
+        assert_eq!(
+            dependency_path(
+                &vfs,
+                "/pkg/modules/extension.so",
+                &["${ORIGIN}/../lib".into()],
+                "provider.so"
+            )
+            .unwrap(),
+            "/pkg/lib/provider.so"
+        );
+        for unsupported in ["relative", "$LIB", "$ORIGIN_SUFFIX"] {
+            assert!(dependency_path(
+                &vfs,
+                "/pkg/extension.so",
+                &[unsupported.into()],
+                "provider.so"
+            )
+            .is_err());
+        }
+    }
 }

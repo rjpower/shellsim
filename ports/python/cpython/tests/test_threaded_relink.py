@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from ports.native.dependencies import digest
-from ports.python.cpython.threaded import compile_receipt, relink
+from ports.python.cpython.threaded import compile_receipt, final_link, relink
 
 
 def test_compile_receipt_changes_for_objects_sources_and_generated_config(tmp_path):
@@ -48,3 +48,43 @@ def test_corrected_platform_threads_errno_and_subprocess(guest_factory):
     assert result.stdout == b"threaded CPython: parent/worker errno and subprocess passed\n"
     assert result.stderr == b""
     guest.assert_interpreter_unchanged()
+
+
+def test_real_atfork_registry_order_and_spawn_separation(guest_factory):
+    guest = guest_factory(bundle_env="SHELLSIM_RELINKED_CPYTHON_BUNDLE", cpu=10_000_000_000)
+    result = guest.run_script(Path(__file__).parent / "probes/threaded_atfork.py")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"threaded CPython: real atfork registry ordering and spawn separation passed\n"
+    assert result.stderr == b""
+    guest.assert_interpreter_unchanged()
+
+
+def test_final_link_normalizes_repeated_ceiling_and_preserves_other_options():
+    command = ["clang", "-Wl,--shared-memory,--max-memory=67108864", "-Wl,--max-memory=67108864", "main.o"]
+    assert final_link(command, 268435456) == ["clang", "-Wl,--shared-memory", "main.o", "-Wl,--max-memory=268435456"]
+    with pytest.raises(ValueError, match="conflicting"):
+        final_link([*command, "-Wl,--max-memory=131072"], 268435456)
+    with pytest.raises(ValueError, match="malformed"):
+        final_link(["clang", "-Wl,--max-memory=bad"], 268435456)
+
+
+def test_threaded_main_allocates_and_touches_more_than_64_mib(guest_factory):
+    guest = guest_factory(bundle_env="SHELLSIM_RELINKED_CPYTHON_BUNDLE", cpu=10_000_000_000)
+    result = guest.run_script(Path(__file__).parent / "probes/threaded_memory.py")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"threaded CPython: allocation beyond 64 MiB passed\n"
+    assert result.stderr == b""
+    guest.assert_interpreter_unchanged()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["-Wl,--max-memory,67108864"],
+        ["-Xlinker", "--max-memory=67108864"],
+        ["-Xlinker", "--max-memory", "-Xlinker", "67108864"],
+    ],
+)
+def test_final_link_rejects_noncanonical_ceiling_spelling(options):
+    with pytest.raises(ValueError):
+        final_link(["clang", *options], 268435456)

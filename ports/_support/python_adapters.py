@@ -157,6 +157,11 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     name, version, abi = recipe["name"], recipe["version"], recipe["abi"]
     build = recipe["build"]
     module = build["module"]
+    output_kind = build.get("output", "wheel")
+    if output_kind not in {"wheel", "stdlib"}:
+        raise ValueError("unsupported Python extension output")
+    if output_kind == "stdlib" and version != cpython.version:
+        raise ValueError("stdlib extension version differs from admitted CPython")
     if not _DIST_NAME.fullmatch(name) or not re.fullmatch(r"[0-9][A-Za-z0-9_.+!-]*", version):
         raise ValueError("invalid extension distribution identity")
     if not _IDENTIFIER.fullmatch(module) or build.get("adapter") != "python-extension":
@@ -181,12 +186,14 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     sources = [_source_file(context.source, raw) for raw in raw_sources]
     if len(set(sources)) != len(sources) or any(path.suffix not in {".c", ".cc", ".cpp", ".cxx"} for path in sources):
         raise ValueError("invalid or repeated extension translation unit")
-    metadata = _source_file(context.source, build["metadata"])
-    message = email.message_from_bytes(metadata.read_bytes())
-    if message["Name"] != name or message["Version"] != version:
-        raise ValueError("extension source metadata differs from recipe")
-    if sorted(message.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", [])):
-        raise ValueError("extension dependencies differ from recipe")
+    metadata = None
+    if output_kind == "wheel":
+        metadata = _source_file(context.source, build["metadata"])
+        message = email.message_from_bytes(metadata.read_bytes())
+        if message["Name"] != name or message["Version"] != version:
+            raise ValueError("extension source metadata differs from recipe")
+        if sorted(message.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", [])):
+            raise ValueError("extension dependencies differ from recipe")
     licenses = build.get("licenses", [])
     if not isinstance(licenses, list) or len(licenses) > _MAX_EXTENSION_FILES:
         raise ValueError("invalid extension license list")
@@ -196,6 +203,17 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
         not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*(?:=[A-Za-z0-9_]+)?", item) for item in defines
     ):
         raise ValueError("invalid extension preprocessor definitions")
+    python_includes = []
+    raw_includes = build.get("cpython_include_directories", [])
+    if not isinstance(raw_includes, list) or len(raw_includes) > _MAX_EXTENSION_FILES:
+        raise ValueError("invalid CPython include directory list")
+    for raw in raw_includes:
+        if not isinstance(raw, str) or PurePosixPath(raw).is_absolute() or ".." in PurePosixPath(raw).parts:
+            raise ValueError("CPython include directory escapes admitted headers")
+        path = cpython.include_dir / raw
+        if path.is_symlink() or not path.is_dir() or not path.resolve().is_relative_to(cpython.include_dir.resolve()):
+            raise ValueError("CPython include directory escapes admitted headers")
+        python_includes.append(path)
     dependencies = build.get("native_dependencies", [])
     if not isinstance(dependencies, list) or any(not isinstance(item, str) or not item for item in dependencies):
         raise ValueError("invalid extension native dependency list")
@@ -239,7 +257,8 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     context.build.mkdir(parents=True)
     wheel_stage = context.build / "wheel-root"
     wheel_stage.mkdir()
-    (context.staging_prefix / "wheels").mkdir(parents=True)
+    if output_kind == "wheel":
+        (context.staging_prefix / "wheels").mkdir(parents=True)
     environment = target_environment(context.sdk)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     commands = []
@@ -255,6 +274,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
                     "-fPIC",
                     "-I" + str(cpython.include_dir),
                     "-I" + str(cpython.generated_config_dir),
+                    *("-I" + str(path) for path in python_includes),
                     *("-I" + str(path) for path in includes),
                     *("-D" + item for item in defines),
                     "-c",
@@ -285,6 +305,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
                 *(str(path) for path in links),
                 "-o",
                 str(extension),
+                *(str(path) for path in context.shared_library_inputs),
             ),
             context.build,
         )
@@ -295,6 +316,21 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     mark_abi(extension, abi.encode())
     if sorted(needed_libraries(extension)) != sorted(dependencies):
         raise ValueError("compiled extension dependency closure differs from recipe")
+    if output_kind == "stdlib":
+        prefix = context.staging_prefix / "usr/local"
+        modules = prefix / "lib-dynload"
+        modules.mkdir(parents=True)
+        (modules / extension.name).write_bytes(extension.read_bytes())
+        if license_files:
+            license_root = prefix / "licenses"
+            license_root.mkdir()
+            for license_file in license_files:
+                destination = license_root / license_file.name
+                if destination.exists():
+                    raise ValueError("extension license basenames conflict")
+                destination.write_bytes(license_file.read_bytes())
+        return PythonBuildOutput(context.staging_prefix, tuple(commands))
+    assert metadata is not None
     dist_name = name.replace("-", "_")
     info = wheel_stage / f"{dist_name}-{version}.dist-info"
     info.mkdir()

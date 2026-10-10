@@ -77,14 +77,17 @@ Repository-owned platform ports can declare `source.files`, a hash-pinned list
 of ports-relative source paths and staging destinations. This stages only the
 declared files. Upstream packages continue to use pinned release archives.
 
-Use `build.adapter` to choose one of `pure-wheel`, `python-extension`, `cmake`,
-`meson`, or `configure-make`. The first stages an unchanged, verified upstream
-wheel. The extension adapter compiles a declared single-module C/C++ extension
-against the cohort's CPython headers. Native adapters install to a private
+Use `build.adapter` to choose one of `pure-wheel`, `python-extension`,
+`python-meson`, `cmake`, `meson`, `configure-make`, or `plain-make`. The first
+stages an unchanged, verified upstream wheel. `python-extension` compiles a
+declared single-module C/C++ extension against the cohort's CPython headers.
+`python-meson` stages package files and multiple extensions from Meson's install
+plan. Native adapters install to a private
 `/usr/local` staging tree through the admitted compiler and verified dependency
 sysroot. Recipe `source` pins the upstream URL and SHA256; `patches` pin local
 patch files. `source_exports` copies declared source files, such as licenses,
 that an upstream install omits. Port-specific build hooks must also be pinned.
+Scientific generator and Meson setup uses [pinned host-tool receipts](_support/HOST_TOOLS.md).
 
 Native exports are published into the release's native catalog as well as the
 build dependency store. `role: "guest-tool"` selects executable tools;

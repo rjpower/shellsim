@@ -51,7 +51,7 @@
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "1eee07ff0c7bce11b816bbaf1580b028065c89f8d6c6c974f7dffe45a1684891"
+      "sha256": "46cf695de3349f1ee1cc1b1f24a414c395c02431e6f7c160aed23cadad5fea9c"
     },
     {
       "file": "../../native/libffi/threaded/toolchain.py",
@@ -71,7 +71,7 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../toolchain/wasi_threads/dynamic.py",
@@ -98,7 +98,7 @@
     "count": 265,
     "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
   },
-  "cpython_manifest_sha256": "2367a6cb1370a034f4a40a2aad745b5449a86f0913ea67180acb8190afda1921",
+  "cpython_manifest_sha256": "592fa85e2fbaaf47ffab162b8f63a5a89ebb49a1464cc3bacd69478685ab4914",
   "cpython_recipe_sha256": "775ea746f5153c9c188c4a8a4978b067c01f46e73b872734e399007184acb846",
-  "cpython_recipe_digest": "a99a5a474b826d50b3464fe43e0c214ae2f4885139cbacab548febc2c975338d"
+  "cpython_recipe_digest": "3a7c739227b2952e6c36ce8ace1b7b0cd1b4bb136c770ad9dcce0c9cf781c089"
 }

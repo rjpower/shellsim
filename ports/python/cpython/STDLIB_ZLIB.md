@@ -18,3 +18,21 @@ Set `SHELLSIM_DYNAMIC_V2_ARTIFACTS` and `SHELLSIM_STDLIB_ZLIB` to run
 compression roundtrip, streaming gzip, CRC32, invalid-stream exceptions and
 unchanged interpreter bytes. This module also supplies Cython's compressed
 string-table dependency.
+
+## Threaded graph product
+
+`stdlib-zlib-graph-recipe.json` compiles upstream CPython 3.13.7's
+`Modules/zlibmodule.c` through the standard Python extension adapter with
+`build.output = "stdlib"`. Its native dependency is the explicit threaded zlib
+CMake recipe. Internal CPython headers come from the admitted source/header
+receipt; the graph records the actual `libz.so` dependency.
+
+Publication assembles the separately sealed stdlib module and native provider
+into a new verified rootfs. The base runtime and build cohort remain unchanged;
+the resulting manifest records the original runtime digest and all incorporated
+artifact identities. Assembly rejects conflicting existing destinations. It
+never recompiles or replaces the interpreter.
+
+The port-local guest probe covers compression/decompression, streaming, gzip,
+CRC32, invalid input and two independent Python threads. Runtime acceptance is
+recorded by the normal graph `--check` receipt.

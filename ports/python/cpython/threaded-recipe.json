@@ -8,7 +8,7 @@
     "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
     "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
   },
-  "sysroot_recipe_sha256": "d328627df35d3d8b4166c404c5b6d5dbfa03d47b5f140228c8841f9dff1cb6cb",
+  "sysroot_recipe_sha256": "62743e684e4428ddaa91750792de60ddb877090aea9c9ed11858a44751426234",
   "patches": [
     {
       "file": "sdk34-threads.patch",
@@ -24,7 +24,7 @@
   "build_scripts": [
     {
       "file": "threaded.py",
-      "sha256": "553788f4e4d8dec0930fbe0eb64d8631f845fc9d61abd5ace2ee7fb292d789fd"
+      "sha256": "d3f0082c6b86a844985d24d7ffa6628239559b3a821f86b700137c7e2fe6c817"
     },
     {
       "file": "sdk34-threads.patch",
@@ -52,7 +52,7 @@
     },
     {
       "file": "../../toolchain/wasi_threads/dynamic-recipe.json",
-      "sha256": "d328627df35d3d8b4166c404c5b6d5dbfa03d47b5f140228c8841f9dff1cb6cb"
+      "sha256": "62743e684e4428ddaa91750792de60ddb877090aea9c9ed11858a44751426234"
     },
     {
       "file": "../../toolchain/llvm/build.py",
@@ -128,7 +128,8 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     }
-  ]
+  ],
+  "maximum_memory_bytes": 268435456
 }

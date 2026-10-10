@@ -1,0 +1,24 @@
+--- a/scipy/_build_utils/_wrappers_common.py
++++ b/scipy/_build_utils/_wrappers_common.py
+@@ -34 +34 @@
+-WRAPPED_FUNCS = ['cdotc', 'cdotu', 'zdotc', 'zdotu', 'cladiv', 'zladiv']
++WRAPPED_FUNCS = ['cdotc', 'cdotu', 'zdotc', 'zdotu', 'cladiv', 'zladiv', 'chla_transtype']
+@@ -109,0 +110,2 @@
++    if name == 'xerbla_array':
++        return 'F_FUNC', 'xerbla_arraywrp,XERBLA_ARRAYWRP'
+--- a/scipy/_build_utils/src/wrap_g77_abi.c
++++ b/scipy/_build_utils/src/wrap_g77_abi.c
+@@ -137,0 +138,13 @@
++#ifdef __wasi__
++/* f2c CHARACTER uses a hidden result buffer and 32-bit length. */
++void BLAS_FUNC(chla_transtype)(char *result, int length, CBLAS_INT *trans);
++void F_FUNC(chla_transtypewrp,CHLA_TRANSTYPEWRP)(char *result, CBLAS_INT *trans) {
++    BLAS_FUNC(chla_transtype)(result, 1, trans);
++}
++
++int BLAS_FUNC(xerbla_array)(char *name, CBLAS_INT *length, CBLAS_INT *info, int char_length);
++int F_FUNC(xerbla_arraywrp,XERBLA_ARRAYWRP)(char *name, CBLAS_INT *length, CBLAS_INT *info) {
++    return BLAS_FUNC(xerbla_array)(name, length, info, 1);
++}
++#endif
++

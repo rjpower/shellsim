@@ -14,11 +14,11 @@
     },
     {
       "file": "stdlib_ctypes_threaded_recipe.json",
-      "sha256": "e208ba20b991a57d501df95b924b29604f6b097909ec428dde69f2556fcfcd97"
+      "sha256": "c1871ab71ab57d630c05c8a889fa560d67fde6961ed67ac66d33738695da854c"
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "1eee07ff0c7bce11b816bbaf1580b028065c89f8d6c6c974f7dffe45a1684891"
+      "sha256": "46cf695de3349f1ee1cc1b1f24a414c395c02431e6f7c160aed23cadad5fea9c"
     },
     {
       "file": "../../_support/build.py",
@@ -26,7 +26,7 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../native/dependencies.py",

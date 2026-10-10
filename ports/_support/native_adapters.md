@@ -107,7 +107,9 @@ immutable graph results still bind the complete implementation identity.
 The producer state, source and snapshots live in its parent directory, and the
 producer verifies their exact inputs before reuse. Without an override, the
 runner selects a compatible generated workspace and its `build` directory.
-Other adapters currently reject this option.
+Meson and Python Meson recipes also support retained Ninja directories, as
+described in [Retained Meson workspaces](#retained-meson-workspaces). Other
+adapters reject this option.
 `llvm-guest-sdk` stages admitted target development data without running a
 compiler and requires its explicit platform dependency.
 
@@ -144,3 +146,115 @@ disk, and records the effective explicit budget in the acceptance receipt.
 These budgets allow compiler and SDK checks to include installation and execution
 costs. Temporary release materialization lives under the proof directory and is
 removed after the checks.
+
+
+## Python Meson projects
+
+The `python-meson` adapter uses an admitted host Python and Cython for generators,
+and admitted CPython headers and `pyconfig.h` for target compilation. Its
+pkg-config wrapper answers target Python queries with those headers; other
+providers resolve only through the dependency sysroot. Optional
+`build.host_header_packages` entries bind header-only generator packages to a
+complete host-tool receipt, including the package files beyond its executable.
+
+`build.cross_properties` supplies upstream cross facts.
+`build.dependency_properties` resolves a property from an admitted native port
+and export-relative directory. `build.install_tags` defaults to runtime,
+python-runtime and devel. Meson's install plan selects the build targets and
+supplies wheel paths, extension names and directory exclusions. The adapter
+removes host SOABI suffixes, preserves qualified package paths, copies upstream
+PKG-INFO as METADATA, and binds each Wasm extension to the target ABI and its
+actual shared-library imports. No maintained extension inventory is required.
+
+`build.development_exports` maps installed wheel files or directories to the
+native payload beneath `/usr/local`. These exports use the same sealing and
+dependency closure as native libraries. NumPy exports its generated C headers,
+libnpymath archive and upstream pkg-config files from the same build as its
+wheel. A mixed wheel/development port installs both selections for acceptance.
+
+The scientific host descriptor admits a Meson tree patched with
+`meson-wasi-archive-groups.patch`. Meson otherwise inserts GNU archive groups for
+WASI Clang. wasm-ld rescans archive members and rejects these GNU flags. The
+receipt binds NumPy's vendored Meson source, the patch input and output hashes,
+and every resulting tool file. [Scientific host-tool setup](HOST_TOOLS.md)
+produces these receipts with a private read-only Python closure.
+
+
+## Retained Meson workspaces
+
+`--workspace RECIPE=PATH` also accepts Meson and Python Meson recipes. PATH is
+an actual Ninja directory named `meson-build`; its parent holds compiler
+wrappers, while the enclosing directory holds admitted source and dependencies.
+For example, use `--workspace python/numpy/graph-recipe.json=target/numpy-work/build/meson-build`.
+
+The first build requires a fresh directory. Existing trees without a workspace
+receipt are rejected. Each resume verifies exact source bytes and executable
+modes, configuration, target product receipts, host tool code, compiler flags
+and dependency exports. Receipts also bind both generated compiler wrappers,
+the target Python pkg-config launcher when used, and the effective build
+environment. Effective setup arguments, cross and native machine files,
+properties, installation prefix and fixed setup flags are also bound, including
+options appended by Python Meson. Only the installation destination (`DESTDIR`)
+is excluded; paths in compiler or configure bindings remain exact. A changed
+compilation input rejects that workspace without deleting it. Recipes with
+mutable hooks cannot use this mode.
+
+Jobs, install tags, licenses and development-export selections remain packaging
+inputs rather than compilation-workspace inputs. The runner still keys and
+verifies every immutable result with the full recipe, implementation and cohort.
+A packaging change reuses the verified Meson configuration, runs Ninja's selected
+install targets and writes a fresh install and wheel directory. Unchanged
+compiler wrappers and machine files retain their timestamps so Ninja does not
+reconfigure or rebuild generated headers.
+Each retained build copies its verified workspace receipt into the sealed
+result provenance. Older receipt schemas are rejected and require a fresh
+workspace. Result-cache hits, workspace decisions and phase
+timings are printed to stderr.
+
+Host f2py is an optional explicit binding in both Meson cross and native files.
+Its complete admitted NumPy package supports SciPy's generation steps; target
+NumPy headers and f2py C sources come from the native dependency exports.
+
+Shared links keep `-nostdlib` so libc, pthread and interpreter state come from
+the process runtime. The runner supplies the target compiler-rt builtin archive
+from the verified SDK as an explicit trailing link input. This resolves numeric
+compiler helpers, including quad-precision conversions, without relying on
+which helpers a particular interpreter link happened to export. The archive
+path and hash remain result inputs; retained workspace admission also binds
+these trailing inputs, so a changed link policy cannot reuse stale modules.
+
+The one-module Python adapter accepts `build.output: stdlib` for CPython's own
+extensions. It compiles the pinned CPython source against admitted headers,
+seals `lib-dynload/<module>.so` and licenses as a native artifact, and emits no
+wheel metadata. Additional internal include directories must stay below the
+admitted CPython `Include` tree. An internal graph runtime edge can select such
+an artifact without changing an upstream package's `Requires-Dist`. Publication
+verifies its native closure, then assembles a separate runtime with the module
+and providers. It preserves the base interpreter and records exact artifact
+identities; module files are never published as generic `/lib` providers.
+
+Shared links treat linker warnings as errors, including incompatible function
+signatures. Python Meson packaging compares direct imported function types
+against the actual exports of declared shared providers before sealing.
+`build.required_shared_libraries` names admitted provider basenames that at
+least one installed extension must declare in its Wasm dependency metadata.
+This establishes the provider link separately from behavioral guest checks.
+
+The pinned Meson patch also handles WASI link checks with explicit shared
+provider inputs. It links those checks as PIC side modules and rejects
+unresolved symbols. Executable checks keep their normal policy. OpenBLAS
+symbol-existence checks retain volatile function addresses without calling
+unknown prototypes; callable ABI checks still reject signature mismatches.
+
+Compiler wrappers read LLVM GNU response files for option classification,
+including nested `@file` arguments. They pass the original argv unchanged to
+the compiler. Compile-only modes take precedence over shared-link selection.
+Expansion is bounded to 16 nested files, 256 files, 4 MiB and 65,536 arguments;
+unreadable, cyclic or excessive inputs fail before compiler invocation.
+
+Native build commands bound Git discovery at the admitted source and build
+parents. Extracted tarballs therefore use upstream version fallbacks instead
+of the enclosing Shellsim commit. A pinned checkout inside the source tree
+remains discoverable. Inherited Git directory/work-tree overrides are excluded
+by the existing target environment allowlist. Retained generated VCS headers
+may change once when this boundary corrects a previously embedded parent hash.

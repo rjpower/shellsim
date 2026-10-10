@@ -11,10 +11,17 @@ from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 
+def write_build_file(path: Path, contents: str) -> None:
+    """Preserve unchanged generated inputs so Ninja does not reconfigure."""
+    if not path.exists() or path.read_text() != contents:
+        path.write_text(contents)
+
+
 class NativeAdapter(Enum):
     CMAKE = "cmake"
     MESON = "meson"
     CONFIGURE_MAKE = "configure-make"
+    PLAIN_MAKE = "plain-make"
 
 
 @dataclass(frozen=True)
@@ -36,6 +43,8 @@ class NativeBuildContext:
     dependency_sysroot: Path
     shared_library_flags: tuple[str, ...] = ()
     executable_flags: tuple[str, ...] = ()
+    retained_workspace: bool = False
+    shared_library_inputs: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -51,6 +60,8 @@ class NativeBuildRequest:
     install_prefix: PurePosixPath = PurePosixPath("/usr/local")
     configure_environment: Mapping[str, str] = field(default_factory=dict)
     build_args: tuple[str, ...] = ()
+    meson_properties: Mapping[str, str | bool | int] = field(default_factory=dict)
+    meson_install_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,30 +79,129 @@ class NativeBuildOutput:
     install_prefix: PurePosixPath
 
 
-def _cmake_literal(value: str) -> str:
-    delimiter = "="
-    while "]" + delimiter + "]" in value:
-        delimiter += "="
-    return "[" + delimiter + "[" + value + "]" + delimiter + "]"
+def _strings(build: Mapping, field: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    values = build.get(field, list(default))
+    if not isinstance(values, list) or len(values) > 256 or any(not isinstance(value, str) for value in values):
+        raise ValueError(f"adapter {field} must be a bounded string array")
+    return tuple(values)
 
 
-def _meson_literal(value: object) -> str:
-    return repr(str(value))
+def native_build_request(context: NativeBuildContext, build: Mapping, jobs: int | None) -> NativeBuildRequest:
+    """Resolve one native request for both execution and retained admission."""
+    return NativeBuildRequest(
+        NativeAdapter(build["adapter"]),
+        context,
+        _strings(build, "configure_args"),
+        _strings(build, "build_targets"),
+        _strings(build, "install_targets", ("install",)),
+        jobs if jobs is not None else build.get("jobs", 1),
+        PurePosixPath(build.get("install_prefix", "/usr/local")),
+        build.get("configure_environment", {}),
+        _strings(build, "build_args"),
+        meson_properties=build.get("cross_properties", {}),
+    )
+
+
+def compiler_wrapper_text(context: NativeBuildContext, role: str, response_source: str) -> str:
+    """Generate the exact compiler driver consumed by every native adapter."""
+    python = context.host_tools["python"]
+    base = [str(context.target_tools[role]), *context.compiler_flags]
+    return (
+        "#!"
+        + str(python)
+        + "\n"
+        + response_source
+        + "\nimport os, sys\n"
+        + "command = "
+        + repr(base)
+        + "\narguments = sys.argv[1:]\n"
+        + "options = response_arguments(arguments, Path.cwd())\n"
+        + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
+        + 'is_shared = is_link and "-shared" in options\n'
+        + "if is_link:\n"
+        + "    command += "
+        + repr(list(context.linker_flags))
+        + "\n"
+        + "if is_shared:\n"
+        + "    command += "
+        + repr(list(context.shared_library_flags))
+        + "\n"
+        + "elif is_link:\n"
+        + "    command += "
+        + repr(list(context.executable_flags))
+        + "\n"
+        + "os.execv(command[0], command + arguments + ("
+        + repr([str(path) for path in context.shared_library_inputs])
+        + " if is_shared else []))\n"
+    )
+
+
+def build_environment(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict[str, str]:
+    """Construct the effective build environment without ambient search overrides."""
+    import os
+    import shlex
+
+    environment = {"SOURCE_DATE_EPOCH": "1756857600", "LC_ALL": "C"}
+    environment.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            # Upstream VCS probes may inspect an admitted package-local checkout,
+            # but must not discover the repository containing extracted sources.
+            "GIT_CEILING_DIRECTORIES": os.pathsep.join(sorted({str(context.source.parent), str(context.build.parent)})),
+            "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
+            "CC": shlex.quote(str(context.build / "adapter-tools/cc")),
+            "CXX": shlex.quote(str(context.build / "adapter-tools/cxx")),
+            "AR": str(context.target_tools["ar"]),
+            "RANLIB": str(context.target_tools["ranlib"]),
+            "CHOST": context.target,
+            "DESTDIR": str(context.staging_prefix),
+            "PKG_CONFIG": str(context.host_tools["pkg-config"]),
+            "PKG_CONFIG_PATH": "",
+            "PKG_CONFIG_LIBDIR": os.pathsep.join(
+                str(context.dependency_sysroot / directory)
+                for directory in ("usr/local/lib/pkgconfig", "usr/local/share/pkgconfig")
+            ),
+            "PKG_CONFIG_SYSROOT_DIR": str(context.dependency_sysroot),
+        }
+    )
+    environment.update(configure_environment)
+    return environment
+
+
+def compilation_driver_inputs(request: NativeBuildRequest) -> dict:
+    """Bind generated drivers and effective compilation settings to retained state."""
+    context = request.context
+    response_source = Path(__file__).with_name("compiler_response.py").read_text()
+    environment = build_environment(context, request.configure_environment)
+    # DESTDIR is consumed only during installation. All other environment values
+    # remain exact, including any paths embedded in configure bindings.
+    del environment["DESTDIR"]
+    inputs = {
+        "wrappers": {role: compiler_wrapper_text(context, role, response_source) for role in ("cc", "cxx")},
+        "environment": environment,
+        "configure_environment": dict(request.configure_environment),
+    }
+
+    if request.adapter is NativeAdapter.MESON:
+        from ports._support.meson_adapter import meson_configuration
+
+        inputs["meson_configuration"] = meson_configuration(request)
+    return inputs
 
 
 def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     """Run one admitted cross-build without publishing or sealing its output."""
     import json
-    import os
     import re
-    import shlex
     import subprocess
-
-    from ports.native.dependencies import target_environment
+    import sys
+    import time
 
     context = request.context
     if not isinstance(request.adapter, NativeAdapter):
         raise ValueError("unsupported native build adapter")
+    if request.adapter is NativeAdapter.PLAIN_MAKE and request.configure_args:
+        raise ValueError("plain-make adapter has no configure phase")
     if request.adapter is NativeAdapter.MESON and request.install_targets != ("install",):
         raise ValueError("Meson adapter supports its normal install target only")
     if not 1 <= request.jobs <= 16:
@@ -106,8 +216,8 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     ):
         raise ValueError("native adapter paths must be absolute")
     if request.configure_environment or request.build_args:
-        if request.adapter is not NativeAdapter.CONFIGURE_MAKE:
-            raise ValueError("configure environment and make arguments require configure-make")
+        if request.adapter not in {NativeAdapter.CONFIGURE_MAKE, NativeAdapter.PLAIN_MAKE}:
+            raise ValueError("configure environment and make arguments require a make adapter")
     if (
         not isinstance(request.configure_environment, Mapping)
         or len(request.configure_environment) > 128
@@ -125,16 +235,31 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         not isinstance(value, str)
         or len(value) > 4096
         or "\0" in value
-        or value.startswith(("CC=", "CXX=", "AR=", "RANLIB=", "PATH=", "SHELL="))
+        or value.startswith(("CC=", "CXX=", "AR=", "RANLIB=", "HOSTCC=", "PATH=", "SHELL="))
         for value in request.build_args
     ):
         raise ValueError("unsupported make build argument")
+    if request.meson_properties and request.adapter is not NativeAdapter.MESON:
+        raise ValueError("cross properties require Meson")
+    if len(request.meson_properties) > 64 or any(
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key)
+        or not isinstance(value, (str, bool, int))
+        or (isinstance(value, str) and (len(value) > 4096 or "\0" in value))
+        for key, value in request.meson_properties.items()
+    ):
+        raise ValueError("invalid Meson cross property")
+    if request.meson_install_tags and (
+        request.adapter is not NativeAdapter.MESON
+        or any(not re.fullmatch(r"[A-Za-z0-9_-]+", tag) for tag in request.meson_install_tags)
+    ):
+        raise ValueError("invalid Meson install tags")
     required_host = {"python", "pkg-config", "sh", "rm"}
     required_host.update(
         {
             NativeAdapter.CMAKE: {"cmake", "ninja"},
             NativeAdapter.MESON: {"meson", "ninja"},
             NativeAdapter.CONFIGURE_MAKE: {"make"},
+            NativeAdapter.PLAIN_MAKE: {"make", "cc"},
         }[request.adapter]
     )
     required_target = {"cc", "cxx", "ar", "ranlib"}
@@ -149,55 +274,15 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     context.build.mkdir(parents=True, exist_ok=True)
     context.staging_prefix.mkdir(parents=True, exist_ok=True)
     tools = context.build / "adapter-tools"
-    tools.mkdir()
+    tools.mkdir(exist_ok=context.retained_workspace)
+    response_source = Path(__file__).with_name("compiler_response.py").read_text()
     wrappers = {}
     for role in ("cc", "cxx"):
         wrapper = tools / role
-        base = [str(context.target_tools[role]), *context.compiler_flags]
-        wrapper.write_text(
-            "#!"
-            + str(python)
-            + "\nimport os, sys\n"
-            + "command = "
-            + repr(base)
-            + "\narguments = sys.argv[1:]\n"
-            + 'if not any(flag in arguments for flag in ("-c", "-S", "-E")):\n'
-            + "    command += "
-            + repr(list(context.linker_flags))
-            + "\n"
-            + 'if "-shared" in arguments:\n'
-            + "    command += "
-            + repr(list(context.shared_library_flags))
-            + "\n"
-            + 'elif not any(flag in arguments for flag in ("-c", "-S", "-E")):\n'
-            + "    command += "
-            + repr(list(context.executable_flags))
-            + "\n"
-            + "os.execv(command[0], command + arguments)\n"
-        )
+        write_build_file(wrapper, compiler_wrapper_text(context, role, response_source))
         wrapper.chmod(0o755)
         wrappers[role] = wrapper
-    environment = target_environment(context.sdk)
-    environment.update(
-        {
-            "PYTHONDONTWRITEBYTECODE": "1",
-            "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
-            "CC": shlex.quote(str(wrappers["cc"])),
-            "CXX": shlex.quote(str(wrappers["cxx"])),
-            "AR": str(context.target_tools["ar"]),
-            "RANLIB": str(context.target_tools["ranlib"]),
-            "CHOST": context.target,
-            "DESTDIR": str(context.staging_prefix),
-            "PKG_CONFIG": str(context.host_tools["pkg-config"]),
-            "PKG_CONFIG_PATH": "",
-            "PKG_CONFIG_LIBDIR": os.pathsep.join(
-                str(context.dependency_sysroot / directory)
-                for directory in ("usr/local/lib/pkgconfig", "usr/local/share/pkgconfig")
-            ),
-            "PKG_CONFIG_SYSROOT_DIR": str(context.dependency_sysroot),
-        }
-    )
-    environment.update(request.configure_environment)
+    environment = build_environment(context, request.configure_environment)
     commands = []
 
     def run(argv, directory):
@@ -206,115 +291,39 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         (context.build / "adapter-commands.json").write_text(
             json.dumps([{"argv": item.argv, "directory": str(item.directory)} for item in commands], indent=2) + "\n"
         )
+        started = time.perf_counter()
         with (context.build / f"adapter-{len(commands)}.log").open("wb") as log:
             subprocess.run(
                 command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
             )
+        phase = (
+            "configure"
+            if (
+                request.adapter is NativeAdapter.MESON
+                and "setup" in command.argv
+                or request.adapter not in {NativeAdapter.MESON, NativeAdapter.PLAIN_MAKE}
+                and len(commands) == 1
+            )
+            else "install"
+            if "install" in command.argv
+            else "build"
+        )
+        print(
+            f"ports: {request.adapter.value} {phase} {time.perf_counter() - started:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
 
     if request.adapter is NativeAdapter.CMAKE:
-        toolchain = tools / "toolchain.cmake"
-        entries = {
-            "CMAKE_SYSTEM_NAME": "WASI",
-            "CMAKE_SYSTEM_PROCESSOR": "wasm32",
-            "CMAKE_C_COMPILER": str(wrappers["cc"]),
-            "CMAKE_CXX_COMPILER": str(wrappers["cxx"]),
-            "CMAKE_AR": str(context.target_tools["ar"]),
-            "CMAKE_RANLIB": str(context.target_tools["ranlib"]),
-            "CMAKE_SYSROOT": str(context.sysroot),
-            "CMAKE_FIND_ROOT_PATH": str(context.dependency_sysroot) + ";" + str(context.sysroot),
-            "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
-            "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY": "ONLY",
-            "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE": "ONLY",
-            "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "ONLY",
-            "CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH": "FALSE",
-            "CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH": "FALSE",
-            "CMAKE_FIND_USE_PACKAGE_REGISTRY": "FALSE",
-            "CMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY": "FALSE",
-        }
-        toolchain.write_text(
-            "".join("set(" + name + " " + _cmake_literal(value) + ")\n" for name, value in entries.items())
-        )
-        build = context.build / "cmake-build"
-        cmake = context.host_tools["cmake"]
-        run(
-            [
-                cmake,
-                "-S",
-                context.source,
-                "-B",
-                build,
-                "-G",
-                "Ninja",
-                *request.configure_args,
-                "-DCMAKE_TOOLCHAIN_FILE=" + str(toolchain),
-                "-DCMAKE_MAKE_PROGRAM=" + str(context.host_tools["ninja"]),
-                "-DCMAKE_INSTALL_PREFIX=" + str(request.install_prefix),
-                "-DPKG_CONFIG_EXECUTABLE=" + str(context.host_tools["pkg-config"]),
-                "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
-            ],
-            context.build,
-        )
-        run(
-            [
-                cmake,
-                "--build",
-                build,
-                "--parallel",
-                request.jobs,
-                *(["--target", *request.build_targets] if request.build_targets else []),
-            ],
-            context.build,
-        )
-        run([cmake, "--build", build, "--target", *request.install_targets], context.build)
+        from ports._support.cmake_adapter import build_cmake
+
+        build_cmake(request, wrappers, tools, run)
     elif request.adapter is NativeAdapter.MESON:
-        cross = tools / "cross.ini"
-        cross.write_text(
-            "[binaries]\nc = "
-            + _meson_literal(wrappers["cc"])
-            + "\ncpp = "
-            + _meson_literal(wrappers["cxx"])
-            + "\nar = "
-            + _meson_literal(context.target_tools["ar"])
-            + "\nstrip = "
-            + _meson_literal(context.target_tools["strip"])
-            + "\npkg-config = "
-            + _meson_literal(context.host_tools["pkg-config"])
-            + "\n[host_machine]\nsystem = 'wasi'\ncpu_family = 'wasm32'\ncpu = 'wasm32'\nendian = 'little'\n[properties]\nneeds_exe_wrapper = true\nsys_root = "
-            + _meson_literal(context.dependency_sysroot)
-            + "\n"
-        )
-        meson = context.host_tools["meson"]
-        build = context.build / "meson-build"
-        run(
-            [
-                meson,
-                "setup",
-                build,
-                context.source,
-                *request.configure_args,
-                "--cross-file",
-                cross,
-                "--prefix",
-                request.install_prefix,
-                "--wrap-mode=nodownload",
-            ],
-            context.build,
-        )
-        run([meson, "compile", "-C", build, "-j", request.jobs, *request.build_targets], context.build)
-        run([meson, "install", "-C", build, "--no-rebuild"], context.build)
+        from ports._support.meson_adapter import build_meson
+
+        build_meson(request, tools, run)
     else:
-        build = context.build / "configure-build"
-        build.mkdir()
-        run(
-            [
-                context.host_tools["sh"],
-                context.source / "configure",
-                *request.configure_args,
-                "--prefix=" + str(request.install_prefix),
-            ],
-            build,
-        )
-        make = context.host_tools["make"]
-        run([make, "-j", request.jobs, *request.build_args, *request.build_targets], build)
-        run([make, *request.build_args, *request.install_targets, "DESTDIR=" + str(context.staging_prefix)], build)
+        from ports._support.make_adapter import build_make
+
+        build_make(request, wrappers, run)
     return NativeBuildOutput(context.staging_prefix, tuple(commands), request.install_prefix)

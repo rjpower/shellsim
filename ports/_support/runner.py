@@ -11,14 +11,23 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, plan
-from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
+from ports._support.native_adapters import (
+    NativeAdapter,
+    NativeBuildContext,
+    build_native,
+    compilation_driver_inputs,
+    native_build_request,
+)
 from ports._support.python_adapters import (
     CPythonBuildContext,
     ExtensionBuildRequest,
@@ -31,6 +40,7 @@ from ports._support.store import build_slot, extract, fetch, file_hash, relative
 _COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "cohort.py", "local_sources.py")
 _NATIVE_BUILD_MODULES = (
     "native_adapters.py",
+    "compiler_response.py",
     "native_artifacts.py",
     "wasm.py",
     "wasm_metadata.py",
@@ -83,6 +93,7 @@ def _admit_recipe(port: Port) -> dict[str, str]:
     if adapter not in {
         "pure-wheel",
         "python-extension",
+        "python-meson",
         "llvm-guest",
         "llvm-guest-sdk",
         *(item.value for item in NativeAdapter),
@@ -128,26 +139,35 @@ def _hooks(port: Port, phase: str, context: NativeBuildContext, cohort: BuildCoh
             )
 
 
-def _strings(build: dict, field: str, default: tuple[str, ...] = ()) -> tuple[str, ...]:
-    values = build.get(field, list(default))
-    if not isinstance(values, list) or len(values) > 256 or any(not isinstance(value, str) for value in values):
-        raise ValueError(f"adapter {field} must be a bounded string array")
-    return tuple(values)
+def _native_driver_inputs(context: NativeBuildContext, *, build: dict, jobs: int | None) -> dict:
+    return compilation_driver_inputs(native_build_request(context, build, jobs))
 
 
-def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
+def _build_implementation(support: Path, adapter: str, *, stdlib: bool = False) -> dict[str, str]:
     """Bind cached outputs to the code that actually stages and seals them."""
     modules = [*_COMMON_BUILD_MODULES]
     if adapter == "pure-wheel":
         modules.extend(_PURE_BUILD_MODULES)
     elif adapter in {"llvm-guest", "llvm-guest-sdk"}:
         modules.extend(("build.py", "toolchain/llvm/guest.py", *_NATIVE_BUILD_MODULES))
-    elif adapter == "python-extension":
+    elif adapter in {"python-extension", "python-meson"}:
         modules.extend(("build.py", "python_adapters.py", *_NATIVE_BUILD_MODULES))
+        if adapter == "python-meson":
+            modules.append("python_meson.py")
     else:
         modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
+    if adapter in {"meson", "python-meson"}:
+        modules.extend(("meson_adapter.py", "meson_workspace.py"))
+    elif adapter == "cmake":
+        modules.append("cmake_adapter.py")
+    elif adapter in {"configure-make", "plain-make"}:
+        modules.append("make_adapter.py")
+    if stdlib:
+        modules.append("python/cpython/graph_assembly.py")
     return {
-        name: file_hash(support.parent / name if name.startswith(("native/", "toolchain/")) else support / name)
+        name: file_hash(
+            support.parent / name if name.startswith(("native/", "toolchain/", "python/")) else support / name
+        )
         for name in modules
     }
 
@@ -195,7 +215,11 @@ def build_graph(
     graph = plan(ports, requests, target_profile=cohort.dynamic_abi)
     selected = {port.reference: port for port in graph.ports}
     for reference in workspaces or {}:
-        if reference not in selected or selected[reference].recipe["build"]["adapter"] != "llvm-guest":
+        if reference not in selected or selected[reference].recipe["build"]["adapter"] not in {
+            "llvm-guest",
+            "meson",
+            "python-meson",
+        }:
             raise ValueError("explicit workspace requires a selected persistent producer: " + reference)
     local_inputs = {port.reference: _admit_recipe(port) for port in graph.ports}
     from ports._support.local_sources import local_source_files, stage_local_sources
@@ -221,8 +245,11 @@ def build_graph(
             raise ValueError(f"native build requires an explicit target platform dependency: {port.reference}")
     support = Path(__file__).parent
     implementations = {
-        adapter: _build_implementation(support, adapter)
-        for adapter in {port.recipe["build"]["adapter"] for port in graph.ports} - {"llvm-host", "wasi-sysroot"}
+        port.reference: _build_implementation(
+            support, port.recipe["build"]["adapter"], stdlib=port.recipe["build"].get("output") == "stdlib"
+        )
+        for port in graph.ports
+        if port.recipe["build"]["adapter"] not in {"llvm-host", "wasi-sysroot"}
     }
     results: dict[str, Path] = {}
     native: dict[str, NativeArtifact] = {}
@@ -264,7 +291,7 @@ def build_graph(
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
-            "implementation": implementations[adapter],
+            "implementation": implementations[port.reference],
             "cohort": cohort.identity,
             "dependencies": {
                 dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
@@ -275,10 +302,19 @@ def build_graph(
                 "compiler": list(build_cohort.compiler_flags),
                 "linker": list(build_cohort.linker_flags),
                 "shared_library": list(build_cohort.shared_library_flags),
+                "shared_library_inputs": [
+                    {
+                        "path": str(build_cohort.compiler_runtime_archive),
+                        "sha256": file_hash(build_cohort.compiler_runtime_archive),
+                    }
+                ],
                 "executable": list(build_cohort.executable_flags),
             }
-        with build_slot(store, inputs) as slot:
+        with build_slot(store, inputs) as slot, ExitStack() as workspace_stack:
             keys[port.reference] = slot.key
+            print(
+                f"ports: result cache {'hit' if slot.cached else 'miss'}: {port.reference}", file=sys.stderr, flush=True
+            )
             if not slot.cached:
                 recipe, build = port.recipe, port.recipe["build"]
                 source = (
@@ -351,9 +387,9 @@ def build_graph(
                         dependency_sysroot=prefix,
                         shared_library_flags=build_cohort.shared_library_flags,
                         executable_flags=build_cohort.executable_flags,
+                        shared_library_inputs=(build_cohort.compiler_runtime_archive,),
                     )
-                    _hooks(port, "before_build", context, cohort)
-                    if build["adapter"] == "python-extension":
+                    if adapter in {"python-extension", "python-meson"}:
                         python = cohort.python
                         if python is None:
                             raise ValueError("Python extension requires admitted CPython headers and runtime")
@@ -371,9 +407,115 @@ def build_graph(
                                 "runtime": python.runtime_manifest_sha256,
                             },
                         )
-                        output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
+                        if adapter == "python-meson":
+                            from ports._support.python_meson import (
+                                PythonMesonBuildRequest,
+                                build_python_meson,
+                                python_meson_driver_inputs,
+                            )
+
+                            host_packages = {}
+                            for item in build.get("host_header_packages", {}).values():
+                                tool = cohort.host_tools[item["tool"]]
+                                if tool.receipt_path is None:
+                                    raise ValueError("Python Meson host headers require a complete package receipt")
+                                proof = json.loads(tool.receipt_path.read_text())
+                                host_packages[item["tool"]] = (tool.receipt_path.parent / proof["root"]).resolve()
+                    if adapter in {"meson", "python-meson"} and workspaces and port.reference in workspaces:
+                        from ports._support.meson_workspace import retained_meson
+
+                        if build.get("hooks"):
+                            raise ValueError(
+                                "retained Meson workspaces require source patches rather than mutable hooks"
+                            )
+                        compilation = {
+                            name: build[name]
+                            for name in (
+                                "configure_args",
+                                "configure_environment",
+                                "cross_properties",
+                                "dependency_properties",
+                                "host_header_packages",
+                                "install_prefix",
+                            )
+                            if name in build
+                        }
+                        host_code = {}
+                        for name in (
+                            "python",
+                            "meson",
+                            "ninja",
+                            "cython",
+                            "f2py",
+                            "pybind11-config",
+                            "pkg-config",
+                            "sh",
+                        ):
+                            if name in cohort.host_tools:
+                                tool = cohort.host_tools[name]
+                                host_code[name] = {"path": str(tool.path), "sha256": tool.sha256}
+                                if tool.receipt_path is not None:
+                                    proof = json.loads(tool.receipt_path.read_text())
+                                    host_code[name]["files"] = proof["files"]
+                        product_inputs = {
+                            "compiler": build_cohort.llvm.sha256,
+                            "platform": build_cohort.sysroot.sha256,
+                            "sdk": build_cohort.sdk.sha256,
+                        }
+                        if cohort.python is not None:
+                            product_inputs["python"] = {
+                                "source": cohort.python.source_sha256,
+                                "headers": cohort.python.headers_sha256,
+                                "pyconfig": cohort.python.pyconfig_sha256,
+                            }
+                        context = workspace_stack.enter_context(
+                            retained_meson(
+                                context,
+                                workspaces[port.reference],
+                                compilation,
+                                product_inputs,
+                                host_code,
+                                driver_inputs=(
+                                    partial(
+                                        python_meson_driver_inputs,
+                                        cpython=python_context,
+                                        recipe=recipe,
+                                        host_packages=host_packages,
+                                    )
+                                )
+                                if adapter == "python-meson"
+                                else partial(_native_driver_inputs, build=build, jobs=jobs),
+                            )
+                        )
+                        # The sealed result inventories this exact compilation receipt.
+                        shutil.copyfile(
+                            context.build.parent / ".meson-workspace.json",
+                            slot.result / "meson-workspace-receipt.json",
+                        )
+                    _hooks(port, "before_build", context, cohort)
+                    if build["adapter"] in {"python-extension", "python-meson"}:
+                        if adapter == "python-meson":
+                            output = build_python_meson(
+                                PythonMesonBuildRequest(context, python_context, recipe, host_packages)
+                            )
+                        else:
+                            output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
                         _hooks(port, "after_install", context, cohort)
-                        shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
+                        if adapter == "python-meson" or build.get("output", "wheel") == "wheel":
+                            shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
+                        if (adapter == "python-meson" or build.get("output") == "stdlib") and (
+                            recipe.get("exports") or recipe.get("export_directories")
+                        ):
+                            seal_native_install(
+                                recipe,
+                                port.directory,
+                                output.staging_prefix,
+                                slot.result / "native",
+                                target,
+                                direct,
+                                native,
+                                {item.port: native[item.port] for item in port.dependencies if item.kind == "runtime"},
+                            )
                     else:
                         if adapter == "llvm-guest-sdk":
                             from ports.toolchain.llvm.guest import install_guest_sdk
@@ -384,19 +526,7 @@ def build_graph(
 
                             output = build_guest(context, recipe, compiler, jobs=jobs)
                         else:
-                            output = build_native(
-                                NativeBuildRequest(
-                                    NativeAdapter(build["adapter"]),
-                                    context,
-                                    _strings(build, "configure_args"),
-                                    _strings(build, "build_targets"),
-                                    _strings(build, "install_targets", ("install",)),
-                                    jobs if jobs is not None else build.get("jobs", 1),
-                                    PurePosixPath(build.get("install_prefix", "/usr/local")),
-                                    build.get("configure_environment", {}),
-                                    _strings(build, "build_args"),
-                                )
-                            )
+                            output = build_native(native_build_request(context, build, jobs))
                         _hooks(port, "after_install", context, cohort)
                         _source_exports(port, context)
                         seal_native_install(
@@ -438,6 +568,34 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ports-catalog-", dir=output.parent) as temporary:
+        runtime = cohort.python.runtime_bundle
+        incorporated_providers = frozenset()
+        stdlib_ports = [port for port in build.graph.ports if port.recipe["build"].get("output") == "stdlib"]
+        if stdlib_ports:
+            from ports._support.native_artifacts import NativeArtifact
+            from ports.python.cpython.graph_assembly import assemble_stdlib
+
+            artifacts = {
+                port.reference.split("/", 1)[0] + "/" + port.name: NativeArtifact(
+                    build.results[port.reference] / "native", verify_artifact(build.results[port.reference] / "native")
+                )
+                for port in build.graph.ports
+                if (build.results[port.reference] / "native").is_dir()
+            }
+            modules = {
+                port.reference.split("/", 1)[0] + "/" + port.name: artifacts[
+                    port.reference.split("/", 1)[0] + "/" + port.name
+                ]
+                for port in stdlib_ports
+            }
+            runtime, incorporated_providers = assemble_stdlib(
+                runtime,
+                modules,
+                artifacts,
+                _native_target(build.cohorts[stdlib_ports[0].reference]),
+                Path(temporary) / "runtime",
+                runtime_manifest_sha256=cohort.python.runtime_manifest_sha256,
+            )
         raw = Path(temporary) / "raw"
         (raw / "wheels").mkdir(parents=True)
         (raw / "providers").mkdir()
@@ -463,6 +621,12 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                 artifact = verify_artifact(result / "native")
                 for relative in artifact["inputs"]["recipe"]["exports"].get("shared_libraries", []):
                     path = result / "native" / relative
+                    if port.recipe["build"].get("output") == "stdlib":
+                        continue
+                    if path.name in incorporated_providers:
+                        if file_hash(path) != file_hash(runtime / "rootfs/lib" / path.name):
+                            raise ValueError("graph provider conflicts with assembled stdlib runtime")
+                        continue
                     destination = raw / "providers" / path.name
                     if destination.exists():
                         raise ValueError("graph shared provider names conflict")
@@ -485,11 +649,9 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
             "native_providers": providers,
         }
         (raw / "catalog.json").write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
-        combined = compose(cohort.python.runtime_bundle, [raw], Path(temporary) / "catalog")
+        combined = compose(runtime, [raw], Path(temporary) / "catalog")
         native_catalog = publish_native_catalog(build.graph, build.results, Path(temporary) / "native")
-        return build_release(
-            cohort.python.runtime_bundle, combined, cohort.tool("uv"), output, native_catalog=native_catalog
-        )
+        return build_release(runtime, combined, cohort.tool("uv"), output, native_catalog=native_catalog)
 
 
 def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, output: Path) -> None:
@@ -515,8 +677,10 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
         proof = output / Path(port.reference).with_suffix("")
         identity = port.reference.split("/", 1)[0] + "/" + port.name
         kind = "native" if identity in native else "pypi"
+        if kind == "native" and (build.results[port.reference] / "wheels").exists():
+            kind = "pypi+native"
         dependencies = None
-        if kind == "native":
+        if kind in {"native", "pypi+native"}:
             if identity not in native:
                 raise ValueError(f"native port has no sealed artifact: {port.reference}")
             if any(test["kind"] == "native" for test in port.recipe.get("tests", [])):

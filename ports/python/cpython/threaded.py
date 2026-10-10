@@ -109,6 +109,50 @@ def run(command, cwd, environment, log):
         )
 
 
+def final_link(command, maximum_memory_bytes):
+    """Make the declared linear-memory ceiling authoritative for every main link.
+
+    Generated make commands can repeat the same prior ceiling in combined -Wl
+    arguments. Preserve other linker options and reject ambiguous old ceilings.
+    The runtime prepays the full ceiling against the guest resource budget.
+    """
+    if type(maximum_memory_bytes) is not int or not 0 < maximum_memory_bytes <= 256 * 1024**2:
+        raise ValueError("unsupported threaded main memory ceiling")
+    if maximum_memory_bytes % 65536:
+        raise ValueError("threaded main memory ceiling must be page aligned")
+    result, ceilings = [], set()
+    for argument in command:
+        if argument == "--max-memory" or argument.startswith("--max-memory="):
+            raise ValueError("main memory ceiling must use -Wl,--max-memory=BYTES")
+        if not argument.startswith("-Wl,"):
+            result.append(argument)
+            continue
+        retained = []
+        for option in argument[4:].split(","):
+            if not option.startswith("--max-memory"):
+                retained.append(option)
+                continue
+            value = option.removeprefix("--max-memory=")
+            if not option.startswith("--max-memory=") or not value.isascii() or not value.isdecimal():
+                raise ValueError("malformed main memory ceiling")
+            ceilings.add(int(value))
+        if retained:
+            result.append("-Wl," + ",".join(retained))
+    if len(ceilings) > 1:
+        raise ValueError("conflicting main memory ceilings")
+    return [*result, "-Wl,--max-memory=" + str(maximum_memory_bytes)]
+
+
+def libc_symbol_exports(sdk, libc, environment):
+    """Retain every public libc definition in the canonical main executable."""
+    definitions = subprocess.check_output(
+        [str(sdk / "bin/llvm-nm"), "--defined-only", "--extern-only", "--format=posix", str(libc)],
+        env=environment,
+        text=True,
+    )
+    return sorted({line.split()[0] for line in definitions.splitlines() if len(line.split()) >= 2})
+
+
 def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment):
     """Reuse only a sealed compile receipt; publish a distinct relinked runtime."""
     manifest_path = previous / "manifest.json"
@@ -165,7 +209,17 @@ def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix
         elif argument.startswith(str(previous) + "/"):
             argument = str(work) + argument[len(str(previous)) :]
         link.append(argument)
+    # A newly admitted platform can add public libc APIs without changing headers.
+    # Refresh retention on relink rather than replaying only the old archive's symbols.
+    libc = sysroot_prefix / "sysroot/lib/wasm32-wasip1-threads/libc.a"
+    retained = set(link)
+    link.extend(
+        flag
+        for name in libc_symbol_exports(sdk, libc, environment)
+        if (flag := "-Wl,--undefined=" + name) not in retained
+    )
     python = work / "python3.wasm"
+    link = final_link(link, recipe["maximum_memory_bytes"])
     run(link, work / "wasi-build", environment, work / "link.log")
     metadata = main_tls_metadata(python)
     run([str(sdk / "bin/llvm-strip"), "--keep-section=dylink.0", str(python)], work, environment, work / "strip.log")
@@ -356,12 +410,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
     archives = [runtime / "eh" / name for name in ("libc++.a", "libc++abi.a", "libunwind.a")]
     archives.extend(runtime / name for name in ("libsetjmp.a", "libc-printscan-long-double.a"))
     libc = runtime / "libc.a"
-    definitions = subprocess.check_output(
-        [str(sdk / "bin/llvm-nm"), "--defined-only", "--extern-only", "--format=posix", str(libc)],
-        env=environment,
-        text=True,
-    )
-    names = sorted({line.split()[0] for line in definitions.splitlines() if len(line.split()) >= 2})
+    names = libc_symbol_exports(sdk, libc, environment)
     python = work / "python3.wasm"
     link.extend(
         [
@@ -381,6 +430,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
             str(python),
         ]
     )
+    link = final_link(link, recipe["maximum_memory_bytes"])
     run(link, guest, environment, work / "link.log")
     tls_metadata = main_tls_metadata(python)
     run([str(sdk / "bin/llvm-strip"), "--keep-section=dylink.0", str(python)], guest, environment, work / "strip.log")

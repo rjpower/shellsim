@@ -10,6 +10,7 @@ pub(super) struct Layout {
     pub(super) table_size: u32,
     pub(super) table_align: u32,
     pub(super) needed: Vec<String>,
+    pub(super) runtime_paths: Vec<String>,
     pub(super) tls_exports: BTreeSet<String>,
     pub(super) weak_imports: BTreeSet<(String, String)>,
     pub(super) has_start: bool,
@@ -229,6 +230,7 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
     if !marker {
         return Err(Error::msg("threaded dynamic ABI mismatch"));
     }
+    let mut runtime_paths = Vec::new();
     let mut cursor = Cursor(metadata.ok_or_else(|| Error::msg("missing dylink.0"))?);
     let mut dimensions = None;
     let mut deferred = false;
@@ -279,6 +281,18 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
                         return Err(Error::msg("invalid dylink dependency"));
                     }
                     needed.push(name);
+                }
+            }
+            5 => {
+                if !flags_seen.insert(kind) {
+                    return Err(Error::msg("duplicate dylink runtime paths"));
+                }
+                let count = payload.number()?;
+                if count as usize > MAX_MODULES {
+                    return Err(Error::msg("dylink runtime path limit exceeded"));
+                }
+                for _ in 0..count {
+                    runtime_paths.push(payload.string()?);
                 }
             }
             3 | 4 => {
@@ -368,6 +382,7 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
         table_size,
         table_align,
         needed,
+        runtime_paths,
         tls_exports,
         weak_imports,
         has_start,
@@ -456,6 +471,10 @@ mod tests {
     }
 
     fn side(body: &str) -> Vec<u8> {
+        side_metadata(body, &[])
+    }
+
+    fn side_metadata(body: &str, extra: &[u8]) -> Vec<u8> {
         let mut module = wat::parse_str(format!(
             "(module (import \"env\" \"memory\" (memory 1 2 shared)) {body})"
         ))
@@ -464,8 +483,40 @@ mod tests {
         let mut metadata = vec![1, 4, 0, 0, 0, 0, 128, 24, 22];
         metadata.extend_from_slice(b"shellsim.deferred-init");
         metadata.push(1);
+        metadata.extend_from_slice(extra);
         custom(&mut module, "dylink.0", &metadata);
         module
+    }
+
+    // LLD DylinkSection::writeBody emits subsection 5 as count + length-prefixed paths.
+    #[test]
+    fn runtime_path_vector_matches_lld_encoding_and_is_bounded() {
+        let paths = ["/host/build/lib", "$ORIGIN/../lib"];
+        let mut payload = vec![paths.len() as u8];
+        for path in paths {
+            payload.extend(leb(path.len()));
+            payload.extend(path.as_bytes());
+        }
+        let mut subsection = vec![5];
+        subsection.extend(leb(payload.len()));
+        subsection.extend(&payload);
+        assert_eq!(
+            parse(&side_metadata("", &subsection))
+                .unwrap()
+                .runtime_paths,
+            paths
+        );
+        let mut duplicate = subsection.clone();
+        duplicate.extend(&subsection);
+        assert!(parse(&side_metadata("", &duplicate)).is_err());
+        subsection.pop();
+        assert!(parse(&side_metadata("", &subsection)).is_err());
+        let count = leb(MAX_MODULES + 1);
+        let mut excessive = vec![5];
+        excessive.extend(leb(count.len()));
+        excessive.extend(count);
+        assert!(parse(&side_metadata("", &excessive)).is_err());
+        assert!(parse(&side_metadata("", &[5, 2, 1, 0])).is_err());
     }
 
     #[test]

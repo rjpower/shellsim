@@ -50,3 +50,15 @@ The parent TLS patch restores optional dynamic TLS global relocations after
 `__copy_tls` initializes a child TLS block and restores the parent TLS base.
 The relocation function is weak, so ordinary static links without dynamic TLS
 relocations remain supported.
+
+The dynamic sysroot also builds musl's real `pthread_atfork` registry, adapted to
+its current strong-lock primitives. Registration allocates a synchronized
+callback list and retains musl's `ENOMEM` behavior. The internal fork dispatcher
+calls prepare handlers in reverse registration order and parent/child handlers
+in registration order. CPython's verified relink refreshes the public libc
+symbol inventory so newly admitted APIs are retained in its canonical runtime.
+
+Guest process creation uses spawn/exec; it does not invoke fork callbacks.
+Guest `fork` remains unsupported. The threaded CPython atfork probe registers
+real callbacks, checks that subprocess creation does not invoke them, and calls
+the musl dispatcher explicitly to verify each callback order.

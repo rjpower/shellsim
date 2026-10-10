@@ -69,7 +69,7 @@
     },
     {
       "file": "../../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../../toolchain/wasi_threads/dynamic.py",
@@ -91,7 +91,7 @@
   },
   "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "compiler_recipe_sha256": "44051f1674acd83ca8f59466920507929ee36330c6190e140284663533177126",
-  "overlay_recipe_sha256": "d328627df35d3d8b4166c404c5b6d5dbfa03d47b5f140228c8841f9dff1cb6cb",
+  "overlay_recipe_sha256": "62743e684e4428ddaa91750792de60ddb877090aea9c9ed11858a44751426234",
   "needed_libraries": [],
   "link_flags": [
     "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic,--fatal-warnings,-soname,libffi.so"
