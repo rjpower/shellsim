@@ -194,6 +194,17 @@ pub(in crate::commands::wasm) async fn startup(
 ) -> Result<(), Error> {
     let thread = store.data().thread.as_ref().expect("thread host").clone();
     let main = store.data().threaded_dynamic.main.expect("main instance");
+    const BOOTSTRAP: &str = "__wasm_call_runtime_ctors";
+    if thread.executable.forwarded_exports.contains(BOOTSTRAP) {
+        return Err(Error::msg(
+            "executable runtime constructors must be main-owned",
+        ));
+    }
+    let runtime_ctors = main
+        .get_func(store.as_context_mut(), BOOTSTRAP)
+        .ok_or_else(|| Error::msg("missing executable runtime constructors"))?
+        .typed::<(), ()>(&store)
+        .map_err(|_| Error::msg("executable runtime constructors require () -> ()"))?;
     store.data_mut().threaded_dynamic.initializing = true;
     let result = async {
         if thread.id() == 0 {
@@ -232,7 +243,9 @@ pub(in crate::commands::wasm) async fn startup(
                 .await?;
         }
         if let Some((initialization, records)) = pending {
-            if let Some(function) = main.get_func(store.as_context_mut(), "__wasm_apply_data_relocs") {
+            if let Some(function) =
+                main.get_func(store.as_context_mut(), "__wasm_apply_data_relocs")
+            {
                 let _fiber = fibers::begin(store.as_context_mut())?;
                 function
                     .typed::<(), ()>(&store)?
@@ -240,6 +253,13 @@ pub(in crate::commands::wasm) async fn startup(
                     .await?;
             }
             replay::relocate_data(store.as_context_mut()).await?;
+            // The admitted linker splits implementation-priority constructors
+            // into a process-once thunk. Ordinary main ctors delegate to the same
+            // guard later, after side ctors, before main application ctors.
+            {
+                let _fiber = fibers::begin(store.as_context_mut())?;
+                runtime_ctors.call_async(store.as_context_mut(), ()).await?;
+            }
             let installed = store.data().threaded_dynamic.libraries.len();
             for index in installed - records.len()..installed {
                 replay::initialize(store.as_context_mut(), index).await?;

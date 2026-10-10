@@ -72,7 +72,15 @@ fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
         (func $initialize (call $global_relocs) (call $init_memory))
         (start $initialize)
         (func (export "wasi_thread_start") (param i32 i32) {worker_start})
+        (func $runtime_ctors (export "__wasm_call_runtime_ctors")
+            (if (i32.eqz (i32.load (i32.const 28))) (then
+                (if (i32.ne (i32.load (i32.const 12)) (global.get $shared)) (then unreachable))
+                (if (i32.ne (i32.load (i32.add (global.get $shared) (i32.const 12)))
+                    (i32.const 314)) (then unreachable))
+                (i32.store (i32.const 28)
+                    (i32.add (i32.load (i32.const 28)) (i32.const 1))))))
         (func $main_ctors (export "__wasm_call_ctors")
+            (call $runtime_ctors)
             (if (i32.ne (i32.load (i32.add (global.get $shared) (i32.const 4)))
                 (i32.const 52)) (then unreachable)))
         (func (export "_start")
@@ -86,7 +94,9 @@ fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
                 (i32.const 42)) (then unreachable))
             (if (i32.ne (call $main_tls_read) (i32.const 33)) (then unreachable))
             (call $main_ctors)
-            {worker_main} {body}))"#)).unwrap()
+            {worker_main}
+            (if (i32.ne (i32.load (i32.const 28)) (i32.const 1)) (then unreachable))
+            {body}))"#)).unwrap()
 }
 
 fn side_module(needed: &str, answer: &str, constructor: &str) -> Vec<u8> {
@@ -120,6 +130,7 @@ fn side_module_with_type(needed: &str, answer: &str, constructor: &str, result: 
         (func (export "tls_read") (result i32) (i32.load (global.get $tls)))
         (func (export "tls_write") (param i32) (i32.store (global.get $tls) (local.get 0)))
         (func (export "__wasm_call_ctors")
+            (if (i32.ne (i32.load (i32.const 28)) (i32.const 1)) (then unreachable))
             (if (i32.eqz (i32.load (i32.const 8))) (then unreachable))
             (if (i32.ne (i32.load (i32.const 12)) (global.get $base)) (then unreachable))
             (i32.store (i32.add (global.get $base) (i32.const 4)) (call $callback))
@@ -234,6 +245,49 @@ fn strong_function_and_type_mismatch_fail_before_main_entry() {
 }
 
 #[test]
+fn runtime_bootstrap_must_be_main_owned_and_have_the_exact_type() {
+    for (hook, expected) in [
+        ("", "missing executable runtime constructors"),
+        (
+            r#"(import "env" "runtime_ctor" (func $hook))
+                (export "__wasm_call_runtime_ctors" (func $hook))"#,
+            "executable runtime constructors must be main-owned",
+        ),
+        (
+            r#"(func (export "__wasm_call_runtime_ctors") (param i32))"#,
+            "executable runtime constructors require () -> ()",
+        ),
+    ] {
+        let main = wat::parse_str(format!(
+            r#"(module
+                (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-threads-v3")
+                (@custom "dylink.0" "\81\13\11shellsim.main-tls\01\02\09\01\07root.so")
+                (import "env" "memory" (memory 1 4 shared))
+                (import "shellsim_threads_v2" "thread_ready" (func (param i32 i32)))
+                {hook}
+                (export "memory" (memory 0))
+                (table (export "__indirect_function_table") 1 funcref)
+                (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+                (global (export "__stack_low") i32 (i32.const 32768))
+                (global (export "__stack_high") i32 (i32.const 65536))
+                (global (export "__tls_base") (mut i32) (i32.const 1024))
+                (func (export "malloc") (param i32) (result i32) (i32.const 0))
+                (func (export "_start") unreachable))"#
+        ))
+        .unwrap();
+        let mut environment =
+            linked_environment(&main, &side_module("", "(i32.load (global.get $base))", ""));
+        let (outcome, _, stderr) = environment.run_script_capture("/app");
+        assert_eq!(outcome.exit_status, 126);
+        assert!(
+            String::from_utf8_lossy(&stderr).contains(expected),
+            "expected {expected}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+#[test]
 fn strong_data_import_and_missing_dependency_fail_before_main_entry() {
     let missing = r#"(import "GOT.mem" "absent_data" (global (mut i32)))"#;
     let mut environment = linked_environment(
@@ -310,7 +364,8 @@ fn native_c_consumers_load_their_declared_shared_libraries() {
                 0o755,
             )
             .unwrap();
-        let (outcome, stdout, stderr) = environment.run_script_capture("/consumer");
+        let (outcome, stdout, stderr) =
+            environment.run_script_capture("BOOTSTRAP_TEST=present /consumer");
         assert_eq!(
             outcome.exit_status,
             0,
