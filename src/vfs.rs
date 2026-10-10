@@ -775,6 +775,16 @@ impl Vfs {
         mode: Mode,
         replace_builtin: bool,
     ) -> Result<bool> {
+        for parent in std::path::Path::new(path).ancestors().skip(1) {
+            let parent = parent.to_str().expect("VFS paths are UTF-8");
+            if let Some(node) = self.nodes.get(parent) {
+                if !matches!(node.kind, NodeKind::Dir) {
+                    return Err(VfsError::Invalid(format!(
+                        "package destination has a non-directory ancestor: {path}"
+                    )));
+                }
+            }
+        }
         if self.realpath(path, false)? != path {
             return Err(VfsError::Invalid(format!(
                 "package destination follows a link: {path}"

@@ -123,6 +123,15 @@ fn package_import_rejects_links_and_preserves_existing_directories() {
     );
     environment.vfs.symlink("/", "/work", "/linked").unwrap();
     assert!(mount_package_tree(&mut environment, source.path(), "/linked", &[]).is_err());
+    environment
+        .vfs
+        .put_file("/blocked", b"owned".to_vec(), 0o644)
+        .unwrap();
+    assert!(matches!(
+        mount_package_tree(&mut environment, source.path(), "/blocked/packages", &[]),
+        Err(shellsim::host_ingest::PackageImportError::Conflict(_))
+    ));
+    assert_eq!(environment.vfs.read("/", "/blocked").unwrap(), b"owned");
 }
 
 #[test]

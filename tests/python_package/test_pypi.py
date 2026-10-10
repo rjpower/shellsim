@@ -133,6 +133,44 @@ def test_install_pypi_preserves_existing_vfs_files(monkeypatch: pytest.MonkeyPat
         environment.read_file("/usr/lib/python3.14/site-packages/example-1.0.dist-info/WHEEL")
 
 
+def test_default_install_normalizes_modes_and_uses_atomic_mount(monkeypatch):
+    def install(command, **kwargs):
+        result = _fake_install(command, tag="py3-none-any")
+        target = Path(command[command.index("--target") + 1])
+        for path in target.rglob("*"):
+            path.chmod(0o700 if path.is_dir() else 0o600)
+        script = target / "tool"
+        script.write_text("#!/bin/sh\nprintf staged")
+        script.chmod(0o700)
+        return result
+
+    monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
+    environment = shellsim.Environment()
+
+    def forbidden_preflight(path):
+        raise AssertionError("package installer must check conflicts inside its atomic mount")
+
+    monkeypatch.setattr(environment, "read_file", forbidden_preflight)
+    environment.install_pypi("example")
+    environment.install_pypi("example")
+    assert environment.run("stat -c %a /usr/lib/python3.14/site-packages/example.py").stdout == b"644\n"
+    assert environment.run("/usr/lib/python3.14/site-packages/tool").stdout == b"staged"
+
+
+def test_default_install_preserves_resource_error(monkeypatch):
+    def install(command, **kwargs):
+        result = _fake_install(command, tag="py3-none-any")
+        target = Path(command[command.index("--target") + 1])
+        (target / "oversized.py").write_bytes(b"x" * 200_000)
+        return result
+
+    monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
+    environment = shellsim.Environment(disk=100_000)
+    with pytest.raises(shellsim.SimulationError):
+        environment.install_pypi("example")
+    assert environment.run("test ! -e /usr/lib/python3.14/site-packages/example.py").returncode == 0
+
+
 def test_install_pypi_accepts_exact_bundled_distribution_alone(monkeypatch: pytest.MonkeyPatch) -> None:
     def install(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         _add_numpy_wheel(command, "2.5.3")
@@ -168,9 +206,7 @@ def test_install_pypi_rejects_bundled_record_outside_its_files(
 
 
 @pytest.mark.parametrize("name", ["pytest.py", "json.py", "scipy/__init__.py"])
-def test_install_pypi_rejects_bundled_import_name_collisions(
-    monkeypatch: pytest.MonkeyPatch, name: str
-) -> None:
+def test_install_pypi_rejects_bundled_import_name_collisions(monkeypatch: pytest.MonkeyPatch, name: str) -> None:
     def install(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         result = _fake_install(command, tag="py3-none-any")
         path = Path(command[command.index("--target") + 1]) / name

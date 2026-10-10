@@ -24,8 +24,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Sequence
 
 from ._api import Environment
-from ._native import PackageConflictError
-from .pypi import PackageInstallError
+from .pypi import PackageInstallError, _mount_package_tree
 
 _MAX_CATALOG_BYTES = 1024 * 1024
 _MAX_WHEEL_BYTES = 128 * 1024 * 1024
@@ -695,7 +694,4 @@ def install(
         files = [path for path in staging.rglob("*") if path.is_file()]
         if len(files) > _MAX_FILES or sum(path.stat().st_size for path in files) > _MAX_TOTAL_BYTES:
             raise PackageInstallError("staged package set exceeds VFS import limits")
-        try:
-            environment._native.mount_package_tree(str(staging))
-        except PackageConflictError as error:
-            raise PackageInstallError(str(error)) from error
+        _mount_package_tree(environment, staging, "/", normalize_modes=True)

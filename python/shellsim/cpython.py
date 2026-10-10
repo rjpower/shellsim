@@ -22,8 +22,7 @@ from pathlib import Path, PurePosixPath
 from typing import Sequence, Union
 
 from ._api import Environment, RunResult, SimulationError
-from ._native import PackageConflictError
-from .pypi import _REQUIREMENT, PackageInstallError, _compatibility_blockers
+from .pypi import _REQUIREMENT, PackageInstallError, _compatibility_blockers, _mount_package_tree
 
 _EXECUTABLE = "/usr/bin/python3.wasm"
 _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
@@ -196,10 +195,7 @@ class CPythonRuntime:
 
     def _stage(self, environment: Environment, target: Path) -> None:
         """Reject file conflicts before atomic import; the environment must be idle."""
-        try:
-            environment._native.mount_package_tree(str(target), self.site_packages)
-        except PackageConflictError as error:
-            raise PackageInstallError(str(error)) from error
+        _mount_package_tree(environment, target, self.site_packages, normalize_modes=True)
 
     def install_pypi(self, environment: Environment, requirement: Union[str, Sequence[str]]) -> None:
         """Resolve one or more specs together for the bundle's Python and WASI ABI.
@@ -361,4 +357,5 @@ class CPythonRuntime:
                     continue
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 destination.write_bytes(archive.read(member))
+                destination.chmod(0o755 if mode & 0o111 else 0o644)
             self._stage(environment, target)

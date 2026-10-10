@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import zipfile
 
 import pytest
@@ -86,7 +87,9 @@ def wheel_runtime(tmp_path):
 
 @pytest.mark.parametrize("python_first", [False, True])
 @pytest.mark.parametrize("identical", [False, True])
-def test_python_and_native_files_share_atomic_conflict_policy(catalog, wheel_runtime, python_first, identical):
+def test_python_and_native_files_share_atomic_conflict_policy(
+    catalog, wheel_runtime, python_first, identical, host_umask
+):
     add, universe, _ = catalog
     runtime, wheel = wheel_runtime
     payload = b"python-owned" if identical else b"native-owned"
@@ -104,7 +107,7 @@ def test_python_and_native_files_share_atomic_conflict_policy(catalog, wheel_run
         def install():
             native.install(env, ["collision", "new-file"])
 
-        exception = shellsim.SimulationError
+        exception = shellsim.PackageInstallError
         before = b"python-owned"
     else:
         native.install(env, "collision")
@@ -116,6 +119,8 @@ def test_python_and_native_files_share_atomic_conflict_policy(catalog, wheel_run
         before = payload
     if identical:
         install()
+        if python_first:
+            assert env.run("stat -c %a /usr/local/share").stdout == b"755\n"
     else:
         with pytest.raises(exception):
             install()
@@ -123,6 +128,44 @@ def test_python_and_native_files_share_atomic_conflict_policy(catalog, wheel_run
         if not python_first:
             assert env.run("test ! -e /usr/lib/python3.13/site-packages/example-1.dist-info/WHEEL").returncode == 0
     assert env.read_file(destination) == before
+
+
+@pytest.fixture(params=[0o022, 0o077])
+def host_umask(request):
+    previous = os.umask(request.param)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def test_native_tool_replaces_only_original_builtin(catalog):
+    add, universe, _ = catalog
+    record = add("guest-make", payload=b"#!/bin/sh\nprintf installed")
+    record["destinations"] = {"tool": "/usr/bin/make"}
+    env = shellsim.Environment()
+    universe().install(env, "guest-make")
+    assert env.run("/usr/bin/make").stdout == b"installed"
+    universe().install(env, "guest-make")
+    assert env.run("/usr/bin/make").stdout == b"installed"
+    env = shellsim.Environment()
+    env.write_file("/usr/bin/make", "owned command", mode=0o755)
+    with pytest.raises(shellsim.PackageInstallError):
+        universe().install(env, "guest-make")
+    assert env.read_file("/usr/bin/make") == b"owned command"
+
+
+def test_wheel_executable_mode_comes_from_metadata(wheel_runtime, host_umask):
+    runtime, wheel = wheel_runtime
+    with zipfile.ZipFile(wheel, "a") as archive:
+        member = zipfile.ZipInfo("executable.py")
+        member.external_attr = 0o100755 << 16
+        archive.writestr(member, "print(42)")
+    env = shellsim.Environment()
+    runtime.mount(env)
+    runtime.install_wheel(env, wheel)
+    assert env.run("test -x /usr/lib/python3.13/site-packages/executable.py").returncode == 0
+    assert env.run("test ! -x /usr/lib/python3.13/site-packages/example.py").returncode == 0
 
 
 def test_python_package_disk_failure_preserves_simulation_error(wheel_runtime):
@@ -252,7 +295,7 @@ def test_conflicting_exports_rejected_before_mount(catalog):
     two = add("two")
     two["destinations"] = {"tool": "/usr/local/bin/one"}
     env = shellsim.Environment()
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, ["one", "two"])
     assert env.run("test ! -e /usr/local/bin/one").returncode == 0
 
@@ -312,7 +355,7 @@ def test_sequential_destination_conflict_rejected(catalog):
     two["destinations"] = {"tool": "/usr/local/bin/one"}
     env = shellsim.Environment()
     universe().install(env, "one")
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "two")
     assert env.read_file("/usr/local/bin/one") == b"one1"
 
@@ -333,7 +376,7 @@ def test_modified_installed_export_is_not_silently_skipped(catalog):
     env = shellsim.Environment()
     universe().install(env, "tool")
     env.write_file("/usr/local/bin/tool", b"modified")
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "tool")
     assert env.read_file("/usr/local/bin/tool") == b"modified"
 
