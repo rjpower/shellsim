@@ -75,8 +75,8 @@ release installation, `make -j2`, execution, and SciPy/ImageIO/Kiwi operations. 
 host process with populated Clang/LLD/make/codec native artifacts; the earlier **437.363 seconds**
 used a cold serial runtime without a persistent Wasmtime cache. The cold loading measurements
 remain 38.54 seconds for Clang and 19.85 seconds for LLD, as recorded separately above.
-[The checked measurement data](guest-clang-performance-results.json) preserves the commands,
-source identity, setup duration, and observations.
+The benchmark script below records commands, source identity, setup duration, and observations
+in ignored `target/` outputs.
 
 The previous runtime had both Wasmtime disk caching and parallel compilation disabled. A host
 admission probe measured approximately 0.81 seconds for the Clang raw atomic wait scan and
