@@ -46,3 +46,31 @@ LAPACK. The [shared provider](shared/README.md) consumes the unchanged verified
 archive and establishes independent SDK34 BLAS/LAPACK calls through the v2
 loader and an unchanged CPython interpreter. This static recipe continues to
 verify the archive and executable links.
+
+## Threaded graph provider
+
+`graph-recipe.json` builds a new PIC archive and independent shared provider
+against the admitted threaded v3 compiler and sysroot. The plain Make adapter
+uses a separate admitted native `HOSTCC` for upstream generators. Pinned hooks
+retain the numerical ABI normalization above and link the complete archive into
+`libopenblas.so`, importing the canonical main libc/pthread runtime. Compiler
+math helpers are linked selectively from the admitted SDK builtins archive.
+
+The internal OpenBLAS worker pool is disabled. `USE_LOCKING=1` retains upstream
+pthread allocator locks for callers in guest threads; the embedded-OS header
+branch receives the real pthread declarations. This does not reduce the 32 MiB
+workspace. Concurrent numerical calls still need independent workspace memory.
+
+Run the graph with an admitted descriptor that includes the native C generator:
+
+```sh
+uv run python -m ports native/openblas/graph-recipe.json \
+  --cohort /path/to/scientific/cohort.json --store /path/to/store \
+  --output /path/to/release --check
+```
+
+The native graph probe calls real matrix multiplication, LAPACK solve and its
+invalid-input path, both complex dot-product return conventions, and float REAL
+functions. `tests/shared_smoke.py` exercises the shared provider through upstream
+guest ctypes after public native-package installation. The original static and
+single-thread dynamic recipes remain separate products.
