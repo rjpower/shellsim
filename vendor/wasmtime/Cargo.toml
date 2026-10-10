@@ -27,6 +27,8 @@ readme = "README.md"
 license = "Apache-2.0 WITH LLVM-exception"
 repository = "https://github.com/bytecodealliance/wasmtime"
 resolver = "2"
+# Cargo reserves this registry-generated file when packaging a local dependency.
+exclude = [".cargo_vcs_info.json"]
 
 [package.metadata.docs.rs]
 all-features = true
