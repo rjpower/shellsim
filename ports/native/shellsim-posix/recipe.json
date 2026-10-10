@@ -3,9 +3,6 @@
   "version": "1",
   "kind": "native-library",
   "role": "target-library",
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "linkage": "static",
   "source": {
     "files": [
@@ -102,20 +99,6 @@
     ],
     "sha256": "d809141b2ddfe1865bbe066df84225570c1465e865f0cc47bcd364f72af4a6c7"
   },
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
-    }
-  ],
   "target_dependencies": [],
   "build_scripts": [],
   "build": {
@@ -152,5 +135,6 @@
         "-Wl,--wrap=signal,--wrap=open,--wrap=openat"
       ]
     }
-  ]
+  ],
+  "build_profile": "wasi-threads-v3"
 }

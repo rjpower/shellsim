@@ -2,9 +2,6 @@
   "kind": "native-library",
   "name": "libjpeg-turbo",
   "version": "2.1.5.1",
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "linkage": "shared",
   "soname": "libjpeg.so",
   "source": {
@@ -74,18 +71,5 @@
     }
   ],
   "role": "target-library",
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
-    }
-  ]
+  "build_profile": "wasi-threads-v3"
 }

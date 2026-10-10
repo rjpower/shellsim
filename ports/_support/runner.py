@@ -363,6 +363,8 @@ def build_graph(
                 dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
             },
         }
+        if port.build_profile is not None:
+            inputs["build_profile"] = asdict(port.build_profile)
         if adapter not in {"pure-wheel", "host-wheel", "llvm-guest-sdk"}:
             inputs["target_flags"] = {
                 "compiler": list(build_cohort.compiler_flags),

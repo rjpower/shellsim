@@ -15,15 +15,7 @@
   "build": {
     "adapter": "python-pep517"
   },
-  "target": "wasm32-wasip1-threads",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    },
     {
       "port": "python/setuptools",
       "version": "84.0.0"
@@ -31,13 +23,6 @@
     {
       "port": "python/packaging",
       "version": "26.3"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
     }
   ],
   "runtime_dependencies": [
@@ -51,5 +36,6 @@
       "kind": "python",
       "script": "tests/probes/operations.py"
     }
-  ]
+  ],
+  "build_profile": "wasi-threads-v3"
 }

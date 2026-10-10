@@ -1,28 +1,11 @@
 {
   "version": "34.0.0",
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "linkage": "static",
   "sdk": {
     "version": "34.0",
     "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
     "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
   },
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
-    }
-  ],
   "build_scripts": [
     {
       "file": "guest.py",
@@ -160,5 +143,6 @@
     "cpu": 2000000000,
     "memory": 1073741824,
     "disk": 201326592
-  }
+  },
+  "build_profile": "wasi-threads-v3"
 }

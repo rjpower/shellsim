@@ -8,6 +8,13 @@ That default also applies when `pyproject.toml` has no `build-system` table.
 Declared tables must provide a valid `requires` list; absent `build-backend`
 selects the setuptools legacy backend.
 
+Select `build_profile: "wasi-threads-v3"` for the threaded target, ABI, host compiler
+and platform pins. Declare only additional exact backend wheels as
+`build_dependencies`; profile expansion preserves their host roles and explicit
+version pins. Dependency variants can use the profile defaults or explicit
+`recipe` selections. Package metadata and guest checks remain port-owned. See
+[port authoring](../README.md).
+
 Declare exact backend wheels as `build_dependencies`. Include the pinned
 `packaging` wheel in that closure: the hook runner uses it to validate requirements.
 Backend wheels' runtime dependencies are also part of the host import closure,

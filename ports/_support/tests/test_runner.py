@@ -282,3 +282,61 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
     )
     result = environment.run("python /work/raster.py")
     assert result.returncode == 0 and result.stop_reason is None, result.stderr
+
+
+def test_profile_provider_selection_rebuilds_verified_wheel_consumers(tmp_path, monkeypatch):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    provider, provider_recipe = _wheel_port(ports, store, "provider", [])
+    alternate = provider.with_name("alternate.json")
+    alternate.write_text(json.dumps({**provider_recipe, "features": {"alternate-build": True}}))
+    consumer, recipe = _wheel_port(ports, store, "consumer", ["provider"])
+    consumer.write_text(json.dumps({**recipe, "build_profile": "pure-test"}))
+    profile_path = ports / "profiles/pure-test.json"
+    profile_path.parent.mkdir()
+    profile = {
+        "schema_version": 1,
+        "target": PureCohort.target,
+        "target_profile": PureCohort.dynamic_abi,
+        "abi": PureCohort.dynamic_abi,
+        "build_dependencies": [],
+        "platform_dependencies": [],
+        "dependency_recipes": {"python/provider": "python/provider/recipe.json"},
+    }
+    profile_path.write_text(json.dumps(profile))
+    calls = []
+    real_build = runner.build_pure_wheel
+
+    def observed_build(request):
+        calls.append(request.recipe["name"])
+        return real_build(request)
+
+    monkeypatch.setattr(runner, "build_pure_wheel", observed_build)
+    first = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
+    receipt = json.loads((first.results["python/consumer/recipe.json"] / "build-receipt.json").read_text())
+    assert receipt["inputs"]["build_profile"] == {
+        "reference": "profiles/pure-test.json",
+        "sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
+    }
+    calls.clear()
+    cached = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
+    assert not calls
+    assert cached.results == first.results
+    profile["dependency_recipes"]["python/provider"] = "python/provider/alternate.json"
+    profile_path.write_text(json.dumps(profile))
+    changed = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
+    assert calls == ["provider", "consumer"]
+    assert "python/provider/recipe.json" not in changed.results
+    assert changed.results["python/consumer/recipe.json"] != first.results["python/consumer/recipe.json"]
+    calls.clear()
+    # Equal resolved values still retain the exact authored profile bytes.
+    profile_path.write_text(json.dumps(profile, indent=2))
+    reauthored = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
+    assert calls == ["consumer"]
+    assert reauthored.results["python/provider/alternate.json"] == changed.results["python/provider/alternate.json"]
+    assert reauthored.results["python/consumer/recipe.json"] != changed.results["python/consumer/recipe.json"]
+    calls.clear()
+    artifact = reauthored.results["python/consumer/recipe.json"] / "wheels/consumer-1-py3-none-any.whl"
+    artifact.write_bytes(b"corrupt")
+    with pytest.raises(ValueError):
+        runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
+    assert not calls
