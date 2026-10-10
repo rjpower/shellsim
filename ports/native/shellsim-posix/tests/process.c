@@ -14,6 +14,9 @@
 extern char **environ;
 static void *worker(void *parent_errno) {
     assert(&errno != parent_errno);
+    char *cwd = getcwd(NULL, 0);
+    assert(cwd && strcmp(cwd, "/tmp") == 0);
+    free(cwd);
     errno = EINVAL;
     return NULL;
 }
@@ -29,6 +32,16 @@ int main(void) {
     errno = 0;
     assert(read(descriptors[0], buffer, sizeof buffer) == -1);
     assert(errno == EBADF);
+    char *original_cwd = getcwd(NULL, 0);
+    assert(original_cwd);
+    assert(chdir("/tmp") == 0);
+    char cwd[32];
+    assert(getcwd(cwd, sizeof cwd) == cwd);
+    assert(strcmp(cwd, "/tmp") == 0);
+    int relative = open("shellsim-posix-cwd", O_CREAT | O_EXCL | O_RDWR, 0600);
+    assert(relative >= 0);
+    assert(close(relative) == 0);
+    assert(unlink("/tmp/shellsim-posix-cwd") == 0);
     errno = EDOM;
     int *const parent_errno = &errno;
     pthread_t thread;
@@ -38,6 +51,8 @@ int main(void) {
     assert(pthread_join(thread, NULL) == 0);
     assert(&errno == parent_errno);
     assert(errno == EDOM);
+    assert(chdir(original_cwd) == 0);
+    free(original_cwd);
     char name[] = "/tmp/shellsim-posix-XXXXXX";
     int temporary = mkstemp(name);
     assert(temporary >= 0);

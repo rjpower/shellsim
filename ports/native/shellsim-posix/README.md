@@ -2,8 +2,8 @@
 
 This port builds the shared libc bridge used by guest build tools. Its static
 archive supplies virtual process creation, wait/exec, descriptor operations,
-working directories, temporary files and bounded account lookup. The source
-continues to live beside its owning platform modules under `ports/toolchain`.
+working directories, temporary files and bounded account lookup. The sources remain beside their owning platform modules. The threaded CWD
+wrapper is shared with CPython without copying or changing its admitted source.
 The recipe pins every source/header by hash and stages only those files for
 an ordinary CMake build.
 
@@ -21,5 +21,10 @@ processes or descriptors. Unsupported signal callbacks and process attributes
 retain the existing explicit errors from the platform implementation.
 
 The port-local native check exercises descriptor I/O and invalid descriptors,
-exclusive temporary files, and a spawned shell child's exit status. It is run
+exclusive temporary files, process CWD/relative paths shared with a worker,
+and a spawned shell child's exit status. It is run
 through the graph release and public environment setup path with `--check`.
+
+The threaded CWD implementation owns the complete libc symbol group, including
+its scheduler lock. Explicit provider archives precede default libc extraction;
+canonical runtime roots retain the remaining libc functions for shared modules.

@@ -42,7 +42,7 @@
     },
     {
       "file": "../runtime_profile.py",
-      "sha256": "8c7d377a75e46f9c578dbe3e6b2064a990edc5705898e96be35fd30b71f91b8a"
+      "sha256": "52650530d477fe1fbf4e5aa1776b288107b0f7db4710b9aa796502ecce8d741c"
     }
   ],
   "name": "wasi-development",

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(shellsim_posix LANGUAGES C)
-add_library(shellsim-posix STATIC process.c exec.c tempfile.c accounts.c posix.c)
+add_library(shellsim-posix STATIC process.c exec.c tempfile.c accounts.c python/cpython/threaded_posix.c)
 target_include_directories(shellsim-posix PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)

@@ -1,8 +1,9 @@
 """Select one process-owned runtime for native mains and installed guest Clang.
 
 The GNU archive index supplies the public libc roots from the admitted archive.
-Retaining libc by roots lets the long-double implementation take precedence over
-ordinary printf/scanf members, as in the canonical CPython main link.
+Retaining libc by roots lets explicit providers and the long-double implementation
+take precedence before the driver extracts ordinary libc members at its default
+late archive position.
 """
 
 import struct
@@ -62,7 +63,6 @@ def executable_runtime_arguments(sysroot: Path, target: str) -> tuple[str, ...]:
         *(str(archive) for archive in archives),
         "--no-whole-archive",
         *("--undefined=" + symbol for symbol in public_archive_symbols(libc)),
-        str(libc),
     )
 
 
