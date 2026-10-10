@@ -35,6 +35,7 @@ def main():
         "#ifndef OPENBLAS_CONFIG_H\n#define OPENBLAS_CONFIG_H\n"
         + config
         + "\n"
+        + f'#define OPENBLAS_VERSION " OpenBLAS {recipe["version"]} "\n'
         + (source / "openblas_config_template.h").read_text()
         + "\n#endif\n"
     )

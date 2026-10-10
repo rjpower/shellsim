@@ -47,7 +47,7 @@
       {
         "phase": "after_install",
         "file": "graph_install.py",
-        "sha256": "94adc8b1aa8e025db26b856f2887bc44904713a8cc7d1124a6ca77465a591094"
+        "sha256": "0b5d52320129228ef73811a60bbe89a4909733ae78dacf73373505c78ae33712"
       }
     ]
   },
@@ -102,7 +102,7 @@
     },
     {
       "file": "graph_install.py",
-      "sha256": "94adc8b1aa8e025db26b856f2887bc44904713a8cc7d1124a6ca77465a591094"
+      "sha256": "0b5d52320129228ef73811a60bbe89a4909733ae78dacf73373505c78ae33712"
     },
     {
       "file": "build.py",

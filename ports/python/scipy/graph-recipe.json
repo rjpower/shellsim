@@ -141,7 +141,7 @@
   ],
   "build": {
     "adapter": "python-meson",
-    "jobs": 2,
+    "jobs": 8,
     "metadata": "PKG-INFO",
     "licenses": [
       "LICENSE.txt"
