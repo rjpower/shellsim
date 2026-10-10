@@ -31,7 +31,7 @@ _MAX_BYTES = 1024**3
 _MAX_RELEASE_BYTES = 2 * 1024**3
 _KINDS = {"devel", "runtime", "build-tool"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_INSTALL_ROOTS = ("/usr/bin/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")
+_INSTALL_ROOTS = ("/usr/bin/", "/usr/lib/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")
 
 
 def _digest(value: object) -> str:
