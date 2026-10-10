@@ -20,7 +20,7 @@ def test_openblas_pins_production_sources(monkeypatch):
 @pytest.mark.parametrize("name", ["NAME", "slarfb_gett_", "sgetrf2_", "dgeqp3rk_"])
 def test_converted_subroutine_returns_zero_at_early_exit_and_end(monkeypatch, name):
     monkeypatch.syspath_prepend(str(ROOT))
-    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/build.py")
+    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/source.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     source = f'void {name}(int n) {{ if (n < 0) {{ return; }} const char *s = "}}"; /* }} */ }}'
@@ -31,7 +31,7 @@ def test_converted_subroutine_returns_zero_at_early_exit_and_end(monkeypatch, na
 
 def test_return_conversion_preserves_shared_cblas_body(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
-    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/build.py")
+    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/source.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     source = "#ifndef CBLAS\nvoid NAME(int *n) {\n  if (!*n) return;\n#else\nvoid CNAME(int n) {\n  if (!n) return;\n#endif\n  run_kernel();\n}\n"
@@ -60,7 +60,7 @@ def test_numerical_and_fortran_abi_in_guest():
 @pytest.mark.parametrize("name", ["cdotu_", "zdotc_", "cladiv_", "zladiv_"])
 def test_complex_hidden_result_functions_keep_void_returns(monkeypatch, name):
     monkeypatch.syspath_prepend(str(ROOT))
-    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/build.py")
+    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/source.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     source = f"static inline void {name}(complex *result, int *n) {{ if (!*n) return; }}"
@@ -69,7 +69,7 @@ def test_complex_hidden_result_functions_keep_void_returns(monkeypatch, name):
 
 def test_new_lapack_xerbla_calls_receive_character_length(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
-    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/build.py")
+    spec = importlib.util.spec_from_file_location("openblas_build", ROOT / "ports/native/openblas/source.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     source = 'extern int xerbla_(\n char *, integer \n *);\nxerbla_("SGEQP3RK", &i__1);'
@@ -84,7 +84,7 @@ def test_shared_openblas_pins_production_sources(monkeypatch):
     monkeypatch.syspath_prepend(str(ROOT))
     from ports.native.dependencies import recipe_identity
 
-    directory = ROOT / "ports/native/openblas/shared"
+    directory = ROOT / "ports/native/openblas"
     recipe = json.loads((directory / "recipe.json").read_text())
     recipe_identity(recipe, directory)
 

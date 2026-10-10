@@ -1,13 +1,12 @@
 """Verify pinned pure-wheel admission and unchanged output bytes."""
 
 import hashlib
-import json
 import zipfile
 
 import pytest
 
 from ports._support.pure_wheel import verified_files
-from ports.python.imageio import build as IMAGES
+from ports._support.python_adapters import PureWheelBuildRequest, build_pure_wheel
 
 
 @pytest.fixture
@@ -47,24 +46,18 @@ def test_source_metadata_drift_is_rejected(metadata_source, mutation):
 
 def test_build_copies_verified_upstream_bytes(metadata_source, tmp_path, monkeypatch):
     recipe, wheel = metadata_source
-    recipe["build_scripts"] = []
-    (tmp_path / "recipe.json").write_text(json.dumps(recipe))
-    monkeypatch.setattr(IMAGES, "PORT", tmp_path)
     original = wheel.read_bytes()
-    copied = IMAGES.build(wheel, tmp_path / "output")
+    output = build_pure_wheel(PureWheelBuildRequest(wheel, tmp_path / "output", recipe))
+    copied = output.staging_prefix / "wheels" / wheel.name
     assert copied.read_bytes() == original
-    assert json.loads((copied.parent / "manifest.json").read_text())["sha256"] == hashlib.sha256(original).hexdigest()
 
 
 def test_build_rejects_changed_source_before_copy(metadata_source, tmp_path, monkeypatch):
     recipe, wheel = metadata_source
-    recipe["build_scripts"] = []
-    (tmp_path / "recipe.json").write_text(json.dumps(recipe))
-    monkeypatch.setattr(IMAGES, "PORT", tmp_path)
     wheel.write_bytes(b"changed")
     output = tmp_path / "output"
     with pytest.raises(ValueError):
-        IMAGES.build(wheel, output)
+        build_pure_wheel(PureWheelBuildRequest(wheel, output, recipe))
     assert not output.exists()
 
 

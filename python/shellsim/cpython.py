@@ -1,6 +1,6 @@
 """Explicitly mount and run a source-built CPython WASI bundle.
 
-Build bundles with ``uv run ports/python/cpython/build.py``. Host filesystem access is
+Build bundles with ``uv run --no-project python -m ports python/cpython --store PATH``. Host filesystem access is
 confined to this trusted setup API; interpreter execution uses the virtual WASI
 process boundary and the environment's cumulative resource limits.
 """

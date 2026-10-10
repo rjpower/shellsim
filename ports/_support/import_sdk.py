@@ -66,8 +66,11 @@ def import_products(path: Path, store: Path) -> Path:
     import json
 
     from ports._support.graph import Graph
-    from ports._support.sdk import _publish_json, definition, product_reference, verify_node
+    from ports._support.producer_migration import admit_migration
+    from ports._support.producer_policy import policy
+    from ports._support.sdk import _publish_json, definition, product_reference
     from ports._support.sdk_products import json_hash, tool_reference
+    from ports.api import implementation
 
     context = load_legacy_cohort(path)
     ports = Path(__file__).resolve().parents[1]
@@ -90,15 +93,17 @@ def import_products(path: Path, store: Path) -> Path:
         if node.name not in products:
             continue
         product = products[node.name]
-        verify_node(node, product)
+        registry = read_json(Path(__file__).with_name("producer-migration-v1.json"))["products"][node.name]
+        admit_migration(node, registry["source_policy_sha256"][0], product)
         record = {
             "schema_version": 1,
             "product": product_reference(product),
             "inputs": {
-                "producer_policy": json_hash(node.recipe),
+                "producer_policy": json_hash(policy(node.port.recipe)),
+                "implementation": implementation(node.port),
                 "dependencies": {name: products[name].sha256 for name in node.dependencies},
             },
-            "origin": {"kind": "verified-legacy-import", "descriptor_sha256": file_hash(path)},
+            "origin": {"kind": "reviewed-authoring-migration-v1", "descriptor_sha256": file_hash(path)},
         }
         if node.name == "cpython":
             record["runtime"] = product_reference(context.runtime)

@@ -1,121 +1,93 @@
-"""Build upstream libffi 3.5.2 with the bounded SDK34 WASI scalar backend."""
+"""Build upstream scalar libffi with the declared Shellsim WASI backend."""
 
-import argparse
 import json
-import platform
+import os
+import shlex
 import shutil
 import subprocess
-import tarfile
-from pathlib import Path
+from pathlib import PurePosixPath
 
-from ports.native.dependencies import (
-    artifact_input,
-    digest,
-    file_hash,
-    seal_artifact,
-    target_environment,
-    target_profile,
-    toolchain_identity,
-    verify_artifact,
-)
-
-PORT = Path(__file__).resolve().parent
+from ports._support.native_adapters import NativeBuildCommand, NativeBuildOutput
+from ports._support.wasm import mark_abi
+from ports.api import BuildContext
+from ports.native.dependencies import target_environment
 
 
-def _run(command: list[str], directory: Path, environment: dict[str, str], log: Path) -> None:
-    with log.open("w") as output:
-        subprocess.run(command, cwd=directory, env=environment, stdout=output, stderr=subprocess.STDOUT, check=True)
+def build(ctx: BuildContext) -> NativeBuildOutput:
+    context = ctx.require_native()
+    context.build.mkdir(parents=True)
+    configuration = context.build / "configure"
+    configuration.mkdir()
+    environment = target_environment(context.sdk)
+    environment.update(
+        LC_ALL="C",
+        SOURCE_DATE_EPOCH="1756857600",
+        PATH=os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
+        CC=str(context.target_tools["cc"]),
+        CFLAGS=shlex.join(context.compiler_flags),
+    )
+    commands = []
 
+    def run(argv, directory):
+        command = NativeBuildCommand(tuple(map(str, argv)), directory)
+        commands.append(command)
+        with (context.build / f"command-{len(commands)}.log").open("wb") as log:
+            subprocess.run(
+                command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
+            )
 
-def build_libffi(source_archive: Path, sdk: Path, work: Path) -> tuple[Path, dict]:
-    """Seal a source, SDK, generated-header and backend-bound static artifact."""
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        raise ValueError("this libffi configure recipe requires a Linux x86_64 build host")
-    recipe = json.loads((PORT / "recipe.json").read_text())
-    if file_hash(source_archive) != recipe["source"]["sha256"]:
-        raise ValueError("libffi source archive differs from its pin")
-    if file_hash(PORT / "shellsim_wasi.c") != recipe["backend_sha256"]:
-        raise ValueError("libffi WASI backend differs from its pin")
-    inputs = artifact_input(recipe, PORT, toolchain_identity(recipe, sdk), {})
-    identity = digest(inputs)
-    prefix = work / "native-artifacts" / identity
-    if prefix.exists():
-        return prefix, verify_artifact(prefix, inputs)
-    build = work / ("libffi-build-" + identity[:12])
-    build.mkdir(parents=True)
-    source_parent = build / "source"
-    source_parent.mkdir()
-    with tarfile.open(source_archive) as archive:
-        archive.extractall(source_parent, filter="data")
-    source = source_parent / "libffi-3.5.2"
-    environment = target_environment(sdk)
-    environment["PATH"] = "/usr/bin:/bin"
-    environment["CFLAGS"] = "-O2 -g0 -fPIC"
-    _run(
-        [
-            str(source / "configure"),
+    run(
+        (
+            context.host_tools["sh"],
+            context.source / "configure",
             "--host=wasm32-wasip1",
             "--build=x86_64-pc-linux-gnu",
             "--disable-shared",
             "--disable-docs",
             "--prefix=/usr",
-        ],
-        build,
-        environment,
-        build / "configure.log",
+        ),
+        configuration,
     )
-    profile = target_profile(recipe)
-    flags = [*profile["compiler_flags"], *profile["cpp_flags"], "-fPIC"]
-    includes = ["-I" + str(path) for path in (build / "include", source / "include", build)]
+    includes = tuple(
+        "-I" + str(path) for path in (configuration / "include", context.source / "include", configuration)
+    )
     objects = []
-    for name, path in (
-        ("prep_cif", source / "src/prep_cif.c"),
-        ("types", source / "src/types.c"),
-        ("shellsim_wasi", PORT / "shellsim_wasi.c"),
+    for name, source in (
+        ("prep_cif", context.source / "src/prep_cif.c"),
+        ("types", context.source / "src/types.c"),
+        ("backend", ctx.port.directory / "shellsim_wasi.c"),
     ):
-        output = build / (name + ".o")
-        _run(
-            [str(sdk / "bin/clang"), *flags, *includes, "-c", str(path), "-o", str(output)],
-            build,
-            environment,
-            build / (name + ".log"),
-        )
+        output = context.build / (name + ".o")
+        run((context.target_tools["cc"], *context.compiler_flags, *includes, "-c", source, "-o", output), context.build)
         objects.append(output)
-    temporary = prefix.with_name(prefix.name + ".partial")
-    if temporary.exists():
-        shutil.rmtree(temporary)
-    for directory in ("include", "lib/pkgconfig", "licenses"):
-        (temporary / directory).mkdir(parents=True, exist_ok=True)
-    _run(
-        [str(sdk / "bin/llvm-ar"), "rcs", str(temporary / "lib/libffi.a"), *map(str, objects)],
-        build,
-        environment,
-        build / "archive.log",
+    prefix = context.staging_prefix / "usr/local"
+    for name in ("lib/pkgconfig", "include", "licenses"):
+        (prefix / name).mkdir(parents=True)
+    library = prefix / "lib/libffi.so"
+    run(
+        (
+            context.target_tools["cc"],
+            *context.compiler_flags,
+            *context.linker_flags,
+            *context.shared_library_flags,
+            "-Wl,--export-all,-soname,libffi.so,--fatal-warnings",
+            *objects,
+            "-o",
+            library,
+            *context.shared_library_inputs,
+        ),
+        context.build,
     )
-    shutil.copyfile(build / "include/ffi.h", temporary / "include/ffi.h")
-    shutil.copyfile(build / "include/ffitarget.h", temporary / "include/ffitarget.h")
-    shutil.copyfile(source / "LICENSE", temporary / "licenses/libffi.txt")
-    (temporary / "lib/pkgconfig/libffi.pc").write_text(
-        "prefix=${pcfiledir}/../..\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n"
-        "Name: libffi\nDescription: Shellsim WASI scalar libffi backend\nVersion: 3.5.2\n"
+    mark_abi(library, context.abi.encode())
+    for name in ("ffi.h", "ffitarget.h"):
+        shutil.copyfile(configuration / "include" / name, prefix / "include" / name)
+    shutil.copyfile(context.source / "LICENSE", prefix / "licenses/libffi.txt")
+    (prefix / "lib/pkgconfig/libffi.pc").write_text(
+        "prefix=/usr/local\nlibdir=${prefix}/lib\nincludedir=${prefix}/include\n"
+        f"Name: libffi\nDescription: Scalar WASI libffi provider\nVersion: {ctx.port.version}\n"
         "Libs: -L${libdir} -lffi\nCflags: -I${includedir}\n"
     )
-    seal_artifact(temporary, inputs)
-    temporary.rename(prefix)
-    return prefix, verify_artifact(prefix, inputs)
-
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("source_archive", type=Path)
-    parser.add_argument("sdk", type=Path)
-    parser.add_argument("work", type=Path)
-    arguments = parser.parse_args()
-    prefix, manifest = build_libffi(
-        arguments.source_archive.resolve(), arguments.sdk.resolve(), arguments.work.resolve()
+    (context.build / "commands.json").write_text(
+        json.dumps([{"argv": item.argv, "directory": str(item.directory)} for item in commands], indent=2) + "\n"
     )
-    print(json.dumps({"prefix": str(prefix), "artifact_sha256": manifest["artifact_sha256"]}))
-
-
-if __name__ == "__main__":
-    main()
+    return NativeBuildOutput(context.staging_prefix, tuple(commands), PurePosixPath("/usr/local"))

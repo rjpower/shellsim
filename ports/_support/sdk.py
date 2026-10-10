@@ -8,7 +8,6 @@ order. Imported inventories are references to immutable products, not new receip
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import platform
 import sys
@@ -16,7 +15,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
-from ports._support.graph import Graph, _document
+from ports._support.graph import Graph, Port, _document, canonical_reference
+from ports._support.producer_policy import load_policy, policy, verify_policy
+from ports._support.producer_policy import metadata as producer_metadata
 from ports._support.sdk_products import (
     MaterializedSDK,
     Receipt,
@@ -33,6 +34,7 @@ from ports._support.sdk_products import (
     verify_product,
 )
 from ports._support.store import fetch, relative_path
+from ports.api import BuildContext, ProductBuildOutput, build_port, implementation
 
 
 class PrerequisiteError(ValueError):
@@ -48,6 +50,7 @@ class SDKProduct:
     recipe_path: Path
     recipe: dict
     dependencies: tuple[str, ...]
+    port: Port
 
 
 @dataclass(frozen=True)
@@ -89,15 +92,28 @@ def definition(ports: Path, graph: Graph, default: str = "default") -> SDKDefini
         raise ValueError("SDK product graph must have one to thirty-two nodes")
     nodes = {}
     for name, declaration in declarations.items():
-        if set(declaration) != {"adapter", "recipe", "sha256", "dependencies"}:
+        if set(declaration) != {"adapter", "recipe", "dependencies"}:
             raise ValueError("SDK product declaration fields differ")
-        path, data, recipe = _document(ports, relative_path(declaration["recipe"]))
-        if hashlib.sha256(data).hexdigest() != declaration["sha256"]:
-            raise ValueError("SDK producer recipe pin differs: " + name)
+        port_reference = canonical_reference(ports, declaration["recipe"])
+        directory, selected = producer_metadata(port_reference, ports)
+        if selected["build_system"] != declaration["adapter"]:
+            raise ValueError("SDK product build system differs from its port")
+        recipe = load_policy(port_reference, ports)
+        port = Port(
+            port_reference,
+            directory,
+            selected["name"],
+            selected["version"],
+            "",
+            (),
+            selected,
+            variant=port_reference.partition(":")[2],
+        )
+        path = directory / "recipe.json"
         dependencies = declaration["dependencies"]
         if not isinstance(dependencies, list) or len(dependencies) > 32 or len(set(dependencies)) != len(dependencies):
             raise ValueError("invalid SDK product dependencies")
-        nodes[name] = SDKProduct(name, declaration["adapter"], path, recipe, tuple(dependencies))
+        nodes[name] = SDKProduct(name, declaration["adapter"], path, recipe, tuple(dependencies), port)
     expected_edges = {
         "sdk-tooling": (),
         "llvm-host": (),
@@ -141,8 +157,8 @@ def compatible_inputs(record: dict, current: dict) -> bool:
     """
     recorded = record["inputs"]
     origin = record.get("origin")
-    if isinstance(origin, dict) and origin.get("kind") == "verified-legacy-import":
-        fields = ("producer_policy", "dependencies")
+    if isinstance(origin, dict) and origin.get("kind") == "reviewed-authoring-migration-v1":
+        fields = ("producer_policy", "implementation", "dependencies")
         return all(recorded[field] == current[field] for field in fields)
     return recorded == current
 
@@ -205,7 +221,8 @@ def verify_node(node: SDKProduct, product: Receipt) -> None:
         )
         return
     if node.adapter == "uv-host":
-        if product.contents["recipe"] != node.recipe or not product.contents["build"]["locked"]:
+        verify_policy(product.contents["recipe"], node.port.reference)
+        if not product.contents["build"]["locked"]:
             raise ValueError("resolver producer differs")
         executable = product.contents["executable"]
         if file_hash(product.root / executable["file"]) != executable["sha256"]:
@@ -213,9 +230,22 @@ def verify_node(node: SDKProduct, product: Receipt) -> None:
         return
     if node.adapter not in {"llvm-host", "wasi-sysroot"}:
         raise ValueError("unsupported SDK producer: " + node.adapter)
-    if product.contents["identity"]["recipe"] != node.recipe:
-        raise ValueError("SDK product producer differs")
+    verify_policy(product.contents["identity"]["recipe"], node.port.reference)
     verify_product(product)
+
+
+def verify_dependencies(node: SDKProduct, product: Receipt, products: Mapping[str, Receipt]) -> None:
+    """Bind embedded producer provenance to the exact selected dependency receipts."""
+    if node.adapter == "wasi-sysroot":
+        recorded = product.contents["identity"]
+        if (
+            recorded["compiler"] != products["compiler"].contents
+            or recorded["sdk_tooling"] != products["tooling"].contents
+        ):
+            raise ValueError("platform dependency receipt differs")
+    elif node.adapter == "cpython-threaded":
+        if product.contents["build_profile"]["sysroot"] != products["platform"].contents:
+            raise ValueError("CPython platform dependency receipt differs")
 
 
 def _produce(
@@ -225,64 +255,38 @@ def _produce(
     from ports._support.build import check_build_scripts
 
     check_build_scripts(node.recipe, node.recipe_path.parent)
-    if node.adapter == "sdk-tooling":
-        from ports.toolchain.wasi_threads.build import extract
-        from ports.toolchain.wasi_threads.dynamic import sdk_tooling
-
-        archive = fetch(node.recipe["sdk"], store / "sources", offline=offline)
-        root = work / "sdk"
-        work.mkdir(parents=True)
-        extract(archive, root, node.recipe["sdk"]["sha256"], set())
-        manifest = work / "tooling.json"
-        _publish_json(manifest, sdk_tooling(root))
-    elif node.adapter == "llvm-host":
-        from ports.toolchain.llvm.compiler import build
-
-        if set(seed.compiler_tools) != {"cc", "cxx", "cmake", "ninja"}:
-            raise PrerequisiteError("missing host compiler seed: bind cc, cxx, cmake and ninja with --host-seed")
-        archive = fetch(node.recipe["source"], store / "sources", offline=offline)
-        root = build(archive, *(seed.compiler_tools[name].path for name in ("cc", "cxx", "cmake", "ninja")), work)
-        manifest = root / "manifest.json"
-    elif node.adapter == "wasi-sysroot":
-        from ports.toolchain.wasi_threads.dynamic import build
-
+    if node.adapter == "llvm-host" and set(seed.compiler_tools) != {"cc", "cxx", "cmake", "ninja"}:
+        raise PrerequisiteError("missing host compiler seed: bind cc, cxx, cmake and ninja with --host-seed")
+    if node.adapter == "wasi-sysroot":
         _require_tools(seed, ("cmake", "ninja"))
-        archives = [fetch(node.recipe[name], store / "sources", offline=offline) for name in ("sdk", "wasi_libc")]
-        root = build(
-            *archives, products["compiler"].root, *(seed.tools[name].path for name in ("cmake", "ninja")), work
-        )
-        manifest = root / "manifest.json"
-    elif node.adapter == "cpython-threaded":
-        from ports.python.cpython.threaded import build
-
+    if node.adapter == "cpython-threaded":
         _require_tools(seed, ("make",))
         if seed.python_helper is None:
-            raise PrerequisiteError("missing native CPython 3.13.7 build helper: bind python_helper with --host-seed")
-        archive = fetch(node.recipe["source"], store / "sources", offline=offline)
-        root = build(
-            archive,
-            seed.python_helper.path,
-            products["tooling"].root,
-            products["platform"].root,
-            products["compiler"].root,
-            seed.tools["make"].path,
+            raise PrerequisiteError("missing native CPython build helper: bind python_helper with --host-seed")
+    if node.adapter == "uv-host" and offline:
+        raise PrerequisiteError("offline resolver product is missing; materialize the pinned resolver online first")
+    sources = {}
+    if node.adapter in {"sdk-tooling", "wasi-sysroot"}:
+        names = ("sdk",) if node.adapter == "sdk-tooling" else ("sdk", "wasi_libc")
+        sources = {name: fetch(node.recipe[name], store / "sources", offline=offline) for name in names}
+    elif node.adapter != "uv-host":
+        sources["source"] = fetch(node.recipe["source"], store / "sources", offline=offline)
+    source = next(iter(sources.values()), work)
+    output = build_port(
+        BuildContext(
+            node.port,
+            source,
             work,
+            sources=sources,
+            product_dependencies=products,
+            host_seed=seed,
+            work=work,
+            offline=offline,
         )
-        manifest = root / "manifest.json"
-    elif node.adapter == "uv-host":
-        if offline:
-            raise PrerequisiteError(
-                "offline resolver product is missing; materialize the pinned resolver online before --offline"
-            )
-        from ports.toolchain.uv.build import build
-
-        # uv's existing producer pins Rust and records every resolved native tool.
-        # Its verified output is a graph product, never a required target seed.
-        binary = build(work, offline=offline)
-        root, manifest = binary.parent, binary.parent / "artifact.json"
-    else:
-        raise ValueError("unsupported SDK producer: " + node.adapter)
-    return Receipt(root, manifest, file_hash(manifest), read_json(manifest))
+    )
+    if not isinstance(output, ProductBuildOutput):
+        raise ValueError("SDK builder must return an unpublished product")
+    return Receipt(output.root, output.manifest, file_hash(output.manifest), read_json(output.manifest))
 
 
 def producer_work(node: SDKProduct, inputs: dict, seed: HostSeed, store: Path) -> Path:
@@ -327,7 +331,8 @@ def node_inputs(node: SDKProduct, products: Mapping[str, Receipt], seed: HostSee
         tools = {name: seed.tools[name] for name in ("make",) if name in seed.tools}
         helper = seed.python_helper.sha256 if seed.python_helper else None
     return {
-        "producer_policy": json_hash(node.recipe),
+        "producer_policy": json_hash(policy(node.port.recipe)),
+        "implementation": implementation(node.port),
         "dependencies": {name: products[name].sha256 for name in node.dependencies},
         "host_tools": {name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256} for name, tool in tools.items()},
         "python_helper": helper,
@@ -386,11 +391,13 @@ def _materialize(
         if record is not None and compatible_inputs(record, inputs):
             product = receipt(path.parent, record["product"])
             verify_node(node, product)
+            verify_dependencies(node, product, products)
             print("ports: SDK product cache hit: " + node.name, file=sys.stderr, flush=True)
         else:
             print("ports: SDK product cache miss: " + node.name, file=sys.stderr, flush=True)
             product = _produce(node, products, seed, store.resolve(), producer_work(node, inputs, seed, store), offline)
             verify_node(node, product)
+            verify_dependencies(node, product, products)
             record = {
                 "schema_version": 1,
                 "product": product_reference(product),
@@ -401,8 +408,9 @@ def _materialize(
         products[node.name], records[node.name] = product, record
     runtime = None
     if python:
-        runtime_binding = records["cpython"].get("runtime")
-        runtime = receipt(index, runtime_binding) if runtime_binding is not None else products["cpython"]
+        # Explicit stdlib graph selections assemble from the package-free product.
+        # Imported assembled runtimes remain preserved in their original records.
+        runtime = products["cpython"]
     tools = dict(seed.tools)
     if python:
         resolver = products["resolver"]

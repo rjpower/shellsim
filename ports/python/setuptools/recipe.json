@@ -2,9 +2,6 @@
   "name": "setuptools",
   "version": "84.0.0",
   "role": "host-tool",
-  "build": {
-    "adapter": "host-wheel"
-  },
   "source": {
     "filename": "setuptools-84.0.0-py3-none-any.whl",
     "url": "https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl",
@@ -62,5 +59,6 @@
     "mypy==1.18.*; extra == \"type\"",
     "importlib_metadata>=7.0.2; python_version < \"3.10\" and extra == \"type\"",
     "jaraco.develop>=7.21; sys_platform != \"cygwin\" and extra == \"type\""
-  ]
+  ],
+  "build_system": "host-wheel"
 }

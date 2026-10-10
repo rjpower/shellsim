@@ -4,24 +4,32 @@
   "kind": "pure-python-sdist",
   "source": {
     "url": "https://files.pythonhosted.org/packages/a8/1e/c606ac9bf0277524cd935d6c2bb5b387c3bf401fa8ddbb59b622d6dd50af/cellpylib-2.4.0.tar.gz",
-    "sha256": "e23ff7b5f647c23958748727c899b4e57b667c9f18cbc66d7577dbfaab3729ef"
+    "sha256": "e23ff7b5f647c23958748727c899b4e57b667c9f18cbc66d7577dbfaab3729ef",
+    "subdirectory": "cellpylib-2.4.0"
   },
-  "build_tools": {
-    "setuptools": {
-      "version": "84.0.0",
-      "filename": "setuptools-84.0.0-py3-none-any.whl",
-      "url": "https://files.pythonhosted.org/packages/95/9c/c510029fc6ef33a6275cd2c5d3cecd6613dfd6aa401d57c54f1c18852ccf/setuptools-84.0.0-py3-none-any.whl",
-      "sha256": "51a52592b3b99e102b609654876bd65f19f999935166d1352678931132b0c670"
-    }
-  },
-  "backend": "setuptools.build_meta",
-  "source_date_epoch": "1676432933",
   "requires_python": ">3.6",
   "requires_dist": [
     "numpy>=1.15.4",
     "matplotlib>=3.0.2"
   ],
-  "wheel": "cellpylib-2.4.0-py3-none-any.whl",
   "patches": [],
-  "build_script_sha256": "b13b79d158f4bfe3ef6df02e1fa1ae5e68b0083371d0ba593de989354bbc71d9"
+  "build_system": "python-pep517",
+  "role": "target-library",
+  "sdk": "default",
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    }
+  ]
 }

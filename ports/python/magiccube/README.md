@@ -1,6 +1,7 @@
 # Magiccube 0.3.0
 
-`build.py --wheel <upstream-wheel> --output <directory>` verifies the recipe's
+`uv run --no-project python -m ports python/magiccube --store target/ports-store --output target/magiccube-release`
+selects the canonical graph. The shared pure-wheel helper verifies the recipe's
 source hash, package metadata, pure tags and dependency metadata, then copies the
 upstream wheel unchanged. Add that wheel to the ordinary curated package catalog.
 NumPy is resolved by the public package installer from the selected catalog.

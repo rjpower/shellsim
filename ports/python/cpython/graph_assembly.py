@@ -11,8 +11,8 @@ from pathlib import Path
 from typing import Mapping
 
 from ports._support.native_artifacts import NativeArtifact, NativeTarget, merge_dependency_sysroot
+from ports._support.runtime_files import _copy, _verified_rootfs
 from ports.native.dependencies import file_hash
-from ports.python.cpython.assembly import _copy, _verified_rootfs
 
 
 def assemble_stdlib(
@@ -62,7 +62,7 @@ def assemble_stdlib(
         providers = set()
         for name, artifact in sorted(selected.items()):
             recipe = artifact.manifest["inputs"]["recipe"]
-            stdlib = recipe.get("build", {}).get("output") == "stdlib"
+            stdlib = recipe.get("output") == "stdlib"
             if stdlib and (
                 recipe["source"]["sha256"] != base["recipe"]["source"]["sha256"]
                 or recipe["version"] != base["recipe"]["version"]
@@ -74,7 +74,7 @@ def assemble_stdlib(
                     if group == "licenses":
                         destination = f"/TOOLCHAIN-LICENSES/graph/{name}/{filename}"
                     elif stdlib:
-                        if source != f"lib-dynload/{recipe['build']['module']}.so":
+                        if source != f"lib-dynload/{recipe['module']}.so":
                             raise ValueError("stdlib export differs from declared module")
                         destination = f"/usr/lib/python3.13/lib-dynload/{filename}"
                     else:

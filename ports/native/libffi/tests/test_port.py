@@ -14,9 +14,7 @@ PORT = Path(__file__).resolve().parent.parent
 
 def test_static_and_shared_recipes_pin_production_sources() -> None:
     static = json.loads((PORT / "recipe.json").read_text())
-    shared = json.loads((PORT / "shared/recipe.json").read_text())
     recipe_identity(static, PORT)
-    recipe_identity(shared, PORT / "shared")
 
 
 def test_real_c_calls_and_callbacks_reject_unsupported_signatures(tmp_path) -> None:

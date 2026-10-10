@@ -1,10 +1,7 @@
 {
   "name": "setuptools-scm",
   "version": "8.3.1",
-  "role": "target-library",
-  "build": {
-    "adapter": "pure-wheel"
-  },
+  "role": "host-tool",
   "source": {
     "filename": "setuptools_scm-8.3.1-py3-none-any.whl",
     "url": "https://files.pythonhosted.org/packages/ab/ac/8f96ba9b4cfe3e4ea201f23f4f97165862395e9331a424ed325ae37024a8/setuptools_scm-8.3.1-py3-none-any.whl",
@@ -31,7 +28,7 @@
     "typing-extensions; python_version < \"3.11\" and extra == \"test\"",
     "wheel; extra == \"test\""
   ],
-  "runtime_dependencies": [
+  "build_dependencies": [
     {
       "port": "python/setuptools",
       "version": "84.0.0"
@@ -40,5 +37,6 @@
       "port": "python/packaging",
       "version": "26.3"
     }
-  ]
+  ],
+  "build_system": "host-wheel"
 }

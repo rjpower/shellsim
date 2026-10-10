@@ -1,36 +1,36 @@
 {
-  "kind": "native-library",
   "name": "libffi",
   "version": "3.5.2",
-  "target_profile": "wasi-cpython-v2",
-  "target": "wasm32-wasip1",
-  "linkage": "static",
+  "kind": "native-library",
   "source": {
     "url": "https://github.com/libffi/libffi/releases/download/v3.5.2/libffi-3.5.2.tar.gz",
-    "sha256": "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc"
+    "sha256": "f3a3082a23b37c293a4fcd1053147b371f2ff91fa7ea1b2a52e335676bac82dc",
+    "subdirectory": "libffi-3.5.2"
   },
-  "host_tools": [
-    "python-build-driver",
-    "libffi-configure",
-    "wasi-sdk-clang",
-    "wasi-sdk-llvm-ar"
-  ],
-  "target_dependencies": [],
   "features": {
     "primitive_scalars": true,
     "closures": true,
     "aggregates": false,
     "variadic": false,
-    "shared": false
+    "shared": true
   },
-  "transitive_link_flags": [],
+  "needed_libraries": [],
+  "role": "target-library",
+  "build_system": "native",
+  "sdk": "default",
+  "linkage": "shared",
+  "soname": "libffi.so",
+  "source_exports": [],
+  "inputs": {
+    "native/libffi/shellsim_wasi.c": "6b018972f550914cc2c7f6df823183765c216f3533a6a59225451a82486e036b"
+  },
   "exports": {
+    "shared_libraries": [
+      "lib/libffi.so"
+    ],
     "headers": [
       "include/ffi.h",
       "include/ffitarget.h"
-    ],
-    "archives": [
-      "lib/libffi.a"
     ],
     "pkg_config": [
       "lib/pkgconfig/libffi.pc"
@@ -39,20 +39,13 @@
       "licenses/libffi.txt"
     ]
   },
-  "backend_sha256": "6b018972f550914cc2c7f6df823183765c216f3533a6a59225451a82486e036b",
-  "build_scripts": [
+  "tests": [
     {
-      "file": "build.py",
-      "sha256": "f20fafc63ea861c90fa7c40fead70c8580d06b0926ac81c54433d23241c92ba2"
-    },
-    {
-      "file": "../dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
+      "kind": "native",
+      "source": "tests/graph_smoke.c",
+      "link_inputs": [
+        "lib/libffi.so"
+      ]
     }
-  ],
-  "sdk": {
-    "version": "34.0",
-    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
-  }
+  ]
 }

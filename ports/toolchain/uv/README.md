@@ -5,10 +5,8 @@ This port patches uv 0.12.3 to resolve for shellsim's CPython 3.13.7 WASI Previe
 Build an optimized host executable from the pinned upstream tag and patch:
 
 ```sh
-uv run --no-project --python 3.13 python ports/toolchain/uv/build.py \
-  /tmp/shellsim-uv/release --jobs 2
-uv run --no-project --python 3.13 python ports/toolchain/uv/tests/verify_target.py \
-  /tmp/shellsim-uv/release/uv
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports toolchain/uv --store /path/to/ports-store
 ```
 
 The builder uses upstream uv's optimized `release` profile, the recipe's Rust

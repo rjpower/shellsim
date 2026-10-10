@@ -2,7 +2,21 @@
 
 import pytest
 
-from ports.python.magiccube.build import build
+from ports._support import python_adapters
+from ports._support.graph import plan
+from ports._support.python_adapters import PureWheelBuildRequest, build_pure_wheel
+
+
+def analyze(roots):
+    from pathlib import Path
+
+    return plan(Path(__file__).resolve().parents[4] / "ports", roots)
+
+
+def build(source, output):
+    recipe = next(port.recipe for port in analyze(["python/magiccube"]).ports if port.name == "magiccube")
+    result = build_pure_wheel(PureWheelBuildRequest(source, output, recipe))
+    return result.staging_prefix / "wheels" / source.name
 
 
 def test_changed_wheel_rejected_before_copy(tmp_path):
@@ -15,7 +29,6 @@ def test_changed_wheel_rejected_before_copy(tmp_path):
 
 def test_upstream_wheel_is_copied_unchanged(tmp_path, monkeypatch):
     import hashlib
-    import json
     import os
     from pathlib import Path
 
@@ -25,7 +38,7 @@ def test_upstream_wheel_is_copied_unchanged(tmp_path, monkeypatch):
     original = Path(source).read_bytes()
     source = tmp_path / Path(source).name
     source.write_bytes(original)
-    from ports.python.magiccube import build as builder
+    builder = python_adapters
 
     verify = builder.verified_files
 
@@ -37,5 +50,4 @@ def test_upstream_wheel_is_copied_unchanged(tmp_path, monkeypatch):
     monkeypatch.setattr(builder, "verified_files", mutate_after_admission)
     destination = build(source, tmp_path / "output")
     assert destination.read_bytes() == original
-    manifest = json.loads((destination.parent / "manifest.json").read_text())
-    assert manifest["sha256"] == hashlib.sha256(original).hexdigest()
+    assert hashlib.sha256(destination.read_bytes()).hexdigest() == hashlib.sha256(original).hexdigest()

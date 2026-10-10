@@ -49,6 +49,32 @@ class PEP517BuildRequest:
     sysconfig_data: Path
     recipe: Mapping
     backend_wheels: tuple[BackendWheel, ...]
+    preserve_package: str | None = None
+    preserve_license: str | None = None
+
+
+def package_snapshot(root: Path, package: str) -> dict[str, bytes]:
+    """Capture a bounded pure package before the backend can alter source files."""
+    directory = root / relative_path(package)
+    files, size = {}, 0
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ValueError("pure source package contains a symlink")
+        if path.is_dir():
+            continue
+        size += path.stat().st_size
+        if len(files) >= 10000 or size > 64 * 1024**2:
+            raise ValueError("pure source package exceeds build bounds")
+        files[path.relative_to(directory).as_posix()] = path.read_bytes()
+    if not files:
+        raise ValueError("pure source package is empty or missing")
+    return files
+
+
+def verify_preserved_package(stage: Path, package: str, original: Mapping[str, bytes]) -> None:
+    """Reject backend transformations of a package promised as unchanged source."""
+    if package_snapshot(stage, package) != original:
+        raise ValueError("wheel package differs from admitted source")
 
 
 def target_sysconfig(request: PEP517BuildRequest) -> dict:
@@ -115,7 +141,7 @@ def _unpack_backends(wheels: tuple[BackendWheel, ...], destination: Path) -> Non
         recipe = dict(wheel.recipe)
         files = (
             verified_host_files(wheel.path, recipe)
-            if recipe["build"]["adapter"] == "host-wheel"
+            if recipe["build_system"] == "host-wheel"
             else verified_files(wheel.path, recipe)
         )
         for name, data in files.items():
@@ -224,6 +250,12 @@ def build_pep517(request: PEP517BuildRequest) -> PythonBuildOutput:
         raise ValueError("PEP 517 target differs from admitted CPython")
     if context.build.exists() or context.staging_prefix.exists():
         raise ValueError("PEP 517 build output already exists")
+    original = package_snapshot(context.source, request.preserve_package) if request.preserve_package else None
+    license_bytes = None
+    if request.preserve_license:
+        license_path = context.source / relative_path(request.preserve_license)
+        file_hash(license_path, limit=1024**2)
+        license_bytes = license_path.read_bytes()
     project_file = context.source / "pyproject.toml"
     project = tomllib.loads(project_file.read_text()) if project_file.exists() else {}
     declaration = project.get(
@@ -317,6 +349,12 @@ def build_pep517(request: PEP517BuildRequest) -> PythonBuildOutput:
     stage = context.staging_prefix / "wheel-root"
     stage.mkdir(parents=True)
     _stage_wheel(output / filename, stage, request)
+    if original is not None:
+        verify_preserved_package(stage, request.preserve_package, original)
+    if license_bytes is not None:
+        licenses = [path for path in stage.rglob(Path(request.preserve_license).name) if path.is_file()]
+        if len(licenses) != 1 or licenses[0].read_bytes() != license_bytes:
+            raise ValueError("wheel license differs from admitted source")
     wheels = context.staging_prefix / "wheels"
     wheels.mkdir()
     dist = recipe["name"].replace("-", "_") + "-" + recipe["version"] + ".dist-info"

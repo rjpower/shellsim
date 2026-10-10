@@ -1,8 +1,8 @@
 # Guest Clang and Wasm LLD
 
-`guest-recipe.json` builds upstream Clang, Wasm LLD and LLVM archive tools as
+`toolchain/llvm:guest` builds upstream Clang, Wasm LLD and LLVM archive tools as
 WASI executables. Shellsim runs those commands inside the guest. The separate
-`host-recipe.json` supplies the native compiler and TableGen programs used to
+`toolchain/llvm:host` supplies the native compiler and TableGen programs used to
 build them; installing a guest tool never exposes a host executable.
 
 The guest compiler uses the admitted SDK 34 threaded libc and C++ runtime,
@@ -12,7 +12,7 @@ preprocessing, C and C++ compilation, response files and driver dispatch. Linkin
 calls the guest `wasm-ld` through the virtual `posix_spawn` and `waitpid` facade.
 The executable and the programs it emits use `wasm32-wasip1-threads`.
 
-The install dependency `guest-sdk-recipe.json` supplies headers, libc++, libc,
+The install dependency `toolchain/llvm:development` supplies headers, libc++, libc,
 compiler builtins and resource headers under `/usr/local/wasi-sysroot` and
 `/usr/local/lib/clang/23`. These development files are installed data, rather
 than native host build tools. Adjacent `clang.cfg` and `clang++.cfg` select the

@@ -1,31 +1,16 @@
-# libffi for the SDK 34 CPython runtime
+# Scalar libffi
 
-This port builds libffi 3.5.2 from its pinned release archive. The static PIC
-archive contains upstream `prep_cif.c` and `types.c` with the reviewed WASI
-backend in `shellsim_wasi.c`. `shared/build.py` links that archive into a separate
-`libffi.so` with no native library dependencies. The artifact manifests bind the
-source archive, build scripts, SDK tools, ABI, and static provider identity.
+The canonical libffi 3.5.2 builder combines upstream common code with the pinned scalar WASI backend in shellsim_wasi.c. It produces a shared libffi.so provider and headers for the threaded CPython ctypes module. Primitive and pointer calls and callbacks are supported; aggregates and variadic calls remain explicit frontiers. Existing static v2 artifacts remain consumable by their historical fixture harness.
 
-The backend accepts pointers and primitive integer and floating point types
-represented by Wasm `i32`, `i64`, `f32`, and `f64`. It admits up to 16 arguments
-and uses the runtime's bounded, non-reusable closure slots. Narrow signed and
-unsigned arguments and returns follow the C ABI's promotion rules. Structs,
-unions, variadic calls, and threaded callback replay are outside this v2 ABI;
-`ffi_prep_cif` or `ffi_prep_cif_var` rejects those signatures before a call.
-
-Build the two providers with the pinned SDK and local source archive:
+`recipe.json` owns source pins, exact graph dependencies, exports and checks.
+`build.py` exposes the typed `build(ctx)` entrypoint and package-specific options.
 
 ```sh
-uv run --no-project --python 3.13 python -m ports.native.libffi.build \
-  /path/to/libffi-3.5.2.tar.gz /path/to/wasi-sdk-34.0-x86_64-linux /tmp/libffi-build
-uv run --no-project --python 3.13 python -m ports.native.libffi.shared.build \
-  /tmp/libffi-build/native-artifacts/STATIC_ID \
-  /path/to/wasi-sdk-34.0-x86_64-linux /tmp/libffi-shared-build
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports native/libffi --store /path/to/ports-store \
+  --output /path/to/release --check
 ```
 
-`tests/verify.py` compiles a C main against the static archive and a separate
-SDK 34 C provider, then runs both in Shellsim. It checks integer and double
-calls, signed and unsigned 8 and 16 bit boundaries, callback returns through
-native C callers, rejection of a second closure definition, and aggregate and
-variadic rejection. The Python package's `_ctypes` consumer and runtime assembly
-are documented in [the CPython port](../../python/cpython/README.md).
+See the [ports authoring guide](../../README.md) for SDK materialization,
+retained workspaces and cache admission. Historical sealed artifact receipts retain
+their original identities; obsolete production build CLIs are retired.

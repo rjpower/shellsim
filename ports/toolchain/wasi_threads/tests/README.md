@@ -107,8 +107,7 @@ at 64 KiB; aggregate polling is capped at 10,000 turns of 10,000 fuel units.
 These bounds support the diagnostic; they do not prove production accounting,
 cancellation, dynamic loading or CPython thread support.
 
-Build the opt-in toolchain with `ports/toolchain/wasi_threads/build.py --help`, supplying the pinned
-LLVM and wasi-libc archives and a fresh external work directory. Build the
+Use an existing verified standalone patched toolchain for this historical fixture. Run the
 patched fixture with `ports/toolchain/wasi_threads/tests/build.py --sdk SDK --toolchain WORK --output OUTPUT`.
 The fixture builder verifies the toolchain manifest and rejects raw waits.
 Pass `--fixture sequential_pthreads` to build the live-cap and slot-reuse probe.
@@ -117,7 +116,7 @@ does not require rebuilding the unchanged linker and libc. Each probe manifest
 records its exact source recipe, compile command, binary hash and instruction audit.
 The verified local artifacts and provenance are under
 `/tmp/shellsim-threads-spike/{toolchain-manifest.json,proof.json,patched-probe}`.
-A clean build through `ports/toolchain/wasi_threads/build.py` also passed under
+The original standalone producer build also passed under
 `/tmp/shellsim-threads-clean-toolchain`. Its linker, libc archive and final fixture
 hashes exactly match the manual build. Its fixture also passed the standalone
 pthread execution proof. The clean toolchain manifest records every build command

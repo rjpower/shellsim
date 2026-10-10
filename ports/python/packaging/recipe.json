@@ -9,6 +9,11 @@
   },
   "requires_dist": [],
   "target_dependencies": [],
-  "tests": [{"kind": "python", "script": "tests/probes/operations.py"}],
-  "build": {"adapter": "pure-wheel"}
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "build_system": "pure-wheel"
 }

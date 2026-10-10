@@ -1,267 +1,64 @@
-# Native build adapters
+# Native build helpers
 
-The graph runner admits source, patches, SDK, host tools and target dependency
-exports before invoking `build_native`. The adapter returns unpublished staging
-files and the exact command vectors. Fetching, sealing, cache publication and
-catalog assembly remain runner operations.
+Port authors call typed helpers in `ports.api` from `build(ctx)`. The canonical
+recipe owns static graph dependencies, outputs, exports, patches and guest checks.
+CMake/Meson/configure/make options, source preparation and package-specific branches
+live in Python. Public helper signatures use explicit named arguments.
 
-`NativeBuildContext.target_tools` supplies absolute `cc`, `cxx`, `ar`, `ranlib`
-and, for Meson, `strip` entrypoints. Compiler drivers may perform the admitted
-SDK's LLVM lowering; the adapter never guesses a compiler from SDK layout.
-Compiler and linker flags are separate admitted argument tuples.
-
-The standard host build baseline includes Python, a POSIX shell and core build
-utilities (including `rm`), with an explicit receipt supplied by the runner.
-CMake needs CMake and Ninja; Meson needs Meson and Ninja; configure/make needs
-Make. Every adapter uses a real admitted pkg-config implementation. Host-tool
-search directories are constructed from that baseline. Target headers,
-libraries and pkg-config files are searched separately and never through host
-include or library environment overrides.
-
-Upstream installation uses logical `/usr/local` and `DESTDIR=staging_prefix`.
-The runner merges verified dependency exports, with collision checks, under
-`dependency_sysroot`. pkg-config receives this sysroot and only its
-`usr/local/lib/pkgconfig` and `usr/local/share/pkgconfig` directories. CMake
-uses only the dependency sysroot and admitted SDK sysroot for target searches.
-Meson disables downloading wrapped projects. Upstream `.pc` files retain their
-original prefix; the adapter does not rewrite them.
-
-A recipe build section selects `adapter` (`cmake`, `meson`, `configure-make`),
-`configure_args`, `build_targets`, `install_targets`, `jobs`, and
-`install_prefix` (`/usr/local`). Arguments and targets are arrays. Configure
-recipes provide their upstream-specific cross options explicitly. Meson accepts
-its standard `install` target. The runner converts these fields into a typed
-`NativeBuildRequest`; it also consumes dependency recipe variants resolved from explicit selections or
-a selected SDK.
-
-The compatibility probes build upstream zlib 1.3.1 through CMake and
-configure/make, and FreeType 2.13.3 through Meson using the configure-built zlib.
-The FreeType archive passes a real guest scalable glyph and malformed-font
-probe. These stock-SDK probes establish adapter behavior; they do not certify
-threaded dynamic TLS lowering. zlib's upstream CMake script also needs an
-explicit WASI library-name portability patch before its generated `-lz`
-pkg-config interface can be published.
-
-`NativeBuildContext.shared_library_flags` contains the SDK's side-module
-flags. The compiler flag wrapper adds them only when the upstream build requests
-its explicit `-shared` mode. Executable compiler checks receive common
-`linker_flags` instead.
-
-`native_artifacts.NativeArtifact` holds a prefix and its verified envelope.
-`NativeTarget` carries exact target, profile, ABI and toolchain identity.
-`merge_dependency_sysroot` validates the direct dependencies and all their
-reachable descendants, then atomically writes their exports under
-`destination/usr/local`. Extra independent results in the supplied mapping are
-not staged. Identical file exports may share a path; differing bytes or a
-file/directory collision reject the merge before publication.
-
-`seal_native_install` reads `staging/usr/local`. Recipe `exports` lists exact
-payload-relative files; `export_directories` lists payload-relative directories
-by group. For example, headers may declare `include` while shared libraries
-name `lib/libexample.so` explicitly. Contained file links become regular file
-snapshots. Shared library exports receive the exact SDK ABI marker and must
-have the declared direct providers in their emitted dependency list. The
-artifact envelope retains the resolved graph recipe and digest separately from
-the effective recipe with expanded exact file exports. Source and cache
-admission stay with the runner.
-
-Graph recipes distinguish host build programs (`role: host-tool`), target
-libraries (`target-library`), installed guest programs (`guest-tool`), and target
-platform inputs (`target-platform`). Existing recipes without `role` are target
-libraries. `build_dependencies`, `target_dependencies`, `runtime_dependencies`,
-and `platform_dependencies` select exact `{port, version, recipe}` providers.
-Build edges select host tools; platform edges select target platforms. Target
-edges supply link prefixes. Runtime edges supply installed guest requirements
-and retain their artifact identities without entering the link prefix.
-
-Native builds may omit `sdk`, select `"sdk": "default"`, or name a supported SDK.
-The planner expands compiler/platform edges and ordinary dependency variants from
-one versioned SDK definition. Exact per-port version pins and explicit variants
-remain in the recipe. Receipts retain the selection and actual product identities.
-The SDK materializer invokes pinned producers for missing products. Its typed
-`MaterializedSDK` supplies concrete compiler tools, sysroot, resource directory,
-flags, Python build data and admitted host tools. `NativeBuildContext` adds the
-consumer's own verified dependency sysroot and staging paths. See
-[SDK materialization](SDK.md) for native host seeds and migration.
-
-An in-tree platform source can declare `source.files` as a list of exact
-`{path, destination, sha256}` entries. Paths are relative to the ports tree;
-destinations are relative to the isolated source directory. `source.sha256`
-pins the canonical file list. Only the admitted bytes are staged, and they are
-verified before any cached build is reused.
-
-Configure/make recipes may declare `build.configure_environment` for
-`ac_cv_*` answers and `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, or `LIBS`.
-`build.build_args` supplies explicit make arguments to build and install.
-These fields cannot replace the admitted compiler, archive tools, shell or PATH.
-
-`llvm-guest` receives the pinned archive directly and owns LLVM source expansion,
-patching and verification. Its persistent workspace binds source, patches,
-compiler and generator bytes, platform, dependencies and host build tools.
-Driver or configuration changes reconfigure the same compatible Ninja tree;
-immutable graph results still bind the complete implementation identity.
-`--workspace RECIPE=PATH` selects the actual retained Ninja build directory.
-The producer state, source and snapshots live in its parent directory, and the
-producer verifies their exact inputs before reuse. Without an override, the
-runner selects a compatible generated workspace and its `build` directory.
-Meson and Python Meson recipes also support retained Ninja directories, as
-described in [Retained Meson workspaces](#retained-meson-workspaces). Other
-adapters reject this option.
-`llvm-guest-sdk` stages admitted target development data without running a
-compiler and requires its explicit platform dependency.
-
-The explicit migration command verifies historical CPython runtime files,
-headers, platform provenance and the matching assembled interpreter. Source,
-patch, ABI and compiled facade pins must match; historical driver hashes remain
-in the original immutable receipt. New compilation uses current pinned producers.
-
-Native artifact toolchain receipts retain actual compiler and platform manifest
-hashes and SDK resource identities. Graph checks use the same materialized
-compiler and sysroot as their consumer and record these receipts in `graph.json`.
-Guest LLVM retained workspaces continue to track compiler/generator bytes and
-consumed headers; changed linker tools or archives trigger verified relinking.
-
-Port checks may declare `test_limits` with positive integer `cpu`, `memory` and
-`disk` guest budgets. Omitted fields retain the public environment defaults.
-The harness caps declarations at one trillion CPU units, 16 GiB memory and 2 GiB
-disk, and records the effective explicit budget in the acceptance receipt.
-These budgets allow compiler and SDK checks to include installation and execution
-costs. Temporary release materialization lives under the proof directory and is
-removed after the checks.
+```python
+from ports.api import BuildContext, meson
 
 
-## Python Meson projects
+def build(ctx: BuildContext):
+    return meson(ctx, configure_args=("--buildtype=release",), jobs=2)
+```
 
-The `python-meson` adapter uses an admitted host Python and Cython for generators,
-and admitted CPython headers and `pyconfig.h` for target compilation. Its
-pkg-config wrapper answers target Python queries with those headers; other
-providers resolve only through the dependency sysroot. Optional
-`build.host_header_packages` entries bind header-only generator packages to a
-complete host-tool receipt, including the package files beyond its executable.
+`ctx.require_native()` returns admitted source, private build/staging paths, target
+compiler/archive tools, separate compiler/linker flags and the verified dependency
+sysroot. `ctx.sdk` supplies materialized compiler, platform, resources and runtime.
+Neither interface admits ambient host paths from guest inputs. These are trusted
+host Python builders; they are not an operating system sandbox.
 
-`build.cross_properties` supplies upstream cross facts.
-`build.dependency_properties` resolves a property from an admitted native port
-and export-relative directory. `build.install_tags` defaults to runtime,
-python-runtime and devel. Meson's install plan selects the build targets and
-supplies wheel paths, extension names and directory exclusions. The adapter
-removes host SOABI suffixes, preserves qualified package paths, copies upstream
-PKG-INFO as METADATA, and binds each Wasm extension to the target ABI and its
-actual shared-library imports. No maintained extension inventory is required.
+CMake and Meson use admitted generators; configure/make and plain make use admitted
+make. Host bindings also include the approved Python, shell, core utilities and
+pkg-config. Target searches use the dependency sysroot and selected SDK, excluding
+host include/library overrides. Meson disables downloaded wrapped projects.
+Upstream installation uses logical `/usr/local` and private `DESTDIR` staging.
+Upstream pkg-config files retain their original prefixes.
 
-`build.development_exports` maps installed wheel files or directories to the
-native payload beneath `/usr/local`. These exports use the same sealing and
-dependency closure as native libraries. NumPy exports its generated C headers,
-libnpymath archive and upstream pkg-config files from the same build as its
-wheel. A mixed wheel/development port installs both selections for acceptance.
+Helpers return unpublished staging paths and command records. The driver fetches
+and checks sources, applies pinned patches, seals exports, verifies ABI/provider
+relationships and atomically publishes results. Helper implementation filenames
+belong to the shared infrastructure; their content hashes are computed on lookup.
+Port-local additional Python helpers are named in static `helpers` declarations.
 
-The scientific host descriptor admits a Meson tree patched with
-`meson-wasi-archive-groups.patch`. Meson otherwise inserts GNU archive groups for
-WASI Clang. wasm-ld rescans archive members and rejects these GNU flags. The
-receipt binds NumPy's vendored Meson source, the patch input and output hashes,
-and every resulting tool file. [Scientific host-tool setup](HOST_TOOLS.md)
-produces these receipts with a private read-only Python closure.
+`NativeArtifact` holds a verified envelope and its payload prefix. `NativeTarget`
+binds target, profile, ABI and actual compiler/platform receipt identities.
+`merge_dependency_sysroot` verifies the full reachable closure before staging it
+under `destination/usr/local`. Conflicting headers, ambiguous SONAMEs, changed
+edge identities, cycles, undeclared libraries and escaping paths reject admission.
+Unselected results are excluded. Identical nonconflicting file exports can share paths.
 
+Recipe `exports` lists exact payload-relative files; `export_directories` lists
+directories by group. Contained installed file links become regular snapshots.
+Shared libraries receive the SDK ABI marker and must name their declared direct
+providers. Guest tools install through static `install` declarations. Host build
+inputs and target-platform products are excluded from guest catalogs.
 
-## Retained Meson workspaces
+`build_dependencies`, `platform_dependencies`, `target_dependencies` and
+`runtime_dependencies` declare exact provider versions and optional `port:variant`
+selections. The SDK adds compiler/platform edges. Ordinary packages retain their
+own canonical identity. Runtime edges install guest requirements without adding
+link prefixes. Installation requirement ranges remain a separate resolver contract.
 
-`--workspace RECIPE=PATH` also accepts Meson and Python Meson recipes. PATH is
-an actual Ninja directory named `meson-build`; its parent holds compiler
-wrappers, while the enclosing directory holds admitted source and dependencies.
-For example, use `--workspace python/numpy/graph-recipe.json=target/numpy-work/build/meson-build`.
+Explicit retained Meson trees use
+`--workspace python/numpy=/path/to/build/meson-build`. The workspace binds source,
+configuration, actual target tools, product receipts and host code. It rejects
+unrecorded or incompatible existing trees. Packaging changes can reuse admitted
+compiled objects; immutable result identities still bind current builder code.
+LLVM has its own admitted persistent Ninja state and product inventories.
 
-The first build requires a fresh directory. Existing trees without a workspace
-receipt are rejected. Each resume verifies exact source bytes and executable
-modes, configuration, target product receipts, host tool code, compiler flags
-and dependency exports. Receipts also bind both generated compiler wrappers,
-the target Python pkg-config launcher when used, and the effective build
-environment. Effective setup arguments, cross and native machine files,
-properties, installation prefix and fixed setup flags are also bound, including
-options appended by Python Meson. Only the installation destination (`DESTDIR`)
-is excluded; paths in compiler or configure bindings remain exact. A changed
-compilation input rejects that workspace without deleting it. Recipes with
-mutable hooks cannot use this mode.
-
-Jobs, install tags, licenses and development-export selections remain packaging
-inputs rather than compilation-workspace inputs. The runner still keys and
-verifies every immutable result with the full recipe, implementation and SDK.
-A packaging change reuses the verified Meson configuration, runs Ninja's selected
-install targets and writes a fresh install and wheel directory. Unchanged
-compiler wrappers and machine files retain their timestamps so Ninja does not
-reconfigure or rebuild generated headers.
-Each retained build copies its verified workspace receipt into the sealed
-result provenance. Older receipt schemas are rejected and require a fresh
-workspace. Result-cache hits, workspace decisions and phase
-timings are printed to stderr.
-
-Host f2py is an optional explicit binding in both Meson cross and native files.
-Its complete admitted NumPy package supports SciPy's generation steps; target
-NumPy headers and f2py C sources come from the native dependency exports.
-
-Shared links keep `-nostdlib` so libc, pthread and interpreter state come from
-the process runtime. The runner supplies the target compiler-rt builtin archive
-from the verified SDK as an explicit trailing link input. This resolves numeric
-compiler helpers, including quad-precision conversions, without relying on
-which helpers a particular interpreter link happened to export. The archive
-path and hash remain result inputs; retained workspace admission also binds
-these trailing inputs, so a changed link policy cannot reuse stale modules.
-
-The one-module Python adapter accepts `build.output: stdlib` for CPython's own
-extensions. It compiles the pinned CPython source against admitted headers,
-seals `lib-dynload/<module>.so` and licenses as a native artifact, and emits no
-wheel metadata. Additional internal include directories must stay below the
-admitted CPython `Include` tree. An internal graph runtime edge can select such
-an artifact without changing an upstream package's `Requires-Dist`. Publication
-verifies its native closure, then assembles a separate runtime with the module
-and providers. It preserves the base interpreter and records exact artifact
-identities; module files are never published as generic `/lib` providers.
-
-Shared links treat linker warnings as errors, including incompatible function
-signatures. Python Meson packaging compares direct imported function types
-against the actual exports of declared shared providers before sealing.
-`build.required_shared_libraries` names admitted provider basenames that at
-least one installed extension must declare in its Wasm dependency metadata.
-This establishes the provider link separately from behavioral guest checks.
-
-The pinned Meson patch also handles WASI link checks with explicit shared
-provider inputs. It links those checks as PIC side modules and rejects
-unresolved symbols. Executable checks keep their normal policy. OpenBLAS
-symbol-existence checks retain volatile function addresses without calling
-unknown prototypes; callable ABI checks still reject signature mismatches.
-
-Compiler wrappers read LLVM GNU response files for option classification,
-including nested `@file` arguments. They pass the original argv unchanged to
-the compiler. Compile-only modes take precedence over shared-link selection.
-Expansion is bounded to 16 nested files, 256 files, 4 MiB and 65,536 arguments;
-unreadable, cyclic or excessive inputs fail before compiler invocation.
-
-Native build commands bound Git discovery at the admitted source and build
-parents. Extracted tarballs therefore use upstream version fallbacks instead
-of the enclosing Shellsim commit. A pinned checkout inside the source tree
-remains discoverable. Inherited Git directory/work-tree overrides are excluded
-by the existing target environment allowlist. Retained generated VCS headers
-may change once when this boundary corrects a previously embedded parent hash.
-
-`build.executable_sdk_link_inputs` declares at most 32 static archives by
-canonical path relative to the resolved platform sysroot, for example
-`lib/wasm32-wasip1-threads/libsetjmp.a`. The runner rejects escaping paths,
-symlinks, missing files, duplicate entries, archives larger than 128 MiB, and
-bytes absent from the admitted platform inventory before consulting the result
-cache. Exact paths and hashes remain result inputs. The common compiler wrapper
-adds these archives after the original executable link arguments, preserving
-static archive order. Compilation and shared links do not consume them. Retained
-workspace admission binds the resulting compiler wrapper text.
-
-Native acceptance selects executable dynamic linking when its declared exact
-link inputs include a shared provider. Static-only probes keep the ordinary
-executable link policy. This selection is derived from admitted files rather
-than arbitrary test linker switches; the resulting command records the exact
-inputs and still runs as a native guest executable.
-
-Executable archives also apply to executable links made by upstream configure
-probes. Their feature checks see the same executable archive inputs as the final
-commands. Shared links receive their independently declared shared inputs.
-
-Declared acceptance `files` stage bounded, regular port files below `/work`
-before the probe runs. Each entry names `source` and a canonical relative
-`destination`; duplicate destinations and path escapes are rejected. Proofs
-record the SHA-256 of each staged file alongside the probe script hash.
+The alternative zlib configure and static FreeType Meson demonstrations live in
+`tests/fixtures/adapters`. They do not create alternate production package identities.
+See [SDK materialization](SDK.md), [Python backends](PYTHON_BACKENDS.md) and
+[host-tool admission](HOST_TOOLS.md).

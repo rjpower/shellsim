@@ -2,14 +2,15 @@
 
 ## SDK 34 ABI v2
 
-Build a bare SDK 34 CPython bundle, then the fixed dynamic interpreter and
-independent proof modules:
+The fixture harness consumes existing verified SDK34/v2 base and runtime bundles.
+Their obsolete production builders are retired; this harness does not regenerate
+those interpreter bundles.
 
 ```sh
-uv run --no-project ports/python/cpython/build.py --work-dir /tmp/shellsim-dynamic-v2/base --build-python /path/to/trusted/python3.13
-uv run --no-project -m ports.python.cpython.dynamic --bundle /tmp/shellsim-dynamic-v2/base --output /tmp/shellsim-dynamic-v2
-uv run --no-project tests/fixtures/wasm/dynamic/build.py --sdk 34 --bundle /tmp/shellsim-dynamic-v2/base --runtime /tmp/shellsim-dynamic-v2 --output /tmp/shellsim-dynamic-fixtures
-SHELLSIM_DYNAMIC_V2_ARTIFACTS=/tmp/shellsim-dynamic-fixtures cargo test --test wasm_dynamic -- --include-ignored
+uv run --no-project tests/fixtures/wasm/dynamic/build.py --sdk 34 \
+  --bundle /path/to/verified-base --runtime /path/to/verified-v2-runtime \
+  --output /path/to/dynamic-fixtures
+SHELLSIM_DYNAMIC_V2_ARTIFACTS=/path/to/dynamic-fixtures cargo test --test wasm_dynamic -- --include-ignored
 ```
 
 The v2 marker is `shellsim-wasi-sdk34-cpython3137-v2`; loader imports use
@@ -22,7 +23,7 @@ definition per runtime symbol. Side modules compile with
 runtime. They contain no private C++ runtime. This uses the pinned SDK 34
 archives without modifying LLVM or rewriting binary symbols.
 
-The production builder rejects compiled package providers and emits only a
+The original runtime producer rejected compiled package providers and emitted only a
 mountable CPython rootfs, its interpreter and runtime provenance. The fixture
 builder takes that verified runtime separately and emits test programs,
 independent extensions and shared zlib with a proof manifest. Fixture sources

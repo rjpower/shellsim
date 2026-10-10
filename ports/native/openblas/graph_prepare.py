@@ -1,21 +1,13 @@
 """Normalize pinned OpenBLAS C/Fortran interfaces before a graph build."""
 
-import json
 import shutil
-import sys
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-
-from ports._support.build import check_build_scripts
-from ports.native.openblas.build import prepare_source
+from ports._support.native_adapters import NativeBuildContext
+from ports.native.openblas.source import prepare_source
 
 
-def main():
-    directory = Path(__file__).parent
-    check_build_scripts(json.loads((directory / "graph-recipe.json").read_text()), directory)
-    context = json.loads(Path(sys.argv[1]).read_text())
-    source = Path(context["source"])
+def prepare(context: NativeBuildContext) -> None:
+    source = context.source
     normalized = source.with_name(source.name + "-normalized")
     prepare_source(source, normalized)
     common = normalized / "common.h"
@@ -32,7 +24,3 @@ def main():
     )
     shutil.rmtree(source)
     normalized.rename(source)
-
-
-if __name__ == "__main__":
-    main()

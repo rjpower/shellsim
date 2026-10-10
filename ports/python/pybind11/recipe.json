@@ -12,7 +12,5 @@
   "requires_dist": [
     "pybind11-global==3.0.4; extra == \"global\""
   ],
-  "build": {
-    "adapter": "pure-wheel"
-  }
+  "build_system": "pure-wheel"
 }

@@ -11,7 +11,7 @@ selects the setuptools legacy backend.
 Select `sdk: "default"` for the threaded target, ABI, host compiler
 and platform pins. Declare only additional exact backend wheels as
 `build_dependencies`; SDK selection preserves their host roles and explicit
-version pins. Dependency variants can use the SDK defaults or explicit
+version pins. Dependency variants use explicit
 `recipe` selections. Package metadata and guest checks remain port-owned. See
 [port authoring](../README.md).
 
@@ -59,7 +59,7 @@ For example, build the current pilot with the default threaded SDK:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports python/kiwisolver/graph-recipe.json python/packaging python/zss \
+  python -m ports python/kiwisolver python/packaging python/zss \
   --store /path/to/ports-cache \
   --output /path/to/backend-release --check
 ```

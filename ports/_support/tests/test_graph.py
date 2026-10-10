@@ -206,7 +206,7 @@ def test_guest_host_wheel_error_identifies_complete_dependency_chain(tmp_path):
     ]:
         path = root / "python" / name / "recipe.json"
         path.parent.mkdir(parents=True)
-        recipe = {"name": name, "version": "1", "build": {"adapter": adapter}}
+        recipe = {"name": name, "version": "1", "build_system": adapter}
         if adapter == "host-wheel":
             recipe["role"] = "host-tool"
         if dependency_name is not None:
@@ -227,7 +227,7 @@ def sdk_recipes(recipes):
     compiler.write_text(json.dumps({"name": "compiler", "version": "1", "role": "host-tool"}))
     platform = write("platform")
     platform.write_text(json.dumps({"name": "platform", "version": "1", "role": "target-platform"}))
-    write("base", version="9")
+    write("base")
     write("base", variant="shared.json")
     consumer = write("consumer", dependencies=[dependency("base")], profile=None)
     recipe = json.loads(consumer.read_text())
@@ -247,7 +247,6 @@ def sdk_recipes(recipes):
                 "abi": "test-abi",
                 "build_dependencies": [dependency("compiler", recipe="native/compiler/host.json")],
                 "platform_dependencies": [dependency("platform")],
-                "dependency_recipes": {"native/base": "native/base/shared.json"},
             }
         )
     )
@@ -259,18 +258,18 @@ def test_sdk_resolves_pinned_native_closure_and_explicit_overrides(sdk_recipes):
     graph = plan(root, ["native/consumer"], target_profile="test-target")
     assert [(port.reference, port.role) for port in graph.ports] == [
         ("native/compiler/host.json", "host-tool"),
-        ("native/base/shared.json", "target-library"),
+        ("native/base/recipe.json", "target-library"),
         ("native/platform/recipe.json", "target-platform"),
         ("native/consumer/recipe.json", "target-library"),
     ]
     resolved = graph.ports[-1]
     assert {(edge.recipe, edge.kind) for edge in resolved.dependencies} == {
         ("native/compiler/host.json", "build"),
-        ("native/base/shared.json", "target"),
+        ("native/base/recipe.json", "target"),
         ("native/platform/recipe.json", "platform"),
     }
     assert resolved.recipe["target_dependencies"] == [
-        {"port": "native/base", "version": "1", "recipe": "native/base/shared.json"}
+        {"port": "native/base", "version": "1", "recipe": "native/base/recipe.json"}
     ]
     write("base", variant="alternate.json")
     authored = json.loads(consumer.read_text())
@@ -316,7 +315,7 @@ def test_invalid_sdks_fail_before_graph_admission(sdk_recipes, failure):
     elif failure == "schema":
         profile["schema_version"] = True
     elif failure == "variant":
-        profile["dependency_recipes"]["native/base"] = "../escape.json"
+        profile["dependency_recipes"] = {"native/base": "../escape.json"}
     consumer.write_text(json.dumps(recipe))
     profile_path.write_text(json.dumps(profile))
     if failure == "oversize":
@@ -339,18 +338,53 @@ def test_sdk_names_cannot_escape_the_named_registry(sdk_recipes, name):
         plan(root, ["native/consumer"])
 
 
-def test_migrated_native_and_python_recipes_resolve_same_provider_variants():
+def test_direct_and_transitive_ports_select_one_canonical_provider():
     root = Path(__file__).resolve().parents[2]
-    graph = plan(root, ["native/freetype/graph-recipe.json", "python/pillow/graph-recipe.json"])
+    graph = plan(root, ["native/zlib", "native/freetype", "python/pillow"])
     ports = {port.reference: port for port in graph.ports}
-    for reference in ("native/freetype/graph-recipe.json", "python/pillow/graph-recipe.json"):
+    for reference in ("native/freetype/recipe.json", "python/pillow/recipe.json"):
         edges = ports[reference].dependencies
-        assert {edge.recipe for edge in edges if edge.kind == "build"} >= {"toolchain/llvm/host-recipe.json"}
+        assert {edge.recipe for edge in edges if edge.kind == "build"} >= {"toolchain/llvm/recipe.json:host"}
         assert [edge.recipe for edge in edges if edge.kind == "platform"] == [
-            "toolchain/wasi_threads/graph-recipe.json"
+            "toolchain/wasi_threads/recipe.json:platform"
         ]
         zlib = next(edge for edge in edges if edge.port == "native/zlib")
-        assert zlib.recipe == "native/zlib/cmake-recipe.json"
+        assert zlib.recipe == "native/zlib/recipe.json"
         assert ports[zlib.recipe].version == zlib.version
-    assert "native/zlib/recipe.json" not in ports
-    assert "native/freetype/recipe.json" not in ports
+    assert len([port for port in graph.ports if port.name == "zlib"]) == 1
+
+
+def test_every_production_selection_resolves_its_exact_dependency_graph():
+    root = Path(__file__).resolve().parents[2]
+    for category in ("native", "python", "toolchain"):
+        for path in sorted((root / category).glob("*/recipe.json")):
+            document = json.loads(path.read_text())
+            reference = path.parent.relative_to(root).as_posix()
+            variants = document.get("variants", {})
+            for selection in tuple(reference + ":" + name for name in variants) if variants else (reference,):
+                graph = plan(root, [selection])
+                providers = {port.reference: port for port in graph.ports}
+                for port in graph.ports:
+                    for edge in port.dependencies:
+                        assert providers[edge.recipe].version == edge.version
+
+
+def test_default_variant_and_explicit_selection_share_node_without_importing_builder(tmp_path):
+    directory = tmp_path / "native/example"
+    directory.mkdir(parents=True)
+    (directory / "build.py").write_text("raise AssertionError('planning imported build code')\n")
+    (directory / "recipe.json").write_text(
+        json.dumps(
+            {
+                "name": "example",
+                "version": "1",
+                "role": "host-tool",
+                "default_variant": "host",
+                "variants": {"host": {}, "other": {"name": "other"}},
+            }
+        )
+    )
+    graph = plan(tmp_path, ["native/example", "native/example:host"])
+    assert len(graph.roots) == len(graph.ports) == 1
+    assert graph.ports[0].variant == "host"
+    assert plan(tmp_path, ["native/example:other"]).ports[0].digest != graph.ports[0].digest

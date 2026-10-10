@@ -8,21 +8,22 @@ from pathlib import Path
 import pytest
 
 from ports._support.build import check_build_scripts
-from ports.toolchain.wasi_threads.build import toolchain_identity
+from ports._support.producer_policy import load_policy
+from ports._support.store import identity
 from ports.toolchain.wasi_threads.tests.build import build_probe
 
 
-def test_toolchain_identity_preserves_every_production_input():
+def test_identity_preserves_every_production_input():
     recipe = {"llvm_commit": "pinned", "build_scripts": [{"file": "build.py", "sha256": "production-driver"}]}
-    assert toolchain_identity(recipe) == recipe
+    assert identity(recipe) == identity(dict(recipe))
     changed = dict(recipe, build_scripts=[{"file": "build.py", "sha256": "changed-driver"}])
-    assert toolchain_identity(changed) != toolchain_identity(recipe)
-    assert toolchain_identity(dict(recipe, llvm_commit="different")) != toolchain_identity(recipe)
+    assert identity(changed) != identity(recipe)
+    assert identity(dict(recipe, llvm_commit="different")) != identity(recipe)
 
 
 def test_thread_recipe_pins_production_and_fixture_build_scripts():
     directory = Path(__file__).resolve().parent.parent
-    recipe = json.loads((directory / "recipe.json").read_text())
+    recipe = load_policy("toolchain/wasi_threads:platform")
     check_build_scripts(recipe, directory)
     fixtures = directory / "tests"
     check_build_scripts(json.loads((fixtures / "recipe.json").read_text()), fixtures)

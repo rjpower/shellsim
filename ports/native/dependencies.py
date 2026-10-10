@@ -38,7 +38,11 @@ def target_environment(sdk):
 
 def target_profile(recipe):
     """Read a versioned profile; callers use its compiler and final link flags."""
-    return json.loads(Path(__file__).with_name(recipe["target_profile"] + ".json").read_text())
+    return json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "tests/fixtures/wasm/dynamic" / (recipe["target_profile"] + ".json")
+        ).read_text()
+    )
 
 
 def toolchain_identity(recipe, sdk):
@@ -76,8 +80,12 @@ def toolchain_identity(recipe, sdk):
 
 
 def recipe_identity(recipe, directory):
-    """Reject edited build scripts before creating or reusing an artifact."""
-    for item in recipe["build_scripts"]:
+    """Hash static metadata, checking any original receipt-owned code pins.
+
+    Canonical builders have a separately recorded automatic implementation
+    closure. Historical artifact recipes retain their original explicit pins.
+    """
+    for item in recipe.get("build_scripts", []):
         if file_hash(directory / item["file"]) != item["sha256"]:
             raise ValueError(f"Build script hash mismatch: {directory / item['file']}")
     return digest(recipe)

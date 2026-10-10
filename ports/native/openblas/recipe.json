@@ -2,34 +2,20 @@
   "kind": "native-library",
   "name": "openblas",
   "version": "0.3.31",
-  "target_profile": "wasi-cpython-v2",
-  "target": "wasm32-wasip1",
-  "linkage": "static",
+  "soname": "libopenblas.so",
   "source": {
     "url": "https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.31/OpenBLAS-0.3.31.tar.gz",
-    "sha256": "6dd2a63ac9d32643b7cc636eab57bf4e57d0ed1fff926dfbc5d3d97f2d2be3a6"
+    "sha256": "6dd2a63ac9d32643b7cc636eab57bf4e57d0ed1fff926dfbc5d3d97f2d2be3a6",
+    "subdirectory": "OpenBLAS-0.3.31"
   },
-  "host_tools": [
-    "python-build-driver",
-    "wasi-sdk-clang",
-    "wasi-sdk-llvm-ar",
-    "make",
-    "host-c-compiler"
-  ],
+  "compiler_support": {
+    "input": "sdk.shared_library_inputs",
+    "linkage": "referenced-members-only"
+  },
+  "linkage": "shared",
+  "role": "target-library",
   "target_dependencies": [],
-  "features": {
-    "threads": false,
-    "integer_bits": 32,
-    "scalar_generic_kernels": true,
-    "lapack": true,
-    "lapacke": false,
-    "fortran_compiler": false,
-    "complex_return": "hidden-pointer",
-    "subroutine_return": "int"
-  },
-  "transitive_link_flags": [
-    "-lm"
-  ],
+  "needed_libraries": [],
   "exports": {
     "headers": [
       "include/cblas.h",
@@ -38,26 +24,46 @@
     "archives": [
       "lib/libopenblas.a"
     ],
+    "shared_libraries": [
+      "lib/libopenblas.so"
+    ],
     "pkg_config": [
       "lib/pkgconfig/openblas.pc"
     ],
     "licenses": [
-      "licenses/openblas.txt"
+      "licenses/openblas.txt",
+      "licenses/compiler-rt.txt",
+      "licenses/lapack.txt"
     ]
   },
-  "build_scripts": [
+  "source_exports": [
     {
-      "file": "build.py",
-      "sha256": "f1f7c1f1a0b2b5003876d6473ca9bf11a23b9812fe8980cd81b4a98c9dfe4b09"
+      "source": "LICENSE",
+      "destination": "licenses/openblas.txt"
     },
     {
-      "file": "../dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
+      "source": "lapack-netlib/LICENSE",
+      "destination": "licenses/lapack.txt"
     }
   ],
-  "sdk": {
-    "version": "34.0",
-    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
-  }
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/graph_smoke.c",
+      "link_inputs": [
+        "lib/libopenblas.a"
+      ]
+    },
+    {
+      "kind": "python",
+      "script": "tests/shared_smoke.py"
+    }
+  ],
+  "sdk": "default",
+  "build_system": "plain-make",
+  "helpers": [
+    "native/openblas/graph_prepare.py",
+    "native/openblas/graph_install.py",
+    "native/openblas/source.py"
+  ]
 }

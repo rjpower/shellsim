@@ -12,9 +12,6 @@
   "requires_dist": [
     "six"
   ],
-  "build": {
-    "adapter": "python-pep517"
-  },
   "build_dependencies": [
     {
       "port": "python/setuptools",
@@ -37,5 +34,6 @@
       "script": "tests/probes/operations.py"
     }
   ],
-  "sdk": "default"
+  "sdk": "default",
+  "build_system": "python-pep517"
 }

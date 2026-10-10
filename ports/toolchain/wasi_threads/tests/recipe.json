@@ -3,10 +3,6 @@
   "schema_version": 1,
   "build_scripts": [
     {
-      "file": "build.py",
-      "sha256": "ade32ce1494d64eefc9989de2c143a9ca1ded869bfae0b240212960876ee49d8"
-    },
-    {
       "file": "two_pthreads.c",
       "sha256": "0af94ae9c2b5304f1b49d2557e5202af5ccfc6e27fff19bca1ec470bf83acd85"
     },
@@ -25,18 +21,6 @@
     {
       "file": "sequential_pthreads.c",
       "sha256": "004554bcc0fb87070984302b63582680cbccd27cb68c883bead2b80e5dbbd3e2"
-    },
-    {
-      "file": "../../../_support/build.py",
-      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
-    },
-    {
-      "file": "../../../native/dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
-    },
-    {
-      "file": "../recipe.json",
-      "sha256": "1e1df528033dfbfea8c2301d3654214593434375c1dcdc2652dfec5e125ab78e"
     }
   ]
 }

@@ -163,7 +163,7 @@ def test_stdlib_extension_rejects_unsupported_output_and_header_escape(tmp_path,
 
 
 def test_host_backend_wheel_preserves_launchers_without_guest_admission(tmp_path: Path) -> None:
-    from ports._support.graph import plan
+    from ports._support.graph import guest_graph, plan
     from ports._support.python_adapters import build_host_wheel
 
     wheel = tmp_path / "example-1.0-py3-none-any.whl"
@@ -171,7 +171,7 @@ def test_host_backend_wheel_preserves_launchers_without_guest_admission(tmp_path
     with zipfile.ZipFile(wheel, "a") as archive:
         archive.writestr("example/launcher.exe", b"MZ\0pinned launcher")
     recipe["source"]["sha256"] = hashlib.sha256(wheel.read_bytes()).hexdigest()
-    recipe.update({"role": "host-tool", "build": {"adapter": "host-wheel"}})
+    recipe.update({"role": "host-tool", "build_system": "host-wheel"})
     stage = tmp_path / "host"
     build_host_wheel(PureWheelBuildRequest(wheel, stage, recipe))
     assert (stage / "wheels" / wheel.name).read_bytes() == wheel.read_bytes()
@@ -183,8 +183,9 @@ def test_host_backend_wheel_preserves_launchers_without_guest_admission(tmp_path
     import json
 
     (provider / "recipe.json").write_text(json.dumps(recipe))
-    with pytest.raises(ValueError):
-        plan(root, ["python/example"])
+    graph = plan(root, ["python/example"])
+    assert graph.ports[0].role == "host-tool"
+    assert not guest_graph(graph).ports
 
 
 @pytest.mark.parametrize("invalid", ["dependency", "data"])

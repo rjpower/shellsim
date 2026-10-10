@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ports.toolchain.llvm.build import digest
+from ports._support.producer_tools import digest
 from ports.toolchain.llvm.compiler import write_workspace
 from ports.toolchain.llvm.guest import _inventory, _update_dependency_headers
 

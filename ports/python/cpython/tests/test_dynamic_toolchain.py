@@ -5,17 +5,24 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.build import check_build_scripts
+from ports._support.graph import plan
+from ports._support.producer_policy import verify_policy
+from ports._support.runner import _admit_recipe
 from ports.native.dependencies import file_hash
-from ports.python.cpython.dynamic import build
+
+
+def analyze(roots):
+    from pathlib import Path
+
+    return plan(Path(__file__).resolve().parents[4] / "ports", roots)
 
 
 def test_dynamic_toolchain_pins_inputs():
     directory = Path(__file__).parents[4] / "ports/toolchain/wasi_sdk"
     recipe = json.loads((directory / "recipe.json").read_text())
-    check_build_scripts(recipe, directory)
-    for notice in recipe["notices"]:
-        assert file_hash(directory / notice["file"]) == notice["sha256"]
+    _admit_recipe(analyze(["toolchain/wasi_sdk"]).ports[0])
+    for notice in recipe["source"]["files"]:
+        assert file_hash(directory.parents[1] / notice["path"]) == notice["sha256"]
 
 
 @pytest.mark.parametrize(
@@ -30,5 +37,5 @@ def test_dynamic_builder_requires_fixed_bare_sdk34_interpreter(tmp_path, profile
     )
     output = tmp_path / "output"
     with pytest.raises(ValueError):
-        build(bundle, output)
+        verify_policy({"target_profile": profile, "native_ports": providers}, "python/cpython:runtime")
     assert not output.exists()

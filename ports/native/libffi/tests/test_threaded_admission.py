@@ -4,7 +4,11 @@ import hashlib
 
 import pytest
 
-from ports.native.libffi.threaded.toolchain import MAX_FILE, validate_files
+from ports._support.sdk_products import MAX_FILE, Receipt, verify_files, verify_product
+
+
+def validate_files(root, manifest):
+    verify_files(root, manifest["artifacts"])
 
 
 def test_changed_toolchain_file_is_rejected(tmp_path):
@@ -19,7 +23,7 @@ def test_changed_toolchain_file_is_rejected(tmp_path):
 
 @pytest.mark.parametrize("name", ["../outside", "/outside", "header/../../outside"])
 def test_artifact_path_cannot_escape_prefix(tmp_path, name):
-    with pytest.raises(ValueError, match="unsafe"):
+    with pytest.raises(ValueError, match="escap"):
         validate_files(tmp_path, {"artifacts": {name: "0" * 64}})
 
 
@@ -35,19 +39,20 @@ def test_symlink_cannot_admit_external_file(tmp_path):
     outside = tmp_path.parent / (tmp_path.name + "-external")
     outside.write_bytes(b"not inside provider")
     (tmp_path / "header.h").symlink_to(outside)
-    with pytest.raises(ValueError, match="outside"):
+    with pytest.raises(ValueError, match="escap"):
         validate_files(tmp_path, {"artifacts": {"header.h": hashlib.sha256(outside.read_bytes()).hexdigest()}})
 
 
 def test_unrecorded_header_cannot_change_include_search(tmp_path):
-    from ports.native.libffi.threaded.toolchain import validate_tree
-
     directory = tmp_path / "sysroot/include"
     directory.mkdir(parents=True)
     target = directory / "stdio.h"
     target.write_bytes(b"approved header")
     artifacts = {"sysroot/include/stdio.h": hashlib.sha256(target.read_bytes()).hexdigest()}
-    validate_tree(tmp_path, "sysroot", artifacts)
+    receipt = Receipt(
+        tmp_path, tmp_path / "manifest.json", "", {"identity": {"recipe": {"name": "fixture"}}, "artifacts": artifacts}
+    )
+    verify_product(receipt)
     (directory / "stddef.h").write_bytes(b"not recorded by producer")
-    with pytest.raises(ValueError, match="undeclared input"):
-        validate_tree(tmp_path, "sysroot", artifacts)
+    with pytest.raises(ValueError, match="unrecorded"):
+        verify_product(receipt)

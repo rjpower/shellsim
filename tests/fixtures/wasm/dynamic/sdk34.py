@@ -13,9 +13,26 @@ from pathlib import Path
 from ports._support.wasm import mark_abi
 from ports._support.wasm import run as run_command
 from ports.native.dependencies import file_hash, target_environment, target_profile
-from ports.native.zlib.build import SOURCES as ZLIB_SOURCES
-from ports.python.cpython.build import fetch_extract
-from ports.toolchain.wasi_sdk.build import dynamic_toolchain
+from tests.fixtures.wasm.dynamic.sources import fetch_extract
+from tests.fixtures.wasm.dynamic.toolchain import dynamic_toolchain
+
+ZLIB_SOURCES = (
+    "adler32",
+    "compress",
+    "crc32",
+    "deflate",
+    "gzclose",
+    "gzlib",
+    "gzread",
+    "gzwrite",
+    "inflate",
+    "infback",
+    "inftrees",
+    "inffast",
+    "trees",
+    "uncompr",
+    "zutil",
+)
 
 
 def build(bundle, runtime, output):

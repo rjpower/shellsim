@@ -100,11 +100,6 @@
     "sha256": "d809141b2ddfe1865bbe066df84225570c1465e865f0cc47bcd364f72af4a6c7"
   },
   "target_dependencies": [],
-  "build_scripts": [],
-  "build": {
-    "adapter": "cmake",
-    "jobs": 2
-  },
   "exports": {
     "archives": [
       "lib/libshellsim-posix.a"
@@ -136,5 +131,6 @@
       ]
     }
   ],
-  "sdk": "default"
+  "sdk": "default",
+  "build_system": "cmake"
 }
