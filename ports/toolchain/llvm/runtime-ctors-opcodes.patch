@@ -1,0 +1,35 @@
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -1654,6 +1654,11 @@
+ // Split only the explicitly opted-in canonical executable profile. Ordinary
+ // static executables and independently initialized side modules are unchanged.
+ void Writer::createRuntimeCtorsFunction() {
++  // The pinned binary-format header names only the subset used by upstream
++  // LLD. These are standard control/comparison instructions for the guard.
++  constexpr uint8_t opIf = 0x04;
++  constexpr uint8_t opI32Ne = 0x47;
++  constexpr uint8_t opUnreachable = 0x00;
+   std::string body;
+   raw_string_ostream os(body);
+   writeUleb128(os, 1, "local groups");
+@@ -1680,16 +1685,16 @@
+   writeUleb128(os, 0, "offset");
+   writeU8(os, WASM_OPCODE_LOCAL_TEE, "previous state");
+   writeUleb128(os, 1, "local index");
+-  writeU8(os, WASM_OPCODE_IF, "already started");
++  writeU8(os, opIf, "already started");
+   writeU8(os, WASM_TYPE_NORESULT, "block type");
+   writeU8(os, WASM_OPCODE_LOCAL_GET, "previous state");
+   writeUleb128(os, 1, "local index");
+   writeU8(os, WASM_OPCODE_I32_CONST, "complete");
+   writeSleb128(os, 2, "value");
+-  writeU8(os, WASM_OPCODE_I32_NE, "incomplete");
+-  writeU8(os, WASM_OPCODE_IF, "reject recursive or concurrent initialization");
++  writeU8(os, opI32Ne, "incomplete");
++  writeU8(os, opIf, "reject recursive or concurrent initialization");
+   writeU8(os, WASM_TYPE_NORESULT, "block type");
+-  writeU8(os, WASM_OPCODE_UNREACHABLE, "serialized initialization violation");
++  writeU8(os, opUnreachable, "serialized initialization violation");
+   writeU8(os, WASM_OPCODE_END, "END");
+   writeU8(os, WASM_OPCODE_RETURN, "already initialized");
+   writeU8(os, WASM_OPCODE_END, "END");

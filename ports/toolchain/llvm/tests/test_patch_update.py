@@ -214,3 +214,42 @@ def test_interrupted_guest_prepare_relinks_versioned_binary(tmp_path):
     assert binary.read_bytes() != previous_bytes
     assert (build / "main.o").read_bytes() == object_bytes
     assert (build / "main.o").stat().st_mtime_ns == object_mtime
+
+
+def test_failed_compile_accepts_verified_correction_and_retains_other_object(project):
+    archive, source, recipe, directory, work, workspace, compatibility, ninja = project
+    changed_patch = directory / "change.patch"
+    changed_patch.write_text(changed_patch.read_text().replace("return 2", "return missing_token"))
+    recipe["patches"][0]["sha256"] = hash_file(changed_patch)
+    compiler.update_workspace_patches(archive, source, recipe, directory, work, workspace, compatibility)
+    object_file = work / "build/main.o"
+    before = object_file.read_bytes(), object_file.stat().st_mtime_ns
+    commands = [[shutil.which("true")], [str(ninja), "-C", str(work / "build")]]
+    attempts = work / "attempts"
+    attempts.mkdir()
+    receipt = work / "workspace.json"
+    with pytest.raises(subprocess.CalledProcessError):
+        compiler.configure_and_build(commands, work / "build", workspace, receipt, attempts, None)
+    assert json.loads(receipt.read_text())["phase"] == "building"
+    fix = directory / "fix.patch"
+    fix.write_text(
+        "--- a/value.cpp\n+++ b/value.cpp\n@@ -1 +1 @@\n"
+        "-int value() { return missing_token; }\n+int value() { return 2; }\n"
+    )
+    corrected = {
+        **compatibility,
+        "patches": [
+            *compatibility["patches"],
+            {"file": fix.name, "sha256": hash_file(fix), "inputs": {"value.cpp": hash_file(source / "value.cpp")}},
+        ],
+    }
+    workspace["phase"] = "configuring"
+    with pytest.raises(ValueError, match="completed configuration"):
+        compiler.update_workspace_patches(archive, source, corrected, directory, work, workspace, corrected)
+    workspace["phase"] = "building"
+    compiler.update_workspace_patches(archive, source, corrected, directory, work, workspace, corrected)
+    assert json.loads(receipt.read_text())["phase"] == "building"
+    compiler.configure_and_build(commands, work / "build", workspace, receipt, attempts, None)
+    assert json.loads(receipt.read_text())["phase"] == "ready"
+    assert subprocess.run([str(work / "build/program")], check=False).returncode == 2
+    assert (object_file.read_bytes(), object_file.stat().st_mtime_ns) == before

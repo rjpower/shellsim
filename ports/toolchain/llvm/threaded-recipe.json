@@ -76,6 +76,13 @@
         "lld/wasm/Driver.cpp": "300fa30ffb7c6f1bd58885ffd6df8a57f390f908942abe72fde827495db70802",
         "lld/wasm/Writer.cpp": "074ed90ec1b2cf59df617fe34c182e0a927aa9389af9452e29291c72a3bbcf55"
       }
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035",
+      "inputs": {
+        "lld/wasm/Writer.cpp": "33b00cbf116dd29c4e1abc3ec3c31d2106b089bbb007413c052fe838ee6801c4"
+      }
     }
   ],
   "build_limits": {
@@ -124,6 +131,10 @@
     {
       "file": "runtime-ctors.patch",
       "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10"
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035"
     }
   ],
   "main_tls_protocol": {

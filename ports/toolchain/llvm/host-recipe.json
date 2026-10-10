@@ -5,6 +5,6 @@
   "build": {
     "adapter": "llvm-host",
     "producer_recipe": "compiler-recipe.json",
-    "producer_sha256": "7e4a973228253808b07b06843055506342f1e23ec02792ed14558ef88af2efba"
+    "producer_sha256": "35e9437ad5424b7e4177d7fe1cda045925f8ec41c4291438561ea495e496906c"
   }
 }

@@ -74,6 +74,9 @@ The host and guest compiler producers can retain their Ninja trees when a pinned
 appended to the existing patch sequence. Admission requires the same source
 archive and all non-patch compilation inputs, the exact old patch prefix, an unchanged CMake cache,
 and a full comparison of the retained source against the old pinned inputs.
+A failed build may receive a verified appended correction after configuration
+completed; configuring or unknown phases are rejected. Only a successful
+actual build marks the workspace ready.
 Only the declared affected files and patch markers move to the new admitted
 source. Atomic file replacement and a hash-bound journal make an interrupted
 update recoverable; unrelated source edits are rejected. New products record

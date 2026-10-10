@@ -186,8 +186,8 @@ def update_workspace_patches(
         raise ValueError("LLVM workspace update requires appended patches and identical compilation inputs")
     if digest(archive) != recipe["source"]["sha256"]:
         raise ValueError("LLVM source archive identity differs")
-    if workspace.get("phase", "ready") != "ready":
-        raise ValueError("finish the prior LLVM build before updating patches")
+    if workspace.get("phase", "ready") not in {"ready", "building"}:
+        raise ValueError("LLVM patch update requires a completed configuration")
     configuration = (work / "build" if build_directory is None else build_directory) / "CMakeCache.txt"
     if digest(configuration) != workspace["configuration_sha256"]:
         raise ValueError("LLVM workspace configuration changed outside its producer")

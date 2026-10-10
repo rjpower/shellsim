@@ -34,7 +34,7 @@
     },
     {
       "file": "compiler.py",
-      "sha256": "0a25e9d7dd91f9e47a926737f37d1e3f1cc5645086ec80bcbebbca5256a530cd"
+      "sha256": "0be2583f1646f70167514f9b17101ffd1d5fc524a5d7b4cf4adb8d320caf826a"
     },
     {
       "file": "../../_support/build.py",
@@ -55,6 +55,10 @@
     {
       "file": "../runtime_profile.py",
       "sha256": "8dd4a55f317408d7f0ddc373ce26d14e7580d34bdd52d1ac55e54c603af7730b"
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035"
     }
   ],
   "name": "clang",
@@ -153,6 +157,13 @@
       "sha256": "c4edba4222e5133bed47720df897bf8199de8ceed7f31ff7cfff435eb1e07fcf",
       "inputs": {
         "clang/lib/Driver/ToolChains/WebAssembly.cpp": "3994a5c6c59d728f5cf0bed2af10e0484e491656b077bffd72d0612faea7a1f9"
+      }
+    },
+    {
+      "file": "runtime-ctors-opcodes.patch",
+      "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035",
+      "inputs": {
+        "lld/wasm/Writer.cpp": "33b00cbf116dd29c4e1abc3ec3c31d2106b089bbb007413c052fe838ee6801c4"
       }
     }
   ],
