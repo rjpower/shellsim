@@ -3,11 +3,11 @@
 //! Resolution happens before the old image is stopped. A successful host call unwinds
 //! Wasmtime; the process owner drops every old Store before applying the replacement.
 
+use super::posix_process::{
+    decode_cost, decode_memory, MAX_ARGUMENTS, MAX_ENVIRONMENT, MAX_STRINGS,
+};
 use super::*;
 use std::collections::BTreeMap;
-
-const MAX_STRINGS: usize = 131_072;
-const DECODE_MEMORY: u64 = 3 * MAX_STRINGS as u64 + 32_768;
 
 /// Validated replacement plus its independently retained decode reservation.
 #[derive(Debug)]
@@ -56,12 +56,13 @@ fn vector(
     caller: &Caller<'_, Host>,
     pointer: u32,
     count: u32,
+    maximum: u32,
     remaining: &mut usize,
 ) -> Result<Vec<String>, i32> {
     if pointer == 0 && count == 0 {
         return Ok(Vec::new());
     }
-    if count > 256 || pointer == 0 {
+    if count > maximum || pointer == 0 {
         return Err(ERRNO_INVAL);
     }
     let entries = memory
@@ -70,13 +71,13 @@ fn vector(
     if entries[count as usize * 4..] != [0; 4] {
         return Err(ERRNO_INVAL);
     }
-    entries[..count as usize * 4]
-        .chunks_exact(4)
-        .map(|entry| {
-            let pointer = u32::from_le_bytes(entry.try_into().expect("fixed-width pointer"));
-            string(memory, caller, pointer, remaining)
-        })
-        .collect()
+    // Keep String-slot capacity exact so the prepaid per-entry bound holds.
+    let mut values = Vec::with_capacity(count as usize);
+    for entry in entries[..count as usize * 4].chunks_exact(4) {
+        let pointer = u32::from_le_bytes(entry.try_into().expect("fixed-width pointer"));
+        values.push(string(memory, caller, pointer, remaining)?);
+    }
+    Ok(values)
 }
 
 fn environment(values: Vec<String>) -> Result<BTreeMap<String, String>, i32> {
@@ -167,7 +168,8 @@ fn resolve(
         executable,
         argv,
         environment,
-        reserved_bytes: DECODE_MEMORY,
+        // The host call installs its reservation after successful preflight.
+        reserved_bytes: 0,
     })
 }
 
@@ -184,10 +186,11 @@ fn exec(
     let Some(memory) = memory(&mut caller) else {
         return Ok(ERRNO_FAULT);
     };
+    let reserved = decode_memory(argc, envc);
     {
         let mut machine = caller.data_mut().machine.get();
-        if !machine.resources.charge_cpu(2 * MAX_STRINGS as u64)
-            || !machine.resources.reserve_memory(DECODE_MEMORY)
+        if !machine.resources.charge_cpu(decode_cost(argc, envc))
+            || !machine.resources.reserve_memory(reserved)
         {
             return Err(exhausted());
         }
@@ -195,12 +198,19 @@ fn exec(
     caller
         .data()
         .retained
-        .fetch_add(DECODE_MEMORY, Ordering::Relaxed);
+        .fetch_add(reserved, Ordering::Relaxed);
     let decoded = (|| {
         let mut remaining = MAX_STRINGS;
         let requested = string(&memory, &caller, path, &mut remaining)?;
-        let argv = vector(&memory, &caller, argv, argc, &mut remaining)?;
-        let environment = environment(vector(&memory, &caller, env, envc, &mut remaining)?)?;
+        let argv = vector(&memory, &caller, argv, argc, MAX_ARGUMENTS, &mut remaining)?;
+        let environment = environment(vector(
+            &memory,
+            &caller,
+            env,
+            envc,
+            MAX_ENVIRONMENT,
+            &mut remaining,
+        )?)?;
         resolve(
             &mut caller.data_mut().machine.get(),
             requested,
@@ -229,8 +239,8 @@ fn exec(
                 .fold(spec.executable.len() as u64, u64::saturating_add)
                 .saturating_mul(3)
                 .saturating_add(65_536)
-                .max(DECODE_MEMORY);
-            let extra = retained - DECODE_MEMORY;
+                .max(reserved);
+            let extra = retained - reserved;
             if !caller
                 .data_mut()
                 .machine
@@ -241,13 +251,13 @@ fn exec(
                 caller
                     .data()
                     .retained
-                    .fetch_sub(DECODE_MEMORY, Ordering::Relaxed);
+                    .fetch_sub(reserved, Ordering::Relaxed);
                 caller
                     .data_mut()
                     .machine
                     .get()
                     .resources
-                    .release_memory(DECODE_MEMORY);
+                    .release_memory(reserved);
                 return Err(exhausted());
             }
             caller.data().retained.fetch_add(extra, Ordering::Relaxed);
@@ -258,13 +268,13 @@ fn exec(
             caller
                 .data()
                 .retained
-                .fetch_sub(DECODE_MEMORY, Ordering::Relaxed);
+                .fetch_sub(reserved, Ordering::Relaxed);
             caller
                 .data_mut()
                 .machine
                 .get()
                 .resources
-                .release_memory(DECODE_MEMORY);
+                .release_memory(reserved);
             if errno == -1 || caller.data().machine.get().resources.is_stopped() {
                 Err(exhausted())
             } else {
