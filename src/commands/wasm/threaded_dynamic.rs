@@ -539,7 +539,9 @@ impl Process {
     fn fail(&self, error: &Error) {
         let mut state = self.0.lock().expect("threaded dynamic registry");
         state.failed = true;
-        state.failure = Some(error.to_string().chars().take(1024).collect());
+        if state.failure.is_none() {
+            state.failure = Some(error.to_string().chars().take(1024).collect());
+        }
         let paused = std::mem::take(&mut state.paused);
         state.wake.extend(paused);
     }
@@ -645,16 +647,20 @@ pub(super) fn register(linker: &mut wasmtime::Linker<super::Host>) {
                     match result {
                         Ok(handle) => Ok(handle),
                         Err(error) => {
-                            if caller
+                            let process = caller
                                 .data()
                                 .thread
                                 .as_ref()
                                 .expect("thread host")
-                                .dynamic_process()
-                                .0
-                                .lock()
-                                .expect("threaded dynamic registry")
-                                .failed
+                                .dynamic_process();
+                            let failed =
+                                process.0.lock().expect("threaded dynamic registry").failed;
+                            // A dropped initialization guard poisons the process. Retain
+                            // its cause before the next checkpoint observes that poison.
+                            if failed {
+                                process.fail(&error);
+                            }
+                            if failed
                                 || error.is::<super::GuestExit>()
                                 || caller
                                     .data()
@@ -757,6 +763,16 @@ mod tests {
         assert!(process.resume_allowed(7).is_err());
         assert!(process.begin(9, 1).is_err());
         assert_eq!(process.snapshot().0, 0);
+        process.fail(&Error::msg("missing native initializer"));
+        assert_eq!(
+            process.resume_allowed(7).unwrap_err().to_string(),
+            "missing native initializer"
+        );
+        process.fail(&Error::msg("later checkpoint failure"));
+        assert_eq!(
+            process.try_prepare(9).unwrap_err().to_string(),
+            "missing native initializer"
+        );
     }
 
     #[test]
