@@ -5,9 +5,22 @@ use crate::commands::wasm::{build_linker, fibers, Host};
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use wasmtime::{
-    AsContextMut, Error, Extern, ExternType, Func, Global, Mutability, Ref, StoreContextMut, Val,
-    ValType,
+    AsContextMut, Error, Extern, ExternType, Func, FuncType, Global, Mutability, Ref,
+    StoreContextMut, Val, ValType,
 };
+
+#[derive(Clone)]
+pub(super) enum DeferredImport {
+    Function {
+        name: String,
+        expected: FuncType,
+    },
+    Got {
+        namespace: String,
+        name: String,
+        global: Global,
+    },
+}
 
 fn library_export(
     mut store: StoreContextMut<'_, Host>,
@@ -20,7 +33,15 @@ fn library_export(
         .libraries
         .get(handle.checked_sub(1)? as usize)?;
     let instance = library.instance;
-    let base = library.record.memory_base;
+    if library.record.layout.forwarded_exports.contains(name) {
+        return None;
+    }
+    let base = if library.record.layout.tls_exports.contains(name) {
+        let slot = store.data().thread.as_ref().expect("thread host").slot();
+        library.record.tls[slot]
+    } else {
+        library.record.memory_base
+    };
     let slot = library.record.function_slots.get(name).copied();
     instance
         .get_export(&mut store, name)
@@ -29,7 +50,7 @@ fn library_export(
 
 // A fixed queue visits each process module once, including diamond graphs.
 // Local dependency scope never changes another module's global visibility.
-fn lookup_dependencies(
+pub(super) fn lookup_dependencies(
     mut store: StoreContextMut<'_, Host>,
     name: &str,
     roots: &[u32],
@@ -85,7 +106,7 @@ fn lookup_dependencies(
     Ok(None)
 }
 
-fn lookup(
+pub(super) fn lookup(
     mut store: StoreContextMut<'_, Host>,
     name: &str,
     dependencies: &[u32],
@@ -95,7 +116,16 @@ fn lookup(
         .threaded_dynamic
         .main
         .ok_or_else(|| Error::msg("threaded main unavailable"))?;
-    if let Some(value) = main.get_export(&mut store, name) {
+    let owned = name != super::layout::START_EXPORT
+        && !store
+            .data()
+            .thread
+            .as_ref()
+            .expect("thread host")
+            .executable
+            .forwarded_exports
+            .contains(name);
+    if let Some(value) = owned.then(|| main.get_export(&mut store, name)).flatten() {
         let slot = store
             .data()
             .threaded_dynamic
@@ -118,6 +148,10 @@ fn lookup(
     }
     if super::super::dynamic::canonical_runtime_symbol(name) {
         return Ok(None);
+    }
+    let roots = store.data().threaded_dynamic.executable.roots.clone();
+    if let Some(value) = lookup_dependencies(store.as_context_mut(), name, &roots)? {
+        return Ok(Some(value));
     }
     let count = store.data().threaded_dynamic.libraries.len();
     if !store
@@ -143,7 +177,7 @@ fn lookup(
     lookup_dependencies(store, name, dependencies)
 }
 
-fn address(
+pub(super) fn address(
     mut store: StoreContextMut<'_, Host>,
     value: Extern,
     base: u32,
@@ -199,6 +233,7 @@ pub(super) async fn install(
     mut store: StoreContextMut<'_, Host>,
     record: Arc<Record>,
     initialize_process: bool,
+    defer_process_init: bool,
 ) -> Result<(), Error> {
     let main = store
         .data()
@@ -250,6 +285,8 @@ pub(super) async fn install(
         .map(|import| import.name().to_owned())
         .collect();
     let mut own_got = Vec::new();
+    let mut imports = Vec::new();
+    let library_index = store.data().threaded_dynamic.libraries.len();
     let mut imported_memory = false;
     for import in record.module.imports() {
         let namespace = import.module();
@@ -290,7 +327,17 @@ pub(super) async fn install(
                 if !ValType::eq(ty.content(), &ValType::I32) || ty.mutability() != Mutability::Var {
                     return Err(Error::msg("GOT imports require mutable i32 globals"));
                 }
-                if let Some(symbol) = lookup(store.as_context_mut(), name, &record.dependencies)? {
+                if defer_process_init {
+                    let global = Global::new(store.as_context_mut(), ty, Val::I32(0))?;
+                    imports.push(DeferredImport::Got {
+                        namespace: namespace.to_owned(),
+                        name: name.to_owned(),
+                        global,
+                    });
+                    Extern::Global(global)
+                } else if let Some(symbol) =
+                    lookup(store.as_context_mut(), name, &record.dependencies)?
+                {
                     if (namespace == "GOT.mem" && !matches!(symbol.0, Extern::Global(_)))
                         || (namespace == "GOT.func" && !matches!(symbol.0, Extern::Func(_)))
                     {
@@ -334,7 +381,48 @@ pub(super) async fn install(
                 }
             }
             ("env", _) => {
-                if let Some(symbol) = lookup(store.as_context_mut(), name, &record.dependencies)? {
+                if defer_process_init && matches!(import.ty(), ExternType::Func(_)) {
+                    let ExternType::Func(ty) = import.ty() else {
+                        unreachable!()
+                    };
+                    imports.push(DeferredImport::Function {
+                        name: name.to_owned(),
+                        expected: ty.clone(),
+                    });
+                    let name = name.to_owned();
+                    Extern::Func(Func::new_async(
+                        store.as_context_mut(),
+                        ty,
+                        move |mut caller, args, results| {
+                            let name = name.clone();
+                            Box::new(async move {
+                                if !caller
+                                    .data()
+                                    .machine
+                                    .get()
+                                    .resources
+                                    .charge_cpu(name.len() as u64 + 64)
+                                {
+                                    return Err(super::super::exhausted());
+                                }
+                                let target = caller
+                                    .data()
+                                    .threaded_dynamic
+                                    .libraries
+                                    .get(library_index)
+                                    .and_then(|library| library.functions.get(&name))
+                                    .copied()
+                                    .ok_or_else(|| {
+                                        Error::msg(format!("unbound startup side function: {name}"))
+                                    })?;
+                                let _fiber = fibers::begin(&mut caller)?;
+                                target.call_async(&mut caller, args, results).await
+                            })
+                        },
+                    ))
+                } else if let Some(symbol) =
+                    lookup(store.as_context_mut(), name, &record.dependencies)?
+                {
                     symbol.0
                 } else if record
                     .layout
@@ -387,6 +475,16 @@ pub(super) async fn install(
                 Ref::Func(Some(function)),
             )?;
         }
+        if defer_process_init {
+            store.data_mut().threaded_dynamic.libraries.push(Loaded {
+                instance,
+                record,
+                imports,
+                functions: Default::default(),
+                deferred: true,
+            });
+            return Ok(());
+        }
         for (name, global) in &own_got {
             let value = if let Some(slot) = record.function_slots.get(name) {
                 *slot
@@ -434,10 +532,15 @@ pub(super) async fn install(
                 .get_export(store.as_context_mut(), &name)
                 .ok_or_else(|| Error::msg("missing own GOT export"))?;
             let slot = record.function_slots.get(&name).copied();
-            let value = address(store.as_context_mut(), value, record.memory_base, slot)?;
+            let base = if record.layout.tls_exports.contains(&name) {
+                record.tls[thread.slot()]
+            } else {
+                record.memory_base
+            };
+            let value = address(store.as_context_mut(), value, base, slot)?;
             global.set(store.as_context_mut(), Val::I32(value as i32))?;
         }
-        if initialize_process {
+        if initialize_process && !defer_process_init {
             for name in ["__wasm_apply_data_relocs", "__wasm_call_ctors"] {
                 if let Some(function) = instance.get_func(store.as_context_mut(), name) {
                     let _fiber = fibers::begin(store.as_context_mut())?;
@@ -448,14 +551,206 @@ pub(super) async fn install(
                 }
             }
         }
-        store
-            .data_mut()
-            .threaded_dynamic
-            .libraries
-            .push(Loaded { instance, record });
+        store.data_mut().threaded_dynamic.libraries.push(Loaded {
+            instance,
+            record,
+            imports,
+            functions: Default::default(),
+            deferred: false,
+        });
         Ok(())
     }
     .await;
     store.data_mut().threaded_dynamic.initializing = false;
     result
+}
+
+/// Run one side's constructors after all graph data relocations are complete.
+pub(super) async fn initialize(
+    mut store: StoreContextMut<'_, Host>,
+    index: usize,
+) -> Result<(), Error> {
+    let instance = store.data().threaded_dynamic.libraries[index].instance;
+    if let Some(function) = instance.get_func(store.as_context_mut(), "__wasm_call_ctors") {
+        let _fiber = fibers::begin(store.as_context_mut())?;
+        function
+            .typed::<(), ()>(&store)?
+            .call_async(store.as_context_mut(), ())
+            .await?;
+    }
+    Ok(())
+}
+
+/// Resolve every eager import against the complete graph in declared-root
+/// breadth-first order. Topological installation must not decide interposition.
+pub(super) fn bind_graph(mut store: StoreContextMut<'_, Host>) -> Result<(), Error> {
+    let count = store.data().threaded_dynamic.libraries.len();
+    for index in 0..count {
+        let record = store.data().threaded_dynamic.libraries[index]
+            .record
+            .clone();
+        if !store
+            .data()
+            .machine
+            .get()
+            .resources
+            .charge_cpu(record.store_cost)
+        {
+            return Err(super::super::exhausted());
+        }
+        let imports = store.data().threaded_dynamic.libraries[index]
+            .imports
+            .clone();
+        for import in imports {
+            match import {
+                DeferredImport::Function { name, expected } => {
+                    let target = match lookup(store.as_context_mut(), &name, &record.dependencies)?
+                    {
+                        Some((Extern::Func(function), _, _)) => {
+                            if !FuncType::eq(&expected, &function.ty(&store)) {
+                                return Err(Error::msg(format!(
+                                    "startup side function type mismatch: {name}"
+                                )));
+                            }
+                            function
+                        }
+                        None if record
+                            .layout
+                            .weak_imports
+                            .contains(&("env".to_owned(), name.clone())) =>
+                        {
+                            let symbol = name.clone();
+                            Func::new(store.as_context_mut(), expected, move |_, _, _| {
+                                Err(Error::msg(format!(
+                                    "unresolved weak function called: {symbol}"
+                                )))
+                            })
+                        }
+                        _ => {
+                            return Err(Error::msg(format!(
+                                "missing startup side function: {name}"
+                            )))
+                        }
+                    };
+                    store.data_mut().threaded_dynamic.libraries[index]
+                        .functions
+                        .insert(name, target);
+                }
+                DeferredImport::Got {
+                    namespace,
+                    name,
+                    global,
+                } => {
+                    let value = match lookup(store.as_context_mut(), &name, &record.dependencies)? {
+                        Some(symbol) => {
+                            if (namespace == "GOT.mem" && !matches!(symbol.0, Extern::Global(_)))
+                                || (namespace == "GOT.func" && !matches!(symbol.0, Extern::Func(_)))
+                            {
+                                return Err(Error::msg(format!(
+                                    "startup side GOT symbol kind mismatch: {name}"
+                                )));
+                            }
+                            address(store.as_context_mut(), symbol.0, symbol.1, symbol.2)?
+                        }
+                        None if record
+                            .layout
+                            .weak_imports
+                            .contains(&(namespace.clone(), name.clone()))
+                            || (namespace == "GOT.func"
+                                && record
+                                    .layout
+                                    .weak_imports
+                                    .contains(&("env".to_owned(), name.clone()))) =>
+                        {
+                            0
+                        }
+                        None => {
+                            return Err(Error::msg(format!(
+                                "missing startup side GOT symbol: {name}"
+                            )))
+                        }
+                    };
+                    global.set(store.as_context_mut(), Val::I32(value as i32))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Initialize each eager instance after the graph is bound. Workers enter here
+/// after libc establishes main TLS, and never initialize shared process data.
+pub(super) async fn prepare_graph(
+    mut store: StoreContextMut<'_, Host>,
+    initialize_process: bool,
+) -> Result<(), Error> {
+    let thread = store.data().thread.as_ref().expect("thread host").clone();
+    let count = store.data().threaded_dynamic.libraries.len();
+    for index in 0..count {
+        let library = &store.data().threaded_dynamic.libraries[index];
+        if !library.deferred {
+            continue;
+        }
+        let instance = library.instance;
+        let record = library.record.clone();
+        for name in ["__wasm_apply_global_relocs", "__wasm_init_memory"] {
+            if name == "__wasm_init_memory" && !initialize_process {
+                continue;
+            }
+            if let Some(function) = instance.get_func(store.as_context_mut(), name) {
+                let _fiber = fibers::begin(store.as_context_mut())?;
+                function
+                    .typed::<(), ()>(&store)?
+                    .call_async(store.as_context_mut(), ())
+                    .await?;
+            }
+        }
+        if record.layout.tls_size != 0 {
+            let function =
+                instance.get_typed_func::<u32, ()>(store.as_context_mut(), "__wasm_init_tls")?;
+            let _fiber = fibers::begin(store.as_context_mut())?;
+            function
+                .call_async(store.as_context_mut(), record.tls[thread.slot()])
+                .await?;
+        }
+        store.data_mut().threaded_dynamic.libraries[index].deferred = false;
+    }
+    // Every TLS base now exists. Refresh imports before derived globals, so a
+    // module can access another module's TLS even when it was instantiated first.
+    bind_graph(store.as_context_mut())?;
+    for index in 0..count {
+        let instance = store.data().threaded_dynamic.libraries[index].instance;
+        for name in [
+            "__wasm_apply_global_relocs",
+            "__wasm_apply_global_tls_relocs",
+        ] {
+            if let Some(function) = instance.get_func(store.as_context_mut(), name) {
+                let _fiber = fibers::begin(store.as_context_mut())?;
+                function
+                    .typed::<(), ()>(&store)?
+                    .call_async(store.as_context_mut(), ())
+                    .await?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Finish all process data relocations before any constructor can observe a
+/// different module's data, including a dependency referring to its root.
+pub(super) async fn relocate_data(mut store: StoreContextMut<'_, Host>) -> Result<(), Error> {
+    let count = store.data().threaded_dynamic.libraries.len();
+    for index in 0..count {
+        let instance = store.data().threaded_dynamic.libraries[index].instance;
+        if let Some(function) =
+            instance.get_func(store.as_context_mut(), "__wasm_apply_data_relocs")
+        {
+            let _fiber = fibers::begin(store.as_context_mut())?;
+            function
+                .typed::<(), ()>(&store)?
+                .call_async(store.as_context_mut(), ())
+                .await?;
+        }
+    }
+    Ok(())
 }

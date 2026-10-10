@@ -147,12 +147,15 @@ fn resolve(
             let bytes = interp.vfs.read_limited("/", &executable, MAX_WASM_BYTES)?;
             threads::reject_raw_waits(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
             let profile = threads::profile(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
-            let module =
-                compiled_command_module(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
+            let module = compiled_executable_module(&bytes, profile.as_ref())
+                .map_err(|_| SyscallError::ExecutableFormat)?;
             validate_imports(
                 &module,
                 profile.is_some(),
                 profile.as_ref().is_some_and(|profile| profile.dynamic),
+                profile
+                    .as_ref()
+                    .is_some_and(|profile| !profile.executable.needed.is_empty()),
             )
             .map_err(|_| SyscallError::ExecutableFormat)
         })();

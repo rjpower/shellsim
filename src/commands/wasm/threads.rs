@@ -246,6 +246,7 @@ pub(super) struct Profile {
     pub(super) maximum_pages: u64,
     pub(super) dynamic: bool,
     pub(super) main_tls: Arc<std::collections::BTreeSet<String>>,
+    pub(super) executable: Arc<super::threaded_dynamic::layout::Executable>,
 }
 
 impl Profile {
@@ -307,6 +308,7 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
                                 maximum_pages: maximum,
                                 dynamic: false,
                                 main_tls: Arc::new(Default::default()),
+                                executable: Arc::new(Default::default()),
                             });
                         }
                     }
@@ -360,7 +362,8 @@ pub(super) fn profile(bytes: &[u8]) -> Result<Option<Profile>, wasmtime::Error> 
     if let Some(profile) = &mut shared {
         if scheduler_v2 && marker && !scheduler && !dynamic {
             profile.dynamic = true;
-            profile.main_tls = Arc::new(super::threaded_dynamic::layout::main_tls_exports(bytes)?);
+            profile.executable = Arc::new(super::threaded_dynamic::layout::executable(bytes)?);
+            profile.main_tls = Arc::new(profile.executable.tls_exports.clone());
         } else if !scheduler || scheduler_v2 || dynamic || profile.maximum_pages > 1024 {
             return Err(wasmtime::Error::msg(
                 "shared memory requires an exact thread ABI",
@@ -401,6 +404,7 @@ pub(super) struct ThreadContext {
     slot: usize,
     dynamic: bool,
     pub(super) main_tls: Arc<std::collections::BTreeSet<String>>,
+    pub(super) executable: Arc<super::threaded_dynamic::layout::Executable>,
 }
 
 impl ThreadContext {
@@ -554,6 +558,7 @@ impl ThreadGroup {
             slot: self.control.lock().expect("thread control").slots[&tid],
             dynamic: self.profile.dynamic,
             main_tls: self.profile.main_tls.clone(),
+            executable: self.profile.executable.clone(),
         });
         self.guests.insert(
             tid,
@@ -842,6 +847,17 @@ pub(super) fn register(linker: &mut Linker<Host>) {
                         function.call_async(&mut caller, ()).await?;
                     }
                     caller.data_mut().threaded_dynamic.ready = true;
+                    if !caller
+                        .data()
+                        .thread
+                        .as_ref()
+                        .expect("thread host")
+                        .executable
+                        .needed
+                        .is_empty()
+                    {
+                        super::threaded_dynamic::executable::ready(caller.as_context_mut()).await?;
+                    }
                     super::threaded_dynamic::checkpoint(caller.as_context_mut()).await
                 })
             },
@@ -926,6 +942,14 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
     super::threaded_dynamic::register(&mut linker);
     let result = async {
         linker.define(&store, "env", "memory", thread.memory())?;
+        let eager = !thread.executable.needed.is_empty();
+        if eager {
+            super::threaded_dynamic::executable::define(
+                store.as_context_mut(),
+                &module,
+                &mut linker,
+            )?;
+        }
         linker.define_unknown_imports_as_traps(&module)?;
         poll_fn(|_| {
             let mut control = thread.control.lock().expect("thread control");
@@ -941,7 +965,23 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
             }
         })
         .await?;
-        let initialized = linker.instantiate_async(&mut store, &module).await;
+        let initialized = async {
+            let instance = linker.instantiate_async(&mut store, &module).await?;
+            if thread.dynamic {
+                super::threaded_dynamic::prepare_main(store.as_context_mut(), &module, instance)?;
+            }
+            store.data_mut().threaded_dynamic.main = Some(instance);
+            if eager {
+                super::threaded_dynamic::executable::startup(
+                    store.as_context_mut(),
+                    &module,
+                    &path,
+                )
+                .await?;
+            }
+            Ok::<_, Error>(instance)
+        }
+        .await;
         {
             let mut control = thread.control.lock().expect("thread control");
             assert_eq!(control.init_owner, Some(thread.tid));
@@ -949,10 +989,6 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
             control.init_failed |= initialized.is_err();
         }
         let instance = initialized?;
-        if thread.dynamic {
-            super::threaded_dynamic::prepare_main(store.as_context_mut(), &module, instance)?;
-        }
-        store.data_mut().threaded_dynamic.main = Some(instance);
         store.data_mut().threaded_dynamic.ready = thread.tid == 0;
         if thread.tid == 0 {
             // Instantiation initializes the main TLS segment and its base, but

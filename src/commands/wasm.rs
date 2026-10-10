@@ -22,8 +22,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, Linker, Module,
-    Store, StoreContextMut, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, ExternType, Linker,
+    Module, Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{
@@ -181,6 +181,19 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
     }
     cache.insert(source, module.clone());
     Ok(module)
+}
+
+/// Rewrite only an admitted main executable. Side-library compilation uses the
+/// original source and must not pass through the main thread-profile checks.
+fn compiled_executable_module(
+    source: &[u8],
+    profile: Option<&threads::Profile>,
+) -> Result<Module, Error> {
+    let rewritten = profile
+        .filter(|profile| !profile.executable.needed.is_empty())
+        .map(|profile| threaded_dynamic::layout::defer_start(source, &profile.executable))
+        .transpose()?;
+    compiled_command_module(rewritten.as_deref().unwrap_or(source))
 }
 
 /// Access to the virtual machine for host calls.
@@ -2495,6 +2508,7 @@ pub(super) fn validate_imports(
     module: &Module,
     threaded: bool,
     threaded_dynamic: bool,
+    executable_dynamic: bool,
 ) -> Result<(), Error> {
     for import in module.imports() {
         let allowed = import.module() == "wasi_snapshot_preview1"
@@ -2505,6 +2519,10 @@ pub(super) fn validate_imports(
                         && matches!(import.name(), "wait32" | "notify"))
                     || (import.module() == threads::NAMESPACE_V2
                         && matches!(import.name(), "wait32" | "notify" | "thread_ready"))))
+            || (executable_dynamic
+                && ((import.module() == "env" && matches!(import.ty(), ExternType::Func(_)))
+                    || (matches!(import.module(), "GOT.mem" | "GOT.func")
+                        && matches!(import.ty(), ExternType::Global(_)))))
             || (import.module() == "shellsim_posix_v1"
                 && matches!(
                     import.name(),
@@ -2582,7 +2600,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             format!("{path}: wasm compilation memory budget exhausted"),
         ));
     }
-    let compiled = compiled_command_module(&wasm);
+    let compiled = compiled_executable_module(&wasm, thread_profile.as_ref());
     interp.resources.release_memory(scratch);
     let module =
         compiled.map_err(|error| (126, format!("{path}: invalid wasm module: {error}")))?;
@@ -2592,6 +2610,9 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
         thread_profile
             .as_ref()
             .is_some_and(|profile| profile.dynamic),
+        thread_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.executable.needed.is_empty()),
     )
     .map_err(|error| (126, format!("{path}: {error}")))?;
     let mut linker = build_linker(command_engine());

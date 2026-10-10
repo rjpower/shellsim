@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use wasmtime::{AsContextMut, Error, Instance, Module, StoreContextMut};
 
 pub(super) mod callbacks;
+pub(super) mod executable;
 pub(super) mod layout;
 mod loading;
 mod replay;
@@ -35,11 +36,15 @@ pub(super) struct StoreState {
     error: Option<String>,
     strings_reserved: bool,
     callbacks: callbacks::StoreState,
+    executable: executable::Bindings,
 }
 
 struct Loaded {
     instance: Instance,
     record: Arc<Record>,
+    imports: Vec<replay::DeferredImport>,
+    functions: BTreeMap<String, wasmtime::Func>,
+    deferred: bool,
 }
 
 fn reserve_store(store: &mut StoreContextMut<'_, super::Host>, bytes: u64) -> Result<(), Error> {
@@ -150,7 +155,17 @@ pub(super) fn prepare_main(
     }
     let mut symbols = BTreeMap::new();
     for export in module.exports() {
-        if !matches!(export.ty(), wasmtime::ExternType::Func(_)) {
+        if !matches!(export.ty(), wasmtime::ExternType::Func(_))
+            || export.name() == layout::START_EXPORT
+            || store
+                .data()
+                .thread
+                .as_ref()
+                .expect("thread host")
+                .executable
+                .forwarded_exports
+                .contains(export.name())
+        {
             continue;
         }
         let function = instance
@@ -220,7 +235,8 @@ pub(super) async fn checkpoint(mut store: StoreContextMut<'_, super::Host>) -> R
         let (_, records) = process.snapshot();
         let installed = store.data().threaded_dynamic.libraries.len();
         for record in records.into_iter().skip(installed) {
-            if let Err(error) = replay::install(store.as_context_mut(), record, false).await {
+            if let Err(error) = replay::install(store.as_context_mut(), record, false, false).await
+            {
                 process.fail(&error);
                 return Err(error);
             }
@@ -266,6 +282,8 @@ struct State {
     main_symbols: Option<BTreeMap<String, u32>>,
     table_next: u32,
     callbacks: callbacks::ProcessState,
+    startup_roots: Vec<u32>,
+    startup_modules: usize,
 }
 
 #[derive(Clone, Default)]
@@ -642,7 +660,7 @@ pub(super) fn register(linker: &mut wasmtime::Linker<super::Host>) {
                         return Err(Error::msg("nested threaded loading is unsupported"));
                     }
                     caller.data_mut().threaded_dynamic.loading = true;
-                    let result = loading::load(&mut caller, path, flags).await;
+                    let result = loading::load(&mut caller.as_context_mut(), path, flags).await;
                     caller.data_mut().threaded_dynamic.loading = false;
                     match result {
                         Ok(handle) => Ok(handle),
