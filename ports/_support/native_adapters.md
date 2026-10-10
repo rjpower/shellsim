@@ -107,7 +107,9 @@ immutable graph results still bind the complete implementation identity.
 The producer state, source and snapshots live in its parent directory, and the
 producer verifies their exact inputs before reuse. Without an override, the
 runner selects a compatible generated workspace and its `build` directory.
-Other adapters currently reject this option.
+Meson and Python Meson recipes also support retained Ninja directories, as
+described in [Retained Meson workspaces](#retained-meson-workspaces). Other
+adapters reject this option.
 `llvm-guest-sdk` stages admitted target development data without running a
 compiler and requires its explicit platform dependency.
 
@@ -173,8 +175,9 @@ wheel. A mixed wheel/development port installs both selections for acceptance.
 The scientific host descriptor admits a Meson tree patched with
 `meson-wasi-archive-groups.patch`. Meson otherwise inserts GNU archive groups for
 WASI Clang. wasm-ld rescans archive members and rejects these GNU flags. The
-receipt records the original Meson receipt, the patch input hash and every
-resulting tool file; the original host tool remains immutable.
+receipt binds NumPy's vendored Meson source, the patch input and output hashes,
+and every resulting tool file. [Scientific host-tool setup](HOST_TOOLS.md)
+produces these receipts with a private read-only Python closure.
 
 
 ## Retained Meson workspaces
