@@ -592,12 +592,33 @@ def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = No
             "SCCACHE_GCS_RW_MODE": "READ_WRITE",
         }
     result = {"SCCACHE_BUCKET": parsed.netloc, "SCCACHE_S3_KEY_PREFIX": prefix}
-    endpoint = environ.get("AWS_ENDPOINT_URL_S3") or environ.get("AWS_ENDPOINT_URL")
+    routing = json.loads(environ.get("FSSPEC_S3", "{}"))
+    endpoint = environ.get("AWS_ENDPOINT_URL_S3") or environ.get("AWS_ENDPOINT_URL") or routing.get("endpoint_url")
     if endpoint:
+        origin = urlsplit(endpoint)
+        if (
+            origin.scheme not in ("http", "https")
+            or not origin.netloc
+            or origin.username
+            or origin.password
+            or origin.query
+            or origin.fragment
+        ):
+            raise ValueError("compiler cache endpoint must be a public HTTP origin")
         result["SCCACHE_ENDPOINT"] = endpoint
-        result["SCCACHE_S3_USE_SSL"] = "true" if urlsplit(endpoint).scheme == "https" else "false"
-        result["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] = "true"
-    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+        result["SCCACHE_S3_USE_SSL"] = "true" if origin.scheme == "https" else "false"
+        style = routing.get("config_kwargs", {}).get("s3", {}).get("addressing_style")
+        if style is not None and style not in ("virtual", "path", "auto"):
+            raise ValueError("unsupported compiler cache addressing style")
+        virtual = style == "virtual" or (
+            style in (None, "auto")
+            and any(
+                (origin.hostname or "") == domain or (origin.hostname or "").endswith("." + domain)
+                for domain in ("cwobject.com", "cwlota.com")
+            )
+        )
+        result["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] = "true" if virtual else "false"
+    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or routing.get("client_kwargs", {}).get("region_name")
     if region:
         result["SCCACHE_REGION"] = region
     return result
@@ -606,14 +627,37 @@ def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = No
 def _worker_environment(config: IrisConfig) -> dict[str, str]:
     if not config.compiler_cache:
         return {}
-    from rigging.filesystem.cluster_config import marin_temp_bucket
-    from rigging.filesystem.s3_compat import configure_coreweave_s3
+    from rigging.filesystem.cluster_config import StoreType, data_buckets, marin_temp_bucket
+    from rigging.filesystem.s3_compat import configure_coreweave_s3, fsspec_s3_conf, s3_endpoint
 
-    configure_coreweave_s3()
     path = marin_temp_bucket(30, prefix="shellsim/ports/sccache/v1")
-    if shutil.which("sccache") is None:
+    environ = dict(os.environ)
+    parsed = urlsplit(path)
+    if parsed.scheme == "s3":
+        spec = data_buckets().get(parsed.netloc)
+        if spec is not None and spec.store == StoreType.COREWEAVE:
+            configure_coreweave_s3()
+            environ = dict(os.environ)
+            endpoint = s3_endpoint(spec.store)
+            environ.update(
+                AWS_ENDPOINT_URL_S3=endpoint,
+                AWS_REGION=spec.signing_region,
+                FSSPEC_S3=json.dumps(fsspec_s3_conf(endpoint)),
+            )
+    binary = shutil.which("sccache")
+    if binary is None:
         raise RuntimeError("compiler cache requires sccache in the worker task image")
-    return {**compiler_cache_environment(path), "SCCACHE_SERVER_PORT": "4226"}
+    digest = hashlib.sha256()
+    with Path(binary).open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    if digest.hexdigest() != "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59":
+        raise RuntimeError("compiler cache requires the admitted sccache 0.18.0 musl binary")
+    return {
+        **compiler_cache_environment(path, environ),
+        "SCCACHE_SERVER_UDS": "/app/.buildomatic/sccache.sock",
+        "SCCACHE_IDLE_TIMEOUT": "0",
+    }
 
 
 def _source_files() -> dict[str, bytes]:
@@ -946,6 +990,8 @@ def _run_worker(config: IrisConfig, worker_id: str) -> None:
     # sccache uses one worker-local server, keeping cloud credentials outside
     # the sanitized action environment owned by WorkerExecutor.
     if env:
+        os.environ.pop("SCCACHE_SERVER_PORT", None)
+        Path(env["SCCACHE_SERVER_UDS"]).parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["sccache", "--start-server"], check=True, stdout=subprocess.DEVNULL)
     root = Path(os.environ["IRIS_WORKDIR"]) / ".buildomatic" / worker_id
     store = RemoteStore(

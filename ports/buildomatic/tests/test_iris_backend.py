@@ -44,6 +44,7 @@ from ports.buildomatic.backends.iris import (
     _deployed_files,
     _entrypoint,
     _WorkerActor,
+    _worker_environment,
     compiler_cache_environment,
     connection_descriptor,
 )
@@ -804,7 +805,12 @@ def test_worker_proxy_targets_chosen_actor_and_propagates_rpc_error():
 def test_compiler_cache_preserves_worker_region_endpoint_and_ttl():
     env = compiler_cache_environment(
         "s3://marin-us-east-02a/tmp/ttl=30d/shellsim/ports/sccache/v1",
-        {"AWS_REGION": "US-EAST-02A", "AWS_ENDPOINT_URL": "http://lota.local", "AWS_SECRET_ACCESS_KEY": "secret"},
+        {
+            "AWS_REGION": "US-EAST-02A",
+            "AWS_ENDPOINT_URL": "http://lota.local",
+            "AWS_SECRET_ACCESS_KEY": "secret",
+            "FSSPEC_S3": json.dumps({"config_kwargs": {"s3": {"addressing_style": "virtual"}}}),
+        },
     )
     assert env == {
         "SCCACHE_BUCKET": "marin-us-east-02a",
@@ -899,3 +905,58 @@ def test_capability_transport_never_logs_url_and_sanitizes_errors(monkeypatch, c
     assert "sensitive-token" not in str(raised.value)
     assert address not in str(raised.value)
     assert "sensitive-token" not in caplog.text
+
+
+def test_compiler_cache_keeps_path_style_and_rejects_secret_endpoints():
+    env = compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "http://127.0.0.1:9000"})
+    assert env["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] == "false"
+    assert compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "https://cwobject.com"})[
+        "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"
+    ] == "true"
+    with pytest.raises(ValueError):
+        compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "https://user:secret@host"})
+
+
+@pytest.mark.parametrize("scheme", ["s3", "gs"])
+def test_worker_cache_uses_pinned_binary_private_uds_and_routed_settings(tmp_path, monkeypatch, scheme):
+    from ports.buildomatic.backends import iris as backend
+
+    config_module = ModuleType("rigging.filesystem.cluster_config")
+    config_module.StoreType = SimpleNamespace(COREWEAVE="coreweave")
+    spec = SimpleNamespace(store="coreweave", signing_region="US-EAST-02A")
+    config_module.data_buckets = lambda: {"bucket": spec}
+    config_module.marin_temp_bucket = lambda days, prefix: f"{scheme}://bucket/tmp/ttl={days}d/{prefix}"
+    compat = ModuleType("rigging.filesystem.s3_compat")
+    configured = []
+    compat.configure_coreweave_s3 = lambda: configured.append(True)
+    compat.s3_endpoint = lambda store: "http://lota.local"
+    compat.fsspec_s3_conf = lambda endpoint: {"config_kwargs": {"s3": {"addressing_style": "path"}}}
+    monkeypatch.setitem(sys.modules, config_module.__name__, config_module)
+    monkeypatch.setitem(sys.modules, compat.__name__, compat)
+    binary = tmp_path / "sccache"
+    binary.write_bytes(b"wrong binary")
+    monkeypatch.setattr(backend.shutil, "which", lambda name: str(binary))
+    with pytest.raises(RuntimeError):
+        _worker_environment(IrisConfig("cache", compiler_cache=True))
+    # Admission success is tested with its exact preverified fingerprint; the
+    # real official binary/cache behavior is separately proven by acceptance.
+    monkeypatch.setattr(
+        backend.hashlib,
+        "sha256",
+        lambda: SimpleNamespace(
+            update=lambda data: None,
+            hexdigest=lambda: "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+        ),
+    )
+    env = _worker_environment(IrisConfig("cache", compiler_cache=True))
+    assert env["SCCACHE_SERVER_UDS"] == "/app/.buildomatic/sccache.sock"
+    assert env["SCCACHE_IDLE_TIMEOUT"] == "0"
+    assert "SCCACHE_SERVER_PORT" not in env
+    assert not any(name.startswith("AWS_") for name in env)
+    if scheme == "s3":
+        assert env["SCCACHE_REGION"] == "US-EAST-02A"
+        assert env["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] == "false"
+        assert configured
+    else:
+        assert env["SCCACHE_GCS_RW_MODE"] == "READ_WRITE"
+        assert not configured
