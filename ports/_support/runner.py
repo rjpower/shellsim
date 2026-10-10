@@ -15,6 +15,7 @@ import sys
 import tempfile
 from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -385,6 +386,38 @@ def build_graph(
                         executable_flags=build_cohort.executable_flags,
                         shared_library_inputs=(build_cohort.compiler_runtime_archive,),
                     )
+                    if adapter in {"python-extension", "python-meson"}:
+                        python = cohort.python
+                        if python is None:
+                            raise ValueError("Python extension requires admitted CPython headers and runtime")
+                        python_context = CPythonBuildContext(
+                            python.source_root / "Include",
+                            python.generated_config_dir,
+                            python.version,
+                            python.dynamic_abi,
+                            python.runtime_target,
+                            python.wheel_platform,
+                            {
+                                "source": python.source_sha256,
+                                "headers": python.headers_sha256,
+                                "pyconfig": python.pyconfig_sha256,
+                                "runtime": python.runtime_manifest_sha256,
+                            },
+                        )
+                        if adapter == "python-meson":
+                            from ports._support.python_meson import (
+                                PythonMesonBuildRequest,
+                                build_python_meson,
+                                python_meson_driver_inputs,
+                            )
+
+                            host_packages = {}
+                            for item in build.get("host_header_packages", {}).values():
+                                tool = cohort.host_tools[item["tool"]]
+                                if tool.receipt_path is None:
+                                    raise ValueError("Python Meson host headers require a complete package receipt")
+                                proof = json.loads(tool.receipt_path.read_text())
+                                host_packages[item["tool"]] = (tool.receipt_path.parent / proof["root"]).resolve()
                     if adapter in {"meson", "python-meson"} and workspaces and port.reference in workspaces:
                         from ports._support.meson_workspace import retained_meson
 
@@ -396,6 +429,7 @@ def build_graph(
                             name: build[name]
                             for name in (
                                 "configure_args",
+                                "configure_environment",
                                 "cross_properties",
                                 "dependency_properties",
                                 "host_header_packages",
@@ -432,37 +466,32 @@ def build_graph(
                                 "pyconfig": cohort.python.pyconfig_sha256,
                             }
                         context = workspace_stack.enter_context(
-                            retained_meson(context, workspaces[port.reference], compilation, product_inputs, host_code)
+                            retained_meson(
+                                context,
+                                workspaces[port.reference],
+                                compilation,
+                                product_inputs,
+                                host_code,
+                                driver_inputs=(
+                                    partial(
+                                        python_meson_driver_inputs,
+                                        cpython=python_context,
+                                        recipe=recipe,
+                                        host_packages=host_packages,
+                                    )
+                                )
+                                if adapter == "python-meson"
+                                else None,
+                            )
+                        )
+                        # The sealed result inventories this exact compilation receipt.
+                        shutil.copyfile(
+                            context.build.parent / ".meson-workspace.json",
+                            slot.result / "meson-workspace-receipt.json",
                         )
                     _hooks(port, "before_build", context, cohort)
                     if build["adapter"] in {"python-extension", "python-meson"}:
-                        python = cohort.python
-                        if python is None:
-                            raise ValueError("Python extension requires admitted CPython headers and runtime")
-                        python_context = CPythonBuildContext(
-                            python.source_root / "Include",
-                            python.generated_config_dir,
-                            python.version,
-                            python.dynamic_abi,
-                            python.runtime_target,
-                            python.wheel_platform,
-                            {
-                                "source": python.source_sha256,
-                                "headers": python.headers_sha256,
-                                "pyconfig": python.pyconfig_sha256,
-                                "runtime": python.runtime_manifest_sha256,
-                            },
-                        )
                         if adapter == "python-meson":
-                            from ports._support.python_meson import PythonMesonBuildRequest, build_python_meson
-
-                            host_packages = {}
-                            for item in build.get("host_header_packages", {}).values():
-                                tool = cohort.host_tools[item["tool"]]
-                                if tool.receipt_path is None:
-                                    raise ValueError("Python Meson host headers require a complete package receipt")
-                                proof = json.loads(tool.receipt_path.read_text())
-                                host_packages[item["tool"]] = (tool.receipt_path.parent / proof["root"]).resolve()
                             output = build_python_meson(
                                 PythonMesonBuildRequest(context, python_context, recipe, host_packages)
                             )

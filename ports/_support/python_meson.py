@@ -23,6 +23,7 @@ from ports._support.native_adapters import (
     NativeBuildContext,
     NativeBuildRequest,
     build_native,
+    compilation_driver_inputs,
     write_build_file,
 )
 from ports._support.python_adapters import CPythonBuildContext, PythonBuildOutput, _source_file, _wheel
@@ -127,7 +128,8 @@ def stage_install_plan(plan: Mapping, source: Path, build: Path, wheel: Path, ta
     return extensions
 
 
-def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Path:
+def target_pkg_config_text(request: PythonMesonBuildRequest) -> str:
+    """Generate the target-only pkg-config launcher bound by retained builds."""
     context, python = request.context, request.cpython
     providers = {
         "python-3.13": ("3.13", [str(python.include_dir), str(python.generated_config_dir)]),
@@ -141,9 +143,7 @@ def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Pat
         if not include.resolve().is_relative_to(root.resolve()) or not include.is_dir():
             raise ValueError("host header package escapes admitted receipt")
         providers[name] = (spec["version"], [str(include)])
-    wrapper = directory / "target-pkg-config"
-    write_build_file(
-        wrapper,
+    return (
         "#!"
         + str(context.host_tools["python"])
         + "\nimport os, shlex, sys\n"
@@ -165,10 +165,30 @@ def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Pat
         + repr(str(context.host_tools["pkg-config"]))
         + ", ["
         + repr(str(context.host_tools["pkg-config"]))
-        + "] + arguments)\n",
+        + "] + arguments)\n"
     )
+
+
+def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Path:
+    wrapper = directory / "target-pkg-config"
+    write_build_file(wrapper, target_pkg_config_text(request))
     wrapper.chmod(0o755)
     return wrapper
+
+
+def python_meson_driver_inputs(
+    context: NativeBuildContext,
+    *,
+    cpython: CPythonBuildContext,
+    recipe: Mapping,
+    host_packages: Mapping[str, Path],
+) -> dict:
+    """Bind the effective native driver after target Python tool substitution."""
+    request = PythonMesonBuildRequest(context, cpython, recipe, host_packages)
+    tools = {**context.host_tools, "pkg-config": context.build / "target-pkg-config"}
+    inputs = compilation_driver_inputs(replace(context, host_tools=tools), {})
+    inputs["target_pkg_config"] = target_pkg_config_text(request)
+    return inputs
 
 
 def stage_development_exports(wheel: Path, staging: Path, exports: list[Mapping]) -> None:

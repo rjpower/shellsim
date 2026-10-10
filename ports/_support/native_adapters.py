@@ -79,17 +79,93 @@ class NativeBuildOutput:
     install_prefix: PurePosixPath
 
 
+def compiler_wrapper_text(context: NativeBuildContext, role: str, response_source: str) -> str:
+    """Generate the exact compiler driver consumed by every native adapter."""
+    python = context.host_tools["python"]
+    base = [str(context.target_tools[role]), *context.compiler_flags]
+    return (
+        "#!"
+        + str(python)
+        + "\n"
+        + response_source
+        + "\nimport os, sys\n"
+        + "command = "
+        + repr(base)
+        + "\narguments = sys.argv[1:]\n"
+        + "options = response_arguments(arguments, Path.cwd())\n"
+        + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
+        + 'is_shared = is_link and "-shared" in options\n'
+        + "if is_link:\n"
+        + "    command += "
+        + repr(list(context.linker_flags))
+        + "\n"
+        + "if is_shared:\n"
+        + "    command += "
+        + repr(list(context.shared_library_flags))
+        + "\n"
+        + "elif is_link:\n"
+        + "    command += "
+        + repr(list(context.executable_flags))
+        + "\n"
+        + "os.execv(command[0], command + arguments + ("
+        + repr([str(path) for path in context.shared_library_inputs])
+        + " if is_shared else []))\n"
+    )
+
+
+def build_environment(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict[str, str]:
+    """Construct the effective build environment without ambient search overrides."""
+    import os
+    import shlex
+
+    environment = {"SOURCE_DATE_EPOCH": "1756857600", "LC_ALL": "C"}
+    environment.update(
+        {
+            "PYTHONDONTWRITEBYTECODE": "1",
+            # Upstream VCS probes may inspect an admitted package-local checkout,
+            # but must not discover the repository containing extracted sources.
+            "GIT_CEILING_DIRECTORIES": os.pathsep.join(sorted({str(context.source.parent), str(context.build.parent)})),
+            "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
+            "CC": shlex.quote(str(context.build / "adapter-tools/cc")),
+            "CXX": shlex.quote(str(context.build / "adapter-tools/cxx")),
+            "AR": str(context.target_tools["ar"]),
+            "RANLIB": str(context.target_tools["ranlib"]),
+            "CHOST": context.target,
+            "DESTDIR": str(context.staging_prefix),
+            "PKG_CONFIG": str(context.host_tools["pkg-config"]),
+            "PKG_CONFIG_PATH": "",
+            "PKG_CONFIG_LIBDIR": os.pathsep.join(
+                str(context.dependency_sysroot / directory)
+                for directory in ("usr/local/lib/pkgconfig", "usr/local/share/pkgconfig")
+            ),
+            "PKG_CONFIG_SYSROOT_DIR": str(context.dependency_sysroot),
+        }
+    )
+    environment.update(configure_environment)
+    return environment
+
+
+def compilation_driver_inputs(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict:
+    """Bind generated drivers and effective compilation settings to retained state."""
+    response_source = Path(__file__).with_name("compiler_response.py").read_text()
+    environment = build_environment(context, configure_environment)
+    # DESTDIR is consumed only during installation. All other environment values
+    # remain exact, including any paths embedded in configure bindings.
+    del environment["DESTDIR"]
+    return {
+        "wrappers": {role: compiler_wrapper_text(context, role, response_source) for role in ("cc", "cxx")},
+        "environment": environment,
+        "configure_environment": dict(configure_environment),
+    }
+
+
 def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     """Run one admitted cross-build without publishing or sealing its output."""
     import json
-    import os
     import re
-    import shlex
     import subprocess
     import sys
     import time
-
-    from ports.native.dependencies import target_environment
 
     context = request.context
     if not isinstance(request.adapter, NativeAdapter):
@@ -169,67 +245,14 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     context.staging_prefix.mkdir(parents=True, exist_ok=True)
     tools = context.build / "adapter-tools"
     tools.mkdir(exist_ok=context.retained_workspace)
+    response_source = Path(__file__).with_name("compiler_response.py").read_text()
     wrappers = {}
     for role in ("cc", "cxx"):
         wrapper = tools / role
-        base = [str(context.target_tools[role]), *context.compiler_flags]
-        write_build_file(
-            wrapper,
-            "#!"
-            + str(python)
-            + "\n"
-            + Path(__file__).with_name("compiler_response.py").read_text()
-            + "\nimport os, sys\n"
-            + "command = "
-            + repr(base)
-            + "\narguments = sys.argv[1:]\n"
-            + "options = response_arguments(arguments, Path.cwd())\n"
-            + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
-            + 'is_shared = is_link and "-shared" in options\n'
-            + "if is_link:\n"
-            + "    command += "
-            + repr(list(context.linker_flags))
-            + "\n"
-            + "if is_shared:\n"
-            + "    command += "
-            + repr(list(context.shared_library_flags))
-            + "\n"
-            + "elif is_link:\n"
-            + "    command += "
-            + repr(list(context.executable_flags))
-            + "\n"
-            + "os.execv(command[0], command + arguments + ("
-            + repr([str(path) for path in context.shared_library_inputs])
-            + " if is_shared else []))\n",
-        )
+        write_build_file(wrapper, compiler_wrapper_text(context, role, response_source))
         wrapper.chmod(0o755)
         wrappers[role] = wrapper
-    environment = target_environment(context.sdk)
-    environment.update(
-        {
-            "PYTHONDONTWRITEBYTECODE": "1",
-            # Upstream VCS probes may inspect an admitted package-local checkout,
-            # but must not discover the repository containing extracted sources.
-            "GIT_CEILING_DIRECTORIES": os.pathsep.join(
-                sorted({str(context.source.parent.resolve()), str(context.build.parent.resolve())})
-            ),
-            "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
-            "CC": shlex.quote(str(wrappers["cc"])),
-            "CXX": shlex.quote(str(wrappers["cxx"])),
-            "AR": str(context.target_tools["ar"]),
-            "RANLIB": str(context.target_tools["ranlib"]),
-            "CHOST": context.target,
-            "DESTDIR": str(context.staging_prefix),
-            "PKG_CONFIG": str(context.host_tools["pkg-config"]),
-            "PKG_CONFIG_PATH": "",
-            "PKG_CONFIG_LIBDIR": os.pathsep.join(
-                str(context.dependency_sysroot / directory)
-                for directory in ("usr/local/lib/pkgconfig", "usr/local/share/pkgconfig")
-            ),
-            "PKG_CONFIG_SYSROOT_DIR": str(context.dependency_sysroot),
-        }
-    )
-    environment.update(request.configure_environment)
+    environment = build_environment(context, request.configure_environment)
     commands = []
 
     def run(argv, directory):

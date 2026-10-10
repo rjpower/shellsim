@@ -14,8 +14,9 @@ import sys
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
-from typing import Iterator, Mapping
+from typing import Callable, Iterator, Mapping
 
+from ports._support import native_adapters
 from ports._support.native_adapters import NativeBuildContext
 from ports._support.store import file_hash, identity
 
@@ -48,6 +49,8 @@ def retained_meson(
     configuration: Mapping,
     products: Mapping,
     host_tools: Mapping,
+    *,
+    driver_inputs: Callable[[NativeBuildContext], Mapping] | None = None,
 ) -> Iterator[NativeBuildContext]:
     """Lock and admit an explicit Ninja tree, preserving stable input paths.
 
@@ -76,6 +79,11 @@ def retained_meson(
             linker_flags=tuple(flag.replace(old_prefix, str(dependencies)) for flag in context.linker_flags),
         )
         inputs = {
+            "driver": (
+                driver_inputs(stable)
+                if driver_inputs is not None
+                else native_adapters.compilation_driver_inputs(stable, configuration.get("configure_environment", {}))
+            ),
             "source": _inventory(context.source),
             "dependencies": _inventory(context.dependency_sysroot),
             "configuration": dict(configuration),
@@ -99,7 +107,7 @@ def retained_meson(
             if receipt.stat().st_size > 32 * 1024**2:
                 raise ValueError("retained Meson receipt exceeds its bound")
             recorded = json.loads(receipt.read_text())
-            if recorded != {"schema_version": 1, "inputs": inputs, "identity": identity(inputs)}:
+            if recorded != {"schema_version": 2, "inputs": inputs, "identity": identity(inputs)}:
                 print("ports: Meson workspace rejected: compilation inputs differ", file=sys.stderr, flush=True)
                 raise ValueError("retained Meson compilation inputs differ")
             if _inventory(source) != inputs["source"] or _inventory(dependencies) != inputs["dependencies"]:
@@ -111,7 +119,7 @@ def retained_meson(
             shutil.copytree(context.source, source)
             shutil.copytree(context.dependency_sysroot, dependencies)
             receipt.write_text(
-                json.dumps({"schema_version": 1, "inputs": inputs, "identity": identity(inputs)}, sort_keys=True) + "\n"
+                json.dumps({"schema_version": 2, "inputs": inputs, "identity": identity(inputs)}, sort_keys=True) + "\n"
             )
             print(f"ports: Meson workspace initialized: {ninja_directory}", file=sys.stderr, flush=True)
         yield stable

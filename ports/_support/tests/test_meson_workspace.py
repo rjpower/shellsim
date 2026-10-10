@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from ports._support import native_adapters
 from ports._support.meson_workspace import retained_meson
 from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
 from ports._support.store import file_hash
@@ -90,6 +91,66 @@ def test_real_build_reuses_objects_when_only_packaging_changes(meson_project):
         with retained_meson(second, ninja, {}, products, tools):
             pytest.fail("changed compilation input was reused")
     assert (object_file.read_bytes(), object_file.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("change", ["cc-wrapper", "cxx-wrapper", "environment"])
+def test_changed_driver_rejects_stale_objects_and_changes_fresh_output(meson_project, monkeypatch, change):
+    context, ninja, products, tools = meson_project
+    cxx = change == "cxx-wrapper"
+    filename = "value.cpp" if cxx else "value.c"
+    if cxx:
+        project = context.source / "meson.build"
+        project.write_text(project.read_text().replace("'c'", "'cpp'").replace("value.c", filename))
+    (context.source / filename).write_text(
+        '#include "generated.h"\n#ifndef BIAS\n#define BIAS 0\n#endif\nint value(void) { return VALUE + BIAS; }\n'
+    )
+
+    def observed_value(staging):
+        main = staging.parent / ("main.cpp" if cxx else "main.c")
+        main.write_text("int value(void); int main(void) { return value(); }\n")
+        executable = staging.parent / (staging.name + "-value")
+        subprocess.run(
+            [
+                context.target_tools["cxx" if cxx else "cc"],
+                main,
+                staging / "usr/local/lib/libvalue.a",
+                "-o",
+                executable,
+            ],
+            check=True,
+        )
+        return subprocess.run([executable], check=False).returncode
+
+    with retained_meson(context, ninja, {}, products, tools) as admitted:
+        build_native(NativeBuildRequest(NativeAdapter.MESON, admitted, meson_install_tags=("devel",)))
+    assert observed_value(context.staging_prefix) == 19
+    object_file = next(ninja.rglob("*.o"))
+    before = object_file.read_bytes(), object_file.stat().st_mtime_ns
+    if change == "environment":
+        original = native_adapters.build_environment
+
+        def changed_environment(context, bindings):
+            return {**original(context, bindings), "CFLAGS": "-DBIAS=7"}
+
+        monkeypatch.setattr(native_adapters, "build_environment", changed_environment)
+    else:
+        original = native_adapters.compiler_wrapper_text
+
+        def changed_wrapper(context, role, response_source):
+            if role == ("cxx" if cxx else "cc"):
+                context = replace(context, compiler_flags=(*context.compiler_flags, "-DBIAS=7"))
+            return original(context, role, response_source)
+
+        monkeypatch.setattr(native_adapters, "compiler_wrapper_text", changed_wrapper)
+    second = replace(context, staging_prefix=context.staging_prefix.parent / "changed-stage")
+    with pytest.raises(ValueError, match="compilation inputs"):
+        with retained_meson(second, ninja, {}, products, tools):
+            pytest.fail("changed compiler behavior reused old objects")
+    assert (object_file.read_bytes(), object_file.stat().st_mtime_ns) == before
+    fresh = ninja.parents[2] / "fresh/build/meson-build"
+    with retained_meson(second, fresh, {}, products, tools) as admitted:
+        build_native(NativeBuildRequest(NativeAdapter.MESON, admitted, meson_install_tags=("devel",)))
+    assert observed_value(second.staging_prefix) == 26
 
 
 def test_unrecorded_existing_tree_is_not_adopted(meson_project):
