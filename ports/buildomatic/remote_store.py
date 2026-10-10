@@ -67,18 +67,28 @@ class RemoteStore:
         return f"{self.journal_prefix}/journals/{key}"
 
     def put_blob(self, data: bytes) -> str:
-        """Publish immutable SHA256 bytes; validate an existing concurrent winner."""
+        """Verify remote bytes before uploading; recheck a concurrent winner.
+
+        A worker-local hit cannot prove an object still exists remotely after
+        cache eviction, so publication always reads the remote namespace.
+        """
         from rigging.filesystem.conditional_object import ConditionalWriteError
 
         if len(data) > MAX_METADATA_BYTES:
             raise ValueError("blob exceeds the supported storage bound")
         digest = hashlib.sha256(data).hexdigest()
-        obj = _conditional(f"{self.prefix}/blobs/{digest}")
         try:
-            obj.write(data, expected_version=None)
-        except ConditionalWriteError:
-            if self._get_remote_blob(digest) != data:
-                raise ValueError("content-addressed blob is missing or corrupt") from None
+            existing = self._get_remote_blob(digest)
+        except FileNotFoundError:
+            obj = _conditional(f"{self.prefix}/blobs/{digest}")
+            try:
+                obj.write(data, expected_version=None)
+            except ConditionalWriteError:
+                existing = self._get_remote_blob(digest)
+            else:
+                existing = data
+        if existing != data:
+            raise ValueError("content-addressed blob is missing or corrupt")
         if self._local_cache is not None:
             self._local_cache.put_blob(data)
         return digest
