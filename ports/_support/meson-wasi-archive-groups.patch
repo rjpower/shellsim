@@ -1,11 +1,40 @@
 --- a/mesonbuild/compilers/mixins/clike.py
 +++ b/mesonbuild/compilers/mixins/clike.py
-@@ -73,7 +73,7 @@
-         # This covers all ld.bfd, ld.gold, ld.gold, and xild on Linux, which
-         # all act like (or are) gnu ld
-         # TODO: this could probably be added to the DynamicLinker instead
+@@ -76 +76 @@
 -        if isinstance(self.compiler.linker, (GnuLikeDynamicLinkerMixin, SolarisDynamicLinker, CompCertDynamicLinker)):
 +        if self.compiler.info.system != 'wasi' and isinstance(self.compiler.linker, (GnuLikeDynamicLinkerMixin, SolarisDynamicLinker, CompCertDynamicLinker)):
-             group_start = -1
-             group_end = -1
-             for i, each in enumerate(new):
+--- a/mesonbuild/compilers/compilers.py
++++ b/mesonbuild/compilers/compilers.py
+@@ -1303 +1303 @@
+-                       disable_cache: bool = False) -> T.Iterator[CompileResult]:
++                       disable_cache: bool = False, link_check: bool = False) -> T.Iterator[CompileResult]:
+@@ -1309,0 +1310,5 @@
++        if link_check and self.info.system == 'wasi' and any(arg.endswith('.so') for arg in args):
++            # A Wasm side module requires a PIC link. This is a link check,
++            # not an executable test; reject missing symbols rather than
++            # importing arbitrary unresolved functions into the probe.
++            args += ['-shared', '-nostdlib', '-Wl,--unresolved-symbols=report-all']
+@@ -1339,5 +1344,6 @@
+-                return self.compiles(objfile, env, extra_args=extra_args,
+-                                     dependencies=dependencies, mode=CompileCheckMode.LINK, disable_cache=True)
+-
+-        return self.compiles(code, env, extra_args=extra_args,
+-                             dependencies=dependencies, mode=CompileCheckMode.LINK, disable_cache=disable_cache)
++                return self.links(objfile, env, extra_args=extra_args,
++                                  dependencies=dependencies, disable_cache=True)
++
++        with self._build_wrapper(code, env, extra_args, dependencies, CompileCheckMode.LINK,
++                                 disable_cache=disable_cache, link_check=True) as p:
++            return p.returncode == 0, p.cached
+--- a/mesonbuild/dependencies/blas_lapack.py
++++ b/mesonbuild/dependencies/blas_lapack.py
+@@ -366,0 +367,9 @@
++        if self.clib_compiler.info.system == 'wasi':
++            # Test symbol existence without claiming an unknown callable ABI.
++            # Volatile address references survive optimization and still fail
++            # the link if a symbol is absent from the supplied provider.
++            prototypes += "".join(
++                f"void (*volatile meson_symbol_{index})(void) = &{symbol}{suffix};\n"
++                for index, symbol in enumerate(symbols))
++            calls = "  ".join(f"if (meson_symbol_{index} == 0) return 1;\n"
++                               for index in range(len(symbols)))

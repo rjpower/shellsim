@@ -10,12 +10,16 @@
     },
     "patch": {
       "file": "meson-wasi-archive-groups.patch",
-      "sha256": "84a9d8c24b3c022007628e6b1a1b8cbfa0d4ad256796b18c92539c329d6aeb84",
+      "sha256": "e358adf27af59ab0a097dfcfff77428baa2402cb7e22961df47e2732fcdb5d68",
       "inputs": {
-        "mesonbuild/compilers/mixins/clike.py": "bad399a400bba40f0d95240b683aa4426fb0d66fbbae3b7b84cf1791d6260dab"
+        "mesonbuild/compilers/mixins/clike.py": "bad399a400bba40f0d95240b683aa4426fb0d66fbbae3b7b84cf1791d6260dab",
+        "mesonbuild/compilers/compilers.py": "73d23c1cfada52d7342490fa03492f1aa02b398ec0d38e5bc0e31fe28aa104bc",
+        "mesonbuild/dependencies/blas_lapack.py": "bc753dbc839b6a02b36974dffcd3433bd0d2f3e17b10b62a03cd23b943529cc9"
       },
       "outputs": {
-        "mesonbuild/compilers/mixins/clike.py": "2b75c602d6b76a8979034dc0a2f796a1cf494029c5442923e738fb916003154a"
+        "mesonbuild/compilers/mixins/clike.py": "2b75c602d6b76a8979034dc0a2f796a1cf494029c5442923e738fb916003154a",
+        "mesonbuild/compilers/compilers.py": "cba4a9523f9284ed34a5e196c45af4e16bb4e38e6618355966bf86b18c38579d",
+        "mesonbuild/dependencies/blas_lapack.py": "9b9ca679f0b89bb5c36fc9e3c5d194c40c6fd8b9dff9a25f32fc92839d4b84f3"
       }
     },
     "kind": "numpy-vendored-meson"
