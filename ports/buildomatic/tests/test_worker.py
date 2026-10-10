@@ -281,6 +281,35 @@ def test_log_disk_and_entry_bounds(worker, store, code, limits):
     assert complete(bounded, item).state == AttemptState.FAILED
 
 
+def test_supervisor_drains_log_without_scanning_each_poll(tmp_path, monkeypatch):
+    import ports.buildomatic._runner as runner
+
+    directory = tmp_path / "attempt"
+    work = directory / "work"
+    for name in ("inputs", "output", "tmp"):
+        (work / name).mkdir(parents=True)
+    item = attempt("import sys; sys.stdout.write('x'*300000)")
+    atomic_write(directory / "plan.json", encode({"attempt": asdict(item), "limits": asdict(ResourceLimits())}))
+    monkeypatch.setenv("PYTHONPATH", str(Path(runner.__file__).resolve().parents[2]))
+    # Frozen supervisor time makes the scan cadence independent of host load.
+    # Multiple bounded log reads still require multiple selector iterations.
+    monkeypatch.setattr(runner.time, "monotonic", lambda: 0.0)
+    usage = runner.tree_usage
+    scans = []
+
+    def count_scan(*args, **kwargs):
+        scans.append(args)
+        return usage(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "tree_usage", count_scan)
+    runner.run(directory)
+    status = json.loads((directory / "status.json").read_bytes())
+    assert status["returncode"] == 0
+    assert status["error"] is None
+    assert (directory / "log").stat().st_size == 300000
+    assert len(scans) == 2  # Initial accounting and mandatory final accounting.
+
+
 def test_timeout_is_terminal_failure_and_retained(worker):
     item = attempt("import signal; signal.pause()", timeout_seconds=0.05)
     worker.submit(item)

@@ -96,6 +96,7 @@ def run(directory: Path) -> None:
                 os.close(gate_read)
                 os.close(gate_write)
             started = time.monotonic()
+            next_usage_check = started
             log_size = 0
             selector = selectors.DefaultSelector()
             with selector, (directory / "log").open("wb") as log:
@@ -104,14 +105,19 @@ def run(directory: Path) -> None:
                     if (directory / "cancelled").exists():
                         result["cancelled"] = True
                         break
-                    if time.monotonic() - started >= action["timeout_seconds"]:
+                    now = time.monotonic()
+                    if now - started >= action["timeout_seconds"]:
                         result["error"] = "action timed out"
                         break
-                    try:
-                        tree_usage(workspace, limits["max_files"], limits["output_bytes"], skip_inputs=True)
-                    except ValueError as error:
-                        result["error"] = str(error)
-                        break
+                    if now >= next_usage_check:
+                        try:
+                            tree_usage(workspace, limits["max_files"], limits["output_bytes"], skip_inputs=True)
+                        except ValueError as error:
+                            result["error"] = str(error)
+                            break
+                        # Recursive scans must not throttle log draining. File
+                        # rlimits remain immediate; final accounting is mandatory.
+                        next_usage_check = now + 1.0
                     for key, _ in selector.select(timeout=0.05):
                         data = os.read(key.fileobj.fileno(), min(65536, limits["log_bytes"] - log_size + 1))
                         if not data:
