@@ -170,7 +170,13 @@ def plan(root: Path, requests: Sequence[str], *, target_profile: str | None = No
             if previous != dependency.recipe:
                 raise ValueError("conflicting recipe variants in dependency chain: " + " -> ".join(active))
             provider = visit(dependency.recipe)
-            if (dependency.kind == "build") != (provider.role == "host-tool"):
+            universal = provider.recipe.get("build", {}).get("adapter") == "pure-wheel"
+            host_data = provider.recipe.get("build", {}).get("adapter") == "host-wheel"
+            if (dependency.kind == "build" and provider.role != "host-tool" and not universal) or (
+                dependency.kind != "build"
+                and provider.role == "host-tool"
+                and not (host_data and port.recipe.get("build", {}).get("adapter") == "pure-wheel")
+            ):
                 raise ValueError("dependency role differs: " + " -> ".join([*active, dependency.recipe]))
             if (dependency.kind == "platform") != (provider.role == "target-platform"):
                 raise ValueError("platform dependency role differs: " + " -> ".join([*active, dependency.recipe]))
@@ -183,4 +189,20 @@ def plan(root: Path, requests: Sequence[str], *, target_profile: str | None = No
 
     for reference in roots:
         visit(reference)
-    return Graph(roots, tuple(ordered))
+    graph = Graph(roots, tuple(ordered))
+    if any(port.recipe.get("build", {}).get("adapter") == "host-wheel" for port in guest_graph(graph).ports):
+        raise ValueError("host wheels cannot be guest roots or dependencies")
+    return graph
+
+
+def guest_graph(graph: Graph) -> Graph:
+    """Select guest roots and their target/runtime closure, excluding build inputs."""
+    ports = {port.reference: port for port in graph.ports}
+    selected = set(graph.roots)
+    pending = list(graph.roots)
+    while pending:
+        for dependency in ports[pending.pop()].dependencies:
+            if dependency.kind in {"target", "runtime"} and dependency.recipe not in selected:
+                selected.add(dependency.recipe)
+                pending.append(dependency.recipe)
+    return Graph(graph.roots, tuple(port for port in graph.ports if port.reference in selected))

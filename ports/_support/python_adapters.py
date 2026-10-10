@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from ports._support.native_adapters import NativeBuildCommand, NativeBuildContext
-from ports._support.pure_wheel import verified_files
+from ports._support.pure_wheel import verified_files, verified_host_files
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
 from ports.native.dependencies import target_environment
@@ -87,6 +87,18 @@ def build_pure_wheel(request: PureWheelBuildRequest) -> PythonBuildOutput:
     if output.exists() or output.is_symlink():
         raise ValueError("pure wheel staging path already exists")
     output.write_bytes(data)
+    return PythonBuildOutput(request.staging_prefix, ())
+
+
+def build_host_wheel(request: PureWheelBuildRequest) -> PythonBuildOutput:
+    """Stage an unchanged universal wheel admitted only for host build use."""
+    if request.source.is_symlink() or request.source.stat().st_size > _MAX_PURE_WHEEL:
+        raise ValueError("host wheel source exceeds its bound")
+    data = request.source.read_bytes()
+    verified_host_files(request.source, dict(request.recipe), source=data)
+    wheels = request.staging_prefix / "wheels"
+    wheels.mkdir(parents=True)
+    (wheels / request.source.name).write_bytes(data)
     return PythonBuildOutput(request.staging_prefix, ())
 
 

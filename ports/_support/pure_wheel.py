@@ -9,6 +9,17 @@ from pathlib import Path, PurePosixPath
 
 def verified_files(wheel: Path, recipe: dict, *, source: bytes | None = None) -> dict[str, bytes]:
     """Reject altered sources, unsafe members and native content before building."""
+    return _verified_files(wheel, recipe, source=source, host_data=False)
+
+
+def verified_host_files(wheel: Path, recipe: dict, *, source: bytes | None = None) -> dict[str, bytes]:
+    """Admit unchanged host-only universal wheels, including inert launcher data."""
+    if recipe.get("role") != "host-tool" or recipe["build"]["adapter"] != "host-wheel":
+        raise ValueError("host wheel requires an explicit host-only recipe")
+    return _verified_files(wheel, recipe, source=source, host_data=True)
+
+
+def _verified_files(wheel: Path, recipe: dict, *, source: bytes | None, host_data: bool) -> dict[str, bytes]:
     if source is None:
         if wheel.stat().st_size > 64 * 1024**2:
             raise ValueError("pure wheel exceeds build bounds")
@@ -32,8 +43,9 @@ def verified_files(wheel: Path, recipe: dict, *, source: bytes | None = None) ->
             ):
                 raise ValueError("unsafe or duplicate wheel member")
             data = archive.read(info)
-            if path.suffix.lower() in {".so", ".pyd", ".dll", ".dylib", ".a", ".wasm"} or data.startswith(
-                (b"\0asm", b"\x7fELF", b"MZ")
+            if not host_data and (
+                path.suffix.lower() in {".so", ".pyd", ".dll", ".dylib", ".a", ".wasm"}
+                or data.startswith((b"\0asm", b"\x7fELF", b"MZ"))
             ):
                 raise ValueError("pure wheel contains native code")
             files[info.filename] = data

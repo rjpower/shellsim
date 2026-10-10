@@ -1,0 +1,44 @@
+{
+  "name": "setuptools-scm",
+  "version": "8.3.1",
+  "role": "target-library",
+  "build": {
+    "adapter": "pure-wheel"
+  },
+  "source": {
+    "filename": "setuptools_scm-8.3.1-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/ab/ac/8f96ba9b4cfe3e4ea201f23f4f97165862395e9331a424ed325ae37024a8/setuptools_scm-8.3.1-py3-none-any.whl",
+    "sha256": "332ca0d43791b818b841213e76b1971b7711a960761c5bea5fc5cdb5196fbce3"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [
+    "packaging>=20",
+    "setuptools",
+    "tomli>=1; python_version < \"3.11\"",
+    "typing-extensions; python_version < \"3.10\"",
+    "importlib-metadata>=4.6; python_version < \"3.10\"",
+    "entangled-cli~=2.0; extra == \"docs\"",
+    "mkdocs; extra == \"docs\"",
+    "mkdocs-entangled-plugin; extra == \"docs\"",
+    "mkdocs-include-markdown-plugin; extra == \"docs\"",
+    "mkdocs-material; extra == \"docs\"",
+    "mkdocstrings[python]; extra == \"docs\"",
+    "pygments; extra == \"docs\"",
+    "rich; extra == \"rich\"",
+    "build; extra == \"test\"",
+    "pytest; extra == \"test\"",
+    "rich; extra == \"test\"",
+    "typing-extensions; python_version < \"3.11\" and extra == \"test\"",
+    "wheel; extra == \"test\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ]
+}

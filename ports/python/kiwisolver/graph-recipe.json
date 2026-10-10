@@ -1,0 +1,62 @@
+{
+  "name": "kiwisolver",
+  "version": "1.5.1",
+  "role": "target-library",
+  "kind": "python-project",
+  "target": "wasm32-wasip1-threads",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "requires_python": ">=3.10",
+  "requires_dist": [],
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/ba/07/bd78e6a8fae171ea041ef5bba3ed21a003522fa088834b069b1909981f30/kiwisolver-1.5.1.tar.gz",
+    "sha256": "f1303ef2eec81262a4b708c3e858afe58d7c75ad91c1c05266eda7673369859a",
+    "subdirectory": "kiwisolver-1.5.1"
+  },
+  "patches": [
+    {
+      "file": "pycfunction-abi.patch",
+      "sha256": "981fcc8cc526c4d9adc8fab5959f1cebde1ccde0aa67f9e59fef2304140b790d"
+    }
+  ],
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "recipe": "toolchain/llvm/host-recipe.json",
+      "version": "23.0.0"
+    },
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/setuptools-scm",
+      "version": "8.3.1"
+    },
+    {
+      "port": "python/cppy",
+      "version": "1.3.1"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json",
+      "version": "3"
+    }
+  ],
+  "build": {
+    "adapter": "python-pep517"
+  },
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 1073741824,
+    "disk": 536870912
+  },
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ]
+}

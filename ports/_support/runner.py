@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ports._support.build import apply_patch
-from ports._support.graph import Graph, Port, plan
+from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.native_adapters import (
     NativeAdapter,
     NativeBuildContext,
@@ -33,6 +33,7 @@ from ports._support.python_adapters import (
     ExtensionBuildRequest,
     PureWheelBuildRequest,
     build_extension,
+    build_host_wheel,
     build_pure_wheel,
 )
 from ports._support.store import build_slot, extract, fetch, file_hash, relative_path
@@ -92,6 +93,8 @@ def _admit_recipe(port: Port) -> dict[str, str]:
         return {build["producer_recipe"]: build["producer_sha256"]}
     if adapter not in {
         "pure-wheel",
+        "host-wheel",
+        "python-pep517",
         "python-extension",
         "python-meson",
         "llvm-guest",
@@ -99,8 +102,13 @@ def _admit_recipe(port: Port) -> dict[str, str]:
         *(item.value for item in NativeAdapter),
     }:
         raise ValueError(f"recipe has no supported build adapter: {port.reference}")
-    if adapter not in {"pure-wheel", "llvm-guest", "llvm-guest-sdk"} and "files" not in port.recipe["source"]:
+    if (
+        adapter not in {"pure-wheel", "host-wheel", "llvm-guest", "llvm-guest-sdk"}
+        and "files" not in port.recipe["source"]
+    ):
         relative_path(port.recipe["source"]["subdirectory"])
+    if adapter == "host-wheel" and port.role != "host-tool":
+        raise ValueError("host-wheel adapter requires a host-only role")
     files = {}
     for item in [*port.recipe.get("patches", []), *build.get("hooks", [])]:
         path = _local_file(port, item["file"])
@@ -143,17 +151,45 @@ def _native_driver_inputs(context: NativeBuildContext, *, build: dict, jobs: int
     return compilation_driver_inputs(native_build_request(context, build, jobs))
 
 
+def _backend_wheels(port: Port, selected: Mapping[str, Port], results: Mapping[str, Path]):
+    """Follow exact backend dependency edges, including runtime imports."""
+    from ports._support.python_pep517 import BackendWheel
+
+    pending = [
+        item.recipe
+        for item in port.dependencies
+        if item.kind == "build" and item.recipe != "toolchain/llvm/host-recipe.json"
+    ]
+    visited, wheels = set(), []
+    while pending:
+        reference = pending.pop()
+        if reference in visited:
+            continue
+        visited.add(reference)
+        dependency = selected[reference]
+        if dependency.recipe["build"]["adapter"] not in {"pure-wheel", "host-wheel"}:
+            raise ValueError("PEP 517 backend dependency is not a pinned wheel")
+        paths = list((results[reference] / "wheels").glob("*.whl"))
+        if len(paths) != 1:
+            raise ValueError("backend dependency must supply one verified wheel")
+        wheels.append(BackendWheel(paths[0], dependency.recipe))
+        pending.extend(item.recipe for item in dependency.dependencies)
+    return tuple(wheels)
+
+
 def _build_implementation(support: Path, adapter: str, *, stdlib: bool = False) -> dict[str, str]:
     """Bind cached outputs to the code that actually stages and seals them."""
     modules = [*_COMMON_BUILD_MODULES]
-    if adapter == "pure-wheel":
+    if adapter in {"pure-wheel", "host-wheel"}:
         modules.extend(_PURE_BUILD_MODULES)
     elif adapter in {"llvm-guest", "llvm-guest-sdk"}:
         modules.extend(("build.py", "toolchain/llvm/guest.py", *_NATIVE_BUILD_MODULES))
-    elif adapter in {"python-extension", "python-meson"}:
+    elif adapter in {"python-extension", "python-meson", "python-pep517"}:
         modules.extend(("build.py", "python_adapters.py", *_NATIVE_BUILD_MODULES))
         if adapter == "python-meson":
             modules.append("python_meson.py")
+        elif adapter == "python-pep517":
+            modules.extend(("python_pep517.py", "pep517_runner.py", "python_meson.py", "pure_wheel.py"))
     else:
         modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
     if adapter in {"meson", "python-meson"}:
@@ -228,7 +264,7 @@ def build_graph(
         if "files" in port.recipe.get("source", {}):
             local_source_files(ports, port.recipe["source"])
     for port in graph.ports:
-        if port.recipe["build"]["adapter"] in {"pure-wheel", "llvm-host", "wasi-sysroot"}:
+        if port.recipe["build"]["adapter"] in {"pure-wheel", "host-wheel", "llvm-host", "wasi-sysroot"}:
             continue
         if (
             len(
@@ -276,7 +312,7 @@ def build_graph(
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
             continue
         build_cohort = cohort
-        if adapter != "pure-wheel":
+        if adapter not in {"pure-wheel", "host-wheel"}:
             from ports._support.cohort import resolved_toolchain
 
             sysroot = next(products[item.recipe] for item in port.dependencies if item.kind == "platform")
@@ -297,7 +333,7 @@ def build_graph(
                 dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
             },
         }
-        if adapter not in {"pure-wheel", "llvm-guest-sdk"}:
+        if adapter not in {"pure-wheel", "host-wheel", "llvm-guest-sdk"}:
             inputs["target_flags"] = {
                 "compiler": list(build_cohort.compiler_flags),
                 "linker": list(build_cohort.linker_flags),
@@ -322,8 +358,9 @@ def build_graph(
                     if "files" in recipe["source"]
                     else fetch(recipe["source"], store / "sources", offline=offline)
                 )
-                if build["adapter"] == "pure-wheel":
-                    build_pure_wheel(PureWheelBuildRequest(source, slot.result, recipe))
+                if adapter in {"pure-wheel", "host-wheel"}:
+                    producer = build_pure_wheel if adapter == "pure-wheel" else build_host_wheel
+                    producer(PureWheelBuildRequest(source, slot.result, recipe))
                 else:
                     if adapter != "llvm-guest" and "files" not in recipe["source"]:
                         source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
@@ -389,7 +426,7 @@ def build_graph(
                         executable_flags=build_cohort.executable_flags,
                         shared_library_inputs=(build_cohort.compiler_runtime_archive,),
                     )
-                    if adapter in {"python-extension", "python-meson"}:
+                    if adapter in {"python-extension", "python-meson", "python-pep517"}:
                         python = cohort.python
                         if python is None:
                             raise ValueError("Python extension requires admitted CPython headers and runtime")
@@ -493,10 +530,35 @@ def build_graph(
                             slot.result / "meson-workspace-receipt.json",
                         )
                     _hooks(port, "before_build", context, cohort)
-                    if build["adapter"] in {"python-extension", "python-meson"}:
+                    if build["adapter"] in {"python-extension", "python-meson", "python-pep517"}:
                         if adapter == "python-meson":
                             output = build_python_meson(
                                 PythonMesonBuildRequest(context, python_context, recipe, host_packages)
+                            )
+                        elif adapter == "python-pep517":
+                            from ports._support.python_pep517 import PEP517BuildRequest, build_pep517
+
+                            configs = [
+                                name
+                                for name in cohort.runtime.contents["files"]
+                                if name.startswith("/usr/lib/python3.13/_sysconfigdata_") and name.endswith(".py")
+                            ]
+                            if len(configs) != 1:
+                                raise ValueError("target runtime must export one admitted sysconfig data file")
+                            config = python.runtime_bundle / "rootfs" / configs[0].lstrip("/")
+                            if file_hash(config) != cohort.runtime.contents["files"][configs[0]]:
+                                raise ValueError("target sysconfig differs from admitted runtime")
+                            output = build_pep517(
+                                PEP517BuildRequest(
+                                    context,
+                                    python_context,
+                                    config,
+                                    recipe,
+                                    _backend_wheels(port, selected, results),
+                                )
+                            )
+                            shutil.copyfile(
+                                output.staging_prefix / "pep517-receipt.json", slot.result / "pep517-receipt.json"
                             )
                         else:
                             output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
@@ -570,7 +632,9 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
     with tempfile.TemporaryDirectory(prefix=".ports-catalog-", dir=output.parent) as temporary:
         runtime = cohort.python.runtime_bundle
         incorporated_providers = frozenset()
-        stdlib_ports = [port for port in build.graph.ports if port.recipe["build"].get("output") == "stdlib"]
+        stdlib_ports = [
+            port for port in guest_graph(build.graph).ports if port.recipe["build"].get("output") == "stdlib"
+        ]
         if stdlib_ports:
             from ports._support.native_artifacts import NativeArtifact
             from ports.python.cpython.graph_assembly import assemble_stdlib
@@ -579,7 +643,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                 port.reference.split("/", 1)[0] + "/" + port.name: NativeArtifact(
                     build.results[port.reference] / "native", verify_artifact(build.results[port.reference] / "native")
                 )
-                for port in build.graph.ports
+                for port in guest_graph(build.graph).ports
                 if (build.results[port.reference] / "native").is_dir()
             }
             modules = {
@@ -600,7 +664,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         (raw / "wheels").mkdir(parents=True)
         (raw / "providers").mkdir()
         packages, providers = [], []
-        for port in build.graph.ports:
+        for port in guest_graph(build.graph).ports:
             if port.role in {"host-tool", "target-platform"}:
                 continue
             result = build.results[port.reference]
@@ -650,7 +714,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         }
         (raw / "catalog.json").write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
         combined = compose(runtime, [raw], Path(temporary) / "catalog")
-        native_catalog = publish_native_catalog(build.graph, build.results, Path(temporary) / "native")
+        native_catalog = publish_native_catalog(guest_graph(build.graph), build.results, Path(temporary) / "native")
         return build_release(runtime, combined, cohort.tool("uv"), output, native_catalog=native_catalog)
 
 
@@ -664,13 +728,13 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
     native = {}
-    for port in build.graph.ports:
+    for port in guest_graph(build.graph).ports:
         if port.role in {"host-tool", "target-platform"}:
             continue
         prefix = build.results[port.reference] / "native"
         if prefix.exists():
             native[port.reference.split("/", 1)[0] + "/" + port.name] = NativeArtifact(prefix, verify_artifact(prefix))
-    for port in build.graph.ports:
+    for port in guest_graph(build.graph).ports:
         if port.role in {"host-tool", "target-platform"}:
             continue
         build_cohort = build.cohorts[port.reference]
@@ -745,7 +809,7 @@ def main() -> None:
         workspaces[reference] = Path(directory)
     cohort = load_cohort(args.cohort)
     if args.check:
-        for port in plan(args.ports, args.recipes, target_profile=cohort.dynamic_abi).ports:
+        for port in guest_graph(plan(args.ports, args.recipes, target_profile=cohort.dynamic_abi)).ports:
             if port.role in {"host-tool", "target-platform"}:
                 continue
             tests = port.recipe.get("tests")

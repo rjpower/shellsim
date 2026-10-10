@@ -77,10 +77,14 @@ Repository-owned platform ports can declare `source.files`, a hash-pinned list
 of ports-relative source paths and staging destinations. This stages only the
 declared files. Upstream packages continue to use pinned release archives.
 
-Use `build.adapter` to choose one of `pure-wheel`, `python-extension`,
-`python-meson`, `cmake`, `meson`, `configure-make`, or `plain-make`. The first
+Use `build.adapter` to choose one of `pure-wheel`, `host-wheel`,
+`python-extension`, `python-pep517`, `python-meson`, `cmake`, `meson`,
+`configure-make`, or `plain-make`. `pure-wheel`
 stages an unchanged, verified upstream wheel. `python-extension` compiles a
 declared single-module C/C++ extension against the cohort's CPython headers.
+`python-pep517` runs upstream pinned offline build backends for pure source
+packages and extensions; see [Python backend authoring](_support/PYTHON_BACKENDS.md).
+`host-wheel` preserves pinned universal backend wheels with host-only data.
 `python-meson` stages package files and multiple extensions from Meson's install
 plan. Native adapters install to a private
 `/usr/local` staging tree through the admitted compiler and verified dependency
@@ -111,16 +115,28 @@ to a remote registry.
 
 ## Python environment setup
 
-Build a bare CPython bundle and its SDK 34 dynamic runtime from the repository
-root. The build host needs uv, make, a native C compiler, and ordinary Unix
-build tools; the builder downloads the pinned SDK.
+Install packages from a checked graph release through the public API:
 
-```sh
-uv run --no-project --python 3.13 ports/python/cpython/build.py \
-  --work-dir /tmp/shellsim-cpython
-uv run --no-project --python 3.13 python -m ports.python.cpython.dynamic \
-  --bundle /tmp/shellsim-cpython --output /tmp/shellsim-runtime
+```python
+from shellsim import Environment, Limits
+
+env = Environment.from_release(
+    "/path/to/release/release.json",
+    pypi=["numpy==2.3.5"],
+    limits=Limits(cpu=100_000_000_000, memory=4 * 1024**3, disk=768 * 1024**2),
+)
+result = env.run_python("import numpy; print(numpy.arange(4).sum())")
+assert result.returncode == 0, result.stderr
+assert result.stdout == b"6\n"
 ```
+
+A release records its admitted runtime, resolver and package catalogs. Build
+cohorts are prepared through the explicit
+[threaded CPython producer](python/cpython/README.md),
+[platform producer](toolchain/wasi_threads/README.md), and
+[scientific host-tool setup](_support/HOST_TOOLS.md). Older static and nonthreaded
+producers remain documented in [CPython](python/cpython/README.md); their bundles
+have separate ABI identities.
 
 The [process overlay](toolchain/wasi_process/README.md) adds upstream CPython
 subprocess support through the virtual process kernel. The
@@ -158,8 +174,9 @@ to `PATH`. Ordinary shell commands and child interpreters select that CPython.
 `Environment.run_python`, `install_pypi`, and `install_lock` use the mounted
 runtime. Without a CPython mount, the existing Python VM remains available.
 
-The host resolves all requested requirements together for CPython 3.13.7 on
-WASI. The ABI-scoped catalog supplies approved native and pure wheels; ordinary
+The host resolves all requested requirements together for the release's admitted
+CPython version and WASI target. The ABI-scoped catalog supplies approved native
+and pure wheels; ordinary
 pure dependencies can come from a configured index or PyPI. An unavailable
 curated version is an error. The installer checks wheel contents, hashes, native
 ABI markers, dependency closure, and file conflicts before an atomic VFS import.
@@ -289,25 +306,33 @@ verifiers because those behaviors span ports. Repository gates are
 
 ## Supported profiles and remaining work
 
-SDK 34 dynamic linking supports separate C/C++ extensions, shared libraries,
-canonical C++ exceptions and setjmp/longjmp, NumPy, Kiwi and Pillow. The
-[Pillow port](python/pillow/DYNAMIC.md) supplies PNG/JPEG codecs, FreeType font
-rendering, image arithmetic and morphology through independently installed
-extensions. Its FreeType provider uses the [LLVM linker port](toolchain/llvm)
-and the loader's explicit initialization protocol. The libffi backend
-supports primitive and pointer calls and callbacks, with up to 16 arguments;
-aggregate and variadic signatures are explicitly rejected. Library loading uses only the VFS and
-is bounded by resource accounting. TLS, unloading, cyclic native dependencies,
-and live loading across threads remain unsupported by this cohort.
+The current SDK 34 threaded v3 graph has accepted NumPy 2.3.5 and SciPy 1.18.0
+through the public release installer. Its guest probes cover C++ exceptions,
+TLS, pthreads, shared native providers and threaded numerical calls. The
+upstream Python backend graph also accepts Kiwi 1.5.1 constraint solving and
+C++ error translation, packaging imports, and zss tree edit distances.
 
-Static CPython builds can include pycosat, NumPy, Pillow and shared native build
-inputs selected before the interpreter link. Static package installation accepts
-pure wheels; it uses host platform markers and therefore is limited to portable
-pure dependencies. The SDK 24 profile is retained for its existing narrow loader
-contract. ABI identifiers prevent mixing these profiles.
+SciPy omits ODR. OpenBLAS disables its internal worker pool, retains pthread
+allocator locks and its upstream 32 MiB workspace; concurrent callers need
+independent scratch memory. NumPy retains its documented floating-point
+warning and exception-policy limits. These probes establish their declared
+behaviors, not arbitrary scientific or task-suite coverage.
+
+Earlier SDK 34 nonthreaded dynamic v2 builds cover Pillow PNG/JPEG codecs,
+FreeType rendering, image arithmetic and morphology, and historical Kiwi builds.
+The [Pillow port](python/pillow/DYNAMIC.md) remains historical evidence until its
+current threaded graph is accepted; it omits several optional codecs. The libffi
+backend supports primitive and pointer calls and callbacks with up to 16
+arguments; aggregate and variadic signatures are rejected. Native loading uses
+only the VFS and is bounded by resource accounting. Unloading and cyclic native
+dependencies remain unsupported.
+
+Static CPython builds can include pycosat, NumPy, Pillow and native inputs
+selected before the interpreter link. Their package installer accepts pure
+wheels and uses host platform markers, limiting it to portable pure dependencies.
+The SDK 24 profile retains its narrow loader contract. ABI identifiers prevent
+mixing these historical profiles with threaded v3.
 
 The tested task set includes two Codeelo tasks, one CalibForge task, and a native
-build variant of a Codeelo task. It does not establish broad Tasktrove coverage.
-NumPy retains documented floating-point warning/exception-policy limits. Pillow
-omits several optional codecs. SciPy, threaded dynamic loading, and Reasoning Gym
-still require further acceptance.
+build variant of a Codeelo task. It does not establish broad Tasktrove or
+Reasoning Gym coverage.
