@@ -38,7 +38,7 @@ from ports.buildomatic.backends.iris import (
     CoordinatorService,
     IrisConfig,
     WorkerProxy,
-    _CapabilityResolver,
+    _CapabilityRPC,
     _deployed_files,
     _entrypoint,
     _WorkerActor,
@@ -518,15 +518,42 @@ def test_iris_config_resource_and_name_bounds(values):
         IrisConfig(**{"service_id": "test", **values})
 
 
-def test_capability_resolver_never_embeds_token_in_url_or_repr(monkeypatch):
-    module = ModuleType("iris.actor.resolver")
-    module.ResolvedEndpoint = lambda url, actor_id, metadata: SimpleNamespace(
-        url=url, actor_id=actor_id, metadata=metadata
-    )
-    module.ResolveResult = lambda name, endpoints: SimpleNamespace(name=name, endpoints=endpoints)
-    monkeypatch.setitem(sys.modules, module.__name__, module)
-    resolver = _CapabilityResolver("https://controller", "/user/service/coordinator", "sensitive-token")
-    found = resolver.resolve("/user/service/coordinator").endpoints[0]
-    assert "sensitive-token" not in found.url
-    assert "sensitive-token" not in repr(resolver)
-    assert found.metadata == {"Authorization": "Bearer sensitive-token"}
+def test_capability_transport_never_logs_url_and_sanitizes_errors(monkeypatch, caplog):
+    address = "https://controller/proxy/t/sensitive-token/actor"
+    modules = {}
+    for name in (
+        "iris.rpc.actor_connect",
+        "iris.rpc.compression",
+        "iris.actor.client",
+        "iris.rpc.errors",
+        "iris.rpc",
+        "cloudpickle",
+        "connectrpc.errors",
+    ):
+        modules[name] = ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, modules[name])
+
+    class ConnectError(Exception):
+        def __init__(self, code, message):
+            self.code, self.message = code, message
+            super().__init__(message)
+
+    def unavailable(request):
+        raise ConnectError("unavailable", f"failed {address}")
+
+    modules["connectrpc.errors"].ConnectError = ConnectError
+    modules["iris.rpc.actor_connect"].ActorServiceClientSync = lambda **kwargs: SimpleNamespace(call=unavailable)
+    modules["iris.rpc.compression"].IRIS_RPC_COMPRESSIONS = ()
+    modules["iris.rpc.compression"].IRIS_RPC_ZSTD = None
+    modules["iris.actor.client"].unwrap_actor_response = lambda value: value
+    modules["iris.rpc.errors"].call_with_retry = lambda name, invoke, **kwargs: invoke()
+    modules["iris.rpc"].actor_pb2 = SimpleNamespace(ActorCall=lambda **kwargs: SimpleNamespace(**kwargs))
+    modules["cloudpickle"].dumps = lambda value: b"serialized"
+    actor = _CapabilityRPC(address, "sensitive-token", "user/service/coordinator", 30)
+    assert "sensitive-token" not in repr(actor)
+    with pytest.raises(ConnectError) as raised:
+        actor.call("Get", "build")
+    assert raised.value.code == "unavailable"
+    assert "sensitive-token" not in str(raised.value)
+    assert address not in str(raised.value)
+    assert "sensitive-token" not in caplog.text

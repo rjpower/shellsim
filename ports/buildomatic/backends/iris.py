@@ -3,7 +3,7 @@
 One coordinator serves a named service. Builds run in durable admission order;
 ready nodes within the active build use the worker pool concurrently. Submit,
 Get and Cancel never wait for a build to finish. Worker actors are private and
-external clients use the controller's authenticated BEARER capability proxy.
+external clients use the controller's authenticated scoped-capability proxy.
 Iris actors deserialize Python objects, so capability holders are trusted peers.
 """
 
@@ -304,7 +304,7 @@ class CoordinatorService:
 
 
 class _CoordinatorActor:
-    """Expose only the short client-facing operations on the BEARER endpoint."""
+    """Expose short client operations on the guarded capability endpoint."""
 
     def __init__(self, service: CoordinatorService):
         self._service = service
@@ -569,17 +569,51 @@ def launch(client, config: IrisConfig, *, environment=None):
     )
 
 
-class _CapabilityResolver:
-    """Keep bearer material in headers, never in a logged URL or repr."""
+class _CapabilityRPC:
+    """Call the capability route without ActorClient's endpoint URL logging.
 
-    def __init__(self, controller_url: str, actor_name: str, token: str):
-        self._url = f"{controller_url.rstrip('/')}/proxy/{actor_name.lstrip('/').replace('/', '.')}"
-        self._token = token
+    The public hub exposes the capability path, while its ordinary proxy path
+    may require a separate edge identity. Capability material remains private,
+    and transport errors are sanitized before Iris's retry logger sees them.
+    """
 
-    def resolve(self, name: str):
-        from iris.actor.resolver import ResolvedEndpoint, ResolveResult
+    def __init__(self, address: str, token: str, actor_name: str, rpc_seconds: float):
+        from iris.rpc.actor_connect import ActorServiceClientSync
+        from iris.rpc.compression import IRIS_RPC_COMPRESSIONS, IRIS_RPC_ZSTD
 
-        return ResolveResult(name, [ResolvedEndpoint(self._url, name, {"Authorization": f"Bearer {self._token}"})])
+        self._address, self._token, self._name = address, token, actor_name
+        self._client = ActorServiceClientSync(
+            address=address,
+            timeout_ms=int(rpc_seconds * 1000),
+            accept_compression=IRIS_RPC_COMPRESSIONS,
+            send_compression=IRIS_RPC_ZSTD,
+        )
+
+    def call(self, method: str, *args):
+        import cloudpickle
+        from connectrpc.errors import ConnectError
+        from iris.actor.client import unwrap_actor_response
+        from iris.rpc import actor_pb2
+        from iris.rpc.errors import call_with_retry
+
+        request = actor_pb2.ActorCall(
+            method_name=method,
+            actor_name=self._name,
+            serialized_args=cloudpickle.dumps(args),
+            serialized_kwargs=cloudpickle.dumps({}),
+        )
+
+        def invoke():
+            try:
+                response = self._client.call(request)
+            except ConnectError as error:
+                message = error.message.replace(self._address, "[capability]").replace(self._token, "[token]")
+                raise ConnectError(error.code, message) from None
+            except Exception as error:
+                raise RuntimeError(f"Iris actor transport failed: {type(error).__name__}") from None
+            return unwrap_actor_response(response)
+
+        return call_with_retry(f"{self._name}.{method}", invoke, max_attempts=3)
 
 
 class IrisBackend:
@@ -604,33 +638,34 @@ class IrisBackend:
         self._controller = controller_client
         self._name = f"{namespace.rstrip('/')}/coordinator"
         self._rpc_seconds = rpc_seconds
-        self._resolver = _CapabilityResolver(controller_url, self._name, "")
+        self._controller_url = controller_url
         self.refresh_capability()
 
     def refresh_capability(self) -> None:
         """Renew with authenticated controller access; never expose the token."""
-        capability = self._controller._cluster_client.mint_endpoint_token(self._name)
-        self._resolver._token = capability.token
-        # The actor resolves headers when connecting. Recreate it so renewal
-        # takes effect without mutating Iris's private transport internals.
-        from iris.actor.client import ActorClient
+        from rigging.connect import capability_path
 
-        self._actor = ActorClient(self._resolver, self._name, call_timeout=self._rpc_seconds, max_call_attempts=3)
+        capability = self._controller.mint_endpoint_token(self._name)
+        address = (
+            capability.capability_url
+            or f"{self._controller_url.rstrip('/')}{capability_path(self._name, capability.token)}"
+        )
+        self._actor = _CapabilityRPC(address, capability.token, self._name, self._rpc_seconds)
 
     def submit(self, request: BuildRequest) -> str:
-        return self._actor.Submit(request)
+        return self._actor.call("Submit", request)
 
     def get(self, build_id: str) -> BuildResult:
-        return self._actor.Get(build_id)
+        return self._actor.call("Get", build_id)
 
     def cancel(self, build_id: str) -> BuildResult:
-        return self._actor.Cancel(build_id)
+        return self._actor.call("Cancel", build_id)
 
     def acknowledge(self, build_id: str) -> None:
-        self._actor.Acknowledge(build_id)
+        self._actor.call("Acknowledge", build_id)
 
     def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
-        return self._actor.GetLogs(build_id)
+        return self._actor.call("GetLogs", build_id)
 
 
 def discover(client, controller_url: str, job, config: IrisConfig, *, rpc_seconds: float = 30) -> IrisBackend:
@@ -764,8 +799,8 @@ def _run_coordinator(config: IrisConfig) -> None:
             worker_id=name,
         )
     service = CoordinatorService(store, config.service_id, workers)
-    # Current Iris calls scoped-capability access LINK. Its native verifier also
-    # accepts that token in Authorization, keeping it out of logged URLs.
+    # Current Iris calls scoped-capability access LINK; no anonymous proxy
+    # access is enabled. The external transport keeps its minted URL private.
     server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_LINK)
     stop = threading.Event()
     errors = []
