@@ -1,6 +1,7 @@
 //! Compatibility and boundary tests for VFS-only compression and archive commands.
 
 use std::io::Write;
+use std::process::{Command, Output, Stdio};
 
 use flate2::write::DeflateEncoder;
 use flate2::Compression;
@@ -376,4 +377,128 @@ fn tar_rejects_archive_materialization_before_exceeding_memory() {
     assert_eq!(outcome.stop_reason, Some(StopReason::MemoryExhausted));
     assert!(String::from_utf8_lossy(&stderr).contains("memory limit exceeded"));
     assert!(!environment.vfs.exists("/", "/tmp/large.tar"));
+}
+
+fn native_tar(arguments: &[&str], archive: &[u8]) -> Option<Output> {
+    let mut process = match Command::new("tar")
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(process) => process,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => panic!("could not start reference tar: {error}"),
+    };
+    process.stdin.take().unwrap().write_all(archive).unwrap();
+    Some(process.wait_with_output().unwrap())
+}
+
+#[test]
+fn tar_archives_symbolic_links_without_following_their_targets() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/tree").unwrap();
+    environment.vfs.mkdir_all("/", "/outside").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/tree/file", b"payload", 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/outside/secret", b"private", 0o644)
+        .unwrap();
+    for (name, target) in [
+        ("relative", "../absent"),
+        ("outside", "/outside"),
+        ("cycle", "."),
+        ("link", "file"),
+    ] {
+        environment
+            .vfs
+            .symlink("/", target, &format!("/work/tree/{name}"))
+            .unwrap();
+    }
+    let (status, archive, stderr) = environment.run_script_capture("tar -cf - -C /work tree");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    environment
+        .vfs
+        .write("/", "/tmp/links.tar", &archive, 0o644)
+        .unwrap();
+    let (status, names, stderr) = environment.run_script_capture("tar -tf /tmp/links.tar");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(
+        names,
+        b"tree\ntree/cycle\ntree/file\ntree/link\ntree/outside\ntree/relative\n"
+    );
+
+    if let Some(listed) = native_tar(&["-tvf", "-"], &archive) {
+        assert!(
+            listed.status.success(),
+            "{}",
+            String::from_utf8_lossy(&listed.stderr)
+        );
+        let listing = String::from_utf8(listed.stdout).unwrap();
+        for entry in [
+            "tree/cycle -> .",
+            "tree/outside -> /outside",
+            "tree/relative -> ../absent",
+            "tree/link -> file",
+        ] {
+            assert!(listing
+                .lines()
+                .any(|line| line.starts_with('l') && line.ends_with(entry)));
+        }
+        let extracted = native_tar(&["-xOf", "-", "tree/file"], &archive).unwrap();
+        assert!(extracted.status.success());
+        assert_eq!(extracted.stdout, b"payload");
+    }
+
+    environment.vfs.mkdir_all("/", "/restored").unwrap();
+    let (status, _, _) = environment.run_script_capture("tar -xf /tmp/links.tar -C /restored");
+    assert_eq!(status.exit_status, 2);
+    assert!(!environment.vfs.exists("/", "/restored/tree"));
+
+    let (status, archive, stderr) = environment.run_script_capture("tar -cf - -C /work/tree .");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    if let Some(extracted) = native_tar(&["-xOf", "-", "file"], &archive) {
+        assert!(extracted.status.success());
+        assert_eq!(extracted.stdout, b"payload");
+    }
+
+    let full_target = "x".repeat(100);
+    environment
+        .vfs
+        .symlink("/", &full_target, "/work/full-width")
+        .unwrap();
+    let (status, archive, stderr) = environment.run_script_capture("tar -cf - -C /work full-width");
+    assert_eq!(
+        status.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    if let Some(listed) = native_tar(&["-tvf", "-"], &archive) {
+        assert!(listed.status.success());
+        let listing = String::from_utf8(listed.stdout).unwrap();
+        assert!(listing
+            .lines()
+            .any(|line| line.starts_with('l')
+                && line.ends_with(&format!("full-width -> {full_target}"))));
+    }
 }
