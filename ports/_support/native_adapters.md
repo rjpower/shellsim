@@ -233,3 +233,9 @@ provider inputs. It links those checks as PIC side modules and rejects
 unresolved symbols. Executable checks keep their normal policy. OpenBLAS
 symbol-existence checks retain volatile function addresses without calling
 unknown prototypes; callable ABI checks still reject signature mismatches.
+
+Compiler wrappers read LLVM GNU response files for option classification,
+including nested `@file` arguments. They pass the original argv unchanged to
+the compiler. Compile-only modes take precedence over shared-link selection.
+Expansion is bounded to 16 nested files, 256 files, 4 MiB and 65,536 arguments;
+unreadable, cyclic or excessive inputs fail before compiler invocation.

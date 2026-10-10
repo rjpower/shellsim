@@ -177,25 +177,30 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             wrapper,
             "#!"
             + str(python)
+            + "\n"
+            + Path(__file__).with_name("compiler_response.py").read_text()
             + "\nimport os, sys\n"
             + "command = "
             + repr(base)
             + "\narguments = sys.argv[1:]\n"
-            + 'if not any(flag in arguments for flag in ("-c", "-S", "-E")):\n'
+            + "options = response_arguments(arguments, Path.cwd())\n"
+            + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
+            + 'is_shared = is_link and "-shared" in options\n'
+            + "if is_link:\n"
             + "    command += "
             + repr(list(context.linker_flags))
             + "\n"
-            + 'if "-shared" in arguments:\n'
+            + "if is_shared:\n"
             + "    command += "
             + repr(list(context.shared_library_flags))
             + "\n"
-            + 'elif not any(flag in arguments for flag in ("-c", "-S", "-E")):\n'
+            + "elif is_link:\n"
             + "    command += "
             + repr(list(context.executable_flags))
             + "\n"
             + "os.execv(command[0], command + arguments + ("
             + repr([str(path) for path in context.shared_library_inputs])
-            + ' if "-shared" in arguments else []))\n',
+            + " if is_shared else []))\n",
         )
         wrapper.chmod(0o755)
         wrappers[role] = wrapper

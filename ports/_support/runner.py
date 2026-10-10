@@ -33,6 +33,7 @@ from ports._support.store import build_slot, extract, fetch, file_hash, relative
 _COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "cohort.py", "local_sources.py")
 _NATIVE_BUILD_MODULES = (
     "native_adapters.py",
+    "compiler_response.py",
     "native_artifacts.py",
     "wasm.py",
     "wasm_metadata.py",
