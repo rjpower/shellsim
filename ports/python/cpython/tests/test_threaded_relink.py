@@ -125,7 +125,7 @@ def test_facade_refresh_recompiles_real_process_objects_and_preserves_core(tmp_p
         text = f"int {name}(void) {{ return 0; }}\n"
         (source / (name + ".c")).write_text(text)
         (staged / (name + ".c")).write_text(text)
-    (guest / "Makefile").write_text(f"CC={cc}\nsrcdir={source.parent}\n")
+    (guest / "Makefile").write_text("CC=/obsolete/compiler\nsrcdir=/obsolete/original-source\n")
     core = guest / "core.c"
     core.write_text("int facade(void); int main(void) { return facade(); }\n")
     core_object = guest / "core.o"

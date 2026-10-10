@@ -170,12 +170,12 @@ def admit_process_refresh(previous, current, requested):
         raise ValueError("CPython facade refresh requires unchanged upstream compilation inputs")
 
 
-def compile_process_facades(work, make, cc, environment, directory, *, previous=None):
+def compile_process_facades(work, make, cc, environment, directory):
     """Compile the explicit process facade objects from admitted source and Makefile.
 
-    A retained Makefile still names its original source directory. Rebase those
-    paths into the newly verified copy; leave configuration and compiler flags
-    intact. Both fresh builds and requested facade refreshes use these commands.
+    A retained Makefile can name an earlier source directory and linker. Bind
+    its directory variables and CC to the verified copy and selected command;
+    leave configuration flags intact. Fresh and retained builds share this path.
     """
     toolchain = directory.parents[1] / "toolchain/wasi_sdk"
     process = toolchain.parent / "wasi_process"
@@ -225,13 +225,22 @@ def compile_process_facades(work, make, cc, environment, directory, *, previous=
         compile_rule = f"shellsim_process_compile:; @echo $(CC) {flags} -c $(srcdir)/Modules/{name}.c"
         command = shlex.split(
             subprocess.check_output(
-                [str(make), "--no-print-directory", "--eval", compile_rule, "shellsim_process_compile"],
+                [
+                    str(make),
+                    "--no-print-directory",
+                    "--eval",
+                    compile_rule,
+                    "CC=" + shlex.join(cc),
+                    "srcdir=" + str(source),
+                    "abs_srcdir=" + str(source),
+                    "abs_builddir=" + str(guest),
+                    "shellsim_process_compile",
+                ],
                 cwd=guest,
                 env=environment,
                 text=True,
             )
         )
-        command = [argument.replace(str(previous), str(work)) for argument in command] if previous else command
         original = str(source / "Modules" / (name + ".c"))
         if command.count(original) != 1:
             raise ValueError("CPython process module source or link differs: " + name)
@@ -329,10 +338,9 @@ def relink(
         objects = compile_process_facades(
             work,
             make,
-            shlex.split(profile["environment"]["CC"]),
+            link[:5],
             environment,
             Path(__file__).resolve().parent,
-            previous=previous,
         )
         profile = {
             **profile,

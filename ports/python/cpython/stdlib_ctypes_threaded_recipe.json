@@ -99,6 +99,6 @@
     "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
   },
   "cpython_manifest_sha256": "3d57bfa7f64990a45cf60ff50ff2c9b3ba75af952660504b1b4accf34068a431",
-  "cpython_recipe_sha256": "985e847c7d72e2bff30ddb8e23a268dbf49be61abfff1d114812801c5e48bfc3",
-  "cpython_recipe_digest": "73a881a00c9471048890dec38f00f4fbd1d4e98714b24adeec6c6be7f3b17fc5"
+  "cpython_recipe_sha256": "e08309acf19608228ea733dae22000d0031343e3297c2aa86fa1f7ce52839016",
+  "cpython_recipe_digest": "d5997c44a81d2abd3c0ba22657343dfebfd62eeb506b4235a08bb1f05ee97d8e"
 }
