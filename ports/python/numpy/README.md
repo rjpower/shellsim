@@ -91,3 +91,9 @@ Run the graph with an admitted scientific host descriptor containing Python,
 Cython, Meson and Ninja. The declared guest probe covers array arithmetic,
 linear algebra, FFT, random values, target type widths, an invalid reshape and
 concurrent ufunc calls from real Python threads.
+
+The graph runtime edge to `cpython-stdlib-zlib` supplies the actual CPython zlib
+module required by Cython's compressed generated string tables. Publication
+assembles verified stdlib modules and their providers into a distinct runtime
+without changing interpreter bytes or upstream NumPy dependency metadata.
+Both NumPy's license and bundled component notices remain in the wheel.

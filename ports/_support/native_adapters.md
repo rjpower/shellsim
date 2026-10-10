@@ -210,3 +210,13 @@ compiler helpers, including quad-precision conversions, without relying on
 which helpers a particular interpreter link happened to export. The archive
 path and hash remain result inputs; retained workspace admission also binds
 these trailing inputs, so a changed link policy cannot reuse stale modules.
+
+The one-module Python adapter accepts `build.output: stdlib` for CPython's own
+extensions. It compiles the pinned CPython source against admitted headers,
+seals `lib-dynload/<module>.so` and licenses as a native artifact, and emits no
+wheel metadata. Additional internal include directories must stay below the
+admitted CPython `Include` tree. An internal graph runtime edge can select such
+an artifact without changing an upstream package's `Requires-Dist`. Publication
+verifies its native closure, then assembles a separate runtime with the module
+and providers. It preserves the base interpreter and records exact artifact
+identities; module files are never published as generic `/lib` providers.

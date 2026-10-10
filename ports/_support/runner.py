@@ -138,7 +138,7 @@ def _strings(build: dict, field: str, default: tuple[str, ...] = ()) -> tuple[st
     return tuple(values)
 
 
-def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
+def _build_implementation(support: Path, adapter: str, *, stdlib: bool = False) -> dict[str, str]:
     """Bind cached outputs to the code that actually stages and seals them."""
     modules = [*_COMMON_BUILD_MODULES]
     if adapter == "pure-wheel":
@@ -157,8 +157,12 @@ def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
         modules.append("cmake_adapter.py")
     elif adapter in {"configure-make", "plain-make"}:
         modules.append("make_adapter.py")
+    if stdlib:
+        modules.append("python/cpython/graph_assembly.py")
     return {
-        name: file_hash(support.parent / name if name.startswith(("native/", "toolchain/")) else support / name)
+        name: file_hash(
+            support.parent / name if name.startswith(("native/", "toolchain/", "python/")) else support / name
+        )
         for name in modules
     }
 
@@ -236,8 +240,11 @@ def build_graph(
             raise ValueError(f"native build requires an explicit target platform dependency: {port.reference}")
     support = Path(__file__).parent
     implementations = {
-        adapter: _build_implementation(support, adapter)
-        for adapter in {port.recipe["build"]["adapter"] for port in graph.ports} - {"llvm-host", "wasi-sysroot"}
+        port.reference: _build_implementation(
+            support, port.recipe["build"]["adapter"], stdlib=port.recipe["build"].get("output") == "stdlib"
+        )
+        for port in graph.ports
+        if port.recipe["build"]["adapter"] not in {"llvm-host", "wasi-sysroot"}
     }
     results: dict[str, Path] = {}
     native: dict[str, NativeArtifact] = {}
@@ -279,7 +286,7 @@ def build_graph(
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
-            "implementation": implementations[adapter],
+            "implementation": implementations[port.reference],
             "cohort": cohort.identity,
             "dependencies": {
                 dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
@@ -461,8 +468,11 @@ def build_graph(
                         else:
                             output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
                         _hooks(port, "after_install", context, cohort)
-                        shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
-                        if adapter == "python-meson" and (recipe.get("exports") or recipe.get("export_directories")):
+                        if adapter == "python-meson" or build.get("output", "wheel") == "wheel":
+                            shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
+                        if (adapter == "python-meson" or build.get("output") == "stdlib") and (
+                            recipe.get("exports") or recipe.get("export_directories")
+                        ):
                             seal_native_install(
                                 recipe,
                                 port.directory,
@@ -537,6 +547,34 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ports-catalog-", dir=output.parent) as temporary:
+        runtime = cohort.python.runtime_bundle
+        incorporated_providers = frozenset()
+        stdlib_ports = [port for port in build.graph.ports if port.recipe["build"].get("output") == "stdlib"]
+        if stdlib_ports:
+            from ports._support.native_artifacts import NativeArtifact
+            from ports.python.cpython.graph_assembly import assemble_stdlib
+
+            artifacts = {
+                port.reference.split("/", 1)[0] + "/" + port.name: NativeArtifact(
+                    build.results[port.reference] / "native", verify_artifact(build.results[port.reference] / "native")
+                )
+                for port in build.graph.ports
+                if (build.results[port.reference] / "native").is_dir()
+            }
+            modules = {
+                port.reference.split("/", 1)[0] + "/" + port.name: artifacts[
+                    port.reference.split("/", 1)[0] + "/" + port.name
+                ]
+                for port in stdlib_ports
+            }
+            runtime, incorporated_providers = assemble_stdlib(
+                runtime,
+                modules,
+                artifacts,
+                _native_target(build.cohorts[stdlib_ports[0].reference]),
+                Path(temporary) / "runtime",
+                runtime_manifest_sha256=cohort.python.runtime_manifest_sha256,
+            )
         raw = Path(temporary) / "raw"
         (raw / "wheels").mkdir(parents=True)
         (raw / "providers").mkdir()
@@ -562,6 +600,12 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                 artifact = verify_artifact(result / "native")
                 for relative in artifact["inputs"]["recipe"]["exports"].get("shared_libraries", []):
                     path = result / "native" / relative
+                    if port.recipe["build"].get("output") == "stdlib":
+                        continue
+                    if path.name in incorporated_providers:
+                        if file_hash(path) != file_hash(runtime / "rootfs/lib" / path.name):
+                            raise ValueError("graph provider conflicts with assembled stdlib runtime")
+                        continue
                     destination = raw / "providers" / path.name
                     if destination.exists():
                         raise ValueError("graph shared provider names conflict")
@@ -584,11 +628,9 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
             "native_providers": providers,
         }
         (raw / "catalog.json").write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
-        combined = compose(cohort.python.runtime_bundle, [raw], Path(temporary) / "catalog")
+        combined = compose(runtime, [raw], Path(temporary) / "catalog")
         native_catalog = publish_native_catalog(build.graph, build.results, Path(temporary) / "native")
-        return build_release(
-            cohort.python.runtime_bundle, combined, cohort.tool("uv"), output, native_catalog=native_catalog
-        )
+        return build_release(runtime, combined, cohort.tool("uv"), output, native_catalog=native_catalog)
 
 
 def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, output: Path) -> None:

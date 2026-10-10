@@ -45,7 +45,8 @@
     "jobs": 2,
     "metadata": "PKG-INFO",
     "licenses": [
-      "LICENSE.txt"
+      "LICENSE.txt",
+      "LICENSES_bundled.txt"
     ],
     "cross_properties": {
       "longdouble_format": "IEEE_QUAD_LE"
@@ -113,5 +114,12 @@
     "cpu": 100000000000,
     "memory": 4294967296,
     "disk": 402653184
-  }
+  },
+  "runtime_dependencies": [
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython/stdlib-zlib-graph-recipe.json"
+    }
+  ]
 }
