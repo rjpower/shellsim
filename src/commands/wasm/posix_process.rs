@@ -7,13 +7,29 @@ use super::*;
 use crate::process::Signal;
 use crate::syscalls::{ProcessSpawn, SignalTarget, SpawnFdAction};
 
-const MAX_STRINGS: usize = 131_072;
-// Shared strings can retain geometric Vec capacity; environment key/value
-// copies coexist briefly with those strings. Reserve that aggregate peak.
-const DECODE_MEMORY: u64 = 3 * MAX_STRINGS as u64 + 32_768;
+pub(super) const MAX_ARGUMENTS: u32 = 4096;
+pub(super) const MAX_ENVIRONMENT: u32 = 256;
+pub(super) const MAX_STRINGS: usize = 131_072;
 const O_CLOEXEC: u32 = 0x0008_0000;
 const ERRNO_CHILD: i32 = 12;
 const ERRNO_SRCH: i32 = 71;
+
+/// Reserve the decode peak before copying any guest input. String payloads,
+/// argv String slots and shared pointer copies coexist with environment tree
+/// nodes and their key/value copies. Fixed slack covers paths and FD actions.
+/// Oversized counts are clamped for charging, then rejected by the decoder.
+pub(super) fn decode_memory(argc: u32, envc: u32) -> u64 {
+    (3 * MAX_STRINGS as u64 + 32_768)
+        .saturating_add(u64::from(argc.min(MAX_ARGUMENTS)).saturating_mul(32))
+        .saturating_add(u64::from(envc.min(MAX_ENVIRONMENT)).saturating_mul(160))
+}
+
+/// Prepay bounded byte scans and per-entry allocation/UTF-8/map work.
+pub(super) fn decode_cost(argc: u32, envc: u32) -> u64 {
+    (2 * MAX_STRINGS as u64)
+        .saturating_add(u64::from(argc.min(MAX_ARGUMENTS)).saturating_mul(64))
+        .saturating_add(u64::from(envc.min(MAX_ENVIRONMENT)).saturating_mul(128))
+}
 
 /// Borrow ordinary ranges and copy bounded shared ranges without exposing a heap slice.
 pub(super) trait ReadGuest {
@@ -91,28 +107,29 @@ pub(super) fn vector(
     bytes: &impl ReadGuest,
     pointer: u32,
     count: u32,
+    maximum: u32,
     remaining: &mut usize,
 ) -> Result<Vec<String>, i32> {
     if pointer == 0 && count == 0 {
         return Ok(Vec::new());
     }
-    if count > 256 {
+    if count > maximum {
         return Err(ERRNO_INVAL);
     }
     let entries = bytes.range(pointer, (count as usize + 1) * 4)?;
     if entries[count as usize * 4..] != [0, 0, 0, 0] {
         return Err(ERRNO_INVAL);
     }
-    entries[..count as usize * 4]
-        .chunks_exact(4)
-        .map(|entry| {
-            let pointer = u32::from_le_bytes(entry.try_into().expect("fixed entry"));
-            if pointer == 0 {
-                return Err(ERRNO_INVAL);
-            }
-            string(bytes, pointer, remaining)
-        })
-        .collect()
+    // Keep String-slot capacity exact so the prepaid per-entry bound holds.
+    let mut values = Vec::with_capacity(count as usize);
+    for entry in entries[..count as usize * 4].chunks_exact(4) {
+        let pointer = u32::from_le_bytes(entry.try_into().expect("fixed entry"));
+        if pointer == 0 {
+            return Err(ERRNO_INVAL);
+        }
+        values.push(string(bytes, pointer, remaining)?);
+    }
+    Ok(values)
 }
 
 fn signal(number: i32) -> Option<Signal> {
@@ -156,8 +173,8 @@ fn decode_spawn(bytes: &impl ReadGuest, params: SpawnParams) -> Result<ProcessSp
     if executable.is_empty() {
         return Err(ERRNO_NOENT);
     }
-    let argv = vector(bytes, argv, argc, &mut remaining)?;
-    let environment = vector(bytes, env, envc, &mut remaining)?
+    let argv = vector(bytes, argv, argc, MAX_ARGUMENTS, &mut remaining)?;
+    let environment = vector(bytes, env, envc, MAX_ENVIRONMENT, &mut remaining)?
         .into_iter()
         .map(|entry| {
             let (name, value) = entry.split_once('=').ok_or(ERRNO_INVAL)?;
@@ -249,10 +266,14 @@ fn spawn(mut caller: Caller<'_, Host>, params: SpawnParams) -> Result<i32, Error
     };
     // Charge the bounded parser before scanning or copying any guest strings.
     let mut machine = caller.data_mut().machine.get();
-    if !machine.resources.charge_cpu(2 * MAX_STRINGS as u64) {
+    let reserved = decode_memory(params.2, params.4);
+    if !machine
+        .resources
+        .charge_cpu(decode_cost(params.2, params.4))
+    {
         return Err(exhausted());
     }
-    if !machine.resources.reserve_memory(DECODE_MEMORY) {
+    if !machine.resources.reserve_memory(reserved) {
         return Err(exhausted());
     }
     drop(machine);
@@ -269,7 +290,7 @@ fn spawn(mut caller: Caller<'_, Host>, params: SpawnParams) -> Result<i32, Error
             .map_err(|error| syscall_errno(&error)),
         Err(error) => Err(error),
     };
-    ActiveSystem::new(&mut caller.data_mut().machine.get()).release_memory(DECODE_MEMORY);
+    ActiveSystem::new(&mut caller.data_mut().machine.get()).release_memory(reserved);
     Ok(match outcome {
         Ok(pid) if write_u32(&mut caller, params.9, pid) => ERRNO_SUCCESS,
         Ok(_) => ERRNO_FAULT,
@@ -498,6 +519,75 @@ mod tests {
     use super::*;
 
     #[test]
+    fn larger_argument_decode_exhausts_before_reading_guest_pointers() {
+        use crate::resources::StopReason;
+
+        // Set the remaining budget after image startup. Legacy guest startup
+        // otherwise leaves a fixed I/O allowance, obscuring decode exhaustion.
+        // One argument reaches the invalid path; 1500 exhaust the same budget
+        // before any pointer reads or process creation.
+        for spawn in [true, false] {
+            for reason in [StopReason::CpuExhausted, StopReason::MemoryExhausted] {
+                for argc in [1, 1500] {
+                    let (signature, arguments, import) = if spawn {
+                        ("i32 i32 i32 i32 i32 i32 i32 i32 i32 i32",
+                         "(i32.const 0) (i32.const 0) (i32.const 0) (i32.const 0) (i32.const 64)",
+                         "process_spawn")
+                    } else {
+                        ("i32 i32 i32 i32 i32 i32", "(i32.const 0)", "process_exec")
+                    };
+                    let bytes = wat::parse_str(format!(
+                        r#"(module
+                        (import "shellsim_posix_v1" "{import}"
+                            (func $launch (param {signature}) (result i32)))
+                        (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))
+                        (memory (export "memory") 1)
+                        (func (export "_start")
+                            (call $exit (call $launch (i32.const -1) (i32.const -1)
+                                (i32.const {argc}) (i32.const 0) (i32.const 0) {arguments}))))"#
+                    ))
+                    .unwrap();
+                    let mut environment = Interp::new();
+                    environment
+                        .vfs
+                        .write("/", "/caller", &bytes, 0o755)
+                        .unwrap();
+                    let mut guest = start_guest(
+                        &mut environment,
+                        Launch {
+                            path: "/caller",
+                            argv: vec![b"/caller".to_vec()],
+                            stdio: Stdio::Descriptors,
+                            interaction: None,
+                        },
+                    )
+                    .unwrap();
+                    if reason == StopReason::CpuExhausted {
+                        let consumed = environment.resources.cpu_remaining() - 300_000;
+                        assert!(environment.resources.charge_cpu(consumed));
+                    } else {
+                        let occupied = environment.resources.memory_remaining() - 450_000;
+                        assert!(environment.resources.reserve_memory(occupied));
+                    }
+                    let GuestPoll::Ready(outcome) = guest.poll(&mut environment) else {
+                        panic!("bounded launch must finish in one poll");
+                    };
+                    let GuestOutcome::Exit { status, .. } = *outcome else {
+                        panic!("invalid input must not replace the image");
+                    };
+                    assert_eq!(status, if argc == 1 { ERRNO_FAULT } else { 137 });
+                    assert_eq!(
+                        environment.resources.stop_reason(),
+                        (argc == 1500).then_some(reason)
+                    );
+                    assert_eq!(environment.processes.iter().count(), 1);
+                    release_guest_resources(&mut environment, &mut guest.reserved);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn zero_signal_probes_virtual_groups_without_changing_processes() {
         let mut processes = crate::process::ProcessTable::new(12, "/".into(), BTreeMap::new());
         let child = processes
@@ -572,7 +662,7 @@ mod tests {
         assert_eq!(spec.signal_defaults, vec![Signal::Pipe, Signal::FileSize]);
         assert!(spec.environment.is_empty());
         assert_eq!(
-            decode_spawn(&bytes, (100, 32, 257, 0, 0, 0, 0, 0, 0, 48)).err(),
+            decode_spawn(&bytes, (100, 32, 4097, 0, 0, 0, 0, 0, 0, 48)).err(),
             Some(ERRNO_INVAL)
         );
         assert_eq!(
