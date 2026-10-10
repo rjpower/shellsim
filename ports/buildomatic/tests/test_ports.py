@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import replace
+from types import ModuleType
 
 import pytest
 
@@ -244,3 +245,58 @@ def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
     assert len(build.results) == 1
     assert calls[0] == "submit" and calls[-1] == "acknowledge"
     assert "get" in calls
+
+
+def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
+    import ports.buildomatic.ports as bridge
+
+    calls = []
+    sentinel = object()
+
+    class JobName:
+        @classmethod
+        def from_wire(cls, value):
+            assert value == "/power/service"
+            return cls()
+
+    class Namespace:
+        @staticmethod
+        def from_job_id(value):
+            assert isinstance(value, JobName)
+            return "/power/service"
+
+    @contextmanager
+    def connect(**kwargs):
+        calls.append(kwargs)
+        yield sentinel
+
+    class Backend:
+        store = sentinel
+
+        def __init__(self, client, url, namespace, **kwargs):
+            assert client is sentinel
+            assert url == "https://iris.oa.dev" and namespace == "/power/service"
+            assert kwargs == {"prefix": "durable", "cache_prefix": "cache"}
+
+    for name, exports in {
+        "iris.cli.connect": {"open_iris_client": connect},
+        "iris.cluster.types": {"JobName": JobName, "Namespace": Namespace},
+        "ports.buildomatic.backends.iris": {"IrisBackend": Backend},
+    }.items():
+        module = ModuleType(name)
+        module.__dict__.update(exports)
+        monkeypatch.setitem(sys.modules, name, module)
+    service = tmp_path / "service.json"
+    service.write_text(json.dumps({"job_id": "/power/service", "prefix": "durable", "cache_prefix": "cache"}))
+    actual_run = bridge.run_graph
+
+    def capture_remote(*args, **kwargs):
+        assert isinstance(kwargs["remote_backend"], Backend)
+        assert kwargs["blob_store"] is sentinel
+        return sentinel
+
+    monkeypatch.setattr(bridge, "run_graph", capture_remote)
+    assert actual_run(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service) is sentinel
+    assert calls == [{"cluster_name": "marin", "workspace": bridge.Path.cwd()}]

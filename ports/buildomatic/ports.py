@@ -502,7 +502,7 @@ def run_graph(
             }:
                 raise ValueError("unsupported Iris connection fields")
             from iris.cli.connect import open_iris_client
-            from iris.cluster.types import Namespace
+            from iris.cluster.types import JobName, Namespace
 
             from ports.buildomatic.backends.iris import IrisBackend
 
@@ -513,7 +513,7 @@ def run_graph(
                 remote = IrisBackend(
                     client,
                     connection.get("controller_url", "https://iris.oa.dev"),
-                    str(Namespace.from_job_id(connection["job_id"])),
+                    str(Namespace.from_job_id(JobName.from_wire(connection["job_id"]))),
                     prefix=connection["prefix"],
                     cache_prefix=connection["cache_prefix"],
                 )
