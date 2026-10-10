@@ -139,6 +139,8 @@ def _stage_wheel(path: Path, stage: Path, request: PEP517BuildRequest) -> None:
             raise ValueError("backend wheel exceeds output bounds")
         for info in archive.infolist():
             name = relative_path(info.filename.rstrip("/"))
+            if any(part.endswith(".data") for part in PurePosixPath(name).parts):
+                raise ValueError("backend wheel .data relocation is unsupported")
             destination = stage / name
             if destination.exists() or ((info.external_attr >> 16) & 0o170000) == 0o120000:
                 raise ValueError("backend wheel has duplicate or linked members")
@@ -212,7 +214,7 @@ def _stage_wheel(path: Path, stage: Path, request: PEP517BuildRequest) -> None:
 
 
 def build_pep517(request: PEP517BuildRequest) -> PythonBuildOutput:
-    """Execute upstream hooks offline, then admit and reseal their native wheel."""
+    """Execute upstream hooks offline, then admit and reseal their wheel."""
     context, recipe = request.context, request.recipe
     if (
         request.cpython.abi != recipe.get("abi", request.cpython.abi)
@@ -223,19 +225,25 @@ def build_pep517(request: PEP517BuildRequest) -> PythonBuildOutput:
     if context.build.exists() or context.staging_prefix.exists():
         raise ValueError("PEP 517 build output already exists")
     project_file = context.source / "pyproject.toml"
-    if project_file.exists():
-        declaration = tomllib.loads(project_file.read_text())["build-system"]
-    else:
-        # PEP 517's setuptools legacy default executes the upstream setup.py.
-        declaration = {"build-backend": "setuptools.build_meta:__legacy__", "requires": ["setuptools>=40.8.0"]}
-    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.]*(?::[A-Za-z_][A-Za-z0-9_.]*)?", declaration["build-backend"]):
-        raise ValueError("invalid PEP 517 backend name")
+    project = tomllib.loads(project_file.read_text()) if project_file.exists() else {}
+    declaration = project.get(
+        "build-system", {"build-backend": "setuptools.build_meta:__legacy__", "requires": ["setuptools>=40.8.0"]}
+    )
+    if not isinstance(declaration, dict):
+        raise ValueError("PEP 517 build-system must be a table")
+    requirements = declaration.get("requires")
     if (
-        not isinstance(declaration["requires"], list)
-        or len(declaration["requires"]) > 64
-        or any(not isinstance(value, str) or len(value) > 4096 for value in declaration["requires"])
+        not isinstance(requirements, list)
+        or len(requirements) > 64
+        or any(not isinstance(value, str) or len(value) > 4096 for value in requirements)
     ):
-        raise ValueError("invalid PEP 517 build requirements")
+        raise ValueError("PEP 517 build-system requires must be a bounded list of requirements")
+    backend = declaration.get("build-backend", "setuptools.build_meta:__legacy__")
+    if not isinstance(backend, str) or not re.fullmatch(
+        r"[A-Za-z_][A-Za-z0-9_.]*(?::[A-Za-z_][A-Za-z0-9_.]*)?", backend
+    ):
+        raise ValueError("invalid PEP 517 build-backend name")
+    declaration = {**declaration, "build-backend": backend}
     backend_paths = _backend_paths(context.source, declaration)
     settings = recipe["build"].get("config_settings", {})
     if (

@@ -538,10 +538,11 @@ def build_graph(
                         elif adapter == "python-pep517":
                             from ports._support.python_pep517 import PEP517BuildRequest, build_pep517
 
+                            version = ".".join(python.version.split(".")[:2])
                             configs = [
                                 name
                                 for name in cohort.runtime.contents["files"]
-                                if name.startswith("/usr/lib/python3.13/_sysconfigdata_") and name.endswith(".py")
+                                if name.startswith(f"/usr/lib/python{version}/_sysconfigdata_") and name.endswith(".py")
                             ]
                             if len(configs) != 1:
                                 raise ValueError("target runtime must export one admitted sysconfig data file")

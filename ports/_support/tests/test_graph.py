@@ -194,3 +194,26 @@ def test_runtime_and_platform_edges_remain_distinct_from_link_inputs(recipes):
         ("native/runtime", "runtime"),
         ("native/platform", "platform"),
     }
+
+
+def test_guest_host_wheel_error_identifies_complete_dependency_chain(tmp_path):
+    root = tmp_path / "ports"
+    for name, adapter, dependency_name in [
+        ("consumer", "pure-wheel", "cppy"),
+        ("cppy", "pure-wheel", "setuptools"),
+        ("setuptools", "host-wheel", None),
+    ]:
+        path = root / "python" / name / "recipe.json"
+        path.parent.mkdir(parents=True)
+        recipe = {"name": name, "version": "1", "build": {"adapter": adapter}}
+        if adapter == "host-wheel":
+            recipe["role"] = "host-tool"
+        if dependency_name is not None:
+            recipe["runtime_dependencies"] = [{"port": "python/" + dependency_name, "version": "1"}]
+        path.write_text(json.dumps(recipe))
+    with pytest.raises(ValueError) as failure:
+        plan(root, ["python/consumer"])
+    assert str(failure.value) == (
+        "host-only provider in guest dependency chain: python/consumer/recipe.json -> "
+        "python/cppy/recipe.json -> python/setuptools/recipe.json"
+    )

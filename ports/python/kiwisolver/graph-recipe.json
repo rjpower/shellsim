@@ -49,7 +49,7 @@
     "adapter": "python-pep517"
   },
   "test_limits": {
-    "cpu": 1000000000000,
+    "cpu": 100000000000,
     "memory": 1073741824,
     "disk": 536870912
   },

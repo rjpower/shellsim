@@ -182,3 +182,45 @@ def test_host_backend_wheel_preserves_launchers_without_guest_admission(tmp_path
     (provider / "recipe.json").write_text(json.dumps(recipe))
     with pytest.raises(ValueError):
         plan(root, ["python/example"])
+
+
+@pytest.mark.parametrize("invalid", ["dependency", "data"])
+def test_backend_output_rejects_changed_runtime_dependencies_and_relocation(tmp_path, invalid):
+    from ports._support.python_pep517 import PEP517BuildRequest, _stage_wheel
+
+    extension = _extension_request(tmp_path)
+    request = PEP517BuildRequest(extension.context, extension.cpython, tmp_path / "sysconfig.py", extension.recipe, ())
+    wheel = tmp_path / "example-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example.py", "VALUE = 42\n")
+        metadata = "Name: example\nVersion: 1.0\n"
+        if invalid == "dependency":
+            metadata += "Requires-Dist: unadmitted-runtime==1\n"
+        archive.writestr("example-1.0.dist-info/METADATA", metadata)
+        archive.writestr(
+            "example-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n"
+        )
+        archive.writestr("example-1.0.dist-info/RECORD", "")
+        if invalid == "data":
+            archive.writestr("example-1.0.data/scripts/launch", "#!/bin/sh\n")
+    stage = tmp_path / "wheel-root"
+    stage.mkdir()
+    with pytest.raises(ValueError, match="metadata differs|relocation is unsupported"):
+        _stage_wheel(wheel, stage, request)
+    assert not (stage / "example-1.0.dist-info/shellsim-native.json").exists()
+
+
+@pytest.mark.parametrize(
+    "table",
+    ["build-system = []", "[build-system]\nbuild-backend = 42", "[build-system]\nrequires = []\nbuild-backend = 42"],
+)
+def test_malformed_backend_declaration_fails_before_host_execution(tmp_path, table, monkeypatch):
+    from ports._support.python_pep517 import PEP517BuildRequest, build_pep517
+
+    extension = _extension_request(tmp_path)
+    (extension.context.source / "pyproject.toml").write_text(table)
+    request = PEP517BuildRequest(extension.context, extension.cpython, tmp_path / "sysconfig.py", extension.recipe, ())
+    monkeypatch.setattr("subprocess.run", lambda *_args, **_kwargs: pytest.fail("host backend ran before admission"))
+    with pytest.raises(ValueError, match="build-system|build-backend"):
+        build_pep517(request)
+    assert not extension.context.build.exists()
