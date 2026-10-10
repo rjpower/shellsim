@@ -9,6 +9,12 @@ assert PIL.__version__ == "12.3.0"
 assert features.check_module("freetype2")
 assert features.check_codec("jpg") and features.check_codec("zlib")
 assert not features.check_feature("raqm")
+for codec in ("libtiff", "jpg_2000"):
+    assert not features.check_codec(codec), codec
+for module in ("webp", "avif", "littlecms2"):
+    assert not features.check_module(module), module
+for feature in ("libimagequant", "xcb"):
+    assert not features.check_feature(feature), feature
 image = Image.new("RGB", (8, 8), (240, 20, 30))
 image.save("/tmp/roundtrip.png")
 with Image.open("/tmp/roundtrip.png") as restored:
