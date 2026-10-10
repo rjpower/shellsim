@@ -37,3 +37,20 @@ probe still checks upstream process-level fatal handling. No recovery stubs
 or host codec fallback are used.
 
 This software is based in part on the work of the Independent JPEG Group.
+
+## Threaded shared graph
+
+`graph-recipe.json` builds libjpeg-turbo 2.1.5.1 through its upstream CMake
+project using the admitted threaded Clang and platform nodes. It publishes
+`libjpeg.so`, the upstream headers and pkg-config metadata. Scalar codecs retain
+8-bit samples, the v6b API, arithmetic coding, and memory source/destination
+managers. SIMD and the separate TurboJPEG/Java interfaces are disabled.
+Upstream command-line tools select dynamic linking with `-Bdynamic` during
+the build, using the admitted executable profile. Those commands are not
+part of this library's declared exports.
+
+The native graph probe links the actual shared codec. It encodes and decodes a
+2x1 RGB image within tolerance 3, catches malformed input through the upstream
+error handler and real setjmp/longjmp, and repeats both operations in one
+process to check recovery. The legacy static and serial recipes remain separate
+historical entrypoints.

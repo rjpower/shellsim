@@ -1,0 +1,104 @@
+{
+  "kind": "native-library",
+  "name": "freetype",
+  "version": "2.13.3",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "linkage": "shared",
+  "source": {
+    "url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz",
+    "sha256": "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289",
+    "subdirectory": "freetype-2.13.3"
+  },
+  "target_dependencies": [
+    {
+      "port": "native/zlib",
+      "version": "1.3.1",
+      "recipe": "native/zlib/cmake-recipe.json"
+    }
+  ],
+  "build_scripts": [],
+  "build": {
+    "adapter": "meson",
+    "configure_args": [
+      "--buildtype=release",
+      "-Ddefault_library=shared",
+      "-Dzlib=system",
+      "-Dbrotli=disabled",
+      "-Dbzip2=disabled",
+      "-Dharfbuzz=disabled",
+      "-Dmmap=disabled",
+      "-Dpng=disabled"
+    ],
+    "jobs": 2,
+    "install_prefix": "/usr/local"
+  },
+  "source_exports": [
+    {
+      "source": "LICENSE.TXT",
+      "destination": "licenses/freetype.txt"
+    },
+    {
+      "source": "docs/FTL.TXT",
+      "destination": "licenses/freetype-FTL.txt"
+    },
+    {
+      "source": "docs/GPLv2.TXT",
+      "destination": "licenses/freetype-GPLv2.txt"
+    }
+  ],
+  "exports": {
+    "pkg_config": [
+      "lib/pkgconfig/freetype2.pc"
+    ],
+    "licenses": [
+      "licenses/freetype.txt",
+      "licenses/freetype-FTL.txt",
+      "licenses/freetype-GPLv2.txt"
+    ],
+    "shared_libraries": [
+      "lib/libfreetype.so"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include/freetype2"
+    ]
+  },
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/graph_smoke.c",
+      "include_directories": [
+        "include/freetype2"
+      ],
+      "link_inputs": [
+        "lib/libfreetype.so",
+        "lib/libz.so"
+      ],
+      "cohort_link_inputs": [
+        "lib/wasm32-wasip1-threads/libsetjmp.a"
+      ]
+    }
+  ],
+  "role": "target-library",
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "soname": "libfreetype.so",
+  "needed_libraries": [
+    "libz.so"
+  ]
+}
