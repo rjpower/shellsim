@@ -534,10 +534,7 @@ def run_graph(
                     max_workers=max_workers,
                     compiler_cache=compiler_cache,
                     build_key=build_key,
-                    worker_identity={
-                        name: connection[name]
-                        for name in ("config_sha256", "task_image", "service_id")
-                    },
+                    worker_identity={name: connection[name] for name in ("config_sha256", "task_image", "service_id")},
                 )
         if blob_store is None or remote_backend is None:
             raise ValueError("Iris builds require a connected remote service and its blob store")
