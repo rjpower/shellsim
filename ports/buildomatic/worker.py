@@ -240,10 +240,11 @@ class WorkerExecutor:
         child = status.get("child") if status is not None else None
         if child is not None:
             token = process_token(child)
-            if token is not None and token != status.get("child_token"):
-                raise RuntimeError("cannot reconcile a reused action PID")
-            kill_group(child)
-            wait_group(child)
+            # A changed start token proves the owned action is gone. Never kill
+            # the unrelated process which now happens to use its numeric PID.
+            if token is None or token == status.get("child_token"):
+                kill_group(child)
+                wait_group(child)
         status = {
             "phase": "completed",
             "returncode": None,

@@ -411,6 +411,26 @@ def test_launch_crash_window_becomes_failure_without_reexecution(worker):
     assert result.state == AttemptState.FAILED
 
 
+def test_reused_action_pid_terminalizes_without_signalling_unrelated_group(worker, monkeypatch):
+    import ports.buildomatic.worker as implementation
+
+    item = attempt("must not execute")
+    directory = worker.root / "attempts/test"
+    directory.mkdir()
+    atomic_write(directory / "plan.json", encode({"attempt": asdict(item), "limits": asdict(worker.limits)}))
+    atomic_write(directory / "status.json", encode({"phase": "running", "child": 999999, "child_token": "original"}))
+    monkeypatch.setattr(implementation, "process_token", lambda pid: "different")
+
+    def unexpected_signal(pid):
+        raise AssertionError("reused process must never be signalled")
+
+    monkeypatch.setattr(implementation, "kill_group", unexpected_signal)
+    result = worker.poll(item.id).result
+    assert result.state == AttemptState.FAILED
+    assert result.error == "worker supervisor lost"
+    assert worker.poll(item.id).result == result
+
+
 def test_real_dag_dependency_bundle_and_independent_progress(worker, store, tmp_path):
     other = WorkerExecutor(store, tmp_path / "other-worker", worker.limits)
     first = Action(
