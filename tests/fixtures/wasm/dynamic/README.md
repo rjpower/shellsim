@@ -164,3 +164,14 @@ resolved VFS paths remain the cache and cycle identities. Host build directories
 embedded by Wasm linkers grant no host filesystem access and normally miss in
 the VFS. Relative paths and variables other than ORIGIN remain unsupported.
 The serial v1/v2 loader retains its existing `/lib` policy.
+
+Runtime-path identity follows the canonical VFS path, rather than the needed
+basename: distinct resolved files may load separately. Missing directories or
+files continue the ordered search; other VFS errors and non-file candidates
+abort loading instead of being hidden by a later fallback.
+
+Threaded v3 resolves weak function imports from existing providers first. An
+unresolved function declared weak by LLVM import metadata has a null GOT address
+and a signature-matched trapping direct-call binding, matching LLD's undefined
+weak stubs. Guarded C++ TLS initialization therefore skips an absent optional
+initializer; an unconditional call traps. Missing strong symbols remain errors.

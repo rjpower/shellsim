@@ -2,9 +2,11 @@
 
 use super::{reserve_store, Loaded, Record};
 use crate::commands::wasm::{build_linker, fibers, Host};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use wasmtime::{
-    AsContextMut, Error, Extern, ExternType, Global, Mutability, Ref, StoreContextMut, Val, ValType,
+    AsContextMut, Error, Extern, ExternType, Func, Global, Mutability, Ref, StoreContextMut, Val,
+    ValType,
 };
 
 fn library_export(
@@ -233,6 +235,20 @@ pub(super) async fn install(
     super::super::posix_exec::register(&mut linker);
     super::super::posix_open::register(&mut linker);
     super::register(&mut linker);
+    // LLVM records function weakness in env, not in its separate GOT.func import.
+    let weak_functions: BTreeSet<_> = record
+        .module
+        .imports()
+        .filter(|import| {
+            import.module() == "env"
+                && matches!(import.ty(), ExternType::Func(_))
+                && record
+                    .layout
+                    .weak_imports
+                    .contains(&("env".to_owned(), import.name().to_owned()))
+        })
+        .map(|import| import.name().to_owned())
+        .collect();
     let mut own_got = Vec::new();
     let mut imported_memory = false;
     for import in record.module.imports() {
@@ -296,6 +312,7 @@ pub(super) async fn install(
                     .layout
                     .weak_imports
                     .contains(&(namespace.to_owned(), name.to_owned()))
+                    || (namespace == "GOT.func" && weak_functions.contains(name))
                 {
                     Extern::Global(Global::new(&mut store, ty, Val::I32(0))?)
                 } else {
@@ -317,9 +334,27 @@ pub(super) async fn install(
                 }
             }
             ("env", _) => {
-                lookup(store.as_context_mut(), name, &record.dependencies)?
-                    .ok_or_else(|| Error::msg(format!("missing dynamic symbol: {name}")))?
-                    .0
+                if let Some(symbol) = lookup(store.as_context_mut(), name, &record.dependencies)? {
+                    symbol.0
+                } else if record
+                    .layout
+                    .weak_imports
+                    .contains(&(namespace.to_owned(), name.to_owned()))
+                {
+                    let ExternType::Func(ty) = import.ty() else {
+                        return Err(Error::msg("unsupported unresolved weak import kind"));
+                    };
+                    // LLD's unresolved weak direct-call stub traps; its GOT address is zero.
+                    // A guarded C++ TLS initialization call consequently never invokes it.
+                    let name = name.to_owned();
+                    Extern::Func(Func::new(&mut store, ty, move |_, _, _| {
+                        Err(Error::msg(format!(
+                            "unresolved weak function called: {name}"
+                        )))
+                    }))
+                } else {
+                    return Err(Error::msg(format!("missing dynamic symbol: {name}")));
+                }
             }
             _ => {
                 return Err(Error::msg(format!(

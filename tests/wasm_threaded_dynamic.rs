@@ -531,3 +531,128 @@ fn threaded_cpp_runnable_process_cancellation_releases_all_stores_and_heaps() {
     assert_eq!(stdout, b"ready\n");
     assert!(outcome.usage.memory_current < 1024 * 1024);
 }
+
+// LLVM emits weak import metadata for the env function, while its address is
+// imported separately through GOT.func. Exercise both bindings in real Stores.
+fn weak_side(weak: bool, direct: bool) -> Vec<u8> {
+    let flags = if weak {
+        r"\04\0f\01\03env\08optional\11"
+    } else {
+        ""
+    };
+    let call = if direct {
+        "(call $optional)"
+    } else {
+        "(if (global.get $address) (then (call $optional)))"
+    };
+    wat::parse_str(format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-threads-v3")
+        (@custom "dylink.0" "\01\04\00\00\00\00\80\18\16shellsim.deferred-init\01{flags}")
+        (import "env" "memory" (memory 1 4 shared))
+        (import "env" "optional" (func $optional))
+        (import "GOT.func" "optional" (global $address (mut i32)))
+        (func (export "answer") (result i32) {call}
+            (if (result i32) (global.get $address)
+                (then (i32.load (i32.const 0))) (else (i32.const 7)))))"#
+    ))
+    .unwrap()
+}
+
+fn weak_environment(provider: bool, body: &str) -> Environment {
+    let provider = if provider {
+        r#"(func (export "optional") (i32.store (i32.const 0) (i32.const 42)))"#
+    } else {
+        ""
+    };
+    let main = wat::parse_str(format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-threads-v3")
+        (@custom "dylink.0" "\81\13\11shellsim.main-tls\01")
+        (import "env" "memory" (memory 1 4 shared))
+        (import "shellsim_threads_v2" "thread_ready" (func (param i32 i32)))
+        (import "shellsim_dylink_v3" "open" (func $open (param i32 i32 i32) (result i32)))
+        (import "shellsim_dylink_v3" "symbol" (func $symbol (param i32 i32 i32) (result i32)))
+        (export "memory" (memory 0))
+        (table (export "__indirect_function_table") 1 funcref)
+        (global (export "__stack_pointer") (mut i32) (i32.const 65536))
+        (global (export "__stack_low") i32 (i32.const 32768))
+        (global (export "__stack_high") i32 (i32.const 65536))
+        (global $heap (mut i32) (i32.const 4096))
+        (data $path "/side.so") (data $name "answer")
+        (func (export "malloc") (param $size i32) (result i32) (local $base i32)
+            (local.set $base (global.get $heap))
+            (global.set $heap (i32.add (global.get $heap) (local.get $size))) (local.get $base))
+        (func (export "wasi_thread_start") (param i32 i32))
+        {provider}
+        (func (export "_start") (local $handle i32)
+            (memory.init $path (i32.const 32) (i32.const 0) (i32.const 8))
+            (memory.init $name (i32.const 64) (i32.const 0) (i32.const 6))
+            (data.drop $path) (data.drop $name)
+            (local.set $handle (call $open (i32.const 32) (i32.const 8) (i32.const 2)))
+            {body}))"#
+    ))
+    .unwrap();
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 100_000_000,
+        memory: 64 * 1024 * 1024,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+    environment
+}
+
+#[test]
+fn unresolved_weak_function_has_null_address_and_guarded_call_skips_it() {
+    for (provider, expected) in [(false, 7), (true, 42)] {
+        let body = format!(
+            r#"
+            (if (i32.eqz (local.get $handle)) (then unreachable))
+            (if (i32.ne (call_indirect (result i32)
+                (call $symbol (local.get $handle) (i32.const 64) (i32.const 6)))
+                (i32.const {expected})) (then unreachable))"#
+        );
+        let mut environment = weak_environment(provider, &body);
+        environment
+            .vfs
+            .write("/", "/side.so", &weak_side(true, false), 0o644)
+            .unwrap();
+        let (outcome, _, stderr) = environment.run_script_capture("/app");
+        assert_eq!(
+            outcome.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+#[test]
+fn calling_unresolved_weak_function_traps_instead_of_returning_success() {
+    let mut environment = weak_environment(
+        false,
+        r#"
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (drop (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 6))))"#,
+    );
+    environment
+        .vfs
+        .write("/", "/side.so", &weak_side(true, true), 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("/app");
+    assert_ne!(outcome.exit_status, 0);
+    assert!(String::from_utf8_lossy(&stderr).contains("unresolved weak function called: optional"));
+}
+
+#[test]
+fn missing_strong_function_still_prevents_side_publication() {
+    let mut environment = weak_environment(false, "(if (local.get $handle) (then unreachable))");
+    environment
+        .vfs
+        .write("/", "/side.so", &weak_side(false, false), 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("/app");
+    assert_eq!(outcome.exit_status, 126);
+    assert!(String::from_utf8_lossy(&stderr).contains("missing dynamic symbol: optional"));
+}
