@@ -47,5 +47,18 @@ result = subprocess.run(
 )
 assert result.stdout == b"/tmp\ncorrected-platform\n"
 assert result.stderr == b""
+arguments = [f"arg-{index}" for index in range(1500)]
+result = subprocess.run(
+    [
+        sys.executable,
+        "-c",
+        "import sys; assert sys.argv[1:] == [f'arg-{i}' for i in range(1500)]; print('large argv passed')",
+        *arguments,
+    ],
+    capture_output=True,
+    check=True,
+)
+assert result.stdout == b"large argv passed\n"
+assert result.stderr == b""
 check_errno()
 print("threaded CPython: parent/worker errno and subprocess passed")

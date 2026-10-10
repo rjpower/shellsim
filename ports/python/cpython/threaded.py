@@ -228,6 +228,7 @@ def compile_process_facades(work, make, cc, environment, directory):
                 [
                     str(make),
                     "--no-print-directory",
+                    "--old-file=Makefile",
                     "--eval",
                     compile_rule,
                     "CC=" + shlex.join(cc),

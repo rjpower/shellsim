@@ -24,7 +24,7 @@
   "build_scripts": [
     {
       "file": "threaded.py",
-      "sha256": "b98e20d95273e8b9bc90aaa205a9608509d6344e4567d49283e1dd826327fdb8"
+      "sha256": "76d1d76cef44a87873bd293aad297b1ef3554df5cfdc6a4ee12002824d988795"
     },
     {
       "file": "sdk34-threads.patch",
