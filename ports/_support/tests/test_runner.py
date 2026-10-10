@@ -17,6 +17,10 @@ class PureCohort:
     dynamic_abi: str = "test-pure-cohort"
     identity: str = "pinned-cohort"
 
+    @property
+    def toolchain_receipt(self):
+        return {"cohort": self.identity, "target": self.target, "abi": self.dynamic_abi}
+
 
 def _wheel_port(ports, store, name, dependencies):
     directory = ports / "python" / name
@@ -117,6 +121,7 @@ def test_acceptance_uses_port_namespace_when_names_collide(tmp_path, monkeypatch
     build = runner.GraphBuild(
         Graph((native.reference, python.reference), (native, python)),
         {native.reference: native_result, python.reference: tmp_path / "python-result"},
+        {native.reference: PureCohort(), python.reference: PureCohort()},
     )
     kinds = []
 
@@ -131,3 +136,66 @@ def test_acceptance_uses_port_namespace_when_names_collide(tmp_path, monkeypatch
     descriptor.write_text("{}")
     runner.accept_graph(build, PureCohort(), descriptor, tmp_path / "proof")
     assert kinds == [(native.reference, "native"), (python.reference, "pypi")]
+
+
+def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkeypatch):
+    from ports._support import acceptance, native_artifacts
+    from ports._support import cohort as cohort_module
+    from ports._support.acceptance import _native_command
+    from ports._support.cohort import BuildCohort, Receipt, resolved_toolchain
+    from ports.native import dependencies
+
+    recipe = {"name": "admitted-producer"}
+
+    def product(name, digest):
+        root = tmp_path / name
+        (root / "bin").mkdir(parents=True)
+        for tool in ("clang", "clang++", "llvm-ar", "llvm-ranlib", "llvm-strip"):
+            (root / "bin" / tool).write_bytes(name.encode())
+        return Receipt(root, root / "manifest.json", digest * 64, {"identity": {"recipe": recipe}})
+
+    original_compiler = product("original-compiler", "a")
+    original_platform = product("original-platform", "b")
+    sdk = product("sdk", "c")
+    original = BuildCohort(sdk, original_compiler, original_platform, None, None, None, {}, {}, "d" * 64, True)
+    bootstrap_compiler = product("bootstrap-compiler", "e")
+    bootstrap_platform = product("bootstrap-platform", "f")
+    monkeypatch.setattr(cohort_module, "local_recipe", lambda _name: recipe)
+    resolved = resolved_toolchain(original, bootstrap_compiler, bootstrap_platform)
+    target = runner._native_target(resolved)
+    assert target.toolchain["compiler"] == bootstrap_compiler.sha256
+    assert target.toolchain["platform"] == bootstrap_platform.sha256
+    assert target.toolchain["cohort"] == resolved.identity != original.identity
+
+    port = Port("native/example/recipe.json", tmp_path, "example", "1", "1" * 64, (), {"tests": [{"kind": "native"}]})
+    result = tmp_path / "result"
+    (result / "native").mkdir(parents=True)
+    graph = runner.GraphBuild(Graph((port.reference,), (port,)), {port.reference: result}, {port.reference: resolved})
+    commands, targets = [], []
+
+    def observed_merge(_direct, _closure, prefix, actual_target):
+        targets.append(actual_target.toolchain)
+        prefix.mkdir(parents=True)
+
+    def observed_accept(request):
+        commands.append(
+            _native_command(
+                request.cohort, request.dependency_sysroot, tmp_path / "probe.c", tmp_path / "probe.wasm", [], [], []
+            )
+        )
+        request.output.mkdir(parents=True)
+
+    monkeypatch.setattr(native_artifacts, "merge_dependency_sysroot", observed_merge)
+    monkeypatch.setattr(dependencies, "verify_artifact", lambda _prefix: {})
+    monkeypatch.setattr(acceptance, "accept_port", observed_accept)
+    (tmp_path / "release.json").write_text("{}")
+    runner.accept_graph(graph, original, tmp_path / "release.json", tmp_path / "proof")
+    assert targets == [target.toolchain]
+    command = commands[0]
+    assert command[0] == str(bootstrap_compiler.root / "bin/clang")
+    assert "--sysroot=" + str(bootstrap_platform.root / "sysroot") in command
+    assert not any(
+        str(original_compiler.root) in argument or str(original_platform.root) in argument for argument in command
+    )
+    proof = json.loads((tmp_path / "proof/graph.json").read_text())
+    assert proof["resolved_toolchains"][port.reference] == target.toolchain

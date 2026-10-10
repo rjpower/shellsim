@@ -48,6 +48,14 @@ class GraphBuild:
 
     graph: Graph
     results: dict[str, Path]
+    cohorts: dict[str, BuildCohort]
+
+
+def _native_target(cohort: BuildCohort):
+    """Use the same resolved products for sealing and acceptance closure checks."""
+    from ports._support.native_artifacts import NativeTarget
+
+    return NativeTarget(cohort.target, cohort.dynamic_abi, cohort.dynamic_abi, cohort.toolchain_receipt)
 
 
 def _local_file(port: Port, name: object) -> Path:
@@ -178,7 +186,6 @@ def build_graph(
     """Build each selected recipe once, reusing only byte-verified cache entries."""
     from ports._support.native_artifacts import (
         NativeArtifact,
-        NativeTarget,
         merge_dependency_sysroot,
         seal_native_install,
     )
@@ -221,12 +228,7 @@ def build_graph(
     native: dict[str, NativeArtifact] = {}
     keys: dict[str, str] = {}
     products = {}
-    target = NativeTarget(
-        cohort.target,
-        cohort.dynamic_abi,
-        cohort.dynamic_abi,
-        {"cohort": cohort.identity, "target": cohort.target, "abi": cohort.dynamic_abi},
-    )
+    cohorts = {}
     for port in graph.ports:
         adapter = port.recipe["build"]["adapter"]
         if adapter in {"llvm-host", "wasi-sysroot"}:
@@ -257,6 +259,8 @@ def build_graph(
                 if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
             )
             build_cohort = resolved_toolchain(cohort, compiler, sysroot)
+            target = _native_target(build_cohort)
+        cohorts[port.reference] = build_cohort
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
@@ -305,41 +309,17 @@ def build_graph(
                     workspace = slot.work
                     if adapter == "llvm-guest":
                         from ports._support.store import identity
+                        from ports.toolchain.llvm.guest import workspace_compatibility
 
-                        compatibility = {
-                            "source": recipe["source"]["sha256"],
-                            "patches": recipe.get("patches", []),
-                            "compiler": {
-                                name: compiler.contents["artifacts"]["bin/" + name]
-                                for name in (
-                                    "clang",
-                                    "llvm-ar",
-                                    "llvm-objcopy",
-                                    "llvm-tblgen",
-                                    "llvm-min-tblgen",
-                                    "clang-tblgen",
-                                )
-                            },
-                            "platform": {
-                                path: digest
-                                for path, digest in sysroot.contents["artifacts"].items()
-                                if path.startswith("sysroot/include/")
-                            },
-                            "resources": {
-                                path: digest
-                                for path, digest in cohort.sdk.contents.items()
-                                if path.startswith("lib/clang/23/include/")
-                            },
-                            "dependencies": {
-                                name: {
-                                    path: digest
-                                    for path, digest in artifact.manifest["files"].items()
-                                    if path.startswith("include/")
-                                }
-                                for name, artifact in direct.items()
-                            },
-                            "host_tools": {name: cohort.host_tools[name].sha256 for name in ("cmake", "ninja")},
-                        }
+                        compatibility = workspace_compatibility(
+                            recipe,
+                            compiler,
+                            sysroot.root / "sysroot",
+                            cohort.sdk.root,
+                            {name: artifact.prefix for name, artifact in direct.items()},
+                            {name: tool.path for name, tool in cohort.host_tools.items()},
+                            build_cohort.target,
+                        )
                         workspace = (
                             workspaces[port.reference].resolve()
                             if workspaces is not None and port.reference in workspaces
@@ -400,7 +380,7 @@ def build_graph(
                         elif adapter == "llvm-guest":
                             from ports.toolchain.llvm.guest import build_guest
 
-                            output = build_guest(context, recipe, compiler)
+                            output = build_guest(context, recipe, compiler, jobs=jobs)
                         else:
                             output = build_native(
                                 NativeBuildRequest(
@@ -435,7 +415,7 @@ def build_graph(
             native[PurePosixPath(port.reference).parts[0] + "/" + port.name] = NativeArtifact(
                 result / "native", verify_artifact(result / "native")
             )
-    return GraphBuild(graph, results)
+    return GraphBuild(graph, results, cohorts)
 
 
 def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
@@ -513,7 +493,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
 def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, output: Path) -> None:
     """Run every selected port's declared guest checks against the graph release."""
     from ports._support.acceptance import AcceptanceRequest, accept_port
-    from ports._support.native_artifacts import NativeArtifact, NativeTarget, merge_dependency_sysroot
+    from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot
     from ports.native.dependencies import verify_artifact
 
     output = output.absolute()
@@ -526,15 +506,10 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
         prefix = build.results[port.reference] / "native"
         if prefix.exists():
             native[port.reference.split("/", 1)[0] + "/" + port.name] = NativeArtifact(prefix, verify_artifact(prefix))
-    target = NativeTarget(
-        cohort.target,
-        cohort.dynamic_abi,
-        cohort.dynamic_abi,
-        {"cohort": cohort.identity, "target": cohort.target, "abi": cohort.dynamic_abi},
-    )
     for port in build.graph.ports:
         if port.role in {"host-tool", "target-platform"}:
             continue
+        build_cohort = build.cohorts[port.reference]
         proof = output / Path(port.reference).with_suffix("")
         identity = port.reference.split("/", 1)[0] + "/" + port.name
         kind = "native" if identity in native else "pypi"
@@ -544,13 +519,17 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
                 raise ValueError(f"native port has no sealed artifact: {port.reference}")
             if any(test["kind"] == "native" for test in port.recipe.get("tests", [])):
                 dependencies = proof.parent / (proof.name + "-dependencies")
+                target = _native_target(build_cohort)
                 merge_dependency_sysroot({identity: native[identity]}, native, dependencies, target)
-        accept_port(AcceptanceRequest(port, descriptor, proof, kind, cohort, dependencies))
+        accept_port(AcceptanceRequest(port, descriptor, proof, kind, build_cohort, dependencies))
     (output / "graph.json").write_text(
         json.dumps(
             {
                 "release_sha256": file_hash(descriptor),
                 "cohort": cohort.identity,
+                "resolved_toolchains": {
+                    reference: resolved.toolchain_receipt for reference, resolved in sorted(build.cohorts.items())
+                },
                 "recipes": {port.reference: port.digest for port in build.graph.ports},
                 "builds": {name: path.name for name, path in build.results.items()},
             },

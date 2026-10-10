@@ -111,10 +111,10 @@ compiler and requires its explicit platform dependency.
 A trusted cohort descriptor pins the historical CPython manifest in full.
 Admission verifies its runtime files, headers, sysroot build profile and matching
 assembled interpreter. Its recipe must match the accepted Python source, patches,
-version, ABI and every other policy field. Historical `build_scripts` hashes
-remain provenance in that pinned manifest; they need not match driver pins for
-new builds. Updating a build driver or a C++ declaration header therefore does
-not invalidate a verified interpreter with the same accepted source and ABI.
+version, ABI and every other policy field. Historical Python driver and JSON
+metadata hashes remain provenance in that pinned manifest; their current pins
+govern new builds. The declared input paths must match exactly, and compiled
+facade sources, headers and patches must retain their current accepted hashes.
 
 The `wasi-sysroot` platform node invokes the pinned libc producer when
 `--platform-bootstrap` supplies a schema-1 descriptor with `sdk_archive` and
@@ -126,3 +126,10 @@ Without bootstrap archives, the explicit cohort platform receipt is reused.
 Guest LLVM workspace compatibility tracks compiler and generator bytes and
 consumed headers; changed linker tools or archives update verified snapshots
 at stable paths and trigger relinking. Result identities still bind all files.
+
+Each native graph node seals a resolved toolchain receipt with the actual
+compiler and platform manifest hashes. Its cohort identity derives from the
+input cohort and those two receipts. Graph acceptance retains that per-node
+context and compiles probes with the same selected compiler and sysroot; it
+also records the resolved receipts in `graph.json`. Bootstrap-selected products
+therefore cannot retain the original cohort toolchain label.

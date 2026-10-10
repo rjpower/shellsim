@@ -107,6 +107,17 @@ class BuildCohort:
     def dynamic_abi(self) -> str:
         return ABI
 
+    @property
+    def toolchain_receipt(self) -> dict[str, str]:
+        """Identify the actual compiler and platform products used by a node."""
+        return {
+            "cohort": self.identity,
+            "target": self.target,
+            "abi": self.dynamic_abi,
+            "compiler": self.llvm.sha256,
+            "platform": self.sysroot.sha256,
+        }
+
     def compiler(self, *, cxx: bool = False) -> Path:
         if not self.has_frontend:
             raise ValueError("this cohort has no standard patched Clang frontend")
@@ -215,8 +226,9 @@ def verify_cpython_recipe(recipe: dict) -> None:
     """Admit historical build provenance while retaining the Python source policy.
 
     The trusted cohort descriptor pins the consumed manifest, including its
-    historical driver hashes. Current driver pins govern new builds. Every
-    other recipe field still identifies the accepted source and runtime ABI.
+    historical driver hashes. Current Python driver and JSON metadata pins
+    govern new builds. Compiled facade sources, headers and patches must still
+    match, along with every other source and runtime ABI field.
     """
     current = local_recipe("python/cpython/threaded-recipe.json")
     scripts = recipe.get("build_scripts")
@@ -238,6 +250,12 @@ def verify_cpython_recipe(recipe: dict) -> None:
         != {key: value for key, value in current.items() if key != "build_scripts"}
     ):
         raise ValueError("CPython producer source or ABI profile differs")
+    historical = {item["file"]: item["sha256"] for item in scripts}
+    expected = {item["file"]: item["sha256"] for item in current["build_scripts"]}
+    if len(historical) != len(scripts) or historical.keys() != expected.keys():
+        raise ValueError("CPython producer input declarations differ")
+    if any(value != expected[name] and Path(name).suffix not in {".py", ".json"} for name, value in historical.items()):
+        raise ValueError("CPython compiled facade source differs")
 
 
 def verify_host_files(proof_path: Path, producer: dict, name: str, executable: Path) -> None:
@@ -623,8 +641,14 @@ def resolved_toolchain(cohort: BuildCohort, compiler: Receipt, sysroot: Receipt)
             "strip": "llvm-strip",
         }.items()
     }
+    identity = json_hash({"cohort": cohort.identity, "compiler": compiler.sha256, "platform": sysroot.sha256})
     return replace(
-        cohort, llvm=compiler, sysroot=sysroot, target_tools=MappingProxyType(target_tools), has_frontend=True
+        cohort,
+        llvm=compiler,
+        sysroot=sysroot,
+        target_tools=MappingProxyType(target_tools),
+        identity=identity,
+        has_frontend=True,
     )
 
 

@@ -113,6 +113,40 @@ def test_historical_python_driver_pins_do_not_change_source_admission():
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        "../../toolchain/wasi_process/process.c",
+        "../../toolchain/wasi_sdk/posix.h",
+        "../../toolchain/wasi_process/cpython-3.13.7-process.patch",
+    ],
+)
+def test_historical_python_receipt_rejects_changed_compiled_inputs(source):
+    from ports._support.cohort import local_recipe, verify_cpython_recipe
+
+    historical = local_recipe("python/cpython/threaded-recipe.json")
+    entry = next(item for item in historical["build_scripts"] if item["file"] == source)
+    entry["sha256"] = "0" * 64
+    with pytest.raises(ValueError):
+        verify_cpython_recipe(historical)
+
+
+@pytest.mark.parametrize("replacement", [None, "threaded.py"])
+def test_historical_python_receipt_cannot_hide_a_compiled_input(replacement):
+    from ports._support.cohort import local_recipe, verify_cpython_recipe
+
+    historical = local_recipe("python/cpython/threaded-recipe.json")
+    entry = next(
+        item for item in historical["build_scripts"] if item["file"] == "../../toolchain/wasi_process/process.c"
+    )
+    if replacement is None:
+        historical["build_scripts"].remove(entry)
+    else:
+        entry["file"] = replacement
+    with pytest.raises(ValueError):
+        verify_cpython_recipe(historical)
+
+
+@pytest.mark.parametrize(
     "field,value",
     [
         ("source", {"url": "https://example.invalid/python.tar.xz", "sha256": "0" * 64}),
