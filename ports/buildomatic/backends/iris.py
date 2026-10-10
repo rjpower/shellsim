@@ -487,13 +487,18 @@ def _runtime_files() -> dict[str, bytes]:
         # The transported package already supplies its Python modules. Resolve
         # its own runtime requirements, including checkout-only additions that
         # may not yet appear in the latest published package metadata.
-        dependencies.update(requirement for requirement in requirements if not requirement.startswith("marin-rigging"))
+        dependencies.update(
+            requirement
+            for requirement in requirements
+            if not requirement.startswith(("marin-rigging", "marin-finelog-server", "marin-iris-native"))
+        )
         for path in root.rglob("*.py"):
             result[f"{package}/{path.relative_to(root).as_posix()}"] = path.read_bytes()
     result["pyproject.toml"] = (
         '[project]\nname = "buildomatic-iris-runtime"\nversion = "0.0.0"\n'
         'requires-python = ">=3.12,<3.14"\n'
         f"dependencies = {json.dumps(sorted(dependencies))}\n"
+        "[tool.uv]\nrequired-environments = [\"sys_platform == 'linux' and platform_machine == 'x86_64'\"]\n"
     ).encode()
     checkout = find_project_root(Path(rigging.filesystem.factory.__file__).parent)
     directories = tuple(
@@ -759,7 +764,9 @@ def _run_coordinator(config: IrisConfig) -> None:
             worker_id=name,
         )
     service = CoordinatorService(store, config.service_id, workers)
-    server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_BEARER)
+    # Current Iris calls scoped-capability access LINK. Its native verifier also
+    # accepts that token in Authorization, keeping it out of logged URLs.
+    server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_LINK)
     stop = threading.Event()
     errors = []
 
