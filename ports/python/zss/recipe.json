@@ -1,0 +1,55 @@
+{
+  "name": "zss",
+  "version": "1.2.0",
+  "role": "target-library",
+  "kind": "python-project",
+  "source": {
+    "filename": "zss-1.2.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/1e/d1/ed34d12f55d07cc1efb61d74fb2f64f46a705557f5bdd1ef1b810f0e2ec5/zss-1.2.0.tar.gz",
+    "sha256": "07bb937441929ccb82961f4f7b80fbce9e2b20d0e46ddcbcbc1fcb094f585b50",
+    "subdirectory": "zss-1.2.0"
+  },
+  "requires_dist": [
+    "six"
+  ],
+  "build": {
+    "adapter": "python-pep517"
+  },
+  "target": "wasm32-wasip1-threads",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    },
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/six",
+      "version": "1.17.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ]
+}

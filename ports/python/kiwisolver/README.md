@@ -1,5 +1,28 @@
 # Kiwi 1.5.1
 
+`graph-recipe.json` builds the pinned upstream sdist through its actual PEP 517
+setuptools backend for the threaded v3 cohort. Graph build dependencies supply
+unchanged setuptools, setuptools_scm, packaging and CPPy wheels in a private
+host import tree. CPPy's CppyBuildExt helper supplies its headers; upstream
+setuptools_scm generates the version header. No replacement source inventory
+or global host environment is required.
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports python/kiwisolver/graph-recipe.json \
+  --cohort /path/to/threaded/cohort.json --store /path/to/ports-cache \
+  --output /path/to/kiwi-release --check
+```
+
+The public release installer accepts `kiwisolver==1.5.1`. Its guest probe covers
+two-variable constraints, edit variables, corrected methods and properties,
+invalid input, and translated C++ constraint errors. See
+[backend admission](../../_support/PYTHON_BACKENDS.md) for the pinned offline
+hook and target sysconfig contract. This GIL-enabled cohort does not enable
+free-threaded Python or establish Matplotlib's other native providers.
+
+## Historical dynamic v2 build
+
 This port builds the seven upstream C++ sources as an independent CPython 3.13
 extension for SDK 34 dynamic ABI v2. The fixed interpreter owns libc, libc++, the
 C++ exception tag and Python runtime. The extension imports them and contains no
