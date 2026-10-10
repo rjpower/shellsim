@@ -227,3 +227,9 @@ against the actual exports of declared shared providers before sealing.
 `build.required_shared_libraries` names admitted provider basenames that at
 least one installed extension must declare in its Wasm dependency metadata.
 This establishes the provider link separately from behavioral guest checks.
+
+The pinned Meson patch also handles WASI link checks with explicit shared
+provider inputs. It links those checks as PIC side modules and rejects
+unresolved symbols. Executable checks keep their normal policy. OpenBLAS
+symbol-existence checks retain volatile function addresses without calling
+unknown prototypes; callable ABI checks still reject signature mismatches.
