@@ -68,6 +68,18 @@ retain assignments; they never imply loss. Only explicit `UNKNOWN` permits a
 bounded retry, after cancellation tombstones fence delayed dispatch. A worker
 endpoint removed from the mapping remains uncertain until restored.
 
+`Coordinator.worker_lost(worker_id)` fences a confirmed terminal worker instance
+in the journal before bounded retry. Worker IDs must identify immutable lifecycle
+instances; replacements need fresh IDs and endpoint namespaces. The caller must
+verify matching original instance identity, terminal state and a finished
+timestamp. For Iris this means the original `TaskAttempt(task_id, attempt_id)`
+with matching controller-minted `attempt_uid`, terminal state and non-null
+`finished_at`; current-task status, degradation, RPC timeout or a missing UID
+does not suffice. Retired IDs remain excluded across coordinator restart and
+late completions cannot become authoritative. This guarantees journal fencing:
+old private processes may persist under a partition, so it does not promise
+physical exactly-once compilation. Independent actions continue normally.
+
 `WorkerExecutor` preserves attempts across client restart using a detached
 supervisor, durable launch records, locks and process start identities. A pipe
 gate prevents argv execution until child identity is durable. Lost supervisors

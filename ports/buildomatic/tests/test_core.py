@@ -364,6 +364,62 @@ def test_explicit_worker_loss_and_failure_retry_are_bounded(store):
     assert result.nodes[0].attempts == 2
 
 
+def test_confirmed_terminal_worker_is_fenced_before_retry_and_after_reopen(store, bundle):
+    old, fresh = FakeWorker(store), FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"old-instance": old})
+    coordinator.submit(request(action("a")))
+    coordinator.tick()
+    old_id = next(iter(old.attempts))
+    old.unavailable = True
+    for _ in range(3):
+        assert coordinator.tick().nodes[0].attempts == 1
+    coordinator.workers["fresh-instance"] = fresh
+    coordinator.worker_lost("old-instance")
+    durable = json.loads(store.read_journal("build").data)
+    assert durable["lost_workers"] == ["old-instance"]
+    assert not durable["attempts"][old_id]["active"]
+    assert not durable["attempts"][old_id]["ack_pending"]
+    assert list(fresh.attempts) != [old_id]
+    assert len(fresh.attempts) == 1
+    assert coordinator.worker_lost("old-instance").nodes[0].attempts == 2
+    # The retired private process may still complete; it cannot publish a result
+    # in the accepted request or become an available slot again.
+    old.unavailable = False
+    old.complete("a", bundle)
+    reopened = Coordinator(store, "build", {"old-instance": old, "fresh-instance": fresh})
+    assert reopened.tick().nodes[0].state == NodeState.RUNNING
+    assert len(old.attempts) == 1
+    fresh.complete("a", bundle)
+    assert reopened.tick().state == BuildState.SUCCEEDED
+    reopened.acknowledge()
+    assert not old.acknowledged
+    assert fresh.acknowledged == set(fresh.attempts)
+    with pytest.raises(CoordinatorFenced):
+        coordinator.worker_lost("fresh-instance")
+
+
+def test_confirmed_worker_loss_survives_crash_before_attempt_reconciliation(store):
+    old, fresh = FakeWorker(store), FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"old-instance": old})
+    coordinator.submit(request(action("a", max_attempts=1), action("independent")))
+    coordinator.tick()
+    durable = store.read_journal("build")
+    journal = json.loads(durable.data)
+    # Simulate process exit immediately after durable retirement, before tick.
+    journal["lost_workers"] = ["old-instance"]
+    store.write_journal("build", encode(journal), durable.version)
+    reopened = Coordinator(store, "build", {"old-instance": old, "fresh-instance": fresh})
+    result = reopened.tick()
+    assert result.nodes[0].state == NodeState.FAILED
+    assert result.nodes[0].attempts == 1
+    assert result.nodes[1].state == NodeState.RUNNING
+    assert len(old.attempts) == 1
+    before = store.read_journal("build").data
+    with pytest.raises(ValueError):
+        reopened.worker_lost("unknown")
+    assert store.read_journal("build").data == before
+
+
 def test_cancellation_tombstones_unconfirmed_dispatch(store):
     worker = FakeWorker(store)
     worker.uncertain_submit = True

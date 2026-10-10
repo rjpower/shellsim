@@ -3,7 +3,8 @@
 One journal owns one idempotent request. Opening an existing journal claims a
 new generation, fencing previous coordinators. Dispatch intent and attempt IDs
 are durable before RPCs. A failed RPC leaves its worker assignment uncertain;
-only an explicit UNKNOWN report permits loss recovery on another worker.
+An explicit UNKNOWN report or confirmed lifecycle terminal identity permits loss
+recovery on another worker. RPC errors alone never establish that evidence.
 """
 
 from __future__ import annotations
@@ -101,7 +102,7 @@ def read_build_result(store: Store, journal_key: str) -> BuildResult | None:
 class Coordinator:
     """Drive a request by calling tick; there is no background coordinator thread.
 
-    workers maps stable worker IDs to durable endpoints. Each endpoint receives
+    workers maps immutable instance IDs to durable endpoints. Each endpoint receives
     at most one active node from this request. Removing an endpoint while it has
     an active attempt does not prove loss: restore the endpoint to reconcile it.
     Use distinct journal keys for independent requests. Acknowledgement releases
@@ -163,6 +164,7 @@ class Coordinator:
             "request_id": identity,
             "cancelled": False,
             "acknowledged": False,
+            "lost_workers": [],
             "nodes": {
                 action.id: {"state": "pending", "attempts": 0, "bundle": None, "error": None}
                 for action in request.actions
@@ -183,6 +185,10 @@ class Coordinator:
         for record in self._journal["attempts"].values():
             if record["active"] or not record["ack_pending"]:
                 continue
+            if record["worker"] in self._journal.get("lost_workers", ()):
+                record["ack_pending"] = False
+                self._save()
+                continue
             worker = self.workers.get(record["worker"])
             if worker is None:
                 continue
@@ -200,7 +206,7 @@ class Coordinator:
         if error is not None and not isinstance(error, str):
             raise ValueError("attempt diagnostics must be text")
         node = self._journal["nodes"][record["action_id"]]
-        record.update(active=False, ack_pending=True)
+        record.update(active=False, ack_pending=record["worker"] not in self._journal.get("lost_workers", ()))
         action = next(action for action in self.request.actions if action.id == record["action_id"])
         node["error"] = error[:4096] if error else None
         if self._journal["cancelled"] or state == AttemptState.CANCELLED:
@@ -222,6 +228,9 @@ class Coordinator:
         self._check()
         for record in list(self._journal["attempts"].values()):
             if not record["active"]:
+                continue
+            if record["worker"] in self._journal.get("lost_workers", ()):
+                self._finish(record, AttemptState.FAILED, None, "worker instance terminated")
                 continue
             worker = self.workers.get(record["worker"])
             if worker is None:
@@ -273,7 +282,8 @@ class Coordinator:
                 self._save()
 
         active = [record for record in self._journal["attempts"].values() if record["active"]]
-        available = [key for key in self.workers if key not in {record["worker"] for record in active}]
+        occupied = {record["worker"] for record in active} | set(self._journal.get("lost_workers", ()))
+        available = [key for key in self.workers if key not in occupied]
         slots = max(0, self.request.max_workers - len(active))
         if not self._journal["cancelled"]:
             for action in self.request.actions:
@@ -306,6 +316,30 @@ class Coordinator:
         if self._journal["acknowledged"]:
             self._ack_workers()
         return self.result()
+
+    def worker_lost(self, worker_id: str) -> BuildResult:
+        """Fence a confirmed terminal instance durably before bounded retry.
+
+        The caller must prove terminal lifecycle identity for this exact immutable
+        worker ID. RPC errors, missing endpoints and degradation are insufficient.
+        Replacement instances require fresh IDs/namespaces. Retired IDs stay
+        fenced after coordinator restart and late results cannot become authoritative.
+        This fences journal authority; partitioned private processes may persist.
+        """
+        self._check()
+        name(worker_id)
+        known = (
+            set(self.workers)
+            | {record["worker"] for record in self._journal["attempts"].values()}
+            | set(self._journal.get("lost_workers", ()))
+        )
+        if worker_id not in known:
+            raise ValueError("worker identity was never assigned or registered")
+        retired = self._journal.setdefault("lost_workers", [])
+        if worker_id not in retired:
+            retired.append(worker_id)
+            self._save()
+        return self.tick()
 
     def cancel(self) -> BuildResult:
         """Persist cancellation before delivering it; tick retries uncertain RPCs."""
