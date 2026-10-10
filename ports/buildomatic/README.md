@@ -86,6 +86,12 @@ late completions cannot become authoritative. This guarantees journal fencing:
 old private processes may persist under a partition, so it does not promise
 physical exactly-once compilation. Independent actions continue normally.
 
+`Coordinator.knows_worker(worker_id)` checks whether an ID belongs to the current
+worker mapping, historical assignments or retired instances in this request.
+It checks the current journal claim without writes or worker RPCs. Valid unknown
+IDs return false; invalid IDs and stale claims raise. Services can use this query
+to filter global retirement observations before calling `worker_lost`.
+
 `WorkerExecutor` preserves attempts across client restart using a detached
 supervisor, durable launch records, locks and process start identities. A pipe
 gate prevents argv execution until child identity is durable. Lost supervisors

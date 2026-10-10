@@ -318,6 +318,22 @@ class Coordinator:
             self._ack_workers()
         return self.result()
 
+    def knows_worker(self, worker_id: str) -> bool:
+        """Check current, historically assigned or retired instance membership.
+
+        Verify the current journal claim without writes or worker RPCs. A valid
+        unknown ID returns False; invalid IDs and stale claims raise explicitly.
+        Membership alone does not prove terminal lifecycle identity.
+        """
+        self._check()
+        name(worker_id)
+        known = (
+            set(self.workers)
+            | {record["worker"] for record in self._journal["attempts"].values()}
+            | set(self._journal.get("lost_workers", ()))
+        )
+        return worker_id in known
+
     def worker_lost(self, worker_id: str) -> BuildResult:
         """Fence a confirmed terminal instance durably before bounded retry.
 
@@ -327,14 +343,7 @@ class Coordinator:
         fenced after coordinator restart and late results cannot become authoritative.
         This fences journal authority; partitioned private processes may persist.
         """
-        self._check()
-        name(worker_id)
-        known = (
-            set(self.workers)
-            | {record["worker"] for record in self._journal["attempts"].values()}
-            | set(self._journal.get("lost_workers", ()))
-        )
-        if worker_id not in known:
+        if not self.knows_worker(worker_id):
             raise ValueError("worker identity was never assigned or registered")
         retired = self._journal.setdefault("lost_workers", [])
         if worker_id not in retired:

@@ -427,6 +427,59 @@ def test_explicit_worker_loss_and_failure_retry_are_bounded(store):
     assert result.nodes[0].attempts == 2
 
 
+def test_worker_identity_query_includes_current_history_and_retirement(store):
+    assigned, registered = FakeWorker(store), FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"assigned": assigned, "registered": registered})
+    coordinator.submit(request(action("a")))
+    assert coordinator.knows_worker("assigned")
+    assert coordinator.knows_worker("registered")
+    coordinator.tick()
+    reopened = Coordinator(store, "build", {"registered": registered})
+    assert reopened.knows_worker("assigned")
+    assert reopened.knows_worker("registered")
+    reopened.worker_lost("registered")
+    retired = Coordinator(store, "build", {})
+    assert retired.knows_worker("assigned")
+    assert retired.knows_worker("registered")
+    other = Coordinator(store, "other", {"foreign": FakeWorker(store, "other")})
+    other.submit(request(action("a")))
+    assert other.knows_worker("foreign")
+    assert not retired.knows_worker("foreign")
+    assert not retired.knows_worker("unknown")
+    with pytest.raises(ValueError):
+        retired.knows_worker("../invalid")
+
+
+def test_worker_identity_query_does_not_write_or_call_workers(store, monkeypatch):
+    assigned, registered = FakeWorker(store), FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"assigned": assigned})
+    coordinator.submit(request(action("a")))
+    coordinator.tick()
+    reopened = Coordinator(store, "build", {"registered": registered})
+    before = store.read_journal("build")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("worker identity query must only read the journal")
+
+    monkeypatch.setattr(store, "write_journal", forbidden)
+    for worker in (assigned, registered):
+        for method in ("submit", "poll", "cancel", "acknowledge"):
+            monkeypatch.setattr(worker, method, forbidden)
+    assert reopened.knows_worker("assigned")
+    assert reopened.knows_worker("registered")
+    assert not reopened.knows_worker("unknown")
+    assert store.read_journal("build") == before
+
+
+@pytest.mark.parametrize("worker_id", ["assigned", "unknown"])
+def test_worker_identity_query_checks_current_claim_before_membership(store, worker_id):
+    coordinator = Coordinator(store, "build", {"assigned": FakeWorker(store)})
+    coordinator.submit(request(action("a")))
+    Coordinator(store, "build", {})
+    with pytest.raises(CoordinatorFenced):
+        coordinator.knows_worker(worker_id)
+
+
 def test_confirmed_terminal_worker_is_fenced_before_retry_and_after_reopen(store, bundle):
     old, fresh = FakeWorker(store), FakeWorker(store)
     coordinator = Coordinator(store, "build", {"old-instance": old})
