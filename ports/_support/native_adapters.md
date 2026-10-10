@@ -103,8 +103,11 @@ patching and verification. Its persistent workspace binds source, patches,
 compiler and generator bytes, platform, dependencies and host build tools.
 Driver or configuration changes reconfigure the same compatible Ninja tree;
 immutable graph results still bind the complete implementation identity.
-`--workspace RECIPE=PATH` selects an existing explicit producer workspace whose
-inputs the producer must verify. Other adapters currently reject this option.
+`--workspace RECIPE=PATH` selects the actual retained Ninja build directory.
+The producer state, source and snapshots live in its parent directory, and the
+producer verifies their exact inputs before reuse. Without an override, the
+runner selects a compatible generated workspace and its `build` directory.
+Other adapters currently reject this option.
 `llvm-guest-sdk` stages admitted target development data without running a
 compiler and requires its explicit platform dependency.
 
@@ -136,7 +139,7 @@ therefore cannot retain the original cohort toolchain label.
 
 Port checks may declare `test_limits` with positive integer `cpu`, `memory` and
 `disk` guest budgets. Omitted fields retain the public environment defaults.
-The harness caps declarations at one trillion CPU units, 4 GiB memory and 2 GiB
+The harness caps declarations at one trillion CPU units, 16 GiB memory and 2 GiB
 disk, and records the effective explicit budget in the acceptance receipt.
 These budgets allow compiler and SDK checks to include installation and execution
 costs. Temporary release materialization lives under the proof directory and is

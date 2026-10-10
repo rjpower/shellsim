@@ -307,6 +307,7 @@ def build_graph(
                         if dependency.kind == "target" and dependency.port in native
                     }
                     workspace = slot.work
+                    build_directory = workspace / "build"
                     if adapter == "llvm-guest":
                         from ports._support.store import identity
                         from ports.toolchain.llvm.guest import workspace_compatibility
@@ -320,18 +321,19 @@ def build_graph(
                             {name: tool.path for name, tool in cohort.host_tools.items()},
                             build_cohort.target,
                         )
-                        workspace = (
+                        build_directory = (
                             workspaces[port.reference].resolve()
                             if workspaces is not None and port.reference in workspaces
-                            else store.resolve() / "workspaces" / "llvm-guest" / identity(compatibility)
+                            else store.resolve() / "workspaces" / "llvm-guest" / identity(compatibility) / "build"
                         )
+                        workspace = build_directory.parent
                     prefix = workspace / "dependencies"
                     if adapter == "llvm-guest" and prefix.exists():
                         shutil.rmtree(prefix)
                     merge_dependency_sysroot(direct, native, prefix, target)
                     context = NativeBuildContext(
                         source=source,
-                        build=workspace / "build",
+                        build=build_directory,
                         staging_prefix=slot.work / "install",
                         sdk=build_cohort.sdk.root,
                         compiler_prefix=build_cohort.llvm.root,
@@ -557,7 +559,7 @@ def main() -> None:
         action="append",
         default=[],
         metavar="RECIPE=PATH",
-        help="explicit compatible persistent producer workspace",
+        help="actual compatible retained Ninja build directory; producer state lives in its parent",
     )
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")

@@ -30,7 +30,7 @@ if TYPE_CHECKING:
 
 _MAX_TESTS = 32
 _MAX_SOURCE_BYTES = 16 * 1024**2
-_MAX_TEST_LIMITS = {"cpu": 1_000_000_000_000, "memory": 4 * 1024**3, "disk": 2 * 1024**3}
+_MAX_TEST_LIMITS = {"cpu": 1_000_000_000_000, "memory": 16 * 1024**3, "disk": 2 * 1024**3}
 
 
 @dataclass(frozen=True)

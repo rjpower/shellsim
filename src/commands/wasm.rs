@@ -52,8 +52,9 @@ mod posix_exec;
 mod posix_open;
 mod posix_process;
 
-// The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
-const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
+// Stripped guest Clang is 84 MB. Compilation remains CPU-metered and threaded
+// images prepay their conservative host compilation memory reservation.
+const MAX_WASM_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 const LARGE_TABLE_ELEMENTS: usize = 16_384;

@@ -679,7 +679,7 @@ fn infinite_wasm_loop_is_metered() {
 fn static_module_image_bound_and_compilation_cost_are_enforced() {
     // A large ignored custom section tests the image boundary without a numerical fixture.
     let mut bytes = wat::parse_str("(module (func (export \"_start\")))").unwrap();
-    let payload_len = 13 * 1024 * 1024;
+    let payload_len = 17 * 1024 * 1024;
     bytes.push(0);
     let mut length = payload_len + 1;
     loop {
@@ -694,6 +694,7 @@ fn static_module_image_bound_and_compilation_cost_are_enforced() {
     bytes.resize(bytes.len() + payload_len, 0);
     let mut environment = Environment::with_limits(Limits {
         cpu: 1_000_000_000,
+        disk: 256 * 1024 * 1024,
         ..Limits::default()
     });
     environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
@@ -708,7 +709,7 @@ fn static_module_image_bound_and_compilation_cost_are_enforced() {
     assert_eq!(status, 137);
     assert!(String::from_utf8_lossy(&stderr).contains("wasm compilation budget exhausted"));
 
-    bytes.resize(16 * 1024 * 1024 + 1, 0);
+    bytes.resize(128 * 1024 * 1024 + 1, 0);
     environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
     let (status, _, stderr) = run(&mut environment, "/app");
     assert_eq!(status, 126);
