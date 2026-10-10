@@ -4,6 +4,7 @@ import pytest
 
 from ports._support.python_meson import (
     extension_destination,
+    shared_providers,
     stage_development_exports,
     stage_install_plan,
     wheel_destination,
@@ -83,3 +84,22 @@ def test_undeclared_archive_cannot_enter_curated_wheel(tmp_path):
     (wheel / "hidden.a").write_bytes(b"archive")
     with pytest.raises(ValueError):
         stage_development_exports(wheel, tmp_path / "stage", [])
+
+
+def test_provider_diamond_uses_same_admitted_prefix_once(tmp_path):
+    prefix = tmp_path / "merged"
+    prefix.mkdir()
+    provider = prefix / "libprovider.so"
+    provider.write_bytes(b"one admitted provider")
+    assert shared_providers({"first": prefix, "second": prefix / "."}) == {"libprovider.so": provider}
+
+
+@pytest.mark.parametrize("contents", [b"first provider", b"different provider"])
+def test_distinct_provider_identities_with_same_name_are_rejected(tmp_path, contents):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "libprovider.so").write_bytes(b"first provider")
+    (second / "libprovider.so").write_bytes(contents)
+    with pytest.raises(ValueError):
+        shared_providers({"first": first, "second": second})

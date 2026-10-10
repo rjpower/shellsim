@@ -198,6 +198,22 @@ def stage_development_exports(wheel: Path, staging: Path, exports: list[Mapping]
         archive.unlink()
 
 
+def shared_providers(dependencies: Mapping[str, Path]) -> dict[str, Path]:
+    """Index admitted providers once per actual prefix, rejecting name conflicts.
+
+    A retained dependency closure exposes one verified merged prefix through
+    several logical edges. Those edges share an identity. Distinct prefixes
+    remain distinct providers, even when their file bytes happen to agree.
+    """
+    providers = {}
+    for prefix in dict.fromkeys(path.resolve() for path in dependencies.values()):
+        for path in prefix.rglob("*.so"):
+            if path.name in providers:
+                raise ValueError("declared native providers have duplicate library names")
+            providers[path.name] = path
+    return providers
+
+
 def build_python_meson(request: PythonMesonBuildRequest) -> PythonBuildOutput:
     """Build shared extensions, retain upstream metadata, and stage devel exports."""
     context, python, recipe = request.context, request.cpython, request.recipe
@@ -251,12 +267,7 @@ def build_python_meson(request: PythonMesonBuildRequest) -> PythonBuildOutput:
     extensions = stage_install_plan(plan, context.source, meson_build, wheel, tags)
     if not extensions:
         raise ValueError("Python Meson install contains no extension modules")
-    providers = {}
-    for prefix in context.dependencies.values():
-        for path in prefix.rglob("*.so"):
-            if path.name in providers:
-                raise ValueError("declared native providers have duplicate library names")
-            providers[path.name] = path
+    providers = shared_providers(context.dependencies)
     required = build.get("required_shared_libraries", [])
     if not isinstance(required, list) or any(not isinstance(name, str) or name not in providers for name in required):
         raise ValueError("required shared libraries must name admitted target providers")
