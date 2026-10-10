@@ -1,4 +1,10 @@
-# NumPy static WASI port
+# NumPy WASI ports
+
+The static, shared v2 and threaded graph recipes are separate products. The
+threaded graph builds independent extensions and a development payload for
+downstream ports; its current behavior is described below.
+
+## Static interpreter build
 
 This recipe builds upstream NumPy 2.3.5 into CPython 3.13.7 using WASI SDK 34.0.
 It installs NumPy's Python package and registers thirteen qualified native modules
@@ -29,7 +35,7 @@ compiler assertions before Meson receives `IEEE_QUAD_LE`. The interpreter links 
 
 ## Build choices and frontiers
 
-The build uses scalar code, one interpreter thread, no external BLAS, and NumPy's
+The static build uses scalar code, one interpreter thread, no external BLAS, and NumPy's
 internal C LAPACK fallback. SIMD dispatch and the Highway/Intel sorting libraries
 are disabled. Legacy RandomState distribution functions have a separate static
 symbol namespace because their `long` integer ABI is 32 bits on wasm32, while
@@ -41,7 +47,8 @@ matching exception runtime. NumPy's ordinary `unique` hash optimization and
 `numpy.fft._pocketfft_umath` are enabled. The build removes the old SDK 24
 exception workarounds. NumPy's own test-only extension modules and SIMD inspection
 module remain omitted. Guest checks cover complex and real FFT round trips and
-invalid lengths. Threads, dynamic native loading, and ctypes remain unsupported.
+invalid lengths. The static profile does not provide threads, dynamic native loading or ctypes.
+These restrictions do not describe the threaded graph profile.
 
 ### Floating-point policy gap
 
@@ -77,8 +84,9 @@ and [NumPy Meson build](https://numpy.org/doc/2.3/building/understanding_meson.h
 
 `graph-recipe.json` builds upstream NumPy 2.3.5 as shared Python extensions with
 the Python Meson adapter. It uses the admitted threaded CPython headers and
-verified host Clang/platform graph nodes. BLAS and SIMD are disabled explicitly; ordinary NumPy GIL release and Python
-thread support remain enabled. Internal LAPACK, FFT and random modules remain built.
+verified host Clang/platform graph nodes. External BLAS and SIMD are disabled explicitly; ordinary NumPy GIL release and
+Python thread support remain enabled. Internal LAPACK, FFT and random modules
+remain built.
 `meson-threads.patch` admits WASI's wasm32 CPU identity and excludes mutex headers
 used only by free-threaded CPython. It preserves upstream shared-module builds.
 
@@ -97,3 +105,10 @@ module required by Cython's compressed generated string tables. Publication
 assembles verified stdlib modules and their providers into a distinct runtime
 without changing interpreter bytes or upstream NumPy dependency metadata.
 Both NumPy's license and bundled component notices remain in the wheel.
+
+The threaded graph and a separate public `Environment.from_release` installation
+have passed the numerical probe, including random and long-double behavior and
+concurrent ufuncs. The public installation requests only NumPy and receives zlib
+through the published runtime edge. A verified warm packaging run preserved all
+172 compiled objects. This acceptance does not close the floating-point exception
+policy gap documented above.

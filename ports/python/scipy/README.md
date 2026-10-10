@@ -15,7 +15,15 @@ returns, hidden complex results, character lengths and indirect callback types.
 They retain the upstream ctypes and threading paths. OpenBLAS uses 32-bit BLAS
 integers and its documented single internal worker profile.
 
-Build and public guest acceptance are pending final generator receipts and the
-retained Meson workspace implementation. The checked-in probe covers BLAS,
-real and complex linear solves, invalid dimensions, a Python integration callback
-and sparse solves. No SciPy runtime acceptance is claimed yet.
+The Python Meson adapter implements verified retained workspaces. The graph uses
+admitted host NumPy/f2py, Cython and pybind11 inputs, with separately verified
+target NumPy headers and OpenBLAS exports. Shared linking treats warnings as
+errors and validates imported function signatures against provider exports;
+packaging requires an actual OpenBLAS dependency reference.
+
+Build and public guest acceptance are pending the final host-tool receipt freeze.
+The checked-in probe covers BLAS, real and complex solves, Schur decomposition,
+Sylvester equations, trust-krylov optimization, sparse eigenvalues and solves,
+spline interpolation and a Python integration callback. It also checks invalid
+solve dimensions, singular LAPACK factorization status and invalid LAPACK input.
+These expanded paths have not yet passed in the SciPy guest.
