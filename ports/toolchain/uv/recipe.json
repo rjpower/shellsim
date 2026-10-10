@@ -1,12 +1,8 @@
 {
-  "name": "uv-wasi-resolver",
+  "name": "uv",
   "version": "0.12.3",
   "host_target": "x86_64-unknown-linux-gnu",
   "rust_toolchain": "1.97.1",
-  "build_scripts": [
-    {"file": "build.py", "sha256": "41ebfceabb56eb75f44a3cf3b2d3050838b9984a625a2c4152e1b7f534078367"},
-    {"file": "tests/verify_target.py", "sha256": "a1f708ca59712047514f029b9e4f48e3ac412c3715185adda97a660b335b08b0"}
-  ],
   "guest_python": "3.13.7",
   "guest_target": "wasm32-wasip1",
   "wheel_platform_tag": "wasm32_wasip1",
@@ -18,5 +14,11 @@
   "patch": {
     "file": "uv-0.12.3-wasip1.patch",
     "sha256": "b5653010317810015dc5cfe3bb8ccfb12ceb6d0c027a756029dc0b33db3f170f"
-  }
+  },
+  "producer_identity": {
+    "name": "uv-wasi-resolver",
+    "version": "0.12.3"
+  },
+  "role": "host-tool",
+  "build_system": "uv-host"
 }

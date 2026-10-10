@@ -1,51 +1,13 @@
 {
-  "kind": "python-extension",
+  "role": "target-library",
+  "kind": "python-project",
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 1073741824,
+    "disk": 536870912
+  },
   "name": "pillow",
   "version": "12.3.0",
-  "target_profile": "wasi-cpython-v2",
-  "target": "wasm32-wasip1",
-  "linkage": "cpython-builtin",
-  "source": {
-    "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
-    "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce"
-  },
-  "host_tools": [
-    "python-build-driver",
-    "wasi-sdk-clang",
-    "wasi-sdk-llvm-ar"
-  ],
-  "target_development": {
-    "cpython": "3.13.7"
-  },
-  "target_dependencies": [
-    {
-      "port": "native/zlib",
-      "version": "1.3.1"
-    },
-    {
-      "port": "native/libjpeg-turbo",
-      "version": "2.1.5.1"
-    },
-    {
-      "port": "native/freetype",
-      "version": "2.13.3"
-    }
-  ],
-  "features": {
-    "png": true,
-    "jpeg": true,
-    "jpeg2000": false,
-    "tiff": false,
-    "webp": false,
-    "avif": false,
-    "freetype": true,
-    "lcms": false,
-    "raqm": false,
-    "imagequant": false,
-    "xcb": false,
-    "imagingmath": false,
-    "imagingmorph": false
-  },
   "requires_python": ">=3.10",
   "requires_dist": [
     "furo; extra == \"docs\"",
@@ -74,30 +36,58 @@
     "trove-classifiers>=2024.10.12; extra == \"tests\"",
     "defusedxml; extra == \"xmp\""
   ],
-  "builtin_modules": [
-    "PIL._imaging",
-    "PIL._imagingft"
-  ],
-  "dist_info": "/usr/lib/python3.13/site-packages/pillow-12.3.0.dist-info",
-  "patches": [
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
+    "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce",
+    "subdirectory": "pillow-12.3.0"
+  },
+  "build_dependencies": [
     {
-      "file": "../numpy/cpython-qualified-builtins.patch",
-      "sha256": "678994500f8deaa9fca773db3fc7e33f29022092077dc690a103240e6a8c4f25"
-    }
-  ],
-  "build_scripts": [
-    {
-      "file": "build.py",
-      "sha256": "9693c3018e4396684dc35177725f75e8c678e81c9b3cfb352a95f6575b71dfb8"
+      "port": "python/setuptools",
+      "version": "84.0.0"
     },
     {
-      "file": "../../native/dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
+      "port": "python/pybind11",
+      "version": "3.0.4"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
     }
   ],
-  "sdk": {
-    "version": "34.0",
-    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
-  }
+  "target_dependencies": [
+    {
+      "port": "native/zlib",
+      "version": "1.3.1"
+    },
+    {
+      "port": "native/libjpeg-turbo",
+      "version": "2.1.5.1"
+    },
+    {
+      "port": "native/freetype",
+      "version": "2.13.3"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/graph_smoke.py"
+    }
+  ],
+  "patches": [
+    {
+      "file": "target-search.patch",
+      "sha256": "529d11de7e5004e9416d8cc20f070aff410c06ef48292a88d890fffdd7f4eb1a"
+    }
+  ],
+  "sdk": "default",
+  "build_system": "python-pep517"
 }

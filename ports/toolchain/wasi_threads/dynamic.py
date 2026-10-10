@@ -4,9 +4,7 @@ Both source archives are verified before extraction. The LLVM artifact must
 match the production threaded compiler recipe; diagnostic binaries are rejected.
 """
 
-import argparse
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -14,9 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from ports._support.build import apply_patch, check_build_scripts
+from ports._support.producer_tools import extract, run
 from ports.native.dependencies import digest, file_hash, target_environment
-from ports.toolchain.llvm.build import run
-from ports.toolchain.wasi_threads.build import extract
 
 
 def sdk_tooling(sdk):
@@ -38,40 +35,25 @@ def verify_sdk(sdk, manifest):
         raise ValueError("SDK frontend or resource files differ")
 
 
-def compiler_identity(prefix, recipe_path):
-    """Verify the complete immutable compiler product before using its tools."""
-    manifest = json.loads((prefix / "manifest.json").read_text())
-    if manifest["identity"]["recipe"].get("name") == "llvm-wasi-compiler":
-        from ports.toolchain.llvm.compiler import verify_product
+def compiler_identity(prefix, recipe_path=None):
+    """Admit the recorded compiler policy and its immutable product inventory."""
+    from ports._support.producer_policy import verify_policy
+    from ports._support.sdk_products import Receipt, verify_product
 
-        expected = json.loads((recipe_path.parent / "compiler-recipe.json").read_text())
-        threaded = json.loads(recipe_path.read_text())
-        if manifest["identity"]["recipe"] != expected or any(
-            expected[name] != threaded[name] for name in ("source", "patches")
-        ):
-            raise ValueError("threaded frontend source profile differs")
-        verify_product(prefix, manifest["identity"])
-        return manifest
-    if manifest["identity"]["recipe"] != json.loads(recipe_path.read_text()):
-        raise ValueError("threaded compiler recipe differs")
-    if set(manifest["artifacts"]) != {"bin/lld", "bin/llc", "licenses/LLVM-LICENSE.txt"}:
-        raise ValueError("threaded compiler product differs")
-    for name, expected in manifest["artifacts"].items():
-        if file_hash(prefix / name) != expected:
-            raise ValueError("threaded compiler artifact differs: " + name)
-    if not (prefix / "bin/wasm-ld").is_symlink() or os.readlink(prefix / "bin/wasm-ld") != "lld":
-        raise ValueError("threaded compiler driver differs")
+    manifest_path = prefix / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    verify_policy(manifest["identity"]["recipe"], "toolchain/llvm:host")
+    verify_product(Receipt(prefix, manifest_path, file_hash(manifest_path), manifest))
     return manifest
 
 
 def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
     directory = Path(__file__).resolve().parent
-    recipe = json.loads((directory / "dynamic-recipe.json").read_text())
+    from ports._support.producer_policy import load_policy
+
+    recipe = load_policy("toolchain/wasi_threads")
     check_build_scripts(recipe, directory)
-    llvm_recipe = directory.parent / "llvm/threaded-recipe.json"
-    if file_hash(llvm_recipe) != recipe["compiler_recipe_sha256"]:
-        raise ValueError("threaded compiler source recipe differs")
-    compiler = compiler_identity(llvm_prefix, llvm_recipe)
+    compiler = compiler_identity(llvm_prefix)
     if work.exists():
         raise ValueError("use a fresh threaded sysroot output directory")
     work.mkdir(parents=True)
@@ -135,22 +117,3 @@ def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
     }
     (prefix / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return prefix
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("sdk-archive", "libc-archive", "llvm-prefix", "cmake", "ninja", "work"):
-        parser.add_argument("--" + name, type=Path, required=True)
-    args = parser.parse_args()
-    print(
-        build(
-            *(
-                getattr(args, name).resolve()
-                for name in ("sdk_archive", "libc_archive", "llvm_prefix", "cmake", "ninja", "work")
-            )
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

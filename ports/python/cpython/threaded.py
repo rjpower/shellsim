@@ -1,6 +1,5 @@
 """Build a package-free upstream CPython for the threaded dynamic cohort."""
 
-import argparse
 import json
 import re
 import resource
@@ -13,11 +12,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from ports._support.build import apply_patch, check_build_scripts
+from ports._support.producer_tools import extract
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import number, string
 from ports.native.dependencies import digest, file_hash, target_environment
-from ports.toolchain.wasi_process.build import _patched_source
-from ports.toolchain.wasi_threads.build import extract
+from ports.toolchain.wasi_process.source import _patched_source
 from ports.toolchain.wasi_threads.dynamic import compiler_identity, verify_sdk
 
 
@@ -332,9 +331,8 @@ def relink(
             if file_hash(process / name) != expected:
                 raise ValueError("virtual process source differs: " + name)
         old_process = profile["process_source_recipe"]
-        if {k: v for k, v in old_process.items() if k != "port_sources_sha256"} != {
-            k: v for k, v in process_recipe.items() if k != "port_sources_sha256"
-        }:
+        process_fields = ("cpython_source_sha256", "patch_sha256")
+        if any(old_process[key] != process_recipe[key] for key in process_fields):
             raise ValueError("CPython facade refresh process patch or source differs")
         objects = compile_process_facades(
             work,
@@ -391,19 +389,17 @@ def relink(
 
 def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_from=None, recompile_process=False):
     directory = Path(__file__).resolve().parent
-    recipe = json.loads((directory / "threaded-recipe.json").read_text())
+    from ports._support.producer_policy import load_policy, verify_policy
+
+    recipe = load_policy("python/cpython:runtime")
     check_build_scripts(recipe, directory)
-    threads = directory.parents[1] / "toolchain/wasi_threads"
-    if file_hash(threads / "dynamic-recipe.json") != recipe["sysroot_recipe_sha256"]:
-        raise ValueError("threaded CPython sysroot recipe differs")
     overlay = json.loads((sysroot_prefix / "manifest.json").read_text())
-    if overlay["identity"]["recipe"] != json.loads((threads / "dynamic-recipe.json").read_text()):
-        raise ValueError("threaded CPython sysroot product differs")
+    verify_policy(overlay["identity"]["recipe"], "toolchain/wasi_threads")
     for name, expected in overlay["artifacts"].items():
         if file_hash(sysroot_prefix / name) != expected:
             raise ValueError("threaded CPython sysroot artifact differs: " + name)
     verify_sdk(sdk, overlay)
-    compiler = compiler_identity(llvm_prefix, threads.parent / "llvm/threaded-recipe.json")
+    compiler = compiler_identity(llvm_prefix)
     if compiler != overlay["identity"]["compiler"]:
         raise ValueError("threaded compiler and sysroot cohorts differ")
     environment = target_environment(sdk)
@@ -589,26 +585,3 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
     }
     (work / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return work
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("archive", "helper", "sdk", "sysroot-prefix", "llvm-prefix", "make", "work"):
-        parser.add_argument("--" + name, type=Path, required=True)
-    parser.add_argument("--relink-from", type=Path)
-    parser.add_argument("--recompile-process", action="store_true")
-    args = parser.parse_args()
-    print(
-        build(
-            *(
-                getattr(args, name).resolve()
-                for name in ("archive", "helper", "sdk", "sysroot_prefix", "llvm_prefix", "make", "work")
-            ),
-            relink_from=args.relink_from.resolve() if args.relink_from else None,
-            recompile_process=args.recompile_process,
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

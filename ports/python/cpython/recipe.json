@@ -1,33 +1,139 @@
 {
-  "name": "cpython",
   "version": "3.13.7",
-  "target": "wasm32-wasip1",
-  "prefix": "/usr",
   "source": {
     "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
-    "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
+    "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a",
+    "subdirectory": "Python-3.13.7"
   },
-  "sdk": {
-    "version": "34.0",
-    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
-  },
-  "target_profile": "wasi-cpython-v2",
-  "host_tools": [
-    "native-c-compiler",
-    "make",
-    "python-build-helper",
-    "wasi-sdk-clang",
-    "wasi-sdk-llvm-ar",
-    "wasi-sdk-llvm-strip"
-  ],
-  "target_dependencies": [],
-  "optional_target_dependencies": {
-    "zlib": [
-      {
-        "port": "native/zlib",
-        "version": "1.3.1"
-      }
-    ]
+  "default_variant": "runtime",
+  "variants": {
+    "runtime": {
+      "name": "cpython",
+      "target": "wasm32-wasip1-threads",
+      "dynamic_abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+      "prefix": "/usr",
+      "patches": [
+        {
+          "file": "sdk34-threads.patch",
+          "sha256": "b643be6b4fe650f2f675584db0bdd164b3ba5960ccc8f73a558bc4326f51d4e0"
+        }
+      ],
+      "target_dependencies": [],
+      "build_limits": {
+        "compile_jobs": 2,
+        "command_timeout_seconds": 3600,
+        "address_space_bytes_per_process": 12884901888
+      },
+      "maximum_memory_bytes": 268435456,
+      "inputs": {
+        "toolchain/wasi_process/cpython-3.13.7-process.patch": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
+        "toolchain/wasi_sdk/dynamic.c": "7b1960b84e234a8fb5b1fc68b172548816c213f2b43a8504aedbd75633379c23",
+        "toolchain/wasi_sdk/posix.c": "dee9ca54df32cdad13b6c6cb343dabf18a15cfc3ceb6a817281c026e6ffee450",
+        "toolchain/wasi_sdk/posix.h": "9001c6f4658d236bee3f7ee355b67d757792373ce770d306d0260fc99978704c",
+        "toolchain/wasi_process/process.c": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7",
+        "toolchain/wasi_process/process_abi.h": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73",
+        "toolchain/wasi_process/process_port.h": "42f5b24baa92c300dee0756d4faff51364274c6cac977978581f6d7ccc06714f",
+        "toolchain/wasi_process/spawn.h": "099b12b83babaa658eada6b8848a49822e7d0c3ba9c2d548d0a5cc60fd235108",
+        "toolchain/wasi_process/sys/wait.h": "aabcb78324279b198a4599bc9e800e04ac639ea4fff695409bbec9c3bd3b1698",
+        "toolchain/wasi_process/exec.c": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7",
+        "toolchain/wasi_process/exec_port.h": "9fcd6343589ef58d8e2e1d4395f017fbe357c9eccf736b18a05583897b53a56a",
+        "toolchain/wasi_process/tempfile.c": "2e9a332923ecdd89088fe52b9118e32245ff6767c819b3d47a4763be8e659b4f",
+        "toolchain/wasi_process/tempfile_port.h": "ff9d96e030f707bff65b96491532965fb6968a4b8f1c60a0ee6a1bec6c630325",
+        "python/cpython/threaded_posix.c": "cf01e3775e38e133faff965bdcf22f9a026f22e4d23b380f9f03226c052ca0e0",
+        "toolchain/wasi_process/process_limits.h": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
+      },
+      "role": "target-library",
+      "build_system": "cpython-threaded",
+      "sdk": "default",
+      "output": "runtime"
+    },
+    "stdlib-zlib": {
+      "name": "cpython-stdlib-zlib",
+      "kind": "native-library",
+      "role": "target-library",
+      "linkage": "shared",
+      "target_dependencies": [
+        {
+          "port": "native/zlib",
+          "version": "1.3.1"
+        }
+      ],
+      "exports": {
+        "shared_libraries": [
+          "lib-dynload/zlib.so"
+        ],
+        "licenses": [
+          "licenses/LICENSE"
+        ]
+      },
+      "needed_libraries": [
+        "libz.so"
+      ],
+      "tests": [
+        {
+          "kind": "python",
+          "script": "tests/graph_zlib.py"
+        }
+      ],
+      "test_limits": {
+        "cpu": 10000000000,
+        "memory": 2147483648,
+        "disk": 268435456
+      },
+      "install": {
+        "kind": "runtime",
+        "destinations": {
+          "lib-dynload/zlib.so": "/usr/lib/python3.13/lib-dynload/zlib.so"
+        }
+      },
+      "sdk": "default",
+      "build_system": "python-extension",
+      "output": "stdlib",
+      "module": "zlib"
+    },
+    "stdlib-ctypes": {
+      "name": "cpython-stdlib-ctypes",
+      "role": "target-library",
+      "kind": "native-library",
+      "linkage": "shared",
+      "build_system": "python-extension",
+      "sdk": "default",
+      "output": "stdlib",
+      "target_dependencies": [
+        {
+          "port": "native/libffi",
+          "version": "3.5.2"
+        }
+      ],
+      "needed_libraries": [
+        "libffi.so"
+      ],
+      "exports": {
+        "shared_libraries": [
+          "lib-dynload/_ctypes.so"
+        ],
+        "licenses": [
+          "licenses/LICENSE"
+        ]
+      },
+      "install": {
+        "kind": "runtime",
+        "destinations": {
+          "lib-dynload/_ctypes.so": "/usr/lib/python3.13/lib-dynload/_ctypes.so"
+        }
+      },
+      "tests": [
+        {
+          "kind": "python",
+          "script": "tests/graph_ctypes.py"
+        }
+      ],
+      "test_limits": {
+        "cpu": 100000000000,
+        "memory": 1073741824,
+        "disk": 536870912
+      },
+      "module": "_ctypes"
+    }
   }
 }

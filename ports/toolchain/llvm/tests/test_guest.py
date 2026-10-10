@@ -65,7 +65,7 @@ def test_stripped_main_abi_rejects_runtime_frontiers(tmp_path, defect):
 
 
 def test_guest_compiler_graph_distinguishes_build_and_install_dependencies():
-    graph = plan(PORT.parents[1], ["toolchain/llvm/guest-recipe.json"])
+    graph = plan(PORT.parents[1], ["toolchain/llvm:guest"])
     clang = graph.ports[-1]
     assert clang.role == "guest-tool"
     assert {(edge.port, edge.kind) for edge in clang.dependencies} == {

@@ -1,7 +1,6 @@
 """Compile and run the pinned libffi scalar boundary through a C side provider."""
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -11,15 +10,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
 from ports.native.dependencies import target_environment, target_profile, toolchain_identity, verify_artifact
-from ports.toolchain.wasi_sdk.build import dynamic_toolchain
+from tests.fixtures.wasm.dynamic.toolchain import dynamic_toolchain
 
 PORT = Path(__file__).resolve().parent.parent
 
 
 def build_probe(artifact: Path, sdk: Path, output: Path) -> tuple[Path, Path]:
     """Link the verified archive into a main image with a separate C provider."""
-    recipe = json.loads((PORT / "recipe.json").read_text())
     manifest = verify_artifact(artifact)
+    recipe = manifest["inputs"]["recipe"]
     if manifest["inputs"]["recipe"] != recipe or manifest["inputs"]["toolchain"] != toolchain_identity(recipe, sdk):
         raise ValueError("libffi fixture requires the pinned archive and SDK")
     runtime, _, _ = dynamic_toolchain(sdk)

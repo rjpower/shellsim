@@ -1,54 +1,29 @@
 """Build recipe dependency graphs through admitted adapters and a verified store.
 
-Recipes own package choices. This driver dispatches by build system, publishes
-only complete results, and records exact dependency and compiler identities.
+Static recipes own graph choices. Port functions build admitted inputs; this
+driver publishes complete results with exact dependency and compiler identities.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
-import subprocess
 import sys
 import tempfile
-from contextlib import ExitStack
 from dataclasses import asdict, dataclass
-from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.native_adapters import (
-    NativeAdapter,
     NativeBuildContext,
-    build_native,
-    compilation_driver_inputs,
-    native_build_request,
 )
 from ports._support.python_adapters import (
     CPythonBuildContext,
-    ExtensionBuildRequest,
-    PureWheelBuildRequest,
-    build_extension,
-    build_host_wheel,
-    build_pure_wheel,
 )
 from ports._support.store import build_slot, extract, fetch, file_hash, relative_path
-
-_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "sdk.py", "sdk_products.py", "local_sources.py")
-_NATIVE_BUILD_MODULES = (
-    "native_adapters.py",
-    "compiler_response.py",
-    "native_artifacts.py",
-    "wasm.py",
-    "wasm_metadata.py",
-    "native/dependencies.py",
-    "toolchain/runtime_profile.py",
-)
-_PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
 
 if TYPE_CHECKING:
     from ports._support.sdk_products import MaterializedSDK
@@ -81,47 +56,21 @@ def _local_file(port: Port, name: object) -> Path:
 
 
 def _admit_recipe(port: Port) -> dict[str, str]:
-    build = port.recipe.get("build", {})
-    adapter = build.get("adapter")
-    if adapter in {"llvm-host", "wasi-sysroot"}:
-        expected_role = "host-tool" if adapter == "llvm-host" else "target-platform"
-        if port.role != expected_role:
-            raise ValueError("toolchain adapter role differs")
-        path = _local_file(port, build["producer_recipe"])
-        if file_hash(path) != build["producer_sha256"]:
-            raise ValueError("toolchain producer recipe differs")
-        from ports._support.build import check_build_scripts
+    """Admit metadata and local source inputs without importing build code."""
+    from ports._support.build import check_build_scripts
+    from ports.api import _HELPER_FILES
 
-        check_build_scripts(json.loads(path.read_text()), port.directory)
-        return {build["producer_recipe"]: build["producer_sha256"]}
-    if adapter not in {
-        "pure-wheel",
-        "host-wheel",
-        "python-pep517",
-        "python-extension",
-        "python-meson",
-        "llvm-guest",
-        "llvm-guest-sdk",
-        *(item.value for item in NativeAdapter),
-    }:
-        raise ValueError(f"recipe has no supported build adapter: {port.reference}")
-    if (
-        adapter not in {"pure-wheel", "host-wheel", "llvm-guest", "llvm-guest-sdk"}
-        and "files" not in port.recipe["source"]
-    ):
-        relative_path(port.recipe["source"]["subdirectory"])
-    if adapter == "host-wheel" and port.role != "host-tool":
-        raise ValueError("host-wheel adapter requires a host-only role")
+    if port.recipe.get("build_system") not in _HELPER_FILES:
+        raise ValueError("unsupported build system: " + port.reference)
+    check_build_scripts(port.recipe, port.directory)
     files = {}
-    for item in [*port.recipe.get("patches", []), *build.get("hooks", [])]:
+    for item in port.recipe.get("patches", []):
         path = _local_file(port, item["file"])
         actual = file_hash(path)
         if actual != item["sha256"]:
-            raise ValueError(f"recipe patch or hook differs: {path}")
+            raise ValueError("recipe patch differs: " + str(path))
         files[item["file"]] = actual
-    for hook in build.get("hooks", []):
-        if hook.get("phase") not in {"before_build", "after_install"}:
-            raise ValueError("unsupported port hook phase")
+    files.update(port.recipe.get("inputs", {}))
     return files
 
 
@@ -153,35 +102,6 @@ def _executable_sdk_link_inputs(sdk_context: MaterializedSDK, build: Mapping) ->
     return tuple(root / name for name in inputs)
 
 
-def _hooks(port: Port, phase: str, context: NativeBuildContext, sdk_context: MaterializedSDK) -> None:
-    """Run pinned port-local Python hooks with an explicit JSON context argument."""
-    from ports.native.dependencies import target_environment
-
-    hooks = [hook for hook in port.recipe["build"].get("hooks", []) if hook["phase"] == phase]
-    if not hooks:
-        return
-    context.build.parent.mkdir(parents=True, exist_ok=True)
-    path = context.build.parent / "hook-context.json"
-    path.write_text(json.dumps(asdict(context), default=str, sort_keys=True) + "\n")
-    environment = target_environment(context.sdk)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PATH"] = os.pathsep.join(sorted({str(tool.path.parent) for tool in sdk_context.host_tools.values()}))
-    for index, hook in enumerate(hooks):
-        with (context.build.parent / f"hook-{phase}-{index}.log").open("wb") as log:
-            subprocess.run(
-                [str(sdk_context.tool("python")), str(_local_file(port, hook["file"])), str(path)],
-                cwd=context.source,
-                env=environment,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                check=True,
-            )
-
-
-def _native_driver_inputs(context: NativeBuildContext, *, build: dict, jobs: int | None) -> dict:
-    return compilation_driver_inputs(native_build_request(context, build, jobs))
-
-
 def _backend_wheels(port: Port, selected: Mapping[str, Port], results: Mapping[str, Path]):
     """Follow exact backend dependency edges, including runtime imports."""
     from ports._support.python_pep517 import BackendWheel
@@ -189,7 +109,7 @@ def _backend_wheels(port: Port, selected: Mapping[str, Port], results: Mapping[s
     pending = [
         item.recipe
         for item in port.dependencies
-        if item.kind == "build" and item.recipe != "toolchain/llvm/host-recipe.json"
+        if item.kind == "build" and selected[item.recipe].recipe["build_system"] != "llvm-host"
     ]
     visited, wheels = set(), []
     while pending:
@@ -198,7 +118,7 @@ def _backend_wheels(port: Port, selected: Mapping[str, Port], results: Mapping[s
             continue
         visited.add(reference)
         dependency = selected[reference]
-        if dependency.recipe["build"]["adapter"] not in {"pure-wheel", "host-wheel"}:
+        if dependency.recipe["build_system"] not in {"pure-wheel", "host-wheel"}:
             raise ValueError("PEP 517 backend dependency is not a pinned wheel")
         paths = list((results[reference] / "wheels").glob("*.whl"))
         if len(paths) != 1:
@@ -206,37 +126,6 @@ def _backend_wheels(port: Port, selected: Mapping[str, Port], results: Mapping[s
         wheels.append(BackendWheel(paths[0], dependency.recipe))
         pending.extend(item.recipe for item in dependency.dependencies)
     return tuple(wheels)
-
-
-def _build_implementation(support: Path, adapter: str, *, stdlib: bool = False) -> dict[str, str]:
-    """Bind cached outputs to the code that actually stages and seals them."""
-    modules = [*_COMMON_BUILD_MODULES]
-    if adapter in {"pure-wheel", "host-wheel"}:
-        modules.extend(_PURE_BUILD_MODULES)
-    elif adapter in {"llvm-guest", "llvm-guest-sdk"}:
-        modules.extend(("build.py", "toolchain/llvm/guest.py", *_NATIVE_BUILD_MODULES))
-    elif adapter in {"python-extension", "python-meson", "python-pep517"}:
-        modules.extend(("build.py", "python_adapters.py", *_NATIVE_BUILD_MODULES))
-        if adapter == "python-meson":
-            modules.append("python_meson.py")
-        elif adapter == "python-pep517":
-            modules.extend(("python_pep517.py", "pep517_runner.py", "python_meson.py", "pure_wheel.py"))
-    else:
-        modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
-    if adapter in {"meson", "python-meson"}:
-        modules.extend(("meson_adapter.py", "meson_workspace.py"))
-    elif adapter == "cmake":
-        modules.append("cmake_adapter.py")
-    elif adapter in {"configure-make", "plain-make"}:
-        modules.append("make_adapter.py")
-    if stdlib:
-        modules.append("python/cpython/graph_assembly.py")
-    return {
-        name: file_hash(
-            support.parent / name if name.startswith(("native/", "toolchain/", "python/")) else support / name
-        )
-        for name in modules
-    }
 
 
 def _source_exports(port: Port, context: NativeBuildContext) -> None:
@@ -269,12 +158,12 @@ def build_graph(
     default_sdk: str = "default",
     workspaces: Mapping[str, Path] | None = None,
 ) -> GraphBuild:
-    """Build each selected recipe once, reusing only byte-verified cache entries."""
-    from ports._support.native_artifacts import (
-        NativeArtifact,
-        merge_dependency_sysroot,
-        seal_native_install,
-    )
+    """Execute admitted port builders and publish byte-verified immutable results."""
+    from ports._support.local_sources import stage_local_sources
+    from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot, seal_native_install
+    from ports._support.sdk_products import resolved_toolchain, verify_product
+    from ports._support.store import identity
+    from ports.api import BuildContext, build_port, implementation
 
     if jobs is not None and not 1 <= jobs <= 16:
         raise ValueError("build jobs must be between one and sixteen")
@@ -283,175 +172,153 @@ def build_graph(
     )
     selected = {port.reference: port for port in graph.ports}
     for reference in workspaces or {}:
-        if reference not in selected or selected[reference].recipe["build"]["adapter"] not in {
+        if reference not in selected or selected[reference].recipe["build_system"] not in {
             "llvm-guest",
             "meson",
             "python-meson",
         }:
             raise ValueError("explicit workspace requires a selected persistent producer: " + reference)
     local_inputs = {port.reference: _admit_recipe(port) for port in graph.ports}
-    from ports._support.local_sources import local_source_files, stage_local_sources
+    implementations = {port.reference: implementation(port) for port in graph.ports}
+    product_systems = {"llvm-host", "wasi-sysroot", "sdk-tooling", "cpython-threaded", "uv-host"}
+    results, native, keys, products, sdks = {}, {}, {}, {}, {}
+    for port in graph.ports:
+        recipe, system = port.recipe, port.recipe["build_system"]
+        if system in product_systems:
+            product = {
+                "llvm-host": sdk_context.llvm,
+                "wasi-sysroot": sdk_context.sysroot,
+                "sdk-tooling": sdk_context.sdk,
+                "cpython-threaded": sdk_context.cpython_manifest,
+            }.get(system)
+            if system == "uv-host":
+                from ports._support.sdk_products import Receipt, read_json
 
-    for port in graph.ports:
-        if "files" in port.recipe.get("source", {}):
-            local_source_files(ports, port.recipe["source"])
-    for port in graph.ports:
-        if port.recipe["build"]["adapter"] in {"pure-wheel", "host-wheel", "llvm-host", "wasi-sysroot"}:
-            continue
-        if (
-            len(
-                [
-                    item
-                    for item in port.dependencies
-                    if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
-                ]
-            )
-            != 1
-        ):
-            raise ValueError(f"native build requires an explicit host compiler dependency: {port.reference}")
-        if len([item for item in port.dependencies if item.kind == "platform"]) != 1:
-            raise ValueError(f"native build requires an explicit target platform dependency: {port.reference}")
-    support = Path(__file__).parent
-    implementations = {
-        port.reference: _build_implementation(
-            support, port.recipe["build"]["adapter"], stdlib=port.recipe["build"].get("output") == "stdlib"
-        )
-        for port in graph.ports
-        if port.recipe["build"]["adapter"] not in {"llvm-host", "wasi-sysroot"}
-    }
-    results: dict[str, Path] = {}
-    native: dict[str, NativeArtifact] = {}
-    keys: dict[str, str] = {}
-    products = {}
-    sdks = {}
-    for port in graph.ports:
-        adapter = port.recipe["build"]["adapter"]
-        if adapter in {"llvm-host", "wasi-sysroot"}:
-            from ports._support.sdk_products import verify_product
-            from ports._support.store import identity
-
-            product = sdk_context.llvm if adapter == "llvm-host" else sdk_context.sysroot
-            verify_product(product)
-            producer_path = _local_file(port, port.recipe["build"]["producer_recipe"])
-            if product.contents["identity"]["recipe"] != json.loads(producer_path.read_text()):
-                raise ValueError("graph product producer differs from declared recipe")
+                resolver = sdk_context.host_tools["uv"]
+                product = Receipt(
+                    resolver.path.parent,
+                    resolver.receipt_path,
+                    resolver.receipt_sha256,
+                    read_json(resolver.receipt_path),
+                )
+            if product is None:
+                raise ValueError("selected SDK product was not materialized")
+            if system in {"llvm-host", "wasi-sysroot"}:
+                verify_product(product)
             products[port.reference] = product
             results[port.reference] = product.root
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
             continue
         build_sdk = sdk_context
-        if adapter not in {"pure-wheel", "host-wheel"}:
-            from ports._support.sdk_products import resolved_toolchain
-
-            sysroot = next(products[item.recipe] for item in port.dependencies if item.kind == "platform")
-            compiler = next(
-                products[item.recipe]
+        pure = system in {"pure-wheel", "host-wheel", "source-tree"}
+        if not pure:
+            platform_edges = [item for item in port.dependencies if item.kind == "platform"]
+            compiler_edges = [
+                item
                 for item in port.dependencies
-                if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
-            )
+                if item.kind == "build" and selected[item.recipe].recipe["build_system"] == "llvm-host"
+            ]
+            if len(platform_edges) != 1 or len(compiler_edges) != 1:
+                raise ValueError("native build requires one explicit compiler and platform dependency")
+            compiler, sysroot = products[compiler_edges[0].recipe], products[platform_edges[0].recipe]
             build_sdk = resolved_toolchain(sdk_context, compiler, sysroot)
             target = _native_target(build_sdk)
         sdks[port.reference] = build_sdk
-        executable_inputs = (
-            _executable_sdk_link_inputs(build_sdk, port.recipe["build"])
-            if adapter not in {"pure-wheel", "host-wheel"}
-            else ()
-        )
+        executable_inputs = _executable_sdk_link_inputs(build_sdk, recipe) if not pure else ()
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
             "implementation": implementations[port.reference],
-            "dependencies": {
-                dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
+            "driver": {
+                name: file_hash(Path(__file__).with_name(name))
+                for name in (
+                    ("runner.py", "store.py", "local_sources.py")
+                    if "files" in recipe["source"]
+                    else ("runner.py", "store.py")
+                )
             },
+            "dependencies": {item.kind + ":" + item.port: keys[item.recipe] for item in port.dependencies},
         }
         if port.sdk_selection is not None:
             inputs["sdk_selection"] = asdict(port.sdk_selection)
-        if adapter not in {"pure-wheel", "host-wheel"}:
+        if not pure:
             inputs["sdk"] = build_sdk.identity
             inputs["host_tools"] = {
                 name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
-                for name, tool in sdk_context.host_tools.items()
+                for name, tool in build_sdk.host_tools.items()
                 if name != "uv"
             }
-            if adapter in {"python-extension", "python-pep517", "python-meson"}:
-                inputs["python"] = {
-                    "source": sdk_context.python.source_sha256,
-                    "headers": sdk_context.python.headers_sha256,
-                    "pyconfig": sdk_context.python.pyconfig_sha256,
-                }
-        if adapter not in {"pure-wheel", "host-wheel", "llvm-guest-sdk"}:
             inputs["target_flags"] = {
-                "compiler": list(build_sdk.compiler_flags),
-                "linker": list(build_sdk.linker_flags),
-                "shared_library": list(build_sdk.shared_library_flags),
-                "shared_library_inputs": [
-                    {
-                        "path": str(build_sdk.compiler_runtime_archive),
-                        "sha256": file_hash(build_sdk.compiler_runtime_archive),
-                    }
-                ],
-                "executable": list(build_sdk.executable_flags),
-                "executable_link_inputs": [
-                    {"path": str(path), "sha256": file_hash(path)} for path in executable_inputs
-                ],
+                "compiler": build_sdk.compiler_flags,
+                "linker": build_sdk.linker_flags,
+                "shared_library": build_sdk.shared_library_flags,
+                "executable": build_sdk.executable_flags,
+                "compiler_runtime": file_hash(build_sdk.compiler_runtime_archive),
+                "executable_link_inputs": {str(path): file_hash(path) for path in executable_inputs},
             }
-        with build_slot(store, inputs) as slot, ExitStack() as workspace_stack:
+            if system.startswith("python-"):
+                python = build_sdk.python
+                if python is None:
+                    raise ValueError("Python builder requires admitted CPython headers and runtime")
+                inputs["python"] = {
+                    "source": python.source_sha256,
+                    "headers": python.headers_sha256,
+                    "pyconfig": python.pyconfig_sha256,
+                }
+        # Cache receipts use JSON arrays for the typed toolchain argument tuples.
+        inputs = json.loads(json.dumps(inputs, sort_keys=True))
+        with build_slot(store, inputs) as slot:
             keys[port.reference] = slot.key
             print(
                 f"ports: result cache {'hit' if slot.cached else 'miss'}: {port.reference}", file=sys.stderr, flush=True
             )
             if not slot.cached:
-                recipe, build = port.recipe, port.recipe["build"]
                 source = (
                     stage_local_sources(ports, recipe["source"], slot.work / "source")
                     if "files" in recipe["source"]
                     else fetch(recipe["source"], store / "sources", offline=offline)
                 )
-                if adapter in {"pure-wheel", "host-wheel"}:
-                    producer = build_pure_wheel if adapter == "pure-wheel" else build_host_wheel
-                    producer(PureWheelBuildRequest(source, slot.result, recipe))
-                else:
-                    if adapter != "llvm-guest" and "files" not in recipe["source"]:
+                if pure:
+                    if system == "source-tree" and "files" not in recipe["source"]:
                         source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
-                    if adapter != "llvm-guest":
                         for patch in recipe.get("patches", []):
                             apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
-                    for dependency in port.dependencies:
-                        if (
-                            dependency.kind == "target"
-                            and dependency.port.startswith("native/")
-                            and dependency.port not in native
-                        ):
-                            raise ValueError(f"native dependency has no sealed artifact: {dependency.port}")
-                    direct = {
-                        dependency.port: native[dependency.port]
-                        for dependency in port.dependencies
-                        if dependency.kind == "target" and dependency.port in native
-                    }
-                    workspace = slot.work
-                    build_directory = workspace / "build"
-                    if adapter == "llvm-guest":
-                        from ports._support.store import identity
+                    build_port(BuildContext(port, source, slot.result, sdk=build_sdk, jobs=jobs))
+                else:
+                    if system != "llvm-guest" and "files" not in recipe["source"]:
+                        source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
+                    if system != "llvm-guest":
+                        for patch in recipe.get("patches", []):
+                            apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
+                    direct = {}
+                    for item in port.dependencies:
+                        if item.kind != "target":
+                            continue
+                        if item.port in native:
+                            direct[item.port] = native[item.port]
+                        elif item.port.startswith("native/"):
+                            raise ValueError("native dependency has no sealed artifact: " + item.port)
+                    workspace, build_directory = slot.work, slot.work / "build"
+                    if system == "llvm-guest":
                         from ports.toolchain.llvm.guest import workspace_compatibility
 
                         compatibility = workspace_compatibility(
                             recipe,
                             compiler,
                             sysroot.root / "sysroot",
-                            sdk_context.sdk.root,
+                            build_sdk.sdk.root,
                             {name: artifact.prefix for name, artifact in direct.items()},
-                            {name: tool.path for name, tool in sdk_context.host_tools.items()},
+                            {name: tool.path for name, tool in build_sdk.host_tools.items()},
                             build_sdk.target,
                         )
                         build_directory = (
                             workspaces[port.reference].resolve()
-                            if workspaces is not None and port.reference in workspaces
-                            else store.resolve() / "workspaces" / "llvm-guest" / identity(compatibility) / "build"
+                            if workspaces and port.reference in workspaces
+                            else store.resolve() / "workspaces/llvm-guest" / identity(compatibility) / "build"
                         )
                         workspace = build_directory.parent
                     prefix = workspace / "dependencies"
-                    if adapter == "llvm-guest" and prefix.exists():
+                    if system == "llvm-guest" and prefix.exists():
                         shutil.rmtree(prefix)
                     merge_dependency_sysroot(direct, native, prefix, target)
                     context = NativeBuildContext(
@@ -461,7 +328,7 @@ def build_graph(
                         sdk=build_sdk.sdk.root,
                         compiler_prefix=build_sdk.llvm.root,
                         sysroot=build_sdk.sysroot.root / "sysroot",
-                        target=sdk_context.target,
+                        target=build_sdk.target,
                         compiler_flags=(*build_sdk.compiler_flags, "-I" + str(prefix / "usr/local/include"))
                         if direct
                         else build_sdk.compiler_flags,
@@ -469,7 +336,7 @@ def build_graph(
                         if direct
                         else build_sdk.linker_flags,
                         dependencies={name: artifact.prefix for name, artifact in direct.items()},
-                        host_tools={name: tool.path for name, tool in sdk_context.host_tools.items()},
+                        host_tools={name: tool.path for name, tool in build_sdk.host_tools.items()},
                         target_tools={name: tool.path for name, tool in build_sdk.target_tools.items()},
                         dependency_sysroot=prefix,
                         abi=build_sdk.dynamic_abi,
@@ -480,10 +347,9 @@ def build_graph(
                         shared_library_inputs=(build_sdk.compiler_runtime_archive,),
                         executable_link_inputs=executable_inputs,
                     )
-                    if adapter in {"python-extension", "python-meson", "python-pep517"}:
-                        python = sdk_context.python
-                        if python is None:
-                            raise ValueError("Python extension requires admitted CPython headers and runtime")
+                    python_context = None
+                    if system.startswith("python-"):
+                        python = build_sdk.python
                         python_context = CPythonBuildContext(
                             python.source_root / "Include",
                             python.generated_config_dir,
@@ -498,154 +364,28 @@ def build_graph(
                                 "runtime": python.runtime_manifest_sha256,
                             },
                         )
-                        if adapter == "python-meson":
-                            from ports._support.python_meson import (
-                                PythonMesonBuildRequest,
-                                build_python_meson,
-                                python_meson_driver_inputs,
-                            )
-
-                            host_packages = {}
-                            for item in build.get("host_header_packages", {}).values():
-                                tool = sdk_context.host_tools[item["tool"]]
-                                if tool.receipt_path is None:
-                                    raise ValueError("Python Meson host headers require a complete package receipt")
-                                proof = json.loads(tool.receipt_path.read_text())
-                                host_packages[item["tool"]] = (tool.receipt_path.parent / proof["root"]).resolve()
-                    if adapter in {"meson", "python-meson"} and workspaces and port.reference in workspaces:
-                        from ports._support.meson_workspace import retained_meson
-
-                        if build.get("hooks"):
-                            raise ValueError(
-                                "retained Meson workspaces require source patches rather than mutable hooks"
-                            )
-                        compilation = {
-                            name: build[name]
-                            for name in (
-                                "configure_args",
-                                "configure_environment",
-                                "cross_properties",
-                                "dependency_properties",
-                                "host_header_packages",
-                                "install_prefix",
-                            )
-                            if name in build
-                        }
-                        host_code = {}
-                        for name in (
-                            "python",
-                            "meson",
-                            "ninja",
-                            "cython",
-                            "f2py",
-                            "pybind11-config",
-                            "pkg-config",
-                            "sh",
-                        ):
-                            if name in sdk_context.host_tools:
-                                tool = sdk_context.host_tools[name]
-                                host_code[name] = {"path": str(tool.path), "sha256": tool.sha256}
-                                if tool.receipt_path is not None:
-                                    proof = json.loads(tool.receipt_path.read_text())
-                                    host_code[name]["files"] = proof["files"]
-                        product_inputs = {
-                            "compiler": build_sdk.llvm.sha256,
-                            "platform": build_sdk.sysroot.sha256,
-                            "sdk": build_sdk.sdk.sha256,
-                        }
-                        if sdk_context.python is not None:
-                            product_inputs["python"] = {
-                                "source": sdk_context.python.source_sha256,
-                                "headers": sdk_context.python.headers_sha256,
-                                "pyconfig": sdk_context.python.pyconfig_sha256,
-                            }
-                        context = workspace_stack.enter_context(
-                            retained_meson(
-                                context,
-                                workspaces[port.reference],
-                                compilation,
-                                product_inputs,
-                                host_code,
-                                driver_inputs=(
-                                    partial(
-                                        python_meson_driver_inputs,
-                                        cpython=python_context,
-                                        recipe=recipe,
-                                        host_packages=host_packages,
-                                    )
-                                )
-                                if adapter == "python-meson"
-                                else partial(_native_driver_inputs, build=build, jobs=jobs),
-                            )
+                    output = build_port(
+                        BuildContext(
+                            port,
+                            source,
+                            slot.result,
+                            sdk=build_sdk,
+                            native=context,
+                            cpython=python_context,
+                            backend_wheels=_backend_wheels(port, selected, results)
+                            if system == "python-pep517"
+                            else (),
+                            jobs=jobs,
+                            workspace=workspaces.get(port.reference) if workspaces else None,
                         )
-                        # The sealed result inventories this exact compilation receipt.
-                        shutil.copyfile(
-                            context.build.parent / ".meson-workspace.json",
-                            slot.result / "meson-workspace-receipt.json",
-                        )
-                    _hooks(port, "before_build", context, sdk_context)
-                    if build["adapter"] in {"python-extension", "python-meson", "python-pep517"}:
-                        if adapter == "python-meson":
-                            output = build_python_meson(
-                                PythonMesonBuildRequest(context, python_context, recipe, host_packages)
-                            )
-                        elif adapter == "python-pep517":
-                            from ports._support.python_pep517 import PEP517BuildRequest, build_pep517
-
-                            version = ".".join(python.version.split(".")[:2])
-                            configs = [
-                                name
-                                for name in sdk_context.runtime.contents["files"]
-                                if name.startswith(f"/usr/lib/python{version}/_sysconfigdata_") and name.endswith(".py")
-                            ]
-                            if len(configs) != 1:
-                                raise ValueError("target runtime must export one admitted sysconfig data file")
-                            config = python.runtime_bundle / "rootfs" / configs[0].lstrip("/")
-                            if file_hash(config) != sdk_context.runtime.contents["files"][configs[0]]:
-                                raise ValueError("target sysconfig differs from admitted runtime")
-                            output = build_pep517(
-                                PEP517BuildRequest(
-                                    context,
-                                    python_context,
-                                    config,
-                                    recipe,
-                                    _backend_wheels(port, selected, results),
-                                )
-                            )
-                            shutil.copyfile(
-                                output.staging_prefix / "pep517-receipt.json", slot.result / "pep517-receipt.json"
-                            )
-                        else:
-                            output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
-                        _hooks(port, "after_install", context, sdk_context)
-                        if adapter == "python-meson" or build.get("output", "wheel") == "wheel":
-                            shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
-                        if (adapter == "python-meson" or build.get("output") == "stdlib") and (
-                            recipe.get("exports") or recipe.get("export_directories")
-                        ):
-                            seal_native_install(
-                                recipe,
-                                port.directory,
-                                output.staging_prefix,
-                                slot.result / "native",
-                                target,
-                                direct,
-                                native,
-                                {item.port: native[item.port] for item in port.dependencies if item.kind == "runtime"},
-                            )
-                    else:
-                        if adapter == "llvm-guest-sdk":
-                            from ports.toolchain.llvm.guest import install_guest_sdk
-
-                            output = install_guest_sdk(context, recipe)
-                        elif adapter == "llvm-guest":
-                            from ports.toolchain.llvm.guest import build_guest
-
-                            output = build_guest(context, recipe, compiler, jobs=jobs)
-                        else:
-                            output = build_native(native_build_request(context, build, jobs))
-                        _hooks(port, "after_install", context, sdk_context)
-                        _source_exports(port, context)
+                    )
+                    _source_exports(port, context)
+                    for receipt_name in ("pep517-receipt.json",):
+                        if (output.staging_prefix / receipt_name).is_file():
+                            shutil.copyfile(output.staging_prefix / receipt_name, slot.result / receipt_name)
+                    if (output.staging_prefix / "wheels").exists():
+                        shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
+                    if recipe.get("exports") or recipe.get("export_directories"):
                         seal_native_install(
                             recipe,
                             port.directory,
@@ -654,7 +394,11 @@ def build_graph(
                             target,
                             direct,
                             native,
-                            {item.port: native[item.port] for item in port.dependencies if item.kind == "runtime"},
+                            {
+                                item.port: native[item.port]
+                                for item in port.dependencies
+                                if item.kind == "runtime" and item.port in native
+                            },
                         )
         result = store.resolve() / "results" / keys[port.reference]
         results[port.reference] = result
@@ -687,9 +431,7 @@ def publish_graph(build: GraphBuild, sdk_context: MaterializedSDK, output: Path)
     with tempfile.TemporaryDirectory(prefix=".ports-catalog-", dir=output.parent) as temporary:
         runtime = sdk_context.python.runtime_bundle
         incorporated_providers = frozenset()
-        stdlib_ports = [
-            port for port in guest_graph(build.graph).ports if port.recipe["build"].get("output") == "stdlib"
-        ]
+        stdlib_ports = [port for port in guest_graph(build.graph).ports if port.recipe.get("output") == "stdlib"]
         if stdlib_ports:
             from ports._support.native_artifacts import NativeArtifact
             from ports.python.cpython.graph_assembly import assemble_stdlib
@@ -740,7 +482,7 @@ def publish_graph(build: GraphBuild, sdk_context: MaterializedSDK, output: Path)
                 artifact = verify_artifact(result / "native")
                 for relative in artifact["inputs"]["recipe"]["exports"].get("shared_libraries", []):
                     path = result / "native" / relative
-                    if port.recipe["build"].get("output") == "stdlib":
+                    if port.recipe.get("output") == "stdlib":
                         continue
                     if path.name in incorporated_providers:
                         if file_hash(path) != file_hash(runtime / "rootfs/lib" / path.name):
@@ -793,7 +535,10 @@ def accept_graph(build: GraphBuild, sdk_context: MaterializedSDK, descriptor: Pa
         if port.role in {"host-tool", "target-platform"}:
             continue
         build_sdk = build.sdks[port.reference]
-        proof = output / Path(port.reference).with_suffix("")
+        reference, _, variant = port.reference.partition(":")
+        proof = output / Path(reference).with_suffix("")
+        if variant:
+            proof /= variant
         identity = port.reference.split("/", 1)[0] + "/" + port.name
         kind = "native" if identity in native else "pypi"
         if kind == "native" and (build.results[port.reference] / "wheels").exists():
@@ -852,16 +597,20 @@ def main() -> None:
         reference, separator, directory = declaration.partition("=")
         if not separator or not reference or not directory:
             parser.error("--workspace requires RECIPE=PATH")
-        reference = relative_path(reference)
-        if not reference.endswith(".json"):
-            reference += "/recipe.json"
+        from ports._support.graph import canonical_reference
+
+        reference = canonical_reference(args.ports, reference)
         if reference in workspaces:
             parser.error("duplicate --workspace recipe")
         workspaces[reference] = Path(directory)
     graph = plan(args.ports, args.recipes, default_sdk=args.sdk)
-    needs_target = any(port.recipe["build"]["adapter"] not in {"pure-wheel", "host-wheel"} for port in graph.ports)
+    needs_target = any(
+        port.recipe["build_system"] not in {"pure-wheel", "host-wheel", "source-tree"} for port in graph.ports
+    )
     needs_python = args.output is not None or any(
-        port.recipe["build"]["adapter"] in {"python-extension", "python-pep517", "python-meson"} for port in graph.ports
+        port.recipe["build_system"]
+        in {"python-extension", "python-pep517", "python-meson", "cpython-threaded", "uv-host"}
+        for port in graph.ports
     )
     if args.check:
         for port in guest_graph(graph).ports:

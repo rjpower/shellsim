@@ -6,7 +6,7 @@ from pathlib import Path
 
 from ports._support.wasm import mark_abi, run
 from ports.native.dependencies import file_hash, target_environment, target_profile
-from ports.toolchain.wasi_sdk.build import dynamic_toolchain
+from tests.fixtures.wasm.dynamic.toolchain import dynamic_toolchain
 
 PORT = Path(__file__).resolve().parent
 

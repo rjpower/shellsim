@@ -1,63 +1,447 @@
 {
-  "name": "llvm-wasi-linker",
-  "version": "23-sdk34-deferred-init-1",
   "source": {
     "commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
     "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
     "sha256": "b4525499be9ccd65a0da8c9efbeb59a5955130b302a190a51883727d8c5c7542"
   },
-  "protocol": {
-    "dylink_subsection_type": 128,
-    "type_encoding": "uint8",
-    "vendor": "shellsim.deferred-init",
-    "version": 1,
-    "reject_module_start": true
-  },
-  "patches": [
-    {
-      "file": "serial-memory-init.patch",
-      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
-      "inputs": {
-        "Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
-        "Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
-        "Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
-        "Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
-      }
+  "default_variant": "host",
+  "variants": {
+    "host": {
+      "name": "llvm",
+      "version": "23.0.0",
+      "protocol": {
+        "dylink_subsection_type": 128,
+        "type_encoding": "uint8",
+        "vendor": "shellsim.deferred-init",
+        "version": 1,
+        "reject_module_start": true
+      },
+      "patches": [
+        {
+          "file": "serial-memory-init.patch",
+          "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
+          "inputs": {
+            "lld/wasm/Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+            "lld/wasm/Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+            "lld/wasm/Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+            "lld/wasm/Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+          }
+        },
+        {
+          "file": "deferred-shared-init.patch",
+          "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
+          "inputs": {
+            "lld/wasm/Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
+            "lld/wasm/Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
+            "lld/wasm/Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
+            "lld/wasm/Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
+            "lld/wasm/SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
+          }
+        },
+        {
+          "file": "llvm-wasi-dynamic-tls.patch",
+          "sha256": "393441b4b3e85faf93badae7ad152a6e8b11a9f6138f71dbea0923114d21649f",
+          "inputs": {
+            "llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp": "4e33c6df76cc32cacbeac45f7f03562f61567d83d1a138233e1a8222077223fa"
+          }
+        },
+        {
+          "file": "main-tls-exports.patch",
+          "sha256": "e0fbee17b79a28833e89494b55da2ad340984f6c2b926ebafaa3b14c927d3c64",
+          "inputs": {
+            "lld/wasm/Config.h": "0d1c923bfcaff7bbbb4c22937afa1ff9a62f65f584e22fad20026e4e732a7296",
+            "lld/wasm/Driver.cpp": "cae03917f2e1eeac3d1f1d7e20135ac0ab78cececa406672622690a759891b22",
+            "lld/wasm/Options.td": "1c04d302078a3adf032dbdbebd5f75daa0543ec291a7995dc080acc2995c2f78",
+            "lld/wasm/SyntheticSections.cpp": "6d806f6d168a2e48584db64ca1da7cae460bb0f04ca14a79517ea237f8d17f60"
+          }
+        },
+        {
+          "file": "tls-reloc-symbol.patch",
+          "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117",
+          "inputs": {
+            "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
+            "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
+          }
+        },
+        {
+          "file": "image-synthetic-ownership.patch",
+          "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
+          "inputs": {
+            "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
+          }
+        },
+        {
+          "file": "runtime-ctors.patch",
+          "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10",
+          "inputs": {
+            "lld/wasm/Config.h": "ed372be1e01c7b6da82b8ba6a23736469fa1c674ea47368f1024aa2f6c925ec0",
+            "lld/wasm/Options.td": "eeaab5b15bee6337c92cc532f9676f6fbffed0bd7b9f8355d2bc77bc34caf80f",
+            "lld/wasm/Driver.cpp": "300fa30ffb7c6f1bd58885ffd6df8a57f390f908942abe72fde827495db70802",
+            "lld/wasm/Writer.cpp": "074ed90ec1b2cf59df617fe34c182e0a927aa9389af9452e29291c72a3bbcf55"
+          }
+        },
+        {
+          "file": "runtime-ctors-opcodes.patch",
+          "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035",
+          "inputs": {
+            "lld/wasm/Writer.cpp": "33b00cbf116dd29c4e1abc3ec3c31d2106b089bbb007413c052fe838ee6801c4"
+          }
+        }
+      ],
+      "build_limits": {
+        "compile_jobs": 4,
+        "link_jobs": 1,
+        "address_space_bytes_per_process": 12884901888,
+        "command_timeout_seconds": 3600
+      },
+      "main_tls_protocol": {
+        "dylink_subsection_type": 129,
+        "type_encoding": "uint8",
+        "vendor": "shellsim.main-tls",
+        "version": 1,
+        "exhaustive_tls_export_classification": true
+      },
+      "producer_identity": {
+        "name": "llvm-wasi-compiler",
+        "version": "23-sdk34-threaded-compiler-2"
+      },
+      "build_system": "llvm-host",
+      "role": "host-tool"
     },
-    {
-      "file": "deferred-shared-init.patch",
-      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
-      "inputs": {
-        "Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
-        "Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
-        "Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
-        "Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
-        "SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
-      }
+    "guest": {
+      "version": "23.1.0rc3",
+      "linkage": "static",
+      "name": "clang",
+      "kind": "native-tool",
+      "role": "guest-tool",
+      "patches": [
+        {
+          "file": "serial-memory-init.patch",
+          "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
+          "inputs": {
+            "lld/wasm/Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+            "lld/wasm/Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+            "lld/wasm/Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+            "lld/wasm/Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+          }
+        },
+        {
+          "file": "deferred-shared-init.patch",
+          "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
+          "inputs": {
+            "lld/wasm/Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
+            "lld/wasm/Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
+            "lld/wasm/Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
+            "lld/wasm/Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
+            "lld/wasm/SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
+          }
+        },
+        {
+          "file": "llvm-wasi-dynamic-tls.patch",
+          "sha256": "393441b4b3e85faf93badae7ad152a6e8b11a9f6138f71dbea0923114d21649f",
+          "inputs": {
+            "llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp": "4e33c6df76cc32cacbeac45f7f03562f61567d83d1a138233e1a8222077223fa"
+          }
+        },
+        {
+          "file": "main-tls-exports.patch",
+          "sha256": "e0fbee17b79a28833e89494b55da2ad340984f6c2b926ebafaa3b14c927d3c64",
+          "inputs": {
+            "lld/wasm/Config.h": "0d1c923bfcaff7bbbb4c22937afa1ff9a62f65f584e22fad20026e4e732a7296",
+            "lld/wasm/Driver.cpp": "cae03917f2e1eeac3d1f1d7e20135ac0ab78cececa406672622690a759891b22",
+            "lld/wasm/Options.td": "1c04d302078a3adf032dbdbebd5f75daa0543ec291a7995dc080acc2995c2f78",
+            "lld/wasm/SyntheticSections.cpp": "6d806f6d168a2e48584db64ca1da7cae460bb0f04ca14a79517ea237f8d17f60"
+          }
+        },
+        {
+          "file": "guest-wasi.patch",
+          "sha256": "aceae42917de4a57e27215ec334c75e088af34a562dc830361041755e33bd8da",
+          "inputs": {
+            "llvm/include/llvm/ADT/bit.h": "b3c8320299cc6a422b50793ed73d3a6e4dd4353d09878beac5d87d2ac600876d",
+            "llvm/lib/Support/ProgramStack.cpp": "97b4944057da163aa50f3a1597fef296535369db34ccf7ad6bb65d97ae4b1847",
+            "llvm/lib/Support/LockFileManager.cpp": "9904822bc869485782f9f28be4abf15171e5ea7150180dc0009b4b0393feb928",
+            "llvm/lib/Support/CrashRecoveryContext.cpp": "220f6204b6169f811cdae655d0644c67dff41c2b201258fcf3300ae859576432",
+            "llvm/lib/Support/raw_socket_stream.cpp": "b1054fe3f62a173dbc0e4eaece845ab3c2307dafa051e2616d3bf7c610125f38",
+            "llvm/lib/Support/Unix/Process.inc": "969c4a820e0ebbe197d6aeb07ada489056fe8520a621ee6befbbfc520b4c2c19",
+            "llvm/lib/Support/Unix/Program.inc": "33b3c3cd324fba24815b37704a124db6b31d4c966f5a4e307ba7f6ba8db587dc",
+            "llvm/lib/Support/Unix/Path.inc": "4eb29bfcf362f99f2c1cf8b0088da05e759ee66115b726724877983153e6ffa7",
+            "llvm/lib/Support/Unix/Signals.inc": "462bb0fdf8510d5d1fdc2462dec6deccc14fd36a976c978e1ad6b108937c3901",
+            "llvm/lib/Support/Unix/Watchdog.inc": "2842394de68bcd926f22cc3976ce1968ce3bf214a0be6d96f7bf2465fe0b725b",
+            "llvm/lib/Support/Unix/Memory.inc": "cc0d9fdeb4eebc10da8b0cff37d61221d7b7e65249f16e1f80717705e34cb61a",
+            "lld/tools/lld/CMakeLists.txt": "8853af7bf63b1d4c1e620adb28d7d2858f8b1881b5e3237429f2efcbbf5e4c02",
+            "lld/tools/lld/lld.cpp": "f35f6cf82397874b3b1e149b8e3986fbe50ecee449eda601fbc2ec5f21e999a0"
+          }
+        },
+        {
+          "file": "tls-reloc-symbol.patch",
+          "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117",
+          "inputs": {
+            "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
+            "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
+          }
+        },
+        {
+          "file": "image-synthetic-ownership.patch",
+          "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
+          "inputs": {
+            "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
+          }
+        },
+        {
+          "file": "runtime-ctors.patch",
+          "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10",
+          "inputs": {
+            "lld/wasm/Config.h": "ed372be1e01c7b6da82b8ba6a23736469fa1c674ea47368f1024aa2f6c925ec0",
+            "lld/wasm/Options.td": "eeaab5b15bee6337c92cc532f9676f6fbffed0bd7b9f8355d2bc77bc34caf80f",
+            "lld/wasm/Driver.cpp": "300fa30ffb7c6f1bd58885ffd6df8a57f390f908942abe72fde827495db70802",
+            "lld/wasm/Writer.cpp": "074ed90ec1b2cf59df617fe34c182e0a927aa9389af9452e29291c72a3bbcf55"
+          }
+        },
+        {
+          "file": "guest-runtime-profile.patch",
+          "sha256": "c4edba4222e5133bed47720df897bf8199de8ceed7f31ff7cfff435eb1e07fcf",
+          "inputs": {
+            "clang/lib/Driver/ToolChains/WebAssembly.cpp": "3994a5c6c59d728f5cf0bed2af10e0484e491656b077bffd72d0612faea7a1f9"
+          }
+        },
+        {
+          "file": "runtime-ctors-opcodes.patch",
+          "sha256": "8502eb5e9660bc3f3f16969333fae7849b71d1d55a23e4cfb644046ff217a035",
+          "inputs": {
+            "lld/wasm/Writer.cpp": "33b00cbf116dd29c4e1abc3ec3c31d2106b089bbb007413c052fe838ee6801c4"
+          }
+        }
+      ],
+      "build_limits": {
+        "compile_jobs": 8,
+        "link_jobs": 1,
+        "address_space_bytes_per_process": 12884901888,
+        "command_timeout_seconds": 3600
+      },
+      "target_dependencies": [
+        {
+          "port": "native/shellsim-posix",
+          "version": "1",
+          "recipe": "native/shellsim-posix/recipe.json"
+        }
+      ],
+      "runtime_dependencies": [
+        {
+          "port": "toolchain/wasi-development",
+          "version": "34.0.0",
+          "recipe": "toolchain/llvm:development"
+        }
+      ],
+      "exports": {
+        "tools": [
+          "bin/clang",
+          "bin/clang++",
+          "bin/lld",
+          "bin/wasm-ld",
+          "bin/llvm-ar",
+          "bin/llvm-ranlib",
+          "bin/llvm-nm",
+          "bin/llvm-objcopy",
+          "bin/llvm-strip",
+          "bin/cc",
+          "bin/c++",
+          "bin/ar",
+          "bin/ranlib",
+          "bin/nm",
+          "bin/objcopy",
+          "bin/strip"
+        ],
+        "configs": [
+          "bin/clang.cfg",
+          "bin/clang++.cfg"
+        ],
+        "licenses": [
+          "licenses/LLVM-LICENSE.txt"
+        ]
+      },
+      "install": {
+        "kind": "build-tool",
+        "destinations": {
+          "bin/clang.cfg": "/usr/bin/clang.cfg",
+          "bin/clang++.cfg": "/usr/bin/clang++.cfg",
+          "bin/clang": "/usr/bin/clang",
+          "bin/clang++": "/usr/bin/clang++",
+          "bin/lld": "/usr/bin/lld",
+          "bin/wasm-ld": "/usr/bin/wasm-ld",
+          "bin/llvm-ar": "/usr/bin/llvm-ar",
+          "bin/llvm-ranlib": "/usr/bin/llvm-ranlib",
+          "bin/llvm-nm": "/usr/bin/llvm-nm",
+          "bin/llvm-objcopy": "/usr/bin/llvm-objcopy",
+          "bin/llvm-strip": "/usr/bin/llvm-strip",
+          "bin/cc": "/usr/bin/cc",
+          "bin/c++": "/usr/bin/c++",
+          "bin/ar": "/usr/bin/ar",
+          "bin/ranlib": "/usr/bin/ranlib",
+          "bin/nm": "/usr/bin/nm",
+          "bin/objcopy": "/usr/bin/objcopy",
+          "bin/strip": "/usr/bin/strip"
+        }
+      },
+      "features": {
+        "host_execution": false,
+        "languages": [
+          "C",
+          "C++"
+        ],
+        "llvm_internal_threads": false,
+        "target_backends": [
+          "WebAssembly"
+        ],
+        "link_formats": [
+          "WebAssembly"
+        ],
+        "asynchronous_signal_callbacks": false,
+        "sockets": false,
+        "process_memory_limits": false,
+        "timed_child_wait": false
+      },
+      "tests": [
+        {
+          "kind": "shell",
+          "script": "tests/guest-compiler.sh",
+          "files": [
+            {
+              "source": "tests/fixtures/runtime_ctors_main.cpp",
+              "destination": "runtime_ctors_main.cpp"
+            },
+            {
+              "source": "tests/fixtures/runtime_ctors_side.cpp",
+              "destination": "runtime_ctors_side.cpp"
+            }
+          ]
+        }
+      ],
+      "test_limits": {
+        "cpu": 500000000000,
+        "memory": 8589934592,
+        "disk": 402653184
+      },
+      "build_system": "llvm-guest",
+      "sdk": "default"
+    },
+    "development": {
+      "version": "34.0.0",
+      "linkage": "static",
+      "name": "wasi-development",
+      "kind": "native-library",
+      "role": "target-library",
+      "source": {
+        "files": [
+          {
+            "path": "toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",
+            "destination": "licenses/llvm-LICENSE.TXT",
+            "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/llvm-libcxx-LICENSE.TXT",
+            "destination": "licenses/llvm-libcxx-LICENSE.TXT",
+            "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/llvm-libcxxabi-LICENSE.TXT",
+            "destination": "licenses/llvm-libcxxabi-LICENSE.TXT",
+            "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/llvm-libunwind-LICENSE.TXT",
+            "destination": "licenses/llvm-libunwind-LICENSE.TXT",
+            "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE",
+            "destination": "licenses/wasi-libc-LICENSE",
+            "sha256": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE",
+            "destination": "licenses/wasi-libc-LICENSE-APACHE",
+            "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE-LLVM",
+            "destination": "licenses/wasi-libc-LICENSE-APACHE-LLVM",
+            "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-MIT",
+            "destination": "licenses/wasi-libc-LICENSE-MIT",
+            "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-dlmalloc-src-malloc.txt",
+            "destination": "licenses/wasi-libc-dlmalloc-src-malloc.txt",
+            "sha256": "5791fb3131f2e81e8065cd8080b62c155eb292b3fc1de26eb85150ab1aafb890"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-emmalloc-emmalloc.txt",
+            "destination": "licenses/wasi-libc-emmalloc-emmalloc.txt",
+            "sha256": "ac80caba8cb45681c047889e8d123e8ec15f02267dcf50328162592bcd725b4a"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-fts-musl-fts-COPYING",
+            "destination": "licenses/wasi-libc-fts-musl-fts-COPYING",
+            "sha256": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+            "destination": "licenses/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+            "sha256": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
+          },
+          {
+            "path": "toolchain/wasi_sdk/notices/wasi-libc-libc-top-half-musl-COPYRIGHT",
+            "destination": "licenses/wasi-libc-libc-top-half-musl-COPYRIGHT",
+            "sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b"
+          },
+          {
+            "path": "toolchain/llvm/shellsim-abi.s",
+            "destination": "shellsim-abi.s",
+            "sha256": "2d711335e3f2c03eaed95520fb7f6f32ab7161e71788cc3f85221ecfac03345b"
+          }
+        ],
+        "sha256": "a3bbe617d8e2a141daee7fe48c9454d3e78a9ce8e8ba3ff3c07bcf7db6e53aa7"
+      },
+      "target_dependencies": [],
+      "runtime_dependencies": [],
+      "exports": {},
+      "export_directories": {
+        "development": [
+          "wasi-sysroot",
+          "lib/clang/23"
+        ],
+        "licenses": [
+          "licenses/wasi-sdk"
+        ]
+      },
+      "install": {
+        "kind": "devel"
+      },
+      "empty_directories": {
+        "wasi-sysroot/include/c++/v1": 493
+      },
+      "tests": [
+        {
+          "kind": "native",
+          "source": "tests/guest-sdk.c",
+          "include_directories": [
+            "wasi-sysroot/include/wasm32-wasip1-threads"
+          ],
+          "link_inputs": [
+            "wasi-sysroot/lib/wasm32-wasip1-threads/libc.a"
+          ]
+        }
+      ],
+      "test_limits": {
+        "cpu": 2000000000,
+        "memory": 1073741824,
+        "disk": 201326592
+      },
+      "build_system": "llvm-guest-sdk",
+      "sdk": "default"
     }
-  ],
-  "build_limits": {
-    "compile_jobs": 4,
-    "link_jobs": 1,
-    "address_space_bytes_per_process": 12884901888,
-    "command_timeout_seconds": 3600
-  },
-  "build_scripts": [
-    {
-      "file": "build.py",
-      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
-    },
-    {
-      "file": "serial-memory-init.patch",
-      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522"
-    },
-    {
-      "file": "deferred-shared-init.patch",
-      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7"
-    },
-    {
-      "file": "../../_support/build.py",
-      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
-    }
-  ]
+  }
 }

@@ -4,26 +4,45 @@ import base64
 import csv
 import hashlib
 import io
-import json
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from ports._support.build import check_build_scripts
-from ports.python.numpy.dynamic import provider_inputs, write_wheel
+from ports._support.graph import plan
+from ports._support.native_artifacts import NativeArtifact, NativeTarget, merge_dependency_sysroot
+from ports._support.python_adapters import _wheel
+from ports._support.runner import _admit_recipe
+
+
+def analyze(roots):
+    return plan(Path(__file__).resolve().parents[4] / "ports", roots)
+
+
+def write_wheel(stage, path):
+    (stage / "numpy-2.3.5.dist-info/RECORD").unlink(missing_ok=True)
+    _wheel(stage, path, "numpy-2.3.5.dist-info/RECORD")
 
 
 def test_dynamic_recipe_pins_builder():
-    directory = Path(__file__).parents[1]
-    recipe = json.loads((directory / "dynamic-recipe.json").read_text())
-    check_build_scripts(recipe, directory)
+    _admit_recipe(analyze(["python/numpy"]).ports[-1])
 
 
 def test_provider_refuses_changed_cohort_before_using_archives(tmp_path):
-    (tmp_path / "manifest.json").write_text(json.dumps({"native_ports": [{"name": "numpy"}]}))
+    artifact = NativeArtifact(
+        tmp_path,
+        {
+            "inputs": {
+                "recipe": {"name": "openblas", "target": "wrong", "target_profile": "wrong", "abi": "wrong"},
+                "toolchain": {},
+            }
+        },
+    )
     with pytest.raises(ValueError):
-        provider_inputs(tmp_path, {"archive_provider_sha256": "different"})
+        merge_dependency_sysroot(
+            {"native/openblas": artifact}, {}, tmp_path / "output", NativeTarget("wasm32", "approved", "abi", {})
+        )
+    assert not (tmp_path / "output").exists()
 
 
 def test_wheel_record_hashes_every_payload_and_is_reproducible(tmp_path):

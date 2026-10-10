@@ -1,47 +1,47 @@
-"""Check build-cache refusal and native-provider metadata without a compiler run."""
-
-import importlib.util
-from pathlib import Path
+"""Check cache refusal and preserve upstream distribution metadata."""
 
 import pytest
 
-
-def load_tool(name, relative):
-    path = Path(__file__).parents[4] / relative
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+from ports._support.meson_workspace import retained_meson
+from ports._support.python_adapters import _wheel
+from ports._support.tests import test_meson_workspace as workspace_tests
 
 
-CPYTHON_BUILD = load_tool("cpython_port_build", "ports/python/cpython/build.py")
-NUMPY_BUILD = load_tool("numpy_port_build", "ports/python/numpy/build.py")
+@pytest.fixture
+def meson_project(tmp_path):
+    return workspace_tests.meson_project.__wrapped__(tmp_path)
 
 
-def test_profile_accepts_same_identity_and_refuses_changed_inputs(tmp_path):
-    recipe = {"source": {"sha256": "source"}, "build_scripts": [{"sha256": "builder"}]}
-    NUMPY_BUILD.check_profile(recipe, tmp_path)
-    NUMPY_BUILD.check_profile(recipe, tmp_path)
+def test_profile_accepts_same_identity_and_refuses_changed_inputs(meson_project):
+    context, ninja, products, tools = meson_project
+    with retained_meson(context, ninja, {}, products, tools):
+        pass
+    with retained_meson(context, ninja, {}, products, tools):
+        pass
     with pytest.raises(ValueError):
-        NUMPY_BUILD.check_profile({**recipe, "build_scripts": [{"sha256": "changed"}]}, tmp_path)
+        with retained_meson(context, ninja, {"changed": True}, products, tools):
+            pytest.fail("changed compilation identity was reused")
 
 
-def test_profile_refuses_unidentified_meson_cache(tmp_path):
-    (tmp_path / "numpy-build").mkdir()
+def test_profile_refuses_unidentified_meson_cache(meson_project):
+    context, ninja, products, tools = meson_project
+    ninja.mkdir(parents=True)
     with pytest.raises(ValueError):
-        NUMPY_BUILD.check_profile({"version": "2.3.5"}, tmp_path)
-    assert not (tmp_path / "numpy-profile.sha256").exists()
+        with retained_meson(context, ninja, {}, products, tools):
+            pytest.fail("unidentified tree was reused")
+    assert not (ninja.parent.parent / ".meson-workspace.json").exists()
 
 
 def test_native_metadata_preserves_upstream_dependencies(tmp_path):
-    source = tmp_path / "source"
-    source.mkdir()
+    import zipfile
+
     metadata = "Metadata-Version: 2.1\nName: sample\nVersion: 1.0\nRequires-Dist: pure>=2\n\nUpstream description\n"
-    (source / "PKG-INFO").write_text(metadata)
-    root = tmp_path / "root"
-    port = {"dist_info": "/usr/lib/python3.13/site-packages/sample-1.0.dist-info"}
-    CPYTHON_BUILD.install_metadata(port, source, root)
-    destination = root / port["dist_info"].lstrip("/")
-    assert (destination / "METADATA").read_text() == metadata
-    assert "Tag: py313-none-any\n" in (destination / "WHEEL").read_text()
-    assert "sample-1.0.dist-info/METADATA,sha256=" in (destination / "RECORD").read_text()
+    stage = tmp_path / "stage"
+    dist = stage / "sample-1.0.dist-info"
+    dist.mkdir(parents=True)
+    (dist / "METADATA").write_text(metadata)
+    destination = tmp_path / "sample.whl"
+    _wheel(stage, destination, "sample-1.0.dist-info/RECORD")
+    with zipfile.ZipFile(destination) as wheel:
+        assert wheel.read("sample-1.0.dist-info/METADATA").decode() == metadata
+        assert b"sample-1.0.dist-info/METADATA,sha256=" in wheel.read("sample-1.0.dist-info/RECORD")

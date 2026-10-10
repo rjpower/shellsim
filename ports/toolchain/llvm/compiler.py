@@ -1,6 +1,5 @@
 """Build the pinned Clang toolchain for threaded WASI ports."""
 
-import argparse
 import fcntl
 import hashlib
 import json
@@ -14,7 +13,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 from ports._support.build import apply_patch, check_build_scripts
-from ports.toolchain.llvm.build import digest, run
+from ports._support.producer_tools import digest, run
 
 TARGETS = (
     "clang",
@@ -277,7 +276,9 @@ def build(archive, cc, cxx, cmake, ninja, work):
 
 def build_locked(archive, cc, cxx, cmake, ninja, work):
     directory = Path(__file__).resolve().parent
-    recipe = json.loads((directory / "compiler-recipe.json").read_text())
+    from ports._support.producer_policy import load_policy
+
+    recipe = load_policy("toolchain/llvm:host")
     check_build_scripts(recipe, directory)
     tools = {
         name: {"path": str(path), "sha256": digest(path)}
@@ -416,19 +417,3 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     destination = work / "products" / key
     prefix.rename(destination)
     return verify_product(destination, identity)
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("archive", "cc", "cxx", "cmake", "ninja", "work"):
-        parser.add_argument("--" + name, type=Path, required=True)
-    args = parser.parse_args()
-    print(
-        build(
-            *(getattr(args, name).resolve() for name in ("archive", "cc", "cxx", "cmake", "ninja", "work")),
-        )
-    )
-
-
-if __name__ == "__main__":
-    main()

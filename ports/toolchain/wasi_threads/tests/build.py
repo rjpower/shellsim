@@ -11,7 +11,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 
 from ports._support.build import check_build_scripts
 from ports.native.dependencies import file_hash, target_environment
-from ports.toolchain.wasi_threads.build import toolchain_identity
 
 
 def build_probe(sdk, output, toolchain=None, fixture="two_pthreads"):
@@ -20,8 +19,7 @@ def build_probe(sdk, output, toolchain=None, fixture="two_pthreads"):
     directory = Path(__file__).parent
     fixture_recipe = json.loads((directory / "recipe.json").read_text())
     check_build_scripts(fixture_recipe, directory)
-    recipe = json.loads((directory.parent / "recipe.json").read_text())
-    check_build_scripts(recipe, directory.parent)
+    recipe = json.loads((directory / "platform-policy.json").read_text())
     for name, digest in recipe["sdk_binaries"].items():
         if file_hash(sdk / "bin" / name) != digest:
             raise ValueError("pthread probe requires the pinned SDK 34 binaries")
@@ -34,7 +32,7 @@ def build_probe(sdk, output, toolchain=None, fixture="two_pthreads"):
     extra_flags = []
     if toolchain is not None:
         provenance = json.loads((toolchain / "toolchain-manifest.json").read_text())
-        if toolchain_identity(provenance["recipe"]) != toolchain_identity(recipe):
+        if {key: provenance["recipe"][key] for key in recipe} != recipe:
             raise ValueError("patched toolchain recipe differs from the fixture recipe")
         for path, digest in provenance["artifacts"].items():
             if file_hash(toolchain / path) != digest:
@@ -76,6 +74,7 @@ def build_probe(sdk, output, toolchain=None, fixture="two_pthreads"):
         "schema_version": 1,
         "recipe": fixture_recipe,
         "toolchain_recipe": recipe,
+        "fixture_implementation_sha256": file_hash(Path(__file__)),
         "execution_verified": False,
         "artifact": {"path": target.name, "sha256": file_hash(target)},
         "raw_atomic_operations": raw_operations,

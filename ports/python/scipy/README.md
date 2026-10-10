@@ -28,7 +28,7 @@ packaging requires an actual OpenBLAS dependency reference.
 
 ## Build and use
 
-Build `python/scipy/graph-recipe.json` with the [graph command](../../README.md#build-and-check-a-port-graph)
+Build `python/scipy` with the [graph command](../../README.md#build-and-check-a-port-graph)
 and `--check` to run its declared guest probes. Select a threaded CPython cohort
 whose image has the recipe-declared 256 MiB linear-memory ceiling.
 

@@ -1,136 +1,108 @@
 # Shellsim ports
 
-This tree builds packages for Shellsim's virtual WASI environment. Trusted host
-builds fetch pinned upstream releases, apply reviewed patches, and produce
-verified runtime bundles, Python wheels, and native artifacts. Guest programs
-use Shellsim's filesystem, processes, clock, entropy, and resource limits.
+Ports build pinned upstream packages for Shellsim's virtual WASI environment.
+Trusted host builders consume admitted SDK products and exact dependency artifacts.
+Guest programs use Shellsim's filesystem, processes, clock, entropy and resource limits.
 
-## Layout
+## Build and check a graph
 
-| Directory | Ownership |
-| --- | --- |
-| `python/<name>` | CPython and Python distributions, including their patches and tests |
-| `native/<name>` | Libraries, native development files, and guest build tools |
-| `toolchain/<name>` | Host resolver/compiler ports and guest platform support |
-| `sdks` | Target defaults and pinned SDK product graphs |
-| `_support` | Small shared build and test helpers |
-| `<port>/tests` | Recipe checks, guest programs, and port-specific acceptance |
-
-The production CPython builder lives in [python/cpython](python/cpython).
-The SDK owns its dynamic-loader bridge. Compiler, loader, exception and FFI
-conformance programs live under [tests/fixtures/wasm](../tests/fixtures/wasm);
-production builds do not compile those programs.
-
-Each recipe records upstream source URLs and SHA256 values, versions, named or explicit target
-profile, build inputs, selected features, patches, and dependencies. Native
-artifacts retain exact compiled-provider identities. Pure wheels keep upstream
-metadata and tags; curated source builds retain their provenance. A recipe or
-builder change invalidates the corresponding build cache.
-
-## Build and check a port graph
-
-From the repository root, request recipes and let their SDK materialize:
+From the repository root with Shellsim installed:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/freetype/graph-recipe.json \
+  python -m ports native/freetype python/kiwisolver \
   --store /path/to/ports-store --output /path/to/release --check
 ```
 
-The output path must be absent. A directory selects its `recipe.json`; name a
-variant explicitly when a historical port has several recipes. Dependencies pin
-`port` and exact `version`, with an optional `recipe` variant. Planning rejects
-cycles, missing providers, incompatible SDKs, versions and roles before building.
-The store verifies inventories on each reuse. `--offline` requires pinned source
-archives in that store; it does not promise offline resolution of pure packages
-outside the graph.
+The output must be absent. `--offline` requires admitted cached sources and products.
+The driver verifies cached inventories on every reuse. `--check` installs the sealed
+release through the public API and runs each declared guest probe before publication.
+Failed work remains available for diagnosis. This command creates local release assets.
 
-Native and source-built Python recipes may omit `sdk` or select `"sdk": "default"`:
+## Author a port
 
-```json
-{
-  "name": "example",
-  "version": "1.0",
-  "sdk": "default",
-  "target_dependencies": [{"port": "native/zlib", "version": "1.3.1"}],
-  "build": {"adapter": "cmake"}
-}
+Each production port has one `recipe.json`. It declares source URLs and checksums,
+version, role, exact build/target/runtime dependencies, patches, exports, installation
+paths and guest checks. Planning reads this JSON without importing builder code.
+Ordinary dependencies select the same canonical definitions as direct requests.
+The SDK supplies the target ABI, compiler, resource files and platform edges;
+package names and versions belong to their ports.
+
+A port-owned `build.py` exposes `build(ctx: BuildContext)`. The context supplies
+private paths, selected variant, admitted SDK tools, Python headers and verified
+dependency prefixes. [ports.api](api.py) exposes typed CMake, Meson, configure/make,
+plain make and Python helpers. Package-specific options and source preparation live
+in Python. The driver owns fetching, checksum admission, patching, cache publication,
+artifact sealing and release assembly.
+
+For example, [zlib](native/zlib/recipe.json) declares static metadata and builds
+both its shared provider and archive through [build.py](native/zlib/build.py):
+
+```python
+from ports.api import BuildContext, cmake
+
+
+def build(ctx: BuildContext):
+    return cmake(ctx, configure_args=("-DZLIB_BUILD_EXAMPLES=OFF",),
+                 build_targets=("zlib", "zlibstatic"), jobs=2)
 ```
 
-[The SDK definition](sdks/wasi-threads-v3.json) owns target, ABI, compiler/platform
-edges, default dependency variants and pinned product producers.
-[The default alias](sdks/default.json) selects this versioned definition.
-`--sdk NAME` changes the default for unopinionated consumers. A recipe may name
-`wasi-threads-v3` explicitly; linked selections must agree. Pure wheels and host
-bootstrap/tool nodes do not acquire target SDK edges. Source hashes, patches,
-features, exports, sonames, backend wheels, version pins and checks remain explicit.
-An explicit dependency recipe overrides its SDK default.
+`build_system` selects the shared implementation closure. Standard `pure-wheel`
+and `host-wheel` ports can omit `build.py`; they select bounded helpers that copy
+verified upstream wheels unchanged. Additional local Python helpers are declared
+by filename in `helpers`. Builder and helper bytes are hashed automatically at
+cache lookup. Authors pin source and patch bytes, rather than Python file checksums.
+These trusted Python interfaces are not an operating system sandbox.
 
-The SDK product graph reuses byte-verified compiler, SDK tooling, libc platform,
-Python and resolver products, or invokes their existing pinned producers in
-dependency order. Sources are fetched automatically. `--host-seed FILE` supplies
-native host tools and a native CPython build helper for missing products; it cannot
-supply target SDK or runtime products. Only x86-64 Linux is supported initially.
-See [SDK materialization](_support/SDK.md) for host seeds and explicit migration
-of accepted products. No cohort descriptor is a normal build input.
+Real differing products use finite `port:variant` selections in the same definition.
+A `default_variant` normalizes to the same graph node as its explicit selection.
+A variant replaces bounded, whole static fields; there is no recursive overlay,
+expression evaluation or template language. LLVM's `host`, `guest` and `development`
+variants produce distinct host tools, guest tools and guest SDK data. CPython's
+`runtime`, `stdlib-zlib` and `stdlib-ctypes` variants produce the interpreter or
+independent stdlib modules. Source/version data is shared once when it is common.
 
-A native build without `--output` materializes compiler/tooling/platform only.
-Publishing the existing combined release format also materializes CPython and
-its package resolver. A Python native consumer acquires CPython headers and build
-data. Guest Clang is a separate guest-tool port and builds only when selected.
-Materialized SDK manifests are outputs under the store's `materialized-sdks`.
-Consumer identities bind the selected compiler, platform, resources, target flags,
-relevant host tools and dependency results. Python consumers also bind headers and
-configuration; resolver or runtime assembly changes do not invalidate native
-library compilation. Inventory corruption fails rather than becoming a cache miss.
+| Tree | Responsibility |
+| --- | --- |
+| `python/<name>` | Python distributions and CPython outputs |
+| `native/<name>` | Native libraries, development files and guest build tools |
+| `toolchain/<name>` | SDK producers and repository-owned source components |
+| `sdks` | ABI, toolchain and runtime product selection |
+| `_support` | Shared driver, admission, helpers and acceptance |
+| `<port>/tests` | Package-specific guest and integrity checks |
 
-To add a port, start from [FreeType](native/freetype/graph-recipe.json) or
-[Pillow](python/pillow/graph-recipe.json). Select the adapter matching upstream's
-build system and declare package-specific settings. Add a port-local guest check
-under `tests`, then run the command above with `--check`. Checks install the sealed
-release through the public API and must pass before the output appears. See
-[native adapters](_support/native_adapters.md) and
-[Python backends](_support/PYTHON_BACKENDS.md) for build fields.
+Repository-owned source components use a hash-pinned `source.files` list.
+Adapter demonstrations belong under `_support/tests/fixtures/adapters` rather than
+alternate production recipes. See [native helpers](_support/native_adapters.md),
+[Python backends](_support/PYTHON_BACKENDS.md), and [SDK products](_support/SDK.md).
 
-Repository-owned platform ports can declare `source.files`, a hash-pinned list
-of ports-relative source paths and staging destinations. This stages only the
-declared files. Upstream packages continue to use pinned release archives.
+## SDK products and cache reuse
 
-Use `build.adapter` to choose one of `pure-wheel`, `host-wheel`,
-`python-extension`, `python-pep517`, `python-meson`, `cmake`, `meson`,
-`configure-make`, or `plain-make`. `pure-wheel`
-stages an unchanged, verified upstream wheel. `python-extension` compiles a
-declared single-module C/C++ extension against the materialized SDK's CPython headers.
-`python-pep517` runs upstream pinned offline build backends for pure source
-packages and extensions; see [Python backend authoring](_support/PYTHON_BACKENDS.md).
-`host-wheel` preserves pinned universal backend wheels with host-only data.
-`python-meson` stages package files and multiple extensions from Meson's install
-plan. Native adapters install to a private
-`/usr/local` staging tree through the admitted compiler and verified dependency
-sysroot. Recipe `source` pins the upstream URL and SHA256; `patches` pin local
-patch files. `source_exports` copies declared source files, such as licenses,
-that an upstream install omits. Port-specific build hooks must also be pinned.
-Scientific generator and Meson setup uses [pinned host-tool receipts](_support/HOST_TOOLS.md).
+The materializer builds only required compiler, tooling, platform, Python and resolver
+products. `--host-seed FILE` supplies admitted native tools and a Python build helper
+for missing products. Host seeds cannot substitute target products. Native commands
+without `--output` need compiler/tooling/platform; combined releases also need
+CPython and uv. Python consumers bind the runtime's exact headers and configuration.
+Guest LLVM is built only when `toolchain/llvm:guest` is selected.
 
-Native exports are published into the release's native catalog as well as the
-build dependency store. `role: "guest-tool"` selects executable tools;
-`install` can specify a package alias, kind and destination overrides. Standard
-exports install under `/usr/local`. Host tools and target-platform build inputs
-are excluded from guest publication. A port-local test with `kind: "shell"`
-and `script` installs the tool through `Environment.from_release` and executes
-that script inside the guest.
+Current cache hits require the current implementation closure, source policy and
+actual dependency receipt identities. The explicit reviewed migration command
+admits known prior producer identities and preserves their original product receipts:
 
-Each recipe declares guest checks under `tests`, using a port-local Python
-`script` or native C `source`. Native probes may name exact package
-`link_inputs` and exact `sdk_link_inputs` from the verified SDK sysroot;
-`include_directories` come from the verified package dependency tree. For
-example, an archive path can be `lib/libz.a`, avoiding ambiguous `-l` search.
-`--check` installs the sealed graph in fresh guest environments and requires
-every declared probe to exit successfully. Missing tests, build failures,
-unsupported inputs, and guest failures fail the command. The release appears
-at `--output` only after all checks pass; failed work remains available for
-diagnosis. This command creates local release assets and does not publish them
-to a remote registry.
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports._support.producer_migration --store /path/to/ports-store
+```
+
+The frozen migration registry binds original policy digests to the reviewed new
+implementation. Changed sources, patches, compiled auxiliary files, runtime protocols,
+unknown fields, dependency receipts or unreviewed implementations reject admission.
+Ordinary cache misses never invoke migration. Retained Ninja compilation workspaces
+have their own input checks and remain separate from immutable result identities.
+Use `--workspace python/numpy=/path/to/build/meson-build` for a compatible Meson tree.
+
+Package installation resolves constraints from wheel metadata. Build dependencies
+use exact graph identities; these are separate contracts.
 
 ## Python environment setup
 
@@ -153,9 +125,9 @@ A release records its admitted runtime, resolver and package catalogs. Missing S
 [threaded CPython producer](python/cpython/README.md),
 [platform producer](toolchain/wasi_threads/README.md), and
 [scientific host-tool setup](_support/HOST_TOOLS.md). SDK selection and verified
-product migration are described in [SDK materialization](_support/SDK.md). Older static and nonthreaded
-producers remain documented in [CPython](python/cpython/README.md); their bundles
-have separate ABI identities.
+product migration are described in [SDK materialization](_support/SDK.md). Already sealed static and nonthreaded bundles retain their separate ABI identities.
+Their obsolete production builders are retired; historical conformance fixtures
+consume verified bundles under [tests/fixtures/wasm](../tests/fixtures/wasm).
 
 The [process overlay](toolchain/wasi_process/README.md) adds upstream CPython
 subprocess support through the virtual process kernel. The

@@ -1,0 +1,49 @@
+{
+  "kind": "reviewed-authoring-migration-v1",
+  "products": {
+    "compiler": {
+      "implementation_sha256": "473be5547b6a6a05f98fe59a9eaa3fb8182aac2a6e19805447585e055774431f",
+      "receipt_policy_sha256": [
+        "b262b2e5cdd75cd0ddef66d7ca738af364bce1055d82d6a3d0bbe0fcd8b1a954"
+      ],
+      "source_policy_sha256": [
+        "b262b2e5cdd75cd0ddef66d7ca738af364bce1055d82d6a3d0bbe0fcd8b1a954"
+      ]
+    },
+    "cpython": {
+      "implementation_sha256": "f51e0cc1279d7b543f65c3bfdcc118b4b29cd41420084ba44b73e331559e6b8c",
+      "receipt_policy_sha256": [
+        "44a4463764ec967262cdb49d539da98f700a1dfa2f5c444395a8a9ea614d94b4"
+      ],
+      "source_policy_sha256": [
+        "44a4463764ec967262cdb49d539da98f700a1dfa2f5c444395a8a9ea614d94b4"
+      ]
+    },
+    "platform": {
+      "implementation_sha256": "787151861da8c7341f20cdff24160407a865ae414dc2f246e5bfcc8cbb6fa13e",
+      "receipt_policy_sha256": [
+        "0996dd8c6ad44150d5c81f847501b6a8aa9543d8d06067ae2f7e98c787bc39fd"
+      ],
+      "source_policy_sha256": [
+        "0996dd8c6ad44150d5c81f847501b6a8aa9543d8d06067ae2f7e98c787bc39fd"
+      ]
+    },
+    "resolver": {
+      "implementation_sha256": "39630eba4bcd8d8ad1365d81cbb3867a99a06ac9526f5db9c2603739102d1ed2",
+      "receipt_policy_sha256": [
+        "769ad04ce94ee613ffb75b5a6b8556f14e42a72a730a385fe74fbd69ffc78664"
+      ],
+      "source_policy_sha256": [
+        "769ad04ce94ee613ffb75b5a6b8556f14e42a72a730a385fe74fbd69ffc78664"
+      ]
+    },
+    "tooling": {
+      "implementation_sha256": "787151861da8c7341f20cdff24160407a865ae414dc2f246e5bfcc8cbb6fa13e",
+      "receipt_policy_sha256": [],
+      "source_policy_sha256": [
+        "0996dd8c6ad44150d5c81f847501b6a8aa9543d8d06067ae2f7e98c787bc39fd"
+      ]
+    }
+  },
+  "schema_version": 1
+}

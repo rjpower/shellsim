@@ -1,6 +1,7 @@
 # ImageIO 2.37.0
 
-`build.py --wheel <upstream-wheel> --output <directory>` verifies the pinned
+`uv run --no-project python -m ports python/imageio --store target/ports-store --output target/imageio-release`
+selects the canonical graph. The shared pure-wheel helper verifies the pinned
 upstream pure wheel, its metadata, dependencies and member safety, then copies
 it unchanged. The output manifest records the wheel hash. Add that wheel to an
 ABI-matched package catalog alongside native NumPy 2.3.5 and Pillow 12.3.0;

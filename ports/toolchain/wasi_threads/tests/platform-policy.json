@@ -1,0 +1,23 @@
+{
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "sdk_binaries": {
+    "clang": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+    "llvm-objdump": "7b36433d726cd16a13ffe59e24300f9be2f02a78c9c31c444e8b96c57e3ac947",
+    "wasm-ld": "ec1daef61bc84256bf7c4a8491b3ea9abcc7163d9aaf6aa8e8bc6faa18f99043",
+    "llvm-ar": "aff24388a6589b45837cff1b50c7efaa203efa0e5f1e5f679b70b2d8feded9cf",
+    "llvm-ranlib": "aff24388a6589b45837cff1b50c7efaa203efa0e5f1e5f679b70b2d8feded9cf"
+  },
+  "sdk_files": {
+    "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a": "258840a0ce51e4b9f16a518ce2fe80d4a960bf7f31762d2e743fd6a43063197e"
+  },
+  "wasi_libc": {
+    "commit": "2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f"
+  },
+  "llvm_commit": "895aa2c896ada719451be2e3673c83da8ddf1141"
+}

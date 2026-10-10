@@ -185,19 +185,39 @@ def test_recipe_build_script_changes_are_rejected(tmp_path):
 
 
 def test_pillow_source_lists_include_upstream_internal_library(tmp_path, monkeypatch):
-    monkeypatch.syspath_prepend(str(Path(__file__).parents[2]))
-    (tmp_path / "setup.py").write_text(
-        "raise AssertionError('setup.py must not execute')\n"
+    import json
+    import zipfile
+
+    from ports._support.tests import test_pep517_runner as backend_tests
+
+    request = backend_tests.backend_request.__wrapped__(tmp_path)
+    _, source, payload = request
+    (source / "setup.py").write_text(
         "_IMAGING = ('encode',)\n_LIB_IMAGING = ('ZipEncode',)\n"
         "libraries: list = [('pil_imaging_mode', {'sources': ['src/libImaging/Mode.c']})]\n"
     )
-    path = Path(__file__).parents[2] / "ports/python/pillow/build.py"
-    spec = importlib.util.spec_from_file_location("pillow_build", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    assert [p.relative_to(tmp_path).as_posix() for p in module.pillow_sources(tmp_path)] == [
-        "src/_imaging.c",
-        "src/encode.c",
-        "src/libImaging/ZipEncode.c",
-        "src/libImaging/Mode.c",
-    ]
+    # The upstream fixture owns source selection. The actual isolated hook runner
+    # must retain both extension sources and the internal library's sources.
+    (source / "backend.py").write_text(
+        "import json, pathlib, runpy, zipfile\n"
+        "def build_wheel(output, config_settings):\n"
+        "    namespace = runpy.run_path(str(pathlib.Path(__file__).with_name('setup.py')))\n"
+        "    sources = ['src/_imaging.c']\n"
+        "    sources += ['src/' + name + '.c' for name in namespace['_IMAGING']]\n"
+        "    sources += ['src/libImaging/' + name + '.c' for name in namespace['_LIB_IMAGING']]\n"
+        "    sources += [path for _, library in namespace['libraries'] for path in library['sources']]\n"
+        "    wheel = pathlib.Path(output) / 'sample-1-py3-none-any.whl'\n"
+        "    with zipfile.ZipFile(wheel, 'w') as archive:\n"
+        "        archive.writestr('sources.json', json.dumps(sources))\n"
+        "    return wheel.name\n"
+    )
+    completed = backend_tests.invoke(request)
+    assert completed.returncode == 0, completed.stderr
+    response = json.loads(Path(payload["response"]).read_text())
+    with zipfile.ZipFile(Path(payload["output"]) / response["wheel"]) as wheel:
+        assert json.loads(wheel.read("sources.json")) == [
+            "src/_imaging.c",
+            "src/encode.c",
+            "src/libImaging/ZipEncode.c",
+            "src/libImaging/Mode.c",
+        ]

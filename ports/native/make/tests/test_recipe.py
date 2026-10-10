@@ -10,8 +10,10 @@ ROOT = Path(__file__).resolve().parents[4]
 def test_make_recipe_pins_build_inputs():
     port = ROOT / "ports/native/make"
     recipe = json.loads((port / "recipe.json").read_text())
-    assert hashlib.sha256((port / "wasi.patch").read_bytes()).hexdigest() == recipe["patch_sha256"]
-    for name, expected in recipe["port_inputs_sha256"].items():
-        assert hashlib.sha256((ROOT / name).read_bytes()).hexdigest() == expected
-    for item in recipe["build_scripts"]:
-        assert hashlib.sha256((port / item["file"]).read_bytes()).hexdigest() == item["sha256"]
+    from ports._support.graph import plan
+    from ports._support.runner import _admit_recipe
+
+    selected = next(item for item in plan(ROOT / "ports", ["native/make"]).ports if item.name == "make")
+    _admit_recipe(selected)
+    for patch in recipe["patches"]:
+        assert hashlib.sha256((port / patch["file"]).read_bytes()).hexdigest() == patch["sha256"]

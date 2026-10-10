@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from ports.toolchain.uv import build
+from ports.toolchain.uv import producer as build
 
 
 def test_changed_driver_is_rejected_before_clone(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

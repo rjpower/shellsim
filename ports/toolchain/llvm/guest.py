@@ -15,9 +15,9 @@ from pathlib import Path, PurePosixPath
 
 from ports._support.build import apply_patch, check_build_scripts
 from ports._support.native_adapters import NativeBuildCommand, NativeBuildOutput
+from ports._support.producer_tools import digest, run
 from ports._support.wasm_metadata import number, string
 from ports.native.dependencies import verify_artifact
-from ports.toolchain.llvm.build import digest, run
 from ports.toolchain.llvm.compiler import (
     configure_and_build,
     identity_hash,
@@ -318,7 +318,9 @@ def _validate_guest_layout(recipe):
         if destinations.get(name) != "/usr/" + name:
             raise ValueError("guest compiler commands and configs require /usr/bin")
     edge = recipe["runtime_dependencies"][0]
-    sdk = json.loads((PORT.parents[1] / edge["recipe"]).read_text())
+    from ports._support.producer_policy import metadata
+
+    _, sdk = metadata(edge["recipe"])
     for field in ("destinations", "directories"):
         for source, destination in sdk["install"].get(field, {}).items():
             if destination != "/usr/local/" + source:
@@ -409,7 +411,7 @@ def _invalidate_final_outputs(build, recipe, state, receipt, changed):
 def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
-    requested_jobs = recipe["build"]["jobs"] if jobs is None else jobs
+    requested_jobs = recipe["build_limits"]["compile_jobs"] if jobs is None else jobs
     if not isinstance(requested_jobs, int) or not 1 <= requested_jobs <= 16:
         raise ValueError("guest LLVM compile jobs must be between one and sixteen")
     compile_jobs = min(requested_jobs, recipe["build_limits"]["compile_jobs"])

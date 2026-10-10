@@ -1,7 +1,7 @@
 """Plan a bounded ports dependency graph before fetching or building anything.
 
 Recipe references are relative to the ports tree. A directory selects recipe.json;
-other variants can be named explicitly or selected by a recipe-owned SDK.
+finite variants use a colon suffix. SDKs select only ABI and toolchain inputs.
 SDK defaults expand into explicit inputs before validation. The build driver consumes
 dependency-first nodes and records their digests alongside artifact identities.
 """
@@ -52,6 +52,7 @@ class Port:
     dependencies: tuple[Dependency, ...]
     recipe: dict[str, Any]
     sdk_selection: SDKSelection | None = None
+    variant: str = ""
 
     @property
     def role(self) -> str:
@@ -77,13 +78,16 @@ def _relative(value: object) -> str:
 
 def _reference(value: object) -> str:
     name = _relative(value)
-    return name if name.endswith(".json") else name + "/recipe.json"
+    path, separator, variant = name.partition(":")
+    if separator and (not variant or re.fullmatch(r"[a-z][a-z0-9-]{0,63}", variant) is None):
+        raise ValueError("invalid port variant")
+    return (path if path.endswith(".json") else path + "/recipe.json") + (separator + variant if separator else "")
 
 
 def _document(root: Path, reference: str) -> tuple[Path, bytes, dict[str, Any]]:
     """Read a bounded, unlinked JSON document inside the admitted ports tree."""
     path = root
-    for part in PurePosixPath(reference).parts:
+    for part in PurePosixPath(reference.partition(":")[0]).parts:
         path /= part
         if path.is_symlink():
             raise ValueError(f"linked recipe path is unsupported: {reference}")
@@ -106,7 +110,7 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
     """
     if "build_profile" in recipe:
         raise ValueError("build_profile was replaced by sdk selection")
-    adapter = recipe.get("build", {}).get("adapter")
+    adapter = recipe.get("build_system")
     explicit = "sdk" in recipe
     if recipe.get("role") in {"host-tool", "target-platform"} or adapter in {"pure-wheel", "host-wheel"}:
         if explicit:
@@ -134,7 +138,6 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
         "abi",
         "build_dependencies",
         "platform_dependencies",
-        "dependency_recipes",
         "host",
         "products",
     }
@@ -159,17 +162,9 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
         if any(isinstance(item, dict) and item.get("port") in owned for item in declarations):
             raise ValueError(f"recipe redeclares SDK {field}")
         resolved[field] = [*profile[field], *declarations]
-    variants = profile["dependency_recipes"]
-    if not isinstance(variants, dict) or len(variants) > _MAX_NODES:
-        raise ValueError("invalid SDK dependency variants")
-    variants = {_relative(port): _reference(reference) for port, reference in variants.items()}
     for field in ("build_dependencies", "target_dependencies", "runtime_dependencies", "platform_dependencies"):
-        declarations = resolved.get(field, [])
-        if not isinstance(declarations, list) or len(declarations) > _MAX_NODES:
-            raise ValueError("invalid recipe dependency declarations")
         resolved[field] = [
-            {**item, "recipe": _reference(item.get("recipe", variants.get(item["port"], item["port"])))}
-            for item in declarations
+            {**item, "recipe": _reference(item.get("recipe", item["port"]))} for item in resolved.get(field, [])
         ]
     return resolved, SDKSelection(
         f"sdks/{name}.json",
@@ -207,8 +202,87 @@ def _dependencies(recipe: dict[str, Any], reference: str) -> tuple[Dependency, .
     return tuple(dependencies)
 
 
+_VARIANT_FIELDS = frozenset(
+    {
+        "name",
+        "version",
+        "role",
+        "kind",
+        "source",
+        "patches",
+        "sdk",
+        "build_system",
+        "build_dependencies",
+        "platform_dependencies",
+        "target_dependencies",
+        "runtime_dependencies",
+        "exports",
+        "export_directories",
+        "install",
+        "tests",
+        "test_limits",
+        "needed_libraries",
+        "linkage",
+        "soname",
+        "features",
+        "build_limits",
+        "output",
+        "module",
+        "source_exports",
+        "empty_directories",
+        "protocol",
+        "main_tls_protocol",
+        "helpers",
+        "producer",
+        "development_exports",
+        "producer_identity",
+        "inputs",
+        "dynamic_abi",
+        "prefix",
+        "maximum_memory_bytes",
+        "target",
+    }
+)
+
+
+def select_variant(document: dict, variant: str = "") -> dict:
+    """Select finite replacements of static metadata, without importing code.
+
+    Variants replace whole declared fields. There is no recursive merge,
+    interpolation, condition language, or execution during analysis.
+    """
+    variants = document.get("variants", {})
+    if not isinstance(variants, dict) or len(variants) > 16:
+        raise ValueError("port variants must be a bounded object")
+    selected = variant or document.get("default_variant", "")
+    recipe = {key: value for key, value in document.items() if key not in {"variants", "default_variant"}}
+    if selected:
+        if selected not in variants:
+            raise ValueError("unknown port variant: " + selected)
+        fields = variants[selected]
+        if not isinstance(fields, dict) or not set(fields).issubset(_VARIANT_FIELDS):
+            raise ValueError("unsupported variant metadata field")
+        recipe.update(fields)
+    return recipe
+
+
+def canonical_reference(root: Path, value: str) -> str:
+    """Make an implicit default and its explicit selection the same graph node."""
+    reference = _reference(value)
+    path, separator, variant = reference.partition(":")
+    if separator:
+        return reference
+    try:
+        _, _, document = _document(root, path)
+    except (OSError, ValueError) as error:
+        raise ValueError("cannot read dependency chain: " + reference) from error
+    default = document.get("default_variant")
+    return path + ":" + default if default else path
+
+
 def _read(root: Path, reference: str, default_sdk: str) -> Port:
     path, data, recipe = _document(root, reference)
+    recipe = select_variant(recipe, reference.partition(":")[2])
     recipe, profile = _expand_sdk(root, recipe, default_sdk)
     name, version = recipe.get("name"), recipe.get("version")
     if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
@@ -219,11 +293,23 @@ def _read(root: Path, reference: str, default_sdk: str) -> Port:
     role = recipe.get("role", "target-library")
     if role not in {"host-tool", "target-library", "guest-tool", "target-platform"}:
         raise ValueError(f"unsupported port role: {reference}")
-    dependencies = _dependencies(recipe, reference)
-    digest = hashlib.sha256(data).hexdigest()
+    dependencies = tuple(
+        Dependency(item.port, item.version, canonical_reference(root, item.recipe), item.kind)
+        for item in _dependencies(recipe, reference)
+    )
+    digest = hashlib.sha256(data + b"\0" + reference.partition(":")[2].encode()).hexdigest()
     if profile is not None:
-        digest = hashlib.sha256(b"shellsim-sdk-selection-v1\0" + data + b"\0" + profile.sha256.encode()).hexdigest()
-    return Port(reference, path.parent, name, version, digest, dependencies, recipe, profile)
+        digest = hashlib.sha256(
+            b"shellsim-sdk-selection-v1\0"
+            + data
+            + b"\0"
+            + reference.partition(":")[2].encode()
+            + b"\0"
+            + profile.sha256.encode()
+        ).hexdigest()
+    return Port(
+        reference, path.parent, name, version, digest, dependencies, recipe, profile, reference.partition(":")[2]
+    )
 
 
 def plan(
@@ -238,7 +324,7 @@ def plan(
     if isinstance(requests, (str, bytes)) or not requests or len(requests) > _MAX_NODES:
         raise ValueError("request between 1 and 512 port recipes")
     root = root.resolve(strict=True)
-    roots = tuple(dict.fromkeys(_reference(request) for request in requests))
+    roots = tuple(dict.fromkeys(canonical_reference(root, request) for request in requests))
     loaded: dict[str, Port] = {}
     finished: set[str] = set()
     active: list[str] = []
@@ -287,12 +373,12 @@ def plan(
             if previous != dependency.recipe:
                 raise ValueError("conflicting recipe variants in dependency chain: " + " -> ".join(active))
             provider = visit(dependency.recipe)
-            universal = provider.recipe.get("build", {}).get("adapter") == "pure-wheel"
-            host_data = provider.recipe.get("build", {}).get("adapter") == "host-wheel"
+            universal = provider.recipe.get("build_system") == "pure-wheel"
+            host_data = provider.recipe.get("build_system") == "host-wheel"
             if (dependency.kind == "build" and provider.role != "host-tool" and not universal) or (
                 dependency.kind != "build"
                 and provider.role == "host-tool"
-                and not (host_data and port.recipe.get("build", {}).get("adapter") == "pure-wheel")
+                and not (host_data and port.recipe.get("build_system") == "pure-wheel")
             ):
                 raise ValueError("dependency role differs: " + " -> ".join([*active, dependency.recipe]))
             if (dependency.kind == "platform") != (provider.role == "target-platform"):
@@ -314,15 +400,16 @@ def plan(
 def guest_graph(graph: Graph) -> Graph:
     """Select guest roots and their target/runtime closure, excluding build inputs."""
     ports = {port.reference: port for port in graph.ports}
-    selected = set(graph.roots)
-    pending = [(reference,) for reference in graph.roots]
+    roots = tuple(reference for reference in graph.roots if ports[reference].role != "host-tool")
+    selected = set(roots)
+    pending = [(reference,) for reference in roots]
     while pending:
         chain = pending.pop()
         port = ports[chain[-1]]
-        if port.recipe.get("build", {}).get("adapter") == "host-wheel":
+        if port.recipe.get("build_system") == "host-wheel":
             raise ValueError("host-only provider in guest dependency chain: " + " -> ".join(chain))
         for dependency in port.dependencies:
             if dependency.kind in {"target", "runtime"} and dependency.recipe not in selected:
                 selected.add(dependency.recipe)
                 pending.append((*chain, dependency.recipe))
-    return Graph(graph.roots, tuple(port for port in graph.ports if port.reference in selected))
+    return Graph(roots, tuple(port for port in graph.ports if port.reference in selected))

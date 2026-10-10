@@ -7,7 +7,8 @@ from dataclasses import dataclass
 
 import pytest
 
-from ports._support import runner
+from ports import api
+from ports._support import python_adapters, runner
 from ports._support.graph import Graph, Port
 from ports._support.sdk_products import Receipt
 
@@ -38,7 +39,7 @@ def _wheel_port(ports, store, name, dependencies):
     recipe = {
         "name": name,
         "version": "1",
-        "build": {"adapter": "pure-wheel"},
+        "build_system": "pure-wheel",
         "source": {"filename": wheel.name, "url": "https://example.invalid/" + wheel.name, "sha256": digest},
         "target_dependencies": [{"port": "python/" + dependency, "version": "1"} for dependency in dependencies],
     }
@@ -52,13 +53,13 @@ def test_graph_reuses_verified_builds_and_rebuilds_dependents(tmp_path, monkeypa
     provider, recipe = _wheel_port(ports, store, "provider", [])
     _wheel_port(ports, store, "consumer", ["provider"])
     calls = []
-    real_build = runner.build_pure_wheel
+    real_build = python_adapters.build_pure_wheel
 
     def observed_build(request):
         calls.append(request.recipe["name"])
         return real_build(request)
 
-    monkeypatch.setattr(runner, "build_pure_wheel", observed_build)
+    monkeypatch.setattr(python_adapters, "build_pure_wheel", observed_build)
     first = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
     assert calls == ["provider", "consumer"]
     calls.clear()
@@ -83,22 +84,22 @@ def test_build_cache_ignores_acceptance_code_but_tracks_selected_adapter(tmp_pat
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store, "example", [])
     calls = []
-    real_build = runner.build_pure_wheel
+    real_build = python_adapters.build_pure_wheel
 
     def observed_build(request):
         calls.append(request.recipe["name"])
         return real_build(request)
 
-    monkeypatch.setattr(runner, "build_pure_wheel", observed_build)
+    monkeypatch.setattr(python_adapters, "build_pure_wheel", observed_build)
     runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
     assert calls == ["example"]
 
-    real_hash = runner.file_hash
+    real_hash = api.file_hash
 
     def changed_acceptance(path, **kwargs):
         return "a" * 64 if path.name == "acceptance.py" else real_hash(path, **kwargs)
 
-    monkeypatch.setattr(runner, "file_hash", changed_acceptance)
+    monkeypatch.setattr(api, "file_hash", changed_acceptance)
     calls.clear()
     runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
     assert not calls
@@ -106,7 +107,7 @@ def test_build_cache_ignores_acceptance_code_but_tracks_selected_adapter(tmp_pat
     def changed_adapter(path, **kwargs):
         return "b" * 64 if path.name == "pure_wheel.py" else real_hash(path, **kwargs)
 
-    monkeypatch.setattr(runner, "file_hash", changed_adapter)
+    monkeypatch.setattr(api, "file_hash", changed_adapter)
     runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
     assert calls == ["example"]
 
@@ -174,7 +175,7 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     )
     bootstrap_compiler = product("bootstrap-compiler", "e")
     bootstrap_platform = product("bootstrap-platform", "f")
-    monkeypatch.setattr(cohort_module, "local_recipe", lambda _name: recipe)
+    monkeypatch.setattr("ports._support.producer_policy.verify_policy", lambda *_args: None)
     # This receipt-resolution fixture uses synthetic compiler/platform bytes;
     # real archive selection is covered by the runtime-profile link tests.
     monkeypatch.setattr(
@@ -286,9 +287,7 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
     if cohort_path is None or store_path is None:
         pytest.skip("real Pillow graph inputs were not supplied")
     cohort = load_legacy_cohort(Path(cohort_path))
-    build = runner.build_graph(
-        Path(__file__).parents[2], ["python/pillow/graph-recipe.json"], cohort, Path(store_path), offline=True
-    )
+    build = runner.build_graph(Path(__file__).parents[2], ["python/pillow"], cohort, Path(store_path), offline=True)
     release = runner.publish_graph(build, cohort, tmp_path / "release")
     runtime = shellsim.CPythonRuntime.from_release(release, cache_dir=tmp_path / "cache")
     universe = Universe(runtime.universe, abi=cohort.dynamic_abi, python_version=cohort.python.version)
@@ -311,3 +310,69 @@ def test_pure_wheels_do_not_acquire_sdk_dependencies(tmp_path):
     assert {port.name for port in result.graph.ports} == {"consumer", "provider"}
     assert all(port.sdk_selection is None for port in result.graph.ports)
     assert all(context is None for context in result.sdks.values())
+
+
+def test_acceptance_keeps_explicit_variant_proofs_distinct(tmp_path, monkeypatch):
+    from ports._support import acceptance
+
+    ports = tuple(
+        Port(
+            "python/example/recipe.json:" + variant,
+            tmp_path,
+            variant,
+            "1",
+            "a" * 64,
+            (),
+            {"tests": [{"kind": "python"}]},
+            variant=variant,
+        )
+        for variant in ("one", "two")
+    )
+    results = {port.reference: tmp_path / port.name for port in ports}
+    for path in results.values():
+        path.mkdir()
+    build = runner.GraphBuild(Graph(tuple(results), ports), results, dict.fromkeys(results, PureCohort()))
+    paths = []
+
+    def accept(request):
+        paths.append(request.output)
+        request.output.mkdir(parents=True)
+
+    monkeypatch.setattr(acceptance, "accept_port", accept)
+    descriptor = tmp_path / "release.json"
+    descriptor.write_text("{}")
+    runner.accept_graph(build, PureCohort(), descriptor, tmp_path / "proof")
+    assert paths == [tmp_path / "proof/python/example/recipe/one", tmp_path / "proof/python/example/recipe/two"]
+
+
+def test_changed_declared_helper_invalidates_a_real_cached_build(tmp_path, monkeypatch):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    directory = ports / "python/example"
+    recipe_path = directory / "recipe.json"
+    recipe = json.loads(recipe_path.read_text())
+    recipe["helpers"] = ["python/example/helper.py"]
+    recipe_path.write_text(json.dumps(recipe))
+    helper = directory / "helper.py"
+    helper.write_text("VALUE = 1\n")
+    (directory / "build.py").write_text(
+        "import runpy\nfrom ports.api import pure_wheel\n"
+        "def build(ctx):\n"
+        "    value = runpy.run_path(str(ctx.port.directory / 'helper.py'))['VALUE']\n"
+        "    if value < 0: raise ValueError('invalid fixture configuration')\n"
+        "    return pure_wheel(ctx)\n"
+    )
+    calls = []
+    actual = python_adapters.build_pure_wheel
+
+    def build(request):
+        calls.append(request.recipe["name"])
+        return actual(request)
+
+    monkeypatch.setattr(python_adapters, "build_pure_wheel", build)
+    first = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    repeat = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    assert first.results == repeat.results and calls == ["example"]
+    helper.write_text("VALUE = 2\n")
+    changed = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
+    assert changed.results != first.results and calls == ["example", "example"]

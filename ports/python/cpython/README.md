@@ -1,71 +1,33 @@
 # CPython WASI runtime
 
-`build.py` builds upstream CPython 3.13.7 with the selected static SDK profile.
-`dynamic.py` relinks a bare SDK34 build into the package-free ABI v2 runtime.
-It emits `rootfs` and a CPythonRuntime-compatible manifest with file hashes,
-source-bundle identity, runtime archives, canonical bridge and POSIX provenance.
-It builds no test commands, extension fixtures or package providers.
+The canonical definition is `recipe.json`, with finite `runtime`, `stdlib-zlib`
+and `stdlib-ctypes` outputs. The default runtime builds upstream CPython 3.13.7
+for `wasm32-wasip1-threads` and ABI `shellsim-wasi-sdk34-cpython3137-threads-v3`.
+`build.py` consumes the materialized compiler, platform and SDK products through
+`BuildContext`; package options and source preparation live in Python.
 
 ```sh
-uv run --no-project -m ports.python.cpython.build --work-dir /tmp/cpython-base --build-python /path/to/python3.13
-uv run --no-project -m ports.python.cpython.dynamic --bundle /tmp/cpython-base --output /tmp/cpython-runtime
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports python/cpython:stdlib-zlib python/cpython:stdlib-ctypes \
+  --store /path/to/ports-store --output /path/to/release --check
 ```
 
-The canonical dynamic bridge is `ports/toolchain/wasi_sdk/dynamic.c`. The SDK34
-recipe pins its source and the main-owned libc/C++ exception runtime. Independent
-side modules import that runtime using `shellsim_dylink_v2` and the exact ABI
-`shellsim-wasi-sdk34-cpython3137-v2`. SDK24 remains a separate static profile and
-fixture ABI. The threaded runtime is built separately by
-[`wasi_threads`](../../toolchain/wasi_threads/README.md); it uses the compiler
-target `wasm32-wasip1-threads` and exact ABI
-`shellsim-wasi-sdk34-cpython3137-threads-v3`.
+The stdlib selections compile upstream extension sources against the runtime's
+verified source, generated configuration and headers. zlib links the canonical
+shared zlib provider; `_ctypes` links the canonical scalar libffi provider.
+Release assembly validates native dependencies and copies the interpreter unchanged.
+The assembled manifest records original runtime and module artifact identities.
 
-`threaded.py` records patched source, generated configuration, and local linked
-object identities in its build profile. Its optional `--relink-from` reuses only
-those verified inputs when the source, facade, frontend and platform headers
-remain unchanged. A relink writes a new output directory and records the prior
-manifest hash. Historical runtime bundles without compile receipts remain
-valid runtimes but cannot supply relink inputs.
+Scalar and pointer calls and callbacks are supported by the FFI provider.
+Aggregate and variadic signatures are explicit unsupported frontiers. The threaded
+runtime retains its process, loader, TLS and callback protocols. See
+[threaded ctypes](THREADED_CTYPES.md) and [stdlib zlib](STDLIB_ZLIB.md).
 
-`CPythonRuntime` admits these compiler target and ABI pairs explicitly. The
-curated Python catalog target, native wheel tag, and patched uv resolver
-platform remain `wasm32-wasip1` for both cohorts. Native wheel and provider
-content must still declare the runtime's exact dynamic ABI. A release
-descriptor records the compiler target as `runtime_target` while its `target`
-field records the Python wheel platform; the reader rejects crossed pairs.
-
-`stdlib_zlib.py` builds upstream CPython's zlib extension and its independently
-pinned shared zlib provider. It consumes the runtime's verified source bundle,
-not test artifacts. The module manifest records destination paths, hashes,
-ABI and the `libz.so` dependency; installing it does not relink the interpreter.
-
-`stdlib_ctypes.py` compiles the unmodified CPython 3.13.7 `_ctypes` C sources
-against the [shared libffi port](../../native/libffi/README.md). Its recipe pins
-all headers under `Include` and `Modules/_ctypes`, the generated `pyconfig.h`,
-the C sources, and the exact SDK profile. The resulting side module declares
-`libffi.so` as its sole native dependency. It uses the canonical main bridge
-recorded in the process runtime manifest to resolve `ctypes.pythonapi`.
-
-`assembly.py` combines a process-enabled dynamic runtime, the verified stdlib
-zlib artifact, `libffi.so`, and `_ctypes.so` into a new runtime bundle. It
-checks the exact dependency identities, ABI, target paths, source manifests,
-and copied file hashes before publishing the bundle. The interpreter executable
-is copied unchanged. The public `CPythonRuntime` mounts the resulting bundle;
-ordinary `python` commands and child interpreters use the selected environment.
-
-```sh
-uv run --no-project --python 3.13 python -m ports.python.cpython.stdlib_ctypes \
-  /path/to/cpython-base /path/to/process-runtime \
-  /path/to/shared-libffi-artifact /tmp/ctypes-build
-uv run --no-project --python 3.13 python -m ports.python.cpython.assembly \
-  /path/to/process-runtime /path/to/stdlib-zlib-artifact \
-  /path/to/shared-libffi-artifact /path/to/ctypes-artifact \
-  /tmp/cpython-with-ctypes
-```
-
-The current libffi ABI covers primitive and pointer calls and callbacks. It
-rejects aggregates and variadic signatures. Threaded callback replay is not
-part of this v2 runtime.
+The producer retains verified compiled inputs for compatible facade relinks.
+This compilation state is separate from immutable product receipts. Previously
+sealed SDK24/static and SDK34/v1/v2 runtime bundles remain verifiable and mountable
+with their original ABI metadata. Their obsolete production build CLIs are retired.
+Historical conformance harnesses consume those bundles under `tests/fixtures/wasm`.
 
 ## Local release cohort
 
@@ -150,7 +112,7 @@ budget must exceed that ceiling plus runtime overhead even when the program
 uses little heap. Fresh links and verified relinks apply the same final policy.
 Changing this link ceiling preserves verified CPython compilation inputs.
 
-`threaded.py --relink-from OLD --recompile-process` verifies the full retained
+The internal `threaded.relink` helper verifies the full retained
 compile receipt, upstream source, patched modules, configuration, frontend and
 platform headers before rebuilding its five explicit process facade objects.
 Only pinned facade C/header changes are admitted. Fresh builds use the same

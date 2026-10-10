@@ -150,6 +150,7 @@ def _closure(direct: Mapping[str, NativeArtifact], closure: Mapping[str, NativeA
         if name in providers and providers[name].manifest != artifact.manifest:
             raise ValueError("conflicting direct native provider")
         providers[name] = artifact
+    sonames = {}
     snapshots, active = {}, set()
 
     def visit(name):
@@ -163,6 +164,11 @@ def _closure(direct: Mapping[str, NativeArtifact], closure: Mapping[str, NativeA
             raise ValueError("native dependency provider is missing")
         artifact = providers[name]
         recipe = artifact.manifest["inputs"]["recipe"]
+        soname = recipe.get("soname")
+        if soname is not None:
+            if soname in sonames and sonames[soname] != name:
+                raise ValueError("native dependency SONAME collision")
+            sonames[soname] = name
         expected_name = name.split("/")[1] if "/" in name else name
         if recipe["name"] != expected_name:
             raise ValueError("native dependency name mismatch")

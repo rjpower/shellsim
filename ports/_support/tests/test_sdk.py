@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from ports._support import sdk
-from ports._support.graph import Graph, plan
+from ports._support.graph import Graph, Port, plan
 from ports._support.sdk_products import Tool, file_hash, json_hash
 
 
@@ -44,7 +44,7 @@ def product_graph(tmp_path, monkeypatch):
         "tooling": {"build_scripts": [], "sdk": source, "sdk_tooling_digest": json_hash(tooling)},
         "compiler": {"name": "fixture-compiler", "build_scripts": [], "source": source},
         "platform": {"name": "fixture-platform", "build_scripts": [], "sdk": source, "wasi_libc": source},
-        "cpython": {"name": "fixture-python", "build_scripts": [], "source": source},
+        "cpython": {"name": "fixture-python", "version": "3.13.7", "build_scripts": [], "source": source},
         "resolver": {"name": "fixture-resolver", "build_scripts": []},
     }
     adapters = {
@@ -65,7 +65,34 @@ def product_graph(tmp_path, monkeypatch):
     for name, recipe in recipes.items():
         path = tmp_path / (name + ".json")
         path.write_text(json.dumps(recipe))
-        nodes.append(sdk.SDKProduct(name, adapters[name], path, recipe, edges[name]))
+        directory, selection = {
+            "tooling": ("toolchain/wasi_threads", "tooling"),
+            "compiler": ("toolchain/llvm", "host"),
+            "platform": ("toolchain/wasi_threads", "platform"),
+            "cpython": ("python/cpython", "runtime"),
+            "resolver": ("toolchain/uv", ""),
+        }[name]
+        reference = directory + "/recipe.json" + (":" + selection if selection else "")
+        recipe["build_system"] = adapters[name]
+        port = Port(
+            reference, Path(__file__).resolve().parents[2] / directory, name, "1", "", (), recipe, variant=selection
+        )
+        nodes.append(sdk.SDKProduct(name, adapters[name], path, recipe, edges[name], port))
+    monkeypatch.setattr(
+        sdk,
+        "policy",
+        lambda metadata: {
+            key: value for key, value in metadata.items() if key not in {"build_scripts", "build_system"}
+        },
+    )
+    monkeypatch.setattr(sdk, "implementation", lambda port: {"fixture-builder": "a" * 64})
+
+    def verify_policy(recipe, reference):
+        node = next(node for node in sdk.definition(None, None).products if node.port.reference == reference)
+        if recipe != node.recipe:
+            raise ValueError("fixture producer policy differs")
+
+    monkeypatch.setattr(sdk, "verify_policy", verify_policy)
     definition = sdk.SDKDefinition(
         "fixture", "sdks/fixture.json", {"target": "fixture-target", "abi": "fixture-abi"}, tuple(nodes)
     )
@@ -101,7 +128,12 @@ def product_graph(tmp_path, monkeypatch):
     def platform(archive, libc, compiler, cmake, ninja, work):
         assert (compiler / "manifest.json").exists()
         assert archive == libc == cached
-        return product("platform", work)
+        result = product("platform", work)
+        path = result / "manifest.json"
+        manifest = json.loads(path.read_text())
+        manifest["identity"].update(compiler=json.loads((compiler / "manifest.json").read_text()), sdk_tooling=tooling)
+        path.write_text(json.dumps(manifest))
+        return result
 
     def cpython(archive, helper, tooling, platform, compiler, make, work):
         assert helper == make == tool.path
@@ -111,11 +143,15 @@ def product_graph(tmp_path, monkeypatch):
         calls.append("cpython")
         (work / "rootfs").mkdir()
         (work / "rootfs/python.wasm").write_bytes(b"python")
-        manifest = {"recipe": recipes["cpython"], "files": {"/python.wasm": file_hash(work / "rootfs/python.wasm")}}
+        manifest = {
+            "recipe": recipes["cpython"],
+            "files": {"/python.wasm": file_hash(work / "rootfs/python.wasm")},
+            "build_profile": {"sysroot": json.loads((platform / "manifest.json").read_text())},
+        }
         (work / "manifest.json").write_text(json.dumps(manifest))
         return work
 
-    def resolver(work, *, offline):
+    def resolver(work, *, offline, jobs):
         assert not offline
         calls.append("resolver")
         work.mkdir(parents=True)
@@ -134,7 +170,7 @@ def product_graph(tmp_path, monkeypatch):
     monkeypatch.setattr("ports.toolchain.llvm.compiler.build", compiler)
     monkeypatch.setattr("ports.toolchain.wasi_threads.dynamic.build", platform)
     monkeypatch.setattr("ports.python.cpython.threaded.build", cpython)
-    monkeypatch.setattr("ports.toolchain.uv.build.build", resolver)
+    monkeypatch.setattr("ports.toolchain.uv.producer.build", resolver)
     monkeypatch.setattr(
         sdk,
         "verify_cpython_recipe",
@@ -182,8 +218,8 @@ def test_imported_compiler_remains_usable_when_seeding_missing_python(product_gr
     sdk.materialize(store, Graph((), ()), store, offline=True)
     path = store / "sdk-products/fixture/compiler.json"
     record = json.loads(path.read_text())
-    record["origin"] = {"kind": "verified-legacy-import", "descriptor_sha256": "a" * 64}
-    record["inputs"] = {name: record["inputs"][name] for name in ("producer_policy", "dependencies")}
+    record["origin"] = {"kind": "reviewed-authoring-migration-v1", "descriptor_sha256": "a" * 64}
+    record["inputs"] = {name: record["inputs"][name] for name in ("producer_policy", "implementation", "dependencies")}
     path.write_text(json.dumps(record))
     calls.clear()
     sdk.materialize(store, Graph((), ()), store, python=True, offline=False)
@@ -198,7 +234,13 @@ def test_producer_policy_change_rebuilds_its_product_and_dependents(product_grap
     store, calls, definition, _ = product_graph
     sdk.materialize(store, Graph((), ()), store, offline=True)
     changed = tuple(
-        replace(node, recipe={**node.recipe, "configuration": "changed"}) if node.name == "compiler" else node
+        replace(
+            node,
+            recipe={**node.recipe, "configuration": "changed"},
+            port=replace(node.port, recipe={**node.port.recipe, "configuration": "changed"}),
+        )
+        if node.name == "compiler"
+        else node
         for node in definition.products
     )
     monkeypatch.setattr(sdk, "definition", lambda *_args: replace(definition, products=changed))
@@ -220,11 +262,11 @@ def test_missing_host_compiler_fails_with_a_specific_prerequisite(product_graph,
 
 @pytest.mark.parametrize(
     ("field", "value", "error"),
-    [("sha256", "0" * 64, "producer recipe pin"), ("dependencies", [], "producer dependencies")],
+    [("recipe", "toolchain/llvm:guest", "build system differs"), ("dependencies", [], "producer dependencies")],
 )
 def test_changed_sdk_producer_pin_or_edge_fails_before_store_creation(tmp_path, monkeypatch, field, value, error):
     ports = Path(__file__).resolve().parents[2]
-    graph = plan(ports, ["native/freetype/graph-recipe.json"])
+    graph = plan(ports, ["native/freetype"])
     read_document = sdk._document
 
     def changed_document(root, reference):
@@ -240,18 +282,17 @@ def test_changed_sdk_producer_pin_or_edge_fails_before_store_creation(tmp_path, 
     assert not store.exists()
 
 
-def test_changed_pinned_driver_fails_before_cached_product_use(product_graph, monkeypatch):
-    store, calls, definition, _ = product_graph
-    compiler = next(node for node in definition.products if node.name == "compiler")
-    driver = compiler.recipe_path.parent / "fixture-driver.py"
-    driver.write_text("PINNED = True\n")
-    compiler.recipe["build_scripts"] = [{"file": driver.name, "sha256": file_hash(driver)}]
+def test_changed_builder_implementation_cannot_reuse_a_cached_product(product_graph, monkeypatch):
+    store, calls, _, _ = product_graph
     sdk.materialize(store, Graph((), ()), store, offline=True)
     calls.clear()
-    driver.write_text("PINNED = False\n")
-    with pytest.raises(ValueError, match="Build script hash mismatch"):
-        sdk.materialize(store, Graph((), ()), store, offline=True)
-    assert not calls
+    monkeypatch.setattr(
+        sdk,
+        "implementation",
+        lambda port: {"fixture-builder": "b" * 64} if port.name == "compiler" else {"fixture-builder": "a" * 64},
+    )
+    sdk.materialize(store, Graph((), ()), store, offline=True)
+    assert calls[0] == "compiler"
 
 
 def test_native_recipe_omission_selects_default_and_preserves_explicit_sdk(tmp_path):
@@ -263,7 +304,7 @@ def test_native_recipe_omission_selects_default_and_preserves_explicit_sdk(tmp_p
     shutil.copytree(ports / "toolchain/wasi_threads", tmp_path / "toolchain/wasi_threads")
     recipe = tmp_path / "native/example/recipe.json"
     recipe.parent.mkdir(parents=True)
-    authored = {"name": "example", "version": "1", "build": {"adapter": "cmake"}}
+    authored = {"name": "example", "version": "1", "build_system": "cmake"}
     recipe.write_text(json.dumps(authored))
     implicit = plan(tmp_path, ["native/example"]).ports[-1]
     assert implicit.sdk_selection.reference == "sdks/wasi-threads-v3.json"

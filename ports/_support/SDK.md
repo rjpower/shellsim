@@ -2,11 +2,11 @@
 
 The default SDK is `wasi-threads-v3`, currently supported on x86-64 Linux. Its
 versioned definition is the single source for consumer target, ABI, host compiler
-and target platform edges, dependency variants, and pinned producer recipes.
+and target platform edges, and pinned producer selections.
 
 The product graph builds SDK archive tooling and patched host LLVM, then the
 threaded libc platform, then threaded CPython when required. The patched host uv
-resolver is a separate product. Each node uses its existing producer interface.
+resolver is a separate product. Each node uses the uniform typed port build entrypoint.
 Source archives and patches are repository pins, and missing archives are fetched
 into the graph source cache. A missing resolver requires its pinned Git source
 and the existing online producer; `--offline` rejects it before network access.
@@ -44,6 +44,20 @@ native host seeds; no prebuilt target SDK, sysroot, CPython or runtime is requir
 The uv producer resolves its pinned native Rust toolchain and records its native
 build tools in the resulting producer receipt.
 
+Existing product indexes from the reviewed authoring migration can be admitted explicitly:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports._support.producer_migration --store /path/to/ports-store
+```
+
+The frozen migration record binds known original policy and receipt digests to
+this reviewed implementation. Source, patches, compiled inputs, runtime protocols,
+unknown fields and actual dependency relationships are checked. Changed current
+producer code cannot use that record. Ordinary cache misses never invoke migration.
+Product files and original receipt identities remain unchanged. Retained compiler
+workspaces have separate compatibility rules.
+
 Existing accepted outputs can populate the optional product cache once:
 
 ```sh
@@ -64,8 +78,8 @@ Run the resulting graph with the ordinary command:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/freetype/graph-recipe.json \
-  python/kiwisolver/graph-recipe.json --store /path/to/ports-store \
+  python -m ports native/freetype \
+  python/kiwisolver --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 
@@ -74,7 +88,7 @@ The store records original products under `sdk-products`, producer work under
 workspace for compatible source/host seeds; its producer admits patch updates
 and seals new immutable products. Other producers receive fresh output attempts
 on retry, preserving failed attempts for diagnosis. Product inventories
-are checked on every hit. Changed producer policy or dependencies build a new
+are checked on every hit. Changed producer policy, implementation closure or dependencies select a new
 product; altered cached bytes fail. Each consumer receives compiler/platform
 paths and flags plus its own assembled dependency sysroot. Cache identities retain
 these actual products, and Python compilation binds headers/configuration.

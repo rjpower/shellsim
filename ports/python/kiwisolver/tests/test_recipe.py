@@ -7,17 +7,33 @@ import io
 import json
 import tarfile
 import zipfile
+from pathlib import Path
 
 import pytest
 
-from ports._support.build import check_build_scripts
-from ports.python.kiwisolver.build import PORT, unpack_source, write_wheel
+from ports._support.graph import plan
+from ports._support.python_adapters import _wheel
+from ports._support.runner import _admit_recipe
+from ports._support.store import extract, fetch
+
+
+def analyze(roots):
+    from pathlib import Path
+
+    return plan(Path(__file__).resolve().parents[4] / "ports", roots)
+
+
+PORT = Path(__file__).parents[1]
+
+
+def write_wheel(stage, path):
+    _wheel(stage, path, "kiwisolver-1.5.1.dist-info/RECORD")
 
 
 def test_pinned_build_inputs():
     recipe = json.loads((PORT / "recipe.json").read_text())
-    check_build_scripts(recipe, PORT)
-    patch = recipe["patch"]
+    _admit_recipe(analyze(["python/kiwisolver"]).ports[-1])
+    patch = recipe["patches"][0]
     assert hashlib.sha256((PORT / patch["file"]).read_bytes()).hexdigest() == patch["sha256"]
 
 
@@ -28,17 +44,19 @@ def test_source_archive_rejects_unsafe_paths(tmp_path, member):
         info = tarfile.TarInfo(member)
         info.size = 1
         output.addfile(info, io.BytesIO(b"x"))
-    recipe = {"version": "1.5.1", "source": {"sha256": hashlib.sha256(archive.read_bytes()).hexdigest()}}
     with pytest.raises(ValueError):
-        unpack_source(archive, tmp_path / "output", recipe)
+        extract(archive, tmp_path / "output", subdirectory="kiwisolver-1.5.1")
     assert not (tmp_path / "escape").exists()
 
 
 def test_source_archive_hash_checked_before_extraction(tmp_path):
     archive = tmp_path / "source.tar"
     archive.write_bytes(b"not an archive")
-    with pytest.raises(ValueError, match="source archive differs"):
-        unpack_source(archive, tmp_path / "output", {"source": {"sha256": "0" * 64}})
+    cache = tmp_path / "cache" / ("0" * 64)
+    cache.mkdir(parents=True)
+    (cache / archive.name).write_bytes(archive.read_bytes())
+    with pytest.raises(ValueError):
+        fetch({"url": "https://example.invalid/source.tar", "sha256": "0" * 64}, tmp_path / "cache", offline=True)
     assert not (tmp_path / "output").exists()
 
 

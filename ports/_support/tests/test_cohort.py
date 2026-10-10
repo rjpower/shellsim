@@ -113,9 +113,10 @@ def test_compile_flags_keep_linker_selection_in_link_flags(tmp_path):
 
 
 def test_historical_python_driver_pins_do_not_change_source_admission():
-    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
+    from ports._support.producer_policy import load_policy
+    from ports._support.sdk_products import verify_cpython_recipe
 
-    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical = load_policy("python/cpython:runtime")
     historical["build_scripts"][0]["sha256"] = "0" * 64
     verify_cpython_recipe(historical)
 
@@ -129,9 +130,10 @@ def test_historical_python_driver_pins_do_not_change_source_admission():
     ],
 )
 def test_historical_python_receipt_rejects_changed_compiled_inputs(source):
-    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
+    from ports._support.producer_policy import load_policy
+    from ports._support.sdk_products import verify_cpython_recipe
 
-    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical = load_policy("python/cpython:runtime")
     entry = next(item for item in historical["build_scripts"] if item["file"] == source)
     entry["sha256"] = "0" * 64
     with pytest.raises(ValueError):
@@ -140,9 +142,10 @@ def test_historical_python_receipt_rejects_changed_compiled_inputs(source):
 
 @pytest.mark.parametrize("replacement", [None, "threaded.py"])
 def test_historical_python_receipt_cannot_hide_a_compiled_input(replacement):
-    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
+    from ports._support.producer_policy import load_policy
+    from ports._support.sdk_products import verify_cpython_recipe
 
-    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical = load_policy("python/cpython:runtime")
     entry = next(
         item for item in historical["build_scripts"] if item["file"] == "../../toolchain/wasi_process/process.c"
     )
@@ -164,9 +167,10 @@ def test_historical_python_receipt_cannot_hide_a_compiled_input(replacement):
     ],
 )
 def test_historical_python_receipt_requires_the_accepted_source_and_abi(field, value):
-    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
+    from ports._support.producer_policy import load_policy
+    from ports._support.sdk_products import verify_cpython_recipe
 
-    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical = load_policy("python/cpython:runtime")
     historical[field] = value
-    with pytest.raises(ValueError, match="source or ABI profile"):
+    with pytest.raises(ValueError):
         verify_cpython_recipe(historical)

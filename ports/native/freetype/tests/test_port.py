@@ -2,14 +2,13 @@
 
 import json
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
+from ports._support.sdk_products import Receipt, file_hash, verify_product
 from ports.native.dependencies import recipe_identity
-from ports.native.freetype.build import pkg_config
 
 ROOT = Path(__file__).resolve().parents[4]
 
@@ -19,31 +18,25 @@ def test_freetype_pins_production_sources():
     recipe_identity(recipe, ROOT / "ports/native/freetype")
 
 
-@pytest.fixture
-def upstream_metadata(tmp_path):
-    source = os.environ.get("SHELLSIM_FREETYPE_SOURCE")
-    if not source:
-        pytest.skip("set the pinned FreeType source directory")
-    for name in ("include/freetype/freetype.h", "builds/unix/configure.raw", "builds/unix/freetype2.in"):
-        destination = tmp_path / name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(Path(source) / name, destination)
-    return tmp_path
-
-
-@pytest.mark.parametrize("field", ["version", "template", "release"])
-def test_pkg_config_rejects_changed_upstream_contract(upstream_metadata, field):
-    recipe = json.loads((ROOT / "ports/native/freetype/recipe.json").read_text())
-    if field == "version":
-        path = upstream_metadata / "builds/unix/configure.raw"
-        path.write_text(path.read_text().replace("version_info='26:2:20'", "version_info='unknown'"))
-    elif field == "template":
-        path = upstream_metadata / "builds/unix/freetype2.in"
-        path.write_text(path.read_text() + "Unsupported: %NEW_FIELD%\n")
-    else:
-        recipe["version"] = "2.14.3"
+@pytest.mark.parametrize("field", ["header", "pkg-config", "receipt"])
+def test_development_export_drift_is_rejected_before_build(tmp_path, field):
+    paths = {
+        "header": "include/freetype2/freetype.h",
+        "pkg-config": "lib/pkgconfig/freetype2.pc",
+        "receipt": "licenses/FTL.txt",
+    }
+    for name in paths.values():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(name)
+    hashes = {name: file_hash(tmp_path / name) for name in paths.values()}
+    receipt = Receipt(
+        tmp_path, tmp_path / "manifest.json", "", {"identity": {"recipe": {"name": "freetype"}}, "artifacts": hashes}
+    )
+    verify_product(receipt)
+    (tmp_path / paths[field]).write_text("changed after admission")
     with pytest.raises(ValueError):
-        pkg_config(upstream_metadata, recipe)
+        verify_product(receipt)
 
 
 def test_actual_pkg_config_accepts_upstream_version_requirement():

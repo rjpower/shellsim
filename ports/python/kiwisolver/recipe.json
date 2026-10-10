@@ -1,65 +1,46 @@
 {
   "name": "kiwisolver",
   "version": "1.5.1",
-  "target": "wasm32-wasip1",
-  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
+  "role": "target-library",
+  "kind": "python-project",
+  "requires_python": ">=3.10",
+  "requires_dist": [],
   "source": {
     "url": "https://files.pythonhosted.org/packages/ba/07/bd78e6a8fae171ea041ef5bba3ed21a003522fa088834b069b1909981f30/kiwisolver-1.5.1.tar.gz",
-    "sha256": "f1303ef2eec81262a4b708c3e858afe58d7c75ad91c1c05266eda7673369859a"
+    "sha256": "f1303ef2eec81262a4b708c3e858afe58d7c75ad91c1c05266eda7673369859a",
+    "subdirectory": "kiwisolver-1.5.1"
   },
-  "cppy": {
-    "version": "1.3.1",
-    "filename": "cppy-1.3.1-py3-none-any.whl",
-    "url": "https://files.pythonhosted.org/packages/8b/3c/823fda3f226d84f983e48005527a6dd2dc365220ac4f098b770779d9f4a1/cppy-1.3.1-py3-none-any.whl",
-    "sha256": "7ca132b6ef6187384738804bd3a453d4eab7e3274df6dcd35e5d92aae3404717"
-  },
-  "cpython": {
-    "version": "3.13.7",
-    "source_sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a",
-    "pyconfig_sha256": "dd6cc21cbbe8dca6bd5536f1fb0b367eeb842f1bd86458c2f60cf1f9eb6a98ce",
-    "headers_sha256": "9476cfcf736d64be5d42aac03cf63d9662576fecdf77a14e570a53c6a99d871f"
-  },
-  "sources": [
-    "py/src/kiwisolver.cpp",
-    "py/src/constraint.cpp",
-    "py/src/expression.cpp",
-    "py/src/solver.cpp",
-    "py/src/strength.cpp",
-    "py/src/term.cpp",
-    "py/src/variable.cpp"
-  ],
-  "patch": {
-    "file": "pycfunction-abi.patch",
-    "sha256": "981fcc8cc526c4d9adc8fab5959f1cebde1ccde0aa67f9e59fef2304140b790d"
-  },
-  "build_scripts": [
+  "patches": [
     {
-      "file": "build.py",
-      "sha256": "295c515f0e86d749bd0822f68fe44463158f6659e4b0445515410aa037a61f76"
-    },
-    {
-      "file": "../cellpylib/build.py",
-      "sha256": "b13b79d158f4bfe3ef6df02e1fa1ae5e68b0083371d0ba593de989354bbc71d9"
-    },
-    {
-      "file": "../numpy/build.py",
-      "sha256": "4836ebba637f85482aeda358364de551282fa0179f56e79b1c6646a9b6c19e02"
-    },
-    {
-      "file": "../../_support/wasm.py",
-      "sha256": "0d408a426e33e089e00230552424dff08f8401af3aeea703d7cfb81336e25dc8"
-    },
-    {
-      "file": "../../native/dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
-    },
-    {
-      "file": "../../toolchain/wasi_sdk/build.py",
-      "sha256": "97e424ec9fb67f59d0c029cd547dba4cb1c16e47fda0a62651cadf652b4fddad"
-    },
-    {
-      "file": "../../_support/build.py",
-      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+      "file": "pycfunction-abi.patch",
+      "sha256": "981fcc8cc526c4d9adc8fab5959f1cebde1ccde0aa67f9e59fef2304140b790d"
     }
-  ]
+  ],
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/setuptools-scm",
+      "version": "8.3.1"
+    },
+    {
+      "port": "python/cppy",
+      "version": "1.3.1"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 1073741824,
+    "disk": 536870912
+  },
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "sdk": "default",
+  "build_system": "python-pep517"
 }

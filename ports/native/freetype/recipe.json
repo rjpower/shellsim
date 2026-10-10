@@ -2,173 +2,71 @@
   "kind": "native-library",
   "name": "freetype",
   "version": "2.13.3",
-  "target_profile": "wasi-cpython-v2",
-  "target": "wasm32-wasip1",
-  "linkage": "static",
+  "linkage": "shared",
   "source": {
     "url": "https://download.savannah.gnu.org/releases/freetype/freetype-2.13.3.tar.xz",
-    "sha256": "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289"
+    "sha256": "0550350666d427c74daeb85d5ac7bb353acba5f76956395995311a9c6f063289",
+    "subdirectory": "freetype-2.13.3"
   },
-  "host_tools": [
-    "python-build-driver",
-    "wasi-sdk-clang",
-    "wasi-sdk-llvm-ar"
-  ],
   "target_dependencies": [
     {
       "port": "native/zlib",
       "version": "1.3.1"
     }
   ],
-  "features": {
-    "truetype": true,
-    "cff": true,
-    "autofit": true,
-    "smooth": true,
-    "monochrome": true,
-    "system_zlib": true,
-    "png": false,
-    "bzip2": false,
-    "brotli": false,
-    "harfbuzz": false,
-    "lzw": false,
-    "svg": false,
-    "sdf": false,
-    "host_discovery": false
-  },
-  "transitive_link_flags": [
-    "-lm"
+  "source_exports": [
+    {
+      "source": "LICENSE.TXT",
+      "destination": "licenses/freetype.txt"
+    },
+    {
+      "source": "docs/FTL.TXT",
+      "destination": "licenses/freetype-FTL.txt"
+    },
+    {
+      "source": "docs/GPLv2.TXT",
+      "destination": "licenses/freetype-GPLv2.txt"
+    }
   ],
   "exports": {
-    "headers": [
-      "include/freetype2/dlg/dlg.h",
-      "include/freetype2/dlg/output.h",
-      "include/freetype2/freetype/config/ftconfig.h",
-      "include/freetype2/freetype/config/ftheader.h",
-      "include/freetype2/freetype/config/ftmodule.h",
-      "include/freetype2/freetype/config/ftoption.h",
-      "include/freetype2/freetype/config/ftstdlib.h",
-      "include/freetype2/freetype/config/integer-types.h",
-      "include/freetype2/freetype/config/mac-support.h",
-      "include/freetype2/freetype/config/public-macros.h",
-      "include/freetype2/freetype/freetype.h",
-      "include/freetype2/freetype/ftadvanc.h",
-      "include/freetype2/freetype/ftbbox.h",
-      "include/freetype2/freetype/ftbdf.h",
-      "include/freetype2/freetype/ftbitmap.h",
-      "include/freetype2/freetype/ftbzip2.h",
-      "include/freetype2/freetype/ftcache.h",
-      "include/freetype2/freetype/ftchapters.h",
-      "include/freetype2/freetype/ftcid.h",
-      "include/freetype2/freetype/ftcolor.h",
-      "include/freetype2/freetype/ftdriver.h",
-      "include/freetype2/freetype/fterrdef.h",
-      "include/freetype2/freetype/fterrors.h",
-      "include/freetype2/freetype/ftfntfmt.h",
-      "include/freetype2/freetype/ftgasp.h",
-      "include/freetype2/freetype/ftglyph.h",
-      "include/freetype2/freetype/ftgxval.h",
-      "include/freetype2/freetype/ftgzip.h",
-      "include/freetype2/freetype/ftimage.h",
-      "include/freetype2/freetype/ftincrem.h",
-      "include/freetype2/freetype/ftlcdfil.h",
-      "include/freetype2/freetype/ftlist.h",
-      "include/freetype2/freetype/ftlogging.h",
-      "include/freetype2/freetype/ftlzw.h",
-      "include/freetype2/freetype/ftmac.h",
-      "include/freetype2/freetype/ftmm.h",
-      "include/freetype2/freetype/ftmodapi.h",
-      "include/freetype2/freetype/ftmoderr.h",
-      "include/freetype2/freetype/ftotval.h",
-      "include/freetype2/freetype/ftoutln.h",
-      "include/freetype2/freetype/ftparams.h",
-      "include/freetype2/freetype/ftpfr.h",
-      "include/freetype2/freetype/ftrender.h",
-      "include/freetype2/freetype/ftsizes.h",
-      "include/freetype2/freetype/ftsnames.h",
-      "include/freetype2/freetype/ftstroke.h",
-      "include/freetype2/freetype/ftsynth.h",
-      "include/freetype2/freetype/ftsystem.h",
-      "include/freetype2/freetype/fttrigon.h",
-      "include/freetype2/freetype/fttypes.h",
-      "include/freetype2/freetype/ftwinfnt.h",
-      "include/freetype2/freetype/internal/autohint.h",
-      "include/freetype2/freetype/internal/cffotypes.h",
-      "include/freetype2/freetype/internal/cfftypes.h",
-      "include/freetype2/freetype/internal/compiler-macros.h",
-      "include/freetype2/freetype/internal/ftcalc.h",
-      "include/freetype2/freetype/internal/ftdebug.h",
-      "include/freetype2/freetype/internal/ftdrv.h",
-      "include/freetype2/freetype/internal/ftgloadr.h",
-      "include/freetype2/freetype/internal/fthash.h",
-      "include/freetype2/freetype/internal/ftmemory.h",
-      "include/freetype2/freetype/internal/ftmmtypes.h",
-      "include/freetype2/freetype/internal/ftobjs.h",
-      "include/freetype2/freetype/internal/ftpsprop.h",
-      "include/freetype2/freetype/internal/ftrfork.h",
-      "include/freetype2/freetype/internal/ftserv.h",
-      "include/freetype2/freetype/internal/ftstream.h",
-      "include/freetype2/freetype/internal/fttrace.h",
-      "include/freetype2/freetype/internal/ftvalid.h",
-      "include/freetype2/freetype/internal/psaux.h",
-      "include/freetype2/freetype/internal/pshints.h",
-      "include/freetype2/freetype/internal/services/svbdf.h",
-      "include/freetype2/freetype/internal/services/svcfftl.h",
-      "include/freetype2/freetype/internal/services/svcid.h",
-      "include/freetype2/freetype/internal/services/svfntfmt.h",
-      "include/freetype2/freetype/internal/services/svgldict.h",
-      "include/freetype2/freetype/internal/services/svgxval.h",
-      "include/freetype2/freetype/internal/services/svkern.h",
-      "include/freetype2/freetype/internal/services/svmetric.h",
-      "include/freetype2/freetype/internal/services/svmm.h",
-      "include/freetype2/freetype/internal/services/svotval.h",
-      "include/freetype2/freetype/internal/services/svpfr.h",
-      "include/freetype2/freetype/internal/services/svpostnm.h",
-      "include/freetype2/freetype/internal/services/svprop.h",
-      "include/freetype2/freetype/internal/services/svpscmap.h",
-      "include/freetype2/freetype/internal/services/svpsinfo.h",
-      "include/freetype2/freetype/internal/services/svsfnt.h",
-      "include/freetype2/freetype/internal/services/svttcmap.h",
-      "include/freetype2/freetype/internal/services/svtteng.h",
-      "include/freetype2/freetype/internal/services/svttglyf.h",
-      "include/freetype2/freetype/internal/services/svwinfnt.h",
-      "include/freetype2/freetype/internal/sfnt.h",
-      "include/freetype2/freetype/internal/svginterface.h",
-      "include/freetype2/freetype/internal/t1types.h",
-      "include/freetype2/freetype/internal/tttypes.h",
-      "include/freetype2/freetype/internal/wofftypes.h",
-      "include/freetype2/freetype/otsvg.h",
-      "include/freetype2/freetype/t1tables.h",
-      "include/freetype2/freetype/ttnameid.h",
-      "include/freetype2/freetype/tttables.h",
-      "include/freetype2/freetype/tttags.h",
-      "include/freetype2/ft2build.h"
-    ],
-    "archives": [
-      "lib/libfreetype.a"
-    ],
     "pkg_config": [
       "lib/pkgconfig/freetype2.pc"
     ],
     "licenses": [
-      "licenses/FTL.TXT",
-      "licenses/GPLv2.TXT",
-      "licenses/LICENSE.TXT"
+      "licenses/freetype.txt",
+      "licenses/freetype-FTL.txt",
+      "licenses/freetype-GPLv2.txt"
+    ],
+    "shared_libraries": [
+      "lib/libfreetype.so"
     ]
   },
-  "build_scripts": [
+  "export_directories": {
+    "headers": [
+      "include/freetype2"
+    ]
+  },
+  "tests": [
     {
-      "file": "build.py",
-      "sha256": "04f219113ef614f0633bd73c82c7b913430dc3422743013a705de5cbb8842684"
-    },
-    {
-      "file": "../dependencies.py",
-      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
+      "kind": "native",
+      "source": "tests/graph_smoke.c",
+      "include_directories": [
+        "include/freetype2"
+      ],
+      "link_inputs": [
+        "lib/libfreetype.so",
+        "lib/libz.so"
+      ],
+      "sdk_link_inputs": [
+        "lib/wasm32-wasip1-threads/libsetjmp.a"
+      ]
     }
   ],
-  "sdk": {
-    "version": "34.0",
-    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
-  }
+  "role": "target-library",
+  "soname": "libfreetype.so",
+  "needed_libraries": [
+    "libz.so"
+  ],
+  "sdk": "default",
+  "build_system": "meson"
 }

@@ -17,6 +17,9 @@ from typing import Mapping
 from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, host_executable_flags
 from ports.toolchain.wasi_threads.dynamic import verify_sdk
 
+MAX_FILE = 512 * 1024**2
+
+
 HOST_TOOLS = frozenset(
     {
         "cmake",
@@ -37,9 +40,15 @@ HOST_TOOLS = frozenset(
 
 
 def file_hash(path: Path) -> str:
+    if not path.is_file() or path.stat().st_size > MAX_FILE:
+        raise ValueError("missing or oversized SDK input")
     digest = hashlib.sha256()
+    size = 0
     with path.open("rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            size += len(chunk)
+            if size > MAX_FILE:
+                raise ValueError("oversized SDK input")
             digest.update(chunk)
     return digest.hexdigest()
 
@@ -235,10 +244,6 @@ def verify_product(product: Receipt) -> None:
         raise ValueError("SDK product contains unrecorded or missing files")
 
 
-def local_recipe(name: str) -> dict:
-    return json.loads((Path(__file__).resolve().parents[1] / name).read_text())
-
-
 def verify_cpython_recipe(recipe: dict) -> None:
     """Admit historical build provenance while retaining the Python source policy.
 
@@ -247,32 +252,9 @@ def verify_cpython_recipe(recipe: dict) -> None:
     govern new builds. Compiled facade sources, headers and patches must still
     match, along with every other source and runtime ABI field.
     """
-    current = local_recipe("python/cpython/threaded-recipe.json")
-    scripts = recipe.get("build_scripts")
-    if (
-        set(recipe) != set(current)
-        or not isinstance(scripts, list)
-        or not 1 <= len(scripts) <= 256
-        or any(
-            not isinstance(item, dict)
-            or set(item) != {"file", "sha256"}
-            or not isinstance(item["file"], str)
-            or not item["file"]
-            or not isinstance(item["sha256"], str)
-            or len(item["sha256"]) != 64
-            or any(character not in "0123456789abcdef" for character in item["sha256"])
-            for item in scripts
-        )
-        or {key: value for key, value in recipe.items() if key != "build_scripts"}
-        != {key: value for key, value in current.items() if key != "build_scripts"}
-    ):
-        raise ValueError("CPython producer source or ABI profile differs")
-    historical = {item["file"]: item["sha256"] for item in scripts}
-    expected = {item["file"]: item["sha256"] for item in current["build_scripts"]}
-    if len(historical) != len(scripts) or historical.keys() != expected.keys():
-        raise ValueError("CPython producer input declarations differ")
-    if any(value != expected[name] and Path(name).suffix not in {".py", ".json"} for name, value in historical.items()):
-        raise ValueError("CPython compiled facade source differs")
+    from ports._support.producer_policy import verify_policy
+
+    verify_policy(recipe, "python/cpython:runtime")
 
 
 def verify_host_files(proof_path: Path, producer: dict, name: str, executable: Path) -> None:
@@ -333,8 +315,9 @@ def admit_host_tools(base: Path, bindings: dict) -> Mapping[str, Tool]:
                 raise ValueError("host producer receipt digest differs")
             producer = read_json(proof_path)
             if name == "uv":
-                if producer["recipe"] != local_recipe("toolchain/uv/recipe.json"):
-                    raise ValueError("patched uv producer differs")
+                from ports._support.producer_policy import verify_policy
+
+                verify_policy(producer["recipe"], "toolchain/uv")
                 if producer["executable"]["sha256"] != item["sha256"] or not producer["build"]["locked"]:
                     raise ValueError("patched uv executable differs")
             else:
@@ -361,24 +344,20 @@ def admit_sdk(
     overlay = sysroot.contents
     if overlay["identity"]["recipe"]["dynamic_abi"] != abi:
         raise ValueError("SDK ABI differs from platform producer")
-    if overlay["identity"]["recipe"] != local_recipe("toolchain/wasi_threads/dynamic-recipe.json"):
-        raise ValueError("sysroot producer profile differs")
+    from ports._support.producer_policy import verify_policy
+
+    verify_policy(overlay["identity"]["recipe"], "toolchain/wasi_threads")
     verify_sdk(sdk.root, overlay)
     if sdk.contents != overlay["identity"]["sdk_tooling"]:
         raise ValueError("SDK receipt differs from the sysroot input")
     compiler_recipe = llvm.contents["identity"]["recipe"]
     frontend = compiler_recipe.get("name") == "llvm-wasi-compiler"
-    expected_recipe = "compiler-recipe.json" if frontend else "threaded-recipe.json"
-    if compiler_recipe != local_recipe("toolchain/llvm/" + expected_recipe):
-        raise ValueError("compiler producer profile differs")
-    built_compiler = overlay["identity"]["compiler"]["identity"]["recipe"]
-    if any(compiler_recipe[name] != built_compiler[name] for name in ("source", "patches")):
-        raise ValueError("frontend and sysroot compiler source profiles differ")
-    verify_product(llvm)
     if not frontend:
-        alias = llvm.root / "bin/wasm-ld"
-        if not alias.is_symlink() or os.readlink(alias) != "lld":
-            raise ValueError("linker alias differs")
+        raise ValueError("SDK requires the current host compiler product")
+    verify_policy(compiler_recipe, "toolchain/llvm:host")
+    if overlay["identity"]["compiler"] != llvm.contents:
+        raise ValueError("platform compiler receipt differs from selected compiler")
+    verify_product(llvm)
     verify_product(sysroot)
     if cpython is None and runtime is not None:
         raise ValueError("runtime admission requires its CPython build receipt")
@@ -489,10 +468,10 @@ def resolved_toolchain(sdk_context: MaterializedSDK, compiler: Receipt, sysroot:
     """Bind adapter flags and entrypoints to the graph's selected producer results."""
     from dataclasses import replace
 
-    if compiler.contents["identity"]["recipe"] != local_recipe("toolchain/llvm/compiler-recipe.json"):
-        raise ValueError("resolved compiler producer differs")
-    if sysroot.contents["identity"]["recipe"] != local_recipe("toolchain/wasi_threads/dynamic-recipe.json"):
-        raise ValueError("resolved platform producer differs")
+    from ports._support.producer_policy import verify_policy
+
+    verify_policy(compiler.contents["identity"]["recipe"], "toolchain/llvm:host")
+    verify_policy(sysroot.contents["identity"]["recipe"], "toolchain/wasi_threads")
     target_tools = {
         name: Tool(compiler.root / "bin" / executable, file_hash(compiler.root / "bin" / executable))
         for name, executable in {

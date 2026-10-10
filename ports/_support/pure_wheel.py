@@ -14,7 +14,7 @@ def verified_files(wheel: Path, recipe: dict, *, source: bytes | None = None) ->
 
 def verified_host_files(wheel: Path, recipe: dict, *, source: bytes | None = None) -> dict[str, bytes]:
     """Admit unchanged host-only universal wheels, including inert launcher data."""
-    if recipe.get("role") != "host-tool" or recipe["build"]["adapter"] != "host-wheel":
+    if recipe.get("role") != "host-tool" or recipe["build_system"] != "host-wheel":
         raise ValueError("host wheel requires an explicit host-only recipe")
     return _verified_files(wheel, recipe, source=source, host_data=True)
 

@@ -1,13 +1,67 @@
 {
-  "name": "shellsim-wasi-process",
+  "name": "wasi_process",
   "version": "1",
-  "status": "integration-in-progress",
-  "abi": "shellsim-wasi-sdk34-cpython3137-v2",
-  "target": "wasm32-wasip1",
-  "cpython": "3.13.7",
-  "sdk": {
-    "version": "34.0",
-    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  "role": "host-tool",
+  "build_system": "source-tree",
+  "source": {
+    "files": [
+      {
+        "path": "toolchain/wasi_process/process.c",
+        "destination": "process.c",
+        "sha256": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7"
+      },
+      {
+        "path": "toolchain/wasi_process/process_abi.h",
+        "destination": "process_abi.h",
+        "sha256": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73"
+      },
+      {
+        "path": "toolchain/wasi_process/process_port.h",
+        "destination": "process_port.h",
+        "sha256": "42f5b24baa92c300dee0756d4faff51364274c6cac977978581f6d7ccc06714f"
+      },
+      {
+        "path": "toolchain/wasi_process/spawn.h",
+        "destination": "spawn.h",
+        "sha256": "099b12b83babaa658eada6b8848a49822e7d0c3ba9c2d548d0a5cc60fd235108"
+      },
+      {
+        "path": "toolchain/wasi_process/sys/wait.h",
+        "destination": "sys/wait.h",
+        "sha256": "aabcb78324279b198a4599bc9e800e04ac639ea4fff695409bbec9c3bd3b1698"
+      },
+      {
+        "path": "toolchain/wasi_process/exec.c",
+        "destination": "exec.c",
+        "sha256": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7"
+      },
+      {
+        "path": "toolchain/wasi_process/exec_port.h",
+        "destination": "exec_port.h",
+        "sha256": "9fcd6343589ef58d8e2e1d4395f017fbe357c9eccf736b18a05583897b53a56a"
+      },
+      {
+        "path": "toolchain/wasi_process/tempfile.c",
+        "destination": "tempfile.c",
+        "sha256": "2e9a332923ecdd89088fe52b9118e32245ff6767c819b3d47a4763be8e659b4f"
+      },
+      {
+        "path": "toolchain/wasi_process/tempfile_port.h",
+        "destination": "tempfile_port.h",
+        "sha256": "ff9d96e030f707bff65b96491532965fb6968a4b8f1c60a0ee6a1bec6c630325"
+      },
+      {
+        "path": "toolchain/wasi_process/process_limits.h",
+        "destination": "process_limits.h",
+        "sha256": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
+      },
+      {
+        "path": "toolchain/wasi_process/cpython-3.13.7-process.patch",
+        "destination": "cpython-3.13.7-process.patch",
+        "sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f"
+      }
+    ],
+    "sha256": "27e562fcfac7da43b67d0bb1e86912da14149626fbffc0626f05f5158ccc5f6d"
   },
   "cpython_source_sha256": {
     "Modules/posixmodule.c": "d7c234fe19bf204c9c776caf9e4619a0327ff535e6f4fc29f5bcd6f9b1a98eaf",
@@ -17,7 +71,6 @@
   },
   "patch_sha256": "10d170692dd4732d736bf4294854a6f07539a5578586fe6f452e5a6d338e044f",
   "port_sources_sha256": {
-    "build.py": "69a190ca77bc58ba9ba0adae2b917e8a16a5de23964a59f86e60de29fdcc2c5d",
     "process.c": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7",
     "process_abi.h": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73",
     "process_port.h": "42f5b24baa92c300dee0756d4faff51364274c6cac977978581f6d7ccc06714f",

@@ -4,9 +4,27 @@ import hashlib
 
 import pytest
 
-from ports._support.wasm import leb
-from ports.native import imaging_shared
+from ports._support import native_artifacts
+from ports._support.native_artifacts import NativeArtifact, NativeTarget, merge_dependency_sysroot
+from ports._support.store import identity
+from ports._support.wasm import leb, mark_abi
 from ports.native.dependencies import seal_artifact, verify_artifact
+
+ABI = "shellsim-wasm32-fixture"
+
+
+def stage_dependencies(recipe, providers, destination, toolchain):
+    closure = {name: NativeArtifact(path, verify_artifact(path)) for name, path in providers.items()}
+    direct = {item["port"]: closure[item["port"]] for item in recipe["target_dependencies"]}
+    for item in recipe["target_dependencies"]:
+        if direct[item["port"]].manifest["inputs"]["recipe"]["version"] != item["version"]:
+            raise ValueError("direct dependency version mismatch")
+    merge_dependency_sysroot(
+        direct, closure, destination, NativeTarget(recipe["target"], recipe["target_profile"], recipe["abi"], toolchain)
+    )
+    links = [providers[name] / closure[name].manifest["inputs"]["recipe"]["exports"]["libraries"][0] for name in direct]
+    return direct, links
+
 
 TOOLCHAIN = {"sdk": "verified-fixture"}
 
@@ -26,6 +44,7 @@ def graph(tmp_path):
         payload = leb(len(needed)) + b"".join(leb(len(item.encode())) + item.encode() for item in needed)
         custom = leb(8) + b"dylink.0" + b"\x02" + leb(len(payload)) + payload
         (prefix / "lib" / soname).write_bytes(b"\0asm\x01\0\0\0\0" + leb(len(custom)) + custom)
+        mark_abi(prefix / "lib" / soname, ABI.encode())
         relative = "include/" + (header or (name + ".h"))
         (prefix / relative).write_bytes(name.encode())
         recipe = {
@@ -33,7 +52,7 @@ def graph(tmp_path):
             "version": "1.0",
             "target": "wasm32-wasip1",
             "target_profile": "wasi-cpython-v2",
-            "abi": imaging_shared.ABI,
+            "abi": ABI,
             "linkage": "shared",
             "soname": soname,
             "target_dependencies": [{"port": "native/" + child, "version": "1.0"} for child in children],
@@ -43,7 +62,7 @@ def graph(tmp_path):
         }
         inputs = {
             "recipe": recipe,
-            "recipe_sha256": imaging_shared.digest(recipe),
+            "recipe_sha256": identity(recipe),
             "source_sha256": recipe["source"]["sha256"],
             "toolchain": toolchain,
             "dependency_artifacts": {
@@ -58,7 +77,7 @@ def graph(tmp_path):
         return {
             "target": "wasm32-wasip1",
             "target_profile": "wasi-cpython-v2",
-            "abi": imaging_shared.ABI,
+            "abi": ABI,
             "target_dependencies": [{"port": "native/" + name, "version": "1.0"} for name in names],
         }
 
@@ -70,11 +89,11 @@ def test_deep_chain_stages_headers_but_preserves_direct_link_edges(tmp_path, gra
     add("leaf")
     add("middle", ["leaf"])
     add("parent", ["middle"])
-    selected, links = imaging_shared.shared_dependencies(consumer("parent"), providers, tmp_path / "stage", TOOLCHAIN)
+    selected, links = stage_dependencies(consumer("parent"), providers, tmp_path / "stage", TOOLCHAIN)
     assert list(selected) == ["native/parent"]
     assert links == [providers["native/parent"] / "lib/libparent.so"]
-    assert (tmp_path / "stage/include/leaf.h").read_bytes() == b"leaf"
-    assert (tmp_path / "stage/include/middle.h").read_bytes() == b"middle"
+    assert (tmp_path / "stage/usr/local/include/leaf.h").read_bytes() == b"leaf"
+    assert (tmp_path / "stage/usr/local/include/middle.h").read_bytes() == b"middle"
 
 
 def test_diamond_reuses_the_verified_provider(tmp_path, graph, monkeypatch):
@@ -89,8 +108,8 @@ def test_diamond_reuses_the_verified_provider(tmp_path, graph, monkeypatch):
         visited.append(path)
         return verify_artifact(path)
 
-    monkeypatch.setattr(imaging_shared, "verify_artifact", verify)
-    imaging_shared.shared_dependencies(consumer("top"), providers, tmp_path / "stage", TOOLCHAIN)
+    monkeypatch.setattr(native_artifacts, "verify_artifact", verify)
+    stage_dependencies(consumer("top"), providers, tmp_path / "stage", TOOLCHAIN)
     assert visited.count(providers["native/leaf"]) == 1
 
 
@@ -116,7 +135,7 @@ def test_deep_failure_leaves_destination_uncreated(tmp_path, graph, problem):
             (prefix / "lib/libleaf.so").write_bytes(b"\0asm\x01\0\0\0\0" + leb(len(custom)) + custom)
         seal_artifact(prefix, inputs)
     with pytest.raises(ValueError):
-        imaging_shared.shared_dependencies(consumer("good", "top"), providers, tmp_path / "stage", TOOLCHAIN)
+        stage_dependencies(consumer("good", "top"), providers, tmp_path / "stage", TOOLCHAIN)
     assert not (tmp_path / "stage").exists()
 
 
@@ -126,11 +145,11 @@ def test_cycle_fails_before_staging(tmp_path, graph):
     add("parent", ["leaf"])
     inputs = manifests["native/leaf"]["inputs"]
     inputs["recipe"]["target_dependencies"] = [{"port": "native/parent", "version": "1.0"}]
-    inputs["recipe_sha256"] = imaging_shared.digest(inputs["recipe"])
+    inputs["recipe_sha256"] = identity(inputs["recipe"])
     inputs["dependency_artifacts"] = {"native/parent": manifests["native/parent"]["artifact_sha256"]}
     seal_artifact(providers["native/leaf"], inputs)
-    with pytest.raises(ValueError, match="Cyclic"):
-        imaging_shared.shared_dependencies(consumer("parent"), providers, tmp_path / "stage", TOOLCHAIN)
+    with pytest.raises(ValueError, match="cycle"):
+        stage_dependencies(consumer("parent"), providers, tmp_path / "stage", TOOLCHAIN)
     assert not (tmp_path / "stage").exists()
 
 
@@ -143,8 +162,8 @@ def test_conflicting_provider_exports_fail_before_staging(tmp_path, graph, colli
         header="common.h" if collision == "header" else None,
         soname="libleft.so" if collision == "soname" else None,
     )
-    with pytest.raises(ValueError, match="Conflicting"):
-        imaging_shared.shared_dependencies(consumer("left", "right"), providers, tmp_path / "stage", TOOLCHAIN)
+    with pytest.raises(ValueError, match="collision"):
+        stage_dependencies(consumer("left", "right"), providers, tmp_path / "stage", TOOLCHAIN)
     assert not (tmp_path / "stage").exists()
 
 
@@ -155,7 +174,8 @@ def test_header_staging_rejects_redirected_directory(tmp_path, graph):
     destination.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    (destination / "include").symlink_to(outside, target_is_directory=True)
-    with pytest.raises(ValueError, match="destination"):
-        imaging_shared.shared_dependencies(consumer("leaf"), providers, destination, TOOLCHAIN)
+    (destination / "usr/local").mkdir(parents=True)
+    (destination / "usr/local/include").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink|exists"):
+        stage_dependencies(consumer("leaf"), providers, destination, TOOLCHAIN)
     assert not (outside / "leaf.h").exists()

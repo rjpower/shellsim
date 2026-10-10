@@ -24,7 +24,15 @@ def apply_patch(source, patch, expected_hash):
 
 def check_build_scripts(recipe, directory):
     """Bind the cached profile to its reviewed build tooling as well as sources."""
-    for item in recipe["build_scripts"]:
+    for item in recipe.get("build_scripts", []):
         path = directory / item["file"]
         if hashlib.sha256(path.read_bytes()).hexdigest() != item["sha256"]:
             raise ValueError(f"Build script hash mismatch: {path}")
+
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    for name, expected in recipe.get("inputs", {}).items():
+        path = root / name
+        if not path.resolve().is_relative_to(root) or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise ValueError(f"Compiled port input differs: {name}")
