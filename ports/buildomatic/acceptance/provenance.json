@@ -1,0 +1,186 @@
+{
+  "cases": [
+    {
+      "backend": "local",
+      "case": "host-release",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "8dbaeabd2577021365769441b5c7b06438348b023b3337f448465b24860dea8b",
+      "compiler_sha256": "b5f1b773a7c733738352000c92a077dc5852a1a2fc6d836b1e411be1e9ec5f88",
+      "compiler_version": "cc (Ubuntu 15.2.0-16ubuntu1) 15.2.0",
+      "debug": false,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "131031c83d714756ada66416f50a4dce",
+      "object_sha256": "cd1bfdc08582b587fd75c957bfb018fac117a1f7edd4d459ad4bdb531ac5f3da",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "host"
+    },
+    {
+      "backend": "local",
+      "case": "upstream-wasm-release",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "9b88d7e4441255ba5ee5e8b20ac6740626d627f9c7697ac2ed83e79046f04eb0",
+      "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+      "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+      "debug": false,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "a80b9cba42274fed86b6399c34751839",
+      "object_sha256": "ed6d7a5af9eec00a81f4d77c214d3e90673a1391ab8e8de5138f42ff3d303e1e",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "wasm"
+    },
+    {
+      "backend": "local",
+      "case": "upstream-wasm-debug",
+      "changed_flags": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "changed_object_sha256": "b472219375c08416be661b41acaddc4667b8efd8559437bdb90ce1e00cbfcd34",
+      "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+      "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+      "debug": true,
+      "first": {
+        "compilations": 1,
+        "errors": 0,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "link": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 0,
+        "misses": 0,
+        "writes": 0
+      },
+      "local_corrupt": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "local_missing": {
+        "compilations": 1,
+        "errors": 1,
+        "hits": 0,
+        "misses": 1,
+        "writes": 1
+      },
+      "nonce": "d64100e934d3445e85d400541b2fa489",
+      "object_sha256": "ae81746672bbd1d63d9ae77fb4c3d713e93f00574aa984b76e95c42761941517",
+      "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+      "sccache_version": "0.18.0",
+      "second": {
+        "compilations": 0,
+        "errors": 0,
+        "hits": 1,
+        "misses": 0,
+        "writes": 0
+      },
+      "target": "wasm"
+    }
+  ],
+  "client_environment_keys": [
+    "HOME",
+    "LC_ALL",
+    "PATH",
+    "SCCACHE_SERVER_PORT"
+  ],
+  "daemon_basedirs": [],
+  "debug_dwarf_verified": {
+    "DW_AT_comp_dir": ".",
+    "DW_AT_name": "../source/probe.c"
+  },
+  "manifest_clang_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+  "retained_sdk_tooling_manifest": "/home/power/code/shellsim/.worktrees/ports-imaging-native/target/imaging-native/runtime-ctors-cohort/cohort-sdk.json",
+  "retained_upstream_clang": "/tmp/shellsim-dynamic-v2/base/wasi-sdk-34.0-x86_64-linux/bin/clang",
+  "sccache_archive_sha256": "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89",
+  "sccache_release_url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz",
+  "scope": "Isolated upstream compiler-cache acceptance; no patched LLVM23 SDK/native port admission or remote backend claim"
+}
