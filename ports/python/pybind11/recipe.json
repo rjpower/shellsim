@@ -1,0 +1,18 @@
+{
+  "name": "pybind11",
+  "version": "3.0.4",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "source": {
+    "filename": "pybind11-3.0.4-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/b3/06/c3a23c9a0263b136c519f033a58d4641e73065fefc7754e9667ec206d992/pybind11-3.0.4-py3-none-any.whl",
+    "sha256": "961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [
+    "pybind11-global==3.0.4; extra == \"global\""
+  ],
+  "build": {
+    "adapter": "pure-wheel"
+  }
+}

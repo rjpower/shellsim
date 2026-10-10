@@ -725,7 +725,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                     if path.name in incorporated_providers:
                         if file_hash(path) != file_hash(runtime / "rootfs/lib" / path.name):
                             raise ValueError("graph provider conflicts with assembled stdlib runtime")
-                        continue
+                        # Wheels and other providers still need an explicit catalog closure.
                     destination = raw / "providers" / path.name
                     if destination.exists():
                         raise ValueError("graph shared provider names conflict")

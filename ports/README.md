@@ -152,7 +152,7 @@ Provide a matching package catalog and the pinned
 [uv WASI resolver](toolchain/uv/README.md):
 
 ```python
-from shellsim import CPythonRuntime, Environment
+from shellsim import CPythonRuntime, Environment, Limits
 
 runtime = CPythonRuntime(
     "/path/to/runtime",
@@ -160,7 +160,7 @@ runtime = CPythonRuntime(
     uv="/path/to/patched-uv",
     venv="/app/.venv",
 )
-env = Environment(cpu=4_000_000_000, memory=512 * 1024**2, disk=128 * 1024**2)
+env = Environment(limits=Limits(cpu=100_000_000_000, memory=4 * 1024**3, disk=768 * 1024**2))
 runtime.mount(env)
 env.install_pypi(["pytest==8.4.1", "numpy==2.3.5"])
 result = env.run("python -c 'import numpy; print(numpy.arange(4).sum())'")

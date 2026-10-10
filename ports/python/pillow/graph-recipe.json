@@ -1,0 +1,127 @@
+{
+  "role": "target-library",
+  "kind": "python-project",
+  "target": "wasm32-wasip1-threads",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json",
+      "version": "3"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 1073741824,
+    "disk": 536870912
+  },
+  "name": "pillow",
+  "version": "12.3.0",
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "furo; extra == \"docs\"",
+    "olefile; extra == \"docs\"",
+    "sphinx>=8.2; extra == \"docs\"",
+    "sphinx-autobuild; extra == \"docs\"",
+    "sphinx-copybutton; extra == \"docs\"",
+    "sphinx-inline-tabs; extra == \"docs\"",
+    "sphinxext-opengraph; extra == \"docs\"",
+    "olefile; extra == \"fpx\"",
+    "olefile; extra == \"mic\"",
+    "arro3-compute; extra == \"test-arrow\"",
+    "arro3-core; extra == \"test-arrow\"",
+    "nanoarrow; extra == \"test-arrow\"",
+    "pyarrow; extra == \"test-arrow\"",
+    "coverage>=7.4.2; extra == \"tests\"",
+    "defusedxml; extra == \"tests\"",
+    "markdown2; extra == \"tests\"",
+    "olefile; extra == \"tests\"",
+    "packaging; extra == \"tests\"",
+    "pytest; extra == \"tests\"",
+    "pytest-cov; extra == \"tests\"",
+    "pytest-timeout; extra == \"tests\"",
+    "pytest-xdist; extra == \"tests\"",
+    "setuptools; extra == \"tests\"",
+    "trove-classifiers>=2024.10.12; extra == \"tests\"",
+    "defusedxml; extra == \"xmp\""
+  ],
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1c/3d/bb7fca845737cf9d7dbde16ed1843984665ff2e0a518f5db43e77ec540b9/pillow-12.3.0.tar.gz",
+    "sha256": "3b8182a766685eaa002637e28b4ec8d6b18819a0c71f579bf0dbaa5830297cce",
+    "subdirectory": "pillow-12.3.0"
+  },
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "recipe": "toolchain/llvm/host-recipe.json",
+      "version": "23.0.0"
+    },
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/pybind11",
+      "version": "3.0.4"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ],
+  "target_dependencies": [
+    {
+      "port": "native/zlib",
+      "version": "1.3.1",
+      "recipe": "native/zlib/cmake-recipe.json"
+    },
+    {
+      "port": "native/libjpeg-turbo",
+      "version": "2.1.5.1",
+      "recipe": "native/libjpeg-turbo/graph-recipe.json"
+    },
+    {
+      "port": "native/freetype",
+      "version": "2.13.3",
+      "recipe": "native/freetype/graph-recipe.json"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython/stdlib-zlib-graph-recipe.json"
+    }
+  ],
+  "build": {
+    "adapter": "python-pep517",
+    "config_settings": {
+      "platform-guessing": "disable",
+      "parallel": "2",
+      "zlib": "enable",
+      "jpeg": "enable",
+      "freetype": "enable",
+      "tiff": "disable",
+      "raqm": "disable",
+      "lcms": "disable",
+      "webp": "disable",
+      "jpeg2000": "disable",
+      "imagequant": "disable",
+      "xcb": "disable",
+      "avif": "disable"
+    }
+  },
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/graph_smoke.py"
+    }
+  ],
+  "patches": [
+    {
+      "file": "target-search.patch",
+      "sha256": "529d11de7e5004e9416d8cc20f070aff410c06ef48292a88d890fffdd7f4eb1a"
+    }
+  ]
+}
