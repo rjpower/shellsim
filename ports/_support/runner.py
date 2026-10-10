@@ -225,18 +225,16 @@ def build_graph(
             target = _native_target(build_sdk)
         sdks[port.reference] = build_sdk
         executable_inputs = _executable_sdk_link_inputs(build_sdk, recipe) if not pure else ()
+        driver_files = ["runner.py", "store.py"]
+        if "files" in recipe["source"]:
+            driver_files.append("local_sources.py")
+        if recipe.get("patches"):
+            driver_files.append("build.py")
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
             "implementation": implementations[port.reference],
-            "driver": {
-                name: file_hash(Path(__file__).with_name(name))
-                for name in (
-                    ("runner.py", "store.py", "local_sources.py")
-                    if "files" in recipe["source"]
-                    else ("runner.py", "store.py")
-                )
-            },
+            "driver": {name: file_hash(Path(__file__).with_name(name)) for name in driver_files},
             "dependencies": {item.kind + ":" + item.port: keys[item.recipe] for item in port.dependencies},
         }
         if port.sdk_selection is not None:

@@ -376,3 +376,77 @@ def test_changed_declared_helper_invalidates_a_real_cached_build(tmp_path, monke
     helper.write_text("VALUE = 2\n")
     changed = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
     assert changed.results != first.results and calls == ["example", "example"]
+
+
+def test_changed_patch_driver_rebuilds_a_real_cached_source_component(tmp_path, monkeypatch):
+    import io
+    import runpy
+    import tarfile
+    from pathlib import Path
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    directory = ports / "toolchain/example"
+    directory.mkdir(parents=True)
+    archive = directory / "example.tar.gz"
+    with tarfile.open(archive, "w:gz") as output:
+        member = tarfile.TarInfo("example/value.txt")
+        member.size = len(b"before\n")
+        output.addfile(member, io.BytesIO(b"before\n"))
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    cached = store / "sources" / digest / archive.name
+    cached.parent.mkdir(parents=True)
+    cached.write_bytes(archive.read_bytes())
+    patch = directory / "value.patch"
+    patch.write_text("--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-before\n+patched\n")
+    (directory / "recipe.json").write_text(
+        json.dumps(
+            {
+                "name": "example",
+                "version": "1",
+                "role": "host-tool",
+                "build_system": "source-tree",
+                "source": {
+                    "url": "https://example.invalid/example.tar.gz",
+                    "filename": archive.name,
+                    "sha256": digest,
+                    "subdirectory": "example",
+                },
+                "patches": [{"file": patch.name, "sha256": hashlib.sha256(patch.read_bytes()).hexdigest()}],
+            }
+        )
+    )
+    (directory / "build.py").write_text("from ports.api import source_tree\ndef build(ctx): return source_tree(ctx)\n")
+    driver = tmp_path / "driver"
+    driver.mkdir()
+    support = Path(runner.__file__).parent
+    for name in ("runner.py", "store.py"):
+        (driver / name).write_bytes((support / name).read_bytes())
+    patch_driver = driver / "build.py"
+    original = (support / "build.py").read_text()
+
+    def change_driver(value):
+        patch_driver.write_text(
+            original + "\n_original_apply_patch = apply_patch\n"
+            "def apply_patch(source, patch, expected_hash):\n"
+            "    _original_apply_patch(source, patch, expected_hash)\n"
+            f"    (source / 'value.txt').write_text({value!r})\n"
+        )
+
+    calls = []
+
+    def apply_patch(*args):
+        calls.append(args[1].name)
+        runpy.run_path(str(patch_driver))["apply_patch"](*args)
+
+    monkeypatch.setattr(runner, "__file__", str(driver / "runner.py"))
+    monkeypatch.setattr(runner, "apply_patch", apply_patch)
+    change_driver("first\n")
+    first = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
+    repeat = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
+    reference = "toolchain/example/recipe.json"
+    assert first.results == repeat.results and calls == ["value.patch"]
+    assert (first.results[reference] / "source/value.txt").read_text() == "first\n"
+    change_driver("second\n")
+    changed = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
+    assert changed.results != first.results and calls == ["value.patch", "value.patch"]
+    assert (changed.results[reference] / "source/value.txt").read_text() == "second\n"
