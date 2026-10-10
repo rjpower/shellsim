@@ -59,7 +59,7 @@
     },
     {
       "file": "../../native/dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     },
     {
       "file": "dynamic.c",
@@ -71,7 +71,7 @@
     },
     {
       "file": "posix.h",
-      "sha256": "031eac921644625f3f6923c224fe1341831e4340fc2d13bea7fee7ad3ccd38ee"
+      "sha256": "9001c6f4658d236bee3f7ee355b67d757792373ce770d306d0260fc99978704c"
     },
     {
       "file": "../../_support/build.py",

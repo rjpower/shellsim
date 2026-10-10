@@ -119,7 +119,6 @@ class BuildCohort:
             "-pthread",
             "--sysroot=" + str(self.sysroot.root / "sysroot"),
             "-resource-dir=" + str(self.sdk.root / "lib/clang/23"),
-            "-fuse-ld=" + str(self.llvm.root / "bin/wasm-ld"),
         )
 
     @property
@@ -141,7 +140,11 @@ class BuildCohort:
     @property
     def linker_flags(self) -> tuple[str, ...]:
         """Target link flags that also permit ordinary configure executables."""
-        return (*self.flags, "-Wl,--shared-memory,--serial-memory-init")
+        return (
+            *self.flags,
+            "-fuse-ld=" + str(self.llvm.root / "bin/wasm-ld"),
+            "-Wl,--shared-memory,--serial-memory-init",
+        )
 
     @property
     def executable_flags(self) -> tuple[str, ...]:
@@ -206,6 +209,35 @@ def verify_product(product: Receipt) -> None:
 
 def local_recipe(name: str) -> dict:
     return json.loads((Path(__file__).resolve().parents[1] / name).read_text())
+
+
+def verify_cpython_recipe(recipe: dict) -> None:
+    """Admit historical build provenance while retaining the Python source policy.
+
+    The trusted cohort descriptor pins the consumed manifest, including its
+    historical driver hashes. Current driver pins govern new builds. Every
+    other recipe field still identifies the accepted source and runtime ABI.
+    """
+    current = local_recipe("python/cpython/threaded-recipe.json")
+    scripts = recipe.get("build_scripts")
+    if (
+        set(recipe) != set(current)
+        or not isinstance(scripts, list)
+        or not 1 <= len(scripts) <= 256
+        or any(
+            not isinstance(item, dict)
+            or set(item) != {"file", "sha256"}
+            or not isinstance(item["file"], str)
+            or not item["file"]
+            or not isinstance(item["sha256"], str)
+            or len(item["sha256"]) != 64
+            or any(character not in "0123456789abcdef" for character in item["sha256"])
+            for item in scripts
+        )
+        or {key: value for key, value in recipe.items() if key != "build_scripts"}
+        != {key: value for key, value in current.items() if key != "build_scripts"}
+    ):
+        raise ValueError("CPython producer source or ABI profile differs")
 
 
 def verify_host_files(proof_path: Path, producer: dict, name: str, executable: Path) -> None:
@@ -276,8 +308,7 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
         raise ValueError("runtime admission requires its CPython build receipt")
     if cpython is not None:
         manifest = cpython.contents
-        if manifest["recipe"] != local_recipe("python/cpython/threaded-recipe.json"):
-            raise ValueError("CPython producer profile differs")
+        verify_cpython_recipe(manifest["recipe"])
         if manifest["dynamic_abi"] != ABI or manifest["recipe"]["target"] != TARGET:
             raise ValueError("CPython runtime ABI differs")
         profile = manifest["build_profile"]
@@ -518,3 +549,152 @@ def export_cohort(cohort: BuildCohort, destination: Path) -> Path:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
     load_cohort(path)
     return path
+
+
+@dataclass(frozen=True)
+class CompilerBootstrap:
+    """Explicit seed inputs for the host LLVM producer, outside the guest graph."""
+
+    archive: Path
+    archive_sha256: str
+    work: Path
+    tools: Mapping[str, Tool]
+
+
+def load_bootstrap(path: Path) -> CompilerBootstrap:
+    """Admit pinned host compilers and build tools without searching PATH."""
+    value = read_json(path)
+    if set(value) != {"schema_version", "archive", "work", "tools"} or value["schema_version"] != 1:
+        raise ValueError("compiler bootstrap descriptor fields differ")
+    if set(value["archive"]) != {"path", "sha256"} or set(value["tools"]) != {"cc", "cxx", "cmake", "ninja"}:
+        raise ValueError("compiler bootstrap inputs differ")
+    archive = (path.parent / value["archive"]["path"]).resolve()
+    if file_hash(archive) != value["archive"]["sha256"]:
+        raise ValueError("compiler bootstrap archive differs")
+    tools = {}
+    for name, item in value["tools"].items():
+        if set(item) != {"path", "sha256"}:
+            raise ValueError("compiler bootstrap tool fields differ")
+        executable = (path.parent / item["path"]).resolve()
+        if file_hash(executable) != item["sha256"]:
+            raise ValueError("compiler bootstrap tool differs: " + name)
+        tools[name] = Tool(executable, item["sha256"])
+    return CompilerBootstrap(
+        archive, value["archive"]["sha256"], (path.parent / value["work"]).resolve(), MappingProxyType(tools)
+    )
+
+
+def resolve_compiler(cohort: BuildCohort, bootstrap: CompilerBootstrap | None) -> Receipt:
+    """Run the host producer when seeded, or reuse its admitted immutable product."""
+    from ports.toolchain.llvm.compiler import build
+    from ports.toolchain.llvm.compiler import verify_product as verify_compiler
+
+    if bootstrap is None:
+        cohort.compiler()
+        verify_compiler(cohort.llvm.root, cohort.llvm.contents["identity"])
+        return cohort.llvm
+    if file_hash(bootstrap.archive) != bootstrap.archive_sha256:
+        raise ValueError("compiler bootstrap archive changed after admission")
+    for name, tool in bootstrap.tools.items():
+        if file_hash(tool.path) != tool.sha256:
+            raise ValueError("compiler bootstrap tool changed after admission: " + name)
+    root = build(
+        bootstrap.archive, *(bootstrap.tools[name].path for name in ("cc", "cxx", "cmake", "ninja")), bootstrap.work
+    )
+    path = root / "manifest.json"
+    return Receipt(root, path, file_hash(path), read_json(path))
+
+
+def resolved_toolchain(cohort: BuildCohort, compiler: Receipt, sysroot: Receipt) -> BuildCohort:
+    """Bind adapter flags and entrypoints to the graph's selected producer results."""
+    from dataclasses import replace
+
+    if compiler.contents["identity"]["recipe"] != local_recipe("toolchain/llvm/compiler-recipe.json"):
+        raise ValueError("resolved compiler producer differs")
+    if sysroot.contents["identity"]["recipe"] != local_recipe("toolchain/wasi_threads/dynamic-recipe.json"):
+        raise ValueError("resolved platform producer differs")
+    target_tools = {
+        name: Tool(compiler.root / "bin" / executable, file_hash(compiler.root / "bin" / executable))
+        for name, executable in {
+            "cc": "clang",
+            "cxx": "clang++",
+            "ar": "llvm-ar",
+            "ranlib": "llvm-ranlib",
+            "strip": "llvm-strip",
+        }.items()
+    }
+    return replace(
+        cohort, llvm=compiler, sysroot=sysroot, target_tools=MappingProxyType(target_tools), has_frontend=True
+    )
+
+
+@dataclass(frozen=True)
+class PlatformBootstrap:
+    """Pinned archives and output slot for the WASI libc platform producer."""
+
+    sdk_archive: Path
+    sdk_sha256: str
+    libc_archive: Path
+    libc_sha256: str
+    work: Path
+
+
+def load_platform_bootstrap(path: Path) -> PlatformBootstrap:
+    value = read_json(path)
+    if set(value) != {"schema_version", "sdk_archive", "libc_archive", "work"} or value["schema_version"] != 1:
+        raise ValueError("platform bootstrap descriptor fields differ")
+    archives = {}
+    for name in ("sdk_archive", "libc_archive"):
+        item = value[name]
+        if set(item) != {"path", "sha256"}:
+            raise ValueError("platform archive fields differ")
+        archive = (path.parent / item["path"]).resolve()
+        if file_hash(archive) != item["sha256"]:
+            raise ValueError("platform bootstrap archive differs")
+        archives[name] = (archive, item["sha256"])
+    return PlatformBootstrap(
+        *archives["sdk_archive"], *archives["libc_archive"], (path.parent / value["work"]).resolve()
+    )
+
+
+def resolve_platform(cohort: BuildCohort, compiler: Receipt, bootstrap: PlatformBootstrap | None) -> Receipt:
+    """Run the pinned libc producer or reuse a complete byte-verified product."""
+    from ports.toolchain.wasi_threads.dynamic import build, compiler_identity
+
+    if bootstrap is None:
+        verify_product(cohort.sysroot)
+        return cohort.sysroot
+    recipe = local_recipe("toolchain/wasi_threads/dynamic-recipe.json")
+    for path, expected, declared in (
+        (bootstrap.sdk_archive, bootstrap.sdk_sha256, recipe["sdk"]["sha256"]),
+        (bootstrap.libc_archive, bootstrap.libc_sha256, recipe["wasi_libc"]["sha256"]),
+    ):
+        if expected != declared or file_hash(path) != expected:
+            raise ValueError("platform producer archive differs")
+    tools = [cohort.host_tools[name] for name in ("cmake", "ninja")]
+    for tool in tools:
+        if file_hash(tool.path) != tool.sha256:
+            raise ValueError("platform build tool changed")
+    root = bootstrap.work / "prefix"
+    manifest_path = root / "manifest.json"
+    if manifest_path.exists():
+        product = Receipt(root, manifest_path, file_hash(manifest_path), read_json(manifest_path))
+        expected_compiler = compiler_identity(
+            compiler.root, Path(__file__).parents[1] / "toolchain/llvm/threaded-recipe.json"
+        )
+        if (
+            product.contents["identity"]["recipe"] != recipe
+            or product.contents["identity"]["compiler"] != expected_compiler
+        ):
+            raise ValueError("platform workspace producer inputs differ")
+        if product.contents["identity"]["tools"] != {str(tool.path): tool.sha256 for tool in tools}:
+            raise ValueError("platform workspace build tools differ")
+        verify_product(product)
+        return product
+    root = build(
+        bootstrap.sdk_archive, bootstrap.libc_archive, compiler.root, *(tool.path for tool in tools), bootstrap.work
+    )
+    manifest_path = root / "manifest.json"
+    product = Receipt(root, manifest_path, file_hash(manifest_path), read_json(manifest_path))
+    verify_product(product)
+    return product

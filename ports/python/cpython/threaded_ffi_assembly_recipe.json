@@ -14,11 +14,11 @@
     },
     {
       "file": "stdlib_ctypes_threaded_recipe.json",
-      "sha256": "92860b10bbf8a87e831abca8b48d67e3536086e915381a48c4afff3f073354ed"
+      "sha256": "67d121813980508cbe44c4997de243c2a590efe14c7fa74392e2673b5dde0a4a"
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "845d0a4a7de1042889e7d856ea0fec1f5a5380d28f31dd1eff0bab04bf0b839f"
+      "sha256": "9b38de49ea594272e7114aca37d3ed2ef8159b14b1e893682a8de24e4be6b498"
     },
     {
       "file": "../../_support/build.py",
@@ -30,7 +30,7 @@
     },
     {
       "file": "../../native/dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     }
   ]
 }

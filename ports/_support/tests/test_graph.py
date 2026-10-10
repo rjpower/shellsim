@@ -127,3 +127,70 @@ def test_oversized_recipe_is_rejected_before_json_parse(recipes):
     with pytest.raises(ValueError) as caught:
         plan(root, ["native/base"])
     assert "size limit" in str(caught.value.__cause__)
+
+
+def test_host_and_guest_variants_have_distinct_dependency_roles(recipes):
+    root, write = recipes
+    host = write("compiler", variant="host.json", profile=None)
+    host.write_text(
+        json.dumps({"name": "compiler", "version": "1", "role": "host-tool", "target_profile": "build-machine"})
+    )
+    guest = write("compiler")
+    guest.write_text(
+        json.dumps(
+            {
+                "name": "compiler",
+                "version": "1",
+                "role": "guest-tool",
+                "build_dependencies": [dependency("compiler", recipe="native/compiler/host.json")],
+            }
+        )
+    )
+    graph = plan(root, ["native/compiler"], target_profile="test-target")
+    assert [port.role for port in graph.ports] == ["host-tool", "guest-tool"]
+    assert graph.ports[1].dependencies[0].kind == "build"
+
+
+@pytest.mark.parametrize(
+    "field,role",
+    [
+        ("build_dependencies", "target-library"),
+        ("target_dependencies", "host-tool"),
+        ("runtime_dependencies", "host-tool"),
+        ("platform_dependencies", "target-library"),
+    ],
+)
+def test_wrong_dependency_role_is_rejected(recipes, field, role):
+    root, write = recipes
+    provider = write("provider")
+    provider.write_text(json.dumps({"name": "provider", "version": "1", "role": role}))
+    consumer = write("consumer")
+    consumer.write_text(json.dumps({"name": "consumer", "version": "1", field: [dependency("provider")]}))
+    with pytest.raises(ValueError, match="role differs"):
+        plan(root, ["native/consumer"])
+
+
+def test_runtime_and_platform_edges_remain_distinct_from_link_inputs(recipes):
+    root, write = recipes
+    platform = write("platform")
+    platform.write_text(json.dumps({"name": "platform", "version": "1", "role": "target-platform"}))
+    write("runtime")
+    write("library")
+    consumer = write("consumer")
+    consumer.write_text(
+        json.dumps(
+            {
+                "name": "consumer",
+                "version": "1",
+                "target_dependencies": [dependency("library")],
+                "runtime_dependencies": [dependency("runtime")],
+                "platform_dependencies": [dependency("platform")],
+            }
+        )
+    )
+    graph = plan(root, ["native/consumer"])
+    assert {(edge.port, edge.kind) for edge in graph.ports[-1].dependencies} == {
+        ("native/library", "target"),
+        ("native/runtime", "runtime"),
+        ("native/platform", "platform"),
+    }

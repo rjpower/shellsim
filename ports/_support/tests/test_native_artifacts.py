@@ -157,3 +157,59 @@ def test_symlinked_install_parent_is_rejected_without_reading_target(tmp_path, t
     with pytest.raises(ValueError):
         seal_native_install(recipe("value", target), tmp_path, staging, tmp_path / "output", target, {}, {})
     assert not (tmp_path / "output").exists()
+
+
+def test_runtime_dependencies_are_verified_without_becoming_link_inputs(tmp_path, target):
+    runtime = artifact(tmp_path, "runtime", target)
+    consumer = recipe("consumer", target)
+    consumer["runtime_dependencies"] = [{"port": "native/runtime", "version": "1"}]
+    payload = tmp_path / "stage/usr/local/include"
+    payload.mkdir(parents=True)
+    (payload / "consumer.h").write_bytes(b"consumer")
+    result = seal_native_install(
+        consumer, tmp_path, tmp_path / "stage", tmp_path / "output", target, {}, {}, {"native/runtime": runtime}
+    )
+    assert result.manifest["inputs"]["dependency_artifacts"] == {}
+    assert result.manifest["inputs"]["runtime_artifacts"] == {"native/runtime": runtime.manifest["artifact_sha256"]}
+    consumer["runtime_dependencies"][0]["version"] = "2"
+    with pytest.raises(ValueError, match="runtime dependency version"):
+        seal_native_install(
+            consumer, tmp_path, tmp_path / "stage", tmp_path / "invalid", target, {}, {}, {"native/runtime": runtime}
+        )
+
+
+def test_empty_directory_survives_sealing_and_dependency_merge(tmp_path, target):
+    payload = tmp_path / "stage/usr/local"
+    (payload / "include/c++/v1").mkdir(parents=True)
+    (payload / "include/value.h").write_bytes(b"header")
+    original = recipe("value", target)
+    original["empty_directories"] = {"include/c++/v1": 0o755}
+    result = seal_native_install(original, tmp_path, tmp_path / "stage", tmp_path / "output", target, {}, {})
+    merged = merge_dependency_sysroot({"native/value": result}, {}, tmp_path / "sysroot", target)
+    directory = merged / "usr/local/include/c++/v1"
+    assert directory.is_dir()
+    assert list(directory.iterdir()) == []
+    (result.prefix / "include/c++/v1/injected").write_bytes(b"unexpected")
+    with pytest.raises(ValueError):
+        verify_artifact(result.prefix)
+
+
+def test_wasm_tool_is_marked_and_wrong_existing_marker_rejected(tmp_path, target):
+    from ports._support.native_artifacts import _abi
+    from ports._support.wasm import mark_abi
+
+    target = replace(target, abi="tool-abi")
+    payload = tmp_path / "stage/usr/local/bin"
+    payload.mkdir(parents=True)
+    (payload / "tool").write_bytes(b"\0asm\x01\0\0\0")
+    (payload / "script").write_bytes(b"#!/bin/sh\nprintf ok\n")
+    original = recipe("value", target)
+    original["abi"] = target.abi
+    original["exports"] = {"tools": ["bin/tool", "bin/script"]}
+    result = seal_native_install(original, tmp_path, tmp_path / "stage", tmp_path / "output", target, {}, {})
+    assert _abi((result.prefix / "bin/tool").read_bytes()) == target.abi
+    assert (result.prefix / "bin/script").read_bytes() == (payload / "script").read_bytes()
+    mark_abi(payload / "tool", b"wrong")
+    with pytest.raises(ValueError, match="ABI marker"):
+        seal_native_install(original, tmp_path, tmp_path / "stage", tmp_path / "invalid", target, {}, {})
+    assert not (tmp_path / "invalid").exists()

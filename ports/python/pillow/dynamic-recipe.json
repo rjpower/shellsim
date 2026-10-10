@@ -92,7 +92,7 @@
     },
     {
       "file": "../../native/dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     },
     {
       "file": "../../native/freetype/build.py",
@@ -124,15 +124,15 @@
     },
     {
       "file": "../../native/zlib/shared-recipe.json",
-      "sha256": "3233c13c8c6447362bd68675c69799ee4acfb84cdaeed83745552d24184dce67"
+      "sha256": "41677255ad0d90c93c91b7828f9a4b2ee70754d3d71c9b6a1e01395cef34c916"
     },
     {
       "file": "../../native/libjpeg-turbo/shared-recipe.json",
-      "sha256": "1b5b6651fb701a983282a192580b2715eb8222a71e6249a6e0843d458bf38a40"
+      "sha256": "94f01379e8665d175927951294c212014204ca88f0f6b48d2049bb9c5e0e55a1"
     },
     {
       "file": "../../native/freetype/shared-recipe.json",
-      "sha256": "150a59899f3c4674557ce2cc7b20501ed427a3d5f782a35e27d4406d890034a6"
+      "sha256": "a0a8fdc7b1869ea0f693be0911c24c845006acde5269b7f0e991996b30b3bafd"
     }
   ],
   "sdk": {

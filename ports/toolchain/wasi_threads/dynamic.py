@@ -41,6 +41,17 @@ def verify_sdk(sdk, manifest):
 def compiler_identity(prefix, recipe_path):
     """Verify the complete immutable compiler product before using its tools."""
     manifest = json.loads((prefix / "manifest.json").read_text())
+    if manifest["identity"]["recipe"].get("name") == "llvm-wasi-compiler":
+        from ports.toolchain.llvm.compiler import verify_product
+
+        expected = json.loads((recipe_path.parent / "compiler-recipe.json").read_text())
+        threaded = json.loads(recipe_path.read_text())
+        if manifest["identity"]["recipe"] != expected or any(
+            expected[name] != threaded[name] for name in ("source", "patches")
+        ):
+            raise ValueError("threaded frontend source profile differs")
+        verify_product(prefix, manifest["identity"])
+        return manifest
     if manifest["identity"]["recipe"] != json.loads(recipe_path.read_text()):
         raise ValueError("threaded compiler recipe differs")
     if set(manifest["artifacts"]) != {"bin/lld", "bin/llc", "licenses/LLVM-LICENSE.txt"}:

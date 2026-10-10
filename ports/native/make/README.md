@@ -25,3 +25,16 @@ mode 0600 before virtual umask.
 Measured guest proofs include two concurrent one-second recipes completing in one
 virtual second and a remade included Makefile restarting make with
 `MAKE_RESTARTS=1`. Public catalog installation supplies the same verified executable.
+
+## Graph build
+
+`graph-recipe.json` builds GNU make through the common configure/make adapter.
+It explicitly depends on the host LLVM compiler, threaded target SDK and
+`native/shellsim-posix` library. Process and descriptor code is compiled once
+by that library port. This recipe publishes make as a guest build tool; its
+port-local shell check runs parallel jobs and checks propagation of a failed
+recipe through the public release installation API.
+
+The graph recipe is a distinct threaded build from the earlier standalone
+`recipe.json` profile. Its successful build alone does not establish guest
+execution; use `--output ... --check` to build and run the declared check.

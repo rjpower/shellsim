@@ -1,0 +1,27 @@
+--- a/lld/wasm/Driver.cpp
++++ b/lld/wasm/Driver.cpp
+@@ -1004,6 +1004,11 @@
+         "__wasm_init_tls", WASM_SYMBOL_VISIBILITY_HIDDEN,
+         make<SyntheticFunction>(is64 ? i64ArgSignature : i32ArgSignature,
+                                 "__wasm_init_tls"));
++    // Reserve the symbol before weak undefined references are lowered to stubs.
++    ctx.sym.applyGlobalTLSRelocs = symtab->addSyntheticFunction(
++        "__wasm_apply_global_tls_relocs", WASM_SYMBOL_VISIBILITY_HIDDEN,
++        make<SyntheticFunction>(nullSignature,
++                                "__wasm_apply_global_tls_relocs"));
+     if (ctx.arg.libcallThreadContext) {
+       ctx.sym.tlsBase->markLive();
+       ctx.sym.tlsSize->markLive();
+--- a/lld/wasm/Writer.cpp
++++ b/lld/wasm/Writer.cpp
+@@ -1219,10 +1219,6 @@
+ 
+   if (ctx.arg.isMultithreaded()) {
+     if (out.globalSec->needsTLSRelocations()) {
+-      ctx.sym.applyGlobalTLSRelocs = symtab->addSyntheticFunction(
+-          "__wasm_apply_global_tls_relocs", WASM_SYMBOL_VISIBILITY_HIDDEN,
+-          make<SyntheticFunction>(nullSignature,
+-                                  "__wasm_apply_global_tls_relocs"));
+       ctx.sym.applyGlobalTLSRelocs->markLive();
+       // TLS relocations depend on the __tls_base/__wasm_get_tls_base symbols
+       if (ctx.sym.getTLSBase)

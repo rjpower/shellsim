@@ -45,6 +45,10 @@ struct shellsim_process_action {
     uint32_t path;
 };
 
+#ifdef __cplusplus
+static_assert(sizeof(struct shellsim_process_action) == 24, "process action ABI size");
+#else
 _Static_assert(sizeof(struct shellsim_process_action) == 24, "process action ABI size");
+#endif
 
 #endif

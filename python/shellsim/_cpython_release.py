@@ -195,7 +195,11 @@ def _member(name: str, allowed_roots: frozenset[str]) -> PurePosixPath:
 
 
 def _extract(
-    archive: Path, destination: Path, *, allowed_roots: frozenset[str] = frozenset({"runtime", "universe"})
+    archive: Path,
+    destination: Path,
+    *,
+    allowed_roots: frozenset[str] = frozenset({"runtime", "universe"}),
+    allow_empty_directories: bool = False,
 ) -> None:
     try:
         with zipfile.ZipFile(archive) as source:
@@ -204,9 +208,24 @@ def _extract(
                 raise PackageInstallError("release archive exceeds its file or unpacked size limit")
             seen: set[PurePosixPath] = set()
             for item in members:
-                path = _member(item.filename, allowed_roots)
+                directory = item.is_dir()
+                path = _member(item.filename[:-1] if directory else item.filename, allowed_roots)
                 mode = item.external_attr >> 16
-                if path in seen or item.is_dir() or (stat.S_IFMT(mode) not in {0, stat.S_IFREG}):
+                if directory:
+                    if (
+                        not allow_empty_directories
+                        or item.file_size
+                        or stat.S_IFMT(mode) != stat.S_IFDIR
+                        or (mode & 0o777) != 0o755
+                        or path in seen
+                    ):
+                        raise PackageInstallError("release archive contains an invalid directory member")
+                    seen.add(path)
+                    target = destination.joinpath(*path.parts)
+                    target.mkdir(parents=True, exist_ok=True)
+                    target.chmod(0o755)
+                    continue
+                if path in seen or (stat.S_IFMT(mode) not in {0, stat.S_IFREG}):
                     raise PackageInstallError("release archive contains duplicate or non-regular members")
                 seen.add(path)
                 target = destination.joinpath(*path.parts)

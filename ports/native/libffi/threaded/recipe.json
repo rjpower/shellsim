@@ -49,7 +49,7 @@
     },
     {
       "file": "toolchain.py",
-      "sha256": "0461cc50dca64fcdc314e8be18b54d22bce1ef4c896f1e6e2844afb6d3ebb8d2"
+      "sha256": "638f9724608af7e47e5427cc1de72348e8b0c18ecaf35424c01de65d9cc4cf85"
     },
     {
       "file": "../shellsim_wasi.c",
@@ -57,7 +57,7 @@
     },
     {
       "file": "../../dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     },
     {
       "file": "../../../_support/build.py",
@@ -73,7 +73,7 @@
     },
     {
       "file": "../../../toolchain/wasi_threads/dynamic.py",
-      "sha256": "02ff79b545d533dafc1f60a9c70d4bde5ba6c9d9e8fd7abc9fed0485f61ad06c"
+      "sha256": "df0c8288cfaba83e02eeab222edb634f02d1b08d6e0afe3417e306316997d2aa"
     },
     {
       "file": "../../../toolchain/wasi_threads/build.py",
@@ -90,8 +90,8 @@
     "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
   },
   "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "compiler_recipe_sha256": "f644162ef795d914637ca8fd7cea9628cdc07aad6fcb87d699ac096e01b7c27b",
-  "overlay_recipe_sha256": "4efb14821341356da5100ffe3bc2d86a6f432702465d5a3fade50d23b9d664cd",
+  "compiler_recipe_sha256": "44051f1674acd83ca8f59466920507929ee36330c6190e140284663533177126",
+  "overlay_recipe_sha256": "d328627df35d3d8b4166c404c5b6d5dbfa03d47b5f140228c8841f9dff1cb6cb",
   "needed_libraries": [],
   "link_flags": [
     "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic,--fatal-warnings,-soname,libffi.so"

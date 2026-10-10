@@ -1,0 +1,18 @@
+{
+  "name": "wasi_threads",
+  "version": "3",
+  "role": "target-platform",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "build": {
+    "adapter": "wasi-sysroot",
+    "producer_recipe": "dynamic-recipe.json",
+    "producer_sha256": "d328627df35d3d8b4166c404c5b6d5dbfa03d47b5f140228c8841f9dff1cb6cb"
+  },
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "recipe": "toolchain/llvm/host-recipe.json",
+      "version": "23.0.0"
+    }
+  ]
+}

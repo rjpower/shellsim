@@ -13,7 +13,7 @@
     "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
     "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f"
   },
-  "compiler_recipe_sha256": "f644162ef795d914637ca8fd7cea9628cdc07aad6fcb87d699ac096e01b7c27b",
+  "compiler_recipe_sha256": "44051f1674acd83ca8f59466920507929ee36330c6190e140284663533177126",
   "patches": [
     {
       "file": "wasi-libc-scheduler-v2.patch",
@@ -30,6 +30,13 @@
       "inputs": {
         "libc-top-half/musl/src/thread/wasi-threads/pthread_create.c": "0abfdbd41b5ea10e90662677adf419b1131fb2c5e504c22c1ae29a54272d2a28"
       }
+    },
+    {
+      "file": "wasi-libc-parent-tls.patch",
+      "sha256": "90cccffd43f6a2c1964f67209389ebb2dfb5301eb39d2a7497f20ff8be47e1a7",
+      "inputs": {
+        "libc-top-half/musl/src/env/__init_tls.c": "f24609e8b7d89b33e20ab5e958023e0f387b2fee6651755d9109a8da0f16d531"
+      }
     }
   ],
   "build_limits": {
@@ -40,7 +47,7 @@
   "build_scripts": [
     {
       "file": "dynamic.py",
-      "sha256": "02ff79b545d533dafc1f60a9c70d4bde5ba6c9d9e8fd7abc9fed0485f61ad06c"
+      "sha256": "df0c8288cfaba83e02eeab222edb634f02d1b08d6e0afe3417e306316997d2aa"
     },
     {
       "file": "build.py",
@@ -52,7 +59,7 @@
     },
     {
       "file": "../../native/dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     },
     {
       "file": "../../_support/build.py",
@@ -65,6 +72,14 @@
     {
       "file": "wasi-libc-thread-ready.patch",
       "sha256": "1090358f0ac8493d70fc329725f232d9bfc477e70dce676af868c073424cde7f"
+    },
+    {
+      "file": "wasi-libc-parent-tls.patch",
+      "sha256": "90cccffd43f6a2c1964f67209389ebb2dfb5301eb39d2a7497f20ff8be47e1a7"
+    },
+    {
+      "file": "../llvm/compiler.py",
+      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
     }
   ],
   "sdk_tooling_digest": "4021ef510fac1bf69abb1aca413fb58f066e6b2698a1aaf80b8dcab0a58a29db"

@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import re
 import shlex
 import subprocess
 import tempfile
@@ -99,11 +100,24 @@ def _native_command(
     link_inputs: list[str],
     cohort_link_inputs: list[str],
     include_directories: list[str],
+    link_flags: list[str] | None = None,
 ) -> tuple[str, ...]:
     if not cohort.has_frontend:
         raise ValueError("native acceptance needs the admitted standard Clang frontend")
     if not dependency_sysroot.is_absolute():
         raise ValueError("native acceptance dependency sysroot must be absolute")
+    link_flags = [] if link_flags is None else link_flags
+    if (
+        not isinstance(link_flags, list)
+        or len(link_flags) > 32
+        or any(
+            not isinstance(flag, str)
+            or len(flag) > 4096
+            or re.fullmatch(r"-Wl,--wrap=[A-Za-z_][A-Za-z0-9_]*(?:,--wrap=[A-Za-z_][A-Za-z0-9_]*)*", flag) is None
+            for flag in link_flags
+        )
+    ):
+        raise ValueError("native acceptance link_flags must be bounded linker wrapper switches")
     includes = []
     include_root = dependency_sysroot / "usr/local"
     for raw in include_directories:
@@ -163,6 +177,7 @@ def _native_command(
         "-L" + str(dependency_sysroot / "usr/local/lib"),
         str(source),
         *links,
+        *link_flags,
         "-o",
         str(destination),
     )
@@ -187,17 +202,18 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
     descriptor_sha = _digest(descriptor.read_bytes())
     prepared = []
     for test in tests:
-        if not isinstance(test, dict) or test.get("kind") not in {"python", "native"}:
+        if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
             raise ValueError("acceptance test kind is invalid")
         kind = test["kind"]
-        if kind == "python" and request.install_kind != "pypi":
-            raise ValueError("Python acceptance needs a Python package selection")
+        if kind == "shell" and request.install_kind != "native":
+            raise ValueError("shell acceptance needs a native port selection")
         if kind == "native" and request.install_kind != "native":
             raise ValueError("native acceptance needs a native port selection")
-        path, data = _source(request.port, test.get("script" if kind == "python" else "source"))
+        path, data = _source(request.port, test.get("source" if kind == "native" else "script"))
         link_inputs = test.get("link_inputs", [])
         cohort_link_inputs = test.get("cohort_link_inputs", [])
         include_directories = test.get("include_directories", [])
+        link_flags = test.get("link_flags", [])
         args = test.get("args", [])
         if (
             not isinstance(args, list)
@@ -225,22 +241,36 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 link_inputs,
                 cohort_link_inputs,
                 include_directories,
+                link_flags,
             )
-        elif any(key in test for key in ("link_inputs", "cohort_link_inputs", "include_directories", "libraries")):
+        elif any(
+            key in test
+            for key in ("link_inputs", "cohort_link_inputs", "include_directories", "link_flags", "libraries")
+        ):
             raise ValueError("Python acceptance does not take native compiler options")
         if "libraries" in test:
             raise ValueError("native acceptance requires exact link_inputs rather than -l search")
-        prepared.append((kind, path, data, link_inputs, cohort_link_inputs, include_directories, args))
+        prepared.append((kind, path, data, link_inputs, cohort_link_inputs, include_directories, link_flags, args))
 
     request.output.mkdir(parents=True)
     from shellsim import Environment
 
-    spec = f"{request.port.name}=={request.port.version}" if request.install_kind == "pypi" else None
+    from ports._support.native_catalog import installation
+
+    name = request.port.name if request.install_kind == "pypi" else installation(request.port)[0]
+    spec = f"{name}=={request.port.version}"
     results = []
     with tempfile.TemporaryDirectory(prefix="shellsim-port-acceptance-") as cache_dir:
-        for index, (kind, path, data, link_inputs, cohort_link_inputs, include_directories, args) in enumerate(
-            prepared
-        ):
+        for index, (
+            kind,
+            path,
+            data,
+            link_inputs,
+            cohort_link_inputs,
+            include_directories,
+            link_flags,
+            args,
+        ) in enumerate(prepared):
             proof = request.output / f"probe-{index}"
             proof.mkdir()
             if kind == "native":
@@ -254,6 +284,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                     link_inputs,
                     cohort_link_inputs,
                     include_directories,
+                    link_flags,
                 )
                 with (proof / "build.log").open("wb") as log:
                     subprocess.run(
@@ -270,16 +301,16 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                     wasm_header = stream.read(8)
                 if artifact.stat().st_size > 128 * 1024**2 or wasm_header != b"\0asm\x01\0\0\0":
                     raise ValueError("native acceptance compiler did not produce bounded core Wasm")
-            setup = {"pypi": spec} if spec is not None else {}
+            setup = {"pypi" if request.install_kind == "pypi" else "tools": [spec]}
             kwargs = {"limits": request.limits} if request.limits is not None else {}
             env = Environment.from_release(descriptor, cache_dir=Path(cache_dir), **setup, **kwargs)
-            guest_path = "/work/shellsim-acceptance.py" if kind == "python" else "/work/shellsim-acceptance.wasm"
+            guest_path = "/work/shellsim-acceptance" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[kind]
             env.write_file(
                 guest_path,
-                data if kind == "python" else artifact.read_bytes(),
+                artifact.read_bytes() if kind == "native" else data,
                 mode=0o755 if kind == "native" else 0o644,
             )
-            guest_command = ("python " if kind == "python" else "") + shlex.quote(guest_path)
+            guest_command = {"python": "python ", "shell": "sh ", "native": ""}[kind] + shlex.quote(guest_path)
             result = env.run(" ".join((guest_command, *(shlex.quote(arg) for arg in args))))
             (proof / "stdout").write_bytes(result.stdout)
             (proof / "stderr").write_bytes(result.stderr)

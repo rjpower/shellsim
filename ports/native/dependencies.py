@@ -109,6 +109,9 @@ def seal_artifact(prefix, inputs):
     """Write the artifact identity after every declared export has been produced."""
     files = {name: file_hash(prefix / name) for name in exported_paths(inputs["recipe"])}
     manifest = {"inputs": inputs, "files": files}
+    directories = inputs["recipe"].get("empty_directories", {})
+    if directories:
+        manifest["directories"] = directories
     manifest["artifact_sha256"] = digest(manifest)
     (prefix / "artifact.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest
@@ -123,6 +126,28 @@ def verify_artifact(prefix, expected_inputs=None):
     if expected_inputs is not None and manifest["inputs"] != expected_inputs:
         raise ValueError(f"Native artifact inputs changed: {prefix}")
     files = manifest["files"]
+    directories = manifest.get("directories", {})
+    if directories != manifest["inputs"]["recipe"].get("empty_directories", {}):
+        raise ValueError("Native artifact directories differ from recipe")
+    if not isinstance(directories, dict) or len(directories) > 10_000:
+        raise ValueError("Invalid native directory exports")
+    for name, mode in directories.items():
+        if not isinstance(name, str):
+            raise ValueError("Native directory path must be a string")
+        parsed = PurePosixPath(name)
+        path = prefix / name
+        if (
+            parsed.is_absolute()
+            or ".." in parsed.parts
+            or str(parsed) != name
+            or name == "."
+            or mode != 0o755
+            or path.is_symlink()
+            or not path.is_dir()
+            or path.stat().st_mode & 0o777 != mode
+            or any(path.iterdir())
+        ):
+            raise ValueError("Native empty-directory export is invalid")
     if set(files) != set(exported_paths(manifest["inputs"]["recipe"])):
         raise ValueError(f"Native artifact exports differ from recipe: {prefix}")
     actual = set()

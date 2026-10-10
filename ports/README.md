@@ -49,6 +49,34 @@ bytes against their build receipts. `--offline` requires pinned source archives
 to be in that cache. It does not promise offline package resolution for pure
 dependencies outside the graph.
 
+Native recipes declare the compiler and SDK alongside their library dependencies:
+
+```json
+{
+  "build_dependencies": [
+    {"port": "toolchain/llvm", "version": "23.0.0", "recipe": "toolchain/llvm/host-recipe.json"}
+  ],
+  "platform_dependencies": [
+    {"port": "toolchain/wasi_threads", "version": "3", "recipe": "toolchain/wasi_threads/graph-recipe.json"}
+  ],
+  "target_dependencies": [{"port": "native/shellsim-posix", "version": "1"}]
+}
+```
+
+Build dependencies run on the host. Platform dependencies supply the verified
+target SDK, while target dependencies supply linked libraries and headers.
+`runtime_dependencies` select additional packages to install without asserting
+a linked-library relationship. The selected compiler and platform drive adapter
+paths and flags; dependency results participate in each consumer's cache identity.
+Host compiler bootstrap inputs are explicit and remain outside the graph to
+avoid a circular compiler dependency. `--bootstrap` selects the pinned source
+archive, host tools and persistent LLVM workspace; without it the graph reuses
+the cohort's verified compiler product.
+
+Repository-owned platform ports can declare `source.files`, a hash-pinned list
+of ports-relative source paths and staging destinations. This stages only the
+declared files. Upstream packages continue to use pinned release archives.
+
 Use `build.adapter` to choose one of `pure-wheel`, `python-extension`, `cmake`,
 `meson`, or `configure-make`. The first stages an unchanged, verified upstream
 wheel. The extension adapter compiles a declared single-module C/C++ extension
@@ -57,6 +85,14 @@ against the cohort's CPython headers. Native adapters install to a private
 sysroot. Recipe `source` pins the upstream URL and SHA256; `patches` pin local
 patch files. `source_exports` copies declared source files, such as licenses,
 that an upstream install omits. Port-specific build hooks must also be pinned.
+
+Native exports are published into the release's native catalog as well as the
+build dependency store. `role: "guest-tool"` selects executable tools;
+`install` can specify a package alias, kind and destination overrides. Standard
+exports install under `/usr/local`. Host tools and target-platform build inputs
+are excluded from guest publication. A port-local test with `kind: "shell"`
+and `script` installs the tool through `Environment.from_release` and executes
+that script inside the guest.
 
 Each recipe declares guest checks under `tests`, using a port-local Python
 `script` or native C `source`. Native probes may name exact package

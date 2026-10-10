@@ -21,6 +21,60 @@ from ports.toolchain.wasi_threads.build import extract
 from ports.toolchain.wasi_threads.dynamic import compiler_identity, verify_sdk
 
 
+def tree_identity(root):
+    """Bind retained source/header trees without expanding the runtime manifest."""
+    files = {}
+    total = 0
+    for path in sorted(root.rglob("*")):
+        if "__pycache__" in path.parts:
+            continue
+        if path.is_symlink():
+            raise ValueError("CPython retained input contains a symlink")
+        if not path.is_file():
+            continue
+        total += path.stat().st_size
+        if len(files) >= 20_000 or total > 512 * 1024**2:
+            raise ValueError("CPython retained input exceeds receipt bounds")
+        files[path.relative_to(root).as_posix()] = file_hash(path)
+    return digest(files)
+
+
+def compile_receipt(work, link, sysroot):
+    """Seal reusable local link inputs and the source/configuration that produced them.
+
+    Platform archives retain their separate sysroot receipt. Historical builds
+    without this receipt are runtime products, not admitted relink inputs.
+    """
+    objects = {}
+    for argument in link:
+        if not argument.endswith((".o", ".a")):
+            continue
+        path = Path(argument)
+        if not path.is_absolute():
+            path = work / "wasi-build" / path
+        try:
+            name = path.relative_to(work).as_posix()
+        except ValueError:
+            continue
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("CPython local link input is missing or linked")
+        objects[name] = file_hash(path)
+    generated = {}
+    guest = work / "wasi-build"
+    for path in sorted(guest.rglob("*")):
+        if path.is_file() and (path.suffix in {".h", ".c", ".py"} or path.name in {"Makefile", "config.status"}):
+            if path.is_symlink():
+                raise ValueError("CPython generated input contains a symlink")
+            generated[path.relative_to(work).as_posix()] = file_hash(path)
+    return {
+        "source_tree_sha256": tree_identity(work / "Python-3.13.7"),
+        "process_source_tree_sha256": tree_identity(work / "process-source"),
+        "sysroot_headers_sha256": tree_identity(sysroot / "include"),
+        "generated_files": generated,
+        "objects": objects,
+    }
+
+
 def main_tls_metadata(path):
     """Preserve executable TLS classification through the standard strip step."""
     data = path.read_bytes()
@@ -55,7 +109,93 @@ def run(command, cwd, environment, log):
         )
 
 
-def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work):
+def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment):
+    """Reuse only a sealed compile receipt; publish a distinct relinked runtime."""
+    manifest_path = previous / "manifest.json"
+    old = json.loads(manifest_path.read_text())
+    profile = old["build_profile"]
+    if digest(profile) != old["build_profile_sha256"] or "compile_inputs" not in profile:
+        raise ValueError("CPython relink requires a sealed compile-input receipt")
+    for name in ("version", "source", "patches", "dynamic_abi"):
+        if old["recipe"][name] != recipe[name]:
+            raise ValueError("CPython relink source or ABI differs")
+    old_sysroot = Path(
+        next(
+            value.removeprefix("--sysroot=")
+            for value in shlex.split(profile["environment"]["CC"])
+            if value.startswith("--sysroot=")
+        )
+    )
+    old_compile_sources = {
+        item["file"]: item["sha256"]
+        for item in old["recipe"]["build_scripts"]
+        if Path(item["file"]).suffix in {".c", ".h", ".patch"}
+    }
+    new_compile_sources = {
+        item["file"]: item["sha256"]
+        for item in recipe["build_scripts"]
+        if Path(item["file"]).suffix in {".c", ".h", ".patch"}
+    }
+    if old_compile_sources != new_compile_sources:
+        raise ValueError("CPython relink facade sources changed")
+    if compile_receipt(previous, profile["link"], old_sysroot) != profile["compile_inputs"]:
+        raise ValueError("CPython retained compile inputs changed")
+    if tree_identity(sysroot_prefix / "sysroot/include") != profile["compile_inputs"]["sysroot_headers_sha256"]:
+        raise ValueError("CPython relink requires unchanged platform headers")
+    if profile["sysroot"]["identity"]["sdk_tooling"] != overlay["identity"]["sdk_tooling"]:
+        raise ValueError("CPython relink frontend inputs changed")
+    for name, expected in old["files"].items():
+        if file_hash(previous / "rootfs" / name.lstrip("/")) != expected:
+            raise ValueError("CPython relink runtime input changed")
+    work.mkdir(parents=True)
+    for name in ("Python-3.13.7", "process-source", "rootfs"):
+        shutil.copytree(previous / name, work / name)
+    for name in profile["compile_inputs"]["generated_files"] | profile["compile_inputs"]["objects"]:
+        destination = work / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(previous / name, destination)
+    link = []
+    for argument in profile["link"]:
+        if argument.startswith("--sysroot="):
+            argument = "--sysroot=" + str(sysroot_prefix / "sysroot")
+        elif argument.startswith("-fuse-ld="):
+            argument = "-fuse-ld=" + str(llvm_prefix / "bin/wasm-ld")
+        elif argument.startswith(str(old_sysroot) + "/"):
+            argument = str(sysroot_prefix / "sysroot") + argument[len(str(old_sysroot)) :]
+        elif argument.startswith(str(previous) + "/"):
+            argument = str(work) + argument[len(str(previous)) :]
+        link.append(argument)
+    python = work / "python3.wasm"
+    run(link, work / "wasi-build", environment, work / "link.log")
+    metadata = main_tls_metadata(python)
+    run([str(sdk / "bin/llvm-strip"), "--keep-section=dylink.0", str(python)], work, environment, work / "strip.log")
+    if main_tls_metadata(python) != metadata:
+        raise ValueError("strip changed the threaded main TLS metadata")
+    mark_abi(python, recipe["dynamic_abi"].encode())
+    shutil.copyfile(python, work / "rootfs/usr/bin/python3.wasm")
+    shutil.rmtree(work / "rootfs/TOOLCHAIN-LICENSES")
+    shutil.copytree(sysroot_prefix / "licenses", work / "rootfs/TOOLCHAIN-LICENSES")
+    profile = {
+        **profile,
+        "recipe": recipe,
+        "sysroot": overlay,
+        "compiler": compiler,
+        "link": link,
+        "relink_from_manifest_sha256": file_hash(manifest_path),
+    }
+    profile["environment"] = {**profile["environment"], "CC": shlex.join(link[:5])}
+    profile["compile_inputs"] = compile_receipt(work, link, sysroot_prefix / "sysroot")
+    old.update(recipe=recipe, build_profile=profile, build_profile_sha256=digest(profile))
+    old["files"] = {
+        "/" + path.relative_to(work / "rootfs").as_posix(): file_hash(path)
+        for path in sorted((work / "rootfs").rglob("*"))
+        if path.is_file()
+    }
+    (work / "manifest.json").write_text(json.dumps(old, indent=2) + "\n")
+    return work
+
+
+def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_from=None):
     directory = Path(__file__).resolve().parent
     recipe = json.loads((directory / "threaded-recipe.json").read_text())
     check_build_scripts(recipe, directory)
@@ -78,6 +218,8 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work):
         raise ValueError("CPython build helper version differs")
     if work.exists():
         raise ValueError("use a fresh threaded CPython output directory")
+    if relink_from is not None:
+        return relink(relink_from, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment)
     work.mkdir(parents=True)
     source = work / "Python-3.13.7"
     extract(archive, source, recipe["source"]["sha256"], set())
@@ -113,7 +255,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work):
         "--enable-wasm-pthreads",
     ]
     run(configure, guest, environment, work / "configure.log")
-    run([str(make), "-j4"], guest, environment, work / "make.log")
+    run([str(make), "-j" + str(recipe["build_limits"]["compile_jobs"])], guest, environment, work / "make.log")
     toolchain = directory.parents[1] / "toolchain/wasi_sdk"
     process = toolchain.parent / "wasi_process"
     process_recipe = json.loads((process / "recipe.json").read_text())
@@ -276,6 +418,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work):
         "headers": headers,
         "process_source_recipe": process_recipe,
         "process_objects": {name: file_hash(path) for name, path in process_objects.items()},
+        "compile_inputs": compile_receipt(work, link, sysroot),
     }
     manifest = {
         "recipe": recipe,
@@ -301,13 +444,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("archive", "helper", "sdk", "sysroot-prefix", "llvm-prefix", "make", "work"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--relink-from", type=Path)
     args = parser.parse_args()
     print(
         build(
             *(
                 getattr(args, name).resolve()
                 for name in ("archive", "helper", "sdk", "sysroot_prefix", "llvm_prefix", "make", "work")
-            )
+            ),
+            relink_from=args.relink_from.resolve() if args.relink_from else None,
         )
     )
 

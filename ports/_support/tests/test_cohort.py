@@ -90,3 +90,41 @@ def test_package_tool_rejects_changed_imported_code(tmp_path):
     source.write_bytes(source.read_bytes() + b"\nraise RuntimeError('changed tool code')\n")
     with pytest.raises(ValueError):
         verify_host_files(receipt_path, producer, "meson", executable)
+
+
+def test_compile_flags_keep_linker_selection_in_link_flags(tmp_path):
+    from ports._support.cohort import BuildCohort, Receipt
+
+    sdk = Receipt(tmp_path / "sdk", tmp_path / "sdk.json", "sdk-digest", {})
+    compiler = Receipt(tmp_path / "compiler", tmp_path / "compiler.json", "compiler-digest", {})
+    sysroot = Receipt(tmp_path / "platform", tmp_path / "platform.json", "platform-digest", {})
+    cohort = BuildCohort(sdk, compiler, sysroot, None, None, None, {}, {}, "cohort-digest", True)
+    assert not any(flag.startswith("-fuse-ld=") for flag in cohort.compiler_flags)
+    assert "-fuse-ld=" + str(compiler.root / "bin/wasm-ld") in cohort.linker_flags
+    assert "-resource-dir=" + str(sdk.root / "lib/clang/23") in cohort.compiler_flags
+
+
+def test_historical_python_driver_pins_do_not_change_source_admission():
+    from ports._support.cohort import local_recipe, verify_cpython_recipe
+
+    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical["build_scripts"][0]["sha256"] = "0" * 64
+    verify_cpython_recipe(historical)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("source", {"url": "https://example.invalid/python.tar.xz", "sha256": "0" * 64}),
+        ("dynamic_abi", "different-abi"),
+        ("version", "3.13.8"),
+        ("patches", []),
+    ],
+)
+def test_historical_python_receipt_requires_the_accepted_source_and_abi(field, value):
+    from ports._support.cohort import local_recipe, verify_cpython_recipe
+
+    historical = local_recipe("python/cpython/threaded-recipe.json")
+    historical[field] = value
+    with pytest.raises(ValueError, match="source or ABI profile"):
+        verify_cpython_recipe(historical)

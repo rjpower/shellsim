@@ -74,11 +74,11 @@
     },
     {
       "file": "../recipe.json",
-      "sha256": "2beb48dde6cdab1a4f9ca82abd9ed46de6daa4e345eda98cc5c134fc4a768f37"
+      "sha256": "eed4747c5dd97dfabfe321072d7ad636809540f61aa34c23d8ff137bd718cf6e"
     },
     {
       "file": "../../dependencies.py",
-      "sha256": "2ebe8f0ab6072c232281fb63b23f0a7d0a67f966a8c191ceca1861ff4a87a399"
+      "sha256": "ab1abab4b61816fedc0fd54afa54a3e1c1715b93dd65b9ecdde39f4e75f3b8e1"
     },
     {
       "file": "../../../_support/wasm.py",

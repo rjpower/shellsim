@@ -35,10 +35,15 @@ def _host_requirements(uv: Path) -> tuple[str, list[str]]:
     return ".".join(map(str, max(versions))), libraries
 
 
-def _archive(root: Path, destination: Path) -> None:
+def _archive(root: Path, destination: Path, *, empty_directories: bool = False) -> None:
     """Write stable ZIP metadata so identical verified inputs have identical bytes."""
     with zipfile.ZipFile(destination, "w") as archive:
         for path in sorted(root.rglob("*")):
+            if empty_directories and path.is_dir() and not any(path.iterdir()):
+                info = zipfile.ZipInfo(path.relative_to(root).as_posix() + "/", (1980, 1, 1, 0, 0, 0))
+                info.external_attr = (stat.S_IFDIR | 0o755) << 16
+                archive.writestr(info, b"")
+                continue
             if not path.is_file() or path.relative_to(root).as_posix() == "uv":
                 continue
             name = path.relative_to(root).as_posix()
@@ -107,7 +112,7 @@ def build_release(
             }
             _validate_native_entry(native_stage, native)
             native_archive = work / "native.zip"
-            _archive(native_stage, native_archive)
+            _archive(native_stage, native_archive, empty_directories=True)
             if native_archive.stat().st_size > 256 * 1024 * 1024:
                 raise ValueError("native release archive exceeds 256 MiB")
             native["archive"].update(

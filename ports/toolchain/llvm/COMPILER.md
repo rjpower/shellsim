@@ -47,3 +47,8 @@ Compiler tests exercise preprocessing, resource-header compilation and actual
 TLS lowering. Cohort acceptance additionally compiles independent C/C++ Python
 extensions and executes late TLS loading and typed exception behavior in the
 threaded guest. The compiler artifact alone does not certify a runtime cohort.
+
+The host product also includes `llvm-tblgen`, `llvm-min-tblgen` and
+`clang-tblgen`. Cross-built guest LLVM uses these byte-verified native generators
+from its explicit host compiler dependency. They are ordinary LLVM build outputs
+and share the compiler's pinned source, patches and host tool provenance.
