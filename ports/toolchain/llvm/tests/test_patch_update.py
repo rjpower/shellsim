@@ -166,3 +166,51 @@ def test_preparation_dry_run_never_builds_or_marks_ready(tmp_path):
     compiler.configure_and_build(commands, build, state, receipt, attempts, None)
     assert subprocess.run([str(build / "program")], check=False).returncode == 0
     assert json.loads(receipt.read_text())["phase"] == "ready"
+
+
+def test_interrupted_guest_prepare_relinks_versioned_binary(tmp_path):
+    from ports.toolchain.llvm.guest import _invalidate_final_outputs
+
+    cxx, ninja, ar = (shutil.which(name) for name in ("c++", "ninja", "ar"))
+    if not all((cxx, ninja, ar)):
+        pytest.skip("native C++ compiler, Ninja and ar are required")
+    build = tmp_path / "build"
+    (build / "bin").mkdir(parents=True)
+    main = build / "main.cpp"
+    main.write_text('#include <cstdio>\nextern int value();\nint main() { std::printf("%d", value()); }\n')
+    subprocess.run([cxx, "-c", str(main), "-o", str(build / "main.o")], check=True)
+    object_bytes = (build / "main.o").read_bytes()
+    object_mtime = (build / "main.o").stat().st_mtime_ns
+    provider = build / "provider.cpp"
+
+    def archive(value):
+        provider.write_text(f"int value() {{ return {value}; }}\n")
+        subprocess.run([cxx, "-c", str(provider), "-o", str(build / "provider.o")], check=True)
+        subprocess.run([ar, "rcs", str(build / "provider.a"), str(build / "provider.o")], check=True)
+
+    archive(1)
+    # Driver-selected archives are not Ninja dependencies, as with the real SDK.
+    (build / "build.ninja").write_text(
+        "rule link\n  command = " + shlex.quote(cxx) + " $in provider.a -o $out\nbuild bin/clang-23: link main.o\n"
+    )
+    subprocess.run([ninja, "-C", str(build), "bin/clang-23"], check=True)
+    binary = build / "bin/clang-23"
+    previous_bytes = binary.read_bytes()
+    assert subprocess.check_output([binary]) == b"1"
+    (build / "bin/clang").symlink_to("clang-23")
+    receipt = tmp_path / "workspace.json"
+    state = {"phase": "ready"}
+    recipe = {"version": "23.1.0rc3"}
+    _invalidate_final_outputs(build, recipe, state, receipt, True)
+    assert not binary.exists()
+    assert not (build / "bin/clang").is_symlink()
+    # Resume from the durable preparation receipt after archive inputs advance.
+    archive(2)
+    resumed = json.loads(receipt.read_text())
+    resumed["phase"] = "building"
+    _invalidate_final_outputs(build, recipe, resumed, receipt, False)
+    subprocess.run([ninja, "-C", str(build), "bin/clang-23"], check=True)
+    assert subprocess.check_output([binary]) == b"2"
+    assert binary.read_bytes() != previous_bytes
+    assert (build / "main.o").read_bytes() == object_bytes
+    assert (build / "main.o").stat().st_mtime_ns == object_mtime

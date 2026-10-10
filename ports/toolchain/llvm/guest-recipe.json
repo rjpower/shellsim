@@ -26,7 +26,7 @@
   "build_scripts": [
     {
       "file": "guest.py",
-      "sha256": "6e17810a8286ad989ba7b05acd12b42dec3b9e2a12ecb58870a29dfc2856984f"
+      "sha256": "2f2f7e1302de1dc84bbb5f88ef2d7fe5119dbaf92421630c354c1981ab674ed1"
     },
     {
       "file": "build.py",

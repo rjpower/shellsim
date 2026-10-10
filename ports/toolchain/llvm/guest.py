@@ -292,6 +292,35 @@ def build_guest(context, recipe, compiler, *, jobs=None):
         return _build_guest_locked(context, recipe, compiler, workspace, jobs)
 
 
+def _invalidate_final_outputs(build, recipe, state, receipt, changed):
+    """Keep link invalidation durable until a successful actual Ninja build.
+
+    Clang's public executable is a symlink to its versioned binary. Record both
+    paths before updating snapshots so interrupted preparation cannot forget
+    the real output that must consume the newly admitted linker and archives.
+    """
+    root = (build / "bin").resolve()
+    if changed or state.get("phase") == "building":
+        paths = [build / "bin" / name for name in TARGETS]
+        paths.append(build / "bin" / ("clang-" + recipe["version"].split(".")[0]))
+        outputs = set(state.get("pending_final_outputs", []))
+        for path in paths:
+            resolved = path.resolve()
+            if not resolved.is_relative_to(root):
+                raise ValueError("guest LLVM final output escapes build/bin")
+            outputs.update((str(path.relative_to(build)), str(resolved.relative_to(build.resolve()))))
+        state["pending_final_outputs"] = sorted(outputs)
+        write_workspace(receipt, state)
+    for name in state.get("pending_final_outputs", []):
+        relative = Path(name)
+        path = build / relative
+        if relative.is_absolute() or ".." in relative.parts or relative.parent != Path("bin"):
+            raise ValueError("invalid pending guest LLVM final output")
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("pending guest LLVM final output escapes build/bin")
+        path.unlink(missing_ok=True)
+
+
 def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
@@ -353,6 +382,13 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
         previous_tools = state["inputs"]["compiler_tools"]
     elif context.build.exists() or (workspace / "source").exists():
         raise ValueError("guest LLVM workspace has no input receipt")
+    _invalidate_final_outputs(
+        context.build,
+        recipe,
+        state,
+        receipt,
+        previous != inputs["snapshots"] or previous_tools["wasm-ld"] != compiler_tools["wasm-ld"],
+    )
     for name, (source, inventory) in snapshots.items():
         _refresh_snapshot(
             source,
@@ -364,11 +400,6 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     state["inputs"] = inputs
     write_workspace(receipt, state)
     _snapshot_tools(compiler.root / "bin", workspace / "inputs/compiler", compiler_tools, previous_tools)
-    if previous != inputs["snapshots"] or previous_tools["wasm-ld"] != compiler_tools["wasm-ld"]:
-        # Driver-selected sysroot archives and -fuse-ld are not Ninja link
-        # dependencies. Remove only final binaries to relink with admitted bytes.
-        for name in TARGETS:
-            (context.build / "bin" / name).unlink(missing_ok=True)
     source = workspace / "source"
     if not source.exists():
         preparing = workspace / "source.preparing"
@@ -417,6 +448,8 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
         attempts.mkdir(parents=True, exist_ok=True)
         environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
         configure_and_build(commands, context.build, state, receipt, attempts, environment)
+        state.pop("pending_final_outputs", None)
+        write_workspace(receipt, state)
         staging = prefix.with_name(key + ".preparing")
         if staging.exists():
             shutil.rmtree(staging)
