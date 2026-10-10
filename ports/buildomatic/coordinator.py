@@ -105,13 +105,14 @@ class Coordinator:
     workers maps immutable instance IDs to durable endpoints. Each endpoint receives
     at most one active node from this request. Removing an endpoint while it has
     an active attempt does not prove loss: restore the endpoint to reconcile it.
+    An empty pool admits no execution but still processes recovery controls.
     Use distinct journal keys for independent requests. Acknowledgement releases
     worker results while retaining the request identity and final journal result.
     """
 
     def __init__(self, store: Store, journal_key: str, workers: Mapping[str, Worker]):
-        if not 1 <= len(workers) <= 32:
-            raise ValueError("coordinator needs 1..32 workers")
+        if not 0 <= len(workers) <= 32:
+            raise ValueError("coordinator needs 0..32 workers")
         for key in workers:
             name(key)
         self.store, self.journal_key, self.workers = store, journal_key, dict(workers)

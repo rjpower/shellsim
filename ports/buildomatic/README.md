@@ -68,6 +68,12 @@ retain assignments; they never imply loss. Explicit `UNKNOWN` permits a
 bounded retry, after cancellation tombstones fence delayed dispatch. A worker
 endpoint removed from the mapping remains uncertain until restored.
 
+`Coordinator` accepts 0..32 available workers. An empty pool leaves undispatched
+nodes pending while still applying cancellation and confirmed instance retirement.
+Active assignments remain uncertain until reconciled or explicitly retired;
+replacement admission is not required to process those recovery controls.
+`BuildRequest.max_workers` remains bounded to 1..32.
+
 `Coordinator.worker_lost(worker_id)` fences a confirmed terminal worker instance
 in the journal before bounded retry. Worker IDs must identify immutable lifecycle
 instances; replacements need fresh IDs and endpoint namespaces. The caller must

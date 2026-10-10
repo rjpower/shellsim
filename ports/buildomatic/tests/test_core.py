@@ -113,6 +113,69 @@ def test_worker_bound(workers):
         request(action("node"), workers=workers)
 
 
+def test_coordinator_pool_bound(store):
+    with pytest.raises(ValueError):
+        Coordinator(store, "build", {str(index): FakeWorker(store) for index in range(33)})
+
+
+def test_empty_worker_pool_keeps_pending_graph_and_cancels_without_rpc(store):
+    coordinator = Coordinator(store, "build", {})
+    coordinator.submit(request(action("a"), action("b", "a")))
+    for _ in range(2):
+        result = coordinator.tick()
+        assert result.state == BuildState.PENDING
+        assert all(node.state == NodeState.PENDING and node.attempts == 0 for node in result.nodes)
+    result = coordinator.cancel()
+    assert result.state == BuildState.CANCELLED
+    assert all(node.state == NodeState.CANCELLED and node.attempts == 0 for node in result.nodes)
+    coordinator.acknowledge()
+    assert coordinator.cleanup_complete()
+    reopened = Coordinator(store, "build", {})
+    assert reopened.tick() == result
+    assert reopened.cleanup_complete()
+
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_empty_pool_reopens_uncertain_attempt_and_fences_confirmed_loss(store, bundle, cancelled):
+    old, fresh = FakeWorker(store), FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"old-instance": old})
+    coordinator.submit(request(action("a"), action("b", "a")))
+    coordinator.tick()
+    old_id = next(iter(old.attempts))
+    reopened = Coordinator(store, "build", {})
+    uncertain = reopened.tick()
+    assert uncertain.state == BuildState.RUNNING
+    assert uncertain.nodes[0].attempts == 1
+    assert not old.cancelled
+    if cancelled:
+        assert reopened.cancel().state == BuildState.RUNNING
+    result = reopened.worker_lost("old-instance")
+    assert result.state == (BuildState.CANCELLED if cancelled else BuildState.PENDING)
+    assert result.nodes[0].attempts == 1
+    assert not old.cancelled
+    assert not old.acknowledged
+    with pytest.raises(CoordinatorFenced):
+        coordinator.tick()
+    if cancelled:
+        reopened.acknowledge()
+        assert reopened.cleanup_complete()
+        assert Coordinator(store, "build", {}).cleanup_complete()
+        return
+    pending = Coordinator(store, "build", {})
+    assert pending.tick() == result
+    replacement = Coordinator(store, "build", {"fresh-instance": fresh})
+    assert replacement.tick().nodes[0].attempts == 2
+    assert old_id not in fresh.attempts
+    fresh.complete("a", bundle)
+    assert replacement.tick().nodes[1].state == NodeState.RUNNING
+    fresh.complete("b", bundle)
+    assert replacement.tick().state == BuildState.SUCCEEDED
+    replacement.acknowledge()
+    assert replacement.cleanup_complete()
+    assert len(old.attempts) == 1
+    assert not old.acknowledged
+
+
 @pytest.mark.parametrize(
     "actions",
     [
