@@ -208,6 +208,11 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     environment.update(
         {
             "PYTHONDONTWRITEBYTECODE": "1",
+            # Upstream VCS probes may inspect an admitted package-local checkout,
+            # but must not discover the repository containing extracted sources.
+            "GIT_CEILING_DIRECTORIES": os.pathsep.join(
+                sorted({str(context.source.parent.resolve()), str(context.build.parent.resolve())})
+            ),
             "PATH": os.pathsep.join(sorted({str(path.parent) for path in context.host_tools.values()})),
             "CC": shlex.quote(str(wrappers["cc"])),
             "CXX": shlex.quote(str(wrappers["cxx"])),

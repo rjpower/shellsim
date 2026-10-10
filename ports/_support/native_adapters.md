@@ -239,3 +239,10 @@ including nested `@file` arguments. They pass the original argv unchanged to
 the compiler. Compile-only modes take precedence over shared-link selection.
 Expansion is bounded to 16 nested files, 256 files, 4 MiB and 65,536 arguments;
 unreadable, cyclic or excessive inputs fail before compiler invocation.
+
+Native build commands bound Git discovery at the admitted source and build
+parents. Extracted tarballs therefore use upstream version fallbacks instead
+of the enclosing Shellsim commit. A pinned checkout inside the source tree
+remains discoverable. Inherited Git directory/work-tree overrides are excluded
+by the existing target environment allowlist. Retained generated VCS headers
+may change once when this boundary corrects a previously embedded parent hash.
