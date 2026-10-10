@@ -11,6 +11,7 @@ import sys
 import threading
 import zipfile
 from dataclasses import replace
+from enum import StrEnum
 from types import ModuleType, SimpleNamespace
 from urllib.error import HTTPError, URLError
 
@@ -194,11 +195,18 @@ def test_signing_is_bounded_conditional_and_scoped_to_configured_blob_key(monkey
         BlobAccessRequest("get", "a" * 64, 5)
 
 
+class IrisTaskState(StrEnum):
+    RUNNING = "running"
+    FAILED = "failed"
+
+
 @pytest.fixture
 def lifecycle_pool(tmp_path):
     store = LocalStore(tmp_path / "pool")
     submitted = []
-    status = SimpleNamespace(attempt_number=0, attempt_uid="uid-original", state=1, finished_at=None)
+    status = SimpleNamespace(
+        attempt_number=0, attempt_uid="uid-original", state=IrisTaskState.RUNNING, finished_at=None
+    )
     task = SimpleNamespace(current_attempt_number=0, attempts=(status,))
     calls = []
 
@@ -220,7 +228,7 @@ def lifecycle_pool(tmp_path):
             task_status=lambda task_id: task,
             attempt_status=attempt,
             make_worker=lambda name: SimpleNamespace(name=name),
-            terminal_states=frozenset({2}),
+            terminal_states=frozenset({IrisTaskState.FAILED}),
         )
 
     return SimpleNamespace(create=create, store=store, submitted=submitted, status=status, task=task, calls=calls)
@@ -239,7 +247,7 @@ def test_worker_pool_retains_exact_attempt_across_restart(lifecycle_pool):
     assert set(recovered.reconcile()[0]) == {old}
     assert fixture.submitted == [old]
     assert fixture.calls[-1] == (f"/owner/service/{old}/0", 0)
-    fixture.status.state = 2
+    fixture.status.state = IrisTaskState.FAILED
     assert recovered.reconcile() == ({}, ())
     assert fixture.submitted == [old]
     fixture.status.finished_at = "terminal timestamp"
@@ -251,6 +259,7 @@ def test_worker_pool_retains_exact_attempt_across_restart(lifecycle_pool):
     journal = json.loads(fixture.store.read_journal("iris/test/workers.json").data)
     assert journal["retired"][0]["attempt_uid"] == "uid-original"
     assert journal["retired"][0]["finished_at"] == "terminal timestamp"
+    assert journal["retired"][0]["terminal_state"] == "failed"
 
 
 def test_worker_pool_waits_for_identity_before_dispatch(lifecycle_pool):
@@ -268,7 +277,7 @@ def test_worker_pool_mismatched_uid_never_retires(lifecycle_pool):
     pool = fixture.create()
     pool.reconcile()
     fixture.status.attempt_uid = "different-incarnation"
-    fixture.status.state = 2
+    fixture.status.state = IrisTaskState.FAILED
     fixture.status.finished_at = "terminal timestamp"
     with pytest.raises(RuntimeError):
         pool.reconcile()
@@ -297,7 +306,7 @@ def test_worker_pool_recovery_fences_old_membership_writer(lifecycle_pool):
     original = fixture.create()
     original.reconcile()
     recovered = fixture.create()
-    fixture.status.state = 2
+    fixture.status.state = IrisTaskState.FAILED
     fixture.status.finished_at = "terminal timestamp"
     with pytest.raises(ConditionalWriteError):
         original.reconcile()

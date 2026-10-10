@@ -54,6 +54,7 @@ from ports.buildomatic.remote_store import (
 
 if TYPE_CHECKING:
     from iris.client.workload import AttemptStatus, TaskStatus
+    from iris.resources.state import TaskState
 
     from ports.buildomatic import Attempt, BuildRequest, BuildResult, Store, Worker, WorkerReport
 
@@ -169,7 +170,7 @@ class WorkerPool:
         task_status: Callable[[str], TaskStatus],
         attempt_status: Callable[[str, int], AttemptStatus],
         make_worker: Callable[[str], Worker],
-        terminal_states: frozenset[int],
+        terminal_states: frozenset[TaskState],
     ):
         if type(slots) is not int or not 1 <= slots <= 32:
             raise ValueError("worker pool requires 1..32 slots")
@@ -205,7 +206,7 @@ class WorkerPool:
                 if status.attempt_uid != record["attempt_uid"] or status.attempt_number != record["attempt_number"]:
                     raise RuntimeError("Iris worker attempt identity changed")
                 if status.state in self._terminal_states and status.finished_at is not None:
-                    record.update(terminal_state=int(status.state), finished_at=str(status.finished_at))
+                    record.update(terminal_state=status.state.value, finished_at=str(status.finished_at))
                     self._state["retired"].append(record)
                     self._state["slots"][slot] = None
                     self._save()
@@ -1064,13 +1065,13 @@ def _run_coordinator(config: IrisConfig) -> None:
     from iris.actor.client import ActorClient
     from iris.client.client import JobAlreadyExists, iris_ctx
     from iris.cluster.types import (
-        TERMINAL_TASK_STATES,
         EndpointAccess,
         EnvironmentSpec,
         JobName,
         ResourceSpec,
         TaskAttempt,
     )
+    from iris.resources.state import TERMINAL_TASK_STATES
     from iris.rpc import job_pb2
     from rigging.timing import Duration
 
