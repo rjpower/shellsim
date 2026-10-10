@@ -379,5 +379,128 @@
   "retained_upstream_clang": "/tmp/shellsim-dynamic-v2/base/wasi-sdk-34.0-x86_64-linux/bin/clang",
   "sccache_archive_sha256": "45f1447fbe231e3037bde351ef70677dd212216c8d62ae7ca409fecc4d6acc89",
   "sccache_release_url": "https://github.com/mozilla/sccache/releases/download/v0.18.0/sccache-v0.18.0-x86_64-unknown-linux-musl.tar.gz",
-  "scope": "Isolated upstream compiler-cache acceptance; no patched LLVM23 SDK/native port admission or remote backend claim"
+  "scope": "Isolated upstream compiler-cache acceptance; no patched LLVM23 SDK/native port admission or remote backend claim",
+  "uds_followup": {
+    "cases": [
+      {
+        "backend": "local",
+        "case": "upstream-wasm-release",
+        "changed_flags": {
+          "compilations": 1,
+          "errors": 0,
+          "hits": 0,
+          "misses": 1,
+          "writes": 1
+        },
+        "changed_object_sha256": "0219407d244af52dbc152c7e422e1b325adb1711500ae271178f0b6f3d27b3b2",
+        "client_side": true,
+        "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+        "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+        "containment": {
+          "cancelled": true,
+          "compiler_in_action_group": true,
+          "cpu_seconds": 13,
+          "file_bytes": 16777216,
+          "independent_compile_succeeded": true,
+          "memory_bytes": 8589934592
+        },
+        "debug": false,
+        "first": {
+          "compilations": 1,
+          "errors": 0,
+          "hits": 0,
+          "misses": 1,
+          "writes": 1
+        },
+        "link": {
+          "compilations": 0,
+          "errors": 0,
+          "hits": 0,
+          "misses": 0,
+          "writes": 0
+        },
+        "local_corrupt": null,
+        "local_missing": null,
+        "nonce": "9b5d466b23f54aedaaa63556b722a7ae",
+        "object_sha256": "c5e8f3cd7d61f5de68c9e6f32048f659009fe1f318c8d742fc0a1e306c1b139c",
+        "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+        "sccache_version": "0.18.0",
+        "second": {
+          "compilations": 0,
+          "errors": 0,
+          "hits": 1,
+          "misses": 0,
+          "writes": 0
+        },
+        "target": "wasm"
+      },
+      {
+        "backend": "local",
+        "case": "upstream-wasm-debug",
+        "changed_flags": {
+          "compilations": 1,
+          "errors": 0,
+          "hits": 0,
+          "misses": 1,
+          "writes": 1
+        },
+        "changed_object_sha256": "2fee80bedd33c39f7f6831c933c612bd5fbaef611d56baeb3af637d85777d3c8",
+        "client_side": true,
+        "compiler_sha256": "061f88b9f4c48f3742434c2513d5038ab7fa4dc27abff5cb13b5eaedcb51d6ea",
+        "compiler_version": "clang version 23.1.0-wasi-sdk (https://github.com/llvm/llvm-project 895aa2c896ada719451be2e3673c83da8ddf1141)",
+        "containment": {
+          "cancelled": true,
+          "compiler_in_action_group": true,
+          "cpu_seconds": 13,
+          "file_bytes": 16777216,
+          "independent_compile_succeeded": true,
+          "memory_bytes": 8589934592
+        },
+        "debug": true,
+        "first": {
+          "compilations": 1,
+          "errors": 0,
+          "hits": 0,
+          "misses": 1,
+          "writes": 1
+        },
+        "link": {
+          "compilations": 0,
+          "errors": 0,
+          "hits": 0,
+          "misses": 0,
+          "writes": 0
+        },
+        "local_corrupt": null,
+        "local_missing": null,
+        "nonce": "d382aa52424c497c97f968ebe995749b",
+        "object_sha256": "ba7ef4dded347f96c11c659c56b8f40cc6a28b6e37569e989c6fb694f2d22704",
+        "sccache_sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59",
+        "sccache_version": "0.18.0",
+        "second": {
+          "compilations": 0,
+          "errors": 0,
+          "hits": 1,
+          "misses": 0,
+          "writes": 0
+        },
+        "target": "wasm"
+      }
+    ],
+    "client_credentials": "none",
+    "client_environment_keys": [
+      "HOME",
+      "LC_ALL",
+      "PATH",
+      "SCCACHE_CLIENT_SIDE",
+      "SCCACHE_SERVER_UDS"
+    ],
+    "daemon_credentials": "none; private local disk backend",
+    "endpoint": {
+      "SCCACHE_SERVER_UDS": "/tmp/buildomatic-uds/sccache.sock"
+    },
+    "evidence_root": "target/buildomatic-validation/uds-evidence",
+    "scope": "Local dedicated UDS acceptance; existing upstream SDK34 Clang; no remote backend or patched SDK admission",
+    "transport": "unix-domain-socket"
+  }
 }
