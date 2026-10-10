@@ -3,9 +3,6 @@
   "version": "1.18.0",
   "role": "target-library",
   "kind": "python-project",
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "requires_python": ">=3.12",
   "requires_dist": [
     "numpy<2.8,>=2.0.0",
@@ -53,27 +50,11 @@
   "target_dependencies": [
     {
       "port": "python/numpy",
-      "version": "2.3.5",
-      "recipe": "python/numpy/graph-recipe.json"
+      "version": "2.3.5"
     },
     {
       "port": "native/openblas",
-      "version": "0.3.31",
-      "recipe": "native/openblas/graph-recipe.json"
-    }
-  ],
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+      "version": "0.3.31"
     }
   ],
   "source": {
@@ -182,5 +163,6 @@
     "cpu": 100000000000,
     "memory": 4294967296,
     "disk": 805306368
-  }
+  },
+  "build_profile": "wasi-threads-v3"
 }

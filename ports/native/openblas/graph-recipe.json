@@ -12,9 +12,6 @@
     "input": "cohort.shared_library_inputs",
     "linkage": "referenced-members-only"
   },
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
   "linkage": "shared",
   "role": "target-library",
   "target_dependencies": [],
@@ -81,20 +78,6 @@
       "destination": "licenses/lapack.txt"
     }
   ],
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
-    }
-  ],
   "build_scripts": [
     {
       "file": "graph_prepare.py",
@@ -133,5 +116,6 @@
       "kind": "python",
       "script": "tests/shared_smoke.py"
     }
-  ]
+  ],
+  "build_profile": "wasi-threads-v3"
 }

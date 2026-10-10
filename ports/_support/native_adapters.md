@@ -31,7 +31,8 @@ A recipe build section selects `adapter` (`cmake`, `meson`, `configure-make`),
 `install_prefix` (`/usr/local`). Arguments and targets are arrays. Configure
 recipes provide their upstream-specific cross options explicitly. Meson accepts
 its standard `install` target. The runner converts these fields into a typed
-`NativeBuildRequest`; it also selects explicit dependency recipe variants.
+`NativeBuildRequest`; it also consumes dependency recipe variants resolved from explicit selections or
+a named build profile.
 
 The compatibility probes build upstream zlib 1.3.1 through CMake and
 configure/make, and FreeType 2.13.3 through Meson using the configure-built zlib.
@@ -60,7 +61,7 @@ by group. For example, headers may declare `include` while shared libraries
 name `lib/libexample.so` explicitly. Contained file links become regular file
 snapshots. Shared library exports receive the exact cohort ABI marker and must
 have the declared direct providers in their emitted dependency list. The
-artifact envelope retains the original graph recipe and digest separately from
+artifact envelope retains the resolved graph recipe and digest separately from
 the effective recipe with expanded exact file exports. Source and cache
 admission stay with the runner.
 
@@ -73,8 +74,14 @@ Build edges select host tools; platform edges select target platforms. Target
 edges supply link prefixes. Runtime edges supply installed guest requirements
 and retain their artifact identities without entering the link prefix.
 
-Native builds declare `toolchain/llvm/host-recipe.json` as a build dependency
-and `toolchain/wasi_threads/graph-recipe.json` as a platform dependency. These
+Native builds select `build_profile: "wasi-threads-v3"` to share target/ABI fields,
+compiler/platform pins and dependency variant defaults. The planner expands this
+into `toolchain/llvm/host-recipe.json` as a build dependency and
+`toolchain/wasi_threads/graph-recipe.json` as a platform dependency. Exact
+per-port dependency versions and explicit variant overrides remain in the recipe.
+Profile bytes and the authored recipe participate in its build identity; receipts
+retain the profile reference and hash. See [port authoring](../README.md).
+These
 small graph recipes pin the existing immutable producer recipes. The runner
 verifies their products and provides the selected compiler, sysroot and library
 prefixes to adapters. The SDK resource directory remains the admitted source of

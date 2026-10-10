@@ -1,14 +1,16 @@
 """Plan a bounded ports dependency graph before fetching or building anything.
 
 Recipe references are relative to the ports tree. A directory selects recipe.json;
-other variants must be named explicitly. The build driver consumes dependency-first
-nodes and records their source digests alongside the eventual artifact identities.
+other variants can be named explicitly or selected by a recipe-owned build profile.
+Profiles expand into explicit inputs before validation. The build driver consumes
+dependency-first nodes and records their digests alongside artifact identities.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
@@ -31,6 +33,14 @@ class Dependency:
 
 
 @dataclass(frozen=True)
+class BuildProfile:
+    """The exact profile document admitted with an authoring recipe."""
+
+    reference: str
+    sha256: str
+
+
+@dataclass(frozen=True)
 class Port:
     """A parsed recipe and the identities needed to admit its build inputs."""
 
@@ -41,6 +51,7 @@ class Port:
     digest: str
     dependencies: tuple[Dependency, ...]
     recipe: dict[str, Any]
+    build_profile: BuildProfile | None = None
 
     @property
     def role(self) -> str:
@@ -69,7 +80,8 @@ def _reference(value: object) -> str:
     return name if name.endswith(".json") else name + "/recipe.json"
 
 
-def _read(root: Path, reference: str) -> Port:
+def _document(root: Path, reference: str) -> tuple[Path, bytes, dict[str, Any]]:
+    """Read a bounded, unlinked JSON document inside the admitted ports tree."""
     path = root
     for part in PurePosixPath(reference).parts:
         path /= part
@@ -82,15 +94,70 @@ def _read(root: Path, reference: str) -> Port:
     recipe = json.loads(data)
     if not isinstance(recipe, dict):
         raise ValueError(f"recipe must be an object: {reference}")
-    name, version = recipe.get("name"), recipe.get("version")
-    if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
-        raise ValueError(f"recipe must declare a name and version: {reference}")
-    if PurePosixPath(name).name != name or name in {".", ".."}:
-        raise ValueError(f"recipe name must be a package name: {reference}")
-    Version(version)
-    role = recipe.get("role", "target-library")
-    if role not in {"host-tool", "target-library", "guest-tool", "target-platform"}:
-        raise ValueError(f"unsupported port role: {reference}")
+    return path, data, recipe
+
+
+def _expand_profile(root: Path, recipe: dict[str, Any]) -> tuple[dict[str, Any], BuildProfile | None]:
+    """Resolve recipe-owned defaults without changing pins or explicit variants.
+
+    There is no profile inheritance or ambient selection. Profile bytes join the
+    authoring recipe in its identity, including defaults unused by this port.
+    """
+    if "build_profile" not in recipe:
+        return recipe, None
+    name = recipe["build_profile"]
+    if not isinstance(name, str) or re.fullmatch(r"[a-z0-9][a-z0-9-]{0,63}", name) is None:
+        raise ValueError("build profile must be a simple lowercase name")
+    if recipe.get("role") in {"host-tool", "target-platform"}:
+        raise ValueError("build profiles apply only to target consumers")
+    _, data, profile = _document(root, f"profiles/{name}.json")
+    fields = {
+        "schema_version",
+        "target",
+        "target_profile",
+        "abi",
+        "build_dependencies",
+        "platform_dependencies",
+        "dependency_recipes",
+    }
+    if set(profile) != fields or type(profile["schema_version"]) is not int or profile["schema_version"] != 1:
+        raise ValueError("unsupported build profile schema")
+    _dependencies(recipe, name)
+    resolved = dict(recipe)
+    for field in ("target", "target_profile", "abi"):
+        value = profile[field]
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"build profile needs {field}")
+        if field in recipe and recipe[field] != value:
+            raise ValueError(f"recipe conflicts with build profile {field}")
+        resolved[field] = value
+    # Validate profile edges before merging, so malformed defaults cannot be hidden.
+    _dependencies(profile, f"profiles/{name}.json")
+    for field in ("build_dependencies", "platform_dependencies"):
+        declarations = recipe.get(field, [])
+        if not isinstance(declarations, list) or len(declarations) > _MAX_NODES:
+            raise ValueError("invalid recipe dependency declarations")
+        owned = {item["port"] for item in profile[field]}
+        if any(isinstance(item, dict) and item.get("port") in owned for item in declarations):
+            raise ValueError(f"recipe redeclares build profile {field}")
+        resolved[field] = [*profile[field], *declarations]
+    variants = profile["dependency_recipes"]
+    if not isinstance(variants, dict) or len(variants) > _MAX_NODES:
+        raise ValueError("invalid build profile dependency variants")
+    variants = {_relative(port): _reference(reference) for port, reference in variants.items()}
+    for field in ("build_dependencies", "target_dependencies", "runtime_dependencies", "platform_dependencies"):
+        declarations = resolved.get(field, [])
+        if not isinstance(declarations, list) or len(declarations) > _MAX_NODES:
+            raise ValueError("invalid recipe dependency declarations")
+        resolved[field] = [
+            {**item, "recipe": _reference(item.get("recipe", variants.get(item["port"], item["port"])))}
+            for item in declarations
+        ]
+    return resolved, BuildProfile(f"profiles/{name}.json", hashlib.sha256(data).hexdigest())
+
+
+def _dependencies(recipe: dict[str, Any], reference: str) -> tuple[Dependency, ...]:
+    """Validate exact role-specific edges after profile expansion."""
     dependencies = []
     for field, kind in (
         ("build_dependencies", "build"),
@@ -114,11 +181,30 @@ def _read(root: Path, reference: str) -> Port:
                 raise ValueError(f"duplicate dependency: {reference} -> {port}")
             names.add(port)
             dependencies.append(Dependency(port, version_pin, _reference(declaration.get("recipe", port)), kind))
-    return Port(reference, path.parent, name, version, hashlib.sha256(data).hexdigest(), tuple(dependencies), recipe)
+    return tuple(dependencies)
+
+
+def _read(root: Path, reference: str) -> Port:
+    path, data, recipe = _document(root, reference)
+    recipe, profile = _expand_profile(root, recipe)
+    name, version = recipe.get("name"), recipe.get("version")
+    if not isinstance(name, str) or not name or not isinstance(version, str) or not version:
+        raise ValueError(f"recipe must declare a name and version: {reference}")
+    if PurePosixPath(name).name != name or name in {".", ".."}:
+        raise ValueError(f"recipe name must be a package name: {reference}")
+    Version(version)
+    role = recipe.get("role", "target-library")
+    if role not in {"host-tool", "target-library", "guest-tool", "target-platform"}:
+        raise ValueError(f"unsupported port role: {reference}")
+    dependencies = _dependencies(recipe, reference)
+    digest = hashlib.sha256(data).hexdigest()
+    if profile is not None:
+        digest = hashlib.sha256(b"shellsim-build-profile-v1\0" + data + b"\0" + profile.sha256.encode()).hexdigest()
+    return Port(reference, path.parent, name, version, digest, dependencies, recipe, profile)
 
 
 def plan(root: Path, requests: Sequence[str], *, target_profile: str | None = None) -> Graph:
-    """Resolve explicit recipe variants and reject inconsistent dependency graphs.
+    """Resolve recipe variants and named profiles, rejecting inconsistent graphs.
 
     This operation reads recipe files only. Missing dependencies, cycles, version
     conflicts and target-profile mismatches fail before the driver creates a store.

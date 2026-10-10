@@ -20,7 +20,7 @@ The SDK owns its dynamic-loader bridge. Compiler, loader, exception and FFI
 conformance programs live under [tests/fixtures/wasm](../tests/fixtures/wasm);
 production builds do not compile those programs.
 
-Each recipe records upstream source URLs and SHA256 values, versions, target
+Each recipe records upstream source URLs and SHA256 values, versions, named or explicit target
 profile, build inputs, selected features, patches, and dependencies. Native
 artifacts retain exact compiled-provider identities. Pure wheels keep upstream
 metadata and tags; curated source builds retain their provenance. A recipe or
@@ -49,19 +49,52 @@ bytes against their build receipts. `--offline` requires pinned source archives
 to be in that cache. It does not promise offline package resolution for pure
 dependencies outside the graph.
 
-Native recipes declare the compiler and SDK alongside their library dependencies:
+Native and source-built Python recipes can select the shared threaded profile:
 
 ```json
 {
-  "build_dependencies": [
-    {"port": "toolchain/llvm", "version": "23.0.0", "recipe": "toolchain/llvm/host-recipe.json"}
-  ],
-  "platform_dependencies": [
-    {"port": "toolchain/wasi_threads", "version": "3", "recipe": "toolchain/wasi_threads/graph-recipe.json"}
-  ],
-  "target_dependencies": [{"port": "native/shellsim-posix", "version": "1"}]
+  "build_profile": "wasi-threads-v3",
+  "target_dependencies": [{"port": "native/zlib", "version": "1.3.1"}]
 }
 ```
+
+[The profile](profiles/wasi-threads-v3.json) supplies `target`, `target_profile`,
+`abi`, the pinned host compiler and target platform edges, and default recipe
+variants. For example, the zlib dependency above resolves to
+`native/zlib/cmake-recipe.json`. Each recipe still pins the dependency's version.
+An explicit dependency `recipe` overrides its profile default; incompatible
+provider versions, roles and conflicting variants fail during graph planning.
+A directory passed as a root still selects `recipe.json`, so name a graph variant
+explicitly when requesting a historical port with several recipes.
+
+Profiles live under `profiles/<name>.json` and use schema version 1. They have
+exactly the fields shown in the checked-in profile; names contain lowercase
+letters, digits and hyphens. Profiles have no inheritance, arbitrary recipe
+fragments or implicit selection from the cohort. Host-tool and target-platform
+producers keep their explicit recipes. Consumers cannot override profile-owned
+target/ABI values or redeclare its compiler/platform edges. Package-specific
+backend and other build dependencies are added to the profile's build edges.
+Resolved recipes retain explicit compiler/platform dependencies, and build
+receipts record the profile path and SHA256. Changes to any profile bytes
+invalidate its consumers' cache identities. Artifact-byte verification still
+runs on cache hits.
+
+To add a port, start from
+[FreeType's native recipe](native/freetype/graph-recipe.json) or
+[Pillow's Python recipe](python/pillow/graph-recipe.json). Keep `build_profile`
+and choose the adapter matching upstream's build system. Replace the package
+name, exact version, pinned source and patches, selected features and dependency
+version pins. Native ports declare their own exported files/directories, soname,
+provider libraries and licenses; Python ports retain their upstream wheel
+metadata. These package contracts are explicit because they require review.
+Add a port-local guest program under `tests` that exercises useful installed
+behavior and invalid input, declare it in recipe `tests`, then build the recipe
+with `--check` through the command above. See
+[native adapters](_support/native_adapters.md) and
+[Python backends](_support/PYTHON_BACKENDS.md) for their build fields.
+
+A profile records build choices. Building still requires the verified `--cohort`
+products and admitted host tools described below.
 
 Build dependencies run on the host. Platform dependencies supply the verified
 target SDK, while target dependencies supply linked libraries and headers.

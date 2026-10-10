@@ -1,21 +1,4 @@
 {
-  "target": "wasm32-wasip1-threads",
-  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
-  "build_dependencies": [
-    {
-      "port": "toolchain/llvm",
-      "version": "23.0.0",
-      "recipe": "toolchain/llvm/host-recipe.json"
-    }
-  ],
-  "platform_dependencies": [
-    {
-      "port": "toolchain/wasi_threads",
-      "version": "3",
-      "recipe": "toolchain/wasi_threads/graph-recipe.json"
-    }
-  ],
   "name": "make",
   "version": "4.4.1",
   "kind": "native-tool",
@@ -90,5 +73,6 @@
       "kind": "shell",
       "script": "tests/graph_make.sh"
     }
-  ]
+  ],
+  "build_profile": "wasi-threads-v3"
 }
