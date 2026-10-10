@@ -141,3 +141,11 @@ Dynamic loader proofs and their catalog builder live under
 `tests/fixtures/wasm/dynamic`. Their manifest records fixture inputs and artifacts
 separately from the production runtime. See that directory's README for opt-in
 SDK24/SDK34 guest acceptance and current loader frontiers.
+
+The threaded main recipe declares a 256 MiB linear-memory ceiling. This is
+separate from the total Environment memory budget, which also covers compiled
+modules, host loader state, thread stacks and exception heaps. Shared linear
+memory currently prepays its entire declared ceiling at process launch; the
+budget must exceed that ceiling plus runtime overhead even when the program
+uses little heap. Fresh links and verified relinks apply the same final policy.
+Changing this link ceiling preserves verified CPython compilation inputs.

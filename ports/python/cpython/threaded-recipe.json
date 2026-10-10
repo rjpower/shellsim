@@ -24,7 +24,7 @@
   "build_scripts": [
     {
       "file": "threaded.py",
-      "sha256": "71be3ef19c00eb336dc01b49af304ef0f07778f2235561cbbe6458174b1d5ce1"
+      "sha256": "d3f0082c6b86a844985d24d7ffa6628239559b3a821f86b700137c7e2fe6c817"
     },
     {
       "file": "sdk34-threads.patch",
@@ -130,5 +130,6 @@
       "file": "../../_support/wasm_metadata.py",
       "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     }
-  ]
+  ],
+  "maximum_memory_bytes": 268435456
 }

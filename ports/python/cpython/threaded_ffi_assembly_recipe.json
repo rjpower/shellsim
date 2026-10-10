@@ -14,7 +14,7 @@
     },
     {
       "file": "stdlib_ctypes_threaded_recipe.json",
-      "sha256": "760a2a2b73b4cf3018b90505e82de5c8d22b9f27736e8bd46af4049c1d1c56b0"
+      "sha256": "c1871ab71ab57d630c05c8a889fa560d67fde6961ed67ac66d33738695da854c"
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",

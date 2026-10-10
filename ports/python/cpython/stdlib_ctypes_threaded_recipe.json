@@ -98,7 +98,7 @@
     "count": 265,
     "sha256": "5bb3cc10faae40683fd66d1bf992c2a8b1f1228b4cf64f80b99df2e569bcdac5"
   },
-  "cpython_manifest_sha256": "b8ab13aa6eb07eefb40e319dedbb5b8a79783ccc8f39eb7e3bc911fa048f5737",
+  "cpython_manifest_sha256": "592fa85e2fbaaf47ffab162b8f63a5a89ebb49a1464cc3bacd69478685ab4914",
   "cpython_recipe_sha256": "775ea746f5153c9c188c4a8a4978b067c01f46e73b872734e399007184acb846",
-  "cpython_recipe_digest": "05ff8a04fffde59c6355122e30496198f3acced71fcff73f1c64bf01fccc9ace"
+  "cpython_recipe_digest": "3a7c739227b2952e6c36ce8ace1b7b0cd1b4bb136c770ad9dcce0c9cf781c089"
 }
