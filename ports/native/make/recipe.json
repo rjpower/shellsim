@@ -64,7 +64,8 @@
     "ports/toolchain/wasi_sdk/notices/wasi-libc-fts-musl-fts-COPYING": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046",
     "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0",
     "ports/toolchain/wasi_sdk/notices/wasi-libc-libc-top-half-musl-COPYRIGHT": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
-    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    "LICENSE": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "ports/toolchain/wasi_process/process_limits.h": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
   },
   "license_inputs": {
     "licenses/llvm-LICENSE.TXT": "ports/toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",
