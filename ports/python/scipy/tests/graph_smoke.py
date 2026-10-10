@@ -27,6 +27,11 @@ np.testing.assert_allclose(vectors @ triangular @ vectors.T, matrix, atol=1e-12)
 other = np.diag([4.0, 5.0])
 solution = linalg.solve_sylvester(matrix, other, np.eye(2))
 np.testing.assert_allclose(matrix @ solution + solution @ other, np.eye(2), atol=1e-12)
+linear = optimize.linprog([-1.0, -2.0], A_ub=[[1.0, 1.0]], b_ub=[3.0])
+assert linear.success
+np.testing.assert_allclose(linear.fun, -6.0, atol=1e-10)
+assert np.all(linear.x >= -1e-10)
+assert linear.x.sum() <= 3.0 + 1e-10
 minimum = optimize.minimize(
     lambda x: float(x @ x),
     np.array([2.0, -3.0]),

@@ -165,7 +165,8 @@
       "-Duse-pythran=false",
       "-Duse-g77-abi=true",
       "-Dblas=openblas",
-      "-Dlapack=openblas"
+      "-Dlapack=openblas",
+      "-Dcpp_args=-D_WASI_EMULATED_SIGNAL"
     ],
     "required_shared_libraries": [
       "libopenblas.so"
