@@ -19,6 +19,7 @@ pub(super) struct Layout {
     pub(super) functions: Vec<(String, u32)>,
     pub(super) element_functions: BTreeMap<u32, u32>,
     pub(super) relative_data: BTreeMap<String, u32>,
+    pub(super) forwarded_exports: BTreeSet<String>,
 }
 
 struct Cursor<'a>(&'a [u8]);
@@ -75,6 +76,8 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
     let mut active_elements = 0u32;
     let mut element_count = 0u32;
     let mut imported_globals = 0u32;
+    let mut imported_functions = 0u32;
+    let mut forwarded_exports = BTreeSet::new();
     let mut globals = Vec::new();
     let mut tls_size_index = None;
     let mut tls_align_index = None;
@@ -99,6 +102,11 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
             wasmparser::Payload::ImportSection(imports) => {
                 for import in imports.into_imports() {
                     let import = import?;
+                    if matches!(import.ty, wasmparser::TypeRef::Func(_)) {
+                        imported_functions = imported_functions
+                            .checked_add(1)
+                            .ok_or_else(|| Error::msg("function index overflow"))?;
+                    }
                     if matches!(import.ty, wasmparser::TypeRef::Global(_)) {
                         if import.module == "env" && import.name == "__table_base" {
                             table_base_global = Some(imported_globals);
@@ -187,6 +195,14 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
                     let export = export?;
                     if export.name.len() > 4096 {
                         return Err(Error::msg("oversized side export name"));
+                    }
+                    if (export.kind == wasmparser::ExternalKind::Func
+                        && export.index < imported_functions)
+                        || (export.kind == wasmparser::ExternalKind::Global
+                            && export.index < imported_globals)
+                    {
+                        forwarded_exports.insert(export.name.to_owned());
+                        continue;
                     }
                     if export.kind == wasmparser::ExternalKind::Func {
                         functions.push((export.name.to_owned(), export.index));
@@ -391,60 +407,306 @@ pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
         functions,
         element_functions,
         relative_data,
+        forwarded_exports,
     })
 }
 
-/// Read explicit executable TLS classifications; ordinary exports remain data.
-pub(in crate::commands::wasm) fn main_tls_exports(bytes: &[u8]) -> Result<BTreeSet<String>, Error> {
-    let mut exports = BTreeSet::new();
-    let mut declared = false;
+/// Bounded executable linkage metadata. Imported function and global reexports
+/// must never claim ownership of a symbol supplied by a dependency.
+#[derive(Default)]
+pub(in crate::commands::wasm) struct Executable {
+    pub(in crate::commands::wasm) tls_exports: BTreeSet<String>,
+    pub(in crate::commands::wasm) needed: Vec<String>,
+    pub(super) runtime_paths: Vec<String>,
+    pub(super) weak_imports: BTreeSet<(String, String)>,
+    pub(in crate::commands::wasm) forwarded_exports: BTreeSet<String>,
+    pub(super) start: Option<u32>,
+}
+
+pub(in crate::commands::wasm) const START_EXPORT: &str = "__shellsim_executable_start";
+
+/// Executables own their memory/table placement; only dependency and symbol
+/// metadata affect startup. Reject malformed metadata before guest execution.
+pub(in crate::commands::wasm) fn executable(bytes: &[u8]) -> Result<Executable, Error> {
+    let mut result = Executable::default();
+    let mut metadata = None;
+    let mut imported_functions = 0u32;
+    let mut imported_globals = 0u32;
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
-        if let wasmparser::Payload::CustomSection(section) = payload? {
-            if section.name() != "dylink.0" {
-                continue;
+        match payload? {
+            wasmparser::Payload::CustomSection(section) if section.name() == "dylink.0" => {
+                if metadata.is_some() || section.data().len() > 1024 * 1024 {
+                    return Err(Error::msg(
+                        "duplicate or oversized executable dylink metadata",
+                    ));
+                }
+                metadata = Some(section.data());
             }
-            let mut cursor = Cursor(section.data());
-            while !cursor.0.is_empty() {
-                let kind = cursor.take(1)?[0];
-                let length = cursor.number()? as usize;
-                let mut payload = Cursor(cursor.take(length)?);
-                if kind == 129 {
-                    if declared
-                        || payload.string()? != "shellsim.main-tls"
-                        || payload.number()? != 1
-                        || !payload.0.is_empty()
-                    {
-                        return Err(Error::msg("invalid main TLS classification protocol"));
-                    }
-                    declared = true;
-                } else if kind == 3 {
-                    let count = payload.number()?;
-                    for _ in 0..count {
-                        let name = payload.string()?;
-                        let flags = payload.number()?;
-                        if flags & !0x3ff != 0 {
-                            return Err(Error::msg("invalid main symbol flags"));
+            wasmparser::Payload::StartSection { func, .. } => result.start = Some(func),
+            wasmparser::Payload::ImportSection(imports) => {
+                for import in imports.into_imports() {
+                    match import?.ty {
+                        wasmparser::TypeRef::Func(_) => {
+                            imported_functions = imported_functions
+                                .checked_add(1)
+                                .ok_or_else(|| Error::msg("function index overflow"))?;
                         }
-                        if flags & 0x100 != 0 && !exports.insert(name) {
-                            return Err(Error::msg("duplicate main TLS export"));
+                        wasmparser::TypeRef::Global(_) => {
+                            imported_globals = imported_globals
+                                .checked_add(1)
+                                .ok_or_else(|| Error::msg("global index overflow"))?;
                         }
-                    }
-                    if !payload.0.is_empty() {
-                        return Err(Error::msg("invalid main TLS export payload"));
+                        _ => {}
                     }
                 }
             }
+            wasmparser::Payload::ExportSection(exports) => {
+                for export in exports {
+                    let export = export?;
+                    if export.name == START_EXPORT {
+                        return Err(Error::msg("reserved executable start export"));
+                    }
+                    if (export.kind == wasmparser::ExternalKind::Func
+                        && export.index < imported_functions)
+                        || (export.kind == wasmparser::ExternalKind::Global
+                            && export.index < imported_globals)
+                    {
+                        result.forwarded_exports.insert(export.name.to_owned());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut declared = false;
+    let mut seen = BTreeSet::new();
+    let mut cursor = Cursor(metadata.ok_or_else(|| Error::msg("missing executable dylink.0"))?);
+    while !cursor.0.is_empty() {
+        let kind = cursor.take(1)?[0];
+        let length = cursor.number()? as usize;
+        let mut payload = Cursor(cursor.take(length)?);
+        if !seen.insert(kind) {
+            return Err(Error::msg("duplicate executable dylink subsection"));
+        }
+        match kind {
+            129 => {
+                if payload.string()? != "shellsim.main-tls" || payload.number()? != 1 {
+                    return Err(Error::msg("invalid main TLS classification protocol"));
+                }
+                declared = true;
+            }
+            1 => {
+                let memory = payload.number()?;
+                let memory_align = payload.number()?;
+                let table = payload.number()?;
+                let table_align = payload.number()?;
+                if u64::from(memory) > MAX_MEMORY_PAGES * 65_536
+                    || memory_align > 16
+                    || table_align > 16
+                    || table as usize > MAX_TABLE_ELEMENTS
+                {
+                    return Err(Error::msg("executable dylink layout exceeds limits"));
+                }
+            }
+            2 | 5 => {
+                let count = payload.number()? as usize;
+                if count > MAX_MODULES {
+                    return Err(Error::msg("executable dependency/path limit exceeded"));
+                }
+                let values = if kind == 2 {
+                    &mut result.needed
+                } else {
+                    &mut result.runtime_paths
+                };
+                for _ in 0..count {
+                    let name = payload.string()?;
+                    if kind == 2
+                        && (name.contains('/')
+                            || name.contains('\\')
+                            || matches!(name.as_str(), "." | "..")
+                            || values.contains(&name))
+                    {
+                        return Err(Error::msg("invalid executable dependency"));
+                    }
+                    values.push(name);
+                }
+            }
+            3 | 4 => {
+                let count = payload.number()?;
+                if count > 65_536 {
+                    return Err(Error::msg("executable symbol limit exceeded"));
+                }
+                let mut symbols = BTreeSet::new();
+                for _ in 0..count {
+                    let namespace = if kind == 4 {
+                        payload.string()?
+                    } else {
+                        String::new()
+                    };
+                    let name = payload.string()?;
+                    let flags = payload.number()?;
+                    if flags & !0x3ff != 0 || !symbols.insert((namespace.clone(), name.clone())) {
+                        return Err(Error::msg("invalid executable symbol flags"));
+                    }
+                    if kind == 3 && flags & 0x100 != 0 {
+                        result.tls_exports.insert(name);
+                    } else if kind == 4 && flags & 3 == 1 {
+                        result.weak_imports.insert((namespace, name));
+                    }
+                }
+            }
+            _ => return Err(Error::msg("unsupported executable dylink subsection")),
+        }
+        if !payload.0.is_empty() {
+            return Err(Error::msg("invalid executable dylink metadata length"));
         }
     }
     if !declared {
         return Err(Error::msg("main TLS exports require a versioned protocol"));
     }
-    Ok(exports)
+    Ok(result)
+}
+
+/// Preserve the original start function as a private host-controlled export.
+/// Its memory initialization is called separately before guest malloc; its
+/// remaining relocations run only after strong imports and GOT addresses bind.
+pub(in crate::commands::wasm) fn defer_start(
+    bytes: &[u8],
+    main: &Executable,
+) -> Result<Vec<u8>, Error> {
+    fn leb(output: &mut Vec<u8>, mut value: u32) {
+        loop {
+            let byte = (value & 127) as u8;
+            value >>= 7;
+            output.push(byte | if value != 0 { 128 } else { 0 });
+            if value == 0 {
+                break;
+            }
+        }
+    }
+    let Some(start) = main.start else {
+        return Ok(bytes.to_vec());
+    };
+    let mut output = bytes[..8].to_vec();
+    let mut exported = false;
+    for payload in wasmparser::Parser::new(0).parse_all(bytes) {
+        let payload = payload?;
+        if matches!(payload, wasmparser::Payload::StartSection { .. }) {
+            continue;
+        }
+        let Some((id, range)) = payload.as_section() else {
+            continue;
+        };
+        let range = usize::try_from(range.start)?..usize::try_from(range.end)?;
+        if let wasmparser::Payload::ExportSection(exports) = payload {
+            exported = true;
+            let mut body = Vec::new();
+            leb(
+                &mut body,
+                exports
+                    .count()
+                    .checked_add(1)
+                    .ok_or_else(|| Error::msg("export count overflow"))?,
+            );
+            let mut cursor = Cursor(&bytes[range.clone()]);
+            cursor.number()?;
+            body.extend_from_slice(cursor.0);
+            leb(&mut body, START_EXPORT.len() as u32);
+            body.extend_from_slice(START_EXPORT.as_bytes());
+            body.push(0);
+            leb(&mut body, start);
+            output.push(id);
+            leb(&mut output, body.len() as u32);
+            output.extend(body);
+        } else {
+            output.push(id);
+            leb(&mut output, range.len() as u32);
+            output.extend_from_slice(&bytes[range]);
+        }
+    }
+    if !exported {
+        return Err(Error::msg(
+            "dynamic executable startup requires an export section",
+        ));
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn executable_metadata(body: &str, extra: &[u8]) -> Vec<u8> {
+        let mut module = wat::parse_str(format!("(module {body})")).unwrap();
+        let mut metadata = b"\x81\x13\x11shellsim.main-tls\x01".to_vec();
+        metadata.extend_from_slice(extra);
+        custom(&mut module, "dylink.0", &metadata);
+        module
+    }
+
+    #[test]
+    fn executable_ownership_excludes_function_and_global_import_reexports() {
+        let source = executable_metadata(
+            r#"
+            (import "env" "function" (func $function))
+            (import "GOT.mem" "data" (global $data (mut i32)))
+            (export "function_alias" (func $function))
+            (export "data_alias" (global $data))
+            (func (export "owned"))"#,
+            &[],
+        );
+        let layout = executable(&source).unwrap();
+        assert_eq!(
+            layout.forwarded_exports,
+            BTreeSet::from(["function_alias".to_owned(), "data_alias".to_owned()])
+        );
+    }
+
+    #[test]
+    fn executable_dependencies_reject_truncation_duplicates_and_excessive_counts() {
+        let needed = b"\x02\x09\x01\x07root.so";
+        assert_eq!(
+            executable(&executable_metadata("", needed)).unwrap().needed,
+            ["root.so"]
+        );
+        assert!(executable(&executable_metadata("", &needed[..needed.len() - 1])).is_err());
+        let mut duplicate = needed.to_vec();
+        duplicate.extend_from_slice(needed);
+        assert!(executable(&executable_metadata("", &duplicate)).is_err());
+        assert!(executable(&executable_metadata("", b"\x02\x03\x01\x01/")).is_err());
+        let count = leb(MAX_MODULES + 1);
+        let mut excessive = vec![2];
+        excessive.extend(leb(count.len()));
+        excessive.extend(count);
+        assert!(executable(&executable_metadata("", &excessive)).is_err());
+    }
+
+    #[test]
+    fn deferred_executable_start_is_exported_once_and_cannot_be_spoofed() {
+        let source = executable_metadata("(func $start (export \"_start\")) (start $start)", &[]);
+        let layout = executable(&source).unwrap();
+        let rewritten = defer_start(&source, &layout).unwrap();
+        let mut entry = None;
+        for payload in wasmparser::Parser::new(0).parse_all(&rewritten) {
+            match payload.unwrap() {
+                wasmparser::Payload::StartSection { .. } => panic!("start was not deferred"),
+                wasmparser::Payload::ExportSection(exports) => {
+                    for export in exports {
+                        let export = export.unwrap();
+                        if export.name == START_EXPORT {
+                            entry = Some(export.index);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(entry, layout.start);
+        let source = executable_metadata("(func $start) (start $start)", &[]);
+        assert!(defer_start(&source, &executable(&source).unwrap()).is_err());
+        let source = executable_metadata("(func (export \"__shellsim_executable_start\"))", &[]);
+        assert!(executable(&source).is_err());
+    }
 
     fn leb(mut value: usize) -> Vec<u8> {
         let mut bytes = Vec::new();

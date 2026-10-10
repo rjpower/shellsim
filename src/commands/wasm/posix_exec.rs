@@ -135,7 +135,8 @@ fn resolve(
         if size > MAX_WASM_BYTES {
             return Err(SyscallError::ExecutableFormat);
         }
-        let scratch = (size as u64).saturating_mul(65).saturating_add(4096);
+        // Main startup rewriting temporarily retains a second executable image.
+        let scratch = (size as u64).saturating_mul(66).saturating_add(4096);
         if !interp
             .resources
             .charge_cpu((size as u64).saturating_mul(10))
@@ -147,12 +148,15 @@ fn resolve(
             let bytes = interp.vfs.read_limited("/", &executable, MAX_WASM_BYTES)?;
             threads::reject_raw_waits(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
             let profile = threads::profile(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
-            let module =
-                compiled_command_module(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
+            let module = compiled_executable_module(&bytes, profile.as_ref())
+                .map_err(|_| SyscallError::ExecutableFormat)?;
             validate_imports(
                 &module,
                 profile.is_some(),
                 profile.as_ref().is_some_and(|profile| profile.dynamic),
+                profile
+                    .as_ref()
+                    .is_some_and(|profile| !profile.executable.needed.is_empty()),
             )
             .map_err(|_| SyscallError::ExecutableFormat)
         })();

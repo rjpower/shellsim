@@ -5,7 +5,7 @@
 
 use std::borrow::Cow;
 use std::sync::atomic::{AtomicU8, Ordering};
-use wasmtime::{Caller, Error, Memory, SharedMemory};
+use wasmtime::{AsContext, AsContextMut, Caller, Error, Memory, SharedMemory};
 
 use super::Host;
 
@@ -16,7 +16,7 @@ pub(super) enum GuestMemory {
 }
 
 impl GuestMemory {
-    pub(super) fn data_size(&self, caller: &Caller<'_, Host>) -> usize {
+    pub(super) fn data_size(&self, caller: &impl AsContext<Data = Host>) -> usize {
         match self {
             Self::Ordinary(memory) => memory.data_size(caller),
             Self::Shared(memory) => memory.data_size(),
@@ -25,7 +25,7 @@ impl GuestMemory {
 
     pub(super) fn range(
         &self,
-        caller: &Caller<'_, Host>,
+        caller: &impl AsContext<Data = Host>,
         start: usize,
         length: usize,
     ) -> Result<(), Error> {
@@ -58,7 +58,7 @@ impl GuestMemory {
 
     pub(super) fn write(
         &self,
-        caller: &mut Caller<'_, Host>,
+        caller: &mut impl AsContextMut<Data = Host>,
         start: usize,
         input: &[u8],
     ) -> Result<(), Error> {

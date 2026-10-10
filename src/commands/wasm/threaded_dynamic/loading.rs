@@ -7,7 +7,9 @@ use super::{
     layout, replay, reserve_store, Initialization, Preparation, Process, Record, MAX_MODULES,
     MAX_TABLE_ELEMENTS,
 };
-use crate::commands::wasm::{compiled_command_module, fibers, memory, threads, Host};
+use crate::commands::wasm::{
+    compiled_command_module, fibers, guest_memory::GuestMemory, threads, Host,
+};
 use crate::vfs::{resolve_against, NodeKind, Vfs, VfsError, PATH_MAX};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,7 +17,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use wasmtime::{AsContextMut, Caller, Error, Module};
+use wasmtime::{AsContext, AsContextMut, Error, Module, StoreContextMut};
 
 const MAX_SOURCE_BYTES: usize = 16 * 1024 * 1024;
 
@@ -41,7 +43,11 @@ struct Graph {
     visiting: BTreeSet<String>,
 }
 
-pub(super) fn reserve_process(caller: &Caller<'_, Host>, bytes: u64) -> Result<(), Error> {
+pub(super) fn reserve_process(
+    caller: &impl AsContext<Data = Host>,
+    bytes: u64,
+) -> Result<(), Error> {
+    let caller = caller.as_context();
     if !caller.data().machine.get().resources.reserve_memory(bytes) {
         return Err(super::super::exhausted());
     }
@@ -60,7 +66,7 @@ pub(super) fn reserve_process(caller: &Caller<'_, Host>, bytes: u64) -> Result<(
 }
 
 fn compile(
-    caller: &mut Caller<'_, Host>,
+    caller: &mut StoreContextMut<'_, Host>,
     path: &str,
     process: &Process,
 ) -> Result<(Module, layout::Layout, [u8; 32], u64), Error> {
@@ -214,7 +220,7 @@ fn dependency_path(
 impl Graph {
     fn discover(
         &mut self,
-        caller: &mut Caller<'_, Host>,
+        caller: &mut StoreContextMut<'_, Host>,
         path: String,
         process: &Process,
     ) -> Result<Reference, Error> {
@@ -352,7 +358,7 @@ fn align(value: u32, alignment: u32) -> Result<u32, Error> {
 }
 
 async fn allocate(
-    caller: &mut Caller<'_, Host>,
+    caller: &mut StoreContextMut<'_, Host>,
     pending: Pending,
     first_handle: u32,
     process: &Process,
@@ -385,7 +391,7 @@ async fn allocate(
         return Err(Error::msg("threaded guest allocation failed"));
     }
     let guest_memory =
-        memory(caller).ok_or_else(|| Error::msg("threaded process memory unavailable"))?;
+        GuestMemory::Shared(caller.data().thread.as_ref().expect("thread host").memory());
     guest_memory.range(&*caller, pointer as usize, total as usize)?;
     if !caller
         .data()
@@ -465,7 +471,7 @@ async fn allocate(
 }
 
 pub(super) async fn load(
-    caller: &mut Caller<'_, Host>,
+    caller: &mut StoreContextMut<'_, Host>,
     path: String,
     flags: u32,
 ) -> Result<u32, Error> {
@@ -533,7 +539,7 @@ pub(super) async fn load(
     let mut initialization: Initialization = process.begin_admitted(thread.id(), records.len())?;
     initialization.started();
     for record in &records {
-        replay::install(caller.as_context_mut(), record.clone(), true).await?;
+        replay::install(caller.as_context_mut(), record.clone(), true, false).await?;
     }
     let handles = initialization.publish(records)?;
     caller.data_mut().threaded_dynamic.generation = process.generation().0;
@@ -541,6 +547,82 @@ pub(super) async fn load(
         unreachable!()
     };
     Ok(handles[index])
+}
+
+/// Eagerly instantiate executable dependencies without running constructors.
+/// Workers reuse published process allocations and create only Store handles.
+pub(super) async fn startup(
+    mut store: StoreContextMut<'_, Host>,
+    path: &str,
+) -> Result<Option<(Initialization, Vec<Arc<Record>>)>, Error> {
+    let thread = store.data().thread.as_ref().expect("thread host").clone();
+    let process = thread.dynamic_process();
+    if thread.id() != 0 {
+        let count = process
+            .0
+            .lock()
+            .expect("threaded dynamic registry")
+            .startup_modules;
+        let all = process.generation().1 as u64;
+        if !store
+            .data()
+            .machine
+            .get()
+            .resources
+            .charge_cpu(all.saturating_mul(128))
+        {
+            return Err(super::super::exhausted());
+        }
+        reserve_store(&mut store, all.saturating_mul(32))?;
+        let (_, records) = process.snapshot();
+        for record in records.into_iter().take(count) {
+            replay::install(store.as_context_mut(), record, false, true).await?;
+        }
+        store.data_mut().threaded_dynamic.executable.roots = process
+            .0
+            .lock()
+            .expect("threaded dynamic registry")
+            .startup_roots
+            .clone();
+        return Ok(None);
+    }
+    reserve_store(&mut store, MAX_MODULES as u64 * 512)?;
+    let mut graph = Graph::default();
+    let mut roots = Vec::with_capacity(thread.executable.needed.len());
+    for name in &thread.executable.needed {
+        let search_cost = (thread.executable.runtime_paths.len() as u64 + 1)
+            .saturating_mul(PATH_MAX as u64)
+            .saturating_mul(16);
+        if !store.data().machine.get().resources.charge_cpu(search_cost) {
+            return Err(super::super::exhausted());
+        }
+        let dependency = dependency_path(
+            &store.data().machine.get().vfs,
+            path,
+            &thread.executable.runtime_paths,
+            name,
+        )?;
+        roots.push(graph.discover(&mut store, dependency, &process)?);
+    }
+    let first_handle = process.generation().1 as u32 + 1;
+    let roots = roots
+        .into_iter()
+        .map(|reference| match reference {
+            Reference::Existing(handle) => handle,
+            Reference::Prepared(index) => first_handle + index as u32,
+        })
+        .collect();
+    let mut records = Vec::with_capacity(graph.nodes.len());
+    for pending in graph.nodes {
+        records.push(allocate(&mut store, pending, first_handle, &process, true).await?);
+    }
+    let mut initialization = process.begin_admitted(thread.id(), records.len())?;
+    initialization.started();
+    for record in &records {
+        replay::install(store.as_context_mut(), record.clone(), true, true).await?;
+    }
+    store.data_mut().threaded_dynamic.executable.roots = roots;
+    Ok(Some((initialization, records)))
 }
 
 #[cfg(test)]
