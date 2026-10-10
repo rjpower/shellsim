@@ -1,0 +1,55 @@
+--- a/libc-top-half/CMakeLists.txt
++++ b/libc-top-half/CMakeLists.txt
+@@ -452,6 +452,7 @@
+   # pthreads functions needed for actual thread support
+   list(APPEND top_half_sources
+     musl/src/thread/wasi-threads/futex.c
++    musl/src/thread/wasi-threads/pthread_atfork.c
+     musl/src/thread/wasi-threads/pthread_create.c
+     musl/src/thread/wasi-threads/pthread_detach.c
+     musl/src/thread/wasi-threads/pthread_join.c
+--- a/libc-top-half/musl/src/thread/wasi-threads/pthread_atfork.c
++++ b/libc-top-half/musl/src/thread/wasi-threads/pthread_atfork.c
+@@ -15,14 +15,14 @@
+ 	struct atfork_funcs *prev, *next;
+ } *funcs;
+ 
+-static volatile int lock[1];
++DECLARE_STRONG_LOCK(lock, static);
+ 
+ void __fork_handler(int who)
+ {
+ 	struct atfork_funcs *p;
+ 	if (!funcs) return;
+ 	if (who < 0) {
+-		LOCK(lock);
++		STRONG_LOCK(lock);
+ 		for (p=funcs; p; p = p->next) {
+ 			if (p->prepare) p->prepare();
+ 			funcs = p;
+@@ -33,7 +33,7 @@
+ 			else if (who && p->child) p->child();
+ 			funcs = p;
+ 		}
+-		UNLOCK(lock);
++		STRONG_UNLOCK(lock);
+ 	}
+ }
+ 
+@@ -42,7 +42,7 @@
+ 	struct atfork_funcs *new = malloc(sizeof *new);
+ 	if (!new) return ENOMEM;
+ 
+-	LOCK(lock);
++	STRONG_LOCK(lock);
+ 	new->next = funcs;
+ 	new->prev = 0;
+ 	new->prepare = prepare;
+@@ -50,6 +50,6 @@
+ 	new->child = child;
+ 	if (funcs) funcs->prev = new;
+ 	funcs = new;
+-	UNLOCK(lock);
++	STRONG_UNLOCK(lock);
+ 	return 0;
+ }

@@ -37,6 +37,14 @@
       "inputs": {
         "libc-top-half/musl/src/env/__init_tls.c": "f24609e8b7d89b33e20ab5e958023e0f387b2fee6651755d9109a8da0f16d531"
       }
+    },
+    {
+      "file": "wasi-libc-atfork.patch",
+      "sha256": "eef3f8890d86e3c54616abd31596e72e2217cc19e086ac99468bd91afe2362e1",
+      "inputs": {
+        "libc-top-half/CMakeLists.txt": "0b735a55934d3d9551b6ada33c2d356043c2f9f57a40e5fd14ff5cc34f3ae44c",
+        "libc-top-half/musl/src/thread/wasi-threads/pthread_atfork.c": "fd25a7f7ddbe5e5de3439d31b01c3d4f8e9b8bd7a844d2c55ca8280bb22962b8"
+      }
     }
   ],
   "build_limits": {
@@ -80,6 +88,10 @@
     {
       "file": "../llvm/compiler.py",
       "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+    },
+    {
+      "file": "wasi-libc-atfork.patch",
+      "sha256": "eef3f8890d86e3c54616abd31596e72e2217cc19e086ac99468bd91afe2362e1"
     }
   ],
   "sdk_tooling_digest": "4021ef510fac1bf69abb1aca413fb58f066e6b2698a1aaf80b8dcab0a58a29db"

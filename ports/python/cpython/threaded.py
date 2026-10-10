@@ -109,6 +109,16 @@ def run(command, cwd, environment, log):
         )
 
 
+def libc_symbol_exports(sdk, libc, environment):
+    """Retain every public libc definition in the canonical main executable."""
+    definitions = subprocess.check_output(
+        [str(sdk / "bin/llvm-nm"), "--defined-only", "--extern-only", "--format=posix", str(libc)],
+        env=environment,
+        text=True,
+    )
+    return sorted({line.split()[0] for line in definitions.splitlines() if len(line.split()) >= 2})
+
+
 def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix, work, environment):
     """Reuse only a sealed compile receipt; publish a distinct relinked runtime."""
     manifest_path = previous / "manifest.json"
@@ -165,6 +175,15 @@ def relink(previous, recipe, overlay, compiler, sdk, sysroot_prefix, llvm_prefix
         elif argument.startswith(str(previous) + "/"):
             argument = str(work) + argument[len(str(previous)) :]
         link.append(argument)
+    # A newly admitted platform can add public libc APIs without changing headers.
+    # Refresh retention on relink rather than replaying only the old archive's symbols.
+    libc = sysroot_prefix / "sysroot/lib/wasm32-wasip1-threads/libc.a"
+    retained = set(link)
+    link.extend(
+        flag
+        for name in libc_symbol_exports(sdk, libc, environment)
+        if (flag := "-Wl,--undefined=" + name) not in retained
+    )
     python = work / "python3.wasm"
     run(link, work / "wasi-build", environment, work / "link.log")
     metadata = main_tls_metadata(python)
@@ -356,12 +375,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
     archives = [runtime / "eh" / name for name in ("libc++.a", "libc++abi.a", "libunwind.a")]
     archives.extend(runtime / name for name in ("libsetjmp.a", "libc-printscan-long-double.a"))
     libc = runtime / "libc.a"
-    definitions = subprocess.check_output(
-        [str(sdk / "bin/llvm-nm"), "--defined-only", "--extern-only", "--format=posix", str(libc)],
-        env=environment,
-        text=True,
-    )
-    names = sorted({line.split()[0] for line in definitions.splitlines() if len(line.split()) >= 2})
+    names = libc_symbol_exports(sdk, libc, environment)
     python = work / "python3.wasm"
     link.extend(
         [

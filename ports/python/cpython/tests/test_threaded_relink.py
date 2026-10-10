@@ -48,3 +48,12 @@ def test_corrected_platform_threads_errno_and_subprocess(guest_factory):
     assert result.stdout == b"threaded CPython: parent/worker errno and subprocess passed\n"
     assert result.stderr == b""
     guest.assert_interpreter_unchanged()
+
+
+def test_real_atfork_registry_order_and_spawn_separation(guest_factory):
+    guest = guest_factory(bundle_env="SHELLSIM_RELINKED_CPYTHON_BUNDLE", cpu=10_000_000_000)
+    result = guest.run_script(Path(__file__).parent / "probes/threaded_atfork.py")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"threaded CPython: real atfork registry ordering and spawn separation passed\n"
+    assert result.stderr == b""
+    guest.assert_interpreter_unchanged()
