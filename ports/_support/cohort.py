@@ -16,6 +16,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
+from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, host_executable_flags
 from ports.toolchain.wasi_threads.dynamic import verify_sdk
 
 TARGET = "wasm32-wasip1-threads"
@@ -153,17 +154,7 @@ class BuildCohort:
     def compiler_flags(self) -> tuple[str, ...]:
         if not self.has_frontend:
             raise ValueError("native builds require the standard patched Clang frontend")
-        return (
-            *self.flags,
-            "-fPIC",
-            "-fwasm-exceptions",
-            "-mllvm",
-            "-wasm-enable-wasi-dynamic-tls",
-            "-mllvm",
-            "-wasm-enable-sjlj",
-            "-mllvm",
-            "-wasm-use-legacy-eh=false",
-        )
+        return (*self.flags, *COMMON_COMPILER_FLAGS)
 
     @property
     def linker_flags(self) -> tuple[str, ...]:
@@ -177,11 +168,7 @@ class BuildCohort:
     @property
     def executable_flags(self) -> tuple[str, ...]:
         """Process-owned memory and TLS exports for threaded guest executables."""
-        return (
-            "-Wl,--import-memory,--export-memory,--initial-memory=16777216,--max-memory=67108864",
-            "-Wl,--export-all,--export-table,--growable-table,--export=__stack_pointer,--export=__tls_base",
-            "-Wl,--emit-main-tls-info,--undefined=pthread_create",
-        )
+        return host_executable_flags(self.sysroot.root / "sysroot", TARGET)
 
     @property
     def shared_library_flags(self) -> tuple[str, ...]:

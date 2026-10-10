@@ -13,7 +13,7 @@
     "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
     "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f"
   },
-  "compiler_recipe_sha256": "52abf2b278919009a9c69bf44f3d195e35104f15ab2a35506ff454e736c1d6cb",
+  "compiler_recipe_sha256": "d0d2fb1a8a677ca5972b2945e2b4dd18973d0fb2d565b8a8a4b0b25db4ee41bc",
   "patches": [
     {
       "file": "wasi-libc-scheduler-v2.patch",

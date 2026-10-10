@@ -26,7 +26,7 @@
   "build_scripts": [
     {
       "file": "guest.py",
-      "sha256": "2f2f7e1302de1dc84bbb5f88ef2d7fe5119dbaf92421630c354c1981ab674ed1"
+      "sha256": "e61b531e7654d0982040a5e7845a2a13dcc7b5534d2cf76164317de2b34d0861"
     },
     {
       "file": "build.py",
@@ -43,6 +43,18 @@
     {
       "file": "image-synthetic-ownership.patch",
       "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231"
+    },
+    {
+      "file": "runtime-ctors.patch",
+      "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10"
+    },
+    {
+      "file": "guest-runtime-profile.patch",
+      "sha256": "c4edba4222e5133bed47720df897bf8199de8ceed7f31ff7cfff435eb1e07fcf"
+    },
+    {
+      "file": "../runtime_profile.py",
+      "sha256": "8dd4a55f317408d7f0ddc373ce26d14e7580d34bdd52d1ac55e54c603af7730b"
     }
   ],
   "name": "clang",
@@ -124,6 +136,23 @@
       "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
       "inputs": {
         "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
+      }
+    },
+    {
+      "file": "runtime-ctors.patch",
+      "sha256": "b69d77ba8b688d806ae23912d7afe597cbfa8431ab8a71d13d50254507583a10",
+      "inputs": {
+        "lld/wasm/Config.h": "ed372be1e01c7b6da82b8ba6a23736469fa1c674ea47368f1024aa2f6c925ec0",
+        "lld/wasm/Options.td": "eeaab5b15bee6337c92cc532f9676f6fbffed0bd7b9f8355d2bc77bc34caf80f",
+        "lld/wasm/Driver.cpp": "300fa30ffb7c6f1bd58885ffd6df8a57f390f908942abe72fde827495db70802",
+        "lld/wasm/Writer.cpp": "074ed90ec1b2cf59df617fe34c182e0a927aa9389af9452e29291c72a3bbcf55"
+      }
+    },
+    {
+      "file": "guest-runtime-profile.patch",
+      "sha256": "c4edba4222e5133bed47720df897bf8199de8ceed7f31ff7cfff435eb1e07fcf",
+      "inputs": {
+        "clang/lib/Driver/ToolChains/WebAssembly.cpp": "3994a5c6c59d728f5cf0bed2af10e0484e491656b077bffd72d0612faea7a1f9"
       }
     }
   ],

@@ -26,6 +26,7 @@ from ports.toolchain.llvm.compiler import (
     verify_source,
     write_workspace,
 )
+from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, PROFILE_NAME, guest_runtime_profile
 
 PORT = Path(__file__).resolve().parent
 TARGETS = ("clang", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy")
@@ -629,23 +630,19 @@ def _install_commands(build, destination, source, strip, attempts):
         output = destination / "bin" / alias
         output.write_text(f'#!/bin/sh\nexec /usr/bin/{command} "$@"\n')
         output.chmod(0o755)
-    flags = """--target=wasm32-wasip1-threads
--pthread
---sysroot=/usr/local/wasi-sysroot
--resource-dir=/usr/local/lib/clang/23
--fuse-ld=/usr/bin/wasm-ld
--fwasm-exceptions
--mllvm
--wasm-use-legacy-eh=false
--lunwind
--Wl,/usr/local/wasi-sysroot/lib/wasm32-wasip1-threads/shellsim-abi.o
--Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory
--Wl,--initial-memory=16777216,--max-memory=67108864
--Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base
--Wl,--export-table,--growable-table,--export=__tls_size,--export=__tls_align
--Wl,--export=__wasm_init_tls,--export=wasi_thread_start,--undefined=pthread_create
--Wl,--export-if-defined=__wasm_apply_global_tls_relocs
-"""
+    flags = (
+        "\n".join(
+            (
+                "--target=wasm32-wasip1-threads",
+                "-pthread",
+                "--sysroot=/usr/local/wasi-sysroot",
+                "-resource-dir=/usr/local/lib/clang/23",
+                "-fuse-ld=/usr/bin/wasm-ld",
+                *COMMON_COMPILER_FLAGS,
+            )
+        )
+        + "\n"
+    )
     for name in ("clang.cfg", "clang++.cfg"):
         (destination / "bin" / name).write_text(flags)
     shutil.copyfile(source / "LICENSE.TXT", destination / "licenses/LLVM-LICENSE.txt")
@@ -658,6 +655,9 @@ def install_guest_sdk(context, recipe):
     destination.mkdir(parents=True, exist_ok=True)
     for name in ("include/c++", "include/wasm32-wasip1-threads", "lib/wasm32-wasip1-threads"):
         shutil.copytree(context.sysroot / name, destination / "wasi-sysroot" / name, symlinks=False)
+    profile = guest_runtime_profile(context.sysroot, context.target)
+    profile_path = destination / "wasi-sysroot/lib" / context.target / PROFILE_NAME
+    profile_path.write_text(json.dumps(profile, sort_keys=True, indent=2) + "\n")
     resources = context.sdk / "lib/clang/23"
     for name in ("include", "lib/wasm32-unknown-wasip1-threads", "lib/wasm32-unknown-wasi-threads"):
         shutil.copytree(resources / name, destination / "lib/clang/23" / name, symlinks=False)

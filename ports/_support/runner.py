@@ -46,6 +46,7 @@ _NATIVE_BUILD_MODULES = (
     "wasm.py",
     "wasm_metadata.py",
     "native/dependencies.py",
+    "toolchain/runtime_profile.py",
 )
 _PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
 

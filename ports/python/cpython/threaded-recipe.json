@@ -8,7 +8,7 @@
     "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
     "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
   },
-  "sysroot_recipe_sha256": "3e67eaf7ce80b5e171ed0904de973afe0dcae1cccb63bc2b28065dd3aebd3c63",
+  "sysroot_recipe_sha256": "4e3c60b59933b90e4e7b943bc9ae17050774189a6e91573a75d60744efa2fa32",
   "patches": [
     {
       "file": "sdk34-threads.patch",
@@ -60,7 +60,7 @@
     },
     {
       "file": "../../toolchain/llvm/threaded-recipe.json",
-      "sha256": "52abf2b278919009a9c69bf44f3d195e35104f15ab2a35506ff454e736c1d6cb"
+      "sha256": "d0d2fb1a8a677ca5972b2945e2b4dd18973d0fb2d565b8a8a4b0b25db4ee41bc"
     },
     {
       "file": "../../toolchain/wasi_process/build.py",

@@ -162,6 +162,13 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     bootstrap_compiler = product("bootstrap-compiler", "e")
     bootstrap_platform = product("bootstrap-platform", "f")
     monkeypatch.setattr(cohort_module, "local_recipe", lambda _name: recipe)
+    # This receipt-resolution fixture uses synthetic compiler/platform bytes;
+    # real archive selection is covered by the runtime-profile link tests.
+    monkeypatch.setattr(
+        cohort_module,
+        "host_executable_flags",
+        lambda sysroot, target: (str(sysroot / "lib" / target / "libc.a"),),
+    )
     resolved = resolved_toolchain(original, bootstrap_compiler, bootstrap_platform)
     target = runner._native_target(resolved)
     assert target.toolchain["compiler"] == bootstrap_compiler.sha256

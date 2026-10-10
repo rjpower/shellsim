@@ -1,0 +1,160 @@
+--- a/clang/lib/Driver/ToolChains/WebAssembly.cpp
++++ b/clang/lib/Driver/ToolChains/WebAssembly.cpp
+@@ -17,6 +17,7 @@
+ #include "llvm/Option/ArgList.h"
+ #include "llvm/Support/FileSystem.h"
+ #include "llvm/Support/Path.h"
++#include "llvm/Support/JSON.h"
+ #include "llvm/Support/VirtualFileSystem.h"
+ 
+ using namespace clang::driver;
+@@ -102,6 +103,93 @@
+          !WantsCooperativeMultithreading(Triple, Args);
+ }
+ 
++// SDK presence is an explicit opt-in; unrelated WASI sysroots retain the
++// upstream driver policy. Data is bounded before JSON parsing and paths remain
++// inside the selected sysroot. The sealed SDK pins this profile's exact bytes.
++static std::optional<llvm::json::Object>
++ReadShellsimRuntimeProfile(const ToolChain &TC, const ArgList &Args) {
++  const auto &Triple = TC.getTriple();
++  if (Triple.isArch64Bit() || !Triple.isOSWASI() ||
++      TargetBuildsComponents(Triple) || !WantsSharedMemory(Triple, Args))
++    return std::nullopt;
++  SmallString<256> Path(TC.getDriver().SysRoot);
++  llvm::sys::path::append(Path, "lib", "wasm32-wasip1-threads",
++                         "shellsim-executable-runtime-v1.json");
++  auto &VFS = TC.getDriver().getVFS();
++  if (!VFS.exists(Path))
++    return std::nullopt;
++  auto Invalid = [&]() {
++    TC.getDriver().Diag(diag::err_drv_invalid_argument_to_option)
++        << "invalid or oversized Shellsim SDK runtime profile" << Path;
++  };
++  auto Status = VFS.status(Path);
++  if (!Status || Status->getSize() > 262144) {
++    Invalid();
++    return std::nullopt;
++  }
++  auto Buffer = VFS.getBufferForFile(Path);
++  if (!Buffer || (*Buffer)->getBufferSize() > 262144) {
++    Invalid();
++    return std::nullopt;
++  }
++  auto Parsed = llvm::json::parse((*Buffer)->getBuffer());
++  if (!Parsed) {
++    llvm::consumeError(Parsed.takeError());
++    Invalid();
++    return std::nullopt;
++  }
++  auto *Object = Parsed->getAsObject();
++  if (!Object || Object->getInteger("version") != 1) {
++    Invalid();
++    return std::nullopt;
++  }
++  for (StringRef Kind : {"main", "shared"}) {
++    auto *Arguments = Object->getArray(Kind);
++    if (!Arguments || Arguments->size() > 16384) {
++      Invalid();
++      return std::nullopt;
++    }
++    for (const auto &Value : *Arguments) {
++      auto Argument = Value.getAsString();
++      if (!Argument || Argument->empty() || Argument->size() > 4096 ||
++          Argument->contains('\0')) {
++        Invalid();
++        return std::nullopt;
++      }
++      if (Argument->starts_with("@SYSROOT@/")) {
++        auto Relative = Argument->drop_front(10);
++        SmallVector<StringRef, 8> Components;
++        Relative.split(Components, '/');
++        if (llvm::any_of(Components, [](StringRef C) {
++              return C.empty() || C == "." || C == "..";
++            })) {
++          Invalid();
++          return std::nullopt;
++        }
++      } else if (!Argument->starts_with("-") || Argument->contains("@SYSROOT@")) {
++        Invalid();
++        return std::nullopt;
++      }
++    }
++  }
++  return std::move(*Object);
++}
++
++static void AddShellsimRuntimeProfile(const llvm::json::Object &Profile,
++                                     StringRef Kind, const ToolChain &TC,
++                                     const ArgList &Args, ArgStringList &CmdArgs) {
++  for (const auto &Value : *Profile.getArray(Kind)) {
++    StringRef Argument = *Value.getAsString();
++    if (Argument.starts_with("@SYSROOT@/")) {
++      SmallString<256> Path(TC.getDriver().SysRoot);
++      llvm::sys::path::append(Path, Argument.drop_front(10));
++      CmdArgs.push_back(Args.MakeArgString(Path));
++    } else {
++      CmdArgs.push_back(Args.MakeArgString(Argument));
++    }
++  }
++}
++
+ void wasm::Linker::ConstructJob(Compilation &C, const JobAction &JA,
+                                 const InputInfo &Output,
+                                 const InputInfoList &Inputs,
+@@ -135,6 +223,9 @@
+ 
+   ToolChain.AddFilePathLibArgs(Args, CmdArgs);
+ 
++  auto ShellsimProfile = ReadShellsimRuntimeProfile(ToolChain, Args);
++  bool ShellsimShared = ShellsimProfile && Args.hasArg(options::OPT_shared) &&
++                        !Args.hasArg(options::OPT_r);
+   bool IsCommand = true;
+   const char *Crt1;
+   const char *Entry = nullptr;
+@@ -171,9 +262,9 @@
+     Entry = "_initialize";
+   }
+ 
+-  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles))
++  if (!ShellsimShared && !Args.hasArg(options::OPT_nostdlib, options::OPT_nostartfiles))
+     CmdArgs.push_back(Args.MakeArgString(ToolChain.GetFilePath(Crt1)));
+-  if (Entry) {
++  if (Entry && !ShellsimShared) {
+     CmdArgs.push_back(Args.MakeArgString("--entry"));
+     CmdArgs.push_back(Args.MakeArgString(Entry));
+   }
+@@ -181,6 +272,14 @@
+   if (Args.hasArg(options::OPT_shared))
+     CmdArgs.push_back(Args.MakeArgString("-shared"));
+ 
++  if (ShellsimShared) {
++    AddShellsimRuntimeProfile(*ShellsimProfile, "shared", ToolChain, Args, CmdArgs);
++  } else if (ShellsimProfile && IsCommand &&
++             !Args.hasArg(options::OPT_r, options::OPT_nostdlib,
++                          options::OPT_nodefaultlibs, options::OPT_nostartfiles)) {
++    AddShellsimRuntimeProfile(*ShellsimProfile, "main", ToolChain, Args, CmdArgs);
++  }
++
+   AddLinkerInputs(ToolChain, Inputs, Args, CmdArgs, JA);
+ 
+   if (WantsCooperativeMultithreading(ToolChain.getTriple(), Args))
+@@ -189,7 +288,7 @@
+   if (WantsSharedMemory(ToolChain.getTriple(), Args))
+     CmdArgs.push_back("--shared-memory");
+ 
+-  if (!Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
++  if (!ShellsimShared && !Args.hasArg(options::OPT_nostdlib, options::OPT_nodefaultlibs)) {
+     if (ToolChain.ShouldLinkCXXStdlib(Args))
+       ToolChain.AddCXXStdlibLibArgs(Args, CmdArgs);
+ 
+@@ -199,6 +298,9 @@
+     CmdArgs.push_back("-lc");
+     AddRunTimeLibs(ToolChain, ToolChain.getDriver(), CmdArgs, Args);
+   }
++
++  if (ShellsimShared)
++    AddRunTimeLibs(ToolChain, ToolChain.getDriver(), CmdArgs, Args);
+ 
+   ToolChain.addProfileRTLibs(Args, CmdArgs);
+ 

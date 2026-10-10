@@ -89,3 +89,32 @@ exported by a linked shared library cannot supply the main executable's heap or
 first-page boundary; explicit definitions in the current object's inputs still
 take precedence. The host linker ownership correction also needs to be applied
 to the guest linker before guest compilation against shared providers is admitted.
+
+## Canonical executable runtime
+
+Native main links retain one admitted C/C++ runtime. The shared runtime-profile
+generator selects the public libc definitions from its GNU archive index and
+retains the EH, setjmp and long-double archives before ordinary link inputs.
+Shared libraries import process state instead of retaining their own libc.
+Executable archive inputs also apply to configure-time executable probes.
+
+Installed guest Clang selects this policy from the versioned
+`lib/wasm32-wasip1-threads/shellsim-executable-runtime-v1.json` in its selected
+SDK. The driver bounds and validates the profile before replacing `@SYSROOT@`
+archive prefixes. The opt-in applies only to wasm32 WASI preview1 shared-memory
+links. Compilation and preprocessing do not insert linker inputs. Shared links
+omit CRT/default runtime inputs; relocatable and explicitly suppressed-runtime
+main links retain the upstream policy.
+
+The canonical main profile requests `--split-runtime-ctors`. This explicitly
+opts into the pinned implementation's constructor-priority convention: priorities
+through 100 initialize libc and libc++ before side constructors; higher
+priorities remain application constructors. The linker exports
+`__wasm_call_runtime_ctors`, and ordinary `__wasm_call_ctors` calls this guarded
+bootstrap before application constructors. The guard lives in process linear
+memory, so worker instantiation cannot reset it. Completed initialization is
+idempotent; recursive or concurrent initialization traps under the required
+serialized startup contract. The loader binds imports and applies data
+relocations before calling the hook, then runs side constructors before the
+main command starts. Static mains without this opt-in keep their existing
+constructor sequence.
