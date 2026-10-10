@@ -83,7 +83,7 @@ thread support remain enabled. Internal LAPACK, FFT and random modules remain bu
 used only by free-threaded CPython. It preserves upstream shared-module builds.
 
 Meson's install plan supplies package files and qualified extension names.
-Generated NumPy headers, libnpymath and pkg-config exports are sealed as the
+Generated NumPy headers, libnpymath, libnpyrandom and pkg-config exports are sealed as the
 `python/numpy` development dependency for downstream SciPy. Upstream package
 metadata and dependency constraints remain intact.
 

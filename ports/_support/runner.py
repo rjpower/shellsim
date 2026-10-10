@@ -34,7 +34,6 @@ _COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "cohort.py", "loca
 _NATIVE_BUILD_MODULES = (
     "native_adapters.py",
     "native_artifacts.py",
-    "meson_workspace.py",
     "wasm.py",
     "wasm_metadata.py",
     "native/dependencies.py",
@@ -152,6 +151,12 @@ def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
             modules.append("python_meson.py")
     else:
         modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
+    if adapter in {"meson", "python-meson"}:
+        modules.extend(("meson_adapter.py", "meson_workspace.py"))
+    elif adapter == "cmake":
+        modules.append("cmake_adapter.py")
+    elif adapter in {"configure-make", "plain-make"}:
+        modules.append("make_adapter.py")
     return {
         name: file_hash(support.parent / name if name.startswith(("native/", "toolchain/")) else support / name)
         for name in modules

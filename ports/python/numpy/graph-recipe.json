@@ -77,6 +77,10 @@
       {
         "source": "numpy/f2py/src",
         "destination": "python/numpy/f2py/src"
+      },
+      {
+        "source": "numpy/random/lib/libnpyrandom.a",
+        "destination": "lib/libnpyrandom.a"
       }
     ]
   },
@@ -92,7 +96,8 @@
   },
   "exports": {
     "archives": [
-      "lib/libnpymath.a"
+      "lib/libnpymath.a",
+      "lib/libnpyrandom.a"
     ],
     "pkg_config": [
       "lib/pkgconfig/numpy.pc"

@@ -193,8 +193,10 @@ without deleting it. Recipes with mutable hooks cannot use this mode.
 Jobs, install tags, licenses and development-export selections remain packaging
 inputs rather than compilation-workspace inputs. The runner still keys and
 verifies every immutable result with the full recipe, implementation and cohort.
-A packaging change reconfigures Meson, runs Ninja's selected install targets and
-writes a fresh install and wheel directory. Ninja retains unchanged objects.
+A packaging change reuses the verified Meson configuration, runs Ninja's selected
+install targets and writes a fresh install and wheel directory. Unchanged
+compiler wrappers and machine files retain their timestamps so Ninja does not
+reconfigure or rebuild generated headers.
 Result-cache hits, workspace decisions and phase timings are printed to stderr.
 
 Host f2py is an optional explicit binding in both Meson cross and native files.

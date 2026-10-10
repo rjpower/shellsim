@@ -23,11 +23,14 @@ def meson_project(tmp_path):
     source.mkdir()
     (source / "meson.build").write_text(
         "project('retained', 'c')\n"
-        "static_library('value', 'value.c', install: true)\n"
+        "run_command(find_program('python', native: true), '-c', "
+        "'import pathlib, sys; pathlib.Path(sys.argv[1]).write_text(\"enum { VALUE=19 };\")', "
+        "meson.current_build_dir() / 'generated.h', check: true)\n"
+        "static_library('value', 'value.c', include_directories: include_directories('.'), install: true)\n"
         "install_data('one.txt', install_dir: 'share/value', install_tag: 'one')\n"
         "install_data('two.txt', install_dir: 'share/value', install_tag: 'two')\n"
     )
-    (source / "value.c").write_text("int value(void) { return 19; }\n")
+    (source / "value.c").write_text('#include "generated.h"\nint value(void) { return VALUE; }\n')
     (source / "one.txt").write_text("first packaging selection")
     (source / "two.txt").write_text("second packaging selection")
     dependencies = tmp_path / "deps"

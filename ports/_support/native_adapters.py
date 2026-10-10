@@ -11,6 +11,12 @@ from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 
+def write_build_file(path: Path, contents: str) -> None:
+    """Preserve unchanged generated inputs so Ninja does not reconfigure."""
+    if not path.exists() or path.read_text() != contents:
+        path.write_text(contents)
+
+
 class NativeAdapter(Enum):
     CMAKE = "cmake"
     MESON = "meson"
@@ -70,17 +76,6 @@ class NativeBuildOutput:
     staging_prefix: Path
     commands: tuple[NativeBuildCommand, ...]
     install_prefix: PurePosixPath
-
-
-def _cmake_literal(value: str) -> str:
-    delimiter = "="
-    while "]" + delimiter + "]" in value:
-        delimiter += "="
-    return "[" + delimiter + "[" + value + "]" + delimiter + "]"
-
-
-def _meson_literal(value: object) -> str:
-    return repr(str(value))
 
 
 def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
@@ -177,7 +172,8 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     for role in ("cc", "cxx"):
         wrapper = tools / role
         base = [str(context.target_tools[role]), *context.compiler_flags]
-        wrapper.write_text(
+        write_build_file(
+            wrapper,
             "#!"
             + str(python)
             + "\nimport os, sys\n"
@@ -196,7 +192,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             + "    command += "
             + repr(list(context.executable_flags))
             + "\n"
-            + "os.execv(command[0], command + arguments)\n"
+            + "os.execv(command[0], command + arguments)\n",
         )
         wrapper.chmod(0o755)
         wrappers[role] = wrapper
@@ -236,7 +232,12 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             )
         phase = (
             "configure"
-            if len(commands) == 1 and request.adapter is not NativeAdapter.PLAIN_MAKE
+            if (
+                request.adapter is NativeAdapter.MESON
+                and "setup" in command.argv
+                or request.adapter not in {NativeAdapter.MESON, NativeAdapter.PLAIN_MAKE}
+                and len(commands) == 1
+            )
             else "install"
             if "install" in command.argv
             else "build"
@@ -248,182 +249,15 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         )
 
     if request.adapter is NativeAdapter.CMAKE:
-        toolchain = tools / "toolchain.cmake"
-        entries = {
-            "CMAKE_SYSTEM_NAME": "WASI",
-            "CMAKE_SYSTEM_PROCESSOR": "wasm32",
-            "CMAKE_C_COMPILER": str(wrappers["cc"]),
-            "CMAKE_CXX_COMPILER": str(wrappers["cxx"]),
-            "CMAKE_AR": str(context.target_tools["ar"]),
-            "CMAKE_RANLIB": str(context.target_tools["ranlib"]),
-            "CMAKE_SYSROOT": str(context.sysroot),
-            "CMAKE_FIND_ROOT_PATH": str(context.dependency_sysroot) + ";" + str(context.sysroot),
-            "CMAKE_FIND_ROOT_PATH_MODE_PROGRAM": "NEVER",
-            "CMAKE_FIND_ROOT_PATH_MODE_LIBRARY": "ONLY",
-            "CMAKE_FIND_ROOT_PATH_MODE_INCLUDE": "ONLY",
-            "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "ONLY",
-            "CMAKE_FIND_USE_SYSTEM_ENVIRONMENT_PATH": "FALSE",
-            "CMAKE_FIND_USE_CMAKE_ENVIRONMENT_PATH": "FALSE",
-            "CMAKE_FIND_USE_PACKAGE_REGISTRY": "FALSE",
-            "CMAKE_FIND_USE_SYSTEM_PACKAGE_REGISTRY": "FALSE",
-        }
-        toolchain.write_text(
-            "".join("set(" + name + " " + _cmake_literal(value) + ")\n" for name, value in entries.items())
-        )
-        build = context.build / "cmake-build"
-        cmake = context.host_tools["cmake"]
-        run(
-            [
-                cmake,
-                "-S",
-                context.source,
-                "-B",
-                build,
-                "-G",
-                "Ninja",
-                *request.configure_args,
-                "-DCMAKE_TOOLCHAIN_FILE=" + str(toolchain),
-                "-DCMAKE_MAKE_PROGRAM=" + str(context.host_tools["ninja"]),
-                "-DCMAKE_INSTALL_PREFIX=" + str(request.install_prefix),
-                "-DPKG_CONFIG_EXECUTABLE=" + str(context.host_tools["pkg-config"]),
-                "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
-            ],
-            context.build,
-        )
-        run(
-            [
-                cmake,
-                "--build",
-                build,
-                "--parallel",
-                request.jobs,
-                *(["--target", *request.build_targets] if request.build_targets else []),
-            ],
-            context.build,
-        )
-        run([cmake, "--build", build, "--target", *request.install_targets], context.build)
+        from ports._support.cmake_adapter import build_cmake
+
+        build_cmake(request, wrappers, tools, run)
     elif request.adapter is NativeAdapter.MESON:
-        cross = tools / "cross.ini"
-        cross.write_text(
-            "[binaries]\nc = "
-            + _meson_literal(wrappers["cc"])
-            + "\ncpp = "
-            + _meson_literal(wrappers["cxx"])
-            + "\nar = "
-            + _meson_literal(context.target_tools["ar"])
-            + "\nstrip = "
-            + _meson_literal(context.target_tools["strip"])
-            + "\npkg-config = "
-            + _meson_literal(context.host_tools["pkg-config"])
-            + "".join(
-                "\n" + name + " = " + _meson_literal(context.host_tools[name])
-                for name in ("cython", "f2py")
-                if name in context.host_tools
-            )
-            + "\n[host_machine]\nsystem = 'wasi'\ncpu_family = 'wasm32'\ncpu = 'wasm32'\nendian = 'little'\n[properties]\nneeds_exe_wrapper = true\nsys_root = "
-            + _meson_literal(context.dependency_sysroot)
-            + "\n"
-            + "".join(
-                name + " = " + (str(value).lower() if isinstance(value, (bool, int)) else _meson_literal(value)) + "\n"
-                for name, value in sorted(request.meson_properties.items())
-            )
-        )
-        native_file = tools / "native.ini"
-        native_file.write_text(
-            "[binaries]\npython = "
-            + _meson_literal(python)
-            + "\n"
-            + "".join(
-                name + " = " + _meson_literal(context.host_tools[name]) + "\n"
-                for name in ("cython", "f2py")
-                if name in context.host_tools
-            )
-        )
-        meson = context.host_tools["meson"]
-        build = context.build / "meson-build"
-        run(
-            [
-                meson,
-                "setup",
-                *(["--reconfigure"] if (build / "meson-private/coredata.dat").exists() else []),
-                build,
-                context.source,
-                *request.configure_args,
-                "--cross-file",
-                cross,
-                "--native-file",
-                native_file,
-                "--prefix",
-                request.install_prefix,
-                "--wrap-mode=nodownload",
-            ],
-            context.build,
-        )
-        if request.meson_install_tags:
-            plan = json.loads((build / "meson-info/intro-install_plan.json").read_text())
-            selected = []
-            for source, spec in plan.get("targets", {}).items():
-                if spec["tag"] in request.meson_install_tags:
-                    path = Path(source)
-                    if not path.is_absolute() or not path.is_relative_to(build):
-                        raise ValueError("Meson install target escapes build directory")
-                    selected.append(str(path.relative_to(build)))
-            if not selected:
-                raise ValueError("Meson install tags select no build targets")
-            run([context.host_tools["ninja"], "-C", build, "-j", request.jobs, *sorted(selected)], context.build)
-        else:
-            run([meson, "compile", "-C", build, "-j", request.jobs, *request.build_targets], context.build)
-        run(
-            [
-                meson,
-                "install",
-                "-C",
-                build,
-                "--no-rebuild",
-                *(["--tags=" + ",".join(request.meson_install_tags)] if request.meson_install_tags else []),
-            ],
-            context.build,
-        )
-    elif request.adapter is NativeAdapter.PLAIN_MAKE:
-        make = context.host_tools["make"]
-        bindings = [
-            "CC=" + str(wrappers["cc"]),
-            "CXX=" + str(wrappers["cxx"]),
-            "HOSTCC=" + str(context.host_tools["cc"]),
-            "AR=" + str(context.target_tools["ar"]),
-            "RANLIB=" + str(context.target_tools["ranlib"]),
-        ]
-        # Targets may append to one archive; preserve recipe order between them.
-        for target in request.build_targets or (None,):
-            run(
-                [make, "-j", request.jobs, *bindings, *request.build_args, *([target] if target else [])],
-                context.source,
-            )
-        if request.install_targets:
-            run(
-                [
-                    make,
-                    *bindings,
-                    *request.build_args,
-                    *request.install_targets,
-                    "PREFIX=" + str(request.install_prefix),
-                    "DESTDIR=" + str(context.staging_prefix),
-                ],
-                context.source,
-            )
+        from ports._support.meson_adapter import build_meson
+
+        build_meson(request, wrappers, tools, run)
     else:
-        build = context.build / "configure-build"
-        build.mkdir()
-        run(
-            [
-                context.host_tools["sh"],
-                context.source / "configure",
-                *request.configure_args,
-                "--prefix=" + str(request.install_prefix),
-            ],
-            build,
-        )
-        make = context.host_tools["make"]
-        run([make, "-j", request.jobs, *request.build_args, *request.build_targets], build)
-        run([make, *request.build_args, *request.install_targets, "DESTDIR=" + str(context.staging_prefix)], build)
+        from ports._support.make_adapter import build_make
+
+        build_make(request, wrappers, run)
     return NativeBuildOutput(context.staging_prefix, tuple(commands), request.install_prefix)

@@ -18,7 +18,13 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path, PurePosixPath
 from typing import Mapping
 
-from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
+from ports._support.native_adapters import (
+    NativeAdapter,
+    NativeBuildContext,
+    NativeBuildRequest,
+    build_native,
+    write_build_file,
+)
 from ports._support.python_adapters import CPythonBuildContext, PythonBuildOutput, _source_file, _wheel
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
@@ -136,7 +142,8 @@ def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Pat
             raise ValueError("host header package escapes admitted receipt")
         providers[name] = (spec["version"], [str(include)])
     wrapper = directory / "target-pkg-config"
-    wrapper.write_text(
+    write_build_file(
+        wrapper,
         "#!"
         + str(context.host_tools["python"])
         + "\nimport os, shlex, sys\n"
@@ -158,7 +165,7 @@ def _target_pkg_config(request: PythonMesonBuildRequest, directory: Path) -> Pat
         + repr(str(context.host_tools["pkg-config"]))
         + ", ["
         + repr(str(context.host_tools["pkg-config"]))
-        + "] + arguments)\n"
+        + "] + arguments)\n",
     )
     wrapper.chmod(0o755)
     return wrapper
