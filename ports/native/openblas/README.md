@@ -54,7 +54,8 @@ against the admitted threaded v3 compiler and sysroot. The plain Make adapter
 uses a separate admitted native `HOSTCC` for upstream generators. Pinned hooks
 retain the numerical ABI normalization above and link the complete archive into
 `libopenblas.so`, importing the canonical main libc/pthread runtime. Compiler
-math helpers are linked selectively from the admitted SDK builtins archive.
+math helpers are linked selectively from the cohort-admitted threaded shared-library support archives, recorded in the
+build context and graph receipt.
 
 The internal OpenBLAS worker pool is disabled. `USE_LOCKING=1` retains upstream
 pthread allocator locks for callers in guest threads; the embedded-OS header

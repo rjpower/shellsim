@@ -38,7 +38,6 @@ def main():
         + (source / "openblas_config_template.h").read_text()
         + "\n#endif\n"
     )
-    builtins = Path(context["sdk"]) / recipe["compiler_support"]["path"]
     subprocess.run(
         [
             context["target_tools"]["cc"],
@@ -49,7 +48,7 @@ def main():
             "-Wl,--whole-archive",
             str(archive),
             "-Wl,--no-whole-archive",
-            str(builtins),
+            *context["shared_library_inputs"],
             "-o",
             str(prefix / "lib/libopenblas.so"),
         ],

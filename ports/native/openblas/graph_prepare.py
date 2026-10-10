@@ -19,9 +19,13 @@ def main():
     normalized = source.with_name(source.name + "-normalized")
     prepare_source(source, normalized)
     common = normalized / "common.h"
+    text = common.read_text()
+    anchor = "#include <time.h>\n#include <math.h>\n#endif"
+    if text.count(anchor) != 1:
+        raise ValueError("OpenBLAS pthread header anchor must occur exactly once")
     common.write_text(
-        common.read_text().replace(
-            "#include <time.h>\n#include <math.h>\n#endif",
+        text.replace(
+            anchor,
             "#include <time.h>\n#include <math.h>\n"
             "#if defined(__wasi__) && defined(USE_LOCKING)\n#include <pthread.h>\n#endif\n#endif",
         )

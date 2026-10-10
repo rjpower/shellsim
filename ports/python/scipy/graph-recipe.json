@@ -166,6 +166,9 @@
       "-Duse-g77-abi=true",
       "-Dblas=openblas",
       "-Dlapack=openblas"
+    ],
+    "required_shared_libraries": [
+      "libopenblas.so"
     ]
   },
   "tests": [

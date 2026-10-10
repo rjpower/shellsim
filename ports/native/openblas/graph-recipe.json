@@ -9,12 +9,8 @@
     "subdirectory": "OpenBLAS-0.3.31"
   },
   "compiler_support": {
-    "path": "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a",
-    "linkage": "referenced-members-only",
-    "source": {
-      "repository": "llvm/llvm-project",
-      "commit": "895aa2c896ada719451be2e3673c83da8ddf1141"
-    }
+    "input": "cohort.shared_library_inputs",
+    "linkage": "referenced-members-only"
   },
   "target": "wasm32-wasip1-threads",
   "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
@@ -46,12 +42,12 @@
       {
         "phase": "before_build",
         "file": "graph_prepare.py",
-        "sha256": "ea7862759a736acd9750a6ee0a4b701c9c5a1fe2fa4ce6f9bad357c04502a96a"
+        "sha256": "1814e22c61d55b282c971e64dbbf13fd50b5de7fe125b387939bb2b39102f737"
       },
       {
         "phase": "after_install",
         "file": "graph_install.py",
-        "sha256": "d5ec8f36189a2666d7c27f8df294f43f665f0e2dfea16b5ff01cfb67544a26f7"
+        "sha256": "94adc8b1aa8e025db26b856f2887bc44904713a8cc7d1124a6ca77465a591094"
       }
     ]
   },
@@ -102,11 +98,11 @@
   "build_scripts": [
     {
       "file": "graph_prepare.py",
-      "sha256": "ea7862759a736acd9750a6ee0a4b701c9c5a1fe2fa4ce6f9bad357c04502a96a"
+      "sha256": "1814e22c61d55b282c971e64dbbf13fd50b5de7fe125b387939bb2b39102f737"
     },
     {
       "file": "graph_install.py",
-      "sha256": "d5ec8f36189a2666d7c27f8df294f43f665f0e2dfea16b5ff01cfb67544a26f7"
+      "sha256": "94adc8b1aa8e025db26b856f2887bc44904713a8cc7d1124a6ca77465a591094"
     },
     {
       "file": "build.py",
