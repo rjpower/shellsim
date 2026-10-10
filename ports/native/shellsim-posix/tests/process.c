@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include "exec_port.h"
 #include "process_port.h"
 #include "tempfile_port.h"
 extern char **environ;
