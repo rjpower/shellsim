@@ -687,6 +687,46 @@ def discover(client, controller_url: str, job, config: IrisConfig, *, rpc_second
     )
 
 
+def connection_descriptor(
+    config: IrisConfig,
+    job,
+    *,
+    cluster_name: str = "marin",
+    controller_url: str = "https://iris.oa.dev",
+    workspace: Path | None = None,
+) -> dict[str, str | int | None]:
+    """Project public connection fields accepted by the ports Iris CLI.
+
+    Persist this descriptor after launch. Consumers parse ``job_id`` with Iris
+    ``JobName.from_wire`` before deriving its Namespace, then authenticate to
+    ``cluster_name`` and mint a fresh scoped capability. Tokens and full runtime
+    configuration are deliberately absent from this connection document.
+    """
+    origin = urlsplit(controller_url)
+    if (
+        origin.scheme not in ("https", "http")
+        or not origin.netloc
+        or origin.username
+        or origin.password
+        or origin.query
+        or origin.fragment
+        or origin.path not in ("", "/")
+    ):
+        raise ValueError("controller URL must be a public origin")
+    return {
+        "schema_version": 1,
+        "job_id": str(job.job_id),
+        "cluster_name": cluster_name,
+        "controller_url": controller_url.rstrip("/"),
+        "prefix": config.prefix,
+        "cache_prefix": config.cache_prefix,
+        "service_id": config.service_id,
+        "task_image": config.task_image,
+        "config_sha256": hashlib.sha256(_encode(asdict(config))).hexdigest(),
+        "workspace": str((workspace or Path.cwd()).resolve()),
+    }
+
+
 def _runtime_identity(config: IrisConfig, files: Mapping[str, bytes]) -> dict[str, str]:
     from iris.version import client_revision_date
 

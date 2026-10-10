@@ -43,6 +43,7 @@ from ports.buildomatic.backends.iris import (
     _entrypoint,
     _WorkerActor,
     compiler_cache_environment,
+    connection_descriptor,
 )
 from ports.buildomatic.contracts import request_id
 from ports.buildomatic.remote_store import DEFAULT_PREFIX, RemoteStore
@@ -516,6 +517,34 @@ def test_compiler_cache_preserves_worker_region_endpoint_and_ttl():
 def test_iris_config_resource_and_name_bounds(values):
     with pytest.raises(ValueError):
         IrisConfig(**{"service_id": "test", **values})
+
+
+def test_public_connection_descriptor_matches_cli_schema_and_omits_runtime_secrets():
+    config = IrisConfig("test", setup_scripts=("private-runtime-token",))
+    descriptor = connection_descriptor(config, SimpleNamespace(job_id="/power/service"))
+    assert set(descriptor) == {
+        "schema_version",
+        "job_id",
+        "cluster_name",
+        "controller_url",
+        "prefix",
+        "cache_prefix",
+        "service_id",
+        "task_image",
+        "config_sha256",
+        "workspace",
+    }
+    assert descriptor["schema_version"] == 1
+    assert descriptor["job_id"] == "/power/service"
+    assert descriptor["cluster_name"] == "marin"
+    assert descriptor["controller_url"] == "https://iris.oa.dev"
+    assert descriptor["service_id"] == config.service_id
+    assert "private-runtime-token" not in json.dumps(descriptor)
+    assert len(descriptor["config_sha256"]) == 64
+    with pytest.raises(ValueError):
+        connection_descriptor(
+            config, SimpleNamespace(job_id="/power/service"), controller_url="https://host/proxy/t/token"
+        )
 
 
 def test_capability_transport_never_logs_url_and_sanitizes_errors(monkeypatch, caplog):
