@@ -4,11 +4,15 @@ Polling has a bounded test-harness wait solely to detect hangs. Scheduling, loss
 and retry semantics are covered without clocks in test_core.py.
 """
 
+import io
 import json
 import os
+import shutil
 import signal
+import sys
 import time
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -28,7 +32,7 @@ from ports.buildomatic import (
     capture_tree,
     extract_tree,
 )
-from ports.buildomatic._runner import process_token
+from ports.buildomatic._process import process_token
 from ports.buildomatic.contracts import encode
 from ports.buildomatic.store import atomic_write
 
@@ -133,6 +137,7 @@ def test_pending_dispatch_launch_is_bounded_under_rapid_poll(worker, monkeypatch
 
     class Child:
         pid = os.getpid()
+        stdout = io.BytesIO()
 
         def poll(self):
             return None
@@ -148,10 +153,63 @@ def test_pending_dispatch_launch_is_bounded_under_rapid_poll(worker, monkeypatch
         assert worker.poll(item.id).state == WorkerState.RUNNING
         worker.submit(item)
     assert len(launches) == 1
-    # Remove the synthetic live marker so fixture teardown can reconcile it.
+    # Persist a terminal status for the synthetic supervisor before teardown.
     monkeypatch.undo()
-    (worker.root / "attempts/test/launch.json").unlink()
+    atomic_write(
+        worker.root / "attempts/test/status.json",
+        encode(
+            {
+                "phase": "completed",
+                "returncode": None,
+                "error": "synthetic launch",
+                "cancelled": False,
+            }
+        ),
+    )
     worker._children.clear()
+
+
+def test_module_launch_with_bridge_ports_module_alongside_core(worker, tmp_path, monkeypatch):
+    import ports.buildomatic.worker as implementation
+
+    package = tmp_path / "package/ports/buildomatic"
+    package.mkdir(parents=True)
+    for path in Path(implementation.__file__).parent.glob("*.py"):
+        shutil.copyfile(path, package / path.name)
+    bridge = os.environ.get("BUILDOMATIC_BRIDGE_MODULE")
+    if bridge:
+        shutil.copyfile(bridge, package / "ports.py")
+    else:
+        (package / "ports.py").write_text("from ports._support import native_adapters\n")
+    monkeypatch.setattr(implementation, "__file__", str(package / "worker.py"))
+    item = attempt("import os,pathlib; pathlib.Path(os.environ['BUILD_OUTPUT_DIR'],'ok').write_text('executed')")
+    worker.submit(item)
+    assert complete(worker, item).state == AttemptState.SUCCEEDED
+
+
+def test_pre_status_supervisor_exit_is_terminal_and_never_relaunched(worker, store, monkeypatch):
+    import ports.buildomatic.worker as implementation
+
+    spawn = implementation.subprocess.Popen
+    launches = []
+
+    def fail_startup(argv, **kwargs):
+        launches.append(argv)
+        return spawn(
+            [sys.executable, "-c", "import sys; print('bootstrap diagnostic', file=sys.stderr); sys.exit(7)"], **kwargs
+        )
+
+    monkeypatch.setattr(implementation.subprocess, "Popen", fail_startup)
+    item = attempt("raise AssertionError('must never execute')")
+    worker.submit(item)
+    result = complete(worker, item)
+    assert result.state == AttemptState.FAILED
+    eventually(lambda: worker.read_log(item.id), lambda data: b"bootstrap diagnostic" in data)
+    restarted = WorkerExecutor(store, worker.root, worker.limits)
+    for _ in range(5):
+        restarted.submit(item)
+        assert restarted.poll(item.id).result == result
+    assert len(launches) == 1
 
 
 @pytest.mark.parametrize(

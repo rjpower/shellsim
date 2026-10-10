@@ -14,10 +14,11 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 from dataclasses import asdict, replace
 from pathlib import Path
 
-from ._runner import kill_group, process_token, tree_usage, wait_group
+from ._process import kill_group, process_token, tree_usage, wait_group
 from .bundles import capture_tree, extract_tree
 from .contracts import (
     Attempt,
@@ -72,6 +73,18 @@ def _remove_workspace(root: Path) -> None:
     shutil.rmtree(root)
 
 
+def _startup_log(stream, path: Path, maximum: int) -> None:
+    """Drain launcher diagnostics with constant memory and bounded retained bytes."""
+    with stream, path.open("wb") as log:
+        remaining = maximum
+        while data := stream.read(65536):
+            if remaining:
+                retained = data[:remaining]
+                log.write(retained)
+                log.flush()
+                remaining -= len(retained)
+
+
 class WorkerExecutor:
     """Execute trusted host argv on Linux, with 1..32 durable concurrent slots.
 
@@ -99,22 +112,45 @@ class WorkerExecutor:
             return
         launch = _read(directory / "launch.json")
         if launch is not None:
-            token = process_token(launch["pid"])
-            if token is not None and token == launch["token"]:
-                return
+            # A persisted launch is an attempt, even if the supervisor exited
+            # before recording status. Reconciliation must not launch it again.
+            return
         self._children = [child for child in self._children if child.poll() is None]
         environment = os.environ.copy()
         environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
-        child = subprocess.Popen(
-            [sys.executable, str(Path(__file__).with_name("_runner.py")), str(directory)],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-        self._children.append(child)
-        atomic_write(directory / "launch.json", encode({"pid": child.pid, "token": process_token(child.pid)}))
+        atomic_write(directory / "launch.json", encode({"pid": None, "token": None}))
+        gate_read, gate_write = os.pipe()
+        try:
+            child = subprocess.Popen(
+                [sys.executable, "-m", "ports.buildomatic._runner", "--supervisor", str(directory), str(gate_read)],
+                env=environment,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+                pass_fds=(gate_read,),
+            )
+            self._children.append(child)
+            threading.Thread(
+                target=_startup_log, args=(child.stdout, directory / "startup.log", self.limits.log_bytes), daemon=True
+            ).start()
+            atomic_write(directory / "launch.json", encode({"pid": child.pid, "token": process_token(child.pid)}))
+            os.write(gate_write, b"1")
+        except Exception as error:
+            atomic_write(
+                directory / "status.json",
+                encode(
+                    {
+                        "phase": "completed",
+                        "returncode": None,
+                        "cancelled": False,
+                        "error": f"worker supervisor failed to start: {type(error).__name__}: {error}"[:4096],
+                    }
+                ),
+            )
+        finally:
+            os.close(gate_read)
+            os.close(gate_write)
 
     def submit(self, attempt: Attempt) -> None:
         directory = self._directory(attempt.id)
@@ -182,8 +218,23 @@ class WorkerExecutor:
     def _status(self, directory: Path) -> dict | None:
         status = _read(directory / "status.json")
         if status is None:
-            self._launch(directory)
-            return None
+            launch = _read(directory / "launch.json")
+            if launch is None:
+                self._launch(directory)
+                return None
+            pid = launch["pid"]
+            if pid is not None and (token := process_token(pid)) is not None and token == launch["token"]:
+                return None
+            if _running(directory):
+                return None
+            status = {
+                "phase": "completed",
+                "returncode": None,
+                "cancelled": (directory / "cancelled").exists(),
+                "error": "worker supervisor exited before recording status",
+            }
+            atomic_write(directory / "status.json", encode(status))
+            return status
         if status["phase"] == "completed" or _running(directory):
             return status
         # The supervisor may have died while the action was still running. Kill
@@ -265,11 +316,16 @@ class WorkerExecutor:
         if type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
             raise ValueError("log reads need 1..65536 bytes")
         directory = self._directory(attempt_id)
+        if (directory / "acknowledged").exists():
+            raise FileNotFoundError("attempt log was acknowledged")
         plan = _read(directory / "plan.json")
         if plan is None:
             raise FileNotFoundError("attempt has no log")
         maximum = min(max_bytes, plan["limits"]["log_bytes"])
-        with (directory / "log").open("rb") as stream:
+        path = directory / "log"
+        if not path.exists():
+            path = directory / "startup.log"
+        with path.open("rb") as stream:
             stream.seek(0, os.SEEK_END)
             stream.seek(max(0, stream.tell() - maximum))
             return stream.read(maximum)
@@ -280,7 +336,7 @@ class WorkerExecutor:
             if not directory.exists():
                 directory.mkdir()
             status = _read(directory / "status.json")
-            if _running(directory) or (status is not None and status["phase"] != "completed"):
+            if (status is None and _running(directory)) or (status is not None and status["phase"] != "completed"):
                 raise ValueError("cannot acknowledge a running attempt")
             if (directory / "plan.json").exists() and status is None:
                 raise ValueError("cannot acknowledge a pending attempt")
@@ -288,4 +344,5 @@ class WorkerExecutor:
             if (directory / "work").exists():
                 _remove_workspace(directory / "work")
             (directory / "log").unlink(missing_ok=True)
+            (directory / "startup.log").unlink(missing_ok=True)
             (directory / "result.json").unlink(missing_ok=True)
