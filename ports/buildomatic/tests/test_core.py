@@ -298,6 +298,32 @@ def test_restart_retains_attempt_and_fences_previous_coordinator(store, bundle):
     assert Coordinator(store, "build", {"worker": worker}).result() == retained
 
 
+def test_invalid_success_retains_active_attempt_before_retry_and_reopen(store, bundle):
+    worker = FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"worker": worker})
+    coordinator.submit(request(action("a")))
+    coordinator.tick()
+    attempt_id = next(iter(worker.attempts))
+    worker.reports[attempt_id] = WorkerReport(
+        WorkerState.COMPLETED, AttemptResult(attempt_id, AttemptState.SUCCEEDED, error="invalid success")
+    )
+    for _ in range(2):
+        with pytest.raises(ValueError):
+            coordinator.tick()
+        assert coordinator.result().nodes[0].state == NodeState.RUNNING
+        durable = json.loads(store.read_journal("build").data)
+        assert durable["attempts"][attempt_id]["active"]
+        assert durable["nodes"]["a"]["error"] is None
+    reopened = Coordinator(store, "build", {"worker": worker})
+    with pytest.raises(ValueError):
+        reopened.tick()
+    worker.complete("a", bundle)
+    result = reopened.tick()
+    assert result.state == BuildState.SUCCEEDED
+    assert result.nodes[0].attempts == 1
+    assert list(worker.attempts) == [attempt_id]
+
+
 def test_idempotency_conflict_checks_entire_request(store):
     coordinator = Coordinator(store, "build", {"worker": FakeWorker(store)})
     coordinator.submit(request(action("a")))

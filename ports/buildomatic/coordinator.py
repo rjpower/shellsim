@@ -195,6 +195,10 @@ class Coordinator:
             self._save()
 
     def _finish(self, record: dict, state: AttemptState, bundle: TreeBundle | None, error: str | None) -> None:
+        if state == AttemptState.SUCCEEDED and not isinstance(bundle, TreeBundle):
+            raise ValueError("successful attempt has no output bundle")
+        if error is not None and not isinstance(error, str):
+            raise ValueError("attempt diagnostics must be text")
         node = self._journal["nodes"][record["action_id"]]
         record.update(active=False, ack_pending=True)
         action = next(action for action in self.request.actions if action.id == record["action_id"])
@@ -202,8 +206,6 @@ class Coordinator:
         if self._journal["cancelled"] or state == AttemptState.CANCELLED:
             node["state"] = "cancelled"
         elif state == AttemptState.SUCCEEDED:
-            if bundle is None:
-                raise ValueError("successful attempt has no output bundle")
             node.update(state="succeeded", bundle=bundle.digest, error=None)
         elif node["attempts"] < action.max_attempts:
             node["state"] = "pending"
