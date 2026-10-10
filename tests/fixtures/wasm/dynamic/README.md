@@ -152,3 +152,15 @@ and guest evidence.
 
 The format follows the upstream
 [LLVM dynamic linking convention](https://github.com/WebAssembly/tool-conventions/blob/main/DynamicLinking.md).
+
+### Threaded v3 runtime paths
+
+The threaded v3 loader accepts LLVM `dylink.0` runtime-path subsection 5: an
+ordered vector of length-prefixed paths, bounded to the module-count limit and
+4096 bytes per entry. Dependencies search these directories in the guest VFS,
+then `/lib`. `$ORIGIN` and `${ORIGIN}` expand to the importing module's resolved
+VFS directory. Each dependency uses its own importer, including nested loads;
+resolved VFS paths remain the cache and cycle identities. Host build directories
+embedded by Wasm linkers grant no host filesystem access and normally miss in
+the VFS. Relative paths and variables other than ORIGIN remain unsupported.
+The serial v1/v2 loader retains its existing `/lib` policy.
