@@ -721,8 +721,53 @@ fn v2_declared_diamond_dependencies_share_state_and_remain_local() {
 }
 
 #[test]
+fn v2_dependencies_load_from_local_lib_after_the_lib_default() {
+    for preferred in [false, true] {
+        let mut environment = environment();
+        let expected = if preferred { 11 } else { 42 };
+        let main = synthetic_main_profile(
+            true,
+            &format!(
+                r#"
+            (local.set $handle (call $open (i32.const 32) (i32.const 7) (i32.const 2)))
+            (if (i32.eqz (local.get $handle)) (then unreachable))
+            (if (i32.ne (call_indirect (result i32)
+                (call $symbol (local.get $handle) (i32.const 64) (i32.const 5)))
+                (i32.const {expected})) (then unreachable))"#
+            ),
+            r#"(data (i32.const 64) "probe")"#,
+        );
+        let root = synthetic_library_profile(
+            true,
+            r"\01\04\00\00\00\00\02\09\01\07leaf.so",
+            r#"(import "env" "value" (func $value (result i32)))
+                (func (export "probe") (result i32) (call $value))"#,
+        );
+        environment.vfs.write("/", "/app", &main, 0o755).unwrap();
+        environment.vfs.write("/", "/lib.so", &root, 0o644).unwrap();
+        for (directory, value) in [("/usr/local/lib", 42), ("/lib", 11)] {
+            if directory == "/lib" && !preferred {
+                continue;
+            }
+            environment.vfs.mkdir_all("/", directory).unwrap();
+            let leaf = synthetic_library_profile(
+                true,
+                r"\01\04\00\00\00\00",
+                &format!(r#"(func (export "value") (result i32) (i32.const {value}))"#),
+            );
+            environment
+                .vfs
+                .write("/", &format!("{directory}/leaf.so"), &leaf, 0o644)
+                .unwrap();
+        }
+        assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+        assert_eq!(environment.resources.memory_mark(), 0);
+    }
+}
+
+#[test]
 fn v2_dependency_failures_release_memory() {
-    for failure in ["missing", "mismatch", "cycle", "filename"] {
+    for failure in ["missing", "mismatch", "cycle", "filename", "directory"] {
         let mut environment = environment();
         let main = synthetic_main_profile(
             true,
@@ -744,10 +789,21 @@ fn v2_dependency_failures_release_memory() {
             }
             _ => synthetic_library_profile(false, r"\01\04\00\00\00\00", ""),
         };
-        if failure != "missing" {
+        if failure == "directory" {
+            environment.vfs.mkdir_all("/", "/lib/leaf.so").unwrap();
+        } else if failure != "missing" {
             environment
                 .vfs
                 .write("/", "/lib/leaf.so", &leaf, 0o644)
+                .unwrap();
+        }
+        if matches!(failure, "directory" | "mismatch") {
+            // An invalid first candidate must not select a valid later provider.
+            environment.vfs.mkdir_all("/", "/usr/local/lib").unwrap();
+            let valid = synthetic_library_profile(true, r"\01\04\00\00\00\00", "");
+            environment
+                .vfs
+                .write("/", "/usr/local/lib/leaf.so", &valid, 0o644)
                 .unwrap();
         }
         assert_eq!(

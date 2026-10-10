@@ -3,7 +3,8 @@
 //! Libraries come only from the VFS and share the executable's memory, C stack and function
 //! table. Guest malloc owns their data regions for the process lifetime. The versioned bridge
 //! and exact ABI marker make this an explicit opt-in profile, rather than a host dlopen fallback.
-//! V2 loads declared dependencies only from `/lib` in the VFS, with bounded acyclic graphs.
+//! V2 searches declared dependencies in `/lib`, then `/usr/local/lib`, within the VFS.
+//! Dependency graphs remain bounded and acyclic.
 //! TLS, unloading and guest-initiated nested loads remain unsupported. Side exception tags
 //! are imported from the main runtime. Compilation scratch is charged before cache lookup;
 //! retained images and table growth are released with the owning process.
@@ -12,7 +13,7 @@ use super::{
     build_linker, command_engine, compiled_command_module, ffi, fibers, memory, Host,
     MAX_WASM_BYTES,
 };
-use crate::vfs::resolve_against;
+use crate::vfs::{resolve_against, Vfs, VfsError, PATH_MAX};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use wasmtime::{
 
 pub(super) const NAMESPACE: &str = "shellsim_dylink_v1";
 pub(super) const NAMESPACE_V2: &str = "shellsim_dylink_v2";
+pub(super) const DEFAULT_LIBRARY_DIRECTORIES: [&str; 2] = ["/lib", "/usr/local/lib"];
 pub(super) const MEMORY_RESERVATION: u64 = 32 * 1024 * 1024;
 const ABI_SECTION: &str = "shellsim.abi";
 const ABI: &[u8] = b"shellsim-wasi-sdk24-cpython3137-v1";
@@ -565,6 +567,24 @@ fn address(caller: &mut Caller<'_, Host>, symbol: Extern, base: u32) -> Result<u
     }
 }
 
+/// Select the first existing default VFS candidate; loading validates its type and bytes.
+/// An invalid earlier provider must fail rather than select a different implementation.
+fn dependency_path(vfs: &Vfs, name: &str) -> Result<String, Error> {
+    for directory in DEFAULT_LIBRARY_DIRECTORIES {
+        if directory.len().saturating_add(name.len()).saturating_add(1) >= PATH_MAX {
+            return Err(Error::msg("dylink dependency path exceeds VFS limit"));
+        }
+        let candidate = format!("{directory}/{name}");
+        match vfs.metadata_ref("/", &candidate, true) {
+            Ok(_) => return Ok(candidate),
+            Err(VfsError::NotFound(_) | VfsError::NotADir(_)) => {}
+            Err(error) => return Err(Error::msg(error.to_string())),
+        }
+    }
+    // Preserve the missing-library diagnostic from the first default directory.
+    Ok(format!("/lib/{name}"))
+}
+
 async fn load(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> Result<u32, Error> {
     let path = resolve_against(&caller.data().cwd, &path);
     let path = if caller.data().dynamic.abi == Some(Abi::V2) {
@@ -652,7 +672,17 @@ async fn load_inner(caller: &mut Caller<'_, Host>, path: String, flags: u32) -> 
     }
     let mut dependencies = Vec::new();
     for name in &layout.needed {
-        let dependency = Box::pin(load(caller, format!("/lib/{name}"), 2)).await?;
+        let path = {
+            let mut machine = caller.data().machine.get();
+            let cost = (DEFAULT_LIBRARY_DIRECTORIES.len() as u64)
+                .saturating_mul(PATH_MAX as u64)
+                .saturating_mul(16);
+            if !machine.resources.charge_cpu(cost) {
+                return Err(super::exhausted());
+            }
+            dependency_path(&machine.vfs, name)?
+        };
+        let dependency = Box::pin(load(caller, path, 2)).await?;
         dependencies.push(dependency);
     }
     let required = module.resources_required();

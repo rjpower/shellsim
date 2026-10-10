@@ -172,6 +172,73 @@ fn executable_binds_functions_data_and_constructor_callbacks_before_main() {
 }
 
 #[test]
+fn executable_dependencies_search_local_lib_after_lib() {
+    for preferred in [false, true] {
+        let main = main_module("", false, "");
+        let good = side_module("", "(i32.load (global.get $base))", "");
+        let bad = side_module("", "(i32.const 99)", "");
+        let mut environment = linked_environment(&main, &good);
+        environment.vfs.mkdir_all("/", "/usr/local/lib").unwrap();
+        environment
+            .vfs
+            .write(
+                "/",
+                "/usr/local/lib/root.so",
+                if preferred { &bad } else { &good },
+                0o644,
+            )
+            .unwrap();
+        if !preferred {
+            environment.vfs.remove_file("/", "/lib/root.so").unwrap();
+        }
+        let (outcome, _, stderr) = environment.run_script_capture("/app");
+        assert_eq!(
+            outcome.exit_status,
+            0,
+            "{}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+#[test]
+fn executable_default_search_reports_errors_without_skipping_a_provider() {
+    for (failure, expected) in [
+        ("missing", "No such file or directory"),
+        ("directory", "regular VFS file"),
+        ("type", "executable function type mismatch: answer"),
+    ] {
+        let main = main_module("", false, "");
+        let good = side_module("", "(i32.load (global.get $base))", "");
+        let mut environment = linked_environment(&main, &good);
+        environment.vfs.remove_file("/", "/lib/root.so").unwrap();
+        if failure != "missing" {
+            environment.vfs.mkdir_all("/", "/usr/local/lib").unwrap();
+            environment
+                .vfs
+                .write("/", "/usr/local/lib/root.so", &good, 0o644)
+                .unwrap();
+            if failure == "directory" {
+                environment.vfs.mkdir_all("/", "/lib/root.so").unwrap();
+            } else {
+                let bad = side_module_with_type("", "(i64.const 42)", "", "i64");
+                environment
+                    .vfs
+                    .write("/", "/lib/root.so", &bad, 0o644)
+                    .unwrap();
+            }
+        }
+        let (outcome, _, stderr) = environment.run_script_capture("/app");
+        assert_eq!(outcome.exit_status, 126);
+        assert!(
+            String::from_utf8_lossy(&stderr).contains(expected),
+            "{failure}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+    }
+}
+
+#[test]
 fn worker_rebinds_main_tls_and_keeps_shared_data_and_side_tls_separate() {
     let mut environment = linked_environment(
         &main_module("", true, ""),

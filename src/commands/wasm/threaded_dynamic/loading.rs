@@ -2,13 +2,15 @@
 //!
 //! Only the loading owner calls guest malloc. Every reusable thread slot receives
 //! storage before publication, so replay can interrupt an allocator critical section.
+//! Importer RUNPATH entries precede the VFS defaults `/lib` and `/usr/local/lib`.
 
 use super::{
     layout, replay, reserve_store, Initialization, Preparation, Process, Record, MAX_MODULES,
     MAX_TABLE_ELEMENTS,
 };
 use crate::commands::wasm::{
-    compiled_command_module, fibers, guest_memory::GuestMemory, threads, Host,
+    compiled_command_module, dynamic::DEFAULT_LIBRARY_DIRECTORIES, fibers,
+    guest_memory::GuestMemory, threads, Host,
 };
 use crate::vfs::{resolve_against, NodeKind, Vfs, VfsError, PATH_MAX};
 use sha2::{Digest, Sha256};
@@ -201,7 +203,11 @@ fn dependency_path(
         .rsplit_once('/')
         .map(|(parent, _)| if parent.is_empty() { "/" } else { parent })
         .unwrap_or("/");
-    for directory in paths {
+    for directory in paths
+        .iter()
+        .map(String::as_str)
+        .chain(DEFAULT_LIBRARY_DIRECTORIES)
+    {
         let directory = runtime_directory(directory, origin)?;
         if directory.len().saturating_add(name.len()).saturating_add(1) >= PATH_MAX {
             return Err(Error::msg("dylink dependency path exceeds VFS limit"));
@@ -311,7 +317,8 @@ impl Graph {
         let mut dependencies = Vec::with_capacity(layout.needed.len());
         for name in &layout.needed {
             // Prepay each bounded path expansion and VFS lookup, including fallback.
-            let search_cost = (layout.runtime_paths.len() as u64 + 1)
+            let search_cost = (layout.runtime_paths.len() as u64)
+                .saturating_add(DEFAULT_LIBRARY_DIRECTORIES.len() as u64)
                 .saturating_mul(PATH_MAX as u64)
                 .saturating_mul(16);
             if !caller
@@ -590,7 +597,8 @@ pub(super) async fn startup(
     let mut graph = Graph::default();
     let mut roots = Vec::with_capacity(thread.executable.needed.len());
     for name in &thread.executable.needed {
-        let search_cost = (thread.executable.runtime_paths.len() as u64 + 1)
+        let search_cost = (thread.executable.runtime_paths.len() as u64)
+            .saturating_add(DEFAULT_LIBRARY_DIRECTORIES.len() as u64)
             .saturating_mul(PATH_MAX as u64)
             .saturating_mul(16);
         if !store.data().machine.get().resources.charge_cpu(search_cost) {
@@ -639,7 +647,7 @@ mod tests {
     #[test]
     fn dependency_search_uses_importer_origin_order_and_guest_vfs_only() {
         let mut vfs = Vfs::new();
-        for directory in ["/pkg/lib", "/other", "/lib"] {
+        for directory in ["/pkg/lib", "/other", "/lib", "/usr/local/lib"] {
             vfs.mkdir_all("/", directory).unwrap();
             vfs.write("/", &format!("{directory}/provider.so"), b"wasm", 0o644)
                 .unwrap();
@@ -703,5 +711,16 @@ mod tests {
             )
             .is_err());
         }
+        vfs.remove_file("/", "/lib/provider.so").unwrap();
+        assert_eq!(
+            dependency_path(&vfs, "/pkg/extension.so", &[], "provider.so").unwrap(),
+            "/usr/local/lib/provider.so"
+        );
+        vfs.mkdir_all("/", "/lib/provider.so").unwrap();
+        assert!(dependency_path(&vfs, "/pkg/extension.so", &[], "provider.so").is_err());
+        vfs.remove_all("/", "/lib/provider.so").unwrap();
+        vfs.symlink("/", "/lib/provider.so", "/lib/provider.so")
+            .unwrap();
+        assert!(dependency_path(&vfs, "/pkg/extension.so", &[], "provider.so").is_err());
     }
 }
