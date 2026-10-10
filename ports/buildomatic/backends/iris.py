@@ -5,6 +5,17 @@ ready nodes within the active build use the worker pool concurrently. Submit,
 Get and Cancel never wait for a build to finish. Worker actors are private and
 external clients use the controller's authenticated scoped-capability proxy.
 Iris actors deserialize Python objects, so capability holders are trusted peers.
+
+Outputs are cache objects; publication is a separate caller workflow. The service
+automatically acknowledges worker results after terminal refs and available
+diagnostic tails are durable. Caller acknowledgement records consumption without deleting
+those journals. At most 4096 accepted builds and worker replacements are retained
+per service; GetLogs returns the newest 64 tails with at most 64 KiB total bytes.
+
+Iris timeouts lease each task attempt, rather than an eternal service. Restarting
+the coordinator resets its lease within its bounded retry policy. Get and blob
+signing require a live coordinator capability endpoint, even though journals
+survive task expiry. Expiry does not prove that partitioned processes were reaped.
 """
 
 from __future__ import annotations
@@ -60,6 +71,10 @@ class IrisConfig:
     ``setup_scripts`` installs only the caller's required runtime into the task
     image. Empty scripts require an image with Iris and Rigging already present.
     Pin ``task_image`` to a digest for reproducible compiler environments.
+    ``job_seconds`` leases each Iris task attempt, including worker tasks. Its
+    24-hour default leaves room for admitted four-hour actions and task setup;
+    callers can set a shorter explicit lease for smoke tests. Get and signing
+    require a live service. Lease expiry alone never authorizes worker retirement.
     """
 
     service_id: str
@@ -74,7 +89,7 @@ class IrisConfig:
     worker_max_files: int = 100000
     worker_cpu_seconds: int = 3600
     worker_log_bytes: int = 8 * 1024**2
-    job_seconds: int = 3600
+    job_seconds: int = 24 * 3600
     task_image: str | None = None
     setup_scripts: tuple[str, ...] = ("uv sync --no-dev --no-install-project",)
     compiler_cache: bool = False
@@ -132,22 +147,6 @@ def _decode_request(data: bytes) -> BuildRequest:
         for action in value["actions"]
     )
     return BuildRequest(value["idempotency_key"], actions, value["max_workers"])
-
-
-class _RetiredWorker:
-    """Historical registration solely for core retirement, never an endpoint."""
-
-    def submit(self, attempt):
-        raise RuntimeError("retired worker cannot execute")
-
-    def poll(self, attempt_id):
-        raise RuntimeError("retired worker cannot execute")
-
-    def cancel(self, attempt_id):
-        raise RuntimeError("retired worker cannot execute")
-
-    def acknowledge(self, attempt_id):
-        raise RuntimeError("retired worker cannot execute")
 
 
 class WorkerPool:
@@ -366,6 +365,11 @@ class CoordinatorService:
         return self.get(build_id)
 
     def acknowledge(self, build_id: str) -> None:
+        """Record caller consumption; worker cleanup proceeds automatically.
+
+        Final cache refs and diagnostic journals remain readable. This method
+        neither publishes products nor promises a cache retention lifetime.
+        """
         self._control(build_id, "acknowledged")
 
     def _control(self, build_id: str, flag: str) -> None:
@@ -405,12 +409,12 @@ class CoordinatorService:
     def tick_once(self) -> None:
         """Advance the oldest unfinished build, skipping terminal builds without ack."""
         with self._drive_lock:
-            if not self._workers:
-                return
             index, _ = self._index()
             # Process control for queued builds too, without dispatching their
             # nodes while another build owns the worker pool.
             for record in index["builds"]:
+                if record.get("done"):
+                    continue
                 found = self._store.read_journal(f"{self._base}/control/{record['id']}.json")
                 if found is None:
                     continue
@@ -420,8 +424,10 @@ class CoordinatorService:
                     coordinator.cancel()
                 if intent.get("acknowledged") and coordinator.result().state.value in _TERMINAL:
                     self._fence_workers(record["id"], coordinator)
-                    self._release(record["id"], coordinator)
+                    record["done"] = self._release(record["id"], coordinator)
             for record in index["builds"]:
+                if record.get("done"):
+                    continue
                 coordinator = self._coordinator(record["id"], record["request"])
                 if coordinator.result().state.value in _TERMINAL:
                     self._fence_workers(record["id"], coordinator)
@@ -445,14 +451,11 @@ class CoordinatorService:
         for worker_id in self._retired_workers:
             if worker_id in fenced:
                 continue
-            # Register the historical identity before retirement, including on
-            # recovery when it was never assigned in this particular build.
-            # Its endpoint is never callable and its ID cannot be scheduled.
-            coordinator.workers[worker_id] = _RetiredWorker()
-            try:
+            # A pool retirement may belong to another build. Ask core whether
+            # this identity was registered or assigned here, without inspecting
+            # its private journal or inserting a callable placeholder.
+            if coordinator.knows_worker(worker_id):
                 coordinator.worker_lost(worker_id)
-            finally:
-                del coordinator.workers[worker_id]
             fenced.add(worker_id)
 
     def _release(self, build_id, coordinator):
@@ -463,6 +466,31 @@ class CoordinatorService:
             # Core retries uncertain acknowledgements, keeping outputs retained
             # until the worker confirms cleanup without delaying the next build.
             coordinator.tick()
+        if not coordinator.cleanup_complete():
+            return False
+        self._mark_done(build_id)
+        self._coordinators.pop(build_id, None)
+        self._fenced_workers.pop(build_id, None)
+        self._released.discard(build_id)
+        return True
+
+    def _mark_done(self, build_id):
+        """Persist scheduler completion only after core confirms every worker ack."""
+        from ports.buildomatic import ConditionalWriteError
+
+        with self._lock:
+            for _ in range(16):
+                index, version = self._index()
+                record = next(record for record in index["builds"] if record["id"] == build_id)
+                if record.get("done"):
+                    return
+                record["done"] = True
+                try:
+                    self._store.write_journal(self._index_key, _encode(index), version)
+                except ConditionalWriteError:
+                    continue
+                return
+        raise ConditionalWriteError("completion index remained contended")
 
 
 class _CoordinatorActor:
@@ -618,7 +646,11 @@ def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = No
             )
         )
         result["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] = "true" if virtual else "false"
-    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION") or routing.get("client_kwargs", {}).get("region_name")
+    region = (
+        environ.get("AWS_REGION")
+        or environ.get("AWS_DEFAULT_REGION")
+        or routing.get("client_kwargs", {}).get("region_name")
+    )
     if region:
         result["SCCACHE_REGION"] = region
     return result
@@ -821,9 +853,13 @@ class _CapabilityRPC:
             try:
                 response = self._client.call(request)
             except ConnectError as error:
-                message = error.message.replace(self._address, "[capability]").replace(self._token, "[token]")
+                message = error.message.replace(self._address, "[capability]")
+                if self._token:
+                    message = message.replace(self._token, "[token]")
                 raise ConnectError(error.code, message) from None
             except Exception as error:
+                # Non-Connect failures intentionally escape Iris's transport
+                # retry policy, with secret-bearing exception text discarded.
                 raise RuntimeError(f"Iris actor transport failed: {type(error).__name__}") from None
             return unwrap_actor_response(response)
 

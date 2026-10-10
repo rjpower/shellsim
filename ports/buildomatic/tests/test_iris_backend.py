@@ -43,8 +43,8 @@ from ports.buildomatic.backends.iris import (
     _CapabilityRPC,
     _deployed_files,
     _entrypoint,
-    _WorkerActor,
     _worker_environment,
+    _WorkerActor,
     compiler_cache_environment,
     connection_descriptor,
 )
@@ -590,6 +590,81 @@ def test_service_accepts_while_worker_identities_are_pending(service_parts):
     assert all(not worker.submitted for worker in workers.values())
 
 
+def test_service_persists_done_and_never_reopens_completed_history(service_parts, monkeypatch):
+    store, workers = service_parts
+    service = CoordinatorService(store, "done", workers)
+    build = service.submit(request())
+    service.tick_once()
+    for worker in workers.values():
+        worker.finish()
+    service.tick_once()
+    assert json.loads(store.read_journal("iris/done/index.json").data)["builds"][0]["done"]
+    assert not service._coordinators
+    journal = store.read_journal(f"iris/done/builds/{build}.json")
+    reads = []
+    original = store.read_journal
+
+    def read(key):
+        reads.append(key)
+        return original(key)
+
+    monkeypatch.setattr(store, "read_journal", read)
+    recovered = CoordinatorService(store, "done", workers)
+    recovered.tick_once()
+    recovered.tick_once()
+    assert reads == ["iris/done/index.json", "iris/done/index.json"]
+    assert not recovered._coordinators
+    assert original(f"iris/done/builds/{build}.json") == journal
+    assert recovered.get(build).state == BuildState.SUCCEEDED
+
+
+def test_service_done_waits_for_confirmed_worker_ack(service_parts, monkeypatch):
+    store, workers = service_parts
+    original_ack = workers["worker-0"].acknowledge
+
+    def uncertain(attempt_id):
+        raise ConnectionError()
+
+    monkeypatch.setattr(workers["worker-0"], "acknowledge", uncertain)
+    service = CoordinatorService(store, "uncertain", workers)
+    first = service.submit(request())
+    second = service.submit(request("next"))
+    service.tick_once()
+    for worker in workers.values():
+        worker.finish()
+    service.tick_once()
+    records = json.loads(store.read_journal("iris/uncertain/index.json").data)["builds"]
+    assert not records[0].get("done")
+    assert service.get(first).state == BuildState.SUCCEEDED
+    assert service.get(second).state == BuildState.RUNNING
+    monkeypatch.setattr(workers["worker-0"], "acknowledge", original_ack)
+    recovered = CoordinatorService(store, "uncertain", workers)
+    recovered.tick_once()
+    assert json.loads(store.read_journal("iris/uncertain/index.json").data)["builds"][0]["done"]
+
+
+def test_confirmed_last_worker_loss_and_cancellation_advance_without_capacity(service_parts):
+    store, workers = service_parts
+    old = workers["worker-0"]
+    service = CoordinatorService(store, "no-ready", {"old": old})
+    lost = service.submit(BuildRequest("lost", (Action("lost", ("true",), max_attempts=1),)))
+    pending = service.submit(BuildRequest("pending", (Action("pending", ("true",)),)))
+    cancelled = service.submit(BuildRequest("cancelled", (Action("cancelled", ("true",)),)))
+    service.tick_once()
+    assert len(old.submitted) == 1
+    service.update_workers({}, ("old",))
+    service.cancel(cancelled)
+    service.tick_once()
+    assert service.get(lost).state == BuildState.FAILED
+    assert service.get(cancelled).state == BuildState.CANCELLED
+    assert service.get(pending).state == BuildState.PENDING
+    replacement = Worker(old.bundle)
+    service.update_workers({"fresh": replacement}, ("old",))
+    service.tick_once()
+    assert service.get(pending).state == BuildState.RUNNING
+    assert len(replacement.submitted) == 1
+
+
 def test_service_duplicate_key_conflict_and_worker_limit(service_parts):
     store, workers = service_parts
     service = CoordinatorService(store, "test", workers)
@@ -829,90 +904,15 @@ def test_compiler_cache_preserves_worker_region_endpoint_and_ttl():
         compiler_cache_environment("file:///tmp/cache", {})
 
 
-@pytest.mark.parametrize(
-    "values",
-    [{"workers": 0}, {"workers": 33}, {"worker_cpu": float("inf")}, {"tick_seconds": 0}, {"service_id": "../escape"}],
-)
-def test_iris_config_resource_and_name_bounds(values):
-    with pytest.raises(ValueError):
-        IrisConfig(**{"service_id": "test", **values})
-
-
-def test_public_connection_descriptor_matches_cli_schema_and_omits_runtime_secrets():
-    config = IrisConfig("test", setup_scripts=("private-runtime-token",))
-    descriptor = connection_descriptor(config, SimpleNamespace(job_id="/power/service"))
-    assert set(descriptor) == {
-        "schema_version",
-        "job_id",
-        "cluster_name",
-        "controller_url",
-        "prefix",
-        "cache_prefix",
-        "service_id",
-        "task_image",
-        "config_sha256",
-        "workspace",
-    }
-    assert descriptor["schema_version"] == 1
-    assert descriptor["job_id"] == "/power/service"
-    assert descriptor["cluster_name"] == "marin"
-    assert descriptor["controller_url"] == "https://iris.oa.dev"
-    assert descriptor["service_id"] == config.service_id
-    assert "private-runtime-token" not in json.dumps(descriptor)
-    assert len(descriptor["config_sha256"]) == 64
-    with pytest.raises(ValueError):
-        connection_descriptor(
-            config, SimpleNamespace(job_id="/power/service"), controller_url="https://host/proxy/t/token"
-        )
-
-
-def test_capability_transport_never_logs_url_and_sanitizes_errors(monkeypatch, caplog):
-    address = "https://controller/proxy/t/sensitive-token/actor"
-    modules = {}
-    for name in (
-        "iris.rpc.actor_connect",
-        "iris.rpc.compression",
-        "iris.actor.client",
-        "iris.rpc.errors",
-        "iris.rpc",
-        "cloudpickle",
-        "connectrpc.errors",
-    ):
-        modules[name] = ModuleType(name)
-        monkeypatch.setitem(sys.modules, name, modules[name])
-
-    class ConnectError(Exception):
-        def __init__(self, code, message):
-            self.code, self.message = code, message
-            super().__init__(message)
-
-    def unavailable(request):
-        raise ConnectError("unavailable", f"failed {address}")
-
-    modules["connectrpc.errors"].ConnectError = ConnectError
-    modules["iris.rpc.actor_connect"].ActorServiceClientSync = lambda **kwargs: SimpleNamespace(call=unavailable)
-    modules["iris.rpc.compression"].IRIS_RPC_COMPRESSIONS = ()
-    modules["iris.rpc.compression"].IRIS_RPC_ZSTD = None
-    modules["iris.actor.client"].unwrap_actor_response = lambda value: value
-    modules["iris.rpc.errors"].call_with_retry = lambda name, invoke, **kwargs: invoke()
-    modules["iris.rpc"].actor_pb2 = SimpleNamespace(ActorCall=lambda **kwargs: SimpleNamespace(**kwargs))
-    modules["cloudpickle"].dumps = lambda value: b"serialized"
-    actor = _CapabilityRPC(address, "sensitive-token", "user/service/coordinator", 30)
-    assert "sensitive-token" not in repr(actor)
-    with pytest.raises(ConnectError) as raised:
-        actor.call("Get", "build")
-    assert raised.value.code == "unavailable"
-    assert "sensitive-token" not in str(raised.value)
-    assert address not in str(raised.value)
-    assert "sensitive-token" not in caplog.text
-
-
 def test_compiler_cache_keeps_path_style_and_rejects_secret_endpoints():
     env = compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "http://127.0.0.1:9000"})
     assert env["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] == "false"
-    assert compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "https://cwobject.com"})[
-        "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"
-    ] == "true"
+    assert (
+        compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "https://cwobject.com"})[
+            "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"
+        ]
+        == "true"
+    )
     with pytest.raises(ValueError):
         compiler_cache_environment("s3://bucket/cache", {"AWS_ENDPOINT_URL": "https://user:secret@host"})
 
@@ -960,3 +960,83 @@ def test_worker_cache_uses_pinned_binary_private_uds_and_routed_settings(tmp_pat
     else:
         assert env["SCCACHE_GCS_RW_MODE"] == "READ_WRITE"
         assert not configured
+
+
+@pytest.mark.parametrize(
+    "values",
+    [{"workers": 0}, {"workers": 33}, {"worker_cpu": float("inf")}, {"tick_seconds": 0}, {"service_id": "../escape"}],
+)
+def test_iris_config_resource_and_name_bounds(values):
+    with pytest.raises(ValueError):
+        IrisConfig(**{"service_id": "test", **values})
+
+
+def test_public_connection_descriptor_matches_cli_schema_and_omits_runtime_secrets():
+    config = IrisConfig("test", setup_scripts=("private-runtime-token",))
+    descriptor = connection_descriptor(config, SimpleNamespace(job_id="/power/service"))
+    assert set(descriptor) == {
+        "schema_version",
+        "job_id",
+        "cluster_name",
+        "controller_url",
+        "prefix",
+        "cache_prefix",
+        "service_id",
+        "task_image",
+        "config_sha256",
+        "workspace",
+    }
+    assert descriptor["schema_version"] == 1
+    assert descriptor["job_id"] == "/power/service"
+    assert descriptor["cluster_name"] == "marin"
+    assert descriptor["controller_url"] == "https://iris.oa.dev"
+    assert descriptor["service_id"] == config.service_id
+    assert "private-runtime-token" not in json.dumps(descriptor)
+    assert len(descriptor["config_sha256"]) == 64
+    with pytest.raises(ValueError):
+        connection_descriptor(
+            config, SimpleNamespace(job_id="/power/service"), controller_url="https://host/proxy/t/token"
+        )
+
+
+@pytest.mark.parametrize("token", ["sensitive-token", ""])
+def test_capability_transport_never_logs_url_and_sanitizes_errors(monkeypatch, caplog, token):
+    address = "https://controller/proxy/t/sensitive-token/actor"
+    modules = {}
+    for name in (
+        "iris.rpc.actor_connect",
+        "iris.rpc.compression",
+        "iris.actor.client",
+        "iris.rpc.errors",
+        "iris.rpc",
+        "cloudpickle",
+        "connectrpc.errors",
+    ):
+        modules[name] = ModuleType(name)
+        monkeypatch.setitem(sys.modules, name, modules[name])
+
+    class ConnectError(Exception):
+        def __init__(self, code, message):
+            self.code, self.message = code, message
+            super().__init__(message)
+
+    def unavailable(request):
+        raise ConnectError("unavailable", f"failed {address}")
+
+    modules["connectrpc.errors"].ConnectError = ConnectError
+    modules["iris.rpc.actor_connect"].ActorServiceClientSync = lambda **kwargs: SimpleNamespace(call=unavailable)
+    modules["iris.rpc.compression"].IRIS_RPC_COMPRESSIONS = ()
+    modules["iris.rpc.compression"].IRIS_RPC_ZSTD = None
+    modules["iris.actor.client"].unwrap_actor_response = lambda value: value
+    modules["iris.rpc.errors"].call_with_retry = lambda name, invoke, **kwargs: invoke()
+    modules["iris.rpc"].actor_pb2 = SimpleNamespace(ActorCall=lambda **kwargs: SimpleNamespace(**kwargs))
+    modules["cloudpickle"].dumps = lambda value: b"serialized"
+    actor = _CapabilityRPC(address, token, "user/service/coordinator", 30)
+    assert "sensitive-token" not in repr(actor)
+    with pytest.raises(ConnectError) as raised:
+        actor.call("Get", "build")
+    assert raised.value.code == "unavailable"
+    assert "sensitive-token" not in str(raised.value)
+    assert address not in str(raised.value)
+    assert raised.value.message == "failed [capability]"
+    assert "sensitive-token" not in caplog.text
