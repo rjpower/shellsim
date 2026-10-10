@@ -108,7 +108,7 @@ class BuildCohort:
         return ABI
 
     @property
-    def toolchain_receipt(self) -> dict[str, str]:
+    def toolchain_receipt(self) -> dict[str, object]:
         """Identify the actual compiler and platform products used by a node."""
         return {
             "cohort": self.identity,
@@ -116,6 +116,7 @@ class BuildCohort:
             "abi": self.dynamic_abi,
             "compiler": self.llvm.sha256,
             "platform": self.sysroot.sha256,
+            "sdk": self.sysroot.contents["identity"]["recipe"]["sdk"],
         }
 
     def compiler(self, *, cxx: bool = False) -> Path:

@@ -145,7 +145,7 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     from ports._support.cohort import BuildCohort, Receipt, resolved_toolchain
     from ports.native import dependencies
 
-    recipe = {"name": "admitted-producer"}
+    recipe = {"name": "admitted-producer", "sdk": {"version": "34.0", "sha256": "7" * 64}}
 
     def product(name, digest):
         root = tmp_path / name
@@ -165,6 +165,7 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     target = runner._native_target(resolved)
     assert target.toolchain["compiler"] == bootstrap_compiler.sha256
     assert target.toolchain["platform"] == bootstrap_platform.sha256
+    assert target.toolchain["sdk"] == bootstrap_platform.contents["identity"]["recipe"]["sdk"]
     assert target.toolchain["cohort"] == resolved.identity != original.identity
 
     port = Port("native/example/recipe.json", tmp_path, "example", "1", "1" * 64, (), {"tests": [{"kind": "native"}]})
