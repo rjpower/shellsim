@@ -26,14 +26,40 @@ target NumPy headers and OpenBLAS exports. Shared linking treats warnings as
 errors and validates imported function signatures against provider exports;
 packaging requires an actual OpenBLAS dependency reference.
 
-The complete extension build, wheel packaging and public package installation
-have succeeded. Numerical acceptance remains pending: guest import reaches
-Ducc's thread-pool initialization and requires the real SDK `pthread_atfork`
-implementation in the selected libc. The prior artifacts remain intact while
-the corrected runtime cohort is prepared.
-The checked-in probe covers BLAS, real and complex solves, Schur decomposition,
-Sylvester equations, trust-krylov optimization, sparse eigenvalues and solves,
-spline interpolation, a Python integration callback and Ducc FFT round trips
-with `workers=2`, compared against NumPy. It also checks invalid
-solve dimensions, singular LAPACK factorization status and invalid LAPACK input.
-These expanded paths have not yet passed in the SciPy guest.
+## Build and use
+
+Build `python/scipy/graph-recipe.json` with the [graph command](../../README.md#build-and-check-a-port-graph)
+and `--check` to run its declared guest probes. Select a threaded CPython cohort
+whose image has the recipe-declared 256 MiB linear-memory ceiling.
+
+Install the resulting release through the public package interface:
+
+```python
+from shellsim import Environment, Limits
+
+env = Environment.from_release(
+    "release/release.json",
+    pypi=["scipy==1.18.0"],
+    limits=Limits(cpu=100_000_000_000, memory=4 * 1024**3, disk=768 * 1024**2),
+)
+result = env.run_python(
+    "from scipy.linalg import solve; print(solve([[3., 1.], [1., 2.]], [9., 8.]))"
+)
+assert result.returncode == 0, result.stderr
+```
+
+The recipe uses these budgets for acceptance.
+The total guest budget covers the interpreter, compiled extension images and
+filesystem allocations. The runtime currently prepays the image's declared
+linear-memory maximum; raising the total budget does not change that maximum.
+OpenBLAS needs a 32 MiB scratch allocation in addition to imported modules and
+thread stacks.
+
+## Behavioral checks
+
+The port probe covers BLAS, real and complex solves, Schur decomposition,
+Sylvester equations, HiGHS linear optimization, trust-krylov optimization,
+sparse eigenvalues and solves, spline interpolation, a Python integration
+callback and Ducc FFT round trips with `workers=2`, compared against NumPy.
+It also checks invalid solve dimensions, singular LAPACK factorization status
+and invalid LAPACK input.
