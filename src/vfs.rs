@@ -4,6 +4,8 @@
 //! `BTreeMap<path, Node>` keyed by clean absolute paths ("/" is the root). This keeps
 //! directory listing, rename, copy and snapshotting trivial at the scale of an RL task
 //! (thousands of files), while still supporting unix permissions, ownership and symlinks.
+//! Node identities are allocated monotonically and survive rename, open-unlink and snapshots;
+//! copying or replacing a node allocates a new identity independently of its pathname.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -92,6 +94,8 @@ pub enum NodeKind {
 
 #[derive(Clone, Debug)]
 pub struct Node {
+    /// Stable identity allocated by the owning virtual filesystem; zero is reserved.
+    pub inode: u64,
     pub kind: NodeKind,
     pub mode: Mode,
     pub uid: u32,
@@ -101,8 +105,9 @@ pub struct Node {
 }
 
 impl Node {
-    fn dir(mode: Mode, mtime: u64) -> Self {
+    fn dir(inode: u64, mode: Mode, mtime: u64) -> Self {
         Node {
+            inode,
             kind: NodeKind::Dir,
             mode,
             uid: 0,
@@ -110,8 +115,9 @@ impl Node {
             mtime,
         }
     }
-    fn file(data: Vec<u8>, mode: Mode, mtime: u64) -> Self {
+    fn file(inode: u64, data: Vec<u8>, mode: Mode, mtime: u64) -> Self {
         Node {
+            inode,
             kind: NodeKind::File(data),
             mode,
             uid: 0,
@@ -188,6 +194,7 @@ pub struct Vfs {
     /// Unlinked files retained by open descriptions until their last close.
     orphaned: BTreeMap<u64, Node>,
     next_orphan: u64,
+    next_inode: u64,
     /// Wall-clock timestamp assigned to subsequent content mutations.  The environment updates
     /// this immediately before an effect; the VFS never consults the host clock.
     mutation_time_ms: u64,
@@ -290,12 +297,13 @@ impl Vfs {
 
     pub fn with_disk_limit(disk_limit: u64) -> Self {
         let mut nodes = BTreeMap::new();
-        nodes.insert("/".to_string(), Node::dir(0o755, 0));
+        nodes.insert("/".to_string(), Node::dir(1, 0o755, 0));
         let disk_used = logical_usage(&nodes);
         Vfs {
             nodes,
             orphaned: BTreeMap::new(),
             next_orphan: 1,
+            next_inode: 2,
             mutation_time_ms: 0,
             disk_limit,
             baseline_dirs: std::collections::BTreeSet::new(),
@@ -304,6 +312,20 @@ impl Vfs {
             disk_peak: disk_used,
             read_bytes: Cell::new(0),
         }
+    }
+
+    fn check_inode_capacity(&self, count: usize) -> Result<()> {
+        self.next_inode
+            .checked_add(count as u64)
+            .ok_or(VfsError::NoSpace)?;
+        Ok(())
+    }
+
+    fn allocate_inode(&mut self) -> Result<u64> {
+        self.check_inode_capacity(1)?;
+        let inode = self.next_inode;
+        self.next_inode += 1;
+        Ok(inode)
     }
 
     pub fn disk_used(&self) -> u64 {
@@ -340,8 +362,9 @@ impl Vfs {
     pub(crate) fn seed_dirs<const N: usize>(&mut self, paths: [&str; N]) {
         for path in paths {
             let path = normalize(path);
+            let inode = self.allocate_inode().expect("base image inode capacity");
             self.nodes
-                .insert(path.clone(), Node::dir(0o755, self.mutation_time_ms));
+                .insert(path.clone(), Node::dir(inode, 0o755, self.mutation_time_ms));
             self.baseline_dirs.insert(path);
         }
         self.refresh_usage();
@@ -439,11 +462,14 @@ impl Vfs {
             .fold(0u64, |usage, _| usage.saturating_add(NODE_OVERHEAD))
     }
 
-    fn insert_directories(&mut self, additions: Vec<String>) {
+    fn insert_directories(&mut self, additions: Vec<String>) -> Result<()> {
+        self.check_inode_capacity(additions.len())?;
         for path in additions {
+            let inode = self.allocate_inode()?;
             self.nodes
-                .insert(path, Node::dir(0o755, self.mutation_time_ms));
+                .insert(path, Node::dir(inode, 0o755, self.mutation_time_ms));
         }
+        Ok(())
     }
 
     fn measured_usage(&self) -> u64 {
@@ -875,9 +901,10 @@ impl Vfs {
                 *mtime = self.mutation_time_ms;
             }
             _ => {
+                let inode = self.allocate_inode()?;
                 self.nodes.insert(
                     target,
-                    Node::file(data.to_vec(), mode, self.mutation_time_ms),
+                    Node::file(inode, data.to_vec(), mode, self.mutation_time_ms),
                 );
             }
         }
@@ -914,9 +941,10 @@ impl Vfs {
                 *mtime = self.mutation_time_ms;
             }
             _ => {
+                let inode = self.allocate_inode()?;
                 self.nodes.insert(
                     target,
-                    Node::file(data.to_vec(), mode, self.mutation_time_ms),
+                    Node::file(inode, data.to_vec(), mode, self.mutation_time_ms),
                 );
             }
         }
@@ -993,7 +1021,7 @@ impl Vfs {
             return Err(VfsError::Exists(path.to_string()));
         }
         self.require_parent_dir(&target)?;
-        let node = Node::dir(0o755, self.mutation_time_ms);
+        let node = Node::dir(self.allocate_inode()?, 0o755, self.mutation_time_ms);
         let used = self.usage_after_adding(self.node_usage(&target, &node))?;
         self.nodes.insert(target, node);
         self.record_usage(used);
@@ -1010,7 +1038,7 @@ impl Vfs {
         if used > self.disk_limit {
             return Err(VfsError::NoSpace);
         }
-        self.insert_directories(additions);
+        self.insert_directories(additions)?;
         self.record_usage(used);
         Ok(())
     }
@@ -1237,6 +1265,7 @@ impl Vfs {
             let target = self.write_target(cwd, to)?;
             self.require_parent_dir(&target)?;
             let node = Node {
+                inode: self.allocate_inode()?,
                 kind: NodeKind::NativeExecutable(program),
                 mode: source.mode,
                 uid: source.uid,
@@ -1301,8 +1330,10 @@ impl Vfs {
             }
         }
         let used = self.usage_after_delta(delta)?;
+        self.check_inode_capacity(subtree.len())?;
         for k in subtree {
             let mut node = self.nodes.get(&k).unwrap().clone();
+            node.inode = self.allocate_inode()?;
             if !preserve {
                 node.mtime = self.mutation_time_ms;
             }
@@ -1321,6 +1352,7 @@ impl Vfs {
         }
         self.require_parent_dir(&link_target)?;
         let node = Node {
+            inode: self.allocate_inode()?,
             kind: NodeKind::Symlink(target.to_string()),
             mode: 0o777,
             uid: 0,
@@ -1340,7 +1372,7 @@ impl Vfs {
             return Ok(());
         }
         self.require_parent_dir(&target)?;
-        let node = Node::file(Vec::new(), 0o644, mtime);
+        let node = Node::file(self.allocate_inode()?, Vec::new(), 0o644, mtime);
         let used = self.usage_after_adding(self.node_usage(&target, &node))?;
         self.nodes.insert(target, node);
         self.record_usage(used);
@@ -1416,9 +1448,11 @@ impl Vfs {
         if used > self.disk_limit {
             return Err(VfsError::NoSpace);
         }
-        self.insert_directories(additions);
+        self.check_inode_capacity(additions.len().saturating_add(1))?;
+        self.insert_directories(additions)?;
+        let inode = self.allocate_inode()?;
         self.nodes
-            .insert(norm, Node::file(data, mode, self.mutation_time_ms));
+            .insert(norm, Node::file(inode, data, mode, self.mutation_time_ms));
         self.record_usage(used);
         Ok(())
     }
@@ -1426,9 +1460,11 @@ impl Vfs {
     /// Install a trusted native image at a virtual executable path in the base environment.
     pub(crate) fn seed_native_executable(&mut self, abs: &str, program: NativeProgram) {
         let norm = normalize(abs);
+        let inode = self.allocate_inode().expect("base image inode capacity");
         self.nodes.insert(
             norm.clone(),
             Node {
+                inode,
                 kind: NodeKind::NativeExecutable(program),
                 mode: 0o755,
                 uid: 0,
@@ -1489,6 +1525,49 @@ fn node_payload_len(node: &Node) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inode_identity_tracks_nodes_across_mutation_clone_and_unlink() {
+        let mut vfs = Vfs::new();
+        vfs.put_file("/file", b"old".to_vec(), 0o644).unwrap();
+        let original = vfs.metadata("/", "/file", true).unwrap().inode;
+        assert_ne!(original, 0);
+        vfs.write("/", "/file", b"new", 0o600).unwrap();
+        vfs.rename("/", "/file", "/renamed").unwrap();
+        assert_eq!(vfs.metadata("/", "/renamed", true).unwrap().inode, original);
+        assert_eq!(
+            vfs.clone().metadata("/", "/renamed", true).unwrap().inode,
+            original
+        );
+        let orphan = vfs.unlink_open_file("/", "/renamed").unwrap();
+        assert_eq!(vfs.orphan_metadata(orphan).unwrap().inode, original);
+        vfs.put_file("/renamed", b"replacement".to_vec(), 0o644)
+            .unwrap();
+        assert_ne!(vfs.metadata("/", "/renamed", true).unwrap().inode, original);
+        let replacement = vfs.metadata("/", "/renamed", true).unwrap().inode;
+        vfs.put_file("/renamed", b"reinstalled".to_vec(), 0o644)
+            .unwrap();
+        assert_ne!(
+            vfs.metadata("/", "/renamed", true).unwrap().inode,
+            replacement
+        );
+        vfs.mkdir_all("/", "/tree/child").unwrap();
+        let directory = vfs.metadata("/", "/tree", true).unwrap().inode;
+        vfs.copy_recursive("/", "/tree", "/copy", true).unwrap();
+        assert_ne!(vfs.metadata("/", "/copy", true).unwrap().inode, directory);
+    }
+
+    #[test]
+    fn inode_exhaustion_rejects_bulk_creation_before_mutation() {
+        let mut vfs = Vfs::new();
+        vfs.next_inode = u64::MAX - 1;
+        assert!(matches!(
+            vfs.put_file("/a/b", vec![], 0o644),
+            Err(VfsError::NoSpace)
+        ));
+        assert!(!vfs.exists("/", "/a"));
+        assert_eq!(vfs.next_inode, u64::MAX - 1);
+    }
+
     #[test]
     fn resize_preserves_data_and_unlinked_identity_and_rolls_back_disk_failure() {
         let mut vfs = super::Vfs::with_disk_limit(4096);

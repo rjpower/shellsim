@@ -14,11 +14,38 @@
   "build": {
     "adapter": "python-extension",
     "module": "pycosat",
-    "sources": ["pycosat.c"],
+    "sources": [
+      "pycosat.c"
+    ],
     "metadata": "PKG-INFO",
-    "licenses": ["LICENSE", "AUTHORS.md"],
-    "defines": ["NGETRUSAGE"],
+    "licenses": [
+      "LICENSE",
+      "AUTHORS.md"
+    ],
+    "defines": [
+      "NGETRUSAGE"
+    ],
     "native_dependencies": []
   },
-  "tests": [{"kind": "python", "script": "tests/probes/operations.py"}]
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "role": "target-library",
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ]
 }

@@ -81,5 +81,20 @@
         "lib/wasm32-wasip1-threads/libsetjmp.a"
       ]
     }
+  ],
+  "role": "target-library",
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
   ]
 }

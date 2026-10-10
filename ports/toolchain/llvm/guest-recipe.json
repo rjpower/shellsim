@@ -1,0 +1,222 @@
+{
+  "version": "23.1.0rc3",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "linkage": "static",
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "build_scripts": [
+    {
+      "file": "guest.py",
+      "sha256": "137a62f2702d8cd4995d0fae8795fe70e0937fb58af7251a642c5a1054cad88d"
+    },
+    {
+      "file": "build.py",
+      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
+    },
+    {
+      "file": "compiler.py",
+      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ],
+  "name": "clang",
+  "kind": "native-tool",
+  "role": "guest-tool",
+  "source": {
+    "commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
+    "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
+    "sha256": "b4525499be9ccd65a0da8c9efbeb59a5955130b302a190a51883727d8c5c7542"
+  },
+  "patches": [
+    {
+      "file": "serial-memory-init.patch",
+      "sha256": "1b9d4bfc5c1b5d8145909b7859d94bcd212cb47cb04f604a4565eedd8bc62522",
+      "inputs": {
+        "lld/wasm/Writer.cpp": "03cdcbb741e269ce0288f004d75f14c45d3ec6693c104deca0bc2deb75b27af0",
+        "lld/wasm/Config.h": "e6424ba7e8b92441a3e368deeb5c19bbea56fcdcf95b65a05fa064852db58c25",
+        "lld/wasm/Options.td": "810c507a046c67062a88fc6e0187bc2ca474f0cc899b946b8937be16aa4edf7e",
+        "lld/wasm/Driver.cpp": "b3496c5f79ce39996c4fdc073a3c9accdf635ed0560a3cb60245e781cf9f64b2"
+      }
+    },
+    {
+      "file": "deferred-shared-init.patch",
+      "sha256": "3fdc5588b00a481c13b8aa315cb1eff0507dd82df508fcc855265d2940ef14f7",
+      "inputs": {
+        "lld/wasm/Config.h": "db84ad5f9a92614d214cc046726edc4b934b4514f21961bd02754ca02c5c40a4",
+        "lld/wasm/Options.td": "1ff48f1f60f256e0c2e6c91142d7e15c278c990aa9de964325bf2f6f483cdb8d",
+        "lld/wasm/Driver.cpp": "76e848d69355c732c34daec586b2d7ef4673be38e2a14ba0c8908233ad0843c0",
+        "lld/wasm/Writer.cpp": "d0ac99e8eae1187bd835d3aaab7011dc8189d1f6200073643a3f9ce3856a9c19",
+        "lld/wasm/SyntheticSections.cpp": "de0eb848c32b26fd6e57262dafcef00c91f56d768ed9b58b7fdf224450c17622"
+      }
+    },
+    {
+      "file": "llvm-wasi-dynamic-tls.patch",
+      "sha256": "393441b4b3e85faf93badae7ad152a6e8b11a9f6138f71dbea0923114d21649f",
+      "inputs": {
+        "llvm/lib/Target/WebAssembly/WebAssemblyISelLowering.cpp": "4e33c6df76cc32cacbeac45f7f03562f61567d83d1a138233e1a8222077223fa"
+      }
+    },
+    {
+      "file": "main-tls-exports.patch",
+      "sha256": "e0fbee17b79a28833e89494b55da2ad340984f6c2b926ebafaa3b14c927d3c64",
+      "inputs": {
+        "lld/wasm/Config.h": "0d1c923bfcaff7bbbb4c22937afa1ff9a62f65f584e22fad20026e4e732a7296",
+        "lld/wasm/Driver.cpp": "cae03917f2e1eeac3d1f1d7e20135ac0ab78cececa406672622690a759891b22",
+        "lld/wasm/Options.td": "1c04d302078a3adf032dbdbebd5f75daa0543ec291a7995dc080acc2995c2f78",
+        "lld/wasm/SyntheticSections.cpp": "6d806f6d168a2e48584db64ca1da7cae460bb0f04ca14a79517ea237f8d17f60"
+      }
+    },
+    {
+      "file": "guest-wasi.patch",
+      "sha256": "aceae42917de4a57e27215ec334c75e088af34a562dc830361041755e33bd8da",
+      "inputs": {
+        "llvm/include/llvm/ADT/bit.h": "b3c8320299cc6a422b50793ed73d3a6e4dd4353d09878beac5d87d2ac600876d",
+        "llvm/lib/Support/ProgramStack.cpp": "97b4944057da163aa50f3a1597fef296535369db34ccf7ad6bb65d97ae4b1847",
+        "llvm/lib/Support/LockFileManager.cpp": "9904822bc869485782f9f28be4abf15171e5ea7150180dc0009b4b0393feb928",
+        "llvm/lib/Support/CrashRecoveryContext.cpp": "220f6204b6169f811cdae655d0644c67dff41c2b201258fcf3300ae859576432",
+        "llvm/lib/Support/raw_socket_stream.cpp": "b1054fe3f62a173dbc0e4eaece845ab3c2307dafa051e2616d3bf7c610125f38",
+        "llvm/lib/Support/Unix/Process.inc": "969c4a820e0ebbe197d6aeb07ada489056fe8520a621ee6befbbfc520b4c2c19",
+        "llvm/lib/Support/Unix/Program.inc": "33b3c3cd324fba24815b37704a124db6b31d4c966f5a4e307ba7f6ba8db587dc",
+        "llvm/lib/Support/Unix/Path.inc": "4eb29bfcf362f99f2c1cf8b0088da05e759ee66115b726724877983153e6ffa7",
+        "llvm/lib/Support/Unix/Signals.inc": "462bb0fdf8510d5d1fdc2462dec6deccc14fd36a976c978e1ad6b108937c3901",
+        "llvm/lib/Support/Unix/Watchdog.inc": "2842394de68bcd926f22cc3976ce1968ce3bf214a0be6d96f7bf2465fe0b725b",
+        "llvm/lib/Support/Unix/Memory.inc": "cc0d9fdeb4eebc10da8b0cff37d61221d7b7e65249f16e1f80717705e34cb61a",
+        "lld/tools/lld/CMakeLists.txt": "8853af7bf63b1d4c1e620adb28d7d2858f8b1881b5e3237429f2efcbbf5e4c02",
+        "lld/tools/lld/lld.cpp": "f35f6cf82397874b3b1e149b8e3986fbe50ecee449eda601fbc2ec5f21e999a0"
+      }
+    },
+    {
+      "file": "tls-reloc-symbol.patch",
+      "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117",
+      "inputs": {
+        "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
+        "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
+      }
+    }
+  ],
+  "build": {
+    "adapter": "llvm-guest",
+    "jobs": 8
+  },
+  "build_limits": {
+    "compile_jobs": 8,
+    "link_jobs": 1,
+    "address_space_bytes_per_process": 12884901888,
+    "command_timeout_seconds": 3600
+  },
+  "target_dependencies": [
+    {
+      "port": "native/shellsim-posix",
+      "version": "1",
+      "recipe": "native/shellsim-posix/recipe.json"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "toolchain/wasi-development",
+      "version": "34.0.0",
+      "recipe": "toolchain/llvm/guest-sdk-recipe.json"
+    }
+  ],
+  "exports": {
+    "tools": [
+      "bin/clang",
+      "bin/clang++",
+      "bin/lld",
+      "bin/wasm-ld",
+      "bin/llvm-ar",
+      "bin/llvm-ranlib",
+      "bin/llvm-nm",
+      "bin/llvm-objcopy",
+      "bin/llvm-strip",
+      "bin/cc",
+      "bin/c++",
+      "bin/ar",
+      "bin/ranlib",
+      "bin/nm",
+      "bin/objcopy",
+      "bin/strip"
+    ],
+    "configs": [
+      "bin/clang.cfg",
+      "bin/clang++.cfg"
+    ],
+    "licenses": [
+      "licenses/LLVM-LICENSE.txt"
+    ]
+  },
+  "install": {
+    "kind": "build-tool",
+    "destinations": {
+      "bin/clang.cfg": "/usr/bin/clang.cfg",
+      "bin/clang++.cfg": "/usr/bin/clang++.cfg",
+      "bin/clang": "/usr/bin/clang",
+      "bin/clang++": "/usr/bin/clang++",
+      "bin/lld": "/usr/bin/lld",
+      "bin/wasm-ld": "/usr/bin/wasm-ld",
+      "bin/llvm-ar": "/usr/bin/llvm-ar",
+      "bin/llvm-ranlib": "/usr/bin/llvm-ranlib",
+      "bin/llvm-nm": "/usr/bin/llvm-nm",
+      "bin/llvm-objcopy": "/usr/bin/llvm-objcopy",
+      "bin/llvm-strip": "/usr/bin/llvm-strip",
+      "bin/cc": "/usr/bin/cc",
+      "bin/c++": "/usr/bin/c++",
+      "bin/ar": "/usr/bin/ar",
+      "bin/ranlib": "/usr/bin/ranlib",
+      "bin/nm": "/usr/bin/nm",
+      "bin/objcopy": "/usr/bin/objcopy",
+      "bin/strip": "/usr/bin/strip"
+    }
+  },
+  "features": {
+    "host_execution": false,
+    "languages": [
+      "C",
+      "C++"
+    ],
+    "llvm_internal_threads": false,
+    "target_backends": [
+      "WebAssembly"
+    ],
+    "link_formats": [
+      "WebAssembly"
+    ],
+    "asynchronous_signal_callbacks": false,
+    "sockets": false,
+    "process_memory_limits": false,
+    "timed_child_wait": false
+  },
+  "tests": [
+    {
+      "kind": "shell",
+      "script": "tests/guest-compiler.sh"
+    }
+  ],
+  "test_limits": {
+    "cpu": 500000000000,
+    "memory": 8589934592,
+    "disk": 402653184
+  }
+}

@@ -70,6 +70,24 @@ def test_single_string_range_and_recipe_alias(catalog):
     assert env.run("test -x /usr/local/bin/alias").returncode == 0
 
 
+@pytest.mark.parametrize(
+    "destination",
+    ["/usr/lib/python3.13/lib-dynload/zlib.so", "/usr/lib/../../../work/zlib.so", "/usr/library/zlib.so"],
+)
+def test_system_library_exports_require_canonical_install_paths(catalog, destination):
+    add, universe, _ = catalog
+    record = add("module")
+    record["destinations"] = {"tool": destination}
+    env = shellsim.Environment()
+    if destination == "/usr/lib/python3.13/lib-dynload/zlib.so":
+        universe().install(env, "module")
+        assert env.read_file(destination) == b"module1"
+        return
+    with pytest.raises(ValueError):
+        universe().install(env, "module")
+    assert env.run("test ! -e /work/zlib.so").returncode == 0
+
+
 def test_global_constraints_backtrack(catalog):
     add, universe, _ = catalog
     add("provider", "1")

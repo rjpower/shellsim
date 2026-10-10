@@ -63,3 +63,84 @@ have the declared direct providers in their emitted dependency list. The
 artifact envelope retains the original graph recipe and digest separately from
 the effective recipe with expanded exact file exports. Source and cache
 admission stay with the runner.
+
+Graph recipes distinguish host build programs (`role: host-tool`), target
+libraries (`target-library`), installed guest programs (`guest-tool`), and target
+platform inputs (`target-platform`). Existing recipes without `role` are target
+libraries. `build_dependencies`, `target_dependencies`, `runtime_dependencies`,
+and `platform_dependencies` select exact `{port, version, recipe}` providers.
+Build edges select host tools; platform edges select target platforms. Target
+edges supply link prefixes. Runtime edges supply installed guest requirements
+and retain their artifact identities without entering the link prefix.
+
+Native builds declare `toolchain/llvm/host-recipe.json` as a build dependency
+and `toolchain/wasi_threads/graph-recipe.json` as a platform dependency. These
+small graph recipes pin the existing immutable producer recipes. The runner
+verifies their products and provides the selected compiler, sysroot and library
+prefixes to adapters. The SDK resource directory remains the admitted source of
+compiler-rt builtins, which the host LLVM product does not build.
+
+`--bootstrap` names a JSON descriptor with `schema_version: 1`,
+`archive: {path, sha256}`, `work`, and `tools` containing exact `cc`, `cxx`,
+`cmake` and `ninja` entries `{path, sha256}`. Paths resolve relative to that
+file. The graph calls the LLVM producer with these explicit seed inputs;
+verified products in its persistent workspace are reused. Without a bootstrap,
+the graph verifies and selects the cohort's existing compiler product.
+
+An in-tree platform source can declare `source.files` as a list of exact
+`{path, destination, sha256}` entries. Paths are relative to the ports tree;
+destinations are relative to the isolated source directory. `source.sha256`
+pins the canonical file list. Only the admitted bytes are staged, and they are
+verified before any cached build is reused.
+
+Configure/make recipes may declare `build.configure_environment` for
+`ac_cv_*` answers and `CFLAGS`, `CXXFLAGS`, `CPPFLAGS`, `LDFLAGS`, or `LIBS`.
+`build.build_args` supplies explicit make arguments to build and install.
+These fields cannot replace the admitted compiler, archive tools, shell or PATH.
+
+`llvm-guest` receives the pinned archive directly and owns LLVM source expansion,
+patching and verification. Its persistent workspace binds source, patches,
+compiler and generator bytes, platform, dependencies and host build tools.
+Driver or configuration changes reconfigure the same compatible Ninja tree;
+immutable graph results still bind the complete implementation identity.
+`--workspace RECIPE=PATH` selects the actual retained Ninja build directory.
+The producer state, source and snapshots live in its parent directory, and the
+producer verifies their exact inputs before reuse. Without an override, the
+runner selects a compatible generated workspace and its `build` directory.
+Other adapters currently reject this option.
+`llvm-guest-sdk` stages admitted target development data without running a
+compiler and requires its explicit platform dependency.
+
+A trusted cohort descriptor pins the historical CPython manifest in full.
+Admission verifies its runtime files, headers, sysroot build profile and matching
+assembled interpreter. Its recipe must match the accepted Python source, patches,
+version, ABI and every other policy field. Historical Python driver and JSON
+metadata hashes remain provenance in that pinned manifest; their current pins
+govern new builds. The declared input paths must match exactly, and compiled
+facade sources, headers and patches must retain their current accepted hashes.
+
+The `wasi-sysroot` platform node invokes the pinned libc producer when
+`--platform-bootstrap` supplies a schema-1 descriptor with `sdk_archive` and
+`libc_archive` objects (`path`, `sha256`) and a `work` path. Paths are relative to
+the descriptor. The node consumes its explicit host LLVM build dependency and
+cohort-admitted CMake/Ninja tools. A complete existing workspace product is
+reused only after exact recipe, compiler, tool and output-byte verification.
+Without bootstrap archives, the explicit cohort platform receipt is reused.
+Guest LLVM workspace compatibility tracks compiler and generator bytes and
+consumed headers; changed linker tools or archives update verified snapshots
+at stable paths and trigger relinking. Result identities still bind all files.
+
+Each native graph node seals a resolved toolchain receipt with the actual
+compiler and platform manifest hashes. Its cohort identity derives from the
+input cohort and those two receipts. Graph acceptance retains that per-node
+context and compiles probes with the same selected compiler and sysroot; it
+also records the resolved receipts in `graph.json`. Bootstrap-selected products
+therefore cannot retain the original cohort toolchain label.
+
+Port checks may declare `test_limits` with positive integer `cpu`, `memory` and
+`disk` guest budgets. Omitted fields retain the public environment defaults.
+The harness caps declarations at one trillion CPU units, 16 GiB memory and 2 GiB
+disk, and records the effective explicit budget in the acceptance receipt.
+These budgets allow compiler and SDK checks to include installation and execution
+costs. Temporary release materialization lives under the proof directory and is
+removed after the checks.

@@ -2,8 +2,15 @@
 #ifndef SHELLSIM_WASI_EXEC_PORT_H
 #define SHELLSIM_WASI_EXEC_PORT_H
 #include <sys/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 int execve(const char *path, char *const argv[], char *const environment[]);
 int execv(const char *path, char *const argv[]);
 int execvp(const char *path, char *const argv[]);
 pid_t wait(int *status);
+#ifdef __cplusplus
+}
+#endif
 #endif

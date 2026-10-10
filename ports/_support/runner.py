@@ -14,7 +14,7 @@ import subprocess
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Sequence
+from typing import TYPE_CHECKING, Mapping, Sequence
 
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, plan
@@ -28,7 +28,7 @@ from ports._support.python_adapters import (
 )
 from ports._support.store import build_slot, extract, fetch, file_hash, relative_path
 
-_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py")
+_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "cohort.py", "local_sources.py")
 _NATIVE_BUILD_MODULES = (
     "native_adapters.py",
     "native_artifacts.py",
@@ -39,7 +39,7 @@ _NATIVE_BUILD_MODULES = (
 _PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
 
 if TYPE_CHECKING:
-    from ports._support.cohort import BuildCohort
+    from ports._support.cohort import BuildCohort, CompilerBootstrap, PlatformBootstrap
 
 
 @dataclass(frozen=True)
@@ -48,6 +48,14 @@ class GraphBuild:
 
     graph: Graph
     results: dict[str, Path]
+    cohorts: dict[str, BuildCohort]
+
+
+def _native_target(cohort: BuildCohort):
+    """Use the same resolved products for sealing and acceptance closure checks."""
+    from ports._support.native_artifacts import NativeTarget
+
+    return NativeTarget(cohort.target, cohort.dynamic_abi, cohort.dynamic_abi, cohort.toolchain_receipt)
 
 
 def _local_file(port: Port, name: object) -> Path:
@@ -61,9 +69,26 @@ def _local_file(port: Port, name: object) -> Path:
 def _admit_recipe(port: Port) -> dict[str, str]:
     build = port.recipe.get("build", {})
     adapter = build.get("adapter")
-    if adapter not in {"pure-wheel", "python-extension", *(item.value for item in NativeAdapter)}:
+    if adapter in {"llvm-host", "wasi-sysroot"}:
+        expected_role = "host-tool" if adapter == "llvm-host" else "target-platform"
+        if port.role != expected_role:
+            raise ValueError("toolchain adapter role differs")
+        path = _local_file(port, build["producer_recipe"])
+        if file_hash(path) != build["producer_sha256"]:
+            raise ValueError("toolchain producer recipe differs")
+        from ports._support.build import check_build_scripts
+
+        check_build_scripts(json.loads(path.read_text()), port.directory)
+        return {build["producer_recipe"]: build["producer_sha256"]}
+    if adapter not in {
+        "pure-wheel",
+        "python-extension",
+        "llvm-guest",
+        "llvm-guest-sdk",
+        *(item.value for item in NativeAdapter),
+    }:
         raise ValueError(f"recipe has no supported build adapter: {port.reference}")
-    if adapter != "pure-wheel":
+    if adapter not in {"pure-wheel", "llvm-guest", "llvm-guest-sdk"} and "files" not in port.recipe["source"]:
         relative_path(port.recipe["source"]["subdirectory"])
     files = {}
     for item in [*port.recipe.get("patches", []), *build.get("hooks", [])]:
@@ -115,12 +140,15 @@ def _build_implementation(support: Path, adapter: str) -> dict[str, str]:
     modules = [*_COMMON_BUILD_MODULES]
     if adapter == "pure-wheel":
         modules.extend(_PURE_BUILD_MODULES)
+    elif adapter in {"llvm-guest", "llvm-guest-sdk"}:
+        modules.extend(("build.py", "toolchain/llvm/guest.py", *_NATIVE_BUILD_MODULES))
     elif adapter == "python-extension":
         modules.extend(("build.py", "python_adapters.py", *_NATIVE_BUILD_MODULES))
     else:
         modules.extend(("build.py", *_NATIVE_BUILD_MODULES))
     return {
-        name: file_hash(support.parent / name if name.startswith("native/") else support / name) for name in modules
+        name: file_hash(support.parent / name if name.startswith(("native/", "toolchain/")) else support / name)
+        for name in modules
     }
 
 
@@ -151,11 +179,13 @@ def build_graph(
     *,
     offline: bool = False,
     jobs: int | None = None,
+    bootstrap: CompilerBootstrap | None = None,
+    platform_bootstrap: PlatformBootstrap | None = None,
+    workspaces: Mapping[str, Path] | None = None,
 ) -> GraphBuild:
     """Build each selected recipe once, reusing only byte-verified cache entries."""
     from ports._support.native_artifacts import (
         NativeArtifact,
-        NativeTarget,
         merge_dependency_sysroot,
         seal_native_install,
     )
@@ -163,76 +193,164 @@ def build_graph(
     if jobs is not None and not 1 <= jobs <= 16:
         raise ValueError("build jobs must be between one and sixteen")
     graph = plan(ports, requests, target_profile=cohort.dynamic_abi)
+    selected = {port.reference: port for port in graph.ports}
+    for reference in workspaces or {}:
+        if reference not in selected or selected[reference].recipe["build"]["adapter"] != "llvm-guest":
+            raise ValueError("explicit workspace requires a selected persistent producer: " + reference)
     local_inputs = {port.reference: _admit_recipe(port) for port in graph.ports}
-    if any(port.recipe["build"]["adapter"] != "pure-wheel" for port in graph.ports):
-        cohort.compiler()  # Refuse an incomplete cohort before fetching any source.
+    from ports._support.local_sources import local_source_files, stage_local_sources
+
+    for port in graph.ports:
+        if "files" in port.recipe.get("source", {}):
+            local_source_files(ports, port.recipe["source"])
+    for port in graph.ports:
+        if port.recipe["build"]["adapter"] in {"pure-wheel", "llvm-host", "wasi-sysroot"}:
+            continue
+        if (
+            len(
+                [
+                    item
+                    for item in port.dependencies
+                    if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
+                ]
+            )
+            != 1
+        ):
+            raise ValueError(f"native build requires an explicit host compiler dependency: {port.reference}")
+        if len([item for item in port.dependencies if item.kind == "platform"]) != 1:
+            raise ValueError(f"native build requires an explicit target platform dependency: {port.reference}")
     support = Path(__file__).parent
     implementations = {
         adapter: _build_implementation(support, adapter)
-        for adapter in {port.recipe["build"]["adapter"] for port in graph.ports}
+        for adapter in {port.recipe["build"]["adapter"] for port in graph.ports} - {"llvm-host", "wasi-sysroot"}
     }
     results: dict[str, Path] = {}
     native: dict[str, NativeArtifact] = {}
     keys: dict[str, str] = {}
-    target = NativeTarget(
-        cohort.target,
-        cohort.dynamic_abi,
-        cohort.dynamic_abi,
-        {"cohort": cohort.identity, "target": cohort.target, "abi": cohort.dynamic_abi},
-    )
+    products = {}
+    cohorts = {}
     for port in graph.ports:
         adapter = port.recipe["build"]["adapter"]
+        if adapter in {"llvm-host", "wasi-sysroot"}:
+            from ports._support.cohort import resolve_compiler, resolve_platform, verify_product
+            from ports._support.store import identity
+
+            product = (
+                resolve_compiler(cohort, bootstrap)
+                if adapter == "llvm-host"
+                else resolve_platform(cohort, products["toolchain/llvm/host-recipe.json"], platform_bootstrap)
+            )
+            verify_product(product)
+            producer_path = _local_file(port, port.recipe["build"]["producer_recipe"])
+            if product.contents["identity"]["recipe"] != json.loads(producer_path.read_text()):
+                raise ValueError("graph product producer differs from declared recipe")
+            products[port.reference] = product
+            results[port.reference] = product.root
+            keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
+            continue
+        build_cohort = cohort
+        if adapter != "pure-wheel":
+            from ports._support.cohort import resolved_toolchain
+
+            sysroot = next(products[item.recipe] for item in port.dependencies if item.kind == "platform")
+            compiler = next(
+                products[item.recipe]
+                for item in port.dependencies
+                if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
+            )
+            build_cohort = resolved_toolchain(cohort, compiler, sysroot)
+            target = _native_target(build_cohort)
+        cohorts[port.reference] = build_cohort
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
             "implementation": implementations[adapter],
             "cohort": cohort.identity,
-            "dependencies": {dependency.port: keys[dependency.recipe] for dependency in port.dependencies},
+            "dependencies": {
+                dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
+            },
         }
-        if adapter != "pure-wheel":
+        if adapter not in {"pure-wheel", "llvm-guest-sdk"}:
             inputs["target_flags"] = {
-                "compiler": list(cohort.compiler_flags),
-                "linker": list(cohort.linker_flags),
-                "shared_library": list(cohort.shared_library_flags),
-                "executable": list(cohort.executable_flags),
+                "compiler": list(build_cohort.compiler_flags),
+                "linker": list(build_cohort.linker_flags),
+                "shared_library": list(build_cohort.shared_library_flags),
+                "executable": list(build_cohort.executable_flags),
             }
         with build_slot(store, inputs) as slot:
             keys[port.reference] = slot.key
             if not slot.cached:
                 recipe, build = port.recipe, port.recipe["build"]
-                source = fetch(recipe["source"], store / "sources", offline=offline)
+                source = (
+                    stage_local_sources(ports, recipe["source"], slot.work / "source")
+                    if "files" in recipe["source"]
+                    else fetch(recipe["source"], store / "sources", offline=offline)
+                )
                 if build["adapter"] == "pure-wheel":
                     build_pure_wheel(PureWheelBuildRequest(source, slot.result, recipe))
                 else:
-                    source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
-                    for patch in recipe.get("patches", []):
-                        apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
+                    if adapter != "llvm-guest" and "files" not in recipe["source"]:
+                        source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
+                    if adapter != "llvm-guest":
+                        for patch in recipe.get("patches", []):
+                            apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
                     for dependency in port.dependencies:
-                        if dependency.port.startswith("native/") and dependency.port not in native:
+                        if (
+                            dependency.kind == "target"
+                            and dependency.port.startswith("native/")
+                            and dependency.port not in native
+                        ):
                             raise ValueError(f"native dependency has no sealed artifact: {dependency.port}")
                     direct = {
                         dependency.port: native[dependency.port]
                         for dependency in port.dependencies
-                        if dependency.port in native
+                        if dependency.kind == "target" and dependency.port in native
                     }
-                    prefix = slot.work / "dependencies"
+                    workspace = slot.work
+                    build_directory = workspace / "build"
+                    if adapter == "llvm-guest":
+                        from ports._support.store import identity
+                        from ports.toolchain.llvm.guest import workspace_compatibility
+
+                        compatibility = workspace_compatibility(
+                            recipe,
+                            compiler,
+                            sysroot.root / "sysroot",
+                            cohort.sdk.root,
+                            {name: artifact.prefix for name, artifact in direct.items()},
+                            {name: tool.path for name, tool in cohort.host_tools.items()},
+                            build_cohort.target,
+                        )
+                        build_directory = (
+                            workspaces[port.reference].resolve()
+                            if workspaces is not None and port.reference in workspaces
+                            else store.resolve() / "workspaces" / "llvm-guest" / identity(compatibility) / "build"
+                        )
+                        workspace = build_directory.parent
+                    prefix = workspace / "dependencies"
+                    if adapter == "llvm-guest" and prefix.exists():
+                        shutil.rmtree(prefix)
                     merge_dependency_sysroot(direct, native, prefix, target)
                     context = NativeBuildContext(
                         source=source,
-                        build=slot.work / "build",
+                        build=build_directory,
                         staging_prefix=slot.work / "install",
-                        sdk=cohort.sdk.root,
-                        compiler_prefix=cohort.llvm.root,
-                        sysroot=cohort.sysroot.root / "sysroot",
+                        sdk=build_cohort.sdk.root,
+                        compiler_prefix=build_cohort.llvm.root,
+                        sysroot=build_cohort.sysroot.root / "sysroot",
                         target=cohort.target,
-                        compiler_flags=cohort.compiler_flags,
-                        linker_flags=cohort.linker_flags,
+                        compiler_flags=(*build_cohort.compiler_flags, "-I" + str(prefix / "usr/local/include"))
+                        if direct
+                        else build_cohort.compiler_flags,
+                        linker_flags=(*build_cohort.linker_flags, "-L" + str(prefix / "usr/local/lib"))
+                        if direct
+                        else build_cohort.linker_flags,
                         dependencies={name: artifact.prefix for name, artifact in direct.items()},
                         host_tools={name: tool.path for name, tool in cohort.host_tools.items()},
-                        target_tools={name: tool.path for name, tool in cohort.target_tools.items()},
+                        target_tools={name: tool.path for name, tool in build_cohort.target_tools.items()},
                         dependency_sysroot=prefix,
-                        shared_library_flags=cohort.shared_library_flags,
-                        executable_flags=cohort.executable_flags,
+                        shared_library_flags=build_cohort.shared_library_flags,
+                        executable_flags=build_cohort.executable_flags,
                     )
                     _hooks(port, "before_build", context, cohort)
                     if build["adapter"] == "python-extension":
@@ -257,17 +375,28 @@ def build_graph(
                         _hooks(port, "after_install", context, cohort)
                         shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
                     else:
-                        output = build_native(
-                            NativeBuildRequest(
-                                NativeAdapter(build["adapter"]),
-                                context,
-                                _strings(build, "configure_args"),
-                                _strings(build, "build_targets"),
-                                _strings(build, "install_targets", ("install",)),
-                                jobs if jobs is not None else build.get("jobs", 1),
-                                PurePosixPath(build.get("install_prefix", "/usr/local")),
+                        if adapter == "llvm-guest-sdk":
+                            from ports.toolchain.llvm.guest import install_guest_sdk
+
+                            output = install_guest_sdk(context, recipe)
+                        elif adapter == "llvm-guest":
+                            from ports.toolchain.llvm.guest import build_guest
+
+                            output = build_guest(context, recipe, compiler, jobs=jobs)
+                        else:
+                            output = build_native(
+                                NativeBuildRequest(
+                                    NativeAdapter(build["adapter"]),
+                                    context,
+                                    _strings(build, "configure_args"),
+                                    _strings(build, "build_targets"),
+                                    _strings(build, "install_targets", ("install",)),
+                                    jobs if jobs is not None else build.get("jobs", 1),
+                                    PurePosixPath(build.get("install_prefix", "/usr/local")),
+                                    build.get("configure_environment", {}),
+                                    _strings(build, "build_args"),
+                                )
                             )
-                        )
                         _hooks(port, "after_install", context, cohort)
                         _source_exports(port, context)
                         seal_native_install(
@@ -278,14 +407,17 @@ def build_graph(
                             target,
                             direct,
                             native,
+                            {item.port: native[item.port] for item in port.dependencies if item.kind == "runtime"},
                         )
         result = store.resolve() / "results" / keys[port.reference]
         results[port.reference] = result
         if (result / "native").exists():
             from ports.native.dependencies import verify_artifact
 
-            native["native/" + port.name] = NativeArtifact(result / "native", verify_artifact(result / "native"))
-    return GraphBuild(graph, results)
+            native[PurePosixPath(port.reference).parts[0] + "/" + port.name] = NativeArtifact(
+                result / "native", verify_artifact(result / "native")
+            )
+    return GraphBuild(graph, results, cohorts)
 
 
 def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
@@ -295,6 +427,7 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
     the complete shared-provider closure before publishing the directory.
     """
     from ports._support.catalog import compose
+    from ports._support.native_catalog import publish_native_catalog
     from ports._support.wasm_metadata import needed_libraries
     from ports.native.dependencies import verify_artifact
     from ports.python.cpython.release import build_release
@@ -310,6 +443,8 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         (raw / "providers").mkdir()
         packages, providers = [], []
         for port in build.graph.ports:
+            if port.role in {"host-tool", "target-platform"}:
+                continue
             result = build.results[port.reference]
             for wheel in sorted((result / "wheels").glob("*.whl")):
                 destination = raw / "wheels" / wheel.name
@@ -351,13 +486,16 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
         }
         (raw / "catalog.json").write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
         combined = compose(cohort.python.runtime_bundle, [raw], Path(temporary) / "catalog")
-        return build_release(cohort.python.runtime_bundle, combined, cohort.tool("uv"), output)
+        native_catalog = publish_native_catalog(build.graph, build.results, Path(temporary) / "native")
+        return build_release(
+            cohort.python.runtime_bundle, combined, cohort.tool("uv"), output, native_catalog=native_catalog
+        )
 
 
 def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, output: Path) -> None:
     """Run every selected port's declared guest checks against the graph release."""
     from ports._support.acceptance import AcceptanceRequest, accept_port
-    from ports._support.native_artifacts import NativeArtifact, NativeTarget, merge_dependency_sysroot
+    from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot
     from ports.native.dependencies import verify_artifact
 
     output = output.absolute()
@@ -365,32 +503,35 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
         raise FileExistsError(output)
     native = {}
     for port in build.graph.ports:
+        if port.role in {"host-tool", "target-platform"}:
+            continue
         prefix = build.results[port.reference] / "native"
         if prefix.exists():
-            native["native/" + port.name] = NativeArtifact(prefix, verify_artifact(prefix))
-    target = NativeTarget(
-        cohort.target,
-        cohort.dynamic_abi,
-        cohort.dynamic_abi,
-        {"cohort": cohort.identity, "target": cohort.target, "abi": cohort.dynamic_abi},
-    )
+            native[port.reference.split("/", 1)[0] + "/" + port.name] = NativeArtifact(prefix, verify_artifact(prefix))
     for port in build.graph.ports:
+        if port.role in {"host-tool", "target-platform"}:
+            continue
+        build_cohort = build.cohorts[port.reference]
         proof = output / Path(port.reference).with_suffix("")
-        kind = "native" if port.reference.startswith("native/") else "pypi"
+        identity = port.reference.split("/", 1)[0] + "/" + port.name
+        kind = "native" if identity in native else "pypi"
         dependencies = None
         if kind == "native":
-            if "native/" + port.name not in native:
+            if identity not in native:
                 raise ValueError(f"native port has no sealed artifact: {port.reference}")
-            dependencies = proof.parent / (proof.name + "-dependencies")
-            merge_dependency_sysroot(
-                {"native/" + port.name: native["native/" + port.name]}, native, dependencies, target
-            )
-        accept_port(AcceptanceRequest(port, descriptor, proof, kind, cohort, dependencies))
+            if any(test["kind"] == "native" for test in port.recipe.get("tests", [])):
+                dependencies = proof.parent / (proof.name + "-dependencies")
+                target = _native_target(build_cohort)
+                merge_dependency_sysroot({identity: native[identity]}, native, dependencies, target)
+        accept_port(AcceptanceRequest(port, descriptor, proof, kind, build_cohort, dependencies))
     (output / "graph.json").write_text(
         json.dumps(
             {
                 "release_sha256": file_hash(descriptor),
                 "cohort": cohort.identity,
+                "resolved_toolchains": {
+                    reference: resolved.toolchain_receipt for reference, resolved in sorted(build.cohorts.items())
+                },
                 "recipes": {port.reference: port.digest for port in build.graph.ports},
                 "builds": {name: path.name for name, path in build.results.items()},
             },
@@ -409,6 +550,17 @@ def main() -> None:
     parser.add_argument("--ports", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--cohort", type=Path, required=True)
     parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument(
+        "--platform-bootstrap", type=Path, help="explicit pinned SDK/libc archives and producer workspace"
+    )
+    parser.add_argument("--bootstrap", type=Path, help="explicit pinned host LLVM seed inputs")
+    parser.add_argument(
+        "--workspace",
+        action="append",
+        default=[],
+        metavar="RECIPE=PATH",
+        help="actual compatible retained Ninja build directory; producer state lives in its parent",
+    )
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
@@ -416,17 +568,42 @@ def main() -> None:
     args = parser.parse_args()
     if args.check and args.output is None:
         parser.error("--check requires --output")
+    workspaces = {}
+    for declaration in args.workspace:
+        reference, separator, directory = declaration.partition("=")
+        if not separator or not reference or not directory:
+            parser.error("--workspace requires RECIPE=PATH")
+        reference = relative_path(reference)
+        if not reference.endswith(".json"):
+            reference += "/recipe.json"
+        if reference in workspaces:
+            parser.error("duplicate --workspace recipe")
+        workspaces[reference] = Path(directory)
     cohort = load_cohort(args.cohort)
     if args.check:
         for port in plan(args.ports, args.recipes, target_profile=cohort.dynamic_abi).ports:
+            if port.role in {"host-tool", "target-platform"}:
+                continue
             tests = port.recipe.get("tests")
             if not isinstance(tests, list) or not 1 <= len(tests) <= 32:
                 raise ValueError(f"port has no declared guest acceptance: {port.reference}")
             for test in tests:
-                if not isinstance(test, dict) or test.get("kind") not in {"python", "native"}:
+                if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
                     raise ValueError("unsupported guest test kind")
-                _local_file(port, test.get("script" if test["kind"] == "python" else "source"))
-    result = build_graph(args.ports, args.recipes, cohort, args.store, offline=args.offline, jobs=args.jobs)
+                _local_file(port, test.get("source" if test["kind"] == "native" else "script"))
+    from ports._support.cohort import load_bootstrap, load_platform_bootstrap
+
+    result = build_graph(
+        args.ports,
+        args.recipes,
+        cohort,
+        args.store,
+        offline=args.offline,
+        jobs=args.jobs,
+        bootstrap=load_bootstrap(args.bootstrap) if args.bootstrap else None,
+        platform_bootstrap=load_platform_bootstrap(args.platform_bootstrap) if args.platform_bootstrap else None,
+        workspaces=workspaces,
+    )
     if args.output is not None:
         if args.check:
             if args.output.exists() or args.output.is_symlink():

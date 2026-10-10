@@ -1,6 +1,6 @@
 {
   "name": "llvm-wasi-compiler",
-  "version": "23-sdk34-threaded-compiler-1",
+  "version": "23-sdk34-threaded-compiler-2",
   "source": {
     "commit": "895aa2c896ada719451be2e3673c83da8ddf1141",
     "url": "https://codeload.github.com/llvm/llvm-project/tar.gz/895aa2c896ada719451be2e3673c83da8ddf1141",
@@ -51,6 +51,14 @@
         "lld/wasm/Options.td": "1c04d302078a3adf032dbdbebd5f75daa0543ec291a7995dc080acc2995c2f78",
         "lld/wasm/SyntheticSections.cpp": "6d806f6d168a2e48584db64ca1da7cae460bb0f04ca14a79517ea237f8d17f60"
       }
+    },
+    {
+      "file": "tls-reloc-symbol.patch",
+      "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117",
+      "inputs": {
+        "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
+        "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
+      }
     }
   ],
   "build_limits": {
@@ -62,7 +70,7 @@
   "build_scripts": [
     {
       "file": "compiler.py",
-      "sha256": "ec0ac152fb1deced7bc4823004bb04fb4a27be3616e24fed3f85719dc09d616f"
+      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
     },
     {
       "file": "build.py",
@@ -87,6 +95,10 @@
     {
       "file": "../../_support/build.py",
       "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "tls-reloc-symbol.patch",
+      "sha256": "94bdfa7892ace87078cd9fc95cbc2da397a2dffab896b0db2feea6a51a060117"
     }
   ],
   "main_tls_protocol": {

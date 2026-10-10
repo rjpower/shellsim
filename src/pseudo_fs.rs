@@ -213,6 +213,53 @@ pub fn read(env: &Environment, cwd: &str, path: &str) -> Option<crate::vfs::Resu
     })
 }
 
+/// Separate pseudo-device identities encode finite node kinds and virtual PID/FD numbers.
+/// No pathname hash or host identity participates in this namespace.
+fn inode(env: &Environment, cwd: &str, path: &str, follow: bool) -> u64 {
+    let path = absolute_path(env, cwd, path, follow);
+    let fixed = match path.as_str() {
+        "/dev" => 1,
+        "/dev/null" => 2,
+        "/dev/random" => 3,
+        "/dev/urandom" => 4,
+        "/dev/zero" => 5,
+        "/dev/stdin" => 6,
+        "/dev/stdout" => 7,
+        "/dev/stderr" => 8,
+        "/proc" => 9,
+        "/proc/self" => 10,
+        "/proc/uptime" => 11,
+        "/proc/meminfo" => 12,
+        "/proc/cpuinfo" => 13,
+        "/proc/version" => 14,
+        "/proc/mounts" => 15,
+        _ => 0,
+    };
+    if fixed != 0 {
+        return fixed;
+    }
+    let rest = path.strip_prefix("/proc/").expect("known pseudo node");
+    let (pid, leaf) = rest.split_once('/').unwrap_or((rest, ""));
+    let pid = pid.parse::<u32>().expect("known virtual process");
+    let kind = match leaf {
+        "" => 1,
+        "cwd" => 2,
+        "cmdline" => 3,
+        "environ" => 4,
+        "fd" => 5,
+        "status" => 6,
+        _ => {
+            (1_u64 << 31)
+                | leaf
+                    .strip_prefix("fd/")
+                    .expect("known descriptor")
+                    .parse::<u64>()
+                    .expect("known virtual descriptor")
+        }
+    };
+    (u64::from(pid) << 32) | kind
+}
+
 /// Return generated metadata for a pseudo node.
 pub fn metadata(
     env: &Environment,
@@ -229,6 +276,7 @@ pub fn metadata(
             PseudoNode::Error(error) => return Err(error),
         };
         Ok(Node {
+            inode: inode(env, cwd, path, follow),
             kind,
             mode,
             uid: 0,

@@ -609,6 +609,15 @@ mod tests {
             unreachable!("native writer does not read")
         }
 
+        fn read_at(
+            &self,
+            _fd: i32,
+            _offset: u64,
+            _maximum: usize,
+        ) -> Result<Vec<u8>, SyscallError> {
+            unreachable!("native writer does not read")
+        }
+
         fn write(&mut self, fd: i32, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {
             assert_eq!(fd, 1);
             self.calls += 1;

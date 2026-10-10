@@ -1,0 +1,19 @@
+--- a/libc-top-half/musl/src/env/__init_tls.c
++++ b/libc-top-half/musl/src/env/__init_tls.c
+@@ -154,6 +154,7 @@
+ 
+ #ifndef __wasilibc_unmodified_upstream
+ extern void __wasm_init_tls(void*);
++extern weak void __wasm_apply_global_tls_relocs(void);
+ #endif
+ 
+ #if defined(_REENTRANT) && !defined(__wasi_cooperative_threads__)
+@@ -200,6 +201,8 @@
+   	__asm__("local.get %0\n"
+ 			"global.set __tls_base\n"
+ 			:: "r"(tls_base));
++	/* Child initialization updates TLS globals in the parent instance too. */
++	if (__wasm_apply_global_tls_relocs) __wasm_apply_global_tls_relocs();
+ 	return mem;
+ #endif
+ }

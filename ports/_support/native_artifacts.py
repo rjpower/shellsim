@@ -20,9 +20,9 @@ from ports._support.wasm_metadata import needed_libraries, number, string
 from ports.native.dependencies import digest, exported_paths, recipe_identity, seal_artifact, verify_artifact
 
 MAX_ENTRIES = 16384
-MAX_BYTES = 256 * 1024 * 1024
+MAX_BYTES = 1024**3
 MAX_PROVIDERS = 64
-MAX_CLOSURE_BYTES = 512 * 1024 * 1024
+MAX_CLOSURE_BYTES = 1024**3
 
 
 @dataclass(frozen=True)
@@ -247,6 +247,10 @@ def merge_dependency_sysroot(
 ) -> Path:
     """Verify the entire linked closure before atomically staging /usr/local."""
     snapshots = _closure(direct, closure, target)
+    providers = {**closure, **direct}
+    empty_directories = {
+        path: mode for name in snapshots for path, mode in providers[name].manifest.get("directories", {}).items()
+    }
     merged = {}
     for files in snapshots.values():
         for name, data in files.items():
@@ -255,7 +259,11 @@ def merge_dependency_sysroot(
                 raise ValueError("native dependency export collision")
             merged[name] = data
     names = set(merged)
-    if any(str(parent) in names for name in names for parent in PurePosixPath(name).parents):
+    if any(str(parent) in names for name in names for parent in PurePosixPath(name).parents) or any(
+        str(parent) in names
+        for name in empty_directories
+        for parent in (PurePosixPath(name), *PurePosixPath(name).parents)
+    ):
         raise ValueError("native dependency file/directory collision")
     if destination.exists() or destination.is_symlink():
         raise ValueError("dependency sysroot destination already exists")
@@ -264,6 +272,10 @@ def merge_dependency_sysroot(
     with tempfile.TemporaryDirectory(prefix=".native-dependencies-", dir=destination.parent) as temporary:
         stage = Path(temporary) / "sysroot"
         stage.mkdir()
+        for name, mode in empty_directories.items():
+            path = stage / "usr/local" / name
+            path.mkdir(parents=True, exist_ok=True)
+            path.chmod(mode)
         for name, data in merged.items():
             output = stage / "usr/local" / name
             output.parent.mkdir(parents=True, exist_ok=True)
@@ -280,6 +292,7 @@ def seal_native_install(
     target: NativeTarget,
     direct: Mapping[str, NativeArtifact],
     closure: Mapping[str, NativeArtifact],
+    runtime: Mapping[str, NativeArtifact] | None = None,
 ) -> NativeArtifact:
     """Expand payload-relative exports and seal verified installed snapshots.
 
@@ -298,6 +311,14 @@ def seal_native_install(
     for item in requirements:
         if direct[item["port"]].manifest["inputs"]["recipe"]["version"] != item["version"]:
             raise ValueError("native direct dependency version mismatch")
+    runtime = {} if runtime is None else runtime
+    requirements = recipe.get("runtime_dependencies", [])
+    if {item["port"] for item in requirements} != set(runtime) or len(requirements) != len(runtime):
+        raise ValueError("native runtime dependencies differ from recipe")
+    _closure(runtime, closure, target)
+    for item in requirements:
+        if runtime[item["port"]].manifest["inputs"]["recipe"]["version"] != item["version"]:
+            raise ValueError("native runtime dependency version mismatch")
     files, directories, links = _scan(staging / "usr/local", links=True)
     effective = copy.deepcopy(dict(recipe))
     groups = {group: set(values) for group, values in recipe.get("exports", {}).items()}
@@ -312,6 +333,26 @@ def seal_native_install(
     effective["exports"] = {group: sorted(values) for group, values in groups.items()}
     selected = {name: _normalize_link(name, files, links) for name in exported_paths(effective)}
     missing_markers = _check_libraries(effective, selected, direct, target.abi, require_marker=False)
+    for name in effective.get("exports", {}).get("tools", []):
+        data = selected[name]
+        if not data.startswith(b"\0asm\x01\0\0\0"):
+            continue
+        marker = _abi(data)
+        if target.abi is None or (marker is not None and marker != target.abi):
+            raise ValueError("native tool ABI marker differs from cohort")
+        if marker is None:
+            missing_markers.add(name)
+    empty_directories = effective.get("empty_directories", {})
+    if not isinstance(empty_directories, dict) or len(empty_directories) > MAX_ENTRIES:
+        raise ValueError("native empty directories must be a bounded mapping")
+    for name, mode in empty_directories.items():
+        _relative(name)
+        if (
+            mode != 0o755
+            or name not in directories
+            or any(item.startswith(name + "/") for item in files.keys() | links.keys() | directories - {name})
+        ):
+            raise ValueError("declared native empty directory is missing or nonempty")
     inputs = {
         "recipe": effective,
         "recipe_sha256": digest(effective),
@@ -320,6 +361,7 @@ def seal_native_install(
         "source_sha256": recipe["source"]["sha256"],
         "toolchain": dict(target.toolchain),
         "dependency_artifacts": {name: item.manifest["artifact_sha256"] for name, item in sorted(direct.items())},
+        "runtime_artifacts": {name: item.manifest["artifact_sha256"] for name, item in sorted(runtime.items())},
     }
     if output.exists() or output.is_symlink():
         raise ValueError("native artifact output already exists")
@@ -328,6 +370,10 @@ def seal_native_install(
     with tempfile.TemporaryDirectory(prefix=".native-artifact-", dir=output.parent) as temporary:
         stage = Path(temporary) / "artifact"
         stage.mkdir()
+        for name, mode in empty_directories.items():
+            path = stage / name
+            path.mkdir(parents=True)
+            path.chmod(mode)
         for name, data in selected.items():
             path = stage / name
             path.parent.mkdir(parents=True, exist_ok=True)

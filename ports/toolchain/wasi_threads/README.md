@@ -28,7 +28,7 @@ static recipe does not enable dynamic loading.
 
 `dynamic.py` builds the separate `dynamic-recipe.json` product. It verifies and
 extracts the pinned SDK and wasi-libc archives, applies scheduler wait/notify and
-worker stack-readiness patches, and overlays the rebuilt C runtime onto the
+worker stack-readiness and parent TLS restoration patches, and overlays the rebuilt C runtime onto the
 SDK sysroot. The SDK's C++ headers and threaded exception runtime archives stay
 in that sysroot. Target compilation uses the isolated target environment.
 
@@ -45,3 +45,8 @@ Consumers compile with `--target=wasm32-wasip1-threads -pthread` and
 `shellsim_threads_v2`; it cannot replace v1 or nonthreaded v2 artifacts.
 It builds no interpreter or acceptance fixtures. Production threaded loading
 and upstream interpreter acceptance are verified separately.
+
+The parent TLS patch restores optional dynamic TLS global relocations after
+`__copy_tls` initializes a child TLS block and restores the parent TLS base.
+The relocation function is weak, so ordinary static links without dynamic TLS
+relocations remain supported.

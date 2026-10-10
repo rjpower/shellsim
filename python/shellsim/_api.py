@@ -8,7 +8,7 @@ import os
 import shlex
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
@@ -32,6 +32,7 @@ class _NativeInstallation:
 
     artifacts: dict[str, str]
     files: dict[str, tuple[str, int, int]]
+    directories: dict[str, int] = field(default_factory=dict)
 
 
 _MAX_U64 = (1 << 64) - 1

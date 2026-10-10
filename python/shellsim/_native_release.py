@@ -78,7 +78,7 @@ def materialize_native(descriptor_path: Path, *, cache_dir: Path | None, offline
         stage = work / "stage"
         stage.mkdir()
         _fetch(native["archive"], descriptor_path, archive)
-        _extract(archive, stage, allowed_roots=frozenset({"native"}))
+        _extract(archive, stage, allowed_roots=frozenset({"native"}), allow_empty_directories=True)
         _validate_entry(stage, native)
         try:
             stage.rename(entry)

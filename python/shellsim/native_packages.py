@@ -26,11 +26,12 @@ _MAX_PACKAGES = 256
 _MAX_NAMES = 64
 _MAX_SEARCH = 2048
 _MAX_FILES = 10_000
-_MAX_BYTES = 128 * 1024 * 1024
-_MAX_RELEASE_BYTES = 384 * 1024 * 1024
+# Leave room for a compiler, its SDK and scientific dependencies in one install.
+_MAX_BYTES = 1024**3
+_MAX_RELEASE_BYTES = 2 * 1024**3
 _KINDS = {"devel", "runtime", "build-tool"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
-_INSTALL_ROOTS = ("/usr/bin/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")
+_INSTALL_ROOTS = ("/usr/bin/", "/usr/lib/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")
 
 
 def _digest(value: object) -> str:
@@ -75,6 +76,7 @@ def _requirement(value: str) -> Requirement:
 class _Dependency:
     requirement: Requirement
     kind: str
+    linked: bool = True
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,8 @@ class _Package:
     profile: str
     toolchain: str
     abi: str | None
+    target: str
+    directories: dict[str, PurePosixPath]
 
 
 def _acyclic(selected: dict[str, _Package]) -> bool:
@@ -171,6 +175,7 @@ def _resolve(
 
 
 def _metadata(root: Path, package: _Package, target: str) -> tuple[Path, dict[str, Any]]:
+    target = package.target
     prefix = root
     for part in package.artifact.parts:
         prefix /= part
@@ -187,7 +192,16 @@ def _metadata(root: Path, package: _Package, target: str) -> tuple[Path, dict[st
         raise ValueError("native source identity is inconsistent")
     toolchain = manifest["inputs"]["toolchain"]
     profile = toolchain.get("profile")
-    if not isinstance(profile, dict) or profile.get("name") != package.profile or profile.get("target") != target:
+    legacy_profile = (
+        isinstance(profile, dict) and profile.get("name") == package.profile and profile.get("target") == target
+    )
+    graph_profile = (
+        isinstance(toolchain.get("cohort"), str)
+        and _HASH.fullmatch(toolchain["cohort"]) is not None
+        and toolchain.get("target") == target
+        and toolchain.get("abi") == package.abi == package.profile
+    )
+    if not legacy_profile and not graph_profile:
         raise ValueError("native toolchain profile differs from its recipe")
     if "sdk" in recipe and toolchain.get("sdk") != recipe["sdk"]:
         raise ValueError("native SDK identity differs from its recipe")
@@ -208,6 +222,18 @@ def _artifact(root: Path, package: _Package, target: str) -> tuple[Path, dict[st
     recipe = manifest["inputs"]["recipe"]
     files = manifest["files"]
     exports = recipe["exports"]
+    directories = manifest.get("directories", {})
+    if (
+        not isinstance(directories, dict)
+        or len(directories) > _MAX_FILES
+        or directories != recipe.get("empty_directories", {})
+        or set(directories) != set(package.directories)
+    ):
+        raise ValueError("native artifact directory exports differ from catalog or recipe")
+    for name, mode in directories.items():
+        path = prefix.joinpath(*_relative(name).parts)
+        if mode != 0o755 or path.is_symlink() or not path.is_dir() or any(path.iterdir()):
+            raise ValueError("native artifact empty directory is missing or invalid")
     if not isinstance(files, dict) or not isinstance(exports, dict):
         raise ValueError("invalid native artifact exports")
     if any(
@@ -272,27 +298,33 @@ def _coherent(
         if key not in metadata:
             metadata[key] = _metadata(root, package, target)[1]
         manifest = metadata[key]
-        declared = manifest["inputs"]["recipe"].get("target_dependencies", [])
-        pinned = manifest["inputs"].get("dependency_artifacts", {})
-        dependencies = {
-            selected[canonicalize_name(dependency.requirement.name)].recipe_port: selected[
-                canonicalize_name(dependency.requirement.name)
-            ]
-            for dependency in package.dependencies
-        }
-        if len(dependencies) != len(package.dependencies):
-            raise ValueError("native catalog has duplicate provider identities")
-        ports = [dependency["port"] for dependency in declared]
-        if len(set(ports)) != len(ports) or set(ports) != set(dependencies) or set(pinned) != set(ports):
-            raise ValueError("native catalog omits or adds a verified dependency edge")
-        for dependency in declared:
-            provider = dependencies[dependency["port"]]
-            if (
-                provider.digest != pinned[dependency["port"]]
-                or provider.version != Version(dependency["version"])
-                or ("target_profile" in dependency and provider.profile != dependency["target_profile"])
-            ):
-                return False
+        for linked, field, identities in (
+            (True, "target_dependencies", "dependency_artifacts"),
+            (False, "runtime_dependencies", "runtime_artifacts"),
+        ):
+            declared = manifest["inputs"]["recipe"].get(field, [])
+            pinned = manifest["inputs"].get(identities, {})
+            edges = [edge for edge in package.dependencies if edge.linked == linked]
+            dependencies = {
+                selected[canonicalize_name(edge.requirement.name)].recipe_port: selected[
+                    canonicalize_name(edge.requirement.name)
+                ]
+                for edge in edges
+            }
+            if len(dependencies) != len(edges):
+                raise ValueError("native catalog has duplicate provider identities")
+            ports = [dependency["port"] for dependency in declared]
+            if len(set(ports)) != len(ports) or set(ports) != set(dependencies) or set(pinned) != set(ports):
+                raise ValueError("native catalog omits or adds a verified dependency edge")
+            for dependency in declared:
+                provider = dependencies[dependency["port"]]
+                if (
+                    provider.digest != pinned[dependency["port"]]
+                    or provider.version != Version(dependency["version"])
+                    or (linked and provider.target != package.target)
+                    or ("target_profile" in dependency and provider.profile != dependency["target_profile"])
+                ):
+                    return False
     return True
 
 
@@ -307,6 +339,7 @@ def verify_release_catalog(catalog_path: Path) -> set[str]:
     if catalog_path.name != "catalog.json" or root.is_symlink() or catalog_path.is_symlink():
         raise ValueError("native release needs a regular catalog.json")
     seen: set[str] = set()
+    seen_directories: set[str] = set()
     visited = total = 0
     for path in root.rglob("*"):
         visited += 1
@@ -317,13 +350,17 @@ def verify_release_catalog(catalog_path: Path) -> set[str]:
             if total > _MAX_RELEASE_BYTES or len(seen) >= _MAX_FILES:
                 raise ValueError("native release exceeds bounded file limits")
             seen.add(path.relative_to(root).as_posix())
+        else:
+            seen_directories.add(path.relative_to(root).as_posix())
     universe = _NativePackageUniverse(catalog_path)
     expected = {"catalog.json"}
+    expected_directories = set()
     metadata: dict[tuple[str, Version], dict[str, Any]] = {}
     for candidates in universe._packages.values():
         for package in candidates:
             prefix, manifest = _artifact(universe.root, package, universe.target)
             base = prefix.relative_to(universe.root)
+            expected_directories.update((base / name).as_posix() for name in manifest.get("directories", {}))
             expected.add((base / "artifact.json").as_posix())
             expected.update((base / name).as_posix() for name in manifest["files"])
             _resolve(
@@ -332,7 +369,13 @@ def verify_release_catalog(catalog_path: Path) -> set[str]:
                 lambda selected, expected=package: selected.get(expected.name) is expected
                 and _coherent(universe.root, universe.target, selected, metadata, {}),
             )
-    if seen != expected:
+    expected_directories.update(
+        str(parent)
+        for name in expected | expected_directories
+        for parent in PurePosixPath(name).parents
+        if str(parent) != "."
+    )
+    if seen != expected or seen_directories != expected_directories:
         raise ValueError("native release has missing or undeclared files")
     return expected
 
@@ -350,7 +393,7 @@ class _NativePackageUniverse:
         self.catalog_path = Path(catalog_path).resolve()
         self.root = self.catalog_path.parent
         catalog = _json(self.catalog_path)
-        if catalog.get("format") != 1 or catalog.get("target") != "wasm32-wasip1":
+        if catalog.get("format") != 1 or catalog.get("target") not in {"wasm32-wasip1", "wasm32-wasip1-threads"}:
             raise ValueError("unsupported native catalog format or target")
         self.target = catalog["target"]
         records = catalog.get("packages")
@@ -374,10 +417,12 @@ class _NativePackageUniverse:
             if len(destinations) > _MAX_FILES:
                 raise ValueError("too many native catalog exports")
             dependencies = tuple(
-                _Dependency(_requirement(dependency["requirement"]), dependency["kind"])
+                _Dependency(_requirement(dependency["requirement"]), dependency["kind"], dependency.get("linked", True))
                 for dependency in record.get("dependencies", ())
             )
-            if len(dependencies) > _MAX_NAMES or any(dependency.kind not in _KINDS for dependency in dependencies):
+            if len(dependencies) > _MAX_NAMES or any(
+                dependency.kind not in _KINDS or not isinstance(dependency.linked, bool) for dependency in dependencies
+            ):
                 raise ValueError("invalid native catalog dependency kind")
             recipe_name = record["recipe_name"]
             recipe_port = record.get("recipe_port", recipe_name)
@@ -391,6 +436,9 @@ class _NativePackageUniverse:
                 or _HASH.fullmatch(toolchain) is None
             ):
                 raise ValueError("invalid native recipe name, profile or toolchain identity")
+            directory_exports = record.get("directories", {})
+            if not isinstance(directory_exports, dict) or len(directory_exports) > _MAX_FILES:
+                raise ValueError("invalid native catalog directory exports")
             package = _Package(
                 name,
                 version,
@@ -404,7 +452,14 @@ class _NativePackageUniverse:
                 profile,
                 toolchain,
                 record.get("abi"),
+                record.get("target", self.target),
+                {
+                    _relative(source).as_posix(): _destination(destination)
+                    for source, destination in directory_exports.items()
+                },
             )
+            if package.target not in {"wasm32-wasip1", "wasm32-wasip1-threads"}:
+                raise ValueError("unsupported native artifact target")
             candidates = packages.setdefault(name, [])
             if any(existing.version == version or existing.kind != kind for existing in candidates):
                 raise ValueError("duplicate native release or ambiguous package kind")
@@ -456,10 +511,13 @@ class _NativePackageUniverse:
         if len(installed.artifacts.keys() | identities.keys()) > _MAX_NAMES:
             raise ValueError("cumulative native installation exceeds its package bound")
         files: dict[PurePosixPath, tuple[Path, str, int]] = {}
+        directories: dict[str, int] = {}
         total = 0
         for name in sorted(selected):
             package = selected[name]
             prefix, manifest = _artifact(self.root, package, self.target)
+            for source, destination in package.directories.items():
+                directories[str(destination)] = manifest["directories"][source]
             for source, destination in package.destinations.items():
                 payload = prefix / source
                 digest = manifest["files"][source]
@@ -473,14 +531,25 @@ class _NativePackageUniverse:
                     raise ValueError("native package closure exceeds bounded VFS import limits")
                 files[destination] = (payload, digest, mode)
         cumulative = dict(installed.files)
+        cumulative_directories = installed.directories | directories
+        if len(cumulative_directories) > _MAX_FILES:
+            raise ValueError("cumulative native directory installation exceeds its bound")
         for destination, (payload, identity, mode) in files.items():
             if str(destination) in cumulative and cumulative[str(destination)][:2] != (identity, mode):
                 raise ValueError("native export conflicts with an immutable installed destination")
             cumulative[str(destination)] = (identity, mode, payload.stat().st_size)
         if len(cumulative) > _MAX_FILES or sum(item[2] for item in cumulative.values()) > _MAX_BYTES:
             raise ValueError("cumulative native installation exceeds its export bound")
+        for directory in cumulative_directories:
+            path = PurePosixPath(directory)
+            if any(str(item) in cumulative for item in (path, *path.parents)):
+                raise ValueError("native directory conflicts with an installed file")
         with tempfile.TemporaryDirectory(prefix="shellsim-native-packages-") as temporary:
             staging = Path(temporary)
+            for destination, mode in sorted(directories.items()):
+                target = staging / PurePosixPath(destination).relative_to("/")
+                target.mkdir(parents=True, exist_ok=True)
+                target.chmod(mode)
             for destination, (source, digest, mode) in sorted(files.items()):
                 if str(destination) in installed.files:
                     if hashlib.sha256(environment.read_file(str(destination))).hexdigest() != digest:
@@ -493,5 +562,7 @@ class _NativePackageUniverse:
                 if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise ValueError("native export changed while staging")
             environment._native.mount_package_tree(str(staging))
-        environment._native_installation = _NativeInstallation(installed.artifacts | identities, cumulative)
+        environment._native_installation = _NativeInstallation(
+            installed.artifacts | identities, cumulative, cumulative_directories
+        )
         return {name: str(package.version) for name, package in sorted(selected.items())}

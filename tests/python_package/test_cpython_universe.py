@@ -14,6 +14,7 @@ from shellsim._cpython_universe import (
     Universe,
     _add_wheel_to_set,
     _inspect_wheel,
+    _MAX_TOTAL_BYTES,
     _stage_console_scripts,
     _stage_provider,
     _verify_file,
@@ -236,14 +237,15 @@ def test_wheel_tag_must_be_an_exact_metadata_line(tmp_path: Path) -> None:
 
 def test_wheel_set_limits_and_member_conflicts_are_checked_before_unpacking() -> None:
     members: dict[str, tuple[bool, str | None]] = {}
-    first = _WheelInspection(set(), {}, {"shared/__init__.py": (False, "a" * 64)}, 1, 70 * 1024 * 1024)
+    half_budget = _MAX_TOTAL_BYTES // 2 + 1
+    first = _WheelInspection(set(), {}, {"shared/__init__.py": (False, "a" * 64)}, 1, half_budget)
     count, size = _add_wheel_to_set(first, members, 0, 0)
     identical = _WheelInspection(set(), {}, {"shared/__init__.py": (False, "a" * 64)}, 1, 1)
     assert _add_wheel_to_set(identical, members, count, size) == (2, size + 1)
     changed = _WheelInspection(set(), {}, {"shared/__init__.py": (False, "b" * 64)}, 1, 1)
     with pytest.raises(shellsim.PackageInstallError, match="path conflicts"):
         _add_wheel_to_set(changed, members, count, size)
-    extra = _WheelInspection(set(), {}, {"other.py": (False, "c" * 64)}, 1, 70 * 1024 * 1024)
+    extra = _WheelInspection(set(), {}, {"other.py": (False, "c" * 64)}, 1, half_budget)
     with pytest.raises(shellsim.PackageInstallError, match="uncompressed size limit"):
         _add_wheel_to_set(extra, members, count, size)
     too_many = _WheelInspection(set(), {}, {}, 10_000, 0)

@@ -5,7 +5,7 @@ this context. Adapters build into its staging prefix; the runner alone seals
 exports, publishes cache entries and emits catalogs. Commands are argv vectors.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Mapping
@@ -49,6 +49,8 @@ class NativeBuildRequest:
     install_targets: tuple[str, ...] = ("install",)
     jobs: int = 1
     install_prefix: PurePosixPath = PurePosixPath("/usr/local")
+    configure_environment: Mapping[str, str] = field(default_factory=dict)
+    build_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -81,6 +83,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     """Run one admitted cross-build without publishing or sealing its output."""
     import json
     import os
+    import re
     import shlex
     import subprocess
 
@@ -102,6 +105,30 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         for path in (context.source, context.build, context.staging_prefix, context.dependency_sysroot)
     ):
         raise ValueError("native adapter paths must be absolute")
+    if request.configure_environment or request.build_args:
+        if request.adapter is not NativeAdapter.CONFIGURE_MAKE:
+            raise ValueError("configure environment and make arguments require configure-make")
+    if (
+        not isinstance(request.configure_environment, Mapping)
+        or len(request.configure_environment) > 128
+        or any(
+            not isinstance(key, str)
+            or not re.fullmatch(r"(?:ac_cv_[A-Za-z0-9_]+|CFLAGS|CXXFLAGS|CPPFLAGS|LDFLAGS|LIBS)", key)
+            or not isinstance(value, str)
+            or len(value) > 4096
+            or "\0" in value
+            for key, value in request.configure_environment.items()
+        )
+    ):
+        raise ValueError("unsupported configure environment binding")
+    if len(request.build_args) > 128 or any(
+        not isinstance(value, str)
+        or len(value) > 4096
+        or "\0" in value
+        or value.startswith(("CC=", "CXX=", "AR=", "RANLIB=", "PATH=", "SHELL="))
+        for value in request.build_args
+    ):
+        raise ValueError("unsupported make build argument")
     required_host = {"python", "pkg-config", "sh", "rm"}
     required_host.update(
         {
@@ -170,6 +197,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             "PKG_CONFIG_SYSROOT_DIR": str(context.dependency_sysroot),
         }
     )
+    environment.update(request.configure_environment)
     commands = []
 
     def run(argv, directory):
@@ -287,6 +315,6 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             build,
         )
         make = context.host_tools["make"]
-        run([make, "-j", request.jobs, *request.build_targets], build)
-        run([make, *request.install_targets, "DESTDIR=" + str(context.staging_prefix)], build)
+        run([make, "-j", request.jobs, *request.build_args, *request.build_targets], build)
+        run([make, *request.build_args, *request.install_targets, "DESTDIR=" + str(context.staging_prefix)], build)
     return NativeBuildOutput(context.staging_prefix, tuple(commands), request.install_prefix)

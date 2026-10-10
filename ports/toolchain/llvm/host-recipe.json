@@ -1,0 +1,10 @@
+{
+  "name": "llvm",
+  "version": "23.0.0",
+  "role": "host-tool",
+  "build": {
+    "adapter": "llvm-host",
+    "producer_recipe": "compiler-recipe.json",
+    "producer_sha256": "d9eb1eecd3d3c7b87cd846ef92e8fbb96b1a0b459a04cd92f08b3d8e12fcfd26"
+  }
+}

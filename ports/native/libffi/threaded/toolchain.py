@@ -58,7 +58,6 @@ def validate_tree(prefix, directory, artifacts):
 def admit(sdk: Path, compiler: Path, overlay: Path, *, compiler_recipe: Path, overlay_recipe: Path):
     """Return exact immutable receipts; diagnostic or tampered products fail."""
     expected_overlay = json.loads(overlay_recipe.read_bytes())
-    expected_compiler = json.loads(compiler_recipe.read_bytes())
     manifest = read_manifest(overlay / "manifest.json")
     if manifest["schema_version"] != 1 or manifest["identity"]["recipe"] != expected_overlay:
         raise ValueError("threaded sysroot recipe differs from the admitted production recipe")
@@ -66,7 +65,7 @@ def admit(sdk: Path, compiler: Path, overlay: Path, *, compiler_recipe: Path, ov
         raise ValueError("threaded compiler source recipe differs")
     validate_files(compiler, read_manifest(compiler / "manifest.json"))
     compiled = compiler_identity(compiler, compiler_recipe)
-    if compiled["identity"]["recipe"] != expected_compiler or manifest["identity"]["compiler"] != compiled:
+    if manifest["identity"]["compiler"] != compiled:
         raise ValueError("threaded compiler/sysroot cohort differs")
     if expected_overlay["dynamic_abi"] != "shellsim-wasi-sdk34-cpython3137-threads-v3":
         raise ValueError("threaded provider requires the exact v3 ABI")

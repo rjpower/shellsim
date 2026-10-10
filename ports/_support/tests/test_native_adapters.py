@@ -59,3 +59,21 @@ def test_unapproved_install_prefix_fails_before_build(build_request):
     with pytest.raises(ValueError):
         build_native(replace(build_request, install_prefix=PurePosixPath("/usr")))
     assert not build_request.context.staging_prefix.exists()
+
+
+@pytest.mark.parametrize("bindings", [{"CC": "/ambient/compiler"}, {"PATH": "/ambient/bin"}, {"LIBS": 12}, []])
+def test_configure_environment_cannot_replace_admitted_tools(build_request, bindings):
+    request = replace(build_request, adapter=NativeAdapter.CONFIGURE_MAKE, configure_environment=bindings)
+    with pytest.raises(ValueError, match="configure environment"):
+        build_native(request)
+    assert not request.context.build.exists()
+
+
+@pytest.mark.parametrize(
+    "argument", ["CC=/ambient/compiler", "CXX=/ambient/compiler", "PATH=/ambient/bin", "SHELL=/ambient/sh"]
+)
+def test_make_arguments_cannot_replace_admitted_tools(build_request, argument):
+    request = replace(build_request, adapter=NativeAdapter.CONFIGURE_MAKE, build_args=(argument,))
+    with pytest.raises(ValueError, match="make build argument"):
+        build_native(request)
+    assert not request.context.build.exists()

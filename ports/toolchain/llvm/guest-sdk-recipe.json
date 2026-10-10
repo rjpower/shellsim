@@ -1,0 +1,160 @@
+{
+  "version": "34.0.0",
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "linkage": "static",
+  "sdk": {
+    "version": "34.0",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4"
+  },
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "build_scripts": [
+    {
+      "file": "guest.py",
+      "sha256": "137a62f2702d8cd4995d0fae8795fe70e0937fb58af7251a642c5a1054cad88d"
+    },
+    {
+      "file": "build.py",
+      "sha256": "5cf20137d47e3458241f926fbd83cab414544342c2b189e83f8065a10c1303d8"
+    },
+    {
+      "file": "compiler.py",
+      "sha256": "87c112cdf44114e021e8a7f7fb174f61daae52130e5b98858ee81cc0869da705"
+    },
+    {
+      "file": "../../_support/build.py",
+      "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    }
+  ],
+  "name": "wasi-development",
+  "kind": "native-library",
+  "role": "target-library",
+  "source": {
+    "files": [
+      {
+        "path": "toolchain/wasi_sdk/notices/llvm-LICENSE.TXT",
+        "destination": "licenses/llvm-LICENSE.TXT",
+        "sha256": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/llvm-libcxx-LICENSE.TXT",
+        "destination": "licenses/llvm-libcxx-LICENSE.TXT",
+        "sha256": "539dd7aed86e8a4f12cbdd0e6c50c189c7d74847e4fecc64ce2c6ee3a01da38b"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/llvm-libcxxabi-LICENSE.TXT",
+        "destination": "licenses/llvm-libcxxabi-LICENSE.TXT",
+        "sha256": "e2b35be49f7284a45b7baca8fc7b3ab7440e7902392b2528a457816b5bb2a15c"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/llvm-libunwind-LICENSE.TXT",
+        "destination": "licenses/llvm-libunwind-LICENSE.TXT",
+        "sha256": "b5efebcaca80879234098e52d1725e6d9eb8fb96a19fce625d39184b705f7b6d"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE",
+        "destination": "licenses/wasi-libc-LICENSE",
+        "sha256": "2711a8b5a5cdfef0e639f96c1aca12ae23d7d64a02d0507f1bdf14d2b27bbc3a"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE",
+        "destination": "licenses/wasi-libc-LICENSE-APACHE",
+        "sha256": "a60eea817514531668d7e00765731449fe14d059d3249e0bc93b36de45f759f2"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-APACHE-LLVM",
+        "destination": "licenses/wasi-libc-LICENSE-APACHE-LLVM",
+        "sha256": "268872b9816f90fd8e85db5a28d33f8150ebb8dd016653fb39ef1f94f2686bc5"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-LICENSE-MIT",
+        "destination": "licenses/wasi-libc-LICENSE-MIT",
+        "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-dlmalloc-src-malloc.txt",
+        "destination": "licenses/wasi-libc-dlmalloc-src-malloc.txt",
+        "sha256": "5791fb3131f2e81e8065cd8080b62c155eb292b3fc1de26eb85150ab1aafb890"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-emmalloc-emmalloc.txt",
+        "destination": "licenses/wasi-libc-emmalloc-emmalloc.txt",
+        "sha256": "ac80caba8cb45681c047889e8d123e8ec15f02267dcf50328162592bcd725b4a"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-fts-musl-fts-COPYING",
+        "destination": "licenses/wasi-libc-fts-musl-fts-COPYING",
+        "sha256": "55af87e4017668f54467a3380e7ebbac5e672d8c763bfe95e6fc882a6fdc4046"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+        "destination": "licenses/wasi-libc-libc-bottom-half-cloudlibc-LICENSE",
+        "sha256": "c8b789cf5a746611e6300a0cc7750dbf92b61912a709d04e639245f7290656d0"
+      },
+      {
+        "path": "toolchain/wasi_sdk/notices/wasi-libc-libc-top-half-musl-COPYRIGHT",
+        "destination": "licenses/wasi-libc-libc-top-half-musl-COPYRIGHT",
+        "sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b"
+      },
+      {
+        "path": "toolchain/llvm/shellsim-abi.s",
+        "destination": "shellsim-abi.s",
+        "sha256": "2d711335e3f2c03eaed95520fb7f6f32ab7161e71788cc3f85221ecfac03345b"
+      }
+    ],
+    "sha256": "a3bbe617d8e2a141daee7fe48c9454d3e78a9ce8e8ba3ff3c07bcf7db6e53aa7"
+  },
+  "build": {
+    "adapter": "llvm-guest-sdk"
+  },
+  "target_dependencies": [],
+  "runtime_dependencies": [],
+  "exports": {},
+  "export_directories": {
+    "development": [
+      "wasi-sysroot",
+      "lib/clang/23"
+    ],
+    "licenses": [
+      "licenses/wasi-sdk"
+    ]
+  },
+  "install": {
+    "kind": "devel"
+  },
+  "empty_directories": {
+    "wasi-sysroot/include/c++/v1": 493
+  },
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/guest-sdk.c",
+      "include_directories": [
+        "wasi-sysroot/include/wasm32-wasip1-threads"
+      ],
+      "link_inputs": [
+        "wasi-sysroot/lib/wasm32-wasip1-threads/libc.a"
+      ]
+    }
+  ],
+  "test_limits": {
+    "cpu": 2000000000,
+    "memory": 268435456,
+    "disk": 201326592
+  }
+}

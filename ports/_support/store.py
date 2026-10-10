@@ -19,6 +19,7 @@ import urllib.request
 import zipfile
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Mapping
 
@@ -145,6 +146,8 @@ def extract(archive: Path, destination: Path, *, subdirectory: str) -> Path:
                     with source.open(item) as stream, path.open("xb") as output:
                         shutil.copyfileobj(stream, output, 1024**2)
                     path.chmod(0o755 if mode & 0o111 else 0o644)
+                    timestamp = datetime(*item.date_time, tzinfo=timezone.utc).timestamp()
+                    os.utime(path, (timestamp, timestamp), follow_symlinks=False)
     else:
         with tarfile.open(archive, "r|*") as source:
             for item in source:
@@ -155,6 +158,9 @@ def extract(archive: Path, destination: Path, *, subdirectory: str) -> Path:
                     with source.extractfile(item) as stream, path.open("xb") as output:
                         shutil.copyfileobj(stream, output, 1024**2)
                     path.chmod(0o755 if item.mode & 0o111 else 0o644)
+                    # Autotools release sources rely on generated files retaining
+                    # their order relative to configure.ac and included macros.
+                    os.utime(path, (item.mtime, item.mtime), follow_symlinks=False)
     root = destination / subdirectory
     if not root.is_dir():
         raise ValueError("declared source subdirectory is missing")

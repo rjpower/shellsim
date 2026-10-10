@@ -16,7 +16,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from ports._support.build import apply_patch, check_build_scripts
 from ports.toolchain.llvm.build import digest, run
 
-TARGETS = ("clang", "lld", "llc", "llvm-ar", "llvm-nm", "llvm-objcopy")
+TARGETS = (
+    "clang",
+    "lld",
+    "llc",
+    "llvm-ar",
+    "llvm-nm",
+    "llvm-objcopy",
+    "llvm-tblgen",
+    "llvm-min-tblgen",
+    "clang-tblgen",
+)
 
 
 def identity_hash(value):
@@ -241,7 +251,7 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     prefix = staging
     (prefix / "bin").mkdir(parents=True)
     (prefix / "licenses").mkdir()
-    for name in ("clang", "lld", "llc", "llvm-ar", "llvm-nm", "llvm-objcopy"):
+    for name in TARGETS:
         shutil.copyfile(output / "bin" / name, prefix / "bin" / name)
         (prefix / "bin" / name).chmod(0o755)
     for alias, name in {

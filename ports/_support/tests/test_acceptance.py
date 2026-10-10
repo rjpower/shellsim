@@ -33,15 +33,25 @@ def test_acceptance_requires_existing_declared_probe_before_release_fetch(tmp_pa
     assert not output.exists()
 
 
+@pytest.mark.parametrize("limits", [{"cpu": -1}, {"memory": True}, {"disk": 2**32}, {"host": 1}, []])
+def test_acceptance_rejects_invalid_resource_budgets_before_release_fetch(tmp_path, limits):
+    port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
+    port = dataclasses.replace(port, recipe={**port.recipe, "test_limits": limits})
+    output = tmp_path / "proof"
+    with pytest.raises(ValueError, match="test_limits"):
+        accept_port(AcceptanceRequest(port, tmp_path / "missing-release.json", output, "pypi"))
+    assert not output.exists()
+
+
 def test_acceptance_rejects_test_kind_mismatch_before_release_fetch(tmp_path: Path) -> None:
     descriptor = tmp_path / "release.json"
     descriptor.write_text("{}")
     source = tmp_path / "test.py"
     source.write_text("print('ok')\n")
-    port = _port(tmp_path, [{"kind": "python", "script": "test.py"}])
+    port = _port(tmp_path, [{"kind": "shell", "script": "test.py"}])
     output = tmp_path / "proof"
-    with pytest.raises(ValueError, match="Python package"):
-        accept_port(AcceptanceRequest(port, descriptor, output, "native"))
+    with pytest.raises(ValueError, match="native port"):
+        accept_port(AcceptanceRequest(port, descriptor, output, "pypi"))
     assert not output.exists()
 
     port = dataclasses.replace(port, recipe={"tests": [{"kind": "native", "source": "test.py"}]})
@@ -144,3 +154,24 @@ def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path) -> None:
         _native_command(
             cohort, tmp_path / "dependencies", tmp_path / "probe.c", tmp_path / "probe.wasm", [], [relative], []
         )
+
+
+@pytest.mark.parametrize("flag", ["-L/host", "-lhost", "-Wl,--wrap=ok,--script=/host", "-fplugin=/host"])
+def test_native_probe_rejects_nonwrapper_link_flags(tmp_path, flag):
+    cohort = SimpleNamespace(has_frontend=True)
+    with pytest.raises(ValueError, match="linker wrapper"):
+        _native_command(cohort, tmp_path, tmp_path / "test.c", tmp_path / "test.wasm", [], [], [], [flag])
+
+
+def test_native_probe_passes_exact_wrapper_switches(tmp_path):
+    cohort = SimpleNamespace(
+        has_frontend=True,
+        compiler=lambda: tmp_path / "cc",
+        compiler_flags=(),
+        linker_flags=(),
+        executable_flags=(),
+        sysroot=SimpleNamespace(root=tmp_path),
+    )
+    flag = "-Wl,--wrap=signal,--wrap=open,--wrap=openat"
+    command = _native_command(cohort, tmp_path, tmp_path / "test.c", tmp_path / "test.wasm", [], [], [], [flag])
+    assert flag in command

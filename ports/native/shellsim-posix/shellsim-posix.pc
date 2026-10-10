@@ -1,0 +1,9 @@
+prefix=/usr/local
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: shellsim-posix
+Description: Virtual process and descriptor libc interfaces
+Version: 1
+Libs: -L${libdir} -lshellsim-posix -Wl,--wrap=signal,--wrap=open,--wrap=openat -lwasi-emulated-signal
+Cflags: -I${includedir} -D_WASI_EMULATED_SIGNAL=1 -include ${includedir}/process_abi.h -include ${includedir}/process_port.h -include ${includedir}/exec_port.h -include ${includedir}/tempfile_port.h -include ${includedir}/posix.h

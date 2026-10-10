@@ -955,6 +955,18 @@ async fn execute_thread(host: Host, module: Module, path: String, argument: u32)
         store.data_mut().threaded_dynamic.main = Some(instance);
         store.data_mut().threaded_dynamic.ready = thread.tid == 0;
         if thread.tid == 0 {
+            // Instantiation initializes the main TLS segment and its base, but
+            // dynamic TLS address globals need their own relocation pass. Worker
+            // Stores run this after installing their TLS in thread_ready.
+            if let Some(export) = instance.get_export(&mut store, "__wasm_apply_global_tls_relocs")
+            {
+                export
+                    .into_func()
+                    .ok_or_else(|| Error::msg("invalid global TLS relocation export"))?
+                    .typed::<(), ()>(&store)?
+                    .call_async(&mut store, ())
+                    .await?;
+            }
             instance
                 .get_typed_func::<(), ()>(&mut store, "_start")?
                 .call_async(&mut store, ())

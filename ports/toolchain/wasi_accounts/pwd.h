@@ -11,6 +11,12 @@ struct passwd {
     char *pw_dir;
     char *pw_shell;
 };
+#ifdef __cplusplus
+extern "C" {
+#endif
 struct passwd *getpwnam(const char *name);
 struct passwd *getpwuid(uid_t uid);
+#ifdef __cplusplus
+}
+#endif
 #endif

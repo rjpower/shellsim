@@ -52,8 +52,9 @@ mod posix_exec;
 mod posix_open;
 mod posix_process;
 
-// The static CPython + NumPy + Pillow image is 15.2 MB. Keep compilation input bounded.
-const MAX_WASM_BYTES: usize = 16 * 1024 * 1024;
+// Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
+// prepay their conservative host compilation memory reservation.
+const MAX_WASM_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
 const LARGE_TABLE_ELEMENTS: usize = 16_384;
@@ -62,11 +63,17 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 // CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
-const MAX_CACHED_MODULES: usize = 4;
+const MAX_CACHED_MODULES: usize = 64;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
-const MAX_CACHED_MODULE_BYTES: usize = 128 * 1024 * 1024;
+// This process-wide JIT cache is separate from on-disk compiler build caches.
+// Clang alone occupies 338 MiB; retain a working set of tools and package modules.
+const MAX_CACHED_MODULE_BYTES: usize = if usize::BITS >= 64 {
+    8usize.saturating_mul(1024 * 1024 * 1024)
+} else {
+    1024 * 1024 * 1024
+};
 // Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
 // utility usable on ordinary input without relaxing the host's execution bound.
 const WASM_FUEL_PER_CPU_UNIT: u64 = 10;
@@ -83,6 +90,7 @@ const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
 const ERRNO_NOTSUP: i32 = 58;
+const ERRNO_SPIPE: i32 = 70;
 const MAX_POLL_SUBSCRIPTIONS: u32 = 64;
 const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
@@ -1098,6 +1106,8 @@ fn fd_tell(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
 
 fn filestat(info: &FileInfo) -> [u8; 64] {
     let mut value = [0; 64];
+    value[0..8].copy_from_slice(&info.device.to_le_bytes());
+    value[8..16].copy_from_slice(&info.inode.to_le_bytes());
     value[16] = match info.kind {
         FileKind::Directory => 3,
         FileKind::File => 4,
@@ -1291,6 +1301,7 @@ fn fd_readdir(
             };
             let mut entry = [0; 24];
             entry[..8].copy_from_slice(&(index as u64 + 1).to_le_bytes());
+            entry[8..16].copy_from_slice(&info.inode.to_le_bytes());
             entry[16..20].copy_from_slice(&(name.len() as u32).to_le_bytes());
             entry[20] = match info.kind {
                 FileKind::Directory => 3,
@@ -1626,6 +1637,89 @@ fn fd_write(
             ERRNO_FAULT
         },
     ))
+}
+
+/// Positioned regular-file reads never suspend or change an aliased descriptor's cursor.
+fn fd_pread(
+    mut caller: Caller<'_, Host>,
+    fd: i32,
+    iovs: u32,
+    count: u32,
+    offset: u64,
+    read: u32,
+) -> Result<i32, Error> {
+    let state = match guest_descriptor(&mut caller, fd) {
+        Ok(state) if state.readable => state,
+        Ok(_) => return Ok(ERRNO_BADF),
+        Err(error) => return Ok(error),
+    };
+    if state.kind != DescriptorKind::File {
+        return Ok(if state.kind == DescriptorKind::Directory {
+            ERRNO_ISDIR
+        } else {
+            ERRNO_SPIPE
+        });
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (read as usize).saturating_add(4) > memory.data_size(&caller) {
+        return Ok(ERRNO_FAULT);
+    }
+    let vectors = match iovecs(&mut caller, &memory, iovs, count) {
+        Ok(vectors) => vectors,
+        Err(error) => return Ok(error),
+    };
+    let total = vectors.iter().map(|(_, length)| length).sum::<usize>();
+    let input = {
+        let mut machine = caller.data_mut().machine.get();
+        if !machine
+            .resources
+            .charge_cpu((total as u64).saturating_add(vectors.len() as u64))
+            || !machine.resources.reserve_memory(total as u64)
+        {
+            return Err(exhausted());
+        }
+        ActiveSystem::new(&mut machine).read_at(fd, offset, total)
+    };
+    let result = match input {
+        Ok(input) => {
+            let mut copied = 0;
+            for (pointer, length) in vectors {
+                let take = length.min(input.len() - copied);
+                // All ranges were checked above; no guest code runs during this host call.
+                if memory
+                    .write(&mut caller, pointer, &input[copied..copied + take])
+                    .is_err()
+                {
+                    caller
+                        .data_mut()
+                        .machine
+                        .get()
+                        .resources
+                        .release_memory(total as u64);
+                    return Ok(ERRNO_FAULT);
+                }
+                copied += take;
+                if take < length {
+                    break;
+                }
+            }
+            if write_u32(&mut caller, read, copied as u32) {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            }
+        }
+        Err(error) => syscall_errno(&error),
+    };
+    caller
+        .data_mut()
+        .machine
+        .get()
+        .resources
+        .release_memory(total as u64);
+    Ok(result)
 }
 
 fn fd_read(
@@ -2090,6 +2184,9 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
     wrap_stream_call(&mut linker, "fd_write", fd_write);
     wrap_stream_call(&mut linker, "fd_read", fd_read);
     linker
+        .func_wrap("wasi_snapshot_preview1", "fd_pread", fd_pread)
+        .expect("unique WASI import");
+    linker
         .func_wrap("wasi_snapshot_preview1", "fd_close", fd_close)
         .expect("unique WASI import");
     linker
@@ -2478,15 +2575,11 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
     let thread_profile =
         threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
-    let scratch = if thread_profile.is_some() {
-        (wasm.len() as u64).saturating_mul(65).saturating_add(4096)
-    } else {
-        0
-    };
+    let scratch = (wasm.len() as u64).saturating_mul(65).saturating_add(4096);
     if !interp.resources.reserve_memory(scratch) {
         return Err((
             137,
-            format!("{path}: thread compilation memory budget exhausted"),
+            format!("{path}: wasm compilation memory budget exhausted"),
         ));
     }
     let compiled = compiled_command_module(&wasm);

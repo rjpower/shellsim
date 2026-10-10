@@ -9,8 +9,9 @@ The source patch fixes flexible `dirent.d_name` allocation, selects the existing
 SDK-compatible two-argument main, and guards unavailable signal-mask/callback
 facilities. NLS and Guile are disabled. Ordinary parallel recipes use real virtual
 spawn/wait and work with `-j2`. Recursive jobserver coordination and asynchronous
-signal callbacks remain unsupported. This package supplies make; the separate C
-compiler distribution does not provide C++ or a full build-essential collection.
+signal callbacks remain unsupported. This package supplies make; combine its
+graph recipe with the [guest Clang port](../../toolchain/llvm/GUEST.md) for C and
+C++ compilation, linking and archiving inside the guest.
 
 Configure's synchronous-posix-spawn cache describes the measured non-null-pid
 spawn path used by make. The upstream probe passes a null pid, which this bounded
@@ -25,3 +26,16 @@ mode 0600 before virtual umask.
 Measured guest proofs include two concurrent one-second recipes completing in one
 virtual second and a remade included Makefile restarting make with
 `MAKE_RESTARTS=1`. Public catalog installation supplies the same verified executable.
+
+## Graph build
+
+`graph-recipe.json` builds GNU make through the common configure/make adapter.
+It explicitly depends on the host LLVM compiler, threaded target SDK and
+`native/shellsim-posix` library. Process and descriptor code is compiled once
+by that library port. This recipe publishes make as a guest build tool; its
+port-local shell check runs parallel jobs and checks propagation of a failed
+recipe through the public release installation API.
+
+The graph recipe is a distinct threaded build from the earlier standalone
+`recipe.json` profile. Its successful build alone does not establish guest
+execution; use `--output ... --check` to build and run the declared check.

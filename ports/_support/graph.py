@@ -27,6 +27,7 @@ class Dependency:
     port: str
     version: str
     recipe: str
+    kind: str = "target"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,10 @@ class Port:
     digest: str
     dependencies: tuple[Dependency, ...]
     recipe: dict[str, Any]
+
+    @property
+    def role(self) -> str:
+        return self.recipe.get("role", "target-library")
 
 
 @dataclass(frozen=True)
@@ -83,23 +88,32 @@ def _read(root: Path, reference: str) -> Port:
     if PurePosixPath(name).name != name or name in {".", ".."}:
         raise ValueError(f"recipe name must be a package name: {reference}")
     Version(version)
-    declarations = recipe.get("target_dependencies", [])
-    if not isinstance(declarations, list) or len(declarations) > _MAX_NODES:
-        raise ValueError(f"invalid dependency declarations: {reference}")
+    role = recipe.get("role", "target-library")
+    if role not in {"host-tool", "target-library", "guest-tool", "target-platform"}:
+        raise ValueError(f"unsupported port role: {reference}")
     dependencies = []
-    names = set()
-    for declaration in declarations:
-        if not isinstance(declaration, dict):
-            raise ValueError(f"dependency must be an object: {reference}")
-        port = _relative(declaration.get("port"))
-        version_pin = declaration.get("version")
-        if not isinstance(version_pin, str) or not version_pin:
-            raise ValueError(f"dependency needs an exact build version: {reference} -> {port}")
-        Version(version_pin)
-        if port in names:
-            raise ValueError(f"duplicate dependency: {reference} -> {port}")
-        names.add(port)
-        dependencies.append(Dependency(port, version_pin, _reference(declaration.get("recipe", port))))
+    for field, kind in (
+        ("build_dependencies", "build"),
+        ("target_dependencies", "target"),
+        ("runtime_dependencies", "runtime"),
+        ("platform_dependencies", "platform"),
+    ):
+        declarations = recipe.get(field, [])
+        if not isinstance(declarations, list) or len(declarations) > _MAX_NODES:
+            raise ValueError(f"invalid dependency declarations: {reference}")
+        names = set()
+        for declaration in declarations:
+            if not isinstance(declaration, dict):
+                raise ValueError(f"dependency must be an object: {reference}")
+            port = _relative(declaration.get("port"))
+            version_pin = declaration.get("version")
+            if not isinstance(version_pin, str) or not version_pin:
+                raise ValueError(f"dependency needs an exact build version: {reference} -> {port}")
+            Version(version_pin)
+            if port in names:
+                raise ValueError(f"duplicate dependency: {reference} -> {port}")
+            names.add(port)
+            dependencies.append(Dependency(port, version_pin, _reference(declaration.get("recipe", port)), kind))
     return Port(reference, path.parent, name, version, hashlib.sha256(data).hexdigest(), tuple(dependencies), recipe)
 
 
@@ -133,17 +147,33 @@ def plan(root: Path, requests: Sequence[str], *, target_profile: str | None = No
         except (OSError, ValueError) as error:
             raise ValueError("cannot read dependency chain: " + " -> ".join(active)) from error
         profile = port.recipe.get("target_profile")
-        if target_profile is not None and profile is not None and profile != target_profile:
+        if (
+            port.role != "host-tool"
+            and target_profile is not None
+            and profile is not None
+            and profile != target_profile
+        ):
             raise ValueError("target profile differs in dependency chain: " + " -> ".join(active))
-        logical_name = PurePosixPath(reference).parts[0] + "/" + port.name
+        logical_name = (
+            ("host" if port.role == "host-tool" else "target")
+            + ":"
+            + PurePosixPath(reference).parts[0]
+            + "/"
+            + port.name
+        )
         if selected.setdefault(logical_name, reference) != reference:
             raise ValueError("conflicting recipe variants in dependency chain: " + " -> ".join(active))
         loaded[reference] = port
         for dependency in port.dependencies:
-            previous = selected.setdefault(dependency.port, dependency.recipe)
+            selection = ("host" if dependency.kind == "build" else "target") + ":" + dependency.port
+            previous = selected.setdefault(selection, dependency.recipe)
             if previous != dependency.recipe:
                 raise ValueError("conflicting recipe variants in dependency chain: " + " -> ".join(active))
             provider = visit(dependency.recipe)
+            if (dependency.kind == "build") != (provider.role == "host-tool"):
+                raise ValueError("dependency role differs: " + " -> ".join([*active, dependency.recipe]))
+            if (dependency.kind == "platform") != (provider.role == "target-platform"):
+                raise ValueError("platform dependency role differs: " + " -> ".join([*active, dependency.recipe]))
             if provider.version != dependency.version or provider.name != PurePosixPath(dependency.port).name:
                 raise ValueError("dependency name or version differs: " + " -> ".join([*active, dependency.recipe]))
         active.pop()
