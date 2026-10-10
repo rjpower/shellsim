@@ -248,6 +248,13 @@ reuse compatible installed artifacts and reject replacement or destination
 conflicts. Upgrade and uninstall are not implemented. Recursive make jobserver
 coordination and a C++ compiler remain missing.
 
+Set memory and disk budgets for the selected tools. The default 64 MiB memory
+budget is too small for large Wasm executables: execution reserves compilation
+scratch space of 65 times the executable size, plus guest memory and filesystem
+storage. This charge also applies when Wasmtime reuses a compiled module, so
+cache state does not change guest resource limits. The [Clang port](toolchain/llvm/GUEST.md)
+uses an 8 GiB memory budget for its compiler checks.
+
 See [native dependency contracts](native/README.md) for profiles, exported files,
 cache identities, and compiler isolation.
 
