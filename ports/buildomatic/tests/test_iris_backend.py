@@ -38,6 +38,7 @@ from ports.buildomatic import (
 from ports.buildomatic.backends.iris import (
     CoordinatorService,
     IrisConfig,
+    WorkerPool,
     WorkerProxy,
     _CapabilityRPC,
     _deployed_files,
@@ -164,6 +165,118 @@ def test_signing_is_bounded_conditional_and_scoped_to_configured_blob_key(monkey
         BlobAccessRequest("put", "a" * 64, remote_store.MAX_METADATA_BYTES + 1)
     with pytest.raises(ValueError):
         BlobAccessRequest("get", "a" * 64, 5)
+
+
+@pytest.fixture
+def lifecycle_pool(tmp_path):
+    store = LocalStore(tmp_path / "pool")
+    submitted = []
+    status = SimpleNamespace(attempt_number=0, attempt_uid="uid-original", state=1, finished_at=None)
+    task = SimpleNamespace(current_attempt_number=0, attempts=(status,))
+    calls = []
+
+    def submit(name):
+        assert "/" not in name
+        submitted.append(name)
+        return f"/owner/service/{name}/0"
+
+    def attempt(task_id, number):
+        calls.append((task_id, number))
+        return status
+
+    def create():
+        return WorkerPool(
+            store,
+            "test",
+            1,
+            submit_worker=submit,
+            task_status=lambda task_id: task,
+            attempt_status=attempt,
+            make_worker=lambda name: SimpleNamespace(name=name),
+            terminal_states=frozenset({2}),
+        )
+
+    return SimpleNamespace(create=create, store=store, submitted=submitted, status=status, task=task, calls=calls)
+
+
+def test_worker_pool_retains_exact_attempt_across_restart(lifecycle_pool):
+    fixture = lifecycle_pool
+    pool = fixture.create()
+    workers, retired = pool.reconcile()
+    old = next(iter(workers))
+    assert retired == ()
+    # A task retry/current PENDING state cannot change the retained identity.
+    fixture.task.current_attempt_number = 1
+    fixture.task.attempts = ()
+    recovered = fixture.create()
+    assert set(recovered.reconcile()[0]) == {old}
+    assert fixture.submitted == [old]
+    assert fixture.calls[-1] == (f"/owner/service/{old}/0", 0)
+    fixture.status.state = 2
+    assert recovered.reconcile() == ({}, ())
+    assert fixture.submitted == [old]
+    fixture.status.finished_at = "terminal timestamp"
+    workers, retired = recovered.reconcile()
+    assert workers == {}
+    assert retired == (old,)
+    assert len(fixture.submitted) == 2
+    assert fixture.submitted[1] != old
+    journal = json.loads(fixture.store.read_journal("iris/test/workers.json").data)
+    assert journal["retired"][0]["attempt_uid"] == "uid-original"
+    assert journal["retired"][0]["finished_at"] == "terminal timestamp"
+
+
+def test_worker_pool_waits_for_identity_before_dispatch(lifecycle_pool):
+    fixture = lifecycle_pool
+    fixture.task.attempts = ()
+    pool = fixture.create()
+    assert pool.reconcile() == ({}, ())
+    original = fixture.submitted[0]
+    assert fixture.create().reconcile() == ({}, ())
+    assert fixture.submitted == [original]
+
+
+def test_worker_pool_mismatched_uid_never_retires(lifecycle_pool):
+    fixture = lifecycle_pool
+    pool = fixture.create()
+    pool.reconcile()
+    fixture.status.attempt_uid = "different-incarnation"
+    fixture.status.state = 2
+    fixture.status.finished_at = "terminal timestamp"
+    with pytest.raises(RuntimeError):
+        pool.reconcile()
+    assert len(fixture.submitted) == 1
+    assert json.loads(fixture.store.read_journal("iris/test/workers.json").data)["retired"] == []
+
+
+def test_worker_pool_transport_failure_preserves_identity(lifecycle_pool):
+    fixture = lifecycle_pool
+    pool = fixture.create()
+    pool.reconcile()
+    before = fixture.store.read_journal("iris/test/workers.json")
+
+    def unavailable(task_id, number):
+        raise ConnectionError()
+
+    pool._attempt_status = unavailable
+    with pytest.raises(ConnectionError):
+        pool.reconcile()
+    assert fixture.store.read_journal("iris/test/workers.json") == before
+    assert len(fixture.submitted) == 1
+
+
+def test_worker_pool_recovery_fences_old_membership_writer(lifecycle_pool):
+    fixture = lifecycle_pool
+    original = fixture.create()
+    original.reconcile()
+    recovered = fixture.create()
+    fixture.status.state = 2
+    fixture.status.finished_at = "terminal timestamp"
+    with pytest.raises(ConditionalWriteError):
+        original.reconcile()
+    assert len(fixture.submitted) == 1
+    recovered.reconcile()
+    assert len(fixture.submitted) == 2
 
 
 class NativeConflict(RuntimeError):
@@ -408,6 +521,46 @@ def test_service_serializes_builds_but_parallelizes_ready_nodes(service_parts):
     assert service.get(second).state == BuildState.RUNNING
     assert [len(worker.submitted) for worker in workers.values()] == [2, 2]
     assert all(worker.acknowledged for worker in workers.values())
+
+
+def test_service_fences_retired_instance_before_replacement_and_recovery(service_parts):
+    store, workers = service_parts
+    old = workers["worker-0"]
+    service = CoordinatorService(store, "loss", {"old": old})
+    build = service.submit(BuildRequest("loss", (Action("a", ("true",)),)))
+    service.tick_once()
+    assert len(old.submitted) == 1
+    replacement = Worker(TreeBundle("c" * 64))
+    service.update_workers({"fresh": replacement}, ("old",))
+    service.tick_once()
+    assert len(replacement.submitted) == 1
+    assert service.get(build).nodes[0].attempts == 2
+    old.finish()
+    recovered = CoordinatorService(store, "loss", {"fresh": replacement})
+    recovered.update_workers({"fresh": replacement}, ("old",))
+    recovered.tick_once()
+    assert recovered.get(build).state == BuildState.RUNNING
+    replacement.finish()
+    recovered.tick_once()
+    result = recovered.get(build)
+    assert result.state == BuildState.SUCCEEDED
+    assert result.nodes[0].bundle == replacement.bundle
+    assert not old.acknowledged
+    journal = json.loads(store.read_journal(f"iris/loss/builds/{build}.json").data)
+    assert journal["lost_workers"] == ["old"]
+
+
+def test_service_accepts_while_worker_identities_are_pending(service_parts):
+    store, workers = service_parts
+    service = CoordinatorService(store, "pending", {}, capacity=2)
+    build = service.submit(request())
+    service.tick_once()
+    assert service.get(build).state == BuildState.PENDING
+    service.cancel(build)
+    service.update_workers(workers, ())
+    service.tick_once()
+    assert service.get(build).state == BuildState.CANCELLED
+    assert all(not worker.submitted for worker in workers.values())
 
 
 def test_service_duplicate_key_conflict_and_worker_limit(service_parts):

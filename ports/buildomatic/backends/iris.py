@@ -20,11 +20,12 @@ import shutil
 import subprocess
 import sys
 import threading
+import uuid
 import zipfile
 from dataclasses import asdict, dataclass
 from importlib.metadata import requires
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping
+from typing import TYPE_CHECKING, Callable, Mapping
 from urllib.parse import urlsplit
 
 import tomllib
@@ -41,6 +42,8 @@ from ports.buildomatic.remote_store import (
 )
 
 if TYPE_CHECKING:
+    from iris.client.workload import AttemptStatus, TaskStatus
+
     from ports.buildomatic import Attempt, BuildRequest, BuildResult, Store, Worker, WorkerReport
 
 logger = logging.getLogger(__name__)
@@ -131,6 +134,114 @@ def _decode_request(data: bytes) -> BuildRequest:
     return BuildRequest(value["idempotency_key"], actions, value["max_workers"])
 
 
+class _RetiredWorker:
+    """Historical registration solely for core retirement, never an endpoint."""
+
+    def submit(self, attempt):
+        raise RuntimeError("retired worker cannot execute")
+
+    def poll(self, attempt_id):
+        raise RuntimeError("retired worker cannot execute")
+
+    def cancel(self, attempt_id):
+        raise RuntimeError("retired worker cannot execute")
+
+    def acknowledge(self, attempt_id):
+        raise RuntimeError("retired worker cannot execute")
+
+
+class WorkerPool:
+    """Persist immutable worker names and the exact Iris attempt UID before use.
+
+    A transport failure never retires a worker. Only terminal history for the
+    retained attempt number, matching UID and non-null finished_at does so.
+    Replacement jobs use fresh names; neither automatic task retries nor
+    RECREATE are allowed. Terminal reports fence authority, not physical reaping
+    of partitioned processes. The operator must not recreate these job names.
+    """
+
+    def __init__(
+        self,
+        store: Store,
+        service_id: str,
+        slots: int,
+        *,
+        submit_worker: Callable[[str], str],
+        task_status: Callable[[str], TaskStatus],
+        attempt_status: Callable[[str, int], AttemptStatus],
+        make_worker: Callable[[str], Worker],
+        terminal_states: frozenset[int],
+    ):
+        if type(slots) is not int or not 1 <= slots <= 32:
+            raise ValueError("worker pool requires 1..32 slots")
+        self._store = store
+        self._key = f"iris/{service_id}/workers.json"
+        self._slots = slots
+        self._submit_worker = submit_worker
+        self._task_status = task_status
+        self._attempt_status = attempt_status
+        self._make_worker = make_worker
+        self._terminal_states = terminal_states
+        self._proxies = {}
+        found = store.read_journal(self._key)
+        self._version = found.version if found else None
+        self._state = json.loads(found.data) if found else {"schema": 1, "slots": [], "retired": []}
+        if self._state["schema"] != 1 or len(self._state["slots"]) > slots:
+            raise ValueError("invalid durable worker pool")
+        # Claim the pool revision on recovery, fencing an older scheduler's
+        # next mutation even when no worker membership has changed yet.
+        self._save()
+
+    def _save(self):
+        self._version = self._store.write_journal(self._key, _encode(self._state), self._version)
+
+    def reconcile(self) -> tuple[dict[str, Worker], tuple[str, ...]]:
+        """Resolve current workers and retire only confirmed exact incarnations."""
+        while len(self._state["slots"]) < self._slots:
+            self._state["slots"].append(None)
+        ready = {}
+        for slot, record in enumerate(self._state["slots"]):
+            if record is not None and "attempt_uid" in record:
+                status = self._attempt_status(record["task_id"], record["attempt_number"])
+                if status.attempt_uid != record["attempt_uid"] or status.attempt_number != record["attempt_number"]:
+                    raise RuntimeError("Iris worker attempt identity changed")
+                if status.state in self._terminal_states and status.finished_at is not None:
+                    record.update(terminal_state=int(status.state), finished_at=str(status.finished_at))
+                    self._state["retired"].append(record)
+                    self._state["slots"][slot] = None
+                    self._save()
+                    self._proxies.pop(record["id"], None)
+                    record = None
+                elif status.state in self._terminal_states:
+                    continue
+            if record is None:
+                if len(self._state["retired"]) >= _MAX_BUILDS:
+                    raise ValueError("worker lifecycle history is full")
+                record = {"id": f"worker-{slot}-{uuid.uuid4().hex}"}
+                self._state["slots"][slot] = record
+                self._save()
+            if "task_id" not in record:
+                record["task_id"] = self._submit_worker(record["id"])
+                self._save()
+            if "attempt_uid" not in record:
+                status = self._task_status(record["task_id"])
+                attempt = next(
+                    (item for item in status.attempts if item.attempt_number == status.current_attempt_number), None
+                )
+                if attempt is None or not attempt.attempt_uid:
+                    continue
+                record.update(attempt_number=attempt.attempt_number, attempt_uid=attempt.attempt_uid)
+                self._save()
+                # Even an already-terminal first observation must pass the
+                # exact Attempt API before retirement on the next tick.
+                if attempt.state in self._terminal_states:
+                    continue
+            if record["id"] not in self._proxies:
+                self._proxies[record["id"]] = self._make_worker(record["id"])
+            ready[record["id"]] = self._proxies[record["id"]]
+        return ready, tuple(record["id"] for record in self._state["retired"])
+
+
 class CoordinatorService:
     """Durable service index, with generic core owning each build journal.
 
@@ -141,7 +252,13 @@ class CoordinatorService:
     """
 
     def __init__(
-        self, store: Store, service_id: str, workers: Mapping[str, Worker], *, cache_prefix: str = DEFAULT_PREFIX
+        self,
+        store: Store,
+        service_id: str,
+        workers: Mapping[str, Worker],
+        *,
+        cache_prefix: str = DEFAULT_PREFIX,
+        capacity: int | None = None,
     ):
         if _SERVICE_NAME.fullmatch(service_id) is None:
             raise ValueError("invalid Iris service name")
@@ -153,6 +270,9 @@ class CoordinatorService:
         self._lock = threading.RLock()
         self._drive_lock = threading.Lock()
         self._cache_prefix = validate_prefix(cache_prefix)
+        self._capacity = len(workers) if capacity is None else capacity
+        self._retired_workers = ()
+        self._fenced_workers = {}
 
     def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
         return sign_blob(self._cache_prefix, request)
@@ -192,7 +312,7 @@ class CoordinatorService:
         """Durably accept a request; reject reuse of a key for different content."""
         from ports.buildomatic import ConditionalWriteError, IdempotencyConflict
 
-        if request.max_workers > len(self._workers):
+        if request.max_workers > self._capacity:
             raise ValueError("build requests more workers than this service provides")
         data = _encode(asdict(request))
         digest = hashlib.sha256(data).hexdigest()
@@ -285,6 +405,8 @@ class CoordinatorService:
     def tick_once(self) -> None:
         """Advance the oldest unfinished build, skipping terminal builds without ack."""
         with self._drive_lock:
+            if not self._workers:
+                return
             index, _ = self._index()
             # Process control for queued builds too, without dispatching their
             # nodes while another build owns the worker pool.
@@ -297,16 +419,41 @@ class CoordinatorService:
                 if intent.get("cancelled"):
                     coordinator.cancel()
                 if intent.get("acknowledged") and coordinator.result().state.value in _TERMINAL:
+                    self._fence_workers(record["id"], coordinator)
                     self._release(record["id"], coordinator)
             for record in index["builds"]:
                 coordinator = self._coordinator(record["id"], record["request"])
                 if coordinator.result().state.value in _TERMINAL:
+                    self._fence_workers(record["id"], coordinator)
                     self._release(record["id"], coordinator)
                     continue
+                self._fence_workers(record["id"], coordinator)
                 result = coordinator.tick()
                 if result.state.value not in _TERMINAL:
                     return
                 self._release(record["id"], coordinator)
+
+    def update_workers(self, workers: Mapping[str, Worker], retired: tuple[str, ...]) -> None:
+        """Apply a pool snapshot only from the single scheduler thread."""
+        self._workers = dict(workers)
+        self._retired_workers = retired
+        for coordinator in self._coordinators.values():
+            coordinator.workers = dict(workers)
+
+    def _fence_workers(self, build_id, coordinator):
+        fenced = self._fenced_workers.setdefault(build_id, set())
+        for worker_id in self._retired_workers:
+            if worker_id in fenced:
+                continue
+            # Register the historical identity before retirement, including on
+            # recovery when it was never assigned in this particular build.
+            # Its endpoint is never callable and its ID cannot be scheduled.
+            coordinator.workers[worker_id] = _RetiredWorker()
+            try:
+                coordinator.worker_lost(worker_id)
+            finally:
+                del coordinator.workers[worker_id]
+            fenced.add(worker_id)
 
     def _release(self, build_id, coordinator):
         if build_id not in self._released:
@@ -585,7 +732,9 @@ def launch(client, config: IrisConfig, *, environment=None):
         priority_band=job_pb2.PRIORITY_BAND_BATCH,
         timeout=Duration.from_seconds(config.job_seconds),
         task_image=config.task_image,
+        existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
         max_retries_failure=2,
+        max_retries_preemption=2,
         max_task_failures=2,
     )
 
@@ -831,39 +980,69 @@ def _run_worker(config: IrisConfig, worker_id: str) -> None:
 
 def _run_coordinator(config: IrisConfig) -> None:
     from iris.actor.client import ActorClient
-    from iris.client.client import iris_ctx
-    from iris.cluster.types import EndpointAccess, EnvironmentSpec, ResourceSpec
+    from iris.client.client import JobAlreadyExists, iris_ctx
+    from iris.cluster.types import (
+        TERMINAL_TASK_STATES,
+        EndpointAccess,
+        EnvironmentSpec,
+        JobName,
+        ResourceSpec,
+        TaskAttempt,
+    )
     from iris.rpc import job_pb2
     from rigging.timing import Duration
 
     ctx = iris_ctx()
     files = _deployed_files()
     store = RemoteStore(config.cache_prefix or config.prefix, journal_prefix=config.prefix)
-    workers = {}
-    for index in range(config.workers):
-        name = f"worker-{index}"
-        ctx.client.submit(
-            _entrypoint("worker", config, worker_id=name, files=files),
-            name=name,
-            resources=ResourceSpec(
-                cpu=config.worker_cpu, memory=config.worker_memory_bytes, disk=config.worker_disk_bytes
-            ),
-            environment=EnvironmentSpec(setup_scripts=list(config.setup_scripts)) if config.setup_scripts else None,
-            ports=["actor"],
-            priority_band=job_pb2.PRIORITY_BAND_BATCH,
-            timeout=Duration.from_seconds(config.job_seconds),
-            task_image=config.task_image,
-            existing_job_policy=job_pb2.EXISTING_JOB_POLICY_KEEP,
-            max_retries_failure=2,
-            max_task_failures=2,
-        )
-        workers[name] = WorkerProxy(
+
+    def submit_worker(name):
+        try:
+            job = ctx.client.submit(
+                _entrypoint("worker", config, worker_id=name, files=files),
+                name=name,
+                resources=ResourceSpec(
+                    cpu=config.worker_cpu, memory=config.worker_memory_bytes, disk=config.worker_disk_bytes
+                ),
+                environment=EnvironmentSpec(setup_scripts=list(config.setup_scripts)) if config.setup_scripts else None,
+                ports=["actor"],
+                priority_band=job_pb2.PRIORITY_BAND_BATCH,
+                timeout=Duration.from_seconds(config.job_seconds),
+                task_image=config.task_image,
+                existing_job_policy=job_pb2.EXISTING_JOB_POLICY_ERROR,
+                max_retries_failure=0,
+                max_retries_preemption=0,
+                max_task_failures=0,
+            )
+        except JobAlreadyExists:
+            # A durable random name was persisted before the first submit.
+            # Recover its uncertain acknowledgement without ever recreating it.
+            job = ctx.client.job(ctx.job_id.child(name))
+        return str(job.job_id.task(0))
+
+    def make_worker(name):
+        return WorkerProxy(
             ActorClient(ctx.resolver, name, call_timeout=5, max_call_attempts=1),
             store=store,
             service_id=config.service_id,
             worker_id=name,
         )
-    service = CoordinatorService(store, config.service_id, workers, cache_prefix=config.cache_prefix or config.prefix)
+
+    pool = WorkerPool(
+        store,
+        config.service_id,
+        config.workers,
+        submit_worker=submit_worker,
+        task_status=lambda task_id: ctx.client.task(JobName.from_wire(task_id)).status(),
+        attempt_status=lambda task_id, number: ctx.client.attempt(
+            TaskAttempt(JobName.from_wire(task_id), number)
+        ).status(),
+        make_worker=make_worker,
+        terminal_states=TERMINAL_TASK_STATES,
+    )
+    service = CoordinatorService(
+        store, config.service_id, {}, cache_prefix=config.cache_prefix or config.prefix, capacity=config.workers
+    )
     # Current Iris calls scoped-capability access LINK; no anonymous proxy
     # access is enabled. The external transport keeps its minted URL private.
     server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_LINK)
@@ -873,6 +1052,8 @@ def _run_coordinator(config: IrisConfig) -> None:
     def drive():
         while not stop.wait(config.tick_seconds):
             try:
+                workers, retired = pool.reconcile()
+                service.update_workers(workers, retired)
                 service.tick_once()
             except Exception as error:
                 # Fail the task on storage or fencing errors. Iris then retries
