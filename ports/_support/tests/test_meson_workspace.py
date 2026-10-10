@@ -2,6 +2,7 @@
 
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -97,3 +98,21 @@ def test_unrecorded_existing_tree_is_not_adopted(meson_project):
     with pytest.raises(ValueError, match="no verified workspace receipt"):
         with retained_meson(context, ninja, {}, products, tools):
             pytest.fail("unverified build tree was adopted")
+
+
+def test_shared_link_resolves_trailing_archive(meson_project):
+    context, _, _, _ = meson_project
+    source = context.source
+    (source / "meson.build").write_text(
+        "project('trailing', 'c')\n"
+        "shared_library('value', 'value.c', link_args: ['-Wl,--no-undefined'], install: true)\n"
+    )
+    (source / "value.c").write_text("extern int helper(void); int value(void) { return helper(); }\n")
+    helper = source.parent / "helper.c"
+    helper.write_text("int helper(void) { return 19; }\n")
+    obj, archive = helper.with_suffix(".o"), helper.with_suffix(".a")
+    subprocess.run([context.target_tools["cc"], "-fPIC", "-c", helper, "-o", obj], check=True)
+    subprocess.run([context.target_tools["ar"], "rcs", archive, obj], check=True)
+    context = replace(context, shared_library_inputs=(archive,))
+    build_native(NativeBuildRequest(NativeAdapter.MESON, context))
+    assert next(context.staging_prefix.rglob("libvalue.so")).read_bytes().startswith(b"\x7fELF")

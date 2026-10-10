@@ -86,6 +86,7 @@ def retained_meson(
                 "compiler": stable.compiler_flags,
                 "linker": stable.linker_flags,
                 "shared": stable.shared_library_flags,
+                "shared_inputs": [str(path) for path in stable.shared_library_inputs],
                 "executable": stable.executable_flags,
             },
         }

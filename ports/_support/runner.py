@@ -290,6 +290,12 @@ def build_graph(
                 "compiler": list(build_cohort.compiler_flags),
                 "linker": list(build_cohort.linker_flags),
                 "shared_library": list(build_cohort.shared_library_flags),
+                "shared_library_inputs": [
+                    {
+                        "path": str(build_cohort.compiler_runtime_archive),
+                        "sha256": file_hash(build_cohort.compiler_runtime_archive),
+                    }
+                ],
                 "executable": list(build_cohort.executable_flags),
             }
         with build_slot(store, inputs) as slot, ExitStack() as workspace_stack:
@@ -369,6 +375,7 @@ def build_graph(
                         dependency_sysroot=prefix,
                         shared_library_flags=build_cohort.shared_library_flags,
                         executable_flags=build_cohort.executable_flags,
+                        shared_library_inputs=(build_cohort.compiler_runtime_archive,),
                     )
                     if adapter in {"meson", "python-meson"} and workspaces and port.reference in workspaces:
                         from ports._support.meson_workspace import retained_meson

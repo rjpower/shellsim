@@ -44,6 +44,7 @@ class NativeBuildContext:
     shared_library_flags: tuple[str, ...] = ()
     executable_flags: tuple[str, ...] = ()
     retained_workspace: bool = False
+    shared_library_inputs: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -192,7 +193,9 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             + "    command += "
             + repr(list(context.executable_flags))
             + "\n"
-            + "os.execv(command[0], command + arguments)\n",
+            + "os.execv(command[0], command + arguments + ("
+            + repr([str(path) for path in context.shared_library_inputs])
+            + ' if "-shared" in arguments else []))\n',
         )
         wrapper.chmod(0o755)
         wrappers[role] = wrapper

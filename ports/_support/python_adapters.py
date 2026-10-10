@@ -285,6 +285,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
                 *(str(path) for path in links),
                 "-o",
                 str(extension),
+                *(str(path) for path in context.shared_library_inputs),
             ),
             context.build,
         )

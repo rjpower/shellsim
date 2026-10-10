@@ -193,6 +193,14 @@ class BuildCohort:
             "-Wl,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic",
         )
 
+    @property
+    def compiler_runtime_archive(self) -> Path:
+        """Use the exact SDK builtin archive, independently of guest libc state."""
+        relative = "lib/clang/23/lib/" + TARGET.replace("wasm32-", "wasm32-unknown-", 1) + "/libclang_rt.builtins.a"
+        if relative not in self.sdk.contents:
+            raise ValueError("SDK receipt omits target compiler runtime archive")
+        return self.sdk.root / relative
+
     def tool(self, name: str) -> Path:
         return self.host_tools[name].path
 

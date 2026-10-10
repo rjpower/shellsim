@@ -202,3 +202,11 @@ Result-cache hits, workspace decisions and phase timings are printed to stderr.
 Host f2py is an optional explicit binding in both Meson cross and native files.
 Its complete admitted NumPy package supports SciPy's generation steps; target
 NumPy headers and f2py C sources come from the native dependency exports.
+
+Shared links keep `-nostdlib` so libc, pthread and interpreter state come from
+the process runtime. The runner supplies the target compiler-rt builtin archive
+from the verified SDK as an explicit trailing link input. This resolves numeric
+compiler helpers, including quad-precision conversions, without relying on
+which helpers a particular interpreter link happened to export. The archive
+path and hash remain result inputs; retained workspace admission also binds
+these trailing inputs, so a changed link policy cannot reuse stale modules.
