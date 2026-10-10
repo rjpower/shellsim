@@ -1,12 +1,21 @@
 """Verify that relinking admits sealed compile inputs rather than loose objects."""
 
 import json
+import os
+import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from ports.native.dependencies import digest
-from ports.python.cpython.threaded import compile_receipt, final_link, relink
+from ports.python.cpython.threaded import (
+    admit_process_refresh,
+    compile_process_facades,
+    compile_receipt,
+    final_link,
+    relink,
+)
 
 
 def test_compile_receipt_changes_for_objects_sources_and_generated_config(tmp_path):
@@ -88,3 +97,54 @@ def test_threaded_main_allocates_and_touches_more_than_64_mib(guest_factory):
 def test_final_link_rejects_noncanonical_ceiling_spelling(options):
     with pytest.raises(ValueError):
         final_link(["clang", *options], 268435456)
+
+
+def test_facade_refresh_recompiles_real_process_objects_and_preserves_core(tmp_path):
+    cc, make = shutil.which("cc"), shutil.which("make")
+    if cc is None or make is None:
+        pytest.skip("requires a native C compiler and Make")
+    directory = tmp_path / "ports/python/cpython"
+    process = tmp_path / "ports/toolchain/wasi_process"
+    sdk = tmp_path / "ports/toolchain/wasi_sdk"
+    for path in (directory, process, sdk):
+        path.mkdir(parents=True)
+    header = process / "process_abi.h"
+    header.write_text("#define LIMIT 1\n")
+    (process / "process_port.h").write_text("")
+    (sdk / "posix.h").write_text("")
+    (directory / "threaded_posix.c").write_text("int posix_facade(void) { return 0; }\n")
+    (process / "process.c").write_text('#include "process_abi.h"\nint facade(void) { return LIMIT; }\n')
+    work = tmp_path / "work"
+    guest = work / "wasi-build"
+    guest.mkdir(parents=True)
+    source = work / "Python-3.13.7/Modules"
+    staged = work / "process-source/patched-source/Modules"
+    source.mkdir(parents=True)
+    staged.mkdir(parents=True)
+    for name in ("posixmodule", "signalmodule", "faulthandler"):
+        text = f"int {name}(void) {{ return 0; }}\n"
+        (source / (name + ".c")).write_text(text)
+        (staged / (name + ".c")).write_text(text)
+    (guest / "Makefile").write_text(f"CC={cc}\nsrcdir={source.parent}\n")
+    core = guest / "core.c"
+    core.write_text("int facade(void); int main(void) { return facade(); }\n")
+    core_object = guest / "core.o"
+    subprocess.run([cc, "-c", str(core), "-o", str(core_object)], check=True)
+    before = core_object.read_bytes(), core_object.stat().st_mtime_ns
+    environment = dict(os.environ)
+    objects = compile_process_facades(work, Path(make), [cc], environment, directory)
+    program = work / "program"
+    subprocess.run([cc, str(core_object), *(str(path) for path in objects.values()), "-o", str(program)], check=True)
+    assert subprocess.run([str(program)]).returncode == 1
+    old = {"../../toolchain/wasi_process/process_abi.h": "old", "dynamic.c": "unchanged"}
+    new = {**old, "../../toolchain/wasi_process/process_abi.h": "new"}
+    with pytest.raises(ValueError):
+        admit_process_refresh(old, new, False)
+    admit_process_refresh(old, new, True)
+    header.write_text("#define LIMIT 2\n")
+    objects = compile_process_facades(work, Path(make), [cc], environment, directory)
+    subprocess.run([cc, str(core_object), *(str(path) for path in objects.values()), "-o", str(program)], check=True)
+    assert subprocess.run([str(program)]).returncode == 2
+    assert (core_object.read_bytes(), core_object.stat().st_mtime_ns) == before
+    with pytest.raises(ValueError):
+        admit_process_refresh(old, {**new, "dynamic.c": "changed"}, True)

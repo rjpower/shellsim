@@ -149,3 +149,11 @@ memory currently prepays its entire declared ceiling at process launch; the
 budget must exceed that ceiling plus runtime overhead even when the program
 uses little heap. Fresh links and verified relinks apply the same final policy.
 Changing this link ceiling preserves verified CPython compilation inputs.
+
+`threaded.py --relink-from OLD --recompile-process` verifies the full retained
+compile receipt, upstream source, patched modules, configuration, frontend and
+platform headers before rebuilding its five explicit process facade objects.
+Only pinned facade C/header changes are admitted. Fresh builds use the same
+compile commands; core objects remain verified inputs, and the new runtime gets
+a distinct manifest and compile receipt. Ordinary relinking keeps requiring
+identical facade source pins.

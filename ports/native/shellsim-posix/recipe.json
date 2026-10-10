@@ -27,12 +27,12 @@
       {
         "path": "toolchain/wasi_process/process.c",
         "destination": "process.c",
-        "sha256": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272"
+        "sha256": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7"
       },
       {
         "path": "toolchain/wasi_process/exec.c",
         "destination": "exec.c",
-        "sha256": "3f152fe442b57e0c65acd4b71635a3755f52097c26d21659633f1e323fe2d10b"
+        "sha256": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7"
       },
       {
         "path": "toolchain/wasi_process/tempfile.c",
@@ -47,7 +47,7 @@
       {
         "path": "toolchain/wasi_process/process_abi.h",
         "destination": "include/process_abi.h",
-        "sha256": "157c02f5fd5ebba9fc74aa03f7209e9c5ca9d040e969f50e14ea0190a3e7c862"
+        "sha256": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73"
       },
       {
         "path": "toolchain/wasi_process/exec_port.h",
@@ -93,9 +93,14 @@
         "path": "python/cpython/threaded_posix.c",
         "destination": "python/cpython/threaded_posix.c",
         "sha256": "cf01e3775e38e133faff965bdcf22f9a026f22e4d23b380f9f03226c052ca0e0"
+      },
+      {
+        "path": "toolchain/wasi_process/process_limits.h",
+        "destination": "process_limits.h",
+        "sha256": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
       }
     ],
-    "sha256": "02ad27117deb9a1bbdfaf726888fac9517b0bb65061b60206830be9afed59946"
+    "sha256": "d809141b2ddfe1865bbe066df84225570c1465e865f0cc47bcd364f72af4a6c7"
   },
   "build_dependencies": [
     {

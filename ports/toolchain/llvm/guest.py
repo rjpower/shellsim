@@ -227,6 +227,90 @@ def _refresh_snapshot(source, destination, inventory, previous, directories=()):
         raise ValueError("guest LLVM replacement dependency snapshot differs")
 
 
+def _update_dependency_headers(context, recipe, workspace, state, compatibility, snapshots):
+    """Refresh admitted native headers and let Ninja invalidate their dependants.
+
+    Source, compiler, platform headers and configuration remain exact. The
+    journal authorizes only old/new dependency bytes across an interruption;
+    changed files get fresh mtimes, and no compiled object is blessed or edited.
+    """
+    old = state["compatibility"]
+
+    def fixed(value):
+        return {**value, "headers": {k: v for k, v in value["headers"].items() if k != "posix"}}
+
+    if fixed(old) != fixed(compatibility) or old["headers"]["posix"] == compatibility["headers"]["posix"]:
+        raise ValueError("guest header update requires identical source, tools and platform inputs")
+    if state.get("phase", "ready") not in {"ready", "building"}:
+        raise ValueError("guest header update requires a completed configuration")
+    if digest(context.build / "CMakeCache.txt") != state["configuration_sha256"]:
+        raise ValueError("guest LLVM configuration differs")
+    if digest(context.source) != recipe["source"]["sha256"]:
+        raise ValueError("guest LLVM source archive differs")
+    source_hash = verify_source(context.source, workspace / "source", recipe, PORT)
+    for name, expected in state["inputs"]["compiler_tools"].items():
+        if digest(workspace / "inputs/compiler" / name) != expected:
+            raise ValueError("guest previous compiler snapshot differs: " + name)
+    previous = state["inputs"]["snapshots"]
+    for name in previous:
+        if name != "posix" and _inventory(workspace / "inputs" / name) != previous[name]:
+            raise ValueError("guest previous dependency snapshot differs: " + name)
+    origin, current = snapshots["posix"]
+    before = previous["posix"]
+    for expected, inventory in ((old["headers"]["posix"], before), (compatibility["headers"]["posix"], current)):
+        if expected != {name: value for name, value in inventory.items() if Path(name).parts[0] == "include"}:
+            raise ValueError("guest header compatibility differs from dependency snapshot")
+    changed = {name for name in before.keys() | current.keys() if before.get(name) != current.get(name)}
+    if len(changed) > 128:
+        raise ValueError("guest dependency update exceeds bounds")
+    for name in changed:
+        relative = Path(name)
+        if relative.is_absolute() or ".." in relative.parts or relative.parts[0] not in {"include", "lib"}:
+            raise ValueError("guest dependency update path escapes snapshot")
+        if not (workspace / "inputs/posix" / name).resolve().is_relative_to((workspace / "inputs/posix").resolve()):
+            raise ValueError("guest dependency update follows an escaping symlink")
+        if name in current and (origin / name).is_symlink():
+            raise ValueError("guest dependency update source is linked")
+    if sum((origin / name).stat().st_size for name in changed if name in current) > 16 * 1024**2:
+        raise ValueError("guest dependency update exceeds bounds")
+    journal = workspace / "header-update.json"
+    update = {"old": old, "new": compatibility, "before": before, "after": current}
+    if journal.exists():
+        if json.loads(journal.read_text()) != update:
+            raise ValueError("pending guest dependency update differs")
+    else:
+        if _inventory(workspace / "inputs/posix", ("include", "lib")) != before:
+            raise ValueError("guest previous native snapshot differs")
+        write_workspace(journal, update)
+    destination = workspace / "inputs/posix"
+    actual = _inventory(destination, ("include", "lib"))
+    if actual.keys() - (before.keys() | current.keys()):
+        raise ValueError("guest dependency snapshot has unrecorded files")
+    for name in before.keys() | current.keys():
+        if actual.get(name) not in {before.get(name), current.get(name)}:
+            raise ValueError("guest dependency snapshot is neither admitted old nor new bytes")
+    for name in sorted(changed):
+        output = destination / name
+        if name not in current:
+            output.unlink(missing_ok=True)
+        elif actual.get(name) != current[name]:
+            if digest(origin / name) != current[name]:
+                raise ValueError("guest new dependency changed during update")
+            output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = workspace / "header-update-file.preparing"
+            shutil.copyfile(origin / name, temporary)
+            temporary.replace(output)
+    if _inventory(destination, ("include", "lib")) != current:
+        raise ValueError("guest updated native snapshot differs")
+    state["compatibility"] = compatibility
+    state["phase"] = "building"
+    state["inputs"]["snapshots"]["posix"] = current
+    state.setdefault("dependency_header_updates", []).append({"before": before, "after": current})
+    write_workspace(workspace / "workspace.json", state)
+    journal.unlink()
+    return source_hash
+
+
 def _validate_guest_layout(recipe):
     """Reject layouts that disagree with the compiler's fixed virtual SDK paths."""
     destinations = recipe["install"]["destinations"]
@@ -368,17 +452,31 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     updated_source_hash = None
     if receipt.exists():
         state = json.loads(receipt.read_text())
+        pending_headers = workspace / "header-update.json"
+        if pending_headers.exists() and state["compatibility"] == compatibility:
+            pending = json.loads(pending_headers.read_text())
+            if (
+                pending["new"] != compatibility
+                or _inventory(workspace / "inputs/posix", ("include", "lib")) != pending["after"]
+            ):
+                raise ValueError("completed guest header update differs")
+            pending_headers.unlink()
         if state["compatibility"] != compatibility:
-            updated_source_hash = update_workspace_patches(
-                context.source,
-                workspace / "source",
-                recipe,
-                PORT,
-                workspace,
-                state,
-                compatibility,
-                build_directory=context.build,
-            )
+            if state["compatibility"]["patches"] == compatibility["patches"]:
+                updated_source_hash = _update_dependency_headers(
+                    context, recipe, workspace, state, compatibility, snapshots
+                )
+            else:
+                updated_source_hash = update_workspace_patches(
+                    context.source,
+                    workspace / "source",
+                    recipe,
+                    PORT,
+                    workspace,
+                    state,
+                    compatibility,
+                    build_directory=context.build,
+                )
         previous = state["inputs"]["snapshots"]
         previous_tools = state["inputs"]["compiler_tools"]
     elif context.build.exists() or (workspace / "source").exists():
@@ -460,6 +558,7 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
             "identity": identity,
             "source_tree_sha256": source_hash,
             "patch_updates": state.get("patch_updates", []),
+            "dependency_header_updates": state.get("dependency_header_updates", []),
             "artifacts": _inventory(staging),
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

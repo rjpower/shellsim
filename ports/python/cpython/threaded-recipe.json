@@ -24,7 +24,7 @@
   "build_scripts": [
     {
       "file": "threaded.py",
-      "sha256": "d3f0082c6b86a844985d24d7ffa6628239559b3a821f86b700137c7e2fe6c817"
+      "sha256": "bdfb5f8c636f026c5de1ad144e479db527b2f3aaafbef34100cd9f4c8aae9feb"
     },
     {
       "file": "sdk34-threads.patch",
@@ -68,7 +68,7 @@
     },
     {
       "file": "../../toolchain/wasi_process/recipe.json",
-      "sha256": "ab5d9d7c46c259c0c0447c513ef6f99dbf7ae066a8ffba23d6c217cb8420d3e3"
+      "sha256": "94e0ec103f011beaa5ef9dd66d1d73739a7fc408fce95d5858fe23a61886a2e0"
     },
     {
       "file": "../../toolchain/wasi_process/cpython-3.13.7-process.patch",
@@ -88,11 +88,11 @@
     },
     {
       "file": "../../toolchain/wasi_process/process.c",
-      "sha256": "49da192d4b084ad77a97802b4108bed7d79add74df9c87ae192919b90e8de272"
+      "sha256": "f276fbb293b0d07e2c4a164f319ec332e0d77247ad70f8d1d2b626be061eaba7"
     },
     {
       "file": "../../toolchain/wasi_process/process_abi.h",
-      "sha256": "157c02f5fd5ebba9fc74aa03f7209e9c5ca9d040e969f50e14ea0190a3e7c862"
+      "sha256": "c2a4699c5cfbf47fbd279e7bff612504763b536f2444c957dbf1ec8634fdbe73"
     },
     {
       "file": "../../toolchain/wasi_process/process_port.h",
@@ -108,7 +108,7 @@
     },
     {
       "file": "../../toolchain/wasi_process/exec.c",
-      "sha256": "3f152fe442b57e0c65acd4b71635a3755f52097c26d21659633f1e323fe2d10b"
+      "sha256": "baef674c43efc3546260c38362423be3e55266e1ba9afe89612f2f774df237a7"
     },
     {
       "file": "../../toolchain/wasi_process/exec_port.h",
@@ -129,6 +129,10 @@
     {
       "file": "../../_support/wasm_metadata.py",
       "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
+    },
+    {
+      "file": "../../toolchain/wasi_process/process_limits.h",
+      "sha256": "e3c80aa2ed9bff384958911ae0a9ee02aca21ef4f37969cd01e98a07fbb528d9"
     }
   ],
   "maximum_memory_bytes": 268435456

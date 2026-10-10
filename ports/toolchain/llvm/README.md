@@ -121,3 +121,11 @@ serialized startup contract. The loader binds imports and applies data
 relocations before calling the hook, then runs side constructors before the
 main command starts. Static mains without this opt-in keep their existing
 constructor sequence.
+
+Guest retained builds can update admitted native dependency headers after
+verifying the old source, configuration and snapshots. Source patches, target,
+compiler, platform/resource headers and build tools stay exact. Atomic header
+replacement and an old/new inventory journal permit interrupted updates to
+resume; changed files receive fresh mtimes. Ninja recompiles their dependants
+before the normal producer seals a new product. Header updates never certify
+previous object bytes as outputs of the changed inputs.
