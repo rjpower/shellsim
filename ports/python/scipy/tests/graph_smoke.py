@@ -1,8 +1,14 @@
 """Run numerical and callback behavior in the installed upstream SciPy guest."""
 
 import numpy as np
-from scipy import integrate, interpolate, linalg, optimize, sparse
+from scipy import fft, integrate, interpolate, linalg, optimize, sparse
 from scipy.sparse import linalg as sparse_linalg
+
+samples = np.arange(128, dtype=float).reshape(4, 32)
+samples = np.sin(samples / 7.0) + 0.25j * np.cos(samples / 11.0)
+spectrum = fft.fft(samples, axis=-1, workers=2)
+np.testing.assert_allclose(spectrum, np.fft.fft(samples, axis=-1), rtol=1e-12, atol=1e-12)
+np.testing.assert_allclose(fft.ifft(spectrum, axis=-1, workers=2), samples, atol=1e-12)
 
 matrix = np.array([[3.0, 1.0], [1.0, 2.0]])
 rhs = np.array([9.0, 8.0])

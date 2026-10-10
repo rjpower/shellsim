@@ -26,10 +26,14 @@ target NumPy headers and OpenBLAS exports. Shared linking treats warnings as
 errors and validates imported function signatures against provider exports;
 packaging requires an actual OpenBLAS dependency reference.
 
-The admitted host-tool receipts are frozen. The complete extension build has
-succeeded; packaging and public guest acceptance remain pending.
+The complete extension build, wheel packaging and public package installation
+have succeeded. Numerical acceptance remains pending: guest import reaches
+Ducc's thread-pool initialization and requires the real SDK `pthread_atfork`
+implementation in the selected libc. The prior artifacts remain intact while
+the corrected runtime cohort is prepared.
 The checked-in probe covers BLAS, real and complex solves, Schur decomposition,
 Sylvester equations, trust-krylov optimization, sparse eigenvalues and solves,
-spline interpolation and a Python integration callback. It also checks invalid
+spline interpolation, a Python integration callback and Ducc FFT round trips
+with `workers=2`, compared against NumPy. It also checks invalid
 solve dimensions, singular LAPACK factorization status and invalid LAPACK input.
 These expanded paths have not yet passed in the SciPy guest.
