@@ -689,6 +689,7 @@ def resolve_platform(cohort: BuildCohort, compiler: Receipt, bootstrap: Platform
             raise ValueError("platform workspace producer inputs differ")
         if product.contents["identity"]["tools"] != {str(tool.path): tool.sha256 for tool in tools}:
             raise ValueError("platform workspace build tools differ")
+        verify_sdk(cohort.sdk.root, product.contents)
         verify_product(product)
         return product
     root = build(

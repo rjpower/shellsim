@@ -39,3 +39,12 @@ def test_historical_runtime_without_compile_receipt_cannot_relink(tmp_path):
     with pytest.raises(ValueError, match="sealed compile-input receipt"):
         relink(previous, {}, {}, {}, Path("sdk"), Path("sysroot"), Path("llvm"), output, {})
     assert not output.exists()
+
+
+def test_corrected_platform_threads_errno_and_subprocess(guest_factory):
+    guest = guest_factory(bundle_env="SHELLSIM_RELINKED_CPYTHON_BUNDLE", cpu=10_000_000_000)
+    result = guest.run_script(Path(__file__).parent / "probes/threaded_process_errno.py")
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"threaded CPython: parent/worker errno and subprocess passed\n"
+    assert result.stderr == b""
+    guest.assert_interpreter_unchanged()

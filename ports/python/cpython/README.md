@@ -20,6 +20,13 @@ fixture ABI. The threaded runtime is built separately by
 target `wasm32-wasip1-threads` and exact ABI
 `shellsim-wasi-sdk34-cpython3137-threads-v3`.
 
+`threaded.py` records patched source, generated configuration, and local linked
+object identities in its build profile. Its optional `--relink-from` reuses only
+those verified inputs when the source, facade, frontend and platform headers
+remain unchanged. A relink writes a new output directory and records the prior
+manifest hash. Historical runtime bundles without compile receipts remain
+valid runtimes but cannot supply relink inputs.
+
 `CPythonRuntime` admits these compiler target and ABI pairs explicitly. The
 curated Python catalog target, native wheel tag, and patched uv resolver
 platform remain `wasm32-wasip1` for both cohorts. Native wheel and provider
