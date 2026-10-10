@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "base": "ghcr.io/marin-community/iris-task@sha256:c646ef8b571571edfc96c75fd9c8cc712ad286b61b33781070bdc29ab9f9a6ab",
+  "cmake": {
+    "version": "3.31.8",
+    "url": "https://github.com/Kitware/CMake/releases/download/v3.31.8/cmake-3.31.8-linux-x86_64.tar.gz",
+    "sha256": "630615d8e98ac33eba7fbe472626dff5c899c85af3c024585ae109166a6909d0"
+  },
+  "sccache": {
+    "version": "0.18.0",
+    "sha256": "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59"
+  },
+  "prepared_root": "/home/power/code/shellsim/.worktrees/shellsim-ports-rollout/target/buildomatic-sdk-bootstrap-v1",
+  "prepared_seed_sha256": "e64890e5156b728e599df8418f4509fa029ba7f81a11586a7b28062c171cc828",
+  "python_helper_version": "3.13.7",
+  "system_bindings": {
+    "make": {
+      "path": "/usr/bin/make",
+      "sha256": "27c9f6d806aee15882b01c2c61848f7aa75caa14bc7b6f608ba422f9e46a7d49",
+      "symlink": null
+    },
+    "sh": {
+      "path": "/usr/bin/sh",
+      "sha256": "c626229526bb58ec2d0f585f3c3ae1412e6f973b4353385042d11c38d8426917",
+      "symlink": "dash"
+    },
+    "rm": {
+      "path": "/usr/bin/rm",
+      "sha256": "0362781f855d9de6396b71af947662758970ed09946c4a0a78ff740b20f5e6a6",
+      "symlink": "gnurm"
+    }
+  },
+  "python_helper_inventory_sha256": "102007f1cae4b17685804c2cd0434810604b41c4d4fd2c8c3bbeec1a74714278",
+  "packaging": {
+    "version": "25.0",
+    "url": "https://files.pythonhosted.org/packages/20/12/38679034af332785aac8774540895e234f4d07f7545804097de4b666afd8/packaging-25.0-py3-none-any.whl",
+    "sha256": "29572ef2b1f17581046b3a2227d5c611fb25ec70ca1ba8554b24b0e69331a484"
+  }
+}

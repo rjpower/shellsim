@@ -1,0 +1,34 @@
+{
+  "evidence": {
+    "target/buildomatic-image/build-r1.log": "91542296f67cb765d848999c2988f8183918ecc14bf7cd0d707df2bc62005112",
+    "target/buildomatic-image/caller-preflight.json": "57f0690051920a38c404f3827882a94de8c63825ada592641cbdf681426c6efd",
+    "target/buildomatic-image/container-preflight-r1.json": "5d9b88d23951602b8a42026846475bf2a3d109715ceb2271c3d0f1cfd9f8292c",
+    "target/buildomatic-image/native-smoke-caller.log": "f6a2bcf873dd23cf5c4353dcf1d47b433b9587ec88c671b1711b7a9188308dce",
+    "target/buildomatic-image/native-smoke-image.log": "33e3192348ec3357a152ddb79e1c642a4e1aeb0810c0145b1ebfc5bf2210ba19",
+    "target/buildomatic-image/push-r1.log": "8c066f6706dd4a9ea926d1c633afc2e132766f0da696f3f1c61c0e992716ff13",
+    "target/buildomatic-image/registry-r1.txt": "8c1ca0d74ec001234ab4f2e99655b46fe5c1c9f16ee6279b775c7ccf939c1ab3",
+    "target/buildomatic-image/stable-image-proof.log": "c50858ddc3fca46948bd40de09bf22b7d6051f96985529b8bea3bebcde009a5c",
+    "target/buildomatic-image/stable-native-proof.json": "c6536763007e1dc3a634e1b62a646f719209757e24e5383f6f1cd45f907e5211"
+  },
+  "host_seed": {
+    "path": "/home/power/code/shellsim/.worktrees/shellsim-ports-rollout/target/buildomatic-sdk-bootstrap-v1/host-seed.ready.json",
+    "sha256": "7f10db9fee947ac0a32241430e694b9d3f695ddb2471c366a764bcb7d9bbddd1"
+  },
+  "image": "ghcr.io/marin-community/iris-task@sha256:93ac2b06806548e2a03e88f70b240d5625151eaf3851c24ba32fbe6aa4381acc",
+  "native_receipts": {
+    "cc.json": "c52e1480e47303e1fa51e68d8b0d8b600120c358eabf87a0559108c3011e3bb3",
+    "cmake.json": "99ef427c94fa53200c7582435f6c22c8c76f6c032049c4366201b2e701ef7eff",
+    "ninja.json": "f9f9fe010d450d93939b1b08ac5c9d39c653780f9196f473e351c3be228ba4fd",
+    "pkg-config.json": "54b39dbf990360a7cd1bd9c4ef1ddd773ca69de83f0dc12eed5bb2a46d6540b5"
+  },
+  "native_thread_probe_passed": {
+    "caller": true,
+    "image": true
+  },
+  "platform": "linux/amd64",
+  "platform_manifest_digest": "sha256:2975f5adfd8bacdf05f09dff08d15971604e2268fd0ea853c1906a3859b096b4",
+  "prepared_seed_sha256": "e64890e5156b728e599df8418f4509fa029ba7f81a11586a7b28062c171cc828",
+  "schema_version": 1,
+  "sdk_compile_started": false,
+  "tag": "ghcr.io/marin-community/iris-task:buildomatic-sdk-v1-20261010-97zs1nvl-r1"
+}
