@@ -491,7 +491,10 @@ def _runtime_files() -> dict[str, bytes]:
     from rigging.filesystem.cluster_config import MARIN_CLUSTER_CONFIG_DIRS
 
     result = {}
-    dependencies = {"google-cloud-storage>=2.0"}
+    # The transported ports driver imports packaging for recipe versions and
+    # PEP 517 requirement admission. Install it into the same interpreter used
+    # by WorkerExecutor, independently of guest wheels or image user sites.
+    dependencies = {"google-cloud-storage>=2.0", "packaging==26.2"}
     for package, root in (
         ("iris", Path(iris.client.client.__file__).resolve().parents[1]),
         ("rigging", Path(rigging.filesystem.factory.__file__).resolve().parents[1]),
