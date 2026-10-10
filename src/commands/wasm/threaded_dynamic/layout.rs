@@ -423,6 +423,44 @@ pub(in crate::commands::wasm) struct Executable {
     pub(super) start: Option<u32>,
 }
 
+/// Conservative retained heap estimate: a tree entry reserves 256 bytes plus string
+/// capacity, and each collection reserves 512 bytes for its root/allocation overhead.
+/// This counts the executable graph metadata independently of its Wasm code image.
+pub(in crate::commands::wasm) fn executable_cache_bytes(main: &Executable) -> usize {
+    fn vector(names: &Vec<String>) -> usize {
+        names.iter().fold(
+            512usize.saturating_add(
+                names
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<String>()),
+            ),
+            |bytes, name| bytes.saturating_add(name.capacity()),
+        )
+    }
+    let weak = main
+        .weak_imports
+        .iter()
+        .fold(512usize, |bytes, (namespace, name)| {
+            bytes
+                .saturating_add(256)
+                .saturating_add(namespace.capacity())
+                .saturating_add(name.capacity())
+        });
+    std::mem::size_of::<Executable>()
+        .saturating_add(64)
+        .saturating_add(string_set_cache_bytes(&main.tls_exports))
+        .saturating_add(string_set_cache_bytes(&main.forwarded_exports))
+        .saturating_add(vector(&main.needed))
+        .saturating_add(vector(&main.runtime_paths))
+        .saturating_add(weak)
+}
+
+pub(in crate::commands::wasm) fn string_set_cache_bytes(names: &BTreeSet<String>) -> usize {
+    names.iter().fold(512usize, |bytes, name| {
+        bytes.saturating_add(256).saturating_add(name.capacity())
+    })
+}
+
 pub(in crate::commands::wasm) const START_EXPORT: &str = "__shellsim_executable_start";
 
 /// Executables own their memory/table placement; only dependency and symbol

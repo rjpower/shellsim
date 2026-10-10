@@ -1,0 +1,427 @@
+{
+  "conditions": {
+    "logical_cpus": 16,
+    "platform": "x86_64 Linux",
+    "rust": "1.97.1",
+    "wasmtime": "patched 49.0.0",
+    "observations": "single observations on a shared host; LLVM and package artifacts reused"
+  },
+  "release": {
+    "cohort_archive_sha256": "5edfeab7d45c7e1a47e984a2b3b8a7f55f5bb062c4d086eaf9a40737161631a6",
+    "native_archive_sha256": "6608b4ae246d319e1fd8b830d757c8b1903847d13ca9baf02bd0f3ee31a4d4a6"
+  },
+  "runs": {
+    "baseline": {
+      "setup_seconds": 7.376792379654944,
+      "clang": {
+        "bytes": 84236270,
+        "sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2"
+      },
+      "records": [
+        {
+          "phase": "load-and-version",
+          "repetition": 0,
+          "seconds": 267.87935381848365,
+          "command": "clang --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-main",
+          "repetition": 0,
+          "seconds": 3.5333276065066457,
+          "command": "cd /work && clang -I/usr/local/include -c main.c -o main.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-codec",
+          "repetition": 0,
+          "seconds": 3.7087720185518265,
+          "command": "cd /work && clang -I/usr/local/include -c codec.c -o codec.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "link",
+          "repetition": 0,
+          "seconds": 135.53031566739082,
+          "command": "cd /work && clang -o codec.wasm main.o codec.o -L/usr/local/lib -lz",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 0,
+          "seconds": 4.950354925356805,
+          "command": "cd /work && chmod +x codec.wasm && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "load-and-version",
+          "repetition": 1,
+          "seconds": 3.28554246481508,
+          "command": "clang --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-main",
+          "repetition": 1,
+          "seconds": 3.1875941660255194,
+          "command": "cd /work && clang -I/usr/local/include -c main.c -o main.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-codec",
+          "repetition": 1,
+          "seconds": 3.193633704446256,
+          "command": "cd /work && clang -I/usr/local/include -c codec.c -o codec.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "link",
+          "repetition": 1,
+          "seconds": 4.851832844316959,
+          "command": "cd /work && clang -o codec.wasm main.o codec.o -L/usr/local/lib -lz",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 1,
+          "seconds": 0.07678255997598171,
+          "command": "cd /work && chmod +x codec.wasm && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        }
+      ]
+    },
+    "final-cold": {
+      "setup_seconds": 7.365578792057931,
+      "clang": {
+        "bytes": 84236270,
+        "sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2"
+      },
+      "records": [
+        {
+          "phase": "load-and-version",
+          "repetition": 0,
+          "seconds": 38.538715528324246,
+          "command": "clang --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "load-linker-and-version",
+          "repetition": 0,
+          "seconds": 19.85168970748782,
+          "command": "wasm-ld --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-main",
+          "repetition": 0,
+          "seconds": 0.2852051854133606,
+          "command": "cd /work && clang -I/usr/local/include -c main.c -o main.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-codec",
+          "repetition": 0,
+          "seconds": 0.29070487152785063,
+          "command": "cd /work && clang -I/usr/local/include -c codec.c -o codec.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "link",
+          "repetition": 0,
+          "seconds": 0.5704780239611864,
+          "command": "cd /work && clang -o codec.wasm main.o codec.o -L/usr/local/lib -lz",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 0,
+          "seconds": 0.7651713257655501,
+          "command": "cd /work && chmod +x codec.wasm && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "load-and-version",
+          "repetition": 1,
+          "seconds": 0.25964374653995037,
+          "command": "clang --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "load-linker-and-version",
+          "repetition": 1,
+          "seconds": 0.08450952637940645,
+          "command": "wasm-ld --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-main",
+          "repetition": 1,
+          "seconds": 0.2828849358484149,
+          "command": "cd /work && clang -I/usr/local/include -c main.c -o main.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-codec",
+          "repetition": 1,
+          "seconds": 0.2852339372038841,
+          "command": "cd /work && clang -I/usr/local/include -c codec.c -o codec.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "link",
+          "repetition": 1,
+          "seconds": 0.5730039840564132,
+          "command": "cd /work && clang -o codec.wasm main.o codec.o -L/usr/local/lib -lz",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 1,
+          "seconds": 0.06615155935287476,
+          "command": "cd /work && chmod +x codec.wasm && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        }
+      ]
+    },
+    "final-second-process": {
+      "setup_seconds": 7.018792621791363,
+      "clang": {
+        "bytes": 84236270,
+        "sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2"
+      },
+      "records": [
+        {
+          "phase": "load-and-version",
+          "repetition": 0,
+          "seconds": 4.432262293063104,
+          "command": "clang --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "load-linker-and-version",
+          "repetition": 0,
+          "seconds": 2.092659866437316,
+          "command": "wasm-ld --version",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-main",
+          "repetition": 0,
+          "seconds": 0.28148130513727665,
+          "command": "cd /work && clang -I/usr/local/include -c main.c -o main.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "compile-codec",
+          "repetition": 0,
+          "seconds": 0.2805070001631975,
+          "command": "cd /work && clang -I/usr/local/include -c codec.c -o codec.o",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "link",
+          "repetition": 0,
+          "seconds": 0.5447913277894258,
+          "command": "cd /work && clang -o codec.wasm main.o codec.o -L/usr/local/lib -lz",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 0,
+          "seconds": 0.14224288426339626,
+          "command": "cd /work && chmod +x codec.wasm && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        }
+      ]
+    },
+    "final-make": {
+      "setup_seconds": 7.053377125412226,
+      "clang": {
+        "bytes": 84236270,
+        "sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2"
+      },
+      "records": [
+        {
+          "phase": "make",
+          "repetition": 0,
+          "seconds": 7.741455913521349,
+          "command": "cd /work && make -j2",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 0,
+          "seconds": 0.13212148379534483,
+          "command": "cd /work && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "make",
+          "repetition": 1,
+          "seconds": 0.6421485375612974,
+          "command": "cd /work && make -j2",
+          "returncode": 0,
+          "stop_reason": null
+        },
+        {
+          "phase": "run",
+          "repetition": 1,
+          "seconds": 0.06472801603376865,
+          "command": "cd /work && ./codec.wasm",
+          "returncode": 0,
+          "stop_reason": null
+        }
+      ]
+    }
+  },
+  "public_project": {
+    "previous_seconds": 437.3632911173627,
+    "previous_conditions": "cold serial runtime without persistent Wasmtime cache",
+    "changed_seconds": 31.523033159784973,
+    "changed_conditions": "fresh host process with populated Clang, LLD, make, and codec persistent artifacts; release installation and Python package operations included",
+    "results": [
+      {
+        "name": "make",
+        "command": "cd /work && make -j2",
+        "returncode": 0,
+        "stop_reason": null,
+        "usage": {
+          "cpu_used": 4304437170,
+          "memory_current": 348,
+          "memory_peak": 6471584925,
+          "disk_current": 362380789,
+          "disk_peak": 362380789,
+          "output_bytes": 172
+        }
+      },
+      {
+        "name": "codec",
+        "command": "cd /work && ./codec.wasm",
+        "returncode": 0,
+        "stop_reason": null,
+        "usage": {
+          "cpu_used": 4452613290,
+          "memory_current": 352,
+          "memory_peak": 6471584925,
+          "disk_current": 362380789,
+          "disk_peak": 362380789,
+          "output_bytes": 223
+        }
+      },
+      {
+        "name": "make-up-to-date",
+        "command": "cd /work && make -q",
+        "returncode": 0,
+        "stop_reason": null,
+        "usage": {
+          "cpu_used": 4600558484,
+          "memory_current": 352,
+          "memory_peak": 6471584925,
+          "disk_current": 362380789,
+          "disk_peak": 362380789,
+          "output_bytes": 223
+        }
+      },
+      {
+        "name": "packages",
+        "command": "python /work/packages.py",
+        "returncode": 0,
+        "stop_reason": null,
+        "usage": {
+          "cpu_used": 7353630330,
+          "memory_current": 352,
+          "memory_peak": 6471584925,
+          "disk_current": 371694586,
+          "disk_peak": 371694586,
+          "output_bytes": 269
+        }
+      }
+    ]
+  },
+  "compilation_sweep": [
+    {
+      "compiler": "cranelift",
+      "optimization": "speed",
+      "parallel": "parallel",
+      "metadata": "full",
+      "source_bytes": 84236270,
+      "source_sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2",
+      "read_seconds": 0.349840759,
+      "compile_seconds": 18.452734753,
+      "image_bytes": 270777592,
+      "debug_info": false,
+      "debug_symbols": true,
+      "address_map": true
+    },
+    {
+      "compiler": "cranelift",
+      "optimization": "speed",
+      "parallel": "parallel",
+      "metadata": "minimal",
+      "source_bytes": 84236270,
+      "source_sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2",
+      "read_seconds": 0.041053022,
+      "compile_seconds": 19.330252755,
+      "image_bytes": 231433864,
+      "debug_info": false,
+      "debug_symbols": false,
+      "address_map": false
+    },
+    {
+      "compiler": "cranelift",
+      "optimization": "none",
+      "parallel": "parallel",
+      "metadata": "full",
+      "source_bytes": 84236270,
+      "source_sha256": "c471102c52afc7f75ebd29f7249db8893894b7d401b7ebc60ceefafd4c2abbb2",
+      "read_seconds": 0.373553091,
+      "compile_seconds": 26.720213519,
+      "image_bytes": 303539040,
+      "debug_info": false,
+      "debug_symbols": true,
+      "address_map": true
+    },
+    {
+      "compiler": "winch",
+      "fuel": true,
+      "threads": true,
+      "shared_memory": true,
+      "exceptions": true,
+      "error": "Error: failed to compile: wasm[0]::function[27491]\n\nCaused by:\n    Compilation error: Winch internal error: Illegal fuel state"
+    }
+  ],
+  "runtime": {
+    "wheel_sha256": "4dc44474bcffd5b6a349c6ea2099ef2f3544269760182ecc632a12a8bdb5088c",
+    "wasmtime_build_identity": "2e255d50f5173c6faae86cff6c253bad8cb8626cc36afa760515e865028decb5"
+  }
+}
