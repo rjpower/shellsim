@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import pytest
 
 from ports._support import runner
+from ports._support.cohort import Receipt
 from ports._support.graph import Graph, Port
 
 
@@ -200,3 +201,45 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     )
     proof = json.loads((tmp_path / "proof/graph.json").read_text())
     assert proof["resolved_toolchains"][port.reference] == target.toolchain
+
+
+@dataclass(frozen=True)
+class PlatformCohort:
+    sysroot: Receipt
+
+
+def test_executable_archive_admission_rejects_modified_and_unrecorded_files(tmp_path):
+    path = tmp_path / "sysroot/lib/setjmp.a"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"!<arch>\nverified SDK archive")
+    receipt = Receipt(
+        tmp_path,
+        tmp_path / "manifest.json",
+        "0" * 64,
+        {"artifacts": {"sysroot/lib/setjmp.a": hashlib.sha256(path.read_bytes()).hexdigest()}},
+    )
+    cohort = PlatformCohort(receipt)
+    declared = {"executable_cohort_link_inputs": ["lib/setjmp.a"]}
+    assert runner._executable_cohort_link_inputs(cohort, declared) == (path,)
+    path.write_bytes(b"!<arch>\nmodified archive")
+    with pytest.raises(ValueError, match="differs"):
+        runner._executable_cohort_link_inputs(cohort, declared)
+    unrecorded = path.with_name("ambient.a")
+    unrecorded.write_bytes(b"!<arch>\nambient archive")
+    with pytest.raises(ValueError, match="differs"):
+        runner._executable_cohort_link_inputs(cohort, {"executable_cohort_link_inputs": ["lib/ambient.a"]})
+
+
+@pytest.mark.parametrize("declared", [["../host.a"], ["/host.a"], ["lib/setjmp.a", "lib/setjmp.a"]])
+def test_executable_archive_admission_rejects_escaping_or_duplicate_inputs(tmp_path, declared):
+    path = tmp_path / "sysroot/lib/setjmp.a"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"!<arch>\nverified SDK archive")
+    receipt = Receipt(
+        tmp_path,
+        tmp_path / "manifest.json",
+        "0" * 64,
+        {"artifacts": {"sysroot/lib/setjmp.a": hashlib.sha256(path.read_bytes()).hexdigest()}},
+    )
+    with pytest.raises(ValueError):
+        runner._executable_cohort_link_inputs(PlatformCohort(receipt), {"executable_cohort_link_inputs": declared})

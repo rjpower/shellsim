@@ -258,3 +258,13 @@ of the enclosing Shellsim commit. A pinned checkout inside the source tree
 remains discoverable. Inherited Git directory/work-tree overrides are excluded
 by the existing target environment allowlist. Retained generated VCS headers
 may change once when this boundary corrects a previously embedded parent hash.
+
+`build.executable_cohort_link_inputs` declares at most 32 static archives by
+canonical path relative to the resolved platform sysroot, for example
+`lib/wasm32-wasip1-threads/libsetjmp.a`. The runner rejects escaping paths,
+symlinks, missing files, duplicate entries, archives larger than 128 MiB, and
+bytes absent from the admitted platform inventory before consulting the result
+cache. Exact paths and hashes remain result inputs. The common compiler wrapper
+adds these archives after the original executable link arguments, preserving
+static archive order. Compilation and shared links do not consume them. Retained
+workspace admission binds the resulting compiler wrapper text.

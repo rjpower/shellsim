@@ -45,6 +45,7 @@ class NativeBuildContext:
     executable_flags: tuple[str, ...] = ()
     retained_workspace: bool = False
     shared_library_inputs: tuple[Path, ...] = ()
+    executable_link_inputs: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -132,7 +133,9 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "\n"
         + "os.execv(command[0], command + arguments + ("
         + repr([str(path) for path in context.shared_library_inputs])
-        + " if is_shared else []))\n"
+        + " if is_shared else "
+        + repr([str(path) for path in context.executable_link_inputs])
+        + " if is_link else []))\n"
     )
 
 
