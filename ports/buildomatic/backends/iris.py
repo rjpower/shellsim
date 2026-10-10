@@ -1,0 +1,740 @@
+"""Persistent Iris actors around the generic build coordinator and executor.
+
+One coordinator serves a named service. Builds run in durable admission order;
+ready nodes within the active build use the worker pool concurrently. Submit,
+Get and Cancel never wait for a build to finish. Worker actors are private and
+external clients use the controller's authenticated BEARER capability proxy.
+Iris actors deserialize Python objects, so capability holders are trusted peers.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import zipfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import TYPE_CHECKING, Mapping
+from urllib.parse import urlsplit
+
+from ports.buildomatic.remote_store import DEFAULT_PREFIX, MAX_METADATA_BYTES, RemoteStore, validate_prefix
+
+if TYPE_CHECKING:
+    from ports.buildomatic import Attempt, BuildRequest, BuildResult, Store, Worker, WorkerReport
+
+logger = logging.getLogger(__name__)
+_SERVICE_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
+_BUILD_ID = re.compile(r"[0-9a-f]{64}\Z")
+_TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
+_MAX_BUILDS = 4096
+
+
+@dataclass(frozen=True)
+class IrisConfig:
+    """Modest CPU service resources; all tasks use BATCH priority.
+
+    ``setup_scripts`` installs only the caller's required runtime into the task
+    image. Empty scripts require an image with Iris and Rigging already present.
+    Pin ``task_image`` to a digest for reproducible compiler environments.
+    """
+
+    service_id: str
+    prefix: str = DEFAULT_PREFIX
+    cache_prefix: str | None = None
+    target_cluster: str = "cw-us-east-02a"
+    workers: int = 2
+    worker_cpu: float = 1
+    worker_memory_bytes: int = 8 * 1024**3
+    worker_disk_bytes: int = 10 * 1024**3
+    worker_output_bytes: int = 2 * 1024**3
+    worker_max_files: int = 100000
+    worker_cpu_seconds: int = 3600
+    worker_log_bytes: int = 8 * 1024**2
+    job_seconds: int = 3600
+    task_image: str | None = None
+    setup_scripts: tuple[str, ...] = ("uv sync --no-dev --no-install-project",)
+    compiler_cache: bool = False
+    tick_seconds: float = 0.5
+
+    def __post_init__(self):
+        if _SERVICE_NAME.fullmatch(self.service_id) is None:
+            raise ValueError("invalid Iris service name")
+        validate_prefix(self.prefix)
+        if self.cache_prefix is not None:
+            validate_prefix(self.cache_prefix)
+        if type(self.workers) is not int or not 1 <= self.workers <= 32:
+            raise ValueError("Iris needs 1..32 workers")
+        if not math.isfinite(self.worker_cpu) or self.worker_cpu <= 0:
+            raise ValueError("worker CPU must be positive and finite")
+        if self.worker_memory_bytes <= 0 or self.worker_disk_bytes <= 0 or self.job_seconds <= 0:
+            raise ValueError("Iris resource limits must be positive")
+        if any(
+            value <= 0
+            for value in (
+                self.worker_output_bytes,
+                self.worker_max_files,
+                self.worker_cpu_seconds,
+                self.worker_log_bytes,
+            )
+        ):
+            raise ValueError("worker execution limits must be positive")
+        if not math.isfinite(self.tick_seconds) or self.tick_seconds < 0.1:
+            raise ValueError("tick interval must be finite and at least 0.1 seconds")
+
+
+def _encode(value) -> bytes:
+    data = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    if len(data) > MAX_METADATA_BYTES:
+        raise ValueError("service metadata exceeds byte bound")
+    return data
+
+
+def _decode_request(data: bytes) -> BuildRequest:
+    from ports.buildomatic import Action, BuildRequest, InputMount, TreeBundle
+
+    value = json.loads(data)
+    actions = tuple(
+        Action(
+            id=action["id"],
+            argv=tuple(action["argv"]),
+            dependencies=tuple(action["dependencies"]),
+            inputs=tuple(
+                InputMount(mount["name"], TreeBundle(mount["bundle"]["digest"])) for mount in action["inputs"]
+            ),
+            env=tuple(tuple(pair) for pair in action["env"]),
+            timeout_seconds=action["timeout_seconds"],
+            max_attempts=action["max_attempts"],
+        )
+        for action in value["actions"]
+    )
+    return BuildRequest(value["idempotency_key"], actions, value["max_workers"])
+
+
+class CoordinatorService:
+    """Durable service index, with generic core owning each build journal.
+
+    Accepted requests are immutable blobs referenced by a CAS index before the
+    RPC returns. A replacement coordinator reconstructs submit from that index.
+    One Iris coordinator task must own this service; replicas are not supported.
+    The first cut retains at most 4096 build records per named service.
+    """
+
+    def __init__(self, store: Store, service_id: str, workers: Mapping[str, Worker]):
+        if _SERVICE_NAME.fullmatch(service_id) is None:
+            raise ValueError("invalid Iris service name")
+        self._store, self._workers = store, dict(workers)
+        self._base = f"iris/{service_id}"
+        self._index_key = f"{self._base}/index.json"
+        self._coordinators = {}
+        self._released = set()
+        self._lock = threading.RLock()
+
+    def _index(self):
+        found = self._store.read_journal(self._index_key)
+        if found is None:
+            return {"schema": 1, "builds": []}, None
+        value = json.loads(found.data)
+        if value["schema"] != 1 or len(value["builds"]) > _MAX_BUILDS:
+            raise ValueError("unsupported or oversized service index")
+        return value, found.version
+
+    def _coordinator(self, build_id: str, request_digest: str):
+        from ports.buildomatic import Coordinator
+
+        if build_id not in self._coordinators:
+            found = self._store.read_journal(f"{self._base}/requests/{build_id}.json")
+            if found is None or hashlib.sha256(found.data).hexdigest() != request_digest:
+                raise ValueError("accepted request journal is missing or corrupt")
+            request = _decode_request(found.data)
+            coordinator = Coordinator(self._store, f"{self._base}/builds/{build_id}.json", self._workers)
+            coordinator.submit(request)
+            self._coordinators[build_id] = coordinator
+        return self._coordinators[build_id]
+
+    def _lookup(self, build_id: str):
+        if _BUILD_ID.fullmatch(build_id) is None:
+            raise ValueError("invalid service build ID")
+        index, _ = self._index()
+        record = next((item for item in index["builds"] if item["id"] == build_id), None)
+        if record is None:
+            raise KeyError(build_id)
+        return self._coordinator(build_id, record["request"])
+
+    def submit(self, request: BuildRequest) -> str:
+        """Durably accept a request; reject reuse of a key for different content."""
+        from ports.buildomatic import ConditionalWriteError, IdempotencyConflict
+
+        if request.max_workers > len(self._workers):
+            raise ValueError("build requests more workers than this service provides")
+        data = _encode(asdict(request))
+        digest = hashlib.sha256(data).hexdigest()
+        build_id = hashlib.sha256(request.idempotency_key.encode()).hexdigest()
+        with self._lock:
+            request_key = f"{self._base}/requests/{build_id}.json"
+            try:
+                self._store.write_journal(request_key, data, None)
+            except ConditionalWriteError:
+                found = self._store.read_journal(request_key)
+                if found is None or found.data != data:
+                    raise IdempotencyConflict("service idempotency key owns another request") from None
+            for _ in range(16):
+                index, version = self._index()
+                previous = next((item for item in index["builds"] if item["id"] == build_id), None)
+                if previous is not None:
+                    if previous["request"] != digest:
+                        raise IdempotencyConflict("service idempotency key owns another request")
+                    self._coordinator(build_id, digest)
+                    return build_id
+                if len(index["builds"]) >= _MAX_BUILDS:
+                    raise ValueError("service build index is full")
+                index["builds"].append({"id": build_id, "request": digest})
+                try:
+                    self._store.write_journal(self._index_key, _encode(index), version)
+                except ConditionalWriteError:
+                    continue
+                self._coordinator(build_id, digest)
+                return build_id
+        raise ConditionalWriteError("service index remained contended")
+
+    def get(self, build_id: str) -> BuildResult:
+        """Return durable state using the service ID returned from Submit."""
+        with self._lock:
+            return self._lookup(build_id).result()
+
+    def cancel(self, build_id: str) -> BuildResult:
+        """Cancel only the chosen build's attempts; keep the worker jobs alive."""
+        with self._lock:
+            return self._lookup(build_id).cancel()
+
+    def acknowledge(self, build_id: str) -> None:
+        with self._lock:
+            self._lookup(build_id).acknowledge()
+
+    def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
+        """Return bounded diagnostic tails retained before worker cleanup."""
+        with self._lock:
+            request_id = self._lookup(build_id).result().request_id
+            found = self._store.read_journal(f"{self._base}/diagnostics/{request_id}.json")
+            if found is None:
+                return ()
+            result = []
+            for record in json.loads(found.data):
+                tail = self._store.read_journal(f"{self._base}/logs/{record['attempt_id']}")
+                result.append({**record, "tail": "" if tail is None else tail.data.decode(errors="replace")})
+            return tuple(result)
+
+    def tick_once(self) -> None:
+        """Advance the oldest unfinished build, skipping terminal builds without ack."""
+        with self._lock:
+            index, _ = self._index()
+            for record in index["builds"]:
+                coordinator = self._coordinator(record["id"], record["request"])
+                if coordinator.result().state.value in _TERMINAL:
+                    self._release(record["id"], coordinator)
+                    continue
+                result = coordinator.tick()
+                if result.state.value not in _TERMINAL:
+                    return
+                self._release(record["id"], coordinator)
+
+    def _release(self, build_id, coordinator):
+        if build_id not in self._released:
+            coordinator.acknowledge()
+            self._released.add(build_id)
+        else:
+            # Core retries uncertain acknowledgements, keeping outputs retained
+            # until the worker confirms cleanup without delaying the next build.
+            coordinator.tick()
+
+
+class _CoordinatorActor:
+    """Expose only the short client-facing operations on the BEARER endpoint."""
+
+    def __init__(self, service: CoordinatorService):
+        self._service = service
+
+    def Submit(self, request: BuildRequest) -> str:
+        return self._service.submit(request)
+
+    def Get(self, build_id: str) -> BuildResult:
+        return self._service.get(build_id)
+
+    def Cancel(self, build_id: str) -> BuildResult:
+        return self._service.cancel(build_id)
+
+    def Acknowledge(self, build_id: str) -> None:
+        self._service.acknowledge(build_id)
+
+    def GetLogs(self, build_id: str) -> tuple[dict[str, str], ...]:
+        return self._service.get_logs(build_id)
+
+
+class WorkerProxy:
+    """Target one named worker; transport failures propagate rather than imply loss."""
+
+    def __init__(
+        self, actor, *, store: Store | None = None, service_id: str | None = None, worker_id: str | None = None
+    ):
+        self._actor = actor
+        self._store = store
+        self._base = f"iris/{service_id}"
+        self._worker_id = worker_id
+
+    def submit(self, attempt: Attempt) -> None:
+        if self._store is not None:
+            from ports.buildomatic import ConditionalWriteError
+
+            key = f"{self._base}/diagnostics/{attempt.request_id}.json"
+            record = {"attempt_id": attempt.id, "action_id": attempt.action.id, "worker_id": self._worker_id}
+            for _ in range(16):
+                found = self._store.read_journal(key)
+                records = json.loads(found.data) if found else []
+                if record in records:
+                    break
+                records.append(record)
+                try:
+                    self._store.write_journal(key, _encode(records), found.version if found else None)
+                except ConditionalWriteError:
+                    continue
+                break
+            else:
+                raise ConditionalWriteError("diagnostic index remained contended")
+        self._actor.submit(attempt)
+
+    def poll(self, attempt_id: str) -> WorkerReport:
+        report = self._actor.poll(attempt_id)
+        if self._store is not None and report.state.value == "completed":
+            from ports.buildomatic import ConditionalWriteError
+
+            key = f"{self._base}/logs/{attempt_id}"
+            if self._store.read_journal(key) is None:
+                tail = self._actor.read_log(attempt_id, max_bytes=16384)
+                if len(tail) > 16384:
+                    raise ValueError("worker diagnostic exceeds byte bound")
+                try:
+                    self._store.write_journal(key, tail, None)
+                except ConditionalWriteError:
+                    pass
+        return report
+
+    def cancel(self, attempt_id: str) -> None:
+        self._actor.cancel(attempt_id)
+
+    def acknowledge(self, attempt_id: str) -> None:
+        self._actor.acknowledge(attempt_id)
+
+
+class _WorkerActor:
+    """Expose the executor protocol and bounded logs only on a private endpoint."""
+
+    def __init__(self, executor):
+        self._executor = executor
+
+    def submit(self, attempt: Attempt) -> None:
+        self._executor.submit(attempt)
+
+    def poll(self, attempt_id: str) -> WorkerReport:
+        return self._executor.poll(attempt_id)
+
+    def cancel(self, attempt_id: str) -> None:
+        self._executor.cancel(attempt_id)
+
+    def acknowledge(self, attempt_id: str) -> None:
+        self._executor.acknowledge(attempt_id)
+
+    def read_log(self, attempt_id: str, max_bytes: int = 16384) -> bytes:
+        if type(max_bytes) is not int or not 0 <= max_bytes <= 16384:
+            raise ValueError("diagnostics require a bounded read")
+        return self._executor.read_log(attempt_id, max_bytes=max_bytes)
+
+
+def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """Derive sccache settings from the resolved TTL path and ambient routing.
+
+    Credentials remain in the worker's existing environment. No anonymous cache
+    access is enabled. The S3 endpoint and signing region retain runtime values.
+    """
+    environ = os.environ if environ is None else environ
+    parsed = urlsplit(path)
+    if parsed.scheme not in ("s3", "gs") or not parsed.netloc or not parsed.path.strip("/"):
+        raise ValueError("compiler cache requires a routed S3 or GCS object prefix")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("invalid compiler cache prefix")
+    prefix = parsed.path.strip("/")
+    if parsed.scheme == "gs":
+        return {
+            "SCCACHE_GCS_BUCKET": parsed.netloc,
+            "SCCACHE_GCS_KEY_PREFIX": prefix,
+            "SCCACHE_GCS_RW_MODE": "READ_WRITE",
+        }
+    result = {"SCCACHE_BUCKET": parsed.netloc, "SCCACHE_S3_KEY_PREFIX": prefix}
+    endpoint = environ.get("AWS_ENDPOINT_URL_S3") or environ.get("AWS_ENDPOINT_URL")
+    if endpoint:
+        result["SCCACHE_ENDPOINT"] = endpoint
+        result["SCCACHE_S3_USE_SSL"] = "true" if urlsplit(endpoint).scheme == "https" else "false"
+        result["SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE"] = "true"
+    region = environ.get("AWS_REGION") or environ.get("AWS_DEFAULT_REGION")
+    if region:
+        result["SCCACHE_REGION"] = region
+    return result
+
+
+def _worker_environment(config: IrisConfig) -> dict[str, str]:
+    if not config.compiler_cache:
+        return {}
+    from rigging.filesystem.cluster_config import marin_temp_bucket
+    from rigging.filesystem.s3_compat import configure_coreweave_s3
+
+    configure_coreweave_s3()
+    path = marin_temp_bucket(30, prefix="shellsim/ports/sccache/v1")
+    if shutil.which("sccache") is None:
+        raise RuntimeError("compiler cache requires sccache in the worker task image")
+    return {**compiler_cache_environment(path), "SCCACHE_SERVER_PORT": "4226"}
+
+
+def _source_files() -> dict[str, bytes]:
+    root = Path(__file__).resolve().parents[1]
+    return {
+        f"ports/buildomatic/{path.relative_to(root).as_posix()}": path.read_bytes()
+        for path in root.rglob("*.py")
+        if "tests" not in path.relative_to(root).parts
+    }
+
+
+def _runtime_files() -> dict[str, bytes]:
+    """Transport the installed Iris/Rigging source and a small dependency project.
+
+    Task setup resolves only this project. It cannot discover shellsim's root
+    build system or trigger a Rust extension build from the submitting checkout.
+    Source overlays preserve the actor and native CAS APIs used by this adapter.
+    """
+    import iris.client.client
+    import rigging.filesystem.factory
+    from rigging.config_discovery import find_project_root, resolve_cluster_config
+    from rigging.filesystem.cluster_config import MARIN_CLUSTER_CONFIG_DIRS
+
+    result = {
+        "pyproject.toml": (
+            '[project]\nname = "buildomatic-iris-runtime"\nversion = "0.0.0"\n'
+            'requires-python = ">=3.12,<3.14"\n'
+            'dependencies = ["marin-iris>=0.2.0", "marin-rigging>=0.2.0", "google-cloud-storage>=2.0"]\n'
+        ).encode()
+    }
+    for package, root in (
+        ("iris", Path(iris.client.client.__file__).resolve().parents[1]),
+        ("rigging", Path(rigging.filesystem.factory.__file__).resolve().parents[1]),
+    ):
+        for path in root.rglob("*.py"):
+            result[f"{package}/{path.relative_to(root).as_posix()}"] = path.read_bytes()
+    checkout = find_project_root(Path(rigging.filesystem.factory.__file__).parent)
+    directories = tuple(
+        checkout / entry if checkout and entry == "config" else entry for entry in MARIN_CLUSTER_CONFIG_DIRS
+    )
+    for name in ("marin", "coreweave"):
+        path = Path(resolve_cluster_config(name, dirs=directories))
+        result[f"rigging/clusters/{name}.yaml"] = path.read_bytes()
+    return result
+
+
+def _entrypoint(role: str, config: IrisConfig, *, worker_id: str | None = None, files=None):
+    from iris.cluster.types import Entrypoint
+
+    files = _source_files() if files is None else files
+    archive = io.BytesIO()
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        for name, data in sorted(files.items()):
+            bundle.writestr(name, data)
+    # Kubernetes ConfigMap directory projections are symlinks. Some Iris init
+    # images skip nested small files when walking that projection. A single
+    # archive preserves package markers and all modules across these runtimes.
+    bootstrap = (
+        'import runpy,sys,zipfile;zipfile.ZipFile("_buildomatic_runtime.zip").extractall(".");'
+        'sys.argv=["ports.buildomatic.backends.iris",*sys.argv[1:]];'
+        'runpy.run_module("ports.buildomatic.backends.iris",run_name="__main__")'
+    )
+    command = ["python", "-c", bootstrap, role, json.dumps(asdict(config))]
+    if worker_id is not None:
+        command.append(worker_id)
+    staged = {"_buildomatic_runtime.zip": archive.getvalue()}
+    if "pyproject.toml" in files:
+        staged["pyproject.toml"] = files["pyproject.toml"]
+    return Entrypoint(command=command, workdir_files=staged)
+
+
+def launch(client, config: IrisConfig, *, environment=None):
+    """Submit one persistent coordinator through an authenticated Iris hub client.
+
+    The returned Iris Job can be used to derive the actor namespace. Connect an
+    external IrisBackend to the target controller after its endpoint registers.
+    The client's workspace and environment own runtime dependency installation.
+    """
+    from iris.cluster.constraints import CLUSTER_CONSTRAINT_KEY, Constraint, ConstraintOp
+    from iris.cluster.types import EnvironmentSpec, ResourceSpec
+    from iris.rpc import job_pb2
+    from rigging.timing import Duration
+
+    files = {**_runtime_files(), **_source_files()}
+    return client.submit(
+        _entrypoint("coordinator", config, files=files),
+        name=f"buildomatic-{config.service_id}",
+        resources=ResourceSpec(cpu=0.5, memory="1GB", disk="5GB"),
+        environment=environment or EnvironmentSpec(setup_scripts=list(config.setup_scripts)),
+        ports=["actor"],
+        constraints=[Constraint.create(key=CLUSTER_CONSTRAINT_KEY, op=ConstraintOp.EQ, value=config.target_cluster)],
+        priority_band=job_pb2.PRIORITY_BAND_BATCH,
+        timeout=Duration.from_seconds(config.job_seconds),
+        task_image=config.task_image,
+        max_retries_failure=2,
+        max_task_failures=2,
+    )
+
+
+class _CapabilityResolver:
+    """Keep bearer material in headers, never in a logged URL or repr."""
+
+    def __init__(self, controller_url: str, actor_name: str, token: str):
+        self._url = f"{controller_url.rstrip('/')}/proxy/{actor_name.lstrip('/').replace('/', '.')}"
+        self._token = token
+
+    def resolve(self, name: str):
+        from iris.actor.resolver import ResolvedEndpoint, ResolveResult
+
+        return ResolveResult(name, [ResolvedEndpoint(self._url, name, {"Authorization": f"Bearer {self._token}"})])
+
+
+class IrisBackend:
+    """External client for durable short RPCs through a scoped bearer proxy.
+
+    ``controller_client`` is authenticated to the target controller to mint the
+    endpoint capability. Worker endpoints remain PRIVATE. Closing this client
+    does not cancel builds or stop the persistent service.
+    """
+
+    def __init__(
+        self,
+        controller_client,
+        controller_url: str,
+        namespace: str,
+        *,
+        rpc_seconds: float = 30,
+        prefix: str = DEFAULT_PREFIX,
+        cache_prefix: str | None = None,
+    ):
+        self.store = RemoteStore(cache_prefix or prefix, journal_prefix=prefix)
+        self._controller = controller_client
+        self._name = f"{namespace.rstrip('/')}/coordinator"
+        self._rpc_seconds = rpc_seconds
+        self._resolver = _CapabilityResolver(controller_url, self._name, "")
+        self.refresh_capability()
+
+    def refresh_capability(self) -> None:
+        """Renew with authenticated controller access; never expose the token."""
+        capability = self._controller._cluster_client.mint_endpoint_token(self._name)
+        self._resolver._token = capability.token
+        # The actor resolves headers when connecting. Recreate it so renewal
+        # takes effect without mutating Iris's private transport internals.
+        from iris.actor.client import ActorClient
+
+        self._actor = ActorClient(self._resolver, self._name, call_timeout=self._rpc_seconds, max_call_attempts=3)
+
+    def submit(self, request: BuildRequest) -> str:
+        return self._actor.Submit(request)
+
+    def get(self, build_id: str) -> BuildResult:
+        return self._actor.Get(build_id)
+
+    def cancel(self, build_id: str) -> BuildResult:
+        return self._actor.Cancel(build_id)
+
+    def acknowledge(self, build_id: str) -> None:
+        self._actor.Acknowledge(build_id)
+
+    def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
+        return self._actor.GetLogs(build_id)
+
+
+def discover(client, controller_url: str, job, config: IrisConfig, *, rpc_seconds: float = 30) -> IrisBackend:
+    """Attach after coordinator registry admission; caller chooses a wait policy.
+
+    The authenticated hub may mint and route the capability for a federated
+    endpoint. Missing registration raises a transport error for caller retry.
+    """
+    from iris.cluster.types import Namespace
+
+    namespace = str(Namespace.from_job_id(job.job_id))
+    return IrisBackend(
+        client,
+        controller_url,
+        namespace,
+        rpc_seconds=rpc_seconds,
+        prefix=config.prefix,
+        cache_prefix=config.cache_prefix,
+    )
+
+
+def _runtime_identity(config: IrisConfig, files: Mapping[str, bytes]) -> dict[str, str]:
+    from iris.version import client_revision_date
+
+    source_digest = hashlib.sha256()
+    for name, data in sorted(files.items()):
+        source_digest.update(name.encode() + b"\0" + data)
+    return {
+        "task_image": config.task_image or "cluster-default",
+        "iris_revision_date": client_revision_date(),
+        "image_git_hash": os.environ.get("IRIS_GIT_HASH", "unknown"),
+        "source_sha256": source_digest.hexdigest(),
+        "python": sys.version.split()[0],
+    }
+
+
+def _serve_actor(actor, name: str, access: int):
+    from iris.actor.server import ActorServer
+    from iris.client.client import iris_ctx
+    from iris.cluster.client import get_job_info
+
+    ctx, info = iris_ctx(), get_job_info()
+    if info is None:
+        raise RuntimeError("Iris task context is required")
+    server = ActorServer(host="0.0.0.0", port=ctx.get_port("actor"))
+    full_name = f"{ctx.namespace}/{name}"
+    server.register(full_name, actor)
+    # Namespaced worker callers send the short actor name, while capability
+    # callers send the full registry name.
+    server.register(name, actor)
+    port = server.serve_background()
+    endpoint_id = ctx.registry.register(name, f"http://{info.advertise_host}:{port}", access=access)
+    return server, endpoint_id
+
+
+def _run_worker(config: IrisConfig, worker_id: str) -> None:
+    from iris.client.client import iris_ctx
+    from iris.cluster.types import EndpointAccess
+
+    from ports.buildomatic import LocalStore, ResourceLimits, WorkerExecutor
+
+    env = _worker_environment(config)
+    os.environ.update(env)
+    # sccache uses one worker-local server, keeping cloud credentials outside
+    # the sanitized action environment owned by WorkerExecutor.
+    if env:
+        subprocess.run(["sccache", "--start-server"], check=True, stdout=subprocess.DEVNULL)
+    root = Path(os.environ["IRIS_WORKDIR"]) / ".buildomatic" / worker_id
+    store = RemoteStore(
+        config.cache_prefix or config.prefix,
+        journal_prefix=config.prefix,
+        local_cache=LocalStore(root / "object-cache"),
+    )
+    identity = _runtime_identity(config, _source_files())
+    identity["cache_enabled"] = str(config.compiler_cache).lower()
+    provenance_key = f"iris/{config.service_id}/provenance/{worker_id}.json"
+    before = store.read_journal(provenance_key)
+    store.write_journal(provenance_key, _encode(identity), None if before is None else before.version)
+    executor = WorkerExecutor(
+        store,
+        root,
+        limits=ResourceLimits(
+            memory_bytes=config.worker_memory_bytes,
+            output_bytes=config.worker_output_bytes,
+            max_files=config.worker_max_files,
+            cpu_seconds=config.worker_cpu_seconds,
+            log_bytes=config.worker_log_bytes,
+        ),
+        max_running=1,
+    )
+    server, endpoint_id = _serve_actor(_WorkerActor(executor), worker_id, EndpointAccess.ENDPOINT_ACCESS_PRIVATE)
+    try:
+        server.wait()
+    finally:
+        iris_ctx().registry.unregister(endpoint_id)
+        server.stop()
+
+
+def _run_coordinator(config: IrisConfig) -> None:
+    from iris.actor.client import ActorClient
+    from iris.client.client import iris_ctx
+    from iris.cluster.types import EndpointAccess, EnvironmentSpec, ResourceSpec
+    from iris.rpc import job_pb2
+    from rigging.timing import Duration
+
+    ctx = iris_ctx()
+    files = {**_runtime_files(), **_source_files()}
+    store = RemoteStore(config.cache_prefix or config.prefix, journal_prefix=config.prefix)
+    workers = {}
+    for index in range(config.workers):
+        name = f"worker-{index}"
+        ctx.client.submit(
+            _entrypoint("worker", config, worker_id=name, files=files),
+            name=name,
+            resources=ResourceSpec(
+                cpu=config.worker_cpu, memory=config.worker_memory_bytes, disk=config.worker_disk_bytes
+            ),
+            environment=EnvironmentSpec(setup_scripts=list(config.setup_scripts)) if config.setup_scripts else None,
+            ports=["actor"],
+            priority_band=job_pb2.PRIORITY_BAND_BATCH,
+            timeout=Duration.from_seconds(config.job_seconds),
+            task_image=config.task_image,
+            existing_job_policy=job_pb2.EXISTING_JOB_POLICY_KEEP,
+            max_retries_failure=2,
+            max_task_failures=2,
+        )
+        workers[name] = WorkerProxy(
+            ActorClient(ctx.resolver, name, call_timeout=5, max_call_attempts=1),
+            store=store,
+            service_id=config.service_id,
+            worker_id=name,
+        )
+    service = CoordinatorService(store, config.service_id, workers)
+    server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_BEARER)
+    stop = threading.Event()
+    errors = []
+
+    def drive():
+        while not stop.wait(config.tick_seconds):
+            try:
+                service.tick_once()
+            except Exception as error:
+                # Fail the task on storage or fencing errors. Iris then retries
+                # from the durable index; silence would leave builds stuck.
+                logger.exception("Iris build coordinator stopped")
+                errors.append(error)
+                server.stop()
+                return
+
+    thread = threading.Thread(target=drive, name="buildomatic-coordinator", daemon=True)
+    thread.start()
+    try:
+        server.wait()
+    finally:
+        stop.set()
+        thread.join(timeout=30)
+        ctx.registry.unregister(endpoint_id)
+        server.stop()
+    if errors:
+        raise RuntimeError("Iris coordinator requires recovery") from errors[0]
+
+
+def main() -> None:
+    """Run only explicitly selected in-cluster actor roles."""
+    role, serialized = sys.argv[1:3]
+    values = json.loads(serialized)
+    values["setup_scripts"] = tuple(values["setup_scripts"])
+    config = IrisConfig(**values)
+    if role == "coordinator":
+        _run_coordinator(config)
+    elif role == "worker":
+        _run_worker(config, sys.argv[3])
+    else:
+        raise ValueError("unknown Iris backend role")
+
+
+if __name__ == "__main__":
+    main()
