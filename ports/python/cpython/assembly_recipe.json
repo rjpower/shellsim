@@ -19,11 +19,11 @@
     },
     {
       "file": "stdlib_ctypes_recipe.json",
-      "sha256": "305bbaae43bded205d423c03db7ef0fb7345ae37c807d24415b4b9d06fc21d76"
+      "sha256": "b800e8d62603210df7e073032d2a83a3227df2f918722f77c4091de9811c206b"
     },
     {
       "file": "../../native/libffi/shared/recipe.json",
-      "sha256": "ca99490c57abff0d0f16c64eff2aac292f9fd592c9dee703e08020cd846153f4"
+      "sha256": "01ca4c2fada702c9aa6c26cf03fa87bb013500915eea075ed711eaf8092d8dc8"
     },
     {
       "file": "../../native/dependencies.py",
@@ -31,7 +31,7 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../_support/build.py",

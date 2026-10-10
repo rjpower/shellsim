@@ -69,7 +69,7 @@
     },
     {
       "file": "../../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../../toolchain/wasi_threads/dynamic.py",

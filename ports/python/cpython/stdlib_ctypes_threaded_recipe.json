@@ -51,7 +51,7 @@
     },
     {
       "file": "../../native/libffi/threaded/recipe.json",
-      "sha256": "1eee07ff0c7bce11b816bbaf1580b028065c89f8d6c6c974f7dffe45a1684891"
+      "sha256": "1279a54e0854fb8f1a67a8d966a50fa259ad616a026ae2223e773ccb38b45f3e"
     },
     {
       "file": "../../native/libffi/threaded/toolchain.py",
@@ -71,7 +71,7 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../toolchain/wasi_threads/dynamic.py",

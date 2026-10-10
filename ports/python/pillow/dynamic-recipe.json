@@ -108,7 +108,7 @@
     },
     {
       "file": "../../_support/wasm_metadata.py",
-      "sha256": "cc10cdcf1477514577690e2bc7915dfb4316ea3f5ad78175ede2030cf999ffbf"
+      "sha256": "93ce28024366a4bfc7f757ae87a679c9118e68e967e4cc8fd17d35e07268eb73"
     },
     {
       "file": "../../_support/wasm.py",
@@ -124,15 +124,15 @@
     },
     {
       "file": "../../native/zlib/shared-recipe.json",
-      "sha256": "41677255ad0d90c93c91b7828f9a4b2ee70754d3d71c9b6a1e01395cef34c916"
+      "sha256": "babe2d05ebfe78b759522c296a87d3af854b38f961d3d9a4ed7b0be0cdbc2e1c"
     },
     {
       "file": "../../native/libjpeg-turbo/shared-recipe.json",
-      "sha256": "94f01379e8665d175927951294c212014204ca88f0f6b48d2049bb9c5e0e55a1"
+      "sha256": "b934a634bfe4fe42ff7e5a9055147da325aaf9dd9e8d2473bc0f36a91aab32e3"
     },
     {
       "file": "../../native/freetype/shared-recipe.json",
-      "sha256": "a0a8fdc7b1869ea0f693be0911c24c845006acde5269b7f0e991996b30b3bafd"
+      "sha256": "fc365c62ef51e86a4792117ebeb057b6b96c8862528c59883baf4c1e2f1d17c8"
     }
   ],
   "sdk": {
