@@ -1,6 +1,6 @@
 --- a/src/config.h.in
 +++ b/src/config.h.in
-@@ -1,5 +1,19 @@
+@@ -1,5 +1,20 @@
  /* src/config.h.in.  Generated from configure.ac by autoheader.  */
  
 +#ifdef __wasi__
@@ -15,6 +15,7 @@
 +# define optopt shellsim_make_optopt
 +# define glob shellsim_make_glob
 +# define globfree shellsim_make_globfree
++# define fnmatch shellsim_make_fnmatch
 +#endif
 +
  /* CPU and C ABI indicator */

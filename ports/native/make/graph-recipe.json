@@ -33,7 +33,7 @@
     },
     {
       "file": "private-portability.patch",
-      "sha256": "03939cb0cb259e1785e95de952906a1dfdf8462be300364bad1dc433dac1a655"
+      "sha256": "315f1cfd63711c97ae4956890e513a2976a65e714648f03507b96d957d03f6b0"
     }
   ],
   "target_dependencies": [
