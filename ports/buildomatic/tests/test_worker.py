@@ -4,6 +4,7 @@ Polling has a bounded test-harness wait solely to detect hangs. Scheduling, loss
 and retry semantics are covered without clocks in test_core.py.
 """
 
+import fcntl
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import shutil
 import signal
 import sys
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -210,6 +211,59 @@ def test_pre_status_supervisor_exit_is_terminal_and_never_relaunched(worker, sto
         restarted.submit(item)
         assert restarted.poll(item.id).result == result
     assert len(launches) == 1
+
+
+@pytest.mark.parametrize("initial_phase", [None, "launching", "running"])
+@pytest.mark.parametrize("state", [AttemptState.SUCCEEDED, AttemptState.FAILED, AttemptState.CANCELLED])
+def test_terminal_status_published_between_read_and_lock_check(
+    worker, store, tmp_path, monkeypatch, initial_phase, state
+):
+    import ports.buildomatic.worker as implementation
+
+    item = attempt("raise AssertionError('must never execute')")
+    directory = worker.root / "attempts" / item.id
+    output = directory / "work/output"
+    output.mkdir(parents=True)
+    (output / "value").write_text("completed output")
+    atomic_write(directory / "plan.json", encode({"attempt": asdict(item), "limits": asdict(worker.limits)}))
+    atomic_write(directory / "launch.json", encode({"pid": None, "token": None}))
+    if initial_phase is not None:
+        atomic_write(directory / "status.json", encode({"phase": initial_phase, "child": 999999}))
+    completed = {
+        "phase": "completed",
+        "returncode": 7 if state == AttemptState.FAILED else 0,
+        "error": "action diagnostic" if state == AttemptState.FAILED else None,
+        "cancelled": state == AttemptState.CANCELLED,
+    }
+    running = implementation._running
+
+    def unexpected_kill(pid):
+        raise AssertionError("completed supervisor was mistaken for worker loss")
+
+    monkeypatch.setattr(implementation, "kill_group", unexpected_kill)
+    with (directory / "run.lock").open("a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        assert running(directory)
+
+        def publish_then_unlock(path):
+            # Force the supervisor's final write and release after poll read the
+            # old status, but before its advisory-lock check can observe liveness.
+            atomic_write(path / "status.json", encode(completed))
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return running(path)
+
+        monkeypatch.setattr(implementation, "_running", publish_then_unlock)
+        result = worker.poll(item.id).result
+    assert result.state == state
+    assert result.returncode == completed["returncode"]
+    assert result.error == completed["error"]
+    assert json.loads((directory / "status.json").read_bytes()) == completed
+    assert worker.poll(item.id).result == result
+    if state == AttemptState.SUCCEEDED:
+        extract_tree(result.bundle, store, tmp_path / "recovered")
+        assert (tmp_path / "recovered/value").read_text() == "completed output"
+    else:
+        assert result.bundle is None
 
 
 @pytest.mark.parametrize(

@@ -225,21 +225,19 @@ class WorkerExecutor:
             pid = launch["pid"]
             if pid is not None and (token := process_token(pid)) is not None and token == launch["token"]:
                 return None
-            if _running(directory):
-                return None
-            status = {
-                "phase": "completed",
-                "returncode": None,
-                "cancelled": (directory / "cancelled").exists(),
-                "error": "worker supervisor exited before recording status",
-            }
-            atomic_write(directory / "status.json", encode(status))
+        elif status["phase"] == "completed":
             return status
-        if status["phase"] == "completed" or _running(directory):
+        if _running(directory):
+            return status
+        # Completion is persisted before the supervisor releases run.lock. The
+        # first read may predate that write, so an unlocked attempt needs a fresh
+        # status read before worker-loss reconciliation can overwrite it.
+        status = _read(directory / "status.json")
+        if status is not None and status["phase"] == "completed":
             return status
         # The supervisor may have died while the action was still running. Kill
         # that owned group before reporting failure; never launch it again.
-        child = status.get("child")
+        child = status.get("child") if status is not None else None
         if child is not None:
             token = process_token(child)
             if token is not None and token != status.get("child_token"):
@@ -250,7 +248,9 @@ class WorkerExecutor:
             "phase": "completed",
             "returncode": None,
             "cancelled": (directory / "cancelled").exists(),
-            "error": "worker supervisor lost",
+            "error": "worker supervisor lost"
+            if status is not None
+            else "worker supervisor exited before recording status",
         }
         atomic_write(directory / "status.json", encode(status))
         return status
