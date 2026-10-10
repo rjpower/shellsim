@@ -512,6 +512,7 @@ class _NativePackageUniverse:
             raise ValueError("cumulative native installation exceeds its package bound")
         files: dict[PurePosixPath, tuple[Path, str, int]] = {}
         directories: dict[str, int] = {}
+        tools: list[str] = []
         total = 0
         for name in sorted(selected):
             package = selected[name]
@@ -522,6 +523,8 @@ class _NativePackageUniverse:
                 payload = prefix / source
                 digest = manifest["files"][source]
                 mode = 0o755 if source in manifest["inputs"]["recipe"]["exports"].get("tools", ()) else 0o644
+                if mode == 0o755:
+                    tools.append(str(destination))
                 if destination in files:
                     if files[destination][1:] != (digest, mode):
                         raise ValueError("native packages have conflicting destination identities")
@@ -554,14 +557,13 @@ class _NativePackageUniverse:
                 if str(destination) in installed.files:
                     if hashlib.sha256(environment.read_file(str(destination))).hexdigest() != digest:
                         raise ValueError("installed native export bytes changed")
-                    continue
                 target = staging / destination.relative_to("/")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, target)
                 target.chmod(mode)
                 if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise ValueError("native export changed while staging")
-            environment._native.mount_package_tree(str(staging))
+            environment._native.mount_package_tree(str(staging), replace_builtin_tools=tools)
         environment._native_installation = _NativeInstallation(
             installed.artifacts | identities, cumulative, cumulative_directories
         )

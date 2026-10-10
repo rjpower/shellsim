@@ -23,7 +23,8 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Protocol, Sequence
 
-from ._api import Environment, SimulationError
+from ._api import Environment
+from ._native import PackageConflictError
 from .pypi import PackageInstallError
 
 _MAX_CATALOG_BYTES = 1024 * 1024
@@ -694,14 +695,7 @@ def install(
         files = [path for path in staging.rglob("*") if path.is_file()]
         if len(files) > _MAX_FILES or sum(path.stat().st_size for path in files) > _MAX_TOTAL_BYTES:
             raise PackageInstallError("staged package set exceeds VFS import limits")
-        for path in files:
-            destination = "/" + path.relative_to(staging).as_posix()
-            try:
-                existing = environment.read_file(destination)
-            except SimulationError as error:
-                if "No such file" not in str(error):
-                    raise
-            else:
-                if existing != path.read_bytes():
-                    raise PackageInstallError(f"package file would overwrite an existing VFS file: {destination}")
-        environment._native.mount_package_tree(str(staging))
+        try:
+            environment._native.mount_package_tree(str(staging))
+        except PackageConflictError as error:
+            raise PackageInstallError(str(error)) from error

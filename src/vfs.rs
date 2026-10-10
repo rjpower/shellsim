@@ -764,6 +764,43 @@ impl Vfs {
         self.metadata_ref(cwd, path, follow).cloned()
     }
 
+    /// Check a package destination without following links or replacing foreign content.
+    /// Existing directories retain their permissions; regular files require equal bytes and
+    /// compatible read/execute permissions, preserving existing modes. Only an explicitly
+    /// selected original base-image command may be replaced.
+    pub(crate) fn package_destination_matches(
+        &self,
+        path: &str,
+        contents: Option<&[u8]>,
+        mode: Mode,
+        replace_builtin: bool,
+    ) -> Result<bool> {
+        if self.realpath(path, false)? != path {
+            return Err(VfsError::Invalid(format!(
+                "package destination follows a link: {path}"
+            )));
+        }
+        let Some(node) = self.nodes.get(path) else {
+            return Ok(false);
+        };
+        match (&node.kind, contents) {
+            (NodeKind::Dir, None) => Ok(true),
+            (NodeKind::File(existing), Some(incoming))
+                if existing == incoming && node.mode & mode & 0o555 == mode & 0o555 =>
+            {
+                Ok(true)
+            }
+            (NodeKind::NativeExecutable(program), Some(_))
+                if replace_builtin && self.baseline_native.get(path) == Some(program) =>
+            {
+                Ok(false)
+            }
+            _ => Err(VfsError::Invalid(format!(
+                "package import would overwrite an incompatible VFS node: {path}"
+            ))),
+        }
+    }
+
     /// Inspect a resolved node without copying its file payload. Kernel metadata conversions
     /// borrow this view only for the duration of a syscall.
     pub(crate) fn metadata_ref(&self, cwd: &str, path: &str, follow: bool) -> Result<&Node> {
