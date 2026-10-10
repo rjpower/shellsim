@@ -2246,19 +2246,7 @@ impl Environment {
 
         let description = self.process.fds.get(fd)?;
         if let Some(file) = self.descriptors.file_state(description)? {
-            if !file.readable {
-                return Err(SyscallError::Permission);
-            }
-            let cursor = usize::try_from(file.cursor).map_err(|_| SyscallError::InvalidArgument)?;
-            let bytes = match file.orphan {
-                Some(id) => self
-                    .vfs
-                    .read_orphan_range(id, cursor, maximum.min(MAX_CAPTURE_BYTES)),
-                None => {
-                    self.vfs
-                        .read_range("/", &file.path, cursor, maximum.min(MAX_CAPTURE_BYTES))
-                }
-            }?;
+            let bytes = self.read_fd_at_checked(fd, file.cursor, maximum)?;
             self.descriptors.advance_file(description, bytes.len())?;
             return Ok(IoPoll::Ready(bytes));
         }
@@ -2288,6 +2276,33 @@ impl Environment {
             }
         }
         Ok(result)
+    }
+
+    /// Read a regular-file range without changing the shared descriptor cursor.
+    /// Open files retain their contents after unlink, just as ordinary descriptor reads do.
+    pub(crate) fn read_fd_at_checked(
+        &self,
+        fd: Fd,
+        offset: u64,
+        maximum: usize,
+    ) -> Result<Vec<u8>, crate::syscalls::SyscallError> {
+        use crate::syscalls::SyscallError;
+
+        let description = self.process.fds.get(fd)?;
+        let file = self
+            .descriptors
+            .file_state(description)?
+            .ok_or(SyscallError::InvalidArgument)?;
+        if !file.readable {
+            return Err(SyscallError::Permission);
+        }
+        let offset = usize::try_from(offset).map_err(|_| SyscallError::InvalidArgument)?;
+        let maximum = maximum.min(MAX_CAPTURE_BYTES);
+        match file.orphan {
+            Some(id) => self.vfs.read_orphan_range(id, offset, maximum),
+            None => self.vfs.read_range("/", &file.path, offset, maximum),
+        }
+        .map_err(Into::into)
     }
 
     /// Write to an active process descriptor, routing file effects only through the VFS.

@@ -126,6 +126,8 @@ pub(crate) trait System {
         changes: Vec<FileChange>,
     ) -> Result<(), SyscallError>;
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError>;
+    /// Read a regular file at an explicit offset, preserving the cursor shared by aliases.
+    fn read_at(&self, fd: Fd, offset: u64, maximum: usize) -> Result<Vec<u8>, SyscallError>;
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError>;
     fn open_file(&mut self, base: &str, path: &str, options: OpenFile) -> Result<Fd, SyscallError>;
     /// Open a virtual file onto a chosen process descriptor, replacing its prior target.
@@ -505,6 +507,10 @@ impl System for ActiveSystem<'_> {
 
     fn read(&mut self, fd: Fd, maximum: usize) -> Result<IoPoll<Vec<u8>>, SyscallError> {
         self.interp.read_fd_checked(fd, maximum)
+    }
+
+    fn read_at(&self, fd: Fd, offset: u64, maximum: usize) -> Result<Vec<u8>, SyscallError> {
+        self.interp.read_fd_at_checked(fd, offset, maximum)
     }
 
     fn write(&mut self, fd: Fd, bytes: &[u8]) -> Result<IoPoll<usize>, SyscallError> {

@@ -90,6 +90,7 @@ const ERRNO_NOTDIR: i32 = 54;
 const ERRNO_NOTEMPTY: i32 = 55;
 const ERRNO_PERM: i32 = 63;
 const ERRNO_NOTSUP: i32 = 58;
+const ERRNO_SPIPE: i32 = 70;
 const MAX_POLL_SUBSCRIPTIONS: u32 = 64;
 const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
@@ -1635,6 +1636,89 @@ fn fd_write(
     ))
 }
 
+/// Positioned regular-file reads never suspend or change an aliased descriptor's cursor.
+fn fd_pread(
+    mut caller: Caller<'_, Host>,
+    fd: i32,
+    iovs: u32,
+    count: u32,
+    offset: u64,
+    read: u32,
+) -> Result<i32, Error> {
+    let state = match guest_descriptor(&mut caller, fd) {
+        Ok(state) if state.readable => state,
+        Ok(_) => return Ok(ERRNO_BADF),
+        Err(error) => return Ok(error),
+    };
+    if state.kind != DescriptorKind::File {
+        return Ok(if state.kind == DescriptorKind::Directory {
+            ERRNO_ISDIR
+        } else {
+            ERRNO_SPIPE
+        });
+    }
+    let Some(memory) = memory(&mut caller) else {
+        return Ok(ERRNO_FAULT);
+    };
+    if (read as usize).saturating_add(4) > memory.data_size(&caller) {
+        return Ok(ERRNO_FAULT);
+    }
+    let vectors = match iovecs(&mut caller, &memory, iovs, count) {
+        Ok(vectors) => vectors,
+        Err(error) => return Ok(error),
+    };
+    let total = vectors.iter().map(|(_, length)| length).sum::<usize>();
+    let input = {
+        let mut machine = caller.data_mut().machine.get();
+        if !machine
+            .resources
+            .charge_cpu((total as u64).saturating_add(vectors.len() as u64))
+            || !machine.resources.reserve_memory(total as u64)
+        {
+            return Err(exhausted());
+        }
+        ActiveSystem::new(&mut machine).read_at(fd, offset, total)
+    };
+    let result = match input {
+        Ok(input) => {
+            let mut copied = 0;
+            for (pointer, length) in vectors {
+                let take = length.min(input.len() - copied);
+                // All ranges were checked above; no guest code runs during this host call.
+                if memory
+                    .write(&mut caller, pointer, &input[copied..copied + take])
+                    .is_err()
+                {
+                    caller
+                        .data_mut()
+                        .machine
+                        .get()
+                        .resources
+                        .release_memory(total as u64);
+                    return Ok(ERRNO_FAULT);
+                }
+                copied += take;
+                if take < length {
+                    break;
+                }
+            }
+            if write_u32(&mut caller, read, copied as u32) {
+                ERRNO_SUCCESS
+            } else {
+                ERRNO_FAULT
+            }
+        }
+        Err(error) => syscall_errno(&error),
+    };
+    caller
+        .data_mut()
+        .machine
+        .get()
+        .resources
+        .release_memory(total as u64);
+    Ok(result)
+}
+
 fn fd_read(
     caller: &mut Caller<'_, Host>,
     fd: i32,
@@ -2096,6 +2180,9 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
         .expect("unique WASI import");
     wrap_stream_call(&mut linker, "fd_write", fd_write);
     wrap_stream_call(&mut linker, "fd_read", fd_read);
+    linker
+        .func_wrap("wasi_snapshot_preview1", "fd_pread", fd_pread)
+        .expect("unique WASI import");
     linker
         .func_wrap("wasi_snapshot_preview1", "fd_close", fd_close)
         .expect("unique WASI import");

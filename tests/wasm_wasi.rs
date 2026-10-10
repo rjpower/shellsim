@@ -133,6 +133,93 @@ fn inherited_regular_stdin_has_real_stat_and_seek_state() {
 }
 
 #[test]
+fn positioned_reads_preserve_shared_cursor_and_read_unlinked_files() {
+    let mut environment = Environment::new();
+    environment
+        .vfs
+        .write("/", "/value", b"abcdef", 0o644)
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "shellsim_posix_v1" "descriptor_control" (func $dup (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "path_unlink_file" (func $unlink (param i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_pread" (func $pread (param i32 i32 i32 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_tell" (func $tell (param i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 128) "value")
+        (func (export "_start") (local $fd i32) (local $alias i32) (local $writer i32)
+            (if (call $open (i32.const 4) (i32.const 0) (i32.const 128) (i32.const 5) (i32.const 0) (i64.const 64) (i64.const 0) (i32.const 0) (i32.const 32)) (then unreachable))
+            (local.set $writer (i32.load (i32.const 32)))
+            (if (call $open (i32.const 4) (i32.const 0) (i32.const 128) (i32.const 5) (i32.const 0) (i64.const 2) (i64.const 0) (i32.const 0) (i32.const 32)) (then unreachable))
+            (local.set $fd (i32.load (i32.const 32)))
+            (if (call $dup (local.get $fd) (i32.const 3) (i32.const 5) (i32.const 32)) (then unreachable))
+            (local.set $alias (i32.load (i32.const 32)))
+            (if (call $seek (local.get $fd) (i64.const 1) (i32.const 0) (i32.const 40)) (then unreachable))
+            (i32.store (i32.const 0) (i32.const 256))
+            (i32.store (i32.const 4) (i32.const 2))
+            (i32.store (i32.const 8) (i32.const 258))
+            (i32.store (i32.const 12) (i32.const 4))
+            (if (call $pread (local.get $fd) (i32.const 0) (i32.const 2) (i64.const 2) (i32.const 32)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 32)) (i32.const 4)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 256)) (i32.const 0x66656463)) (then unreachable))
+            (if (call $tell (local.get $alias) (i32.const 40)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 40)) (i64.const 1)) (then unreachable))
+            (i32.store (i32.const 4) (i32.const 1))
+            (if (call $read (local.get $alias) (i32.const 0) (i32.const 1) (i32.const 32)) (then unreachable))
+            (if (i32.ne (i32.load8_u (i32.const 256)) (i32.const 98)) (then unreachable))
+            (if (call $unlink (i32.const 4) (i32.const 128) (i32.const 5)) (then unreachable))
+            (i32.store (i32.const 4) (i32.const 4))
+            (if (call $pread (local.get $fd) (i32.const 0) (i32.const 1) (i64.const 4) (i32.const 32)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 32)) (i32.const 2)) (then unreachable))
+            (if (i32.ne (i32.load16_u (i32.const 256)) (i32.const 0x6665)) (then unreachable))
+            (if (call $tell (local.get $alias) (i32.const 40)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 40)) (i64.const 2)) (then unreachable))
+            (if (call $pread (local.get $fd) (i32.const 0) (i32.const 1) (i64.const 99) (i32.const 32)) (then unreachable))
+            (if (i32.load (i32.const 32)) (then unreachable))
+            (if (i32.ne (call $pread (local.get $fd) (i32.const 0) (i32.const 1) (i64.const 0) (i32.const 65534)) (i32.const 21)) (then unreachable))
+            (if (i32.ne (call $pread (local.get $fd) (i32.const 0) (i32.const 1025) (i64.const 0) (i32.const 32)) (i32.const 28)) (then unreachable))
+            (i32.store (i32.const 0) (i32.const 65535))
+            (if (i32.ne (call $pread (local.get $fd) (i32.const 0) (i32.const 1) (i64.const 0) (i32.const 32)) (i32.const 21)) (then unreachable))
+            (i32.store (i32.const 0) (i32.const 256))
+            (if (i32.ne (call $pread (i32.const 999) (i32.const 0) (i32.const 1) (i64.const 0) (i32.const 32)) (i32.const 8)) (then unreachable))
+            (if (i32.ne (call $pread (local.get $writer) (i32.const 0) (i32.const 1) (i64.const 0) (i32.const 32)) (i32.const 8)) (then unreachable))
+            (if (i32.ne (call $pread (i32.const 0) (i32.const 0) (i32.const 1) (i64.const 0) (i32.const 32)) (i32.const 70)) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
+fn positioned_reads_charge_requested_work_before_copying() {
+    let mut environment = Environment::with_limits(Limits {
+        cpu: 100_000,
+        ..Limits::default()
+    });
+    environment.vfs.write("/", "/value", b"abc", 0o644).unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "fd_pread" (func $pread (param i32 i32 i32 i64 i32) (result i32)))
+        (memory (export "memory") 2)
+        (func (export "_start") (local $index i32)
+            (loop $vectors
+                (i32.store (local.get $index) (i32.const 4096))
+                (i32.store offset=4 (local.get $index) (i32.const 4096))
+                (local.set $index (i32.add (local.get $index) (i32.const 8)))
+                (br_if $vectors (i32.lt_u (local.get $index) (i32.const 2048))))
+            (drop (call $pread (i32.const 0) (i32.const 0) (i32.const 256) (i64.const 0) (i32.const 2048)))))"#,
+    );
+    let (outcome, _, _) = environment.run_script_capture("/app < /value");
+    assert_eq!(
+        outcome.stop_reason,
+        Some(shellsim::StopReason::CpuExhausted)
+    );
+}
+
+#[test]
 fn posix_cwd_and_umask_use_only_virtual_process_state() {
     let mut environment = Environment::new();
     environment.vfs.mkdir_all("/", "/work/dir").unwrap();
