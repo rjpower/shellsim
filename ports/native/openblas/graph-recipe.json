@@ -9,7 +9,7 @@
     "subdirectory": "OpenBLAS-0.3.31"
   },
   "compiler_support": {
-    "input": "cohort.shared_library_inputs",
+    "input": "sdk.shared_library_inputs",
     "linkage": "referenced-members-only"
   },
   "linkage": "shared",
@@ -117,5 +117,5 @@
       "script": "tests/shared_smoke.py"
     }
   ],
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

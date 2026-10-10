@@ -1,0 +1,69 @@
+{
+  "schema_version": 1,
+  "target": "wasm32-wasip1-threads",
+  "target_profile": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "abi": "shellsim-wasi-sdk34-cpython3137-threads-v3",
+  "build_dependencies": [
+    {
+      "port": "toolchain/llvm",
+      "version": "23.0.0",
+      "recipe": "toolchain/llvm/host-recipe.json"
+    }
+  ],
+  "platform_dependencies": [
+    {
+      "port": "toolchain/wasi_threads",
+      "version": "3",
+      "recipe": "toolchain/wasi_threads/graph-recipe.json"
+    }
+  ],
+  "dependency_recipes": {
+    "native/zlib": "native/zlib/cmake-recipe.json",
+    "native/libjpeg-turbo": "native/libjpeg-turbo/graph-recipe.json",
+    "native/freetype": "native/freetype/graph-recipe.json",
+    "native/openblas": "native/openblas/graph-recipe.json",
+    "python/numpy": "python/numpy/graph-recipe.json",
+    "python/pillow": "python/pillow/graph-recipe.json",
+    "python/cpython-stdlib-zlib": "python/cpython/stdlib-zlib-graph-recipe.json"
+  },
+  "host": "linux-x86_64",
+  "products": {
+    "tooling": {
+      "adapter": "sdk-tooling",
+      "recipe": "toolchain/wasi_threads/dynamic-recipe.json",
+      "dependencies": [],
+      "sha256": "927dc5addf622c1be6b7e0e28dcf26d07f67dcd43a680c1d5334ee33e156c3a9"
+    },
+    "compiler": {
+      "adapter": "llvm-host",
+      "recipe": "toolchain/llvm/compiler-recipe.json",
+      "dependencies": [],
+      "sha256": "35e9437ad5424b7e4177d7fe1cda045925f8ec41c4291438561ea495e496906c"
+    },
+    "platform": {
+      "adapter": "wasi-sysroot",
+      "recipe": "toolchain/wasi_threads/dynamic-recipe.json",
+      "dependencies": [
+        "compiler",
+        "tooling"
+      ],
+      "sha256": "927dc5addf622c1be6b7e0e28dcf26d07f67dcd43a680c1d5334ee33e156c3a9"
+    },
+    "cpython": {
+      "adapter": "cpython-threaded",
+      "recipe": "python/cpython/threaded-recipe.json",
+      "dependencies": [
+        "compiler",
+        "platform",
+        "tooling"
+      ],
+      "sha256": "fcdebc0fcde49b4752051e32ed47820590ac0710453637e946d089f53e226f1b"
+    },
+    "resolver": {
+      "adapter": "uv-host",
+      "recipe": "toolchain/uv/recipe.json",
+      "dependencies": [],
+      "sha256": "216a14e0b92037ea24c62c856d19ecd619b5dd0bc4ad265cc463beca9cd73cdc"
+    }
+  }
+}

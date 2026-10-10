@@ -8,10 +8,10 @@ That default also applies when `pyproject.toml` has no `build-system` table.
 Declared tables must provide a valid `requires` list; absent `build-backend`
 selects the setuptools legacy backend.
 
-Select `build_profile: "wasi-threads-v3"` for the threaded target, ABI, host compiler
+Select `sdk: "default"` for the threaded target, ABI, host compiler
 and platform pins. Declare only additional exact backend wheels as
-`build_dependencies`; profile expansion preserves their host roles and explicit
-version pins. Dependency variants can use the profile defaults or explicit
+`build_dependencies`; SDK selection preserves their host roles and explicit
+version pins. Dependency variants can use the SDK defaults or explicit
 `recipe` selections. Package metadata and guest checks remain port-owned. See
 [port authoring](../README.md).
 
@@ -55,12 +55,12 @@ files. Wheel `.data` relocation layouts are rejected. Backends that execute
 target binaries during host configuration remain an
 unsupported cross-build frontier.
 
-For example, build the current pilot with an already admitted threaded cohort:
+For example, build the current pilot with the default threaded SDK:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports python/kiwisolver/graph-recipe.json python/packaging python/zss \
-  --cohort /path/to/cohort.json --store /path/to/ports-cache \
+  --store /path/to/ports-cache \
   --output /path/to/backend-release --check
 ```
 

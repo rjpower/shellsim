@@ -1,8 +1,7 @@
-"""Admit an explicit host build cohort without ambient compiler discovery.
+"""Typed SDK products and inventory admission at the host build boundary.
 
-A setup descriptor binds SDK, compiler, sysroot and CPython receipts. Target
-artifacts and headers are verified before paths become available to adapters.
-The descriptor is a trusted host setup input, never a guest-controlled path.
+The graph materializes products before constructing this context. Product paths
+come from pinned producers or a verified import; guest input cannot select them.
 """
 
 from __future__ import annotations
@@ -10,7 +9,6 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
@@ -19,8 +17,6 @@ from typing import Mapping
 from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, host_executable_flags
 from ports.toolchain.wasi_threads.dynamic import verify_sdk
 
-TARGET = "wasm32-wasip1-threads"
-ABI = "shellsim-wasi-sdk34-cpython3137-threads-v3"
 HOST_TOOLS = frozenset(
     {
         "cmake",
@@ -102,8 +98,8 @@ class CPythonReceipt:
 
 
 @dataclass(frozen=True)
-class BuildCohort:
-    """Verified build inputs for a single native ABI cohort."""
+class MaterializedSDK:
+    """Concrete verified compiler, platform, Python and host tool products."""
 
     sdk: Receipt
     llvm: Receipt
@@ -116,17 +112,14 @@ class BuildCohort:
     identity: str
     has_frontend: bool
 
-    @property
-    def target(self) -> str:
-        return TARGET
-
-    @property
-    def dynamic_abi(self) -> str:
-        return ABI
+    target: str
+    dynamic_abi: str
 
     @property
     def toolchain_receipt(self) -> dict[str, object]:
         """Identify the actual compiler and platform products used by a node."""
+        # The format-1 native artifact field is retained so immutable released
+        # catalogs remain installable. It is an SDK product identity, not setup.
         return {
             "cohort": self.identity,
             "target": self.target,
@@ -138,16 +131,26 @@ class BuildCohort:
 
     def compiler(self, *, cxx: bool = False) -> Path:
         if not self.has_frontend:
-            raise ValueError("this cohort has no standard patched Clang frontend")
+            raise ValueError("this SDK has no standard patched Clang frontend")
         return self.target_tools["cxx" if cxx else "cc"].path
+
+    @property
+    def compiler_resource_directory(self) -> Path:
+        """Resource headers and compiler runtime are supplied by SDK tooling."""
+        return self.sdk.root / "lib/clang/23"
+
+    @property
+    def linker(self) -> Path:
+        """Patched host linker from the selected immutable compiler product."""
+        return self.llvm.root / "bin/wasm-ld"
 
     @property
     def flags(self) -> tuple[str, ...]:
         return (
-            "--target=" + TARGET,
+            "--target=" + self.target,
             "-pthread",
             "--sysroot=" + str(self.sysroot.root / "sysroot"),
-            "-resource-dir=" + str(self.sdk.root / "lib/clang/23"),
+            "-resource-dir=" + str(self.compiler_resource_directory),
         )
 
     @property
@@ -161,14 +164,14 @@ class BuildCohort:
         """Target link flags that also permit ordinary configure executables."""
         return (
             *self.flags,
-            "-fuse-ld=" + str(self.llvm.root / "bin/wasm-ld"),
+            "-fuse-ld=" + str(self.linker),
             "-Wl,--shared-memory,--serial-memory-init",
         )
 
     @property
     def executable_flags(self) -> tuple[str, ...]:
         """Process-owned memory and TLS exports for threaded guest executables."""
-        return host_executable_flags(self.sysroot.root / "sysroot", TARGET)
+        return host_executable_flags(self.sysroot.root / "sysroot", self.target)
 
     @property
     def shared_library_flags(self) -> tuple[str, ...]:
@@ -183,7 +186,9 @@ class BuildCohort:
     @property
     def compiler_runtime_archive(self) -> Path:
         """Use the exact SDK builtin archive, independently of guest libc state."""
-        relative = "lib/clang/23/lib/" + TARGET.replace("wasm32-", "wasm32-unknown-", 1) + "/libclang_rt.builtins.a"
+        relative = (
+            "lib/clang/23/lib/" + self.target.replace("wasm32-", "wasm32-unknown-", 1) + "/libclang_rt.builtins.a"
+        )
         if relative not in self.sdk.contents:
             raise ValueError("SDK receipt omits target compiler runtime archive")
         return self.sdk.root / relative
@@ -194,18 +199,18 @@ class BuildCohort:
 
 def receipt(base: Path, value: dict) -> Receipt:
     if set(value) != {"root", "manifest", "sha256"}:
-        raise ValueError("cohort receipt fields differ")
+        raise ValueError("SDK receipt fields differ")
     root = (base / value["root"]).resolve()
     path = (base / value["manifest"]).resolve()
     if file_hash(path) != value["sha256"]:
-        raise ValueError("cohort receipt digest differs: " + str(path))
+        raise ValueError("SDK receipt digest differs: " + str(path))
     return Receipt(root, path, value["sha256"], read_json(path))
 
 
 def verify_files(root: Path, hashes: dict[str, str], *, prefix: str = "") -> None:
     for name, expected in hashes.items():
         if file_hash(child(root, prefix + name)) != expected:
-            raise ValueError("cohort artifact differs: " + name)
+            raise ValueError("SDK artifact differs: " + name)
 
 
 def verify_product(product: Receipt) -> None:
@@ -217,17 +222,17 @@ def verify_product(product: Receipt) -> None:
     for name, target in aliases.items():
         path = child(product.root, name)
         if not path.is_symlink() or os.readlink(path) != target:
-            raise ValueError("cohort tool alias differs: " + name)
+            raise ValueError("SDK tool alias differs: " + name)
     actual_aliases = {str(path.relative_to(product.root)) for path in product.root.rglob("*") if path.is_symlink()}
     if actual_aliases != set(aliases):
-        raise ValueError("cohort product contains undeclared tool aliases")
+        raise ValueError("SDK product contains undeclared tool aliases")
     actual = {
         str(path.relative_to(product.root))
         for path in product.root.rglob("*")
         if path.is_file() and not path.is_symlink() and path != product.path
     }
     if actual != set(manifest["artifacts"]):
-        raise ValueError("cohort product contains unrecorded or missing files")
+        raise ValueError("SDK product contains unrecorded or missing files")
 
 
 def local_recipe(name: str) -> dict:
@@ -237,7 +242,7 @@ def local_recipe(name: str) -> dict:
 def verify_cpython_recipe(recipe: dict) -> None:
     """Admit historical build provenance while retaining the Python source policy.
 
-    The trusted cohort descriptor pins the consumed manifest, including its
+    The trusted SDK descriptor pins the consumed manifest, including its
     historical driver hashes. Current Python driver and JSON metadata pins
     govern new builds. Compiled facade sources, headers and patches must still
     match, along with every other source and runtime ABI field.
@@ -305,36 +310,57 @@ def verify_host_files(proof_path: Path, producer: dict, name: str, executable: P
         raise ValueError("host package contains unrecorded or missing files")
 
 
-def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohort:
-    """Verify a setup descriptor and every consumed target receipt and header.
+def admit_host_tools(base: Path, bindings: dict) -> Mapping[str, Tool]:
+    """Verify host bindings without admitting or requiring any target product."""
+    tools = {}
+    if not set(bindings) <= HOST_TOOLS:
+        raise ValueError("unknown SDK host tool")
+    for name, item in bindings.items():
+        if set(item) != {"path", "sha256", "receipt"}:
+            raise ValueError("host tool receipt fields differ")
+        tool_path = Path(os.path.abspath(base / item["path"]))
+        if file_hash(tool_path) != item["sha256"]:
+            raise ValueError("SDK host tool differs: " + name)
+        proof = item["receipt"]
+        proof_path = None
+        proof_hash = None
+        if proof is not None:
+            if set(proof) != {"path", "sha256"}:
+                raise ValueError("host producer receipt fields differ")
+            proof_path = (base / proof["path"]).resolve()
+            proof_hash = proof["sha256"]
+            if file_hash(proof_path) != proof_hash:
+                raise ValueError("host producer receipt digest differs")
+            producer = read_json(proof_path)
+            if name == "uv":
+                if producer["recipe"] != local_recipe("toolchain/uv/recipe.json"):
+                    raise ValueError("patched uv producer differs")
+                if producer["executable"]["sha256"] != item["sha256"] or not producer["build"]["locked"]:
+                    raise ValueError("patched uv executable differs")
+            else:
+                verify_host_files(proof_path, producer, name, tool_path)
+        elif name in {"uv", "meson", "python", "cython", "f2py", "pybind11-config"}:
+            raise ValueError("host tool requires its production receipt: " + name)
+        tools[name] = Tool(tool_path, item["sha256"], proof_path, proof_hash)
+    return MappingProxyType(tools)
 
-    Relative roots resolve against the explicitly supplied setup descriptor.
-    Local setup may reference external immutable build directories. Exported
-    target cohorts use only contained roots; host tools remain explicit bindings.
-    """
-    path = path.resolve()
-    if expected_sha256 is not None and file_hash(path) != expected_sha256:
-        raise ValueError("build cohort descriptor digest differs")
-    value = read_json(path)
-    if set(value) != {
-        "schema_version",
-        "target",
-        "dynamic_abi",
-        "sdk",
-        "llvm",
-        "sysroot",
-        "cpython",
-        "runtime",
-        "host_tools",
-        "target_tools",
-    }:
-        raise ValueError("build cohort descriptor fields differ")
-    if value["schema_version"] != 1 or value["target"] != TARGET or value["dynamic_abi"] != ABI:
-        raise ValueError("unsupported build cohort profile")
-    sdk, llvm, sysroot = (receipt(path.parent, value[name]) for name in ("sdk", "llvm", "sysroot"))
-    cpython = receipt(path.parent, value["cpython"]) if value["cpython"] is not None else None
-    runtime = receipt(path.parent, value["runtime"]) if value["runtime"] is not None else None
+
+def admit_sdk(
+    sdk: Receipt,
+    llvm: Receipt,
+    sysroot: Receipt,
+    cpython: Receipt | None,
+    runtime: Receipt | None,
+    host_tools: Mapping[str, Tool],
+    target_bindings: dict,
+    *,
+    target: str,
+    abi: str,
+) -> MaterializedSDK:
+    """Check cross-product provenance and inventories before adapters use paths."""
     overlay = sysroot.contents
+    if overlay["identity"]["recipe"]["dynamic_abi"] != abi:
+        raise ValueError("SDK ABI differs from platform producer")
     if overlay["identity"]["recipe"] != local_recipe("toolchain/wasi_threads/dynamic-recipe.json"):
         raise ValueError("sysroot producer profile differs")
     verify_sdk(sdk.root, overlay)
@@ -359,7 +385,7 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
     if cpython is not None:
         manifest = cpython.contents
         verify_cpython_recipe(manifest["recipe"])
-        if manifest["dynamic_abi"] != ABI or manifest["recipe"]["target"] != TARGET:
+        if manifest["dynamic_abi"] != abi or manifest["recipe"]["target"] != target:
             raise ValueError("CPython runtime ABI differs")
         profile = manifest["build_profile"]
         if profile["sysroot"] != overlay or json_hash(profile) != manifest["build_profile_sha256"]:
@@ -376,10 +402,10 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
         if headers != actual_headers:
             raise ValueError("CPython header closure differs")
         if runtime is None:
-            raise ValueError("Python cohorts require a separately admitted runtime bundle")
+            raise ValueError("Python SDKs require a separately admitted runtime bundle")
         runtime_manifest = runtime.contents
         if (
-            runtime_manifest["dynamic_abi"] != ABI
+            runtime_manifest["dynamic_abi"] != abi
             or runtime_manifest["recipe"] != manifest["recipe"]
             or runtime_manifest["build_profile_sha256"] != manifest["build_profile_sha256"]
             or runtime_manifest["build_profile"] != profile
@@ -389,37 +415,8 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
         verify_files(
             runtime.root / "rootfs", {name.lstrip("/"): digest for name, digest in runtime_manifest["files"].items()}
         )
-    tools = {}
-    if not set(value["host_tools"]) <= HOST_TOOLS:
-        raise ValueError("unknown cohort host tool")
-    for name, item in value["host_tools"].items():
-        if set(item) != {"path", "sha256", "receipt"}:
-            raise ValueError("host tool receipt fields differ")
-        tool_path = Path(os.path.abspath(path.parent / item["path"]))
-        if file_hash(tool_path) != item["sha256"]:
-            raise ValueError("cohort host tool differs: " + name)
-        proof = item["receipt"]
-        proof_path = None
-        proof_hash = None
-        if proof is not None:
-            if set(proof) != {"path", "sha256"}:
-                raise ValueError("host producer receipt fields differ")
-            proof_path = (path.parent / proof["path"]).resolve()
-            proof_hash = proof["sha256"]
-            if file_hash(proof_path) != proof_hash:
-                raise ValueError("host producer receipt digest differs")
-            producer = read_json(proof_path)
-            if name == "uv":
-                if producer["recipe"] != local_recipe("toolchain/uv/recipe.json"):
-                    raise ValueError("patched uv producer differs")
-                if producer["executable"]["sha256"] != item["sha256"] or not producer["build"]["locked"]:
-                    raise ValueError("patched uv executable differs")
-            else:
-                verify_host_files(proof_path, producer, name, tool_path)
-        elif name in {"uv", "meson", "python", "cython", "f2py", "pybind11-config"}:
-            raise ValueError("host tool requires its production receipt: " + name)
-        tools[name] = Tool(tool_path, item["sha256"], proof_path, proof_hash)
     target_tools = {}
+    value = {"target_tools": target_bindings}
     if set(value["target_tools"]) != {"cc", "cxx", "ar", "ranlib", "strip"}:
         raise ValueError("target tool entrypoints differ")
     providers = {"sdk": sdk, "llvm": llvm}
@@ -454,25 +451,27 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
             generated,
             runtime.root,
             manifest["recipe"]["version"],
-            ABI,
-            TARGET,
+            abi,
+            target,
             "wasm32_wasip1",
             manifest["recipe"]["source"]["sha256"],
             json_hash(headers),
             headers["wasi-build/pyconfig.h"],
             runtime.sha256,
         )
-    return BuildCohort(
+    return MaterializedSDK(
         sdk,
         llvm,
         sysroot,
         cpython,
         runtime,
         python,
-        MappingProxyType(tools),
+        MappingProxyType(host_tools),
         MappingProxyType(target_tools),
-        json_hash(value),
+        json_hash({"compiler": llvm.sha256, "platform": sysroot.sha256, "tooling": sdk.sha256}),
         frontend,
+        target,
+        abi,
     )
 
 
@@ -486,176 +485,7 @@ def tool_reference(tool: Tool) -> dict:
     }
 
 
-def write_setup(
-    path: Path,
-    *,
-    sdk: Path,
-    llvm: Path,
-    sysroot: Path,
-    cpython: Path | None,
-    runtime: Path | None,
-    host_tools: Mapping[str, Tool],
-) -> BuildCohort:
-    """Write and admit an explicit local setup from immutable producer outputs.
-
-    The setup references external build directories. Use ``export_cohort`` for
-    contained target inputs. Host tools are always explicit byte-pinned bindings.
-    """
-    path = path.resolve()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    overlay = read_json(sysroot / "manifest.json")
-    sdk_receipt = path.with_name(path.stem + "-sdk.json")
-    sdk_receipt.write_text(json.dumps(overlay["identity"]["sdk_tooling"], indent=2, sort_keys=True) + "\n")
-
-    def reference(root: Path, manifest: Path) -> dict:
-        return {"root": str(root.resolve()), "manifest": str(manifest.resolve()), "sha256": file_hash(manifest)}
-
-    compiler_manifest = read_json(llvm / "manifest.json")
-    frontend = compiler_manifest["identity"]["recipe"].get("name") == "llvm-wasi-compiler"
-    entries = {}
-    for name, executable in {
-        "cc": "clang",
-        "cxx": "clang++",
-        "ar": "llvm-ar",
-        "ranlib": "llvm-ranlib",
-        "strip": "llvm-strip",
-    }.items():
-        provider = "llvm" if frontend else "sdk"
-        root = llvm if frontend else sdk
-        entries[name] = {
-            "provider": provider,
-            "path": "bin/" + executable,
-            "sha256": file_hash(root / "bin" / executable),
-        }
-    value = {
-        "schema_version": 1,
-        "target": TARGET,
-        "dynamic_abi": ABI,
-        "sdk": reference(sdk, sdk_receipt),
-        "llvm": reference(llvm, llvm / "manifest.json"),
-        "sysroot": reference(sysroot, sysroot / "manifest.json"),
-        "cpython": reference(cpython, cpython / "manifest.json") if cpython is not None else None,
-        "runtime": reference(runtime, runtime / "manifest.json") if runtime is not None else None,
-        "host_tools": {name: tool_reference(tool) for name, tool in host_tools.items()},
-        "target_tools": entries,
-    }
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    return load_cohort(path)
-
-
-def export_cohort(cohort: BuildCohort, destination: Path) -> Path:
-    """Copy admitted target inputs into a relocatable setup directory.
-
-    Host executables remain explicit external bindings: copying a binary alone
-    would not package its host interpreter, shared libraries or Python environment.
-    The target roots and receipts are contained and can move as one directory.
-    """
-    destination = destination.resolve()
-    destination.mkdir(parents=True, exist_ok=False)
-    items = {
-        "sdk": cohort.sdk,
-        "llvm": cohort.llvm,
-        "sysroot": cohort.sysroot,
-        "cpython": cohort.cpython_manifest,
-        "runtime": cohort.runtime,
-    }
-    references = {}
-    for name, product in items.items():
-        if product is None:
-            references[name] = None
-            continue
-        output = destination / name
-        if name == "cpython":
-            output.mkdir()
-            shutil.copytree(cohort.python.source_root / "Include", output / cohort.python.source_root.name / "Include")
-            (output / "wasi-build").mkdir()
-            shutil.copyfile(cohort.python.generated_config_dir / "pyconfig.h", output / "wasi-build/pyconfig.h")
-            shutil.copytree(product.root / "rootfs", output / "rootfs")
-        else:
-            shutil.copytree(product.root, output, symlinks=True)
-        manifest_name = "sdk-receipt.json" if name == "sdk" else "manifest.json"
-        shutil.copyfile(product.path, output / manifest_name)
-        references[name] = {"root": name, "manifest": name + "/" + manifest_name, "sha256": product.sha256}
-    value = {
-        "schema_version": 1,
-        "target": TARGET,
-        "dynamic_abi": ABI,
-        **references,
-        "host_tools": {name: tool_reference(tool) for name, tool in cohort.host_tools.items()},
-        "target_tools": {
-            name: {
-                "provider": "llvm" if tool.path.is_relative_to(cohort.llvm.root) else "sdk",
-                "path": str(
-                    tool.path.relative_to(
-                        cohort.llvm.root if tool.path.is_relative_to(cohort.llvm.root) else cohort.sdk.root
-                    )
-                ),
-                "sha256": tool.sha256,
-            }
-            for name, tool in cohort.target_tools.items()
-        },
-    }
-    path = destination / "cohort.json"
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
-    load_cohort(path)
-    return path
-
-
-@dataclass(frozen=True)
-class CompilerBootstrap:
-    """Explicit seed inputs for the host LLVM producer, outside the guest graph."""
-
-    archive: Path
-    archive_sha256: str
-    work: Path
-    tools: Mapping[str, Tool]
-
-
-def load_bootstrap(path: Path) -> CompilerBootstrap:
-    """Admit pinned host compilers and build tools without searching PATH."""
-    value = read_json(path)
-    if set(value) != {"schema_version", "archive", "work", "tools"} or value["schema_version"] != 1:
-        raise ValueError("compiler bootstrap descriptor fields differ")
-    if set(value["archive"]) != {"path", "sha256"} or set(value["tools"]) != {"cc", "cxx", "cmake", "ninja"}:
-        raise ValueError("compiler bootstrap inputs differ")
-    archive = (path.parent / value["archive"]["path"]).resolve()
-    if file_hash(archive) != value["archive"]["sha256"]:
-        raise ValueError("compiler bootstrap archive differs")
-    tools = {}
-    for name, item in value["tools"].items():
-        if set(item) != {"path", "sha256"}:
-            raise ValueError("compiler bootstrap tool fields differ")
-        executable = (path.parent / item["path"]).resolve()
-        if file_hash(executable) != item["sha256"]:
-            raise ValueError("compiler bootstrap tool differs: " + name)
-        tools[name] = Tool(executable, item["sha256"])
-    return CompilerBootstrap(
-        archive, value["archive"]["sha256"], (path.parent / value["work"]).resolve(), MappingProxyType(tools)
-    )
-
-
-def resolve_compiler(cohort: BuildCohort, bootstrap: CompilerBootstrap | None) -> Receipt:
-    """Run the host producer when seeded, or reuse its admitted immutable product."""
-    from ports.toolchain.llvm.compiler import build
-    from ports.toolchain.llvm.compiler import verify_product as verify_compiler
-
-    if bootstrap is None:
-        cohort.compiler()
-        verify_compiler(cohort.llvm.root, cohort.llvm.contents["identity"])
-        return cohort.llvm
-    if file_hash(bootstrap.archive) != bootstrap.archive_sha256:
-        raise ValueError("compiler bootstrap archive changed after admission")
-    for name, tool in bootstrap.tools.items():
-        if file_hash(tool.path) != tool.sha256:
-            raise ValueError("compiler bootstrap tool changed after admission: " + name)
-    root = build(
-        bootstrap.archive, *(bootstrap.tools[name].path for name in ("cc", "cxx", "cmake", "ninja")), bootstrap.work
-    )
-    path = root / "manifest.json"
-    return Receipt(root, path, file_hash(path), read_json(path))
-
-
-def resolved_toolchain(cohort: BuildCohort, compiler: Receipt, sysroot: Receipt) -> BuildCohort:
+def resolved_toolchain(sdk_context: MaterializedSDK, compiler: Receipt, sysroot: Receipt) -> MaterializedSDK:
     """Bind adapter flags and entrypoints to the graph's selected producer results."""
     from dataclasses import replace
 
@@ -673,85 +503,12 @@ def resolved_toolchain(cohort: BuildCohort, compiler: Receipt, sysroot: Receipt)
             "strip": "llvm-strip",
         }.items()
     }
-    identity = json_hash({"cohort": cohort.identity, "compiler": compiler.sha256, "platform": sysroot.sha256})
+    identity = json_hash({"tooling": sdk_context.sdk.sha256, "compiler": compiler.sha256, "platform": sysroot.sha256})
     return replace(
-        cohort,
+        sdk_context,
         llvm=compiler,
         sysroot=sysroot,
         target_tools=MappingProxyType(target_tools),
         identity=identity,
         has_frontend=True,
     )
-
-
-@dataclass(frozen=True)
-class PlatformBootstrap:
-    """Pinned archives and output slot for the WASI libc platform producer."""
-
-    sdk_archive: Path
-    sdk_sha256: str
-    libc_archive: Path
-    libc_sha256: str
-    work: Path
-
-
-def load_platform_bootstrap(path: Path) -> PlatformBootstrap:
-    value = read_json(path)
-    if set(value) != {"schema_version", "sdk_archive", "libc_archive", "work"} or value["schema_version"] != 1:
-        raise ValueError("platform bootstrap descriptor fields differ")
-    archives = {}
-    for name in ("sdk_archive", "libc_archive"):
-        item = value[name]
-        if set(item) != {"path", "sha256"}:
-            raise ValueError("platform archive fields differ")
-        archive = (path.parent / item["path"]).resolve()
-        if file_hash(archive) != item["sha256"]:
-            raise ValueError("platform bootstrap archive differs")
-        archives[name] = (archive, item["sha256"])
-    return PlatformBootstrap(
-        *archives["sdk_archive"], *archives["libc_archive"], (path.parent / value["work"]).resolve()
-    )
-
-
-def resolve_platform(cohort: BuildCohort, compiler: Receipt, bootstrap: PlatformBootstrap | None) -> Receipt:
-    """Run the pinned libc producer or reuse a complete byte-verified product."""
-    from ports.toolchain.wasi_threads.dynamic import build, compiler_identity
-
-    if bootstrap is None:
-        verify_product(cohort.sysroot)
-        return cohort.sysroot
-    recipe = local_recipe("toolchain/wasi_threads/dynamic-recipe.json")
-    for path, expected, declared in (
-        (bootstrap.sdk_archive, bootstrap.sdk_sha256, recipe["sdk"]["sha256"]),
-        (bootstrap.libc_archive, bootstrap.libc_sha256, recipe["wasi_libc"]["sha256"]),
-    ):
-        if expected != declared or file_hash(path) != expected:
-            raise ValueError("platform producer archive differs")
-    tools = [cohort.host_tools[name] for name in ("cmake", "ninja")]
-    for tool in tools:
-        if file_hash(tool.path) != tool.sha256:
-            raise ValueError("platform build tool changed")
-    root = bootstrap.work / "prefix"
-    manifest_path = root / "manifest.json"
-    if manifest_path.exists():
-        product = Receipt(root, manifest_path, file_hash(manifest_path), read_json(manifest_path))
-        expected_compiler = compiler_identity(
-            compiler.root, Path(__file__).parents[1] / "toolchain/llvm/threaded-recipe.json"
-        )
-        if (
-            product.contents["identity"]["recipe"] != recipe
-            or product.contents["identity"]["compiler"] != expected_compiler
-        ):
-            raise ValueError("platform workspace producer inputs differ")
-        if product.contents["identity"]["tools"] != {str(tool.path): tool.sha256 for tool in tools}:
-            raise ValueError("platform workspace build tools differ")
-        verify_sdk(cohort.sdk.root, product.contents)
-        verify_product(product)
-        return product
-    root = build(
-        bootstrap.sdk_archive, bootstrap.libc_archive, compiler.root, *(tool.path for tool in tools), bootstrap.work
-    )
-    manifest_path = root / "manifest.json"
-    product = Receipt(root, manifest_path, file_hash(manifest_path), read_json(manifest_path))
-    verify_product(product)
-    return product

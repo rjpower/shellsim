@@ -66,7 +66,7 @@ Run the graph with an admitted descriptor that includes the native C generator:
 
 ```sh
 uv run python -m ports native/openblas/graph-recipe.json \
-  --cohort /path/to/scientific/cohort.json --store /path/to/store \
+  --store /path/to/store \
   --output /path/to/release --check
 ```
 

@@ -321,6 +321,10 @@ def seal_native_install(
             raise ValueError("native runtime dependency version mismatch")
     files, directories, links = _scan(staging / "usr/local", links=True)
     effective = copy.deepcopy(dict(recipe))
+    if isinstance(effective.get("sdk"), str):
+        # Author selection is retained in graph_recipe; the installable recipe
+        # binds the actual archive supplying compiler resources and builtin code.
+        effective["sdk"] = target.toolchain["sdk"]
     groups = {group: set(values) for group, values in recipe.get("exports", {}).items()}
     for group, values in recipe.get("export_directories", {}).items():
         selected = groups.setdefault(group, set())

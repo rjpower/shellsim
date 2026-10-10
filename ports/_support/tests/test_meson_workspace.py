@@ -63,6 +63,9 @@ def meson_project(tmp_path):
         host,
         target,
         dependencies,
+        "test-abi",
+        tmp_path / "sdk/lib/clang/23",
+        tmp_path / "compiler/bin/wasm-ld",
     )
     tools = {name: {"path": str(path), "sha256": file_hash(path.resolve())} for name, path in host.items()}
     products = {name: file_hash(path.resolve()) for name, path in target.items()}

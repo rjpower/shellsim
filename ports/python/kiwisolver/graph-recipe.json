@@ -44,5 +44,5 @@
       "script": "tests/probes/operations.py"
     }
   ],
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

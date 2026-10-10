@@ -10,7 +10,7 @@ or global host environment is required.
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports python/kiwisolver/graph-recipe.json \
-  --cohort /path/to/threaded/cohort.json --store /path/to/ports-cache \
+  --store /path/to/ports-cache \
   --output /path/to/kiwi-release --check
 ```
 

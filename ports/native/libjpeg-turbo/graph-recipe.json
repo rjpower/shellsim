@@ -26,7 +26,7 @@
     ],
     "jobs": 2,
     "install_prefix": "/usr/local",
-    "executable_cohort_link_inputs": [
+    "executable_sdk_link_inputs": [
       "lib/wasm32-wasip1-threads/libsetjmp.a"
     ]
   },
@@ -55,7 +55,7 @@
       "link_inputs": [
         "lib/libjpeg.so"
       ],
-      "cohort_link_inputs": [
+      "sdk_link_inputs": [
         "lib/wasm32-wasip1-threads/libsetjmp.a"
       ]
     }
@@ -71,5 +71,5 @@
     }
   ],
   "role": "target-library",
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

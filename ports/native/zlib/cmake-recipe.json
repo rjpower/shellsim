@@ -68,5 +68,5 @@
     }
   ],
   "role": "target-library",
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

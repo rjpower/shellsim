@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.cohort import load_cohort
 from ports._support.compiler_response import _MAX_RESPONSE_BYTES, response_arguments
+from ports._support.import_sdk import load_legacy_cohort
 from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
 from ports._support.wasm_metadata import function_signatures
 
@@ -55,7 +55,7 @@ def test_actual_wrapper_compiles_and_links_nested_response_files(tmp_path):
     descriptor = os.environ.get("SHELLSIM_BUILD_COHORT")
     if descriptor is None:
         pytest.skip("requires an explicitly admitted build cohort")
-    cohort = load_cohort(Path(descriptor))
+    cohort = load_legacy_cohort(Path(descriptor))
     source = tmp_path / "source"
     source.mkdir()
     (source / "module source.c").write_text("int operation(int x) { return x + 1; }\n")
@@ -72,6 +72,9 @@ def test_actual_wrapper_compiles_and_links_nested_response_files(tmp_path):
         compiler_prefix=cohort.llvm.root,
         sysroot=cohort.sysroot.root / "sysroot",
         target=cohort.target,
+        abi=cohort.dynamic_abi,
+        compiler_resource_directory=cohort.compiler_resource_directory,
+        linker=cohort.linker,
         compiler_flags=cohort.compiler_flags,
         linker_flags=cohort.linker_flags,
         dependencies={},

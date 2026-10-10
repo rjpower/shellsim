@@ -28,6 +28,9 @@ def build_request(tmp_path):
         host_tools={},
         target_tools={},
         dependency_sysroot=tmp_path / "dependencies",
+        abi="test-abi",
+        compiler_resource_directory=tmp_path / "sdk/lib/clang/23",
+        linker=tmp_path / "compiler/bin/wasm-ld",
     )
     return NativeBuildRequest(NativeAdapter.CMAKE, context)
 

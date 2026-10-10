@@ -41,6 +41,9 @@ class NativeBuildContext:
     host_tools: Mapping[str, Path]
     target_tools: Mapping[str, Path]
     dependency_sysroot: Path
+    abi: str
+    compiler_resource_directory: Path
+    linker: Path
     shared_library_flags: tuple[str, ...] = ()
     executable_flags: tuple[str, ...] = ()
     retained_workspace: bool = False

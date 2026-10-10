@@ -7,7 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.cohort import load_cohort, verify_host_files
+from ports._support.import_sdk import load_legacy_cohort
+from ports._support.sdk_products import verify_host_files
 
 
 @pytest.fixture
@@ -32,7 +33,7 @@ def descriptor(tmp_path):
 
 def test_verified_python_receipt_binds_headers_to_assembled_runtime(descriptor):
     path, _ = descriptor
-    cohort = load_cohort(path)
+    cohort = load_legacy_cohort(path)
     assert cohort.python.dynamic_abi == cohort.dynamic_abi
     assert cohort.python.runtime_bundle == cohort.runtime.root
     assert (cohort.python.source_root / "Include/Python.h").is_file()
@@ -44,7 +45,7 @@ def test_receipt_digest_mismatch_is_rejected_before_admission(descriptor):
     value["sysroot"]["sha256"] = "0" * 64
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError):
-        load_cohort(path)
+        load_legacy_cohort(path)
 
 
 def test_target_executable_cannot_be_rebound_to_a_different_admitted_tool(descriptor):
@@ -52,7 +53,7 @@ def test_target_executable_cannot_be_rebound_to_a_different_admitted_tool(descri
     value["target_tools"]["cc"] = value["target_tools"]["ar"]
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError):
-        load_cohort(path)
+        load_legacy_cohort(path)
 
 
 def test_patched_uv_requires_its_producer_receipt(descriptor):
@@ -60,12 +61,12 @@ def test_patched_uv_requires_its_producer_receipt(descriptor):
     value["host_tools"]["uv"]["receipt"] = None
     path.write_text(json.dumps(value))
     with pytest.raises(ValueError):
-        load_cohort(path)
+        load_legacy_cohort(path)
 
 
 def test_llc_only_product_cannot_be_used_as_a_standard_frontend(descriptor):
     path, _ = descriptor
-    cohort = load_cohort(path)
+    cohort = load_legacy_cohort(path)
     if cohort.has_frontend:
         pytest.skip("this behavior requires the independently sealed llc-only product")
     with pytest.raises(ValueError):
@@ -87,7 +88,7 @@ def test_package_tool_rejects_changed_imported_code(tmp_path):
     executable = copied / producer["executable"]
     if producer["schema_version"] == 2:
         executable.write_text(executable.read_text().replace(str(original), str(copied)))
-        from ports._support.cohort import file_hash
+        from ports._support.sdk_products import file_hash
 
         producer["files"][producer["executable"]] = file_hash(executable)
     verify_host_files(receipt_path, producer, "meson", executable)
@@ -98,19 +99,21 @@ def test_package_tool_rejects_changed_imported_code(tmp_path):
 
 
 def test_compile_flags_keep_linker_selection_in_link_flags(tmp_path):
-    from ports._support.cohort import BuildCohort, Receipt
+    from ports._support.sdk_products import MaterializedSDK, Receipt
 
     sdk = Receipt(tmp_path / "sdk", tmp_path / "sdk.json", "sdk-digest", {})
     compiler = Receipt(tmp_path / "compiler", tmp_path / "compiler.json", "compiler-digest", {})
     sysroot = Receipt(tmp_path / "platform", tmp_path / "platform.json", "platform-digest", {})
-    cohort = BuildCohort(sdk, compiler, sysroot, None, None, None, {}, {}, "cohort-digest", True)
+    cohort = MaterializedSDK(
+        sdk, compiler, sysroot, None, None, None, {}, {}, "cohort-digest", True, "wasm32-wasip1-threads", "test-abi"
+    )
     assert not any(flag.startswith("-fuse-ld=") for flag in cohort.compiler_flags)
     assert "-fuse-ld=" + str(compiler.root / "bin/wasm-ld") in cohort.linker_flags
     assert "-resource-dir=" + str(sdk.root / "lib/clang/23") in cohort.compiler_flags
 
 
 def test_historical_python_driver_pins_do_not_change_source_admission():
-    from ports._support.cohort import local_recipe, verify_cpython_recipe
+    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
 
     historical = local_recipe("python/cpython/threaded-recipe.json")
     historical["build_scripts"][0]["sha256"] = "0" * 64
@@ -126,7 +129,7 @@ def test_historical_python_driver_pins_do_not_change_source_admission():
     ],
 )
 def test_historical_python_receipt_rejects_changed_compiled_inputs(source):
-    from ports._support.cohort import local_recipe, verify_cpython_recipe
+    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
 
     historical = local_recipe("python/cpython/threaded-recipe.json")
     entry = next(item for item in historical["build_scripts"] if item["file"] == source)
@@ -137,7 +140,7 @@ def test_historical_python_receipt_rejects_changed_compiled_inputs(source):
 
 @pytest.mark.parametrize("replacement", [None, "threaded.py"])
 def test_historical_python_receipt_cannot_hide_a_compiled_input(replacement):
-    from ports._support.cohort import local_recipe, verify_cpython_recipe
+    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
 
     historical = local_recipe("python/cpython/threaded-recipe.json")
     entry = next(
@@ -161,7 +164,7 @@ def test_historical_python_receipt_cannot_hide_a_compiled_input(replacement):
     ],
 )
 def test_historical_python_receipt_requires_the_accepted_source_and_abi(field, value):
-    from ports._support.cohort import local_recipe, verify_cpython_recipe
+    from ports._support.sdk_products import local_recipe, verify_cpython_recipe
 
     historical = local_recipe("python/cpython/threaded-recipe.json")
     historical[field] = value

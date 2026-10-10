@@ -74,5 +74,5 @@
       "script": "tests/graph_make.sh"
     }
   ],
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.cohort import load_cohort
+from ports._support.import_sdk import load_legacy_cohort
 from ports._support.wasm_metadata import function_signatures, validate_provider_signatures
 
 
@@ -58,7 +58,7 @@ def test_shared_link_rejects_incompatible_object_function_types(tmp_path, monkey
     descriptor = os.environ.get("SHELLSIM_BUILD_COHORT")
     if descriptor is None:
         pytest.skip("requires an explicitly admitted build cohort")
-    cohort = load_cohort(Path(descriptor))
+    cohort = load_legacy_cohort(Path(descriptor))
     monkeypatch.setenv("PYTHONDONTWRITEBYTECODE", "1")
     provider = tmp_path / "provider.c"
     caller = tmp_path / "caller.c"

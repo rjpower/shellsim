@@ -43,13 +43,13 @@ subprocess.run([uv, 'pip', 'install', '--no-index', '--no-deps', '--python',
 PY
 ```
 
-Then produce a fresh Meson tree and receipts. The supplied cohort provides the
-remaining compiler, platform and host bindings; its existing descriptor is not
-edited:
+Then produce a fresh Meson tree and receipts. Supply a native host seed with
+the remaining host bindings; the producer writes a new seed without target
+products:
 
 ```sh
 uv run --no-project --python "$HOST_ENV/bin/python" python -B -m ports._support.host_tools \
-  --cohort "$INPUT_COHORT" --output "$NEW_RECEIPTS" --cache "$SOURCE_CACHE" \
+  --host-seed "$INPUT_HOST_SEED" --output "$NEW_RECEIPTS" --cache "$SOURCE_CACHE" \
   --base-python "$BASE_PYTHON" --python-environment "$HOST_ENV" \
   --meson-root "$NEW_MESON" --meson-python-environment "$HOST_ENV" \
   --private-python "$PRIVATE_PYTHON" --materialize-meson
@@ -63,6 +63,6 @@ base is already a private read-only tree.
 Omit `--materialize-meson` to verify an existing Meson installation against the
 same pinned source and patch. `--offline` requires all pinned archives in the
 source cache. Both modes check installed wheel files against the upstream
-archives, write new receipts, and fully admit the resulting `cohort.json`.
+archives, write new receipts, and fully admit the resulting `host-seed.json`.
 Existing output directories are rejected. A failed proof does not authorize
 rewriting an old receipt or changing a retained numerical build tree.

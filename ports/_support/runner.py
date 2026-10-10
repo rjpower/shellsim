@@ -38,7 +38,7 @@ from ports._support.python_adapters import (
 )
 from ports._support.store import build_slot, extract, fetch, file_hash, relative_path
 
-_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "cohort.py", "local_sources.py")
+_COMMON_BUILD_MODULES = ("runner.py", "graph.py", "store.py", "sdk.py", "sdk_products.py", "local_sources.py")
 _NATIVE_BUILD_MODULES = (
     "native_adapters.py",
     "compiler_response.py",
@@ -51,7 +51,7 @@ _NATIVE_BUILD_MODULES = (
 _PURE_BUILD_MODULES = ("python_adapters.py", "pure_wheel.py")
 
 if TYPE_CHECKING:
-    from ports._support.cohort import BuildCohort, CompilerBootstrap, PlatformBootstrap
+    from ports._support.sdk_products import MaterializedSDK
 
 
 @dataclass(frozen=True)
@@ -60,14 +60,16 @@ class GraphBuild:
 
     graph: Graph
     results: dict[str, Path]
-    cohorts: dict[str, BuildCohort]
+    sdks: dict[str, MaterializedSDK]
 
 
-def _native_target(cohort: BuildCohort):
+def _native_target(sdk_context: MaterializedSDK):
     """Use the same resolved products for sealing and acceptance closure checks."""
     from ports._support.native_artifacts import NativeTarget
 
-    return NativeTarget(cohort.target, cohort.dynamic_abi, cohort.dynamic_abi, cohort.toolchain_receipt)
+    return NativeTarget(
+        sdk_context.target, sdk_context.dynamic_abi, sdk_context.dynamic_abi, sdk_context.toolchain_receipt
+    )
 
 
 def _local_file(port: Port, name: object) -> Path:
@@ -123,19 +125,19 @@ def _admit_recipe(port: Port) -> dict[str, str]:
     return files
 
 
-def _executable_cohort_link_inputs(cohort: BuildCohort, build: Mapping) -> tuple[Path, ...]:
+def _executable_sdk_link_inputs(sdk_context: MaterializedSDK, build: Mapping) -> tuple[Path, ...]:
     """Resolve declared executable archives only from the verified platform product."""
-    declared = build.get("executable_cohort_link_inputs", [])
+    declared = build.get("executable_sdk_link_inputs", [])
     if not isinstance(declared, list) or len(declared) > 32:
-        raise ValueError("executable cohort link inputs must be a bounded array")
+        raise ValueError("executable SDK link inputs must be a bounded array")
     if not declared:
         return ()
-    root = cohort.sysroot.root / "sysroot"
+    root = sdk_context.sysroot.root / "sysroot"
     inputs = []
     for raw in declared:
         name = relative_path(raw)
         if len(name) > 4096 or not name.endswith(".a") or name in inputs:
-            raise ValueError("executable cohort link input must be a unique archive path")
+            raise ValueError("executable SDK link input must be a unique archive path")
         path = root / name
         if (
             path.is_symlink()
@@ -143,15 +145,15 @@ def _executable_cohort_link_inputs(cohort: BuildCohort, build: Mapping) -> tuple
             or not path.resolve().is_relative_to(root.resolve())
             or path.stat().st_size > 128 * 1024**2
         ):
-            raise ValueError("executable cohort archive is missing or unsupported")
-        expected = cohort.sysroot.contents["artifacts"].get("sysroot/" + name)
+            raise ValueError("executable SDK archive is missing or unsupported")
+        expected = sdk_context.sysroot.contents["artifacts"].get("sysroot/" + name)
         if not isinstance(expected, str) or file_hash(path) != expected:
-            raise ValueError("executable cohort archive differs from admitted platform")
+            raise ValueError("executable SDK archive differs from admitted platform")
         inputs.append(name)
     return tuple(root / name for name in inputs)
 
 
-def _hooks(port: Port, phase: str, context: NativeBuildContext, cohort: BuildCohort) -> None:
+def _hooks(port: Port, phase: str, context: NativeBuildContext, sdk_context: MaterializedSDK) -> None:
     """Run pinned port-local Python hooks with an explicit JSON context argument."""
     from ports.native.dependencies import target_environment
 
@@ -163,11 +165,11 @@ def _hooks(port: Port, phase: str, context: NativeBuildContext, cohort: BuildCoh
     path.write_text(json.dumps(asdict(context), default=str, sort_keys=True) + "\n")
     environment = target_environment(context.sdk)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
-    environment["PATH"] = os.pathsep.join(sorted({str(tool.path.parent) for tool in cohort.host_tools.values()}))
+    environment["PATH"] = os.pathsep.join(sorted({str(tool.path.parent) for tool in sdk_context.host_tools.values()}))
     for index, hook in enumerate(hooks):
         with (context.build.parent / f"hook-{phase}-{index}.log").open("wb") as log:
             subprocess.run(
-                [str(cohort.tool("python")), str(_local_file(port, hook["file"])), str(path)],
+                [str(sdk_context.tool("python")), str(_local_file(port, hook["file"])), str(path)],
                 cwd=context.source,
                 env=environment,
                 stdout=log,
@@ -259,13 +261,12 @@ def _source_exports(port: Port, context: NativeBuildContext) -> None:
 def build_graph(
     ports: Path,
     requests: Sequence[str],
-    cohort: BuildCohort,
+    sdk_context: MaterializedSDK,
     store: Path,
     *,
     offline: bool = False,
     jobs: int | None = None,
-    bootstrap: CompilerBootstrap | None = None,
-    platform_bootstrap: PlatformBootstrap | None = None,
+    default_sdk: str = "default",
     workspaces: Mapping[str, Path] | None = None,
 ) -> GraphBuild:
     """Build each selected recipe once, reusing only byte-verified cache entries."""
@@ -277,7 +278,9 @@ def build_graph(
 
     if jobs is not None and not 1 <= jobs <= 16:
         raise ValueError("build jobs must be between one and sixteen")
-    graph = plan(ports, requests, target_profile=cohort.dynamic_abi)
+    graph = plan(
+        ports, requests, target_profile=sdk_context.dynamic_abi if sdk_context else None, default_sdk=default_sdk
+    )
     selected = {port.reference: port for port in graph.ports}
     for reference in workspaces or {}:
         if reference not in selected or selected[reference].recipe["build"]["adapter"] not in {
@@ -320,18 +323,14 @@ def build_graph(
     native: dict[str, NativeArtifact] = {}
     keys: dict[str, str] = {}
     products = {}
-    cohorts = {}
+    sdks = {}
     for port in graph.ports:
         adapter = port.recipe["build"]["adapter"]
         if adapter in {"llvm-host", "wasi-sysroot"}:
-            from ports._support.cohort import resolve_compiler, resolve_platform, verify_product
+            from ports._support.sdk_products import verify_product
             from ports._support.store import identity
 
-            product = (
-                resolve_compiler(cohort, bootstrap)
-                if adapter == "llvm-host"
-                else resolve_platform(cohort, products["toolchain/llvm/host-recipe.json"], platform_bootstrap)
-            )
+            product = sdk_context.llvm if adapter == "llvm-host" else sdk_context.sysroot
             verify_product(product)
             producer_path = _local_file(port, port.recipe["build"]["producer_recipe"])
             if product.contents["identity"]["recipe"] != json.loads(producer_path.read_text()):
@@ -340,9 +339,9 @@ def build_graph(
             results[port.reference] = product.root
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
             continue
-        build_cohort = cohort
+        build_sdk = sdk_context
         if adapter not in {"pure-wheel", "host-wheel"}:
-            from ports._support.cohort import resolved_toolchain
+            from ports._support.sdk_products import resolved_toolchain
 
             sysroot = next(products[item.recipe] for item in port.dependencies if item.kind == "platform")
             compiler = next(
@@ -350,33 +349,49 @@ def build_graph(
                 for item in port.dependencies
                 if item.kind == "build" and item.recipe == "toolchain/llvm/host-recipe.json"
             )
-            build_cohort = resolved_toolchain(cohort, compiler, sysroot)
-            target = _native_target(build_cohort)
-        cohorts[port.reference] = build_cohort
-        executable_inputs = _executable_cohort_link_inputs(build_cohort, port.recipe["build"])
+            build_sdk = resolved_toolchain(sdk_context, compiler, sysroot)
+            target = _native_target(build_sdk)
+        sdks[port.reference] = build_sdk
+        executable_inputs = (
+            _executable_sdk_link_inputs(build_sdk, port.recipe["build"])
+            if adapter not in {"pure-wheel", "host-wheel"}
+            else ()
+        )
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
             "implementation": implementations[port.reference],
-            "cohort": cohort.identity,
             "dependencies": {
                 dependency.kind + ":" + dependency.port: keys[dependency.recipe] for dependency in port.dependencies
             },
         }
-        if port.build_profile is not None:
-            inputs["build_profile"] = asdict(port.build_profile)
+        if port.sdk_selection is not None:
+            inputs["sdk_selection"] = asdict(port.sdk_selection)
+        if adapter not in {"pure-wheel", "host-wheel"}:
+            inputs["sdk"] = build_sdk.identity
+            inputs["host_tools"] = {
+                name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
+                for name, tool in sdk_context.host_tools.items()
+                if name != "uv"
+            }
+            if adapter in {"python-extension", "python-pep517", "python-meson"}:
+                inputs["python"] = {
+                    "source": sdk_context.python.source_sha256,
+                    "headers": sdk_context.python.headers_sha256,
+                    "pyconfig": sdk_context.python.pyconfig_sha256,
+                }
         if adapter not in {"pure-wheel", "host-wheel", "llvm-guest-sdk"}:
             inputs["target_flags"] = {
-                "compiler": list(build_cohort.compiler_flags),
-                "linker": list(build_cohort.linker_flags),
-                "shared_library": list(build_cohort.shared_library_flags),
+                "compiler": list(build_sdk.compiler_flags),
+                "linker": list(build_sdk.linker_flags),
+                "shared_library": list(build_sdk.shared_library_flags),
                 "shared_library_inputs": [
                     {
-                        "path": str(build_cohort.compiler_runtime_archive),
-                        "sha256": file_hash(build_cohort.compiler_runtime_archive),
+                        "path": str(build_sdk.compiler_runtime_archive),
+                        "sha256": file_hash(build_sdk.compiler_runtime_archive),
                     }
                 ],
-                "executable": list(build_cohort.executable_flags),
+                "executable": list(build_sdk.executable_flags),
                 "executable_link_inputs": [
                     {"path": str(path), "sha256": file_hash(path)} for path in executable_inputs
                 ],
@@ -424,10 +439,10 @@ def build_graph(
                             recipe,
                             compiler,
                             sysroot.root / "sysroot",
-                            cohort.sdk.root,
+                            sdk_context.sdk.root,
                             {name: artifact.prefix for name, artifact in direct.items()},
-                            {name: tool.path for name, tool in cohort.host_tools.items()},
-                            build_cohort.target,
+                            {name: tool.path for name, tool in sdk_context.host_tools.items()},
+                            build_sdk.target,
                         )
                         build_directory = (
                             workspaces[port.reference].resolve()
@@ -443,27 +458,30 @@ def build_graph(
                         source=source,
                         build=build_directory,
                         staging_prefix=slot.work / "install",
-                        sdk=build_cohort.sdk.root,
-                        compiler_prefix=build_cohort.llvm.root,
-                        sysroot=build_cohort.sysroot.root / "sysroot",
-                        target=cohort.target,
-                        compiler_flags=(*build_cohort.compiler_flags, "-I" + str(prefix / "usr/local/include"))
+                        sdk=build_sdk.sdk.root,
+                        compiler_prefix=build_sdk.llvm.root,
+                        sysroot=build_sdk.sysroot.root / "sysroot",
+                        target=sdk_context.target,
+                        compiler_flags=(*build_sdk.compiler_flags, "-I" + str(prefix / "usr/local/include"))
                         if direct
-                        else build_cohort.compiler_flags,
-                        linker_flags=(*build_cohort.linker_flags, "-L" + str(prefix / "usr/local/lib"))
+                        else build_sdk.compiler_flags,
+                        linker_flags=(*build_sdk.linker_flags, "-L" + str(prefix / "usr/local/lib"))
                         if direct
-                        else build_cohort.linker_flags,
+                        else build_sdk.linker_flags,
                         dependencies={name: artifact.prefix for name, artifact in direct.items()},
-                        host_tools={name: tool.path for name, tool in cohort.host_tools.items()},
-                        target_tools={name: tool.path for name, tool in build_cohort.target_tools.items()},
+                        host_tools={name: tool.path for name, tool in sdk_context.host_tools.items()},
+                        target_tools={name: tool.path for name, tool in build_sdk.target_tools.items()},
                         dependency_sysroot=prefix,
-                        shared_library_flags=build_cohort.shared_library_flags,
-                        executable_flags=build_cohort.executable_flags,
-                        shared_library_inputs=(build_cohort.compiler_runtime_archive,),
+                        abi=build_sdk.dynamic_abi,
+                        compiler_resource_directory=build_sdk.compiler_resource_directory,
+                        linker=build_sdk.linker,
+                        shared_library_flags=build_sdk.shared_library_flags,
+                        executable_flags=build_sdk.executable_flags,
+                        shared_library_inputs=(build_sdk.compiler_runtime_archive,),
                         executable_link_inputs=executable_inputs,
                     )
                     if adapter in {"python-extension", "python-meson", "python-pep517"}:
-                        python = cohort.python
+                        python = sdk_context.python
                         if python is None:
                             raise ValueError("Python extension requires admitted CPython headers and runtime")
                         python_context = CPythonBuildContext(
@@ -489,7 +507,7 @@ def build_graph(
 
                             host_packages = {}
                             for item in build.get("host_header_packages", {}).values():
-                                tool = cohort.host_tools[item["tool"]]
+                                tool = sdk_context.host_tools[item["tool"]]
                                 if tool.receipt_path is None:
                                     raise ValueError("Python Meson host headers require a complete package receipt")
                                 proof = json.loads(tool.receipt_path.read_text())
@@ -524,22 +542,22 @@ def build_graph(
                             "pkg-config",
                             "sh",
                         ):
-                            if name in cohort.host_tools:
-                                tool = cohort.host_tools[name]
+                            if name in sdk_context.host_tools:
+                                tool = sdk_context.host_tools[name]
                                 host_code[name] = {"path": str(tool.path), "sha256": tool.sha256}
                                 if tool.receipt_path is not None:
                                     proof = json.loads(tool.receipt_path.read_text())
                                     host_code[name]["files"] = proof["files"]
                         product_inputs = {
-                            "compiler": build_cohort.llvm.sha256,
-                            "platform": build_cohort.sysroot.sha256,
-                            "sdk": build_cohort.sdk.sha256,
+                            "compiler": build_sdk.llvm.sha256,
+                            "platform": build_sdk.sysroot.sha256,
+                            "sdk": build_sdk.sdk.sha256,
                         }
-                        if cohort.python is not None:
+                        if sdk_context.python is not None:
                             product_inputs["python"] = {
-                                "source": cohort.python.source_sha256,
-                                "headers": cohort.python.headers_sha256,
-                                "pyconfig": cohort.python.pyconfig_sha256,
+                                "source": sdk_context.python.source_sha256,
+                                "headers": sdk_context.python.headers_sha256,
+                                "pyconfig": sdk_context.python.pyconfig_sha256,
                             }
                         context = workspace_stack.enter_context(
                             retained_meson(
@@ -565,7 +583,7 @@ def build_graph(
                             context.build.parent / ".meson-workspace.json",
                             slot.result / "meson-workspace-receipt.json",
                         )
-                    _hooks(port, "before_build", context, cohort)
+                    _hooks(port, "before_build", context, sdk_context)
                     if build["adapter"] in {"python-extension", "python-meson", "python-pep517"}:
                         if adapter == "python-meson":
                             output = build_python_meson(
@@ -577,13 +595,13 @@ def build_graph(
                             version = ".".join(python.version.split(".")[:2])
                             configs = [
                                 name
-                                for name in cohort.runtime.contents["files"]
+                                for name in sdk_context.runtime.contents["files"]
                                 if name.startswith(f"/usr/lib/python{version}/_sysconfigdata_") and name.endswith(".py")
                             ]
                             if len(configs) != 1:
                                 raise ValueError("target runtime must export one admitted sysconfig data file")
                             config = python.runtime_bundle / "rootfs" / configs[0].lstrip("/")
-                            if file_hash(config) != cohort.runtime.contents["files"][configs[0]]:
+                            if file_hash(config) != sdk_context.runtime.contents["files"][configs[0]]:
                                 raise ValueError("target sysconfig differs from admitted runtime")
                             output = build_pep517(
                                 PEP517BuildRequest(
@@ -599,7 +617,7 @@ def build_graph(
                             )
                         else:
                             output = build_extension(ExtensionBuildRequest(context, python_context, recipe))
-                        _hooks(port, "after_install", context, cohort)
+                        _hooks(port, "after_install", context, sdk_context)
                         if adapter == "python-meson" or build.get("output", "wheel") == "wheel":
                             shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
                         if (adapter == "python-meson" or build.get("output") == "stdlib") and (
@@ -626,7 +644,7 @@ def build_graph(
                             output = build_guest(context, recipe, compiler, jobs=jobs)
                         else:
                             output = build_native(native_build_request(context, build, jobs))
-                        _hooks(port, "after_install", context, cohort)
+                        _hooks(port, "after_install", context, sdk_context)
                         _source_exports(port, context)
                         seal_native_install(
                             recipe,
@@ -646,10 +664,10 @@ def build_graph(
             native[PurePosixPath(port.reference).parts[0] + "/" + port.name] = NativeArtifact(
                 result / "native", verify_artifact(result / "native")
             )
-    return GraphBuild(graph, results, cohorts)
+    return GraphBuild(graph, results, sdks)
 
 
-def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
+def publish_graph(build: GraphBuild, sdk_context: MaterializedSDK, output: Path) -> Path:
     """Seal wheels and shared providers into one locally installable release.
 
     Existing catalog and release validators enforce runtime compatibility and
@@ -661,13 +679,13 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
     from ports.native.dependencies import verify_artifact
     from ports.python.cpython.release import build_release
 
-    if cohort.python is None:
+    if sdk_context.python is None:
         raise ValueError("graph release requires a CPython runtime")
     if output.exists() or output.is_symlink():
         raise FileExistsError(output)
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".ports-catalog-", dir=output.parent) as temporary:
-        runtime = cohort.python.runtime_bundle
+        runtime = sdk_context.python.runtime_bundle
         incorporated_providers = frozenset()
         stdlib_ports = [
             port for port in guest_graph(build.graph).ports if port.recipe["build"].get("output") == "stdlib"
@@ -693,9 +711,9 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                 runtime,
                 modules,
                 artifacts,
-                _native_target(build.cohorts[stdlib_ports[0].reference]),
+                _native_target(build.sdks[stdlib_ports[0].reference]),
                 Path(temporary) / "runtime",
-                runtime_manifest_sha256=cohort.python.runtime_manifest_sha256,
+                runtime_manifest_sha256=sdk_context.python.runtime_manifest_sha256,
             )
         raw = Path(temporary) / "raw"
         (raw / "wheels").mkdir(parents=True)
@@ -743,19 +761,19 @@ def publish_graph(build: GraphBuild, cohort: BuildCohort, output: Path) -> Path:
                     )
         catalog = {
             "schema_version": 1,
-            "abi": cohort.dynamic_abi,
+            "abi": sdk_context.dynamic_abi,
             "target": "wasm32-wasip1",
-            "python_version": cohort.python.version,
+            "python_version": sdk_context.python.version,
             "packages": packages,
             "native_providers": providers,
         }
         (raw / "catalog.json").write_text(json.dumps(catalog, sort_keys=True, indent=2) + "\n")
         combined = compose(runtime, [raw], Path(temporary) / "catalog")
         native_catalog = publish_native_catalog(guest_graph(build.graph), build.results, Path(temporary) / "native")
-        return build_release(runtime, combined, cohort.tool("uv"), output, native_catalog=native_catalog)
+        return build_release(runtime, combined, sdk_context.tool("uv"), output, native_catalog=native_catalog)
 
 
-def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, output: Path) -> None:
+def accept_graph(build: GraphBuild, sdk_context: MaterializedSDK, descriptor: Path, output: Path) -> None:
     """Run every selected port's declared guest checks against the graph release."""
     from ports._support.acceptance import AcceptanceRequest, accept_port
     from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot
@@ -774,7 +792,7 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
     for port in guest_graph(build.graph).ports:
         if port.role in {"host-tool", "target-platform"}:
             continue
-        build_cohort = build.cohorts[port.reference]
+        build_sdk = build.sdks[port.reference]
         proof = output / Path(port.reference).with_suffix("")
         identity = port.reference.split("/", 1)[0] + "/" + port.name
         kind = "native" if identity in native else "pypi"
@@ -786,16 +804,15 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
                 raise ValueError(f"native port has no sealed artifact: {port.reference}")
             if any(test["kind"] == "native" for test in port.recipe.get("tests", [])):
                 dependencies = proof.parent / (proof.name + "-dependencies")
-                target = _native_target(build_cohort)
+                target = _native_target(build_sdk)
                 merge_dependency_sysroot({identity: native[identity]}, native, dependencies, target)
-        accept_port(AcceptanceRequest(port, descriptor, proof, kind, build_cohort, dependencies))
+        accept_port(AcceptanceRequest(port, descriptor, proof, kind, build_sdk, dependencies))
     (output / "graph.json").write_text(
         json.dumps(
             {
                 "release_sha256": file_hash(descriptor),
-                "cohort": cohort.identity,
                 "resolved_toolchains": {
-                    reference: resolved.toolchain_receipt for reference, resolved in sorted(build.cohorts.items())
+                    reference: resolved.toolchain_receipt for reference, resolved in sorted(build.sdks.items())
                 },
                 "recipes": {port.reference: port.digest for port in build.graph.ports},
                 "builds": {name: path.name for name, path in build.results.items()},
@@ -808,17 +825,14 @@ def accept_graph(build: GraphBuild, cohort: BuildCohort, descriptor: Path, outpu
 
 
 def main() -> None:
-    from ports._support.cohort import load_cohort
+    from ports._support.sdk import materialize
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recipes", nargs="+")
     parser.add_argument("--ports", type=Path, default=Path(__file__).resolve().parents[1])
-    parser.add_argument("--cohort", type=Path, required=True)
+    parser.add_argument("--sdk", default="default", help="default SDK for unopinionated target ports")
+    parser.add_argument("--host-seed", type=Path, help="explicit native host tools; no target products")
     parser.add_argument("--store", type=Path, required=True)
-    parser.add_argument(
-        "--platform-bootstrap", type=Path, help="explicit pinned SDK/libc archives and producer workspace"
-    )
-    parser.add_argument("--bootstrap", type=Path, help="explicit pinned host LLVM seed inputs")
     parser.add_argument(
         "--workspace",
         action="append",
@@ -844,9 +858,13 @@ def main() -> None:
         if reference in workspaces:
             parser.error("duplicate --workspace recipe")
         workspaces[reference] = Path(directory)
-    cohort = load_cohort(args.cohort)
+    graph = plan(args.ports, args.recipes, default_sdk=args.sdk)
+    needs_target = any(port.recipe["build"]["adapter"] not in {"pure-wheel", "host-wheel"} for port in graph.ports)
+    needs_python = args.output is not None or any(
+        port.recipe["build"]["adapter"] in {"python-extension", "python-pep517", "python-meson"} for port in graph.ports
+    )
     if args.check:
-        for port in guest_graph(plan(args.ports, args.recipes, target_profile=cohort.dynamic_abi)).ports:
+        for port in guest_graph(graph).ports:
             if port.role in {"host-tool", "target-platform"}:
                 continue
             tests = port.recipe.get("tests")
@@ -856,17 +874,28 @@ def main() -> None:
                 if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
                     raise ValueError("unsupported guest test kind")
                 _local_file(port, test.get("source" if test["kind"] == "native" else "script"))
-    from ports._support.cohort import load_bootstrap, load_platform_bootstrap
+    sdk_context = (
+        materialize(
+            args.ports,
+            graph,
+            args.store,
+            default=args.sdk,
+            host_seed=args.host_seed,
+            python=needs_python,
+            offline=args.offline,
+        )
+        if needs_target or needs_python
+        else None
+    )
 
     result = build_graph(
         args.ports,
         args.recipes,
-        cohort,
+        sdk_context,
         args.store,
         offline=args.offline,
         jobs=args.jobs,
-        bootstrap=load_bootstrap(args.bootstrap) if args.bootstrap else None,
-        platform_bootstrap=load_platform_bootstrap(args.platform_bootstrap) if args.platform_bootstrap else None,
+        default_sdk=args.sdk,
         workspaces=workspaces,
     )
     if args.output is not None:
@@ -876,15 +905,15 @@ def main() -> None:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             work = Path(tempfile.mkdtemp(prefix=".ports-check-", dir=args.output.parent))
             try:
-                descriptor = publish_graph(result, cohort, work / "release")
-                accept_graph(result, cohort, descriptor, work / "release/acceptance")
+                descriptor = publish_graph(result, sdk_context, work / "release")
+                accept_graph(result, sdk_context, descriptor, work / "release/acceptance")
                 (work / "release").rename(args.output)
             except Exception as error:
                 error.add_note(f"graph acceptance work retained at {work}")
                 raise
             work.rmdir()
         else:
-            publish_graph(result, cohort, args.output)
+            publish_graph(result, sdk_context, args.output)
         print(args.output / "release.json")
     print(json.dumps({name: str(path) for name, path in result.results.items()}, sort_keys=True, indent=2))
 
