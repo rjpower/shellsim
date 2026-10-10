@@ -285,15 +285,35 @@ def verify_cpython_recipe(recipe: dict) -> None:
 
 def verify_host_files(proof_path: Path, producer: dict, name: str, executable: Path) -> None:
     """Bind a package-backed host tool to its complete immutable code tree."""
-    if set(producer) != {"schema_version", "kind", "name", "version", "root", "executable", "source", "files"}:
+    fields = {"schema_version", "kind", "name", "version", "root", "executable", "source", "files"}
+    if producer.get("schema_version") == 2:
+        fields.add("symlinks")
+    if set(producer) != fields:
         raise ValueError("host package receipt fields differ")
-    if producer["schema_version"] != 1 or producer["kind"] != "host-tool-files" or producer["name"] != name:
+    if producer["schema_version"] not in {1, 2} or producer["kind"] != "host-tool-files" or producer["name"] != name:
         raise ValueError("host package receipt profile differs")
     root = (proof_path.parent / producer["root"]).resolve()
     if child(root, producer["executable"]).resolve() != executable.resolve():
         raise ValueError("host package entrypoint differs")
+    if name in {"meson", "python", "cython", "f2py", "pybind11-config"}:
+        if producer["schema_version"] != 2:
+            raise ValueError("Python-backed host tool requires source and base interpreter proof")
+        from ports._support.host_tools import verify_source
+
+        verify_source(root, producer, name)
     verify_files(root, producer["files"])
-    actual = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
+    if producer["schema_version"] == 2:
+        aliases = {str(p.relative_to(root)): os.readlink(p) for p in root.rglob("*") if p.is_symlink()}
+        if aliases != producer["symlinks"]:
+            raise ValueError("host package aliases differ")
+        for name in aliases:
+            if not child(root, name).exists():
+                raise ValueError("host package alias is missing")
+    actual = {
+        str(p.relative_to(root))
+        for p in root.rglob("*")
+        if p.is_file() and (producer["schema_version"] == 1 or not p.is_symlink())
+    }
     if actual != set(producer["files"]):
         raise ValueError("host package contains unrecorded or missing files")
 
@@ -409,8 +429,8 @@ def load_cohort(path: Path, *, expected_sha256: str | None = None) -> BuildCohor
                     raise ValueError("patched uv executable differs")
             else:
                 verify_host_files(proof_path, producer, name, tool_path)
-        elif name == "uv":
-            raise ValueError("patched uv requires its production receipt")
+        elif name in {"uv", "meson", "python", "cython", "f2py", "pybind11-config"}:
+            raise ValueError("host tool requires its production receipt: " + name)
         tools[name] = Tool(tool_path, item["sha256"], proof_path, proof_hash)
     target_tools = {}
     if set(value["target_tools"]) != {"cc", "cxx", "ar", "ranlib", "strip"}:

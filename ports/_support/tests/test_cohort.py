@@ -85,6 +85,11 @@ def test_package_tool_rejects_changed_imported_code(tmp_path):
     shutil.copytree(original, copied)
     producer["root"] = str(copied)
     executable = copied / producer["executable"]
+    if producer["schema_version"] == 2:
+        executable.write_text(executable.read_text().replace(str(original), str(copied)))
+        from ports._support.cohort import file_hash
+
+        producer["files"][producer["executable"]] = file_hash(executable)
     verify_host_files(receipt_path, producer, "meson", executable)
     source = copied / "mesonbuild/mesonmain.py"
     source.write_bytes(source.read_bytes() + b"\nraise RuntimeError('changed tool code')\n")

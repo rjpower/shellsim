@@ -1,0 +1,46 @@
+{
+  "meson": {
+    "name": "meson",
+    "version": "1.8.3",
+    "source": {
+      "url": "https://files.pythonhosted.org/packages/76/65/21b3bc86aac7b8f2862db1e808f1ea22b028e30a225a34a5ede9bf8678f2/numpy-2.3.5.tar.gz",
+      "filename": "numpy-2.3.5.tar.gz",
+      "sha256": "784db1dcdab56bf0517743e746dfb0f885fc68d948aba86eeec2cba234bdf1c0",
+      "subdirectory": "numpy-2.3.5/vendored-meson/meson"
+    },
+    "patch": {
+      "file": "meson-wasi-archive-groups.patch",
+      "sha256": "84a9d8c24b3c022007628e6b1a1b8cbfa0d4ad256796b18c92539c329d6aeb84",
+      "inputs": {
+        "mesonbuild/compilers/mixins/clike.py": "bad399a400bba40f0d95240b683aa4426fb0d66fbbae3b7b84cf1791d6260dab"
+      },
+      "outputs": {
+        "mesonbuild/compilers/mixins/clike.py": "2b75c602d6b76a8979034dc0a2f796a1cf494029c5442923e738fb916003154a"
+      }
+    },
+    "kind": "numpy-vendored-meson"
+  },
+  "python": {
+    "version": "3.13.15",
+    "packages": {
+      "Cython": {
+        "version": "3.2.4",
+        "url": "https://files.pythonhosted.org/packages/7a/d2/16fa02f129ed2b627e88d9d9ebd5ade3eeb66392ae5ba85b259d2d52b047/cython-3.2.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "filename": "cython-3.2.4-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "f81eda419b5ada7b197bbc3c5f4494090e3884521ffd75a3876c93fbf66c9ca8"
+      },
+      "numpy": {
+        "version": "2.3.5",
+        "url": "https://files.pythonhosted.org/packages/f5/10/ca162f45a102738958dcec8023062dad0cbc17d1ab99d68c4e4a6c45fb2b/numpy-2.3.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "filename": "numpy-2.3.5-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
+        "sha256": "11e06aa0af8c0f05104d56450d6093ee639e15f24ecf62d417329d06e522e017"
+      },
+      "pybind11": {
+        "version": "3.0.4",
+        "url": "https://files.pythonhosted.org/packages/b3/06/c3a23c9a0263b136c519f033a58d4641e73065fefc7754e9667ec206d992/pybind11-3.0.4-py3-none-any.whl",
+        "filename": "pybind11-3.0.4-py3-none-any.whl",
+        "sha256": "961720ee652da51d531b7b2451a6bd2bc042b0106e6d9baa48ecb7d58034ce63"
+      }
+    }
+  }
+}
