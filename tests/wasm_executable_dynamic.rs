@@ -11,13 +11,13 @@ fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
             (if (i32.ne (call $tls_read) (i32.const 7)) (then unreachable))
             (call $tls_write (i32.const 9))
             (if (i32.ne (call $answer) (i32.const 42)) (then unreachable))
-            (i32.atomic.store (i32.const 20) (i32.const 1))"#
+            (i32.atomic.store (i32.const 24) (i32.const 1))"#
     } else {
         ""
     };
     let worker_main = if worker {
         r#"(if (i32.lt_s (call $spawn (i32.const 0)) (i32.const 0)) (then unreachable))
-            (loop $wait (br_if $wait (i32.eqz (i32.atomic.load (i32.const 20)))))
+            (loop $wait (br_if $wait (i32.eqz (i32.atomic.load (i32.const 24)))))
             (if (i32.ne (call $main_tls_read) (i32.const 33)) (then unreachable))
             (if (i32.ne (call $tls_read) (i32.const 7)) (then unreachable))
             (if (i32.ne (i32.load (i32.add (global.get $shared) (i32.const 8)))
@@ -62,7 +62,11 @@ fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
                 (i32.store (i32.const 0) (i32.const 1))
                 (i32.store (i32.const 4) (i32.const 10))
                 (i32.store (i32.const 16) (i32.const 12345))
-                (i32.store (i32.const 1024) (i32.const 33)))))
+                (i32.store (i32.const 1024) (i32.const 33))
+                (call $data_relocs))))
+        (func $data_relocs (export "__wasm_apply_data_relocs")
+            (i32.store (i32.const 12) (global.get $shared))
+            (i32.store (i32.const 20) (global.get $answer_slot)))
         (func $global_relocs (export "__wasm_apply_global_relocs")
             (i32.store (i32.const 8) (global.get $shared)))
         (func $initialize (call $global_relocs) (call $init_memory))
@@ -77,6 +81,9 @@ fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
                 (i32.const 42)) (then unreachable))
             (if (i32.ne (i32.load (global.get $shared)) (i32.const 42)) (then unreachable))
             (if (i32.ne (i32.load (i32.const 8)) (global.get $shared)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 12)) (global.get $shared)) (then unreachable))
+            (if (i32.ne (call_indirect (result i32) (i32.load (i32.const 20)))
+                (i32.const 42)) (then unreachable))
             (if (i32.ne (call $main_tls_read) (i32.const 33)) (then unreachable))
             (call $main_ctors)
             {worker_main} {body}))"#)).unwrap()
@@ -114,6 +121,7 @@ fn side_module_with_type(needed: &str, answer: &str, constructor: &str, result: 
         (func (export "tls_write") (param i32) (i32.store (global.get $tls) (local.get 0)))
         (func (export "__wasm_call_ctors")
             (if (i32.eqz (i32.load (i32.const 8))) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 12)) (global.get $base)) (then unreachable))
             (i32.store (i32.add (global.get $base) (i32.const 4)) (call $callback))
             (i32.store (i32.add (global.get $base) (i32.const 8))
                 (i32.add (i32.load (i32.add (global.get $base) (i32.const 8))) (i32.const 1)))

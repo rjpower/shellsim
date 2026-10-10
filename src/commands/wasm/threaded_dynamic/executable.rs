@@ -183,6 +183,10 @@ fn bind_got(mut store: StoreContextMut<'_, Host>) -> Result<(), Error> {
 /// The main memory template precedes guest malloc. Its start and relocations
 /// follow dependency binding, and side constructors precede main `_start`.
 /// Workers never initialize shared data or rerun process constructors.
+/// The pinned LLD memory initializer guards shared data with an atomic once flag:
+/// calling it early for malloc and again through the original start is safe, as
+/// is the worker's original start. Main data relocations need a separate replay
+/// because the early initializer sees the initially unbound GOT cells.
 pub(in crate::commands::wasm) async fn startup(
     mut store: StoreContextMut<'_, Host>,
     module: &Module,
@@ -228,6 +232,13 @@ pub(in crate::commands::wasm) async fn startup(
                 .await?;
         }
         if let Some((initialization, records)) = pending {
+            if let Some(function) = main.get_func(store.as_context_mut(), "__wasm_apply_data_relocs") {
+                let _fiber = fibers::begin(store.as_context_mut())?;
+                function
+                    .typed::<(), ()>(&store)?
+                    .call_async(store.as_context_mut(), ())
+                    .await?;
+            }
             replay::relocate_data(store.as_context_mut()).await?;
             let installed = store.data().threaded_dynamic.libraries.len();
             for index in installed - records.len()..installed {

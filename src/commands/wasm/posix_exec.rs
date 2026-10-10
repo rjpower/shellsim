@@ -135,7 +135,8 @@ fn resolve(
         if size > MAX_WASM_BYTES {
             return Err(SyscallError::ExecutableFormat);
         }
-        let scratch = (size as u64).saturating_mul(65).saturating_add(4096);
+        // Main startup rewriting temporarily retains a second executable image.
+        let scratch = (size as u64).saturating_mul(66).saturating_add(4096);
         if !interp
             .resources
             .charge_cpu((size as u64).saturating_mul(10))

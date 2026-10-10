@@ -2593,7 +2593,8 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
     let thread_profile =
         threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
-    let scratch = (wasm.len() as u64).saturating_mul(65).saturating_add(4096);
+    // Include the rewritten executable image retained beside compilation scratch.
+    let scratch = (wasm.len() as u64).saturating_mul(66).saturating_add(4096);
     if !interp.resources.reserve_memory(scratch) {
         return Err((
             137,
