@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import os
+import zipfile
 
 import pytest
 import shellsim
@@ -12,7 +14,7 @@ from shellsim.native_packages import _digest, _NativePackageUniverse
 def catalog(tmp_path):
     records = []
 
-    def add(name, version="1", dependencies=(), pinned=(), payload=None, recipe_name=None):
+    def add(name, version="1", dependencies=(), pinned=(), payload=None, recipe_name=None, tool=True):
         prefix = tmp_path / (name + "-" + version)
         prefix.mkdir()
         data = payload or (name + version).encode()
@@ -22,7 +24,7 @@ def catalog(tmp_path):
             "version": version,
             "target": "wasm32-wasip1",
             "target_profile": "fixture-v1",
-            "exports": {"tools": ["tool"]},
+            "exports": {"tools" if tool else "headers": ["tool"]},
             "target_dependencies": list(pinned),
         }
         inputs = {
@@ -40,7 +42,7 @@ def catalog(tmp_path):
         record = {
             "name": name,
             "version": version,
-            "kind": "build-tool",
+            "kind": "build-tool" if tool else "devel",
             "artifact": prefix.name,
             "artifact_sha256": manifest["artifact_sha256"],
             "recipe_name": recipe["name"],
@@ -58,6 +60,123 @@ def catalog(tmp_path):
         return _NativePackageUniverse(path)
 
     return add, universe, tmp_path
+
+
+@pytest.fixture
+def wheel_runtime(tmp_path):
+    bundle = tmp_path / "bundle"
+    binary = bundle / "rootfs/usr/bin/python3.wasm"
+    binary.parent.mkdir(parents=True)
+    binary.write_bytes(b"\0asm\x01\0\0\0")
+    binary.chmod(0o755)
+    (bundle / "manifest.json").write_text(
+        json.dumps(
+            {
+                "recipe": {"version": "3.13.7", "target": "wasm32-wasip1", "prefix": "/usr"},
+                "site_packages": "/usr/lib/python3.13/site-packages",
+                "files": {"/usr/bin/python3.wasm": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            }
+        )
+    )
+    wheel = tmp_path / "example-1-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example.py", b"python-owned")
+        archive.writestr("example-1.dist-info/WHEEL", "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n")
+    return shellsim.CPythonRuntime(bundle), wheel
+
+
+@pytest.mark.parametrize("python_first", [False, True])
+@pytest.mark.parametrize("identical", [False, True])
+def test_python_and_native_files_share_atomic_conflict_policy(
+    catalog, wheel_runtime, python_first, identical, host_umask
+):
+    add, universe, _ = catalog
+    runtime, wheel = wheel_runtime
+    payload = b"python-owned" if identical else b"native-owned"
+    record = add("collision", payload=payload, tool=False)
+    destination = runtime.site_packages + "/example.py"
+    record["destinations"] = {"tool": destination}
+    other = add("new-file", tool=False)
+    other["destinations"] = {"tool": "/usr/local/share/new-file"}
+    env = shellsim.Environment()
+    runtime.mount(env)
+    native = universe()
+    if python_first:
+        runtime.install_wheel(env, wheel)
+
+        def install():
+            native.install(env, ["collision", "new-file"])
+
+        exception = shellsim.PackageInstallError
+        before = b"python-owned"
+    else:
+        native.install(env, "collision")
+
+        def install():
+            runtime.install_wheel(env, wheel)
+
+        exception = shellsim.PackageInstallError
+        before = payload
+    if identical:
+        install()
+        if python_first:
+            assert env.run("stat -c %a /usr/local/share").stdout == b"755\n"
+    else:
+        with pytest.raises(exception):
+            install()
+        assert env.run("test ! -e /usr/local/share/new-file").returncode == 0
+        if not python_first:
+            assert env.run("test ! -e /usr/lib/python3.13/site-packages/example-1.dist-info/WHEEL").returncode == 0
+    assert env.read_file(destination) == before
+
+
+@pytest.fixture(params=[0o022, 0o077])
+def host_umask(request):
+    previous = os.umask(request.param)
+    try:
+        yield
+    finally:
+        os.umask(previous)
+
+
+def test_native_tool_replaces_only_original_builtin(catalog):
+    add, universe, _ = catalog
+    record = add("guest-make", payload=b"#!/bin/sh\nprintf installed")
+    record["destinations"] = {"tool": "/usr/bin/make"}
+    env = shellsim.Environment()
+    universe().install(env, "guest-make")
+    assert env.run("/usr/bin/make").stdout == b"installed"
+    universe().install(env, "guest-make")
+    assert env.run("/usr/bin/make").stdout == b"installed"
+    env = shellsim.Environment()
+    env.write_file("/usr/bin/make", "owned command", mode=0o755)
+    with pytest.raises(shellsim.PackageInstallError):
+        universe().install(env, "guest-make")
+    assert env.read_file("/usr/bin/make") == b"owned command"
+
+
+def test_wheel_executable_mode_comes_from_metadata(wheel_runtime, host_umask):
+    runtime, wheel = wheel_runtime
+    with zipfile.ZipFile(wheel, "a") as archive:
+        member = zipfile.ZipInfo("executable.py")
+        member.external_attr = 0o100755 << 16
+        archive.writestr(member, "print(42)")
+    env = shellsim.Environment()
+    runtime.mount(env)
+    runtime.install_wheel(env, wheel)
+    assert env.run("test -x /usr/lib/python3.13/site-packages/executable.py").returncode == 0
+    assert env.run("test ! -x /usr/lib/python3.13/site-packages/example.py").returncode == 0
+
+
+def test_python_package_disk_failure_preserves_simulation_error(wheel_runtime):
+    runtime, wheel = wheel_runtime
+    with zipfile.ZipFile(wheel, "a") as archive:
+        archive.writestr("oversized.py", b"x" * 200_000)
+    env = shellsim.Environment(disk=100_000)
+    runtime.mount(env)
+    with pytest.raises(shellsim.SimulationError):
+        runtime.install_wheel(env, wheel)
+    assert env.run("test ! -e /usr/lib/python3.13/site-packages/example.py").returncode == 0
 
 
 def test_single_string_range_and_recipe_alias(catalog):
@@ -176,7 +295,7 @@ def test_conflicting_exports_rejected_before_mount(catalog):
     two = add("two")
     two["destinations"] = {"tool": "/usr/local/bin/one"}
     env = shellsim.Environment()
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, ["one", "two"])
     assert env.run("test ! -e /usr/local/bin/one").returncode == 0
 
@@ -236,7 +355,7 @@ def test_sequential_destination_conflict_rejected(catalog):
     two["destinations"] = {"tool": "/usr/local/bin/one"}
     env = shellsim.Environment()
     universe().install(env, "one")
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "two")
     assert env.read_file("/usr/local/bin/one") == b"one1"
 
@@ -257,7 +376,7 @@ def test_modified_installed_export_is_not_silently_skipped(catalog):
     env = shellsim.Environment()
     universe().install(env, "tool")
     env.write_file("/usr/local/bin/tool", b"modified")
-    with pytest.raises(ValueError):
+    with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "tool")
     assert env.read_file("/usr/local/bin/tool") == b"modified"
 

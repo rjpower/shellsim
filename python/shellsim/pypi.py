@@ -7,10 +7,9 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path, PurePosixPath
-from typing import Protocol
+from typing import Protocol, Sequence
 
 from . import _native
-from ._api import SimulationError
 
 _VERSION_CLAUSE = r"(?:==|!=|<=|>=|<|>|~=)\s*[A-Za-z0-9.*+!_-]+"
 _REQUIREMENT = re.compile(
@@ -26,10 +25,39 @@ class PackageInstallError(RuntimeError):
     """A requested distribution cannot be resolved or loaded by shellsim Python."""
 
 
-class _StagingEnvironment(Protocol):
-    def mount(self, host_root: Path, destination: str = _SITE_PACKAGES) -> object: ...
+class _PackageMounter(Protocol):
+    def mount_package_tree(
+        self, host_root: str, destination_root: str, replace_builtin_tools: Sequence[str]
+    ) -> None: ...
 
-    def read_file(self, path: str) -> bytes: ...
+
+class _StagingEnvironment(Protocol):
+    _native: _PackageMounter
+
+
+def _mount_package_tree(
+    environment: _StagingEnvironment,
+    target: Path,
+    destination: str,
+    *,
+    normalize_modes: bool = False,
+    replace_builtin_tools: Sequence[str] = (),
+) -> None:
+    """Apply one package transaction with deterministic Python payload permissions.
+
+    Native catalog exports retain their explicit modes. Python data is readable and
+    executable entry points remain executable, regardless of the host umask.
+    """
+    if normalize_modes:
+        for path in target.rglob("*"):
+            if path.is_symlink():
+                raise PackageInstallError("staged package set contains links")
+            mode = 0o755 if path.is_dir() or path.stat().st_mode & 0o111 else 0o644
+            path.chmod(mode)
+    try:
+        environment._native.mount_package_tree(str(target), destination, list(replace_builtin_tools))
+    except _native.PackageConflictError as error:
+        raise PackageInstallError(str(error)) from error
 
 
 def install_pypi(environment: _StagingEnvironment, requirement: str) -> None:
@@ -77,21 +105,7 @@ def install_pypi(environment: _StagingEnvironment, requirement: str) -> None:
             raise PackageInstallError("shellsim Python cannot stage incompatible distributions: " + "; ".join(blockers))
         _check_import_collisions(target)
 
-        for path in target.rglob("*"):
-            if not path.is_file():
-                continue
-            destination = f"{_SITE_PACKAGES}/{path.relative_to(target).as_posix()}"
-            try:
-                existing = environment.read_file(destination)
-            except SimulationError as error:
-                if "No such file" not in str(error):
-                    raise
-            else:
-                if existing != path.read_bytes():
-                    raise PackageInstallError(f"package file would overwrite an existing VFS file: {destination}")
-
-        # NativeEnvironment.mount validates the whole host tree and applies it atomically.
-        environment.mount(target, _SITE_PACKAGES)
+        _mount_package_tree(environment, target, _SITE_PACKAGES, normalize_modes=True)
 
 
 def _check_import_collisions(target: Path) -> None:

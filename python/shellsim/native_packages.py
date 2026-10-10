@@ -20,6 +20,7 @@ from packaging.utils import canonicalize_name
 from packaging.version import Version
 
 from ._api import Environment, _NativeInstallation
+from .pypi import PackageInstallError, _mount_package_tree
 
 _MAX_JSON = 1024 * 1024
 _MAX_PACKAGES = 256
@@ -507,11 +508,12 @@ class _NativePackageUniverse:
             name in installed.artifacts and installed.artifacts[name] != identity
             for name, identity in identities.items()
         ):
-            raise ValueError("native package conflicts with an immutable installed artifact")
+            raise PackageInstallError("native package conflicts with an immutable installed artifact")
         if len(installed.artifacts.keys() | identities.keys()) > _MAX_NAMES:
             raise ValueError("cumulative native installation exceeds its package bound")
         files: dict[PurePosixPath, tuple[Path, str, int]] = {}
         directories: dict[str, int] = {}
+        tools: list[str] = []
         total = 0
         for name in sorted(selected):
             package = selected[name]
@@ -522,9 +524,11 @@ class _NativePackageUniverse:
                 payload = prefix / source
                 digest = manifest["files"][source]
                 mode = 0o755 if source in manifest["inputs"]["recipe"]["exports"].get("tools", ()) else 0o644
+                if mode == 0o755:
+                    tools.append(str(destination))
                 if destination in files:
                     if files[destination][1:] != (digest, mode):
-                        raise ValueError("native packages have conflicting destination identities")
+                        raise PackageInstallError("native packages have conflicting destination identities")
                     continue
                 total += payload.stat().st_size
                 if total > _MAX_BYTES or len(files) >= _MAX_FILES:
@@ -536,14 +540,14 @@ class _NativePackageUniverse:
             raise ValueError("cumulative native directory installation exceeds its bound")
         for destination, (payload, identity, mode) in files.items():
             if str(destination) in cumulative and cumulative[str(destination)][:2] != (identity, mode):
-                raise ValueError("native export conflicts with an immutable installed destination")
+                raise PackageInstallError("native export conflicts with an immutable installed destination")
             cumulative[str(destination)] = (identity, mode, payload.stat().st_size)
         if len(cumulative) > _MAX_FILES or sum(item[2] for item in cumulative.values()) > _MAX_BYTES:
             raise ValueError("cumulative native installation exceeds its export bound")
         for directory in cumulative_directories:
             path = PurePosixPath(directory)
             if any(str(item) in cumulative for item in (path, *path.parents)):
-                raise ValueError("native directory conflicts with an installed file")
+                raise PackageInstallError("native directory conflicts with an installed file")
         with tempfile.TemporaryDirectory(prefix="shellsim-native-packages-") as temporary:
             staging = Path(temporary)
             for destination, mode in sorted(directories.items()):
@@ -553,15 +557,18 @@ class _NativePackageUniverse:
             for destination, (source, digest, mode) in sorted(files.items()):
                 if str(destination) in installed.files:
                     if hashlib.sha256(environment.read_file(str(destination))).hexdigest() != digest:
-                        raise ValueError("installed native export bytes changed")
-                    continue
+                        raise PackageInstallError("installed native export bytes changed")
                 target = staging / destination.relative_to("/")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(source, target)
                 target.chmod(mode)
                 if hashlib.sha256(target.read_bytes()).hexdigest() != digest:
                     raise ValueError("native export changed while staging")
-            environment._native.mount_package_tree(str(staging))
+            for directory in staging.rglob("*"):
+                if directory.is_dir():
+                    destination = "/" + directory.relative_to(staging).as_posix()
+                    directory.chmod(directories.get(destination, 0o755))
+            _mount_package_tree(environment, staging, "/", replace_builtin_tools=tools)
         environment._native_installation = _NativeInstallation(
             installed.artifacts | identities, cumulative, cumulative_directories
         )

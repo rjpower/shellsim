@@ -34,6 +34,12 @@ create_exception!(
     PyException,
     "An adapter or simulator operation could not be completed."
 );
+create_exception!(
+    shellsim._native,
+    PackageConflictError,
+    SimulationError,
+    "A package destination conflicts with existing virtual content."
+);
 
 #[derive(Serialize)]
 struct RunMetadata {
@@ -692,20 +698,36 @@ impl NativeEnvironment {
     }
 
     /// Import a verified package staging tree exactly, including its `.venv` directory.
-    fn mount_package_tree(&self, py: Python<'_>, host_root: String) -> PyResult<()> {
+    #[pyo3(signature = (host_root, destination_root="/".to_string(), replace_builtin_tools=Vec::new()))]
+    fn mount_package_tree(
+        &self,
+        py: Python<'_>,
+        host_root: String,
+        destination_root: String,
+        replace_builtin_tools: Vec<String>,
+    ) -> PyResult<()> {
         py.detach(|| {
             let mut environment = self.lock_environment()?;
             on_worker(&mut environment, move |environment| {
                 environment.sync_vfs_time();
-                shellsim::host_ingest::mount_host_tree_report_exact(
+                Ok(shellsim::host_ingest::mount_package_tree(
                     environment,
                     Path::new(&host_root),
-                    "/",
+                    &destination_root,
+                    &replace_builtin_tools,
                 )
-                .map(|_| ())
+                .map(|_| ()))
             })
         })
-        .map_err(SimulationError::new_err)
+        .map_err(SimulationError::new_err)?
+        .map_err(|error| match error {
+            shellsim::host_ingest::PackageImportError::Conflict(message) => {
+                PackageConflictError::new_err(message)
+            }
+            shellsim::host_ingest::PackageImportError::Other(message) => {
+                SimulationError::new_err(message)
+            }
+        })
     }
 
     #[getter]
@@ -865,5 +887,9 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
+    module.add(
+        "PackageConflictError",
+        module.py().get_type::<PackageConflictError>(),
+    )?;
     Ok(())
 }

@@ -21,6 +21,28 @@ pub const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
     "__pycache__",
 ];
 
+/// Package conflicts are distinct from I/O and resource failures so callers can preserve
+/// their existing resource exception contract.
+#[derive(Debug)]
+pub enum PackageImportError {
+    Conflict(String),
+    Other(String),
+}
+
+impl From<String> for PackageImportError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+impl std::fmt::Display for PackageImportError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(message) | Self::Other(message) => formatter.write_str(message),
+        }
+    }
+}
+
 /// Observable result of importing one trusted host directory.
 ///
 /// `skipped_directories` contains the names from [`DEFAULT_SKIPPED_DIRECTORIES`] that were
@@ -66,17 +88,31 @@ pub fn mount_host_tree_report(
     host_root: &Path,
     destination_root: &str,
 ) -> Result<MountReport, String> {
-    mount_host_tree_report_with_policy(environment, host_root, destination_root, true)
+    mount_host_tree_report_with_policy(environment, host_root, destination_root, true, None)
+        .map_err(|error| error.to_string())
 }
 
-/// Import a verified package staging tree without omitting `.venv` or other project directories.
-/// This is for trusted package installers that require every staged file to reach the VFS.
-pub fn mount_host_tree_report_exact(
+/// Atomically import package files, rejecting conflicting content and links.
+/// Declared tool destinations may replace only their original base-image native commands.
+pub fn mount_package_tree(
     environment: &mut Environment,
     host_root: &Path,
     destination_root: &str,
-) -> Result<MountReport, String> {
-    mount_host_tree_report_with_policy(environment, host_root, destination_root, false)
+    replace_builtin_tools: &[String],
+) -> Result<MountReport, PackageImportError> {
+    if replace_builtin_tools.len() > MAX_HOST_FILES {
+        return Err(PackageImportError::Other(
+            "package tool replacement list exceeds its bound".into(),
+        ));
+    }
+    let tools = replace_builtin_tools.iter().cloned().collect();
+    mount_host_tree_report_with_policy(
+        environment,
+        host_root,
+        destination_root,
+        false,
+        Some(&tools),
+    )
 }
 
 fn mount_host_tree_report_with_policy(
@@ -84,26 +120,34 @@ fn mount_host_tree_report_with_policy(
     host_root: &Path,
     destination_root: &str,
     skip_project_directories: bool,
-) -> Result<MountReport, String> {
+    package_tools: Option<&BTreeSet<String>>,
+) -> Result<MountReport, PackageImportError> {
     let host_root = host_root
         .canonicalize()
         .map_err(|error| format!("cannot resolve host root {}: {error}", host_root.display()))?;
     if !host_root.is_dir() {
-        return Err(format!(
-            "host root is not a directory: {}",
-            host_root.display()
-        ));
+        return Err(format!("host root is not a directory: {}", host_root.display()).into());
     }
     if !destination_root.starts_with('/') || destination_root.contains('\0') {
-        return Err("VFS destination root must be an absolute safe path".to_string());
+        return Err("VFS destination root must be an absolute safe path"
+            .to_string()
+            .into());
     }
     let destination_root = crate::vfs::normalize(destination_root);
     let import_git = has_git_metadata(&host_root)?;
     if import_git && !skip_project_directories {
-        return Err("verified package staging tree contains Git metadata".to_string());
+        return Err("verified package staging tree contains Git metadata"
+            .to_string()
+            .into());
     }
     let before = environment.vfs.clone();
     let result = (|| {
+        if package_tools.is_some() {
+            environment
+                .vfs
+                .package_destination_matches(&destination_root, None, 0o755, false)
+                .map_err(|error| PackageImportError::Conflict(error.to_string()))?;
+        }
         if !environment.vfs.exists("/", &destination_root) {
             environment
                 .vfs
@@ -115,9 +159,12 @@ fn mount_host_tree_report_with_policy(
             &host_root,
             &destination_root,
             skip_project_directories,
+            package_tools,
         )?;
         if !skip_project_directories && !report.skipped_directories.is_empty() {
-            return Err("verified package staging tree contains Git metadata".to_string());
+            return Err("verified package staging tree contains Git metadata"
+                .to_string()
+                .into());
         }
         if import_git {
             let history = crate::commands::git::import::import_head_history(
@@ -170,7 +217,8 @@ fn mount_inner(
     host_root: &Path,
     destination_root: &str,
     skip_project_directories: bool,
-) -> Result<MountReport, String> {
+    package_tools: Option<&BTreeSet<String>>,
+) -> Result<MountReport, PackageImportError> {
     let mut pending = vec![(host_root.to_path_buf(), PathBuf::new())];
     let mut files = 0usize;
     let mut skipped_directories = BTreeSet::new();
@@ -178,15 +226,30 @@ fn mount_inner(
         let metadata = fs::symlink_metadata(&host)
             .map_err(|error| format!("cannot inspect {}: {error}", host.display()))?;
         if metadata.file_type().is_symlink() {
-            return Err(format!("refusing host symlink {}", host.display()));
+            return Err(format!("refusing host symlink {}", host.display()).into());
         }
         let destination = destination_path(destination_root, &relative)?;
         if metadata.is_dir() {
             if destination != destination_root {
-                environment
-                    .vfs
-                    .put_dir(&destination, permission_mode(&metadata, true))
-                    .map_err(|error| format!("cannot create {destination}: {error}"))?;
+                let matches = if package_tools.is_some() {
+                    environment
+                        .vfs
+                        .package_destination_matches(
+                            &destination,
+                            None,
+                            permission_mode(&metadata, true),
+                            false,
+                        )
+                        .map_err(|error| PackageImportError::Conflict(error.to_string()))?
+                } else {
+                    false
+                };
+                if !matches {
+                    environment
+                        .vfs
+                        .put_dir(&destination, permission_mode(&metadata, true))
+                        .map_err(|error| format!("cannot create {destination}: {error}"))?;
+                }
             }
             let mut entries = fs::read_dir(&host)
                 .map_err(|error| format!("cannot read directory {}: {error}", host.display()))?
@@ -214,24 +277,39 @@ fn mount_inner(
                 .checked_add(1)
                 .ok_or_else(|| "host file count overflow".to_string())?;
             if files > MAX_HOST_FILES {
-                return Err(format!(
-                    "project exceeds the {MAX_HOST_FILES}-file ingestion limit"
-                ));
+                return Err(
+                    format!("project exceeds the {MAX_HOST_FILES}-file ingestion limit").into(),
+                );
             }
             if metadata.len() > environment.resources.limits().disk {
                 return Err(format!(
                     "host file is larger than the configured VFS: {}",
                     host.display()
-                ));
+                )
+                .into());
             }
             let contents = fs::read(&host)
                 .map_err(|error| format!("cannot read {}: {error}", host.display()))?;
+            if let Some(tools) = package_tools {
+                if environment
+                    .vfs
+                    .package_destination_matches(
+                        &destination,
+                        Some(&contents),
+                        permission_mode(&metadata, false),
+                        tools.contains(&destination),
+                    )
+                    .map_err(|error| PackageImportError::Conflict(error.to_string()))?
+                {
+                    continue;
+                }
+            }
             environment
                 .vfs
                 .put_file(&destination, contents, permission_mode(&metadata, false))
                 .map_err(|error| format!("cannot import {}: {error}", host.display()))?;
         } else {
-            return Err(format!("unsupported host file type: {}", host.display()));
+            return Err(format!("unsupported host file type: {}", host.display()).into());
         }
     }
     Ok(MountReport {
