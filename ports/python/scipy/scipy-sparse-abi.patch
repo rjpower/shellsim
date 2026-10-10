@@ -1,0 +1,340 @@
+--- a/scipy/sparse/linalg/_eigen/arpack/arnaud/src/blaslapack_declarations.h
++++ b/scipy/sparse/linalg/_eigen/arpack/arnaud/src/blaslapack_declarations.h
+@@ -27,2 +27,2 @@
+-void ARNAUD_BLAS(saxpy)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(scopy)(ARNAUD_INT* n, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(saxpy)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(scopy)(ARNAUD_INT* n, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
+@@ -30,2 +30,2 @@
+-void ARNAUD_BLAS(sgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* a, ARNAUD_INT* lda, float* x, ARNAUD_INT* incx, float* beta, float* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(sger)(ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy, float* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(sgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* a, ARNAUD_INT* lda, float* x, ARNAUD_INT* incx, float* beta, float* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(sger)(ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy, float* a, ARNAUD_INT* lda);
+@@ -33,4 +33,4 @@
+-void ARNAUD_BLAS(srot)(ARNAUD_INT* n, float* sx, ARNAUD_INT* incx, float* sy, ARNAUD_INT* incy, float* c, float* s);
+-void ARNAUD_BLAS(sscal)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(sswap)(ARNAUD_INT* n, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(strmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* a, ARNAUD_INT* lda, float* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(srot)(ARNAUD_INT* n, float* sx, ARNAUD_INT* incx, float* sy, ARNAUD_INT* incy, float* c, float* s);
++int ARNAUD_BLAS(sscal)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx);
++int ARNAUD_BLAS(sswap)(ARNAUD_INT* n, float* x, ARNAUD_INT* incx, float* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(strmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* a, ARNAUD_INT* lda, float* b, ARNAUD_INT* ldb);
+@@ -40,2 +40,2 @@
+-void ARNAUD_BLAS(daxpy)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(dcopy)(ARNAUD_INT* n, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(daxpy)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(dcopy)(ARNAUD_INT* n, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
+@@ -43,2 +43,2 @@
+-void ARNAUD_BLAS(dgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* a, ARNAUD_INT* lda, double* x, ARNAUD_INT* incx, double* beta, double* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(dger)(ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy, double* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(dgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* a, ARNAUD_INT* lda, double* x, ARNAUD_INT* incx, double* beta, double* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(dger)(ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy, double* a, ARNAUD_INT* lda);
+@@ -46,4 +46,4 @@
+-void ARNAUD_BLAS(drot)(ARNAUD_INT* n, double* sx, ARNAUD_INT* incx, double* sy, ARNAUD_INT* incy, double* c, double* s);
+-void ARNAUD_BLAS(dscal)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(dswap)(ARNAUD_INT* n, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(dtrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* a, ARNAUD_INT* lda, double* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(drot)(ARNAUD_INT* n, double* sx, ARNAUD_INT* incx, double* sy, ARNAUD_INT* incy, double* c, double* s);
++int ARNAUD_BLAS(dscal)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx);
++int ARNAUD_BLAS(dswap)(ARNAUD_INT* n, double* x, ARNAUD_INT* incx, double* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(dtrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* a, ARNAUD_INT* lda, double* b, ARNAUD_INT* ldb);
+@@ -53,3 +53,3 @@
+-void ARNAUD_BLAS(caxpy)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(ccopy)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(cgeru)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(caxpy)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(ccopy)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(cgeru)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda);
+@@ -57,5 +57,5 @@
+-void ARNAUD_BLAS(cscal)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(csscal)(ARNAUD_INT* n, float* da, ARNAUD_CPLXF_TYPE* zx, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(cgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* beta, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(crot)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* cx, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* cy, ARNAUD_INT* incy, float* c, ARNAUD_CPLXF_TYPE* s);
+-void ARNAUD_BLAS(ctrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(cscal)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx);
++int ARNAUD_BLAS(csscal)(ARNAUD_INT* n, float* da, ARNAUD_CPLXF_TYPE* zx, ARNAUD_INT* incx);
++int ARNAUD_BLAS(cgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* beta, ARNAUD_CPLXF_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(crot)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* cx, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* cy, ARNAUD_INT* incy, float* c, ARNAUD_CPLXF_TYPE* s);
++int ARNAUD_BLAS(ctrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* b, ARNAUD_INT* ldb);
+@@ -65,3 +65,3 @@
+-void ARNAUD_BLAS(zaxpy)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(zcopy)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(zgeru)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(zaxpy)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(zcopy)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(zgeru)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda);
+@@ -69,5 +69,5 @@
+-void ARNAUD_BLAS(zscal)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(zdscal)(ARNAUD_INT* n, double* da, ARNAUD_CPLX_TYPE* zx, ARNAUD_INT* incx);
+-void ARNAUD_BLAS(zgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* beta, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
+-void ARNAUD_BLAS(zrot)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* cx, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* cy, ARNAUD_INT* incy, double* c, ARNAUD_CPLX_TYPE* s);
+-void ARNAUD_BLAS(ztrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(zscal)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx);
++int ARNAUD_BLAS(zdscal)(ARNAUD_INT* n, double* da, ARNAUD_CPLX_TYPE* zx, ARNAUD_INT* incx);
++int ARNAUD_BLAS(zgemv)(char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* beta, ARNAUD_CPLX_TYPE* y, ARNAUD_INT* incy);
++int ARNAUD_BLAS(zrot)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* cx, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* cy, ARNAUD_INT* incy, double* c, ARNAUD_CPLX_TYPE* s);
++int ARNAUD_BLAS(ztrmm)(char* side, char* uplo, char* transa, char* diag, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* b, ARNAUD_INT* ldb);
+@@ -78,4 +78,4 @@
+-void ARNAUD_BLAS(sgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, float* tau, float* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(slacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, float* b, ARNAUD_INT* ldb);
+-void ARNAUD_BLAS(slaev2)(float* a, float* b, float* c, float* rt1, float* rt2, float* cs1, float* sn1);
+-void ARNAUD_BLAS(slahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, float* h, ARNAUD_INT* ldh, float* wr, float* wi, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, float* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
++int ARNAUD_BLAS(sgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, float* tau, float* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(slacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, float* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(slaev2)(float* a, float* b, float* c, float* rt1, float* rt2, float* cs1, float* sn1);
++int ARNAUD_BLAS(slahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, float* h, ARNAUD_INT* ldh, float* wr, float* wi, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, float* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
+@@ -84,11 +84,11 @@
+-void ARNAUD_BLAS(slarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, float* v, ARNAUD_INT* incv, float* tau, float* c, ARNAUD_INT* ldc, float* work);
+-void ARNAUD_BLAS(slarfg)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* tau);
+-void ARNAUD_BLAS(slartg)(float* f, float* g, float* c, float* s, float* r);
+-void ARNAUD_BLAS(slartgp)(float* f, float* g, float* c, float* s, float* r);
+-void ARNAUD_BLAS(slascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, float* cfrom, float* cto, ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, ARNAUD_INT* info);
+-void ARNAUD_BLAS(slaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* beta, float* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(slasr)(char* side, char* pivot, char* direct, ARNAUD_INT* m, ARNAUD_INT* n, float* c, float* s, float* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(sorm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, float* a, ARNAUD_INT* lda, float* tau, float* c, ARNAUD_INT* ldc, float* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(ssteqr)(char* compz, ARNAUD_INT* n, float* d, float* e, float* z, ARNAUD_INT* ldz, float* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(strevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, float* t, ARNAUD_INT* ldt, float* vl, ARNAUD_INT* ldvl, float* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, float* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(strsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, float* t, ARNAUD_INT* ldt, float* q, ARNAUD_INT* ldq, float* wr, float* wi, ARNAUD_INT* m, float* s, float* sep, float* work, ARNAUD_INT* lwork, ARNAUD_INT* iwork, ARNAUD_INT* liwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(slarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, float* v, ARNAUD_INT* incv, float* tau, float* c, ARNAUD_INT* ldc, float* work);
++int ARNAUD_BLAS(slarfg)(ARNAUD_INT* n, float* alpha, float* x, ARNAUD_INT* incx, float* tau);
++int ARNAUD_BLAS(slartg)(float* f, float* g, float* c, float* s, float* r);
++int ARNAUD_BLAS(slartgp)(float* f, float* g, float* c, float* s, float* r);
++int ARNAUD_BLAS(slascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, float* cfrom, float* cto, ARNAUD_INT* m, ARNAUD_INT* n, float* a, ARNAUD_INT* lda, ARNAUD_INT* info);
++int ARNAUD_BLAS(slaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, float* alpha, float* beta, float* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(slasr)(char* side, char* pivot, char* direct, ARNAUD_INT* m, ARNAUD_INT* n, float* c, float* s, float* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(sorm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, float* a, ARNAUD_INT* lda, float* tau, float* c, ARNAUD_INT* ldc, float* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(ssteqr)(char* compz, ARNAUD_INT* n, float* d, float* e, float* z, ARNAUD_INT* ldz, float* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(strevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, float* t, ARNAUD_INT* ldt, float* vl, ARNAUD_INT* ldvl, float* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, float* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(strsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, float* t, ARNAUD_INT* ldt, float* q, ARNAUD_INT* ldq, float* wr, float* wi, ARNAUD_INT* m, float* s, float* sep, float* work, ARNAUD_INT* lwork, ARNAUD_INT* iwork, ARNAUD_INT* liwork, ARNAUD_INT* info);
+@@ -98,4 +98,4 @@
+-void ARNAUD_BLAS(dgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, double* tau, double* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(dlacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, double* b, ARNAUD_INT* ldb);
+-void ARNAUD_BLAS(dlaev2)(double* a, double* b, double* c, double* rt1, double* rt2, double* cs1, double* sn1);
+-void ARNAUD_BLAS(dlahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, double* h, ARNAUD_INT* ldh, double* wr, double* wi, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, double* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
++int ARNAUD_BLAS(dgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, double* tau, double* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(dlacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, double* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(dlaev2)(double* a, double* b, double* c, double* rt1, double* rt2, double* cs1, double* sn1);
++int ARNAUD_BLAS(dlahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, double* h, ARNAUD_INT* ldh, double* wr, double* wi, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, double* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
+@@ -104,11 +104,11 @@
+-void ARNAUD_BLAS(dlarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, double* v, ARNAUD_INT* incv, double* tau, double* c, ARNAUD_INT* ldc, double* work);
+-void ARNAUD_BLAS(dlarfg)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* tau);
+-void ARNAUD_BLAS(dlartg)(double* f, double* g, double* c, double* s, double* r);
+-void ARNAUD_BLAS(dlartgp)(double* f, double* g, double* c, double* s, double* r);
+-void ARNAUD_BLAS(dlascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, double* cfrom, double* cto, ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, ARNAUD_INT* info);
+-void ARNAUD_BLAS(dlaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* beta, double* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(dlasr)(char* side, char* pivot, char* direct, ARNAUD_INT* m, ARNAUD_INT* n, double* c, double* s, double* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(dorm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, double* a, ARNAUD_INT* lda, double* tau, double* c, ARNAUD_INT* ldc, double* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(dsteqr)(char* compz, ARNAUD_INT* n, double* d, double* e, double* z, ARNAUD_INT* ldz, double* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(dtrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, double* t, ARNAUD_INT* ldt, double* vl, ARNAUD_INT* ldvl, double* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, double* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(dtrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, double* t, ARNAUD_INT* ldt, double* q, ARNAUD_INT* ldq, double* wr, double* wi, ARNAUD_INT* m, double* s, double* sep, double* work, ARNAUD_INT* lwork, ARNAUD_INT* iwork, ARNAUD_INT* liwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(dlarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, double* v, ARNAUD_INT* incv, double* tau, double* c, ARNAUD_INT* ldc, double* work);
++int ARNAUD_BLAS(dlarfg)(ARNAUD_INT* n, double* alpha, double* x, ARNAUD_INT* incx, double* tau);
++int ARNAUD_BLAS(dlartg)(double* f, double* g, double* c, double* s, double* r);
++int ARNAUD_BLAS(dlartgp)(double* f, double* g, double* c, double* s, double* r);
++int ARNAUD_BLAS(dlascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, double* cfrom, double* cto, ARNAUD_INT* m, ARNAUD_INT* n, double* a, ARNAUD_INT* lda, ARNAUD_INT* info);
++int ARNAUD_BLAS(dlaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, double* alpha, double* beta, double* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(dlasr)(char* side, char* pivot, char* direct, ARNAUD_INT* m, ARNAUD_INT* n, double* c, double* s, double* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(dorm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, double* a, ARNAUD_INT* lda, double* tau, double* c, ARNAUD_INT* ldc, double* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(dsteqr)(char* compz, ARNAUD_INT* n, double* d, double* e, double* z, ARNAUD_INT* ldz, double* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(dtrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, double* t, ARNAUD_INT* ldt, double* vl, ARNAUD_INT* ldvl, double* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, double* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(dtrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, double* t, ARNAUD_INT* ldt, double* q, ARNAUD_INT* ldq, double* wr, double* wi, ARNAUD_INT* m, double* s, double* sep, double* work, ARNAUD_INT* lwork, ARNAUD_INT* iwork, ARNAUD_INT* liwork, ARNAUD_INT* info);
+@@ -118,3 +118,3 @@
+-void ARNAUD_BLAS(cgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(clacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* b, ARNAUD_INT* ldb);
+-void ARNAUD_BLAS(clahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, ARNAUD_CPLXF_TYPE* h, ARNAUD_INT* ldh, ARNAUD_CPLXF_TYPE* w, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, ARNAUD_CPLXF_TYPE* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
++int ARNAUD_BLAS(cgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(clacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(clahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, ARNAUD_CPLXF_TYPE* h, ARNAUD_INT* ldh, ARNAUD_CPLXF_TYPE* w, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, ARNAUD_CPLXF_TYPE* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
+@@ -122,8 +122,8 @@
+-void ARNAUD_BLAS(clarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* v, ARNAUD_INT* incv, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLXF_TYPE* work);
+-void ARNAUD_BLAS(clarfg)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* tau);
+-void ARNAUD_BLAS(clartg)(ARNAUD_CPLXF_TYPE* f, ARNAUD_CPLXF_TYPE* g, float* c, ARNAUD_CPLXF_TYPE* s, ARNAUD_CPLXF_TYPE* r);
+-void ARNAUD_BLAS(clascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, float* cfrom, float* cto, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_INT* info);
+-void ARNAUD_BLAS(claset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* beta, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(ctrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLXF_TYPE* vl, ARNAUD_INT* ldvl, ARNAUD_CPLXF_TYPE* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, ARNAUD_CPLXF_TYPE* work, float* rwork, ARNAUD_INT* info);
+-void ARNAUD_BLAS(ctrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLXF_TYPE* q, ARNAUD_INT* ldq, ARNAUD_CPLXF_TYPE* w, ARNAUD_INT* m, float* s, float* sep, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* lwork, ARNAUD_INT* info);
+-void ARNAUD_BLAS(cunm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(clarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* v, ARNAUD_INT* incv, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLXF_TYPE* work);
++int ARNAUD_BLAS(clarfg)(ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLXF_TYPE* tau);
++int ARNAUD_BLAS(clartg)(ARNAUD_CPLXF_TYPE* f, ARNAUD_CPLXF_TYPE* g, float* c, ARNAUD_CPLXF_TYPE* s, ARNAUD_CPLXF_TYPE* r);
++int ARNAUD_BLAS(clascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, float* cfrom, float* cto, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_INT* info);
++int ARNAUD_BLAS(claset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* alpha, ARNAUD_CPLXF_TYPE* beta, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(ctrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLXF_TYPE* vl, ARNAUD_INT* ldvl, ARNAUD_CPLXF_TYPE* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, ARNAUD_CPLXF_TYPE* work, float* rwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(ctrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLXF_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLXF_TYPE* q, ARNAUD_INT* ldq, ARNAUD_CPLXF_TYPE* w, ARNAUD_INT* m, float* s, float* sep, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* lwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(cunm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, ARNAUD_CPLXF_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLXF_TYPE* tau, ARNAUD_CPLXF_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLXF_TYPE* work, ARNAUD_INT* info);
+@@ -133,3 +133,3 @@
+-void ARNAUD_BLAS(zgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* info);
+-void ARNAUD_BLAS(zlacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* b, ARNAUD_INT* ldb);
+-void ARNAUD_BLAS(zlahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, ARNAUD_CPLX_TYPE* h, ARNAUD_INT* ldh, ARNAUD_CPLX_TYPE* w, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, ARNAUD_CPLX_TYPE* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
++int ARNAUD_BLAS(zgeqr2)(ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(zlacpy)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* b, ARNAUD_INT* ldb);
++int ARNAUD_BLAS(zlahqr)(ARNAUD_INT* wantt, ARNAUD_INT* wantz, ARNAUD_INT* n, ARNAUD_INT* ilo, ARNAUD_INT* ihi, ARNAUD_CPLX_TYPE* h, ARNAUD_INT* ldh, ARNAUD_CPLX_TYPE* w, ARNAUD_INT* iloz, ARNAUD_INT* ihiz, ARNAUD_CPLX_TYPE* z, ARNAUD_INT* ldz, ARNAUD_INT* info);
+@@ -137,8 +137,8 @@
+-void ARNAUD_BLAS(zlarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* v, ARNAUD_INT* incv, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLX_TYPE* work);
+-void ARNAUD_BLAS(zlarfg)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* tau);
+-void ARNAUD_BLAS(zlartg)(ARNAUD_CPLX_TYPE* f, ARNAUD_CPLX_TYPE* g, double* c, ARNAUD_CPLX_TYPE* s, ARNAUD_CPLX_TYPE* r);
+-void ARNAUD_BLAS(zlascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, double* cfrom, double* cto, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_INT* info);
+-void ARNAUD_BLAS(zlaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* beta, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda);
+-void ARNAUD_BLAS(ztrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLX_TYPE* vl, ARNAUD_INT* ldvl, ARNAUD_CPLX_TYPE* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, ARNAUD_CPLX_TYPE* work, double* rwork, ARNAUD_INT* info);
+-void ARNAUD_BLAS(ztrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLX_TYPE* q, ARNAUD_INT* ldq, ARNAUD_CPLX_TYPE* w, ARNAUD_INT* m, double* s, double* sep, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* lwork, ARNAUD_INT* info);
+-void ARNAUD_BLAS(zunm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* info);
++int ARNAUD_BLAS(zlarf)(char* side, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* v, ARNAUD_INT* incv, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLX_TYPE* work);
++int ARNAUD_BLAS(zlarfg)(ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* x, ARNAUD_INT* incx, ARNAUD_CPLX_TYPE* tau);
++int ARNAUD_BLAS(zlartg)(ARNAUD_CPLX_TYPE* f, ARNAUD_CPLX_TYPE* g, double* c, ARNAUD_CPLX_TYPE* s, ARNAUD_CPLX_TYPE* r);
++int ARNAUD_BLAS(zlascl)(char* mtype, ARNAUD_INT* kl, ARNAUD_INT* ku, double* cfrom, double* cto, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_INT* info);
++int ARNAUD_BLAS(zlaset)(char* uplo, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* alpha, ARNAUD_CPLX_TYPE* beta, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda);
++int ARNAUD_BLAS(ztrevc)(char* side, char* howmny, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLX_TYPE* vl, ARNAUD_INT* ldvl, ARNAUD_CPLX_TYPE* vr, ARNAUD_INT* ldvr, ARNAUD_INT* mm, ARNAUD_INT* m, ARNAUD_CPLX_TYPE* work, double* rwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(ztrsen)(char* job, char* compq, ARNAUD_INT* select, ARNAUD_INT* n, ARNAUD_CPLX_TYPE* t, ARNAUD_INT* ldt, ARNAUD_CPLX_TYPE* q, ARNAUD_INT* ldq, ARNAUD_CPLX_TYPE* w, ARNAUD_INT* m, double* s, double* sep, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* lwork, ARNAUD_INT* info);
++int ARNAUD_BLAS(zunm2r)(char* side, char* trans, ARNAUD_INT* m, ARNAUD_INT* n, ARNAUD_INT* k, ARNAUD_CPLX_TYPE* a, ARNAUD_INT* lda, ARNAUD_CPLX_TYPE* tau, ARNAUD_CPLX_TYPE* c, ARNAUD_INT* ldc, ARNAUD_CPLX_TYPE* work, ARNAUD_INT* info);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/clacon2.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/clacon2.c
+@@ -110 +110 @@
+-    extern void ccopy_(slu_blasint *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
++    extern int ccopy_(slu_blasint *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/dlacon2.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/dlacon2.c
+@@ -108 +108 @@
+-    extern void dcopy_(slu_blasint *, double *, slu_blasint *, double *, slu_blasint *);
++    extern int dcopy_(slu_blasint *, double *, slu_blasint *, double *, slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ccopy_to_ucol.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ccopy_to_ucol.c
+@@ -29 +29 @@
+-extern void ccopy_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
++extern int ccopy_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_cdrop_row.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_cdrop_row.c
+@@ -26,4 +26,4 @@
+-extern void cswap_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
+-extern void caxpy_(slu_blasint *, singlecomplex *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
+-extern void ccopy_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
+-extern void scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
++extern int cswap_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
++extern int caxpy_(slu_blasint *, singlecomplex *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
++extern int ccopy_(slu_blasint *, singlecomplex [], slu_blasint *, singlecomplex [], slu_blasint *);
++extern int scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_dcopy_to_ucol.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_dcopy_to_ucol.c
+@@ -29 +29 @@
+-extern void dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
++extern int dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ddrop_row.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_ddrop_row.c
+@@ -26,3 +26,3 @@
+-extern void dswap_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
+-extern void daxpy_(slu_blasint *, double *, double [], slu_blasint *, double [], slu_blasint *);
+-extern void dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
++extern int dswap_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
++extern int daxpy_(slu_blasint *, double *, double [], slu_blasint *, double [], slu_blasint *);
++extern int dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_scopy_to_ucol.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_scopy_to_ucol.c
+@@ -29 +29 @@
+-extern void scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
++extern int scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_sdrop_row.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_sdrop_row.c
+@@ -26,3 +26,3 @@
+-extern void sswap_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
+-extern void saxpy_(slu_blasint *, float *, float [], slu_blasint *, float [], slu_blasint *);
+-extern void scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
++extern int sswap_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
++extern int saxpy_(slu_blasint *, float *, float [], slu_blasint *, float [], slu_blasint *);
++extern int scopy_(slu_blasint *, float [], slu_blasint *, float [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zcopy_to_ucol.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zcopy_to_ucol.c
+@@ -29 +29 @@
+-extern void zcopy_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
++extern int zcopy_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zdrop_row.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/ilu_zdrop_row.c
+@@ -26,4 +26,4 @@
+-extern void zswap_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
+-extern void zaxpy_(slu_blasint *, doublecomplex *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
+-extern void zcopy_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
+-extern void dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
++extern int zswap_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
++extern int zaxpy_(slu_blasint *, doublecomplex *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
++extern int zcopy_(slu_blasint *, doublecomplex [], slu_blasint *, doublecomplex [], slu_blasint *);
++extern int dcopy_(slu_blasint *, double [], slu_blasint *, double [], slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slacon2.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slacon2.c
+@@ -108 +108 @@
+-    extern void scopy_(slu_blasint *, float *, slu_blasint *, float *, slu_blasint *);
++    extern int scopy_(slu_blasint *, float *, slu_blasint *, float *, slu_blasint *);
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_cdefs.h
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_cdefs.h
+@@ -267,3 +267,3 @@
+-extern void ccopy_(slu_blasint *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
+-extern void caxpy_(slu_blasint *, singlecomplex *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
+-extern void cgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
++extern int ccopy_(slu_blasint *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
++extern int caxpy_(slu_blasint *, singlecomplex *, singlecomplex *, slu_blasint *, singlecomplex *, slu_blasint *);
++extern int cgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
+@@ -272 +272 @@
+-extern void ctrsv_(char*, char*, char*, slu_blasint*, singlecomplex*, slu_blasint*,
++extern int ctrsv_(char*, char*, char*, slu_blasint*, singlecomplex*, slu_blasint*,
+@@ -274 +274 @@
+-extern void ctrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
++extern int ctrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
+@@ -276 +276 @@
+-extern void cgemv_(char *, slu_blasint *, slu_blasint *, singlecomplex *, singlecomplex *a, slu_blasint *,
++extern int cgemv_(char *, slu_blasint *, slu_blasint *, singlecomplex *, singlecomplex *a, slu_blasint *,
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_ddefs.h
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_ddefs.h
+@@ -264,3 +264,3 @@
+-extern void dcopy_(slu_blasint *, double *, slu_blasint *, double *, slu_blasint *);
+-extern void daxpy_(slu_blasint *, double *, double *, slu_blasint *, double *, slu_blasint *);
+-extern void dgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
++extern int dcopy_(slu_blasint *, double *, slu_blasint *, double *, slu_blasint *);
++extern int daxpy_(slu_blasint *, double *, double *, slu_blasint *, double *, slu_blasint *);
++extern int dgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
+@@ -269 +269 @@
+-extern void dtrsv_(char*, char*, char*, slu_blasint*, double*, slu_blasint*,
++extern int dtrsv_(char*, char*, char*, slu_blasint*, double*, slu_blasint*,
+@@ -271 +271 @@
+-extern void dtrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
++extern int dtrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
+@@ -273 +273 @@
+-extern void dgemv_(char *, slu_blasint *, slu_blasint *, double *, double *a, slu_blasint *,
++extern int dgemv_(char *, slu_blasint *, slu_blasint *, double *, double *a, slu_blasint *,
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_sdefs.h
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_sdefs.h
+@@ -264,3 +264,3 @@
+-extern void scopy_(slu_blasint *, float *, slu_blasint *, float *, slu_blasint *);
+-extern void saxpy_(slu_blasint *, float *, float *, slu_blasint *, float *, slu_blasint *);
+-extern void sgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
++extern int scopy_(slu_blasint *, float *, slu_blasint *, float *, slu_blasint *);
++extern int saxpy_(slu_blasint *, float *, float *, slu_blasint *, float *, slu_blasint *);
++extern int sgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
+@@ -269 +269 @@
+-extern void strsv_(char*, char*, char*, slu_blasint*, float*, slu_blasint*,
++extern int strsv_(char*, char*, char*, slu_blasint*, float*, slu_blasint*,
+@@ -271 +271 @@
+-extern void strsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
++extern int strsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
+@@ -273 +273 @@
+-extern void sgemv_(char *, slu_blasint *, slu_blasint *, float *, float *a, slu_blasint *,
++extern int sgemv_(char *, slu_blasint *, slu_blasint *, float *, float *a, slu_blasint *,
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_zdefs.h
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/slu_zdefs.h
+@@ -267,3 +267,3 @@
+-extern void zcopy_(slu_blasint *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);
+-extern void zaxpy_(slu_blasint *, doublecomplex *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);
+-extern void zgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
++extern int zcopy_(slu_blasint *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);
++extern int zaxpy_(slu_blasint *, doublecomplex *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);
++extern int zgemm_(const char*, const char*, const slu_blasint*, const slu_blasint*, const slu_blasint*,
+@@ -272 +272 @@
+-extern void ztrsv_(char*, char*, char*, slu_blasint*, doublecomplex*, slu_blasint*,
++extern int ztrsv_(char*, char*, char*, slu_blasint*, doublecomplex*, slu_blasint*,
+@@ -274 +274 @@
+-extern void ztrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
++extern int ztrsm_(char*, char*, char*, char*, slu_blasint*, slu_blasint*,
+@@ -276 +276 @@
+-extern void zgemv_(char *, slu_blasint *, slu_blasint *, doublecomplex *, doublecomplex *a, slu_blasint *,
++extern int zgemv_(char *, slu_blasint *, slu_blasint *, doublecomplex *, doublecomplex *a, slu_blasint *,
+--- a/scipy/sparse/linalg/_dsolve/SuperLU/SRC/zlacon2.c
++++ b/scipy/sparse/linalg/_dsolve/SuperLU/SRC/zlacon2.c
+@@ -110 +110 @@
+-    extern void zcopy_(slu_blasint *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);
++    extern int zcopy_(slu_blasint *, doublecomplex *, slu_blasint *, doublecomplex *, slu_blasint *);

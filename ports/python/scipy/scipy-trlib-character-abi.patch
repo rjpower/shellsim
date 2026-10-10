@@ -1,0 +1,8 @@
+--- a/scipy/optimize/_trlib/trlib_private.h
++++ b/scipy/optimize/_trlib/trlib_private.h
+@@ -52 +52 @@
+-int BLAS_FUNC(dlagtm)(char *trans, CBLAS_INT *n, CBLAS_INT *nrhs, double *alpha, double *dl, double *d, double *du, double *x, CBLAS_INT *ldx, double *beta, double *b, CBLAS_INT *ldb, int);
++int BLAS_FUNC(dlagtm)(char *trans, CBLAS_INT *n, CBLAS_INT *nrhs, double *alpha, double *dl, double *d, double *du, double *x, CBLAS_INT *ldx, double *beta, double *b, CBLAS_INT *ldb);
+@@ -111 +111 @@
+-    BLAS_FUNC(dlagtm)(trans, &n_, &nrhs_, alpha, dl, d, du, x, &ldx_, beta, b, &ldb_, 1);
++    BLAS_FUNC(dlagtm)(trans, &n_, &nrhs_, alpha, dl, d, du, x, &ldx_, beta, b, &ldb_);
