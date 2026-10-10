@@ -102,6 +102,7 @@ def test_signed_transfer_conditional_create_conflict_get_and_corruption(signed_s
     assert store.put_blob(b"input") == digest
     assert store.get_blob(digest) == b"input"
     assert signed_store.reads == [remote_store.MAX_METADATA_BYTES + 1] * 2
+    assert [request.method for request in signed_store.requests] == ["GET", "PUT", "GET", "GET"]
     signed_store.objects[digest] = b"other"
     with pytest.raises(ValueError):
         store.get_blob(digest)
@@ -110,6 +111,31 @@ def test_signed_transfer_conditional_create_conflict_get_and_corruption(signed_s
     assert signed_store.objects[digest] == b"other"
     with pytest.raises(FileNotFoundError):
         store.get_blob("a" * 64)
+
+
+def test_signed_transfer_rechecks_conditional_create_race(signed_store, monkeypatch):
+    original = remote_store.urlopen
+
+    def concurrent_winner(request, **kwargs):
+        if request.method == "PUT":
+            digest = request.full_url.partition("?")[0].rsplit("/", 1)[1]
+            signed_store.objects[digest] = request.data
+        return original(request, **kwargs)
+
+    monkeypatch.setattr(remote_store, "urlopen", concurrent_winner)
+    assert signed_store.store.put_blob(b"race") == hashlib.sha256(b"race").hexdigest()
+    assert [request.method for request in signed_store.requests] == ["GET", "PUT", "GET"]
+
+
+def test_signed_transfer_never_puts_on_get_transport_failure(signed_store, monkeypatch):
+    def unavailable(request, **kwargs):
+        signed_store.requests.append(request)
+        raise URLError("unavailable")
+
+    monkeypatch.setattr(remote_store, "urlopen", unavailable)
+    with pytest.raises(OSError):
+        signed_store.store.put_blob(b"input")
+    assert [request.method for request in signed_store.requests] == ["GET"]
 
 
 def test_signed_transfer_bounds_and_journals_are_not_exposed(signed_store, monkeypatch):

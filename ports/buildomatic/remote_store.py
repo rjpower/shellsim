@@ -125,6 +125,16 @@ class SignedBlobStore:
         if len(data) > MAX_METADATA_BYTES:
             raise ValueError("blob exceeds the supported storage bound")
         digest = hashlib.sha256(data).hexdigest()
+        # Cache eviction can remove a previously uploaded blob. Verify remote
+        # bytes on every publication, uploading only a confirmed missing key.
+        try:
+            existing = self.get_blob(digest)
+        except FileNotFoundError:
+            pass
+        else:
+            if existing != data:
+                raise ValueError("content-addressed blob is corrupt")
+            return digest
         access = self._access(BlobAccessRequest("put", digest, len(data)))
         try:
             with urlopen(Request(access.url, data=data, headers=dict(access.headers), method="PUT"), timeout=30):
