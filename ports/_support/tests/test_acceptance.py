@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -181,3 +183,43 @@ def test_native_probe_passes_exact_wrapper_switches(tmp_path):
     flag = "-Wl,--wrap=signal,--wrap=open,--wrap=openat"
     command = _native_command(cohort, tmp_path, tmp_path / "test.c", tmp_path / "test.wasm", [], [], [], [flag])
     assert flag in command
+
+
+def test_native_probe_links_declared_shared_provider_with_real_lld(tmp_path):
+    from ports._support.cohort import load_cohort
+    from ports._support.wasm_metadata import function_signatures, needed_libraries
+
+    descriptor = os.environ.get("SHELLSIM_BUILD_COHORT")
+    if descriptor is None:
+        pytest.skip("requires an explicitly admitted build cohort")
+    cohort = load_cohort(Path(descriptor))
+    dependency_sysroot = tmp_path / "dependencies"
+    library = dependency_sysroot / "usr/local/lib/libactual.so"
+    library.parent.mkdir(parents=True)
+    provider = tmp_path / "provider.c"
+    provider.write_text("int supplied(void) { return 37; }\n")
+    subprocess.run(
+        [
+            str(cohort.compiler()),
+            *cohort.compiler_flags,
+            *cohort.linker_flags,
+            *cohort.shared_library_flags,
+            str(provider),
+            "-Wl,--soname=libactual.so",
+            "-o",
+            str(library),
+            str(cohort.compiler_runtime_archive),
+        ],
+        check=True,
+    )
+    source, output = tmp_path / "consumer.c", tmp_path / "consumer.wasm"
+    source.write_text("extern int supplied(void); int main(void) { return supplied() != 37; }\n")
+    command = _native_command(cohort, dependency_sysroot, source, output, ["lib/libactual.so"], [], [])
+    subprocess.run(command, check=True)
+    assert needed_libraries(output) == ["libactual.so"]
+    imports, _ = function_signatures(output)
+    assert imports["env", "supplied"] == ((), (0x7F,))
+    rejected = subprocess.run(
+        [argument for argument in command if argument != "-Wl,-Bdynamic"], capture_output=True, check=False
+    )
+    assert rejected.returncode != 0

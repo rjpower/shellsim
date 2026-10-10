@@ -268,3 +268,9 @@ cache. Exact paths and hashes remain result inputs. The common compiler wrapper
 adds these archives after the original executable link arguments, preserving
 static archive order. Compilation and shared links do not consume them. Retained
 workspace admission binds the resulting compiler wrapper text.
+
+Native acceptance selects executable dynamic linking when its declared exact
+link inputs include a shared provider. Static-only probes keep the ordinary
+executable link policy. This selection is derived from admitted files rather
+than arbitrary test linker switches; the resulting command records the exact
+inputs and still runs as a native guest executable.

@@ -196,6 +196,7 @@ def _native_command(
         *includes,
         "-L" + str(dependency_sysroot / "usr/local/lib"),
         str(source),
+        *(("-Wl,-Bdynamic",) if any(Path(path).suffix == ".so" for path in links) else ()),
         *links,
         *link_flags,
         "-o",
