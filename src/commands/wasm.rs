@@ -52,8 +52,8 @@ mod posix_exec;
 mod posix_open;
 mod posix_process;
 
-// Stripped guest Clang is 84 MB. Compilation remains CPU-metered and threaded
-// images prepay their conservative host compilation memory reservation.
+// Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
+// prepay their conservative host compilation memory reservation.
 const MAX_WASM_BYTES: usize = 128 * 1024 * 1024;
 const DEFAULT_WASM_MEMORY: usize = 16 * 1024 * 1024;
 const DEFAULT_TABLE_ELEMENTS: usize = 10_000;
@@ -63,13 +63,17 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 // CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
-const MAX_CACHED_MODULES: usize = 4;
+const MAX_CACHED_MODULES: usize = 64;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
-// Guest Clang occupies 338 MiB including its compiled image. Retain its linker
-// and utility modules alongside it without recompiling on every invocation.
-const MAX_CACHED_MODULE_BYTES: usize = 1024 * 1024 * 1024;
+// This process-wide JIT cache is separate from on-disk compiler build caches.
+// Clang alone occupies 338 MiB; retain a working set of tools and package modules.
+const MAX_CACHED_MODULE_BYTES: usize = if usize::BITS >= 64 {
+    8usize.saturating_mul(1024 * 1024 * 1024)
+} else {
+    1024 * 1024 * 1024
+};
 // Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
 // utility usable on ordinary input without relaxing the host's execution bound.
 const WASM_FUEL_PER_CPU_UNIT: u64 = 10;

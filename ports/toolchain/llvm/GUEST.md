@@ -43,6 +43,13 @@ a one-hour timeout and a 12 GiB address-space limit per process. The guest
 compiler executable reserves a 16 MiB C stack, starts with 128 MiB of linear
 memory and permits growth to 256 MiB, subject to Shellsim's memory budget.
 
+Wasmtime keeps compiled commands in a process-wide in-memory LRU cache, shared
+by environments in the same host process. On 64-bit hosts it retains up to
+64 modules and 8 GiB of source plus compiled images, allocating only as entries
+arrive. Guest resource accounting is the same for a cache hit and a miss.
+This cache is separate from the retained Ninja workspace and Cargo's on-disk
+build cache; its size limit does not apply to those build outputs.
+
 This port does not enable native LLVM backends, the optional static analyzer,
 Objective-C rewriting or other LLD executable formats. Unix sockets, file
 ownership changes, disk-capacity queries, child memory limits, detached launch,
