@@ -289,14 +289,37 @@ def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
         module.__dict__.update(exports)
         monkeypatch.setitem(sys.modules, name, module)
     service = tmp_path / "service.json"
-    service.write_text(json.dumps({"job_id": "/power/service", "prefix": "durable", "cache_prefix": "cache"}))
+    connection = {
+        "schema_version": 1,
+        "job_id": "/power/service",
+        "prefix": "durable",
+        "cache_prefix": "cache",
+        "controller_url": "https://iris.oa.dev",
+        "cluster_name": "marin",
+        "workspace": str(tmp_path),
+        "config_sha256": "a" * 64,
+        "task_image": "image@sha256:" + "b" * 64,
+        "service_id": "service",
+    }
+    service.write_text(json.dumps(connection))
     actual_run = bridge.run_graph
 
     def capture_remote(*args, **kwargs):
         assert isinstance(kwargs["remote_backend"], Backend)
         assert kwargs["blob_store"] is sentinel
+        assert kwargs["worker_identity"] == {
+            name: connection[name] for name in ("config_sha256", "task_image", "service_id")
+        }
         return sentinel
 
     monkeypatch.setattr(bridge, "run_graph", capture_remote)
     assert actual_run(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service) is sentinel
-    assert calls == [{"cluster_name": "marin", "workspace": bridge.Path.cwd()}]
+    assert calls == [{"cluster_name": "marin", "workspace": tmp_path}]
+    for invalid in (
+        {**connection, "schema_version": 2},
+        {**connection, "token": "unexpected"},
+        {name: value for name, value in connection.items() if name != "task_image"},
+    ):
+        service.write_text(json.dumps(invalid))
+        with pytest.raises(ValueError):
+            actual_run(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service)

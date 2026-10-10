@@ -489,7 +489,8 @@ def run_graph(
             if iris_service.stat().st_size > 64 * 1024:
                 raise ValueError("Iris connection descriptor exceeds its size bound")
             connection = json.loads(iris_service.read_text())
-            if set(connection) - {
+            if set(connection) != {
+                "schema_version",
                 "job_id",
                 "prefix",
                 "cache_prefix",
@@ -501,18 +502,20 @@ def run_graph(
                 "service_id",
             }:
                 raise ValueError("unsupported Iris connection fields")
+            if type(connection["schema_version"]) is not int or connection["schema_version"] != 1:
+                raise ValueError("unsupported Iris connection schema")
             from iris.cli.connect import open_iris_client
             from iris.cluster.types import JobName, Namespace
 
             from ports.buildomatic.backends.iris import IrisBackend
 
             with open_iris_client(
-                cluster_name=connection.get("cluster_name", "marin"),
-                workspace=Path(connection.get("workspace", Path.cwd())),
+                cluster_name=connection["cluster_name"],
+                workspace=Path(connection["workspace"]),
             ) as client:
                 remote = IrisBackend(
                     client,
-                    connection.get("controller_url", "https://iris.oa.dev"),
+                    connection["controller_url"],
                     str(Namespace.from_job_id(JobName.from_wire(connection["job_id"]))),
                     prefix=connection["prefix"],
                     cache_prefix=connection["cache_prefix"],
@@ -534,7 +537,6 @@ def run_graph(
                     worker_identity={
                         name: connection[name]
                         for name in ("config_sha256", "task_image", "service_id")
-                        if name in connection
                     },
                 )
         if blob_store is None or remote_backend is None:

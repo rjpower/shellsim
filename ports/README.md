@@ -72,9 +72,9 @@ misses and must be rebuilt. Iris imports occur only when explicitly connecting
 to that backend.
 
 The CLI can attach to an existing service with `--backend iris --iris-service
-/path/to/service.json`. Its public descriptor names `job_id`, the durable
-`prefix`, and `cache_prefix`, with optional `controller_url` (default
-`https://iris.oa.dev`), `cluster_name` (default `marin`) and runtime `workspace`.
+/path/to/service.json`. `ports.buildomatic.backends.iris.connection_descriptor`
+creates the canonical public document with `schema_version: 1`, `job_id`, the durable
+`prefix`, `cache_prefix`, `controller_url`, `cluster_name` and runtime `workspace`.
 The workspace must supply the optional Iris and Rigging dependencies. The
 descriptor contains no credentials; authentication belongs to the Iris client.
 Public `config_sha256`, `task_image` (use an image digest pin) and `service_id`
