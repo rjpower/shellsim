@@ -20,7 +20,23 @@ from ports.toolchain.wasi_threads.dynamic import verify_sdk
 
 TARGET = "wasm32-wasip1-threads"
 ABI = "shellsim-wasi-sdk34-cpython3137-threads-v3"
-HOST_TOOLS = frozenset({"cmake", "ninja", "make", "python", "meson", "pkg-config", "sh", "rm", "uv"})
+HOST_TOOLS = frozenset(
+    {
+        "cmake",
+        "ninja",
+        "make",
+        "python",
+        "meson",
+        "pkg-config",
+        "sh",
+        "rm",
+        "uv",
+        "cc",
+        "cython",
+        "pybind11-config",
+        "f2py",
+    }
+)
 
 
 def file_hash(path: Path) -> str:

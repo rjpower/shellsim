@@ -97,7 +97,10 @@ def test_native_acceptance_rejects_include_escape_before_build(tmp_path: Path) -
     assert not output.exists()
 
 
-def test_successful_acceptance_does_not_publish_asset_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("installation_kind", ["pypi", "pypi+native"])
+def test_successful_acceptance_does_not_publish_asset_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, installation_kind: str
+) -> None:
     descriptor = tmp_path / "release.json"
     descriptor.write_text("{}")
     (tmp_path / "probe.py").write_text("print('ok')\n")
@@ -113,6 +116,9 @@ def test_successful_acceptance_does_not_publish_asset_cache(tmp_path: Path, monk
         def from_release(_descriptor: Path, *, cache_dir: Path, **_kwargs: object) -> FakeEnvironment:
             nonlocal cache
             cache = cache_dir
+            assert _kwargs["pypi"] == ["example==1.0"]
+            if installation_kind == "pypi+native":
+                assert _kwargs["tools"] == ["example==1.0"]
             (cache_dir / "large-asset").write_bytes(b"cached")
             return FakeEnvironment()
 
@@ -124,7 +130,7 @@ def test_successful_acceptance_does_not_publish_asset_cache(tmp_path: Path, monk
 
     monkeypatch.setitem(sys.modules, "shellsim", SimpleNamespace(Environment=FakeEnvironment))
     output = tmp_path / "proof"
-    accept_port(AcceptanceRequest(port, descriptor, output, "pypi"))
+    accept_port(AcceptanceRequest(port, descriptor, output, installation_kind))
     assert cache is not None and not cache.exists()
     assert not (output / "cache").exists()
 

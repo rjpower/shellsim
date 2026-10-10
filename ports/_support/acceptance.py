@@ -40,7 +40,7 @@ class AcceptanceRequest:
     port: Port
     descriptor: Path
     output: Path
-    install_kind: Literal["pypi", "native"]
+    install_kind: Literal["pypi", "native", "pypi+native"]
     cohort: BuildCohort | None = None
     dependency_sysroot: Path | None = None
     limits: Limits | None = None
@@ -212,7 +212,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
     tests = request.port.recipe.get("tests")
     if not isinstance(tests, list) or not 1 <= len(tests) <= _MAX_TESTS:
         raise ValueError("port needs between one and 32 declared acceptance probes")
-    if request.install_kind not in {"pypi", "native"}:
+    if request.install_kind not in {"pypi", "native", "pypi+native"}:
         raise ValueError("acceptance installation kind is invalid")
     limits = _test_limits(request.port.recipe)
     if request.limits is not None:
@@ -228,9 +228,9 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
             raise ValueError("acceptance test kind is invalid")
         kind = test["kind"]
-        if kind == "shell" and request.install_kind != "native":
+        if kind == "shell" and request.install_kind not in {"native", "pypi+native"}:
             raise ValueError("shell acceptance needs a native port selection")
-        if kind == "native" and request.install_kind != "native":
+        if kind == "native" and request.install_kind not in {"native", "pypi+native"}:
             raise ValueError("native acceptance needs a native port selection")
         path, data = _source(request.port, test.get("source" if kind == "native" else "script"))
         link_inputs = test.get("link_inputs", [])
@@ -325,6 +325,8 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 if artifact.stat().st_size > 128 * 1024**2 or wasm_header != b"\0asm\x01\0\0\0":
                     raise ValueError("native acceptance compiler did not produce bounded core Wasm")
             setup = {"pypi" if request.install_kind == "pypi" else "tools": [spec]}
+            if request.install_kind == "pypi+native":
+                setup["pypi"] = [f"{request.port.name}=={request.port.version}"]
             kwargs = {"limits": limits} if limits is not None else {}
             env = Environment.from_release(descriptor, cache_dir=Path(cache_dir), **setup, **kwargs)
             guest_path = "/work/shellsim-acceptance" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[kind]

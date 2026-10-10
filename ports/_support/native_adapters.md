@@ -144,3 +144,59 @@ disk, and records the effective explicit budget in the acceptance receipt.
 These budgets allow compiler and SDK checks to include installation and execution
 costs. Temporary release materialization lives under the proof directory and is
 removed after the checks.
+
+
+## Python Meson projects
+
+The `python-meson` adapter uses an admitted host Python and Cython for generators,
+and admitted CPython headers and `pyconfig.h` for target compilation. Its
+pkg-config wrapper answers target Python queries with those headers; other
+providers resolve only through the dependency sysroot. Optional
+`build.host_header_packages` entries bind header-only generator packages to a
+complete host-tool receipt, including the package files beyond its executable.
+
+`build.cross_properties` supplies upstream cross facts.
+`build.dependency_properties` resolves a property from an admitted native port
+and export-relative directory. `build.install_tags` defaults to runtime,
+python-runtime and devel. Meson's install plan selects the build targets and
+supplies wheel paths, extension names and directory exclusions. The adapter
+removes host SOABI suffixes, preserves qualified package paths, copies upstream
+PKG-INFO as METADATA, and binds each Wasm extension to the target ABI and its
+actual shared-library imports. No maintained extension inventory is required.
+
+`build.development_exports` maps installed wheel files or directories to the
+native payload beneath `/usr/local`. These exports use the same sealing and
+dependency closure as native libraries. NumPy exports its generated C headers,
+libnpymath archive and upstream pkg-config files from the same build as its
+wheel. A mixed wheel/development port installs both selections for acceptance.
+
+The scientific host descriptor admits a Meson tree patched with
+`meson-wasi-archive-groups.patch`. Meson otherwise inserts GNU archive groups for
+WASI Clang. wasm-ld rescans archive members and rejects these GNU flags. The
+receipt records the original Meson receipt, the patch input hash and every
+resulting tool file; the original host tool remains immutable.
+
+
+## Retained Meson workspaces
+
+`--workspace RECIPE=PATH` also accepts Meson and Python Meson recipes. PATH is
+an actual Ninja directory named `meson-build`; its parent holds compiler
+wrappers, while the enclosing directory holds admitted source and dependencies.
+For example, use `--workspace python/numpy/graph-recipe.json=target/numpy-work/build/meson-build`.
+
+The first build requires a fresh directory. Existing trees without a workspace
+receipt are rejected. Each resume verifies exact source bytes and executable
+modes, configuration, target product receipts, host tool code, compiler flags
+and dependency exports. A changed compilation input rejects that workspace
+without deleting it. Recipes with mutable hooks cannot use this mode.
+
+Jobs, install tags, licenses and development-export selections remain packaging
+inputs rather than compilation-workspace inputs. The runner still keys and
+verifies every immutable result with the full recipe, implementation and cohort.
+A packaging change reconfigures Meson, runs Ninja's selected install targets and
+writes a fresh install and wheel directory. Ninja retains unchanged objects.
+Result-cache hits, workspace decisions and phase timings are printed to stderr.
+
+Host f2py is an optional explicit binding in both Meson cross and native files.
+Its complete admitted NumPy package supports SciPy's generation steps; target
+NumPy headers and f2py C sources come from the native dependency exports.

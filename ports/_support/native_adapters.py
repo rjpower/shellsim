@@ -15,6 +15,7 @@ class NativeAdapter(Enum):
     CMAKE = "cmake"
     MESON = "meson"
     CONFIGURE_MAKE = "configure-make"
+    PLAIN_MAKE = "plain-make"
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class NativeBuildContext:
     dependency_sysroot: Path
     shared_library_flags: tuple[str, ...] = ()
     executable_flags: tuple[str, ...] = ()
+    retained_workspace: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,8 @@ class NativeBuildRequest:
     install_prefix: PurePosixPath = PurePosixPath("/usr/local")
     configure_environment: Mapping[str, str] = field(default_factory=dict)
     build_args: tuple[str, ...] = ()
+    meson_properties: Mapping[str, str | bool | int] = field(default_factory=dict)
+    meson_install_tags: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -86,12 +90,16 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     import re
     import shlex
     import subprocess
+    import sys
+    import time
 
     from ports.native.dependencies import target_environment
 
     context = request.context
     if not isinstance(request.adapter, NativeAdapter):
         raise ValueError("unsupported native build adapter")
+    if request.adapter is NativeAdapter.PLAIN_MAKE and request.configure_args:
+        raise ValueError("plain-make adapter has no configure phase")
     if request.adapter is NativeAdapter.MESON and request.install_targets != ("install",):
         raise ValueError("Meson adapter supports its normal install target only")
     if not 1 <= request.jobs <= 16:
@@ -106,8 +114,8 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     ):
         raise ValueError("native adapter paths must be absolute")
     if request.configure_environment or request.build_args:
-        if request.adapter is not NativeAdapter.CONFIGURE_MAKE:
-            raise ValueError("configure environment and make arguments require configure-make")
+        if request.adapter not in {NativeAdapter.CONFIGURE_MAKE, NativeAdapter.PLAIN_MAKE}:
+            raise ValueError("configure environment and make arguments require a make adapter")
     if (
         not isinstance(request.configure_environment, Mapping)
         or len(request.configure_environment) > 128
@@ -125,16 +133,31 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         not isinstance(value, str)
         or len(value) > 4096
         or "\0" in value
-        or value.startswith(("CC=", "CXX=", "AR=", "RANLIB=", "PATH=", "SHELL="))
+        or value.startswith(("CC=", "CXX=", "AR=", "RANLIB=", "HOSTCC=", "PATH=", "SHELL="))
         for value in request.build_args
     ):
         raise ValueError("unsupported make build argument")
+    if request.meson_properties and request.adapter is not NativeAdapter.MESON:
+        raise ValueError("cross properties require Meson")
+    if len(request.meson_properties) > 64 or any(
+        not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", key)
+        or not isinstance(value, (str, bool, int))
+        or (isinstance(value, str) and (len(value) > 4096 or "\0" in value))
+        for key, value in request.meson_properties.items()
+    ):
+        raise ValueError("invalid Meson cross property")
+    if request.meson_install_tags and (
+        request.adapter is not NativeAdapter.MESON
+        or any(not re.fullmatch(r"[A-Za-z0-9_-]+", tag) for tag in request.meson_install_tags)
+    ):
+        raise ValueError("invalid Meson install tags")
     required_host = {"python", "pkg-config", "sh", "rm"}
     required_host.update(
         {
             NativeAdapter.CMAKE: {"cmake", "ninja"},
             NativeAdapter.MESON: {"meson", "ninja"},
             NativeAdapter.CONFIGURE_MAKE: {"make"},
+            NativeAdapter.PLAIN_MAKE: {"make", "cc"},
         }[request.adapter]
     )
     required_target = {"cc", "cxx", "ar", "ranlib"}
@@ -149,7 +172,7 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
     context.build.mkdir(parents=True, exist_ok=True)
     context.staging_prefix.mkdir(parents=True, exist_ok=True)
     tools = context.build / "adapter-tools"
-    tools.mkdir()
+    tools.mkdir(exist_ok=context.retained_workspace)
     wrappers = {}
     for role in ("cc", "cxx"):
         wrapper = tools / role
@@ -206,10 +229,23 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         (context.build / "adapter-commands.json").write_text(
             json.dumps([{"argv": item.argv, "directory": str(item.directory)} for item in commands], indent=2) + "\n"
         )
+        started = time.perf_counter()
         with (context.build / f"adapter-{len(commands)}.log").open("wb") as log:
             subprocess.run(
                 command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
             )
+        phase = (
+            "configure"
+            if len(commands) == 1 and request.adapter is not NativeAdapter.PLAIN_MAKE
+            else "install"
+            if "install" in command.argv
+            else "build"
+        )
+        print(
+            f"ports: {request.adapter.value} {phase} {time.perf_counter() - started:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
 
     if request.adapter is NativeAdapter.CMAKE:
         toolchain = tools / "toolchain.cmake"
@@ -279,9 +315,29 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             + _meson_literal(context.target_tools["strip"])
             + "\npkg-config = "
             + _meson_literal(context.host_tools["pkg-config"])
+            + "".join(
+                "\n" + name + " = " + _meson_literal(context.host_tools[name])
+                for name in ("cython", "f2py")
+                if name in context.host_tools
+            )
             + "\n[host_machine]\nsystem = 'wasi'\ncpu_family = 'wasm32'\ncpu = 'wasm32'\nendian = 'little'\n[properties]\nneeds_exe_wrapper = true\nsys_root = "
             + _meson_literal(context.dependency_sysroot)
             + "\n"
+            + "".join(
+                name + " = " + (str(value).lower() if isinstance(value, (bool, int)) else _meson_literal(value)) + "\n"
+                for name, value in sorted(request.meson_properties.items())
+            )
+        )
+        native_file = tools / "native.ini"
+        native_file.write_text(
+            "[binaries]\npython = "
+            + _meson_literal(python)
+            + "\n"
+            + "".join(
+                name + " = " + _meson_literal(context.host_tools[name]) + "\n"
+                for name in ("cython", "f2py")
+                if name in context.host_tools
+            )
         )
         meson = context.host_tools["meson"]
         build = context.build / "meson-build"
@@ -289,19 +345,72 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
             [
                 meson,
                 "setup",
+                *(["--reconfigure"] if (build / "meson-private/coredata.dat").exists() else []),
                 build,
                 context.source,
                 *request.configure_args,
                 "--cross-file",
                 cross,
+                "--native-file",
+                native_file,
                 "--prefix",
                 request.install_prefix,
                 "--wrap-mode=nodownload",
             ],
             context.build,
         )
-        run([meson, "compile", "-C", build, "-j", request.jobs, *request.build_targets], context.build)
-        run([meson, "install", "-C", build, "--no-rebuild"], context.build)
+        if request.meson_install_tags:
+            plan = json.loads((build / "meson-info/intro-install_plan.json").read_text())
+            selected = []
+            for source, spec in plan.get("targets", {}).items():
+                if spec["tag"] in request.meson_install_tags:
+                    path = Path(source)
+                    if not path.is_absolute() or not path.is_relative_to(build):
+                        raise ValueError("Meson install target escapes build directory")
+                    selected.append(str(path.relative_to(build)))
+            if not selected:
+                raise ValueError("Meson install tags select no build targets")
+            run([context.host_tools["ninja"], "-C", build, "-j", request.jobs, *sorted(selected)], context.build)
+        else:
+            run([meson, "compile", "-C", build, "-j", request.jobs, *request.build_targets], context.build)
+        run(
+            [
+                meson,
+                "install",
+                "-C",
+                build,
+                "--no-rebuild",
+                *(["--tags=" + ",".join(request.meson_install_tags)] if request.meson_install_tags else []),
+            ],
+            context.build,
+        )
+    elif request.adapter is NativeAdapter.PLAIN_MAKE:
+        make = context.host_tools["make"]
+        bindings = [
+            "CC=" + str(wrappers["cc"]),
+            "CXX=" + str(wrappers["cxx"]),
+            "HOSTCC=" + str(context.host_tools["cc"]),
+            "AR=" + str(context.target_tools["ar"]),
+            "RANLIB=" + str(context.target_tools["ranlib"]),
+        ]
+        # Targets may append to one archive; preserve recipe order between them.
+        for target in request.build_targets or (None,):
+            run(
+                [make, "-j", request.jobs, *bindings, *request.build_args, *([target] if target else [])],
+                context.source,
+            )
+        if request.install_targets:
+            run(
+                [
+                    make,
+                    *bindings,
+                    *request.build_args,
+                    *request.install_targets,
+                    "PREFIX=" + str(request.install_prefix),
+                    "DESTDIR=" + str(context.staging_prefix),
+                ],
+                context.source,
+            )
     else:
         build = context.build / "configure-build"
         build.mkdir()

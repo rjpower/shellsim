@@ -1,0 +1,35 @@
+--- a/numpy/_core/include/numpy/npy_cpu.h
++++ b/numpy/_core/include/numpy/npy_cpu.h
+@@ -111,7 +111,7 @@
+     #endif
+ #elif defined(__loongarch_lp64)
+     #define NPY_CPU_LOONGARCH64
+-#elif defined(__EMSCRIPTEN__)
++#elif defined(__EMSCRIPTEN__) || defined(__wasi__)
+     /* __EMSCRIPTEN__ is defined by emscripten: an LLVM-to-Web compiler */
+     #define NPY_CPU_WASM
+ #else
+--- a/numpy/_core/src/common/npy_hashtable.cpp
++++ b/numpy/_core/src/common/npy_hashtable.cpp
+@@ -14,7 +14,9 @@
+ 
+ #include "npy_hashtable.h"
+ 
++#ifdef Py_GIL_DISABLED
+ #include <mutex>
++#endif
+ #include <shared_mutex>
+ 
+ #include "templ_common.h"
+--- a/numpy/_core/src/umath/dispatching.cpp
++++ b/numpy/_core/src/umath/dispatching.cpp
+@@ -42,7 +42,9 @@
+ #include <Python.h>
+ #include <convert_datatype.h>
+ 
++#ifdef Py_GIL_DISABLED
+ #include <mutex>
++#endif
+ #include <shared_mutex>
+ 
+ #include "numpy/ndarraytypes.h"

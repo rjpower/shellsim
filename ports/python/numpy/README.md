@@ -71,3 +71,22 @@ and runs cube rotations in the guest.
 Upstream build references:
 [NumPy cross compilation](https://numpy.org/doc/2.3/building/cross_compilation.html)
 and [NumPy Meson build](https://numpy.org/doc/2.3/building/understanding_meson.html).
+
+
+## Threaded graph build
+
+`graph-recipe.json` builds upstream NumPy 2.3.5 as shared Python extensions with
+the Python Meson adapter. It uses the admitted threaded CPython headers and
+verified host Clang/platform graph nodes. BLAS, SIMD and NumPy worker threading
+are disabled explicitly; internal LAPACK, FFT and random modules remain built.
+`meson-threads.patch` admits WASI's wasm32 CPU identity and excludes mutex headers
+used only by free-threaded CPython. It preserves upstream shared-module builds.
+
+Meson's install plan supplies package files and qualified extension names.
+Generated NumPy headers, libnpymath and pkg-config exports are sealed as the
+`python/numpy` development dependency for downstream SciPy. Upstream package
+metadata and dependency constraints remain intact.
+
+Run the graph with an admitted scientific host descriptor containing Python,
+Cython, Meson and Ninja. The declared guest probe covers array arithmetic,
+linear algebra, FFT, random values, target type widths and an invalid reshape.

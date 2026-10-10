@@ -1,7 +1,8 @@
 """Reject invalid build requests before creating an unpublished staging tree."""
 
+import sys
 from dataclasses import replace
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -77,3 +78,40 @@ def test_make_arguments_cannot_replace_admitted_tools(build_request, argument):
     with pytest.raises(ValueError, match="make build argument"):
         build_native(request)
     assert not request.context.build.exists()
+
+
+def test_plain_make_runs_ordered_targets_with_separate_host_compiler(build_request):
+    context = build_request.context
+    context.source.mkdir()
+    (context.source / "host.c").write_text("int main(void) { return 0; }\n")
+    (context.source / "Makefile").write_text(
+        "first:\n\t$(HOSTCC) host.c -o host-generator\n\t./host-generator\n\tprintf first > order\n"
+        "second:\n\ttest -f order\n\tprintf second >> order\n"
+    )
+    host_tools = {name: Path("/usr/bin/" + name) for name in ("make", "cc", "sh", "rm")}
+    host_tools.update({"python": Path(sys.executable), "pkg-config": Path("/usr/bin/true")})
+    # This Makefile only needs its native generator. Target entrypoints must
+    # remain supplied and must never be substituted for HOSTCC.
+    context = replace(
+        context,
+        host_tools=host_tools,
+        target_tools={name: Path("/usr/bin/false") for name in ("cc", "cxx", "ar", "ranlib")},
+    )
+    result = build_native(
+        replace(
+            build_request,
+            adapter=NativeAdapter.PLAIN_MAKE,
+            context=context,
+            build_targets=("first", "second"),
+            install_targets=(),
+        )
+    )
+    assert (context.source / "order").read_text() == "firstsecond"
+    assert (context.source / "host-generator").is_file()
+    assert len(result.commands) == 2
+
+
+def test_plain_make_rejects_configure_phase_before_staging(build_request):
+    with pytest.raises(ValueError, match="no configure phase"):
+        build_native(replace(build_request, adapter=NativeAdapter.PLAIN_MAKE, configure_args=("--static",)))
+    assert not build_request.context.staging_prefix.exists()
