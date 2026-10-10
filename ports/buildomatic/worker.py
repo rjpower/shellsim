@@ -1,0 +1,291 @@
+"""Durable local trusted-host worker with detached subprocess supervision.
+
+Workers may be reconstructed with the same store and root after client restart.
+Supervisor status, output publication and cancellation tombstones live on disk;
+completed results remain until acknowledgement. Linux process start tokens and
+advisory locks prevent restart from guessing whether an action is still running.
+"""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import shutil
+import subprocess
+import sys
+from dataclasses import asdict, replace
+from pathlib import Path
+
+from ._runner import kill_group, process_token, tree_usage, wait_group
+from .bundles import capture_tree, extract_tree
+from .contracts import (
+    Attempt,
+    AttemptResult,
+    AttemptState,
+    ResourceLimits,
+    Store,
+    TreeBundle,
+    WorkerReport,
+    WorkerState,
+    encode,
+    name,
+)
+from .store import atomic_write, locked, read_bounded
+
+_DEFAULT_LIMITS = ResourceLimits()
+
+
+class WorkerBusy(RuntimeError):
+    """No configured execution slot is available; submission can be retried."""
+
+
+def _read(path: Path) -> dict | None:
+    try:
+        return json.loads(read_bounded(path))
+    except FileNotFoundError:
+        return None
+
+
+def _running(directory: Path) -> bool:
+    with (directory / "run.lock").open("a+b") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+    return False
+
+
+def _remove_workspace(root: Path) -> None:
+    """Remove private copies even when the input tree preserved read-only modes."""
+    if root.is_symlink():
+        root.unlink()
+        return
+    directories = [root]
+    while directories:
+        directory = directories.pop()
+        directory.chmod(directory.stat().st_mode | 0o700)
+        with os.scandir(directory) as children:
+            for child in children:
+                if child.is_dir(follow_symlinks=False):
+                    directories.append(Path(child.path))
+    shutil.rmtree(root)
+
+
+class WorkerExecutor:
+    """Execute trusted host argv on Linux, with 1..32 durable concurrent slots.
+
+    Resource rlimits bound each process; the supervisor monitors aggregate disk
+    and log growth. Polling is required to publish output bundles. Input mounts
+    share a total expanded byte/entry allowance. There is no shell by default.
+    The root is private to this worker identity and must survive client restart.
+    """
+
+    def __init__(self, store: Store, root: Path, limits: ResourceLimits = _DEFAULT_LIMITS, max_running: int = 1):
+        if type(max_running) is not int or not 1 <= max_running <= 32:
+            raise ValueError("worker needs 1..32 execution slots")
+        if sys.platform != "linux":
+            raise ValueError("persistent subprocess workers require Linux")
+        self.store, self.root, self.limits, self.max_running = store, Path(root).resolve(), limits, max_running
+        self.root.mkdir(parents=True, exist_ok=True)
+        (self.root / "attempts").mkdir(exist_ok=True)
+        self._children = []
+
+    def _directory(self, attempt_id: str) -> Path:
+        return self.root / "attempts" / name(attempt_id)
+
+    def _launch(self, directory: Path) -> None:
+        if (directory / "status.json").exists() or (directory / "acknowledged").exists():
+            return
+        launch = _read(directory / "launch.json")
+        if launch is not None:
+            token = process_token(launch["pid"])
+            if token is not None and token == launch["token"]:
+                return
+        self._children = [child for child in self._children if child.poll() is None]
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+        child = subprocess.Popen(
+            [sys.executable, str(Path(__file__).with_name("_runner.py")), str(directory)],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        self._children.append(child)
+        atomic_write(directory / "launch.json", encode({"pid": child.pid, "token": process_token(child.pid)}))
+
+    def submit(self, attempt: Attempt) -> None:
+        directory = self._directory(attempt.id)
+        plan = {"attempt": asdict(attempt), "limits": asdict(self.limits)}
+        with locked(self.root / "worker.lock"):
+            existing = _read(directory / "plan.json")
+            if existing is not None:
+                if encode(existing["attempt"]) != encode(plan["attempt"]):
+                    raise ValueError("attempt id reused with different content")
+                self._launch(directory)
+                return
+            if (directory / "cancelled").exists() or (directory / "acknowledged").exists():
+                return
+            active = 0
+            for previous in (self.root / "attempts").iterdir():
+                if _read(previous / "plan.json") is None or (previous / "acknowledged").exists():
+                    continue
+                status = _read(previous / "status.json")
+                if status is None or status["phase"] != "completed":
+                    active += 1
+            if active >= self.max_running:
+                raise WorkerBusy("worker has no available slot")
+            directory.mkdir(exist_ok=True)
+            workspace = directory / "work"
+            # No durable launch intent exists yet, so interrupted preparation can
+            # be replaced safely. A submitted attempt is never prepared twice.
+            if workspace.exists():
+                _remove_workspace(workspace)
+            workspace.mkdir()
+            (workspace / "inputs").mkdir()
+            (workspace / "output").mkdir()
+            (workspace / "tmp").mkdir()
+            files = size = 0
+            try:
+                for mount in attempt.inputs:
+                    if files >= self.limits.max_files or size >= self.limits.output_bytes:
+                        raise ValueError("inputs exceed aggregate transport bounds")
+                    mount_limits = replace(
+                        self.limits,
+                        max_files=self.limits.max_files - files,
+                        output_bytes=self.limits.output_bytes - size,
+                    )
+                    target = workspace / "inputs" / mount.name
+                    extract_tree(mount.bundle, self.store, target, limits=mount_limits)
+                    count, expanded = tree_usage(target, mount_limits.max_files, mount_limits.output_bytes)
+                    files += count
+                    size += expanded
+            except Exception as error:
+                atomic_write(directory / "plan.json", encode(plan))
+                atomic_write(
+                    directory / "status.json",
+                    encode(
+                        {
+                            "phase": "completed",
+                            "returncode": None,
+                            "cancelled": False,
+                            "error": f"input preparation failed: {type(error).__name__}: {error}"[:4096],
+                        }
+                    ),
+                )
+                return
+            atomic_write(directory / "plan.json", encode(plan))
+            self._launch(directory)
+
+    def _status(self, directory: Path) -> dict | None:
+        status = _read(directory / "status.json")
+        if status is None:
+            self._launch(directory)
+            return None
+        if status["phase"] == "completed" or _running(directory):
+            return status
+        # The supervisor may have died while the action was still running. Kill
+        # that owned group before reporting failure; never launch it again.
+        child = status.get("child")
+        if child is not None:
+            token = process_token(child)
+            if token is not None and token != status.get("child_token"):
+                raise RuntimeError("cannot reconcile a reused action PID")
+            kill_group(child)
+            wait_group(child)
+        status = {
+            "phase": "completed",
+            "returncode": None,
+            "cancelled": (directory / "cancelled").exists(),
+            "error": "worker supervisor lost",
+        }
+        atomic_write(directory / "status.json", encode(status))
+        return status
+
+    def poll(self, attempt_id: str) -> WorkerReport:
+        directory = self._directory(attempt_id)
+        with locked(self.root / "worker.lock"):
+            if (directory / "acknowledged").exists():
+                return WorkerReport(WorkerState.UNKNOWN)
+            plan = _read(directory / "plan.json")
+            if plan is None:
+                if (directory / "cancelled").exists():
+                    return WorkerReport(WorkerState.COMPLETED, AttemptResult(attempt_id, AttemptState.CANCELLED))
+                return WorkerReport(WorkerState.UNKNOWN)
+            result = _read(directory / "result.json")
+            if result is None:
+                status = self._status(directory)
+                if status is None or status["phase"] != "completed":
+                    return WorkerReport(WorkerState.RUNNING)
+                bundle = None
+                state = AttemptState.FAILED
+                error = status["error"]
+                if status["cancelled"]:
+                    state = AttemptState.CANCELLED
+                elif status["returncode"] == 0 and error is None:
+                    try:
+                        bundle = capture_tree(
+                            directory / "work" / "output", self.store, limits=ResourceLimits(**plan["limits"])
+                        )
+                        state = AttemptState.SUCCEEDED
+                    except Exception as failure:
+                        error = f"output publication failed: {type(failure).__name__}: {failure}"[:4096]
+                result = asdict(AttemptResult(attempt_id, state, bundle, status["returncode"], error))
+                atomic_write(directory / "result.json", encode(result))
+            return WorkerReport(
+                WorkerState.COMPLETED,
+                AttemptResult(
+                    result["attempt_id"],
+                    AttemptState(result["state"]),
+                    TreeBundle(result["bundle"]["digest"]) if result["bundle"] else None,
+                    result["returncode"],
+                    result["error"],
+                ),
+            )
+
+    def cancel(self, attempt_id: str) -> None:
+        directory = self._directory(attempt_id)
+        with locked(self.root / "worker.lock"):
+            directory.mkdir(exist_ok=True)
+            atomic_write(directory / "cancelled", b"1")
+            # The live supervisor observes the tombstone and kills its process
+            # group. If it died, _status performs the same reconciliation.
+            if (directory / "plan.json").exists():
+                self._status(directory)
+
+    def read_log(self, attempt_id: str, max_bytes: int = 16384) -> bytes:
+        """Read at most 64 KiB of the combined stdout/stderr tail on demand.
+
+        Diagnostics are local to the worker and retained until acknowledgement.
+        Missing or acknowledged logs raise FileNotFoundError. This method reads
+        at most min(max_bytes, log_bytes) bytes, even while the action is writing.
+        """
+        if type(max_bytes) is not int or not 1 <= max_bytes <= 65536:
+            raise ValueError("log reads need 1..65536 bytes")
+        directory = self._directory(attempt_id)
+        plan = _read(directory / "plan.json")
+        if plan is None:
+            raise FileNotFoundError("attempt has no log")
+        maximum = min(max_bytes, plan["limits"]["log_bytes"])
+        with (directory / "log").open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            stream.seek(max(0, stream.tell() - maximum))
+            return stream.read(maximum)
+
+    def acknowledge(self, attempt_id: str) -> None:
+        directory = self._directory(attempt_id)
+        with locked(self.root / "worker.lock"):
+            if not directory.exists():
+                directory.mkdir()
+            status = _read(directory / "status.json")
+            if _running(directory) or (status is not None and status["phase"] != "completed"):
+                raise ValueError("cannot acknowledge a running attempt")
+            if (directory / "plan.json").exists() and status is None:
+                raise ValueError("cannot acknowledge a pending attempt")
+            atomic_write(directory / "acknowledged", b"1")
+            if (directory / "work").exists():
+                _remove_workspace(directory / "work")
+            (directory / "log").unlink(missing_ok=True)
+            (directory / "result.json").unlink(missing_ok=True)
