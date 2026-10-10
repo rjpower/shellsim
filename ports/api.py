@@ -73,7 +73,11 @@ _HELPER_FILES = {
         "toolchain/wasi_threads/dynamic.py",
         "toolchain/wasi_process/source.py",
     ),
-    "uv-host": ("toolchain/uv/producer.py", "_support/producer_policy.py"),
+    "uv-host": (
+        "toolchain/uv/producer.py",
+        "toolchain/uv/tests/verify_target.py",
+        "_support/producer_policy.py",
+    ),
 }
 
 
