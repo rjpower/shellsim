@@ -19,6 +19,62 @@ The driver verifies cached inventories on every reuse. `--check` installs the se
 release through the public API and runs each declared guest probe before publication.
 Failed work remains available for diagnosis. This command creates local release assets.
 
+## Buildomatic cache builds
+
+The default `--backend local` keeps the existing build, release and acceptance
+workflow and imports no Iris dependencies. `--backend buildomatic` uses the same
+generic action protocol as remote workers, with isolated local worker processes:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports python/packaging --backend buildomatic \
+  --store /path/to/ports-store --offline
+```
+
+This writes verified results into the local ports cache and prints the checked
+manifest under `store/buildomatic/manifests`. Distributed builds do not accept
+`--output` or `--check`. Publication is a separate explicit operation:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports.buildomatic.ports publish /path/to/cache-manifest.json \
+  --sdk-descriptor /path/to/exported-sdk/sdk.json \
+  --store /path/to/ports-store --output /path/to/release --check
+```
+
+The publisher imports an already admitted SDK, verifies current recipe,
+implementation, predecessor and result identities, and invokes the existing
+release and guest acceptance functions. It never builds a missing SDK product.
+The Python API is `publish_manifest(manifest, ports, sdk_context, store, output,
+check=False)`. Missing results require a separate cache build before publication.
+Published releases have their own destination and lifetime; cache retention does
+not establish release retention.
+
+`ports.buildomatic.ports.prepare_graph` seals one action per canonical consumer
+recipe. The core ready queue owns port concurrency; `--jobs` bounds each port's
+Ninja or make parallelism. Preparation fetches hash-pinned sources, packages
+enumerated implementation files and selected recipe inputs, and exports admitted
+SDK products. Workers import original SDK and host Python roots, preload complete
+verified predecessor trees, then run the ordinary driver offline for one node.
+Changed predecessor keys or absent results fail before predecessor execution.
+SDK producers use imported products; the bridge never bootstraps LLVM remotely.
+Retained `--workspace` directories are unsupported for distributed actions.
+
+For Iris, pass a connected persistent `IrisBackend` as `remote_backend` and its
+`RemoteStore` as `blob_store` to `run_graph(..., backend="iris")`. The service owns
+accepted builds after client disconnect. `prepare_graph` and `collect_graph`
+also support separate submit and retrieval clients. Cache blobs and durable
+request journals use independently configured storage; evicted blobs are cache
+misses and must be rebuilt. Iris imports occur only when explicitly connecting
+to that backend.
+
+Compiler caching is opt-in through the typed `CompilerCacheLauncher` binding.
+Its worker-image executable is hash-admitted and only `-c` calls use it. Linking
+uses the real compiler. Public S3/GCS configuration is allowlisted; credentials
+belong to the worker's cache daemon and never enter code bundles or receipts.
+Source, build and dependency roots enter `SCCACHE_BASEDIRS` at execution time so
+private attempt paths do not defeat cache reuse or enter product identities.
+
 ## Author a port
 
 Each production port has one `recipe.json`. It declares source URLs and checksums,

@@ -237,3 +237,74 @@ def test_executable_archive_tail_resolves_real_symbol_only_for_links(build_reque
         check=False,
     )
     assert result.returncode != 0
+
+
+def test_admitted_cache_launcher_handles_only_object_compilation(build_request, monkeypatch):
+    from ports._support.native_adapters import CompilerCacheLauncher, build_environment, compiler_wrapper_text
+    from ports._support.store import file_hash
+
+    context = build_request.context
+    context.source.mkdir()
+    compiler = shutil.which("cc")
+    assert compiler is not None
+    log = context.source / "cache-calls.jsonl"
+    launcher = context.source / "sccache"
+    launcher.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        f"with open({str(log)!r}, 'a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "os.execv(sys.argv[1], sys.argv[1:])\n"
+    )
+    launcher.chmod(0o755)
+    context = replace(
+        context,
+        host_tools={"python": Path(sys.executable), "pkg-config": Path("/admitted/pkg-config"), "cc": Path(compiler)},
+        target_tools={
+            "cc": Path(compiler),
+            "cxx": Path(compiler),
+            "ar": Path("/admitted/ar"),
+            "ranlib": Path("/admitted/ranlib"),
+        },
+        compiler_cache=CompilerCacheLauncher(
+            launcher, file_hash(launcher), (("SCCACHE_DIR", str(context.source / "cache")),)
+        ),
+    )
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+    environment = build_environment(context, {})
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert environment["SCCACHE_BASEDIRS"] == ":".join(
+        map(str, (context.source, context.build, context.dependency_sysroot))
+    )
+    wrapper = context.source / "cc"
+    wrapper.write_text(
+        compiler_wrapper_text(context, "cc", (Path(__file__).parents[1] / "compiler_response.py").read_text())
+    )
+    wrapper.chmod(0o755)
+    source = context.source / "main.c"
+    source.write_text("int main(void) { return 0; }\n")
+    response = context.source / "compile.rsp"
+    response.write_text("-c " + str(source) + " -o " + str(context.source / "main.o"))
+    subprocess.run([str(wrapper), "@" + str(response)], env=environment, check=True)
+    subprocess.run(
+        [str(wrapper), str(context.source / "main.o"), "-o", str(context.source / "main")], env=environment, check=True
+    )
+    subprocess.run([str(wrapper), "-E", str(source)], env=environment, stdout=subprocess.DEVNULL, check=True)
+    import json
+
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 1
+    assert calls[0][0] == compiler
+    assert calls[0][-1] == "@" + str(response)
+
+
+@pytest.mark.parametrize(
+    "binding", [("AWS_SECRET_ACCESS_KEY", "secret"), ("CC", "ambient"), ("SCCACHE_DIR", "bad\0path")]
+)
+def test_cache_launcher_rejects_unadmitted_environment(tmp_path, binding):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+    from ports._support.store import file_hash
+
+    launcher = tmp_path / "sccache"
+    launcher.write_text("executable fixture")
+    launcher.chmod(0o755)
+    with pytest.raises(ValueError):
+        compiler_cache_identity(CompilerCacheLauncher(launcher, file_hash(launcher), (binding,)))

@@ -5,10 +5,59 @@ this context. Adapters build into its staging prefix; the runner alone seals
 exports, publishes cache entries and emits catalogs. Commands are argv vectors.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Mapping
+
+
+@dataclass(frozen=True)
+class CompilerCacheLauncher:
+    """Explicit worker-image executable and public cache configuration.
+
+    Credentials remain a worker service concern. This binding carries no ambient
+    environment and enables caching only for compilation to object files.
+    """
+
+    path: Path
+    sha256: str
+    environment: tuple[tuple[str, str], ...] = ()
+
+
+def compiler_cache_identity(launcher: CompilerCacheLauncher) -> dict:
+    """Admit executable bytes and a bounded cache configuration before use."""
+    from ports._support.store import file_hash
+
+    allowed = {
+        "SCCACHE_DIR",
+        "SCCACHE_CACHE_SIZE",
+        "SCCACHE_ENDPOINT",
+        "SCCACHE_BUCKET",
+        "SCCACHE_REGION",
+        "SCCACHE_S3_KEY_PREFIX",
+        "SCCACHE_S3_USE_SSL",
+        "SCCACHE_IDLE_TIMEOUT",
+        "SCCACHE_SERVER_PORT",
+        "SCCACHE_BASEDIRS",
+        "SCCACHE_GCS_BUCKET",
+        "SCCACHE_GCS_KEY_PREFIX",
+        "SCCACHE_GCS_RW_MODE",
+        "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE",
+    }
+    if not launcher.path.is_absolute() or not launcher.path.stat().st_mode & 0o111:
+        raise ValueError("compiler cache requires an absolute executable")
+    if file_hash(launcher.path) != launcher.sha256:
+        raise ValueError("compiler cache executable differs from admitted bytes")
+    environment = dict(launcher.environment)
+    if (
+        len(environment) != len(launcher.environment)
+        or environment.keys() - allowed
+        or any(not isinstance(value, str) or len(value) > 4096 or "\0" in value for value in environment.values())
+    ):
+        raise ValueError("unsupported compiler cache environment")
+    return {"path": str(launcher.path), "sha256": launcher.sha256, "environment": environment}
 
 
 def write_build_file(path: Path, contents: str) -> None:
@@ -49,6 +98,7 @@ class NativeBuildContext:
     retained_workspace: bool = False
     shared_library_inputs: tuple[Path, ...] = ()
     executable_link_inputs: tuple[Path, ...] = ()
+    compiler_cache: CompilerCacheLauncher | None = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +160,7 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
     """Generate the exact compiler driver consumed by every native adapter."""
     python = context.host_tools["python"]
     base = [str(context.target_tools[role]), *context.compiler_flags]
+    cache = compiler_cache_identity(context.compiler_cache) if context.compiler_cache is not None else None
     return (
         "#!"
         + str(python)
@@ -134,6 +185,14 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "    command += "
         + repr(list(context.executable_flags))
         + "\n"
+        + (
+            "if '-c' in options and not any(flag in options for flag in ('-S', '-E')):\n"
+            + "    command.insert(0, "
+            + repr(cache["path"])
+            + ")\n"
+            if cache
+            else ""
+        )
         + "os.execv(command[0], command + arguments + ("
         + repr([str(path) for path in context.shared_library_inputs])
         + " if is_shared else "
@@ -171,6 +230,12 @@ def build_environment(context: NativeBuildContext, configure_environment: Mappin
         }
     )
     environment.update(configure_environment)
+    if context.compiler_cache is not None:
+        environment.update(compiler_cache_identity(context.compiler_cache)["environment"])
+        roots = [str(context.source), str(context.build), str(context.dependency_sysroot)]
+        if environment.get("SCCACHE_BASEDIRS"):
+            roots.append(environment["SCCACHE_BASEDIRS"])
+        environment["SCCACHE_BASEDIRS"] = os.pathsep.join(roots)
     return environment
 
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.native_adapters import (
+    CompilerCacheLauncher,
     NativeBuildContext,
 )
 from ports._support.python_adapters import (
@@ -157,12 +158,18 @@ def build_graph(
     jobs: int | None = None,
     default_sdk: str = "default",
     workspaces: Mapping[str, Path] | None = None,
+    admitted_predecessors: Mapping[str, str] | None = None,
+    compiler_cache: CompilerCacheLauncher | None = None,
 ) -> GraphBuild:
-    """Execute admitted port builders and publish byte-verified immutable results."""
+    """Execute admitted port builders and publish byte-verified immutable results.
+
+    Transferred predecessors must have their current key and a verified cached
+    result. They never build on a miss, including when implementation bytes change.
+    """
     from ports._support.local_sources import stage_local_sources
     from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot, seal_native_install
     from ports._support.sdk_products import resolved_toolchain, verify_product
-    from ports._support.store import identity
+    from ports._support.store import identity, verify
     from ports.api import BuildContext, build_port, implementation
 
     if jobs is not None and not 1 <= jobs <= 16:
@@ -171,6 +178,8 @@ def build_graph(
         ports, requests, target_profile=sdk_context.dynamic_abi if sdk_context else None, default_sdk=default_sdk
     )
     selected = {port.reference: port for port in graph.ports}
+    if set(admitted_predecessors or {}) - selected.keys():
+        raise ValueError("admitted predecessor is outside the requested graph")
     for reference in workspaces or {}:
         if reference not in selected or selected[reference].recipe["build_system"] not in {
             "llvm-guest",
@@ -208,6 +217,9 @@ def build_graph(
             products[port.reference] = product
             results[port.reference] = product.root
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
+            if port.reference in (admitted_predecessors or {}):
+                if admitted_predecessors[port.reference] != keys[port.reference]:
+                    raise ValueError("admitted predecessor key differs: " + port.reference)
             continue
         build_sdk = sdk_context
         pure = system in {"pure-wheel", "host-wheel", "source-tree"}
@@ -240,6 +252,10 @@ def build_graph(
         if port.sdk_selection is not None:
             inputs["sdk_selection"] = asdict(port.sdk_selection)
         if not pure:
+            if compiler_cache is not None:
+                from ports._support.native_adapters import compiler_cache_identity
+
+                inputs["compiler_cache"] = compiler_cache_identity(compiler_cache)
             inputs["sdk"] = build_sdk.identity
             inputs["host_tools"] = {
                 name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
@@ -265,6 +281,14 @@ def build_graph(
                 }
         # Cache receipts use JSON arrays for the typed toolchain argument tuples.
         inputs = json.loads(json.dumps(inputs, sort_keys=True))
+        if port.reference in (admitted_predecessors or {}):
+            expected = admitted_predecessors[port.reference]
+            if expected != identity(inputs):
+                raise ValueError("admitted predecessor key differs: " + port.reference)
+            predecessor = store.resolve() / "results" / expected
+            if not predecessor.is_dir():
+                raise ValueError("admitted predecessor result is missing: " + port.reference)
+            verify(predecessor, inputs)
         with build_slot(store, inputs) as slot:
             keys[port.reference] = slot.key
             print(
@@ -344,6 +368,7 @@ def build_graph(
                         executable_flags=build_sdk.executable_flags,
                         shared_library_inputs=(build_sdk.compiler_runtime_archive,),
                         executable_link_inputs=executable_inputs,
+                        compiler_cache=compiler_cache,
                     )
                     python_context = None
                     if system.startswith("python-"):
@@ -584,10 +609,15 @@ def main() -> None:
         help="actual compatible retained Ninja build directory; producer state lives in its parent",
     )
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--backend", choices=("local", "buildomatic", "iris"), default="local")
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
     args = parser.parse_args()
+    if args.backend != "local" and args.output is not None:
+        parser.error(
+            "distributed builds emit cache manifests; use ports.buildomatic.ports.publish_manifest for releases"
+        )
     if args.check and args.output is None:
         parser.error("--check requires --output")
     workspaces = {}
@@ -635,7 +665,12 @@ def main() -> None:
         else None
     )
 
-    result = build_graph(
+    execute = build_graph
+    if args.backend != "local":
+        from ports.buildomatic.ports import run_graph
+
+        execute = run_graph
+    result = execute(
         args.ports,
         args.recipes,
         sdk_context,
@@ -644,6 +679,7 @@ def main() -> None:
         jobs=args.jobs,
         default_sdk=args.sdk,
         workspaces=workspaces,
+        **({"backend": args.backend} if args.backend != "local" else {}),
     )
     if args.output is not None:
         if args.check:
