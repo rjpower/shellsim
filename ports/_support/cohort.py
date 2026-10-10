@@ -189,7 +189,7 @@ class BuildCohort:
         return (
             "-shared",
             "-nostdlib",
-            "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init",
+            "-Wl,--shared-memory,--serial-memory-init,--defer-shared-init,--fatal-warnings",
             "-Wl,--import-memory,--import-table,--export-all,--no-entry,--unresolved-symbols=import-dynamic",
         )
 

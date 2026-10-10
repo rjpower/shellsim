@@ -27,7 +27,7 @@ from ports._support.native_adapters import (
 )
 from ports._support.python_adapters import CPythonBuildContext, PythonBuildOutput, _source_file, _wheel
 from ports._support.wasm import mark_abi
-from ports._support.wasm_metadata import needed_libraries
+from ports._support.wasm_metadata import validate_provider_signatures
 from ports.native.dependencies import file_hash
 
 _MAX_FILES = 16384
@@ -251,13 +251,21 @@ def build_python_meson(request: PythonMesonBuildRequest) -> PythonBuildOutput:
     extensions = stage_install_plan(plan, context.source, meson_build, wheel, tags)
     if not extensions:
         raise ValueError("Python Meson install contains no extension modules")
-    allowed_libraries = {path.name for prefix in context.dependencies.values() for path in prefix.rglob("*.so")}
+    providers = {}
+    for prefix in context.dependencies.values():
+        for path in prefix.rglob("*.so"):
+            if path.name in providers:
+                raise ValueError("declared native providers have duplicate library names")
+            providers[path.name] = path
+    required = build.get("required_shared_libraries", [])
+    if not isinstance(required, list) or any(not isinstance(name, str) or name not in providers for name in required):
+        raise ValueError("required shared libraries must name admitted target providers")
+    referenced = set()
     artifacts = []
     for extension in sorted(extensions):
         mark_abi(extension, recipe["abi"].encode())
-        dependencies = needed_libraries(extension)
-        if not set(dependencies) <= allowed_libraries:
-            raise ValueError("Python extension imports an undeclared native provider")
+        dependencies = validate_provider_signatures(extension, providers)
+        referenced.update(dependencies)
         artifacts.append(
             {
                 "path": extension.relative_to(wheel).as_posix(),
@@ -265,6 +273,8 @@ def build_python_meson(request: PythonMesonBuildRequest) -> PythonBuildOutput:
                 "native_dependencies": dependencies,
             }
         )
+    if not set(required) <= referenced:
+        raise ValueError("Python extensions do not reference required shared providers")
     dist = recipe["name"].replace("-", "_") + "-" + recipe["version"] + ".dist-info"
     info = wheel / dist
     info.mkdir(exist_ok=True)

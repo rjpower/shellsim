@@ -220,3 +220,10 @@ an artifact without changing an upstream package's `Requires-Dist`. Publication
 verifies its native closure, then assembles a separate runtime with the module
 and providers. It preserves the base interpreter and records exact artifact
 identities; module files are never published as generic `/lib` providers.
+
+Shared links treat linker warnings as errors, including incompatible function
+signatures. Python Meson packaging compares direct imported function types
+against the actual exports of declared shared providers before sealing.
+`build.required_shared_libraries` names admitted provider basenames that at
+least one installed extension must declare in its Wasm dependency metadata.
+This establishes the provider link separately from behavioral guest checks.
