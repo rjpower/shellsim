@@ -21,8 +21,9 @@ from .contracts import (
     Worker,
     WorkerReport,
     WorkerState,
+    request_id,
 )
-from .coordinator import Coordinator, CoordinatorFenced, IdempotencyConflict
+from .coordinator import Coordinator, CoordinatorFenced, IdempotencyConflict, read_build_result
 from .store import LocalStore
 from .worker import WorkerBusy, WorkerExecutor
 
@@ -54,4 +55,6 @@ __all__ = [
     "WorkerState",
     "capture_tree",
     "extract_tree",
+    "read_build_result",
+    "request_id",
 ]

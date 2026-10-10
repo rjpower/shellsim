@@ -43,6 +43,61 @@ class CoordinatorFenced(ConditionalWriteError):
     """A newer coordinator owns this journal; no further worker RPCs are allowed."""
 
 
+def _build_result(journal: dict, request: BuildRequest) -> BuildResult:
+    """Validate and aggregate a journal snapshot without changing ownership."""
+    if journal["schema"] != 1 or type(journal["generation"]) is not int or journal["generation"] < 1:
+        raise ValueError("invalid build journal schema or generation")
+    if journal["request_id"] != request_id(request) or type(journal["cancelled"]) is not bool:
+        raise ValueError("invalid build journal identity or cancellation state")
+    if set(journal["nodes"]) != {action.id for action in request.actions}:
+        raise ValueError("invalid build journal nodes")
+    nodes = []
+    for action in request.actions:
+        node = journal["nodes"][action.id]
+        attempts = node["attempts"]
+        state = NodeState(node["state"])
+        bundle = TreeBundle(node["bundle"]) if node["bundle"] is not None else None
+        if type(attempts) is not int or not 0 <= attempts <= action.max_attempts:
+            raise ValueError("invalid build journal attempt count")
+        if state == NodeState.SUCCEEDED and (bundle is None or attempts == 0):
+            raise ValueError("invalid successful node result")
+        if node["error"] is not None and (not isinstance(node["error"], str) or len(node["error"]) > 4096):
+            raise ValueError("invalid node diagnostics")
+        nodes.append(NodeResult(action.id, state, attempts, bundle, node["error"]))
+    states = {node.state for node in nodes}
+    if NodeState.RUNNING in states:
+        state = BuildState.RUNNING
+    elif NodeState.PENDING in states:
+        state = BuildState.PENDING
+    elif journal["cancelled"]:
+        state = BuildState.CANCELLED
+    elif states == {NodeState.SUCCEEDED}:
+        state = BuildState.SUCCEEDED
+    else:
+        state = BuildState.FAILED
+    return BuildResult(journal["request_id"], state, tuple(nodes))
+
+
+def read_build_result(store: Store, journal_key: str) -> BuildResult | None:
+    """Read a bounded typed snapshot without CAS, mutation or generation claim.
+
+    None means only that the accepted request journal is absent. Malformed or
+    oversized journals raise ValueError. Output bundles remain cache references;
+    this read does not fetch blobs or promise that cached outputs still exist.
+    """
+    current = store.read_journal(journal_key)
+    if current is None:
+        return None
+    if len(current.data) > MAX_METADATA_BYTES:
+        raise ValueError("build journal exceeds byte bound")
+    try:
+        journal = json.loads(current.data)
+        request = request_from_dict(journal["request"])
+        return _build_result(journal, request)
+    except (KeyError, TypeError, AttributeError) as error:
+        raise ValueError("invalid build journal") from error
+
+
 class Coordinator:
     """Drive a request by calling tick; there is no background coordinator thread.
 
@@ -264,29 +319,7 @@ class Coordinator:
 
     def result(self) -> BuildResult:
         self._check()
-        nodes = tuple(
-            NodeResult(
-                action.id,
-                NodeState(node["state"]),
-                node["attempts"],
-                TreeBundle(node["bundle"]) if node["bundle"] else None,
-                node["error"],
-            )
-            for action in self.request.actions
-            for node in (self._journal["nodes"][action.id],)
-        )
-        states = {node.state for node in nodes}
-        if NodeState.RUNNING in states:
-            state = BuildState.RUNNING
-        elif NodeState.PENDING in states:
-            state = BuildState.PENDING
-        elif self._journal["cancelled"]:
-            state = BuildState.CANCELLED
-        elif states == {NodeState.SUCCEEDED}:
-            state = BuildState.SUCCEEDED
-        else:
-            state = BuildState.FAILED
-        return BuildResult(self._journal["request_id"], state, nodes)
+        return _build_result(self._journal, self.request)
 
     def acknowledge(self) -> None:
         """Release terminal worker results after the caller durably consumes them."""

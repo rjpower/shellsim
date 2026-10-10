@@ -25,6 +25,8 @@ from ports.buildomatic import (
     WorkerState,
     capture_tree,
     extract_tree,
+    read_build_result,
+    request_id,
 )
 from ports.buildomatic.contracts import CHUNK_BYTES, encode
 
@@ -377,3 +379,52 @@ def test_independent_request_journals_remain_unaffected(store):
     first.cancel()
     assert second.tick().state == BuildState.RUNNING
     assert not second_worker.cancelled
+
+
+def test_read_build_result_never_writes_claims_or_fences_current_owner(store, bundle, monkeypatch):
+    worker = FakeWorker(store)
+    coordinator = Coordinator(store, "build", {"worker": worker})
+    submitted = request(action("a"))
+    assert coordinator.submit(submitted) == request_id(submitted)
+    coordinator.tick()
+    current = store.read_journal("build")
+
+    def forbidden_write(*args, **kwargs):
+        raise AssertionError("read-only result must not write a journal")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "write_journal", forbidden_write)
+        assert read_build_result(store, "absent") is None
+        assert read_build_result(store, "build") == coordinator.result()
+        assert store.read_journal("build") == current
+    replacement = Coordinator(store, "build", {"worker": worker})
+    with pytest.raises(CoordinatorFenced):
+        coordinator.result()
+    assert read_build_result(store, "build") == replacement.result()
+    worker.complete("a", bundle)
+    assert read_build_result(store, "build").state == BuildState.RUNNING
+    assert replacement.tick() == read_build_result(store, "build")
+    assert read_build_result(store, "build").state == BuildState.SUCCEEDED
+
+
+@pytest.mark.parametrize("data", [b"{}", b"[]", b"null", b"invalid json"])
+def test_read_build_result_rejects_invalid_journal(store, data):
+    store.write_journal("invalid", data, None)
+    with pytest.raises(ValueError):
+        read_build_result(store, "invalid")
+
+
+def test_read_build_result_rejects_invalid_node_and_oversized_payload(store, monkeypatch):
+    import ports.buildomatic.coordinator as implementation
+
+    coordinator = Coordinator(store, "build", {"worker": FakeWorker(store)})
+    coordinator.submit(request(action("a")))
+    current = store.read_journal("build")
+    journal = json.loads(current.data)
+    journal["nodes"]["a"]["attempts"] = -1
+    store.write_journal("build", encode(journal), current.version)
+    with pytest.raises(ValueError):
+        read_build_result(store, "build")
+    monkeypatch.setattr(implementation, "MAX_METADATA_BYTES", 8)
+    with pytest.raises(ValueError):
+        read_build_result(store, "build")

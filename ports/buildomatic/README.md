@@ -59,6 +59,10 @@ identity; conflicting content or keys raise `IdempotencyConflict`. The journal
 stores the accepted request separately from output cache blobs. Opening its
 coordinator claims a new generation, fencing old coordinators with
 `CoordinatorFenced`. A service lease should serialize coordinator ownership.
+`read_build_result(store, journal_key)` reads a bounded typed journal snapshot
+without writing or claiming a generation. It returns `None` only for an absent
+journal and rejects malformed data. `request_id(request)` returns the public
+canonical request identity without accepting or dispatching the request.
 Attempt IDs and assigned workers are durable before dispatch. Worker RPC errors
 retain assignments; they never imply loss. Only explicit `UNKNOWN` permits a
 bounded retry, after cancellation tombstones fence delayed dispatch. A worker
