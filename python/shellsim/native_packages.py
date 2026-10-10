@@ -26,8 +26,9 @@ _MAX_PACKAGES = 256
 _MAX_NAMES = 64
 _MAX_SEARCH = 2048
 _MAX_FILES = 10_000
-_MAX_BYTES = 256 * 1024 * 1024
-_MAX_RELEASE_BYTES = 384 * 1024 * 1024
+# Leave room for a compiler, its SDK and scientific dependencies in one install.
+_MAX_BYTES = 1024**3
+_MAX_RELEASE_BYTES = 2 * 1024**3
 _KINDS = {"devel", "runtime", "build-tool"}
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _INSTALL_ROOTS = ("/usr/bin/", "/usr/local/", "/usr/share/", "/opt/", "/lib/", "/tcc/", "/wasi-sysroot/")

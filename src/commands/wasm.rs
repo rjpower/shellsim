@@ -67,7 +67,9 @@ const MAX_CACHED_MODULES: usize = 4;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
-const MAX_CACHED_MODULE_BYTES: usize = 128 * 1024 * 1024;
+// Guest Clang occupies 338 MiB including its compiled image. Retain its linker
+// and utility modules alongside it without recompiling on every invocation.
+const MAX_CACHED_MODULE_BYTES: usize = 1024 * 1024 * 1024;
 // Wasm instructions are cheaper than a modeled CPU unit. This keeps a compiled byte-oriented
 // utility usable on ordinary input without relaxing the host's execution bound.
 const WASM_FUEL_PER_CPU_UNIT: u64 = 10;
@@ -2479,15 +2481,11 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
     let thread_profile =
         threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
-    let scratch = if thread_profile.is_some() {
-        (wasm.len() as u64).saturating_mul(65).saturating_add(4096)
-    } else {
-        0
-    };
+    let scratch = (wasm.len() as u64).saturating_mul(65).saturating_add(4096);
     if !interp.resources.reserve_memory(scratch) {
         return Err((
             137,
-            format!("{path}: thread compilation memory budget exhausted"),
+            format!("{path}: wasm compilation memory budget exhausted"),
         ));
     }
     let compiled = compiled_command_module(&wasm);

@@ -286,7 +286,7 @@ def _commands(context, workspace, source, jobs):
         "-lsetjmp",
         "-lunwind",
         "-Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory",
-        "-Wl,--initial-memory=134217728,--max-memory=1073741824,-z,stack-size=16777216",
+        "-Wl,--initial-memory=134217728,--max-memory=268435456,-z,stack-size=16777216",
         "-Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base",
         "-Wl,--export-if-defined=__wasm_apply_global_tls_relocs",
     ]

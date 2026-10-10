@@ -5,6 +5,11 @@ Guest native artifacts publish through the existing `native.zip` release asset.
 verified exports atomically. Host tools and target-platform products stay outside
 both guest catalogs and acceptance.
 
+Native artifacts and installed dependency closures allow 1 GiB of exports;
+release archives and unpacked catalogs allow 2 GiB. These transport bounds leave
+room for the compiler, SDK and scientific libraries together. Installation still
+obeys the environment's disk and memory budgets.
+
 Native recipes may declare `install` with `name` (a package alias), `kind`
 (`build-tool`, `devel`, or `runtime`), and `destinations` mapping exported relative
 paths to canonical absolute guest paths. Unspecified destinations use

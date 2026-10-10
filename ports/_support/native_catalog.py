@@ -85,7 +85,7 @@ def publish_native_catalog(graph: Graph, results: dict[str, Path], output: Path)
     ]
     if not selected:
         return None
-    remaining = 384 * 1024**2
+    remaining = 2 * 1024**3
     file_count = 0
     for port in selected:
         remaining, files = _publication_size(results[port.reference] / "native", remaining)

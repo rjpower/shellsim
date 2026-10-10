@@ -695,6 +695,7 @@ fn static_module_image_bound_and_compilation_cost_are_enforced() {
     let mut environment = Environment::with_limits(Limits {
         cpu: 1_000_000_000,
         disk: 256 * 1024 * 1024,
+        memory: 2 * 1024 * 1024 * 1024,
         ..Limits::default()
     });
     environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();
@@ -708,6 +709,18 @@ fn static_module_image_bound_and_compilation_cost_are_enforced() {
     let (status, _, stderr) = run(&mut constrained, "/app");
     assert_eq!(status, 137);
     assert!(String::from_utf8_lossy(&stderr).contains("wasm compilation budget exhausted"));
+
+    let mut constrained_memory = Environment::with_limits(Limits {
+        cpu: 1_000_000_000,
+        ..Limits::default()
+    });
+    constrained_memory
+        .vfs
+        .write("/", "/app", &bytes, 0o755)
+        .unwrap();
+    let (status, _, stderr) = run(&mut constrained_memory, "/app");
+    assert_eq!(status, 137);
+    assert!(String::from_utf8_lossy(&stderr).contains("wasm compilation memory budget exhausted"));
 
     bytes.resize(128 * 1024 * 1024 + 1, 0);
     environment.vfs.write("/", "/app", &bytes, 0o755).unwrap();

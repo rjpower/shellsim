@@ -41,7 +41,7 @@ The producer honors the requested compilation job count, up to eight jobs,
 and uses one link job. Build commands have
 a one-hour timeout and a 12 GiB address-space limit per process. The guest
 compiler executable reserves a 16 MiB C stack, starts with 128 MiB of linear
-memory and permits growth to 1 GiB, subject to Shellsim's memory budget.
+memory and permits growth to 256 MiB, subject to Shellsim's memory budget.
 
 This port does not enable native LLVM backends, the optional static analyzer,
 Objective-C rewriting or other LLD executable formats. Unix sockets, file
