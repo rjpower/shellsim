@@ -29,7 +29,16 @@ from urllib.parse import urlsplit
 
 import tomllib
 
-from ports.buildomatic.remote_store import DEFAULT_PREFIX, MAX_METADATA_BYTES, RemoteStore, validate_prefix
+from ports.buildomatic.remote_store import (
+    DEFAULT_PREFIX,
+    MAX_METADATA_BYTES,
+    BlobAccessRequest,
+    RemoteStore,
+    SignedBlobAccess,
+    SignedBlobStore,
+    sign_blob,
+    validate_prefix,
+)
 
 if TYPE_CHECKING:
     from ports.buildomatic import Attempt, BuildRequest, BuildResult, Store, Worker, WorkerReport
@@ -131,7 +140,9 @@ class CoordinatorService:
     The first cut retains at most 4096 build records per named service.
     """
 
-    def __init__(self, store: Store, service_id: str, workers: Mapping[str, Worker]):
+    def __init__(
+        self, store: Store, service_id: str, workers: Mapping[str, Worker], *, cache_prefix: str = DEFAULT_PREFIX
+    ):
         if _SERVICE_NAME.fullmatch(service_id) is None:
             raise ValueError("invalid Iris service name")
         self._store, self._workers = store, dict(workers)
@@ -141,6 +152,10 @@ class CoordinatorService:
         self._released = set()
         self._lock = threading.RLock()
         self._drive_lock = threading.Lock()
+        self._cache_prefix = validate_prefix(cache_prefix)
+
+    def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
+        return sign_blob(self._cache_prefix, request)
 
     def _index(self):
         found = self._store.read_journal(self._index_key)
@@ -323,6 +338,9 @@ class _CoordinatorActor:
 
     def GetLogs(self, build_id: str) -> tuple[dict[str, str], ...]:
         return self._service.get_logs(build_id)
+
+    def SignBlob(self, request: BlobAccessRequest) -> SignedBlobAccess:
+        return self._service.sign_blob(request)
 
 
 class WorkerProxy:
@@ -634,7 +652,7 @@ class IrisBackend:
         prefix: str = DEFAULT_PREFIX,
         cache_prefix: str | None = None,
     ):
-        self.store = RemoteStore(cache_prefix or prefix, journal_prefix=prefix)
+        self.store = SignedBlobStore(self.sign_blob)
         self._controller = controller_client
         self._name = f"{namespace.rstrip('/')}/coordinator"
         self._rpc_seconds = rpc_seconds
@@ -654,6 +672,10 @@ class IrisBackend:
 
     def submit(self, request: BuildRequest) -> str:
         return self._actor.call("Submit", request)
+
+    def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
+        """Return ephemeral single-object authority; callers must never log it."""
+        return self._actor.call("SignBlob", request)
 
     def get(self, build_id: str) -> BuildResult:
         return self._actor.call("Get", build_id)
@@ -838,7 +860,7 @@ def _run_coordinator(config: IrisConfig) -> None:
             service_id=config.service_id,
             worker_id=name,
         )
-    service = CoordinatorService(store, config.service_id, workers)
+    service = CoordinatorService(store, config.service_id, workers, cache_prefix=config.cache_prefix or config.prefix)
     # Current Iris calls scoped-capability access LINK; no anonymous proxy
     # access is enabled. The external transport keeps its minted URL private.
     server, endpoint_id = _serve_actor(_CoordinatorActor(service), "coordinator", EndpointAccess.ENDPOINT_ACCESS_LINK)

@@ -6,15 +6,167 @@ only when a remote operation runs so local builds do not depend on Iris packages
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import re
 import uuid
+from dataclasses import dataclass, field
+from typing import Callable, Literal
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
 
 DEFAULT_PREFIX = "s3://marin-us-east-02a/marin/shellsim/buildomatic/v1"
 MAX_METADATA_BYTES = 32 * 1024 * 1024
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _JOURNAL_HEADER = b"buildomatic-journal-v1:"
+
+
+@dataclass(frozen=True)
+class BlobAccessRequest:
+    """Authorize only one bounded immutable cache object, never a journal key."""
+
+    operation: Literal["get", "put"]
+    digest: str
+    size: int | None = None
+
+    def __post_init__(self):
+        if (
+            self.operation not in ("get", "put")
+            or not isinstance(self.digest, str)
+            or _DIGEST.fullmatch(self.digest) is None
+        ):
+            raise ValueError("invalid blob signing request")
+        if self.operation == "get":
+            if self.size is not None:
+                raise ValueError("GET size is determined by the bounded response")
+        elif type(self.size) is not int or not 0 <= self.size <= MAX_METADATA_BYTES:
+            raise ValueError("PUT blob size exceeds its bound")
+
+
+@dataclass(frozen=True)
+class SignedBlobAccess:
+    """Ephemeral transfer authority; its URL and headers must never be logged."""
+
+    request: BlobAccessRequest
+    url: str = field(repr=False)
+    headers: tuple[tuple[str, str], ...] = field(default=(), repr=False)
+
+
+@functools.cache
+def _signing_client(prefix: str):
+    import botocore.config
+    import botocore.session
+    from rigging.filesystem.cluster_config import StoreType, data_buckets
+    from rigging.filesystem.s3_compat import s3_credentials
+
+    parsed = urlsplit(prefix)
+    spec = data_buckets().get(parsed.netloc)
+    if parsed.scheme != "s3" or spec is None or spec.store != StoreType.COREWEAVE:
+        raise ValueError("signed transfers require a configured CoreWeave S3 bucket")
+    credentials = s3_credentials(spec.store)
+    if credentials is None:
+        raise PermissionError("worker has no configured object-store credentials")
+    # LOTA is cluster-local. Sign against the public origin itself: changing a
+    # signed URL's host afterwards invalidates its V4 signature.
+    return botocore.session.get_session().create_client(
+        "s3",
+        endpoint_url="https://cwobject.com",
+        region_name=spec.signing_region,
+        aws_access_key_id=credentials[0],
+        aws_secret_access_key=credentials[1],
+        config=botocore.config.Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+    )
+
+
+def sign_blob(prefix: str, request: BlobAccessRequest) -> SignedBlobAccess:
+    """Mint a two-minute transfer using service-side Rigging credentials only."""
+    prefix = validate_prefix(prefix)
+    request = BlobAccessRequest(request.operation, request.digest, request.size)
+    parsed = urlsplit(prefix)
+    params = {"Bucket": parsed.netloc, "Key": (parsed.path.strip("/") + "/blobs/" + request.digest).lstrip("/")}
+    headers = ()
+    if request.operation == "put":
+        # CoreWeave rejects presigned SHA256 checksum headers with
+        # SignatureDoesNotMatch. Sign length and conditional creation; clients
+        # verify the SHA256 on every read, including a concurrent winner.
+        params.update(IfNoneMatch="*", ContentLength=request.size)
+        headers = (("If-None-Match", "*"), ("Content-Length", str(request.size)))
+    url = _signing_client(prefix).generate_presigned_url(
+        f"{request.operation}_object", Params=params, ExpiresIn=120, HttpMethod=request.operation.upper()
+    )
+    return SignedBlobAccess(request, url, headers)
+
+
+class SignedBlobStore:
+    """External BlobStore using scoped signing RPCs and direct bounded HTTPS.
+
+    No cloud credentials or transfer URLs are retained. CAS journals belong to
+    the coordinator and are explicitly unavailable through this client store.
+    """
+
+    def __init__(self, signer: Callable[[BlobAccessRequest], SignedBlobAccess]):
+        self._signer = signer
+
+    def _access(self, request: BlobAccessRequest) -> SignedBlobAccess:
+        access = self._signer(request)
+        parsed = urlsplit(access.url)
+        if (
+            access.request != request
+            or parsed.scheme != "https"
+            or not (parsed.hostname or "").endswith(".cwobject.com")
+            or parsed.username
+            or parsed.password
+        ):
+            raise ValueError("invalid signed blob authority")
+        return access
+
+    def put_blob(self, data: bytes) -> str:
+        if len(data) > MAX_METADATA_BYTES:
+            raise ValueError("blob exceeds the supported storage bound")
+        digest = hashlib.sha256(data).hexdigest()
+        access = self._access(BlobAccessRequest("put", digest, len(data)))
+        try:
+            with urlopen(Request(access.url, data=data, headers=dict(access.headers), method="PUT"), timeout=30):
+                pass
+        except HTTPError as error:
+            status = error.code
+            error.close()
+            if status not in (409, 412):
+                raise OSError(f"signed blob PUT rejected: HTTP {status}") from None
+            if self.get_blob(digest) != data:
+                raise ValueError("concurrent blob winner is corrupt") from None
+        except (URLError, OSError):
+            raise OSError("signed blob PUT transport failed") from None
+        return digest
+
+    def get_blob(self, digest: str) -> bytes:
+        access = self._access(BlobAccessRequest("get", digest))
+        try:
+            with urlopen(Request(access.url, headers=dict(access.headers), method="GET"), timeout=30) as response:
+                size = response.headers.get("Content-Length")
+                if size is not None and not 0 <= int(size) <= MAX_METADATA_BYTES:
+                    raise ValueError("blob exceeds the supported storage bound")
+                data = response.read(MAX_METADATA_BYTES + 1)
+        except HTTPError as error:
+            status = error.code
+            error.close()
+            if status == 404:
+                raise FileNotFoundError(digest) from None
+            raise OSError(f"signed blob GET rejected: HTTP {status}") from None
+        except (URLError, OSError):
+            raise OSError("signed blob GET transport failed") from None
+        if len(data) > MAX_METADATA_BYTES or (size is not None and len(data) != int(size)):
+            raise ValueError("blob has invalid stored size")
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise ValueError("content-addressed blob is corrupt")
+        return data
+
+    def read_journal(self, key: str):
+        raise NotImplementedError("external blob clients cannot read coordinator journals")
+
+    def write_journal(self, key: str, data: bytes, expected_version: str | None):
+        raise NotImplementedError("external blob clients cannot write coordinator journals")
 
 
 def validate_prefix(prefix: str) -> str:

@@ -12,6 +12,7 @@ import threading
 import zipfile
 from dataclasses import replace
 from types import ModuleType, SimpleNamespace
+from urllib.error import HTTPError, URLError
 
 import pytest
 
@@ -46,7 +47,123 @@ from ports.buildomatic.backends.iris import (
     connection_descriptor,
 )
 from ports.buildomatic.contracts import request_id
-from ports.buildomatic.remote_store import DEFAULT_PREFIX, RemoteStore
+from ports.buildomatic.remote_store import (
+    DEFAULT_PREFIX,
+    BlobAccessRequest,
+    RemoteStore,
+    SignedBlobAccess,
+    SignedBlobStore,
+    sign_blob,
+)
+
+
+@pytest.fixture
+def signed_store(monkeypatch):
+    objects, reads, requests = {}, [], []
+
+    class Response(io.BytesIO):
+        def __init__(self, data):
+            super().__init__(data)
+            self.headers = {"Content-Length": str(len(data))}
+
+        def read(self, size=-1):
+            reads.append(size)
+            return super().read(size)
+
+    def signer(request):
+        headers = (("If-None-Match", "*"), ("Content-Length", str(request.size))) if request.operation == "put" else ()
+        return SignedBlobAccess(request, f"https://bucket.cwobject.com/blobs/{request.digest}?secret-token", headers)
+
+    def transfer(request, *, timeout):
+        assert timeout == 30
+        digest = request.full_url.partition("?")[0].rsplit("/", 1)[1]
+        requests.append(request)
+        if request.method == "PUT":
+            assert request.get_header("If-none-match") == "*"
+            assert int(request.get_header("Content-length")) == len(request.data)
+            if digest in objects:
+                raise HTTPError(request.full_url, 412, "exists", {}, None)
+            objects[digest] = request.data
+            return Response(b"")
+        if digest not in objects:
+            raise HTTPError(request.full_url, 404, "missing", {}, None)
+        return Response(objects[digest])
+
+    monkeypatch.setattr(remote_store, "urlopen", transfer)
+    return SimpleNamespace(
+        store=SignedBlobStore(signer), objects=objects, reads=reads, requests=requests, signer=signer
+    )
+
+
+def test_signed_transfer_conditional_create_conflict_get_and_corruption(signed_store):
+    store = signed_store.store
+    digest = store.put_blob(b"input")
+    assert store.put_blob(b"input") == digest
+    assert store.get_blob(digest) == b"input"
+    assert signed_store.reads == [remote_store.MAX_METADATA_BYTES + 1] * 2
+    signed_store.objects[digest] = b"other"
+    with pytest.raises(ValueError):
+        store.get_blob(digest)
+    with pytest.raises(ValueError):
+        store.put_blob(b"input")
+    assert signed_store.objects[digest] == b"other"
+    with pytest.raises(FileNotFoundError):
+        store.get_blob("a" * 64)
+
+
+def test_signed_transfer_bounds_and_journals_are_not_exposed(signed_store, monkeypatch):
+    monkeypatch.setattr(remote_store, "MAX_METADATA_BYTES", 4)
+    with pytest.raises(ValueError):
+        signed_store.store.put_blob(b"large")
+    digest = hashlib.sha256(b"large").hexdigest()
+    signed_store.objects[digest] = b"large"
+    with pytest.raises(ValueError):
+        signed_store.store.get_blob(digest)
+    assert not signed_store.reads
+    with pytest.raises(NotImplementedError):
+        signed_store.store.read_journal("index")
+    with pytest.raises(NotImplementedError):
+        signed_store.store.write_journal("index", b"data", None)
+
+
+def test_signed_transfer_secrets_do_not_escape_repr_or_errors(signed_store, monkeypatch, caplog):
+    access = signed_store.signer(BlobAccessRequest("get", "a" * 64))
+    assert "secret-token" not in repr(access)
+
+    def fail(request, **kwargs):
+        raise URLError(f"network failure {request.full_url}")
+
+    monkeypatch.setattr(remote_store, "urlopen", fail)
+    with pytest.raises(OSError) as error:
+        signed_store.store.get_blob("a" * 64)
+    assert "secret-token" not in str(error.value)
+    assert "secret-token" not in caplog.text
+
+
+def test_signing_is_bounded_conditional_and_scoped_to_configured_blob_key(monkeypatch):
+    calls = []
+
+    def sign(method, **kwargs):
+        calls.append((method, kwargs))
+        return "https://bucket.cwobject.com/key?signed-secret"
+
+    monkeypatch.setattr(remote_store, "_signing_client", lambda prefix: SimpleNamespace(generate_presigned_url=sign))
+    request = BlobAccessRequest("put", hashlib.sha256(b"hello").hexdigest(), 5)
+    signed = sign_blob("s3://bucket/cache", request)
+    params = calls[0][1]["Params"]
+    assert params["Key"] == f"cache/blobs/{request.digest}"
+    assert params["IfNoneMatch"] == "*"
+    assert params["ContentLength"] == 5
+    assert "ChecksumSHA256" not in params
+    assert calls[0][1]["ExpiresIn"] == 120
+    assert dict(signed.headers)["If-None-Match"] == "*"
+    assert "signed-secret" not in repr(signed)
+    with pytest.raises(ValueError):
+        BlobAccessRequest("put", "../journal", 5)
+    with pytest.raises(ValueError):
+        BlobAccessRequest("put", "a" * 64, remote_store.MAX_METADATA_BYTES + 1)
+    with pytest.raises(ValueError):
+        BlobAccessRequest("get", "a" * 64, 5)
 
 
 class NativeConflict(RuntimeError):
@@ -374,14 +491,31 @@ def test_short_rpcs_do_not_wait_for_worker_submit(service_parts, monkeypatch):
 
 
 @pytest.mark.parametrize("preparation_failure", [True, False])
-def test_completed_worker_without_log_remains_observable(tmp_path, preparation_failure):
+def test_completed_worker_without_log_remains_observable(tmp_path, preparation_failure, monkeypatch):
     store = LocalStore(tmp_path / "store")
     executor = WorkerExecutor(store, tmp_path / "worker")
     actor = _WorkerActor(executor)
     proxy = WorkerProxy(actor, store=store, service_id="test", worker_id="worker-0")
     attempt = Attempt("attempt", "b" * 64, Action("a", ("true",)), (InputMount("missing", TreeBundle("a" * 64)),), 1)
     if preparation_failure:
-        proxy.submit(attempt)
+        entered, release = threading.Event(), threading.Event()
+
+        def missing(digest):
+            entered.set()
+            assert release.wait(10)
+            raise FileNotFoundError(digest)
+
+        monkeypatch.setattr(store, "get_blob", missing)
+        try:
+            proxy.submit(attempt)
+            assert entered.wait(10)
+            # Synchronize the asynchronous transfer, without elapsed-time
+            # assumptions about preparation or missing-log completion.
+            transfer = executor._transfers[attempt.id]
+        finally:
+            release.set()
+        transfer.join(10)
+        assert not transfer.is_alive()
     else:
         proxy.cancel(attempt.id)
     report = proxy.poll(attempt.id)
