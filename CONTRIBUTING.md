@@ -77,6 +77,10 @@ Before requesting review, run all safe tests through the same entrypoint as CI:
 make test
 ```
 
+Release 0.1.33 provides Linux and macOS wheels and a source distribution. Windows wheel builds
+are disabled while guest executable permission handling on Windows remains unresolved. Existing
+Windows artifacts remain available in their original releases.
+
 Changes to the Python package should also build and test the installed artifact rather than import
 from the source tree:
 

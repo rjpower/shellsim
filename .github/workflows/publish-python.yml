@@ -69,8 +69,6 @@ jobs:
             target: x86_64
           - os: macos-14
             target: aarch64
-          - os: windows-latest
-            target: x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
