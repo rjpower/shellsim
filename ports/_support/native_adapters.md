@@ -274,3 +274,7 @@ link inputs include a shared provider. Static-only probes keep the ordinary
 executable link policy. This selection is derived from admitted files rather
 than arbitrary test linker switches; the resulting command records the exact
 inputs and still runs as a native guest executable.
+
+Executable archives also apply to executable links made by upstream configure
+probes. Their feature checks see the same executable archive inputs as the final
+commands. Shared links receive their independently declared shared inputs.

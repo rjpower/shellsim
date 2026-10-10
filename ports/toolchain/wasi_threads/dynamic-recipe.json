@@ -87,7 +87,7 @@
     },
     {
       "file": "../llvm/compiler.py",
-      "sha256": "1891f15e7ab941731e2a565afc648342ecae2e2e3017a29debe442602520a8a6"
+      "sha256": "0a25e9d7dd91f9e47a926737f37d1e3f1cc5645086ec80bcbebbca5256a530cd"
     },
     {
       "file": "wasi-libc-atfork.patch",

@@ -26,7 +26,7 @@
   "build_scripts": [
     {
       "file": "guest.py",
-      "sha256": "137a62f2702d8cd4995d0fae8795fe70e0937fb58af7251a642c5a1054cad88d"
+      "sha256": "6e17810a8286ad989ba7b05acd12b42dec3b9e2a12ecb58870a29dfc2856984f"
     },
     {
       "file": "build.py",
@@ -34,11 +34,15 @@
     },
     {
       "file": "compiler.py",
-      "sha256": "1891f15e7ab941731e2a565afc648342ecae2e2e3017a29debe442602520a8a6"
+      "sha256": "0a25e9d7dd91f9e47a926737f37d1e3f1cc5645086ec80bcbebbca5256a530cd"
     },
     {
       "file": "../../_support/build.py",
       "sha256": "4ee204bb32eed63119d807b03d608ae1051d893860adf1f24e1ba347ae9ecd3f"
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231"
     }
   ],
   "name": "clang",
@@ -113,6 +117,13 @@
       "inputs": {
         "lld/wasm/Driver.cpp": "2c97f3f346260e5fdf64d72bbf5994f2d6f7872c1e6c531c03c2f68564b0091a",
         "lld/wasm/Writer.cpp": "b5ef106688c955bb6087c154f032a502248f00b4caaa5f17a8ebc114bcfad37a"
+      }
+    },
+    {
+      "file": "image-synthetic-ownership.patch",
+      "sha256": "b4a0a8d304ba790d8a3e7690a3324358593dd0389d5f5dcffae76393851e9231",
+      "inputs": {
+        "lld/wasm/SymbolTable.cpp": "9c790993180a129dcad3179187d0146563ecef72739b0b6ff87f58f877ea1e96"
       }
     }
   ],

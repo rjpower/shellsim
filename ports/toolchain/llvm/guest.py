@@ -10,6 +10,7 @@ import json
 import shlex
 import shutil
 import tarfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from ports._support.build import apply_patch, check_build_scripts
@@ -20,6 +21,7 @@ from ports.toolchain.llvm.build import digest, run
 from ports.toolchain.llvm.compiler import (
     configure_and_build,
     identity_hash,
+    update_workspace_patches,
     verify_product,
     verify_source,
     write_workspace,
@@ -238,6 +240,44 @@ def _validate_guest_layout(recipe):
                 raise ValueError("guest development SDK requires /usr/local")
 
 
+@dataclass(frozen=True)
+class GuestBuildPreparation:
+    """Verified source/configuration and dry-run evidence, never a published product."""
+
+    source: Path
+    source_sha256: str
+    commands: list[list[str]]
+    identity: dict
+    prefix: Path
+    state: dict
+
+
+def prepare_guest(context, recipe, compiler, *, jobs=None) -> GuestBuildPreparation:
+    """Admit source updates and snapshots, configure, then stop after Ninja dry-run.
+
+    The receipt remains in building phase. Normal build_guest must perform the
+    actual build and seal a new product before the graph can consume it.
+    """
+    workspace = context.build.parent
+    workspace.mkdir(parents=True, exist_ok=True)
+    with (workspace / ".guest-llvm.lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
+        attempts = workspace / "attempts" / plan.prefix.name
+        attempts.mkdir(parents=True, exist_ok=True)
+        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
+        configure_and_build(
+            plan.commands,
+            context.build,
+            plan.state,
+            workspace / "workspace.json",
+            attempts,
+            environment,
+            prepare_only=True,
+        )
+        return plan
+
+
 def build_guest(context, recipe, compiler, *, jobs=None):
     """Build from an archive and return an unsealed graph staging result.
 
@@ -252,7 +292,7 @@ def build_guest(context, recipe, compiler, *, jobs=None):
         return _build_guest_locked(context, recipe, compiler, workspace, jobs)
 
 
-def _build_guest_locked(context, recipe, compiler, workspace, jobs):
+def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
     requested_jobs = recipe["build"]["jobs"] if jobs is None else jobs
@@ -295,10 +335,20 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     state = {"schema_version": 1, "compatibility": compatibility, "inputs": inputs}
     previous = inputs["snapshots"]
     previous_tools = compiler_tools
+    updated_source_hash = None
     if receipt.exists():
         state = json.loads(receipt.read_text())
         if state["compatibility"] != compatibility:
-            raise ValueError("guest LLVM workspace inputs differ; choose another workspace")
+            updated_source_hash = update_workspace_patches(
+                context.source,
+                workspace / "source",
+                recipe,
+                PORT,
+                workspace,
+                state,
+                compatibility,
+                build_directory=context.build,
+            )
         previous = state["inputs"]["snapshots"]
         previous_tools = state["inputs"]["compiler_tools"]
     elif context.build.exists() or (workspace / "source").exists():
@@ -337,11 +387,31 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
             apply_patch(roots[0], PORT / patch["file"], patch["sha256"])
         roots[0].rename(source)
         preparing.rmdir()
-    source_hash = verify_source(context.source, source, recipe, PORT)
+    source_hash = updated_source_hash or verify_source(context.source, source, recipe, PORT)
+    journal = workspace / "patch-update.json"
+    if journal.exists():
+        if json.loads(journal.read_text())["new"] != compatibility:
+            raise ValueError("pending guest LLVM patch update differs")
+        journal.unlink()
     commands = _commands(context, workspace, source, compile_jobs)
     identity = {**inputs, "commands": commands}
     key = identity_hash(identity)
     prefix = workspace / "products" / key
+    return GuestBuildPreparation(source, source_hash, commands, identity, prefix, state)
+
+
+def _build_guest_locked(context, recipe, compiler, workspace, jobs):
+    plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
+    source, source_hash, commands, identity, prefix, state = (
+        plan.source,
+        plan.source_sha256,
+        plan.commands,
+        plan.identity,
+        plan.prefix,
+        plan.state,
+    )
+    key = prefix.name
+    receipt = workspace / "workspace.json"
     if not prefix.exists():
         attempts = workspace / "attempts" / key
         attempts.mkdir(parents=True, exist_ok=True)
@@ -355,6 +425,7 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
             "schema_version": 1,
             "identity": identity,
             "source_tree_sha256": source_hash,
+            "patch_updates": state.get("patch_updates", []),
             "artifacts": _inventory(staging),
         }
         (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")

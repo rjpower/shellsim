@@ -8,7 +8,7 @@
     "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
     "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a"
   },
-  "sysroot_recipe_sha256": "43d320467ddf0c361b274aad0c2675c7ecb5ad2a67b87ff6b16f7188c013c4bc",
+  "sysroot_recipe_sha256": "3e67eaf7ce80b5e171ed0904de973afe0dcae1cccb63bc2b28065dd3aebd3c63",
   "patches": [
     {
       "file": "sdk34-threads.patch",
@@ -52,7 +52,7 @@
     },
     {
       "file": "../../toolchain/wasi_threads/dynamic-recipe.json",
-      "sha256": "43d320467ddf0c361b274aad0c2675c7ecb5ad2a67b87ff6b16f7188c013c4bc"
+      "sha256": "3e67eaf7ce80b5e171ed0904de973afe0dcae1cccb63bc2b28065dd3aebd3c63"
     },
     {
       "file": "../../toolchain/llvm/build.py",

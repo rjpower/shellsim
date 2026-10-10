@@ -44,8 +44,12 @@ def write_workspace(path, value):
     temporary.replace(path)
 
 
-def configure_and_build(commands, output, workspace, receipt, attempts, environment):
-    """Recover configuration or Ninja interruption under the workspace lock."""
+def configure_and_build(commands, output, workspace, receipt, attempts, environment, *, prepare_only=False):
+    """Recover configuration/build under lock, or stop after an explicit Ninja dry-run.
+
+    Preparation leaves building phase intact; only a successful actual build
+    marks the retained workspace ready for product sealing.
+    """
     cache = output / "CMakeCache.txt"
     phase = workspace.get("phase", "ready")
     if phase not in {"ready", "configuring", "building"}:
@@ -60,6 +64,9 @@ def configure_and_build(commands, output, workspace, receipt, attempts, environm
     workspace["configuration_sha256"] = digest(cache)
     workspace["phase"] = "building"
     write_workspace(receipt, workspace)
+    if prepare_only:
+        run([commands[1][0], "-n", *commands[1][1:]], attempts / f"dry-run-{attempt}.log", environment)
+        return
     run(commands[1], attempts / f"build-{attempt}.log", environment)
     workspace["configuration_sha256"] = digest(cache)
     workspace["phase"] = "ready"
@@ -159,7 +166,9 @@ def replace_patch_input(snapshot, destination, work):
         temporary.unlink(missing_ok=True)
 
 
-def update_workspace_patches(archive, source, recipe, directory, work, workspace, compatibility):
+def update_workspace_patches(
+    archive, source, recipe, directory, work, workspace, compatibility, *, build_directory=None
+):
     """Admit an append-only patch update under the producer's workspace lock.
 
     Snapshot only changed pinned files before mutation. A durable journal lets
@@ -169,17 +178,18 @@ def update_workspace_patches(archive, source, recipe, directory, work, workspace
     old = workspace["compatibility"]
     old_patches, new_patches = old["patches"], compatibility["patches"]
     if (
-        old["source"] != compatibility["source"]
-        or old["tools"] != compatibility["tools"]
+        {name: value for name, value in old.items() if name != "patches"}
+        != {name: value for name, value in compatibility.items() if name != "patches"}
         or new_patches[: len(old_patches)] != old_patches
         or len(new_patches) <= len(old_patches)
     ):
-        raise ValueError("LLVM workspace update requires appended patches and identical source/tools")
+        raise ValueError("LLVM workspace update requires appended patches and identical compilation inputs")
     if digest(archive) != recipe["source"]["sha256"]:
         raise ValueError("LLVM source archive identity differs")
     if workspace.get("phase", "ready") != "ready":
         raise ValueError("finish the prior LLVM build before updating patches")
-    if digest(work / "build/CMakeCache.txt") != workspace["configuration_sha256"]:
+    configuration = (work / "build" if build_directory is None else build_directory) / "CMakeCache.txt"
+    if digest(configuration) != workspace["configuration_sha256"]:
         raise ValueError("LLVM workspace configuration changed outside its producer")
     journal = work / "patch-update.json"
     snapshot = work / "patch-update-files"

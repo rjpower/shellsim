@@ -70,14 +70,19 @@ four patches, the complete driver/helper identity, host tool hashes, both
 compiler binaries and the upstream license. Diagnostic binaries built before
 this driver are evidence only and are not admitted as products of this recipe.
 
-The full host compiler producer can retain its Ninja tree when a pinned patch is
+The host and guest compiler producers can retain their Ninja trees when a pinned patch is
 appended to the existing patch sequence. Admission requires the same source
-archive and host tools, the exact old patch prefix, an unchanged CMake cache,
+archive and all non-patch compilation inputs, the exact old patch prefix, an unchanged CMake cache,
 and a full comparison of the retained source against the old pinned inputs.
 Only the declared affected files and patch markers move to the new admitted
 source. Atomic file replacement and a hash-bound journal make an interrupted
 update recoverable; unrelated source edits are rejected. New products record
 both source identities and keep the earlier immutable products.
+
+The guest producer also exposes `prepare_guest`: it admits the same inputs,
+configures the retained tree and records a Ninja dry-run. Preparation leaves
+the workspace unfinished and creates no sealed product. The normal graph
+build must complete the actual Ninja actions and seal the new output.
 
 Optional linker-synthesized data symbols belong to the current image. A symbol
 exported by a linked shared library cannot supply the main executable's heap or

@@ -118,3 +118,51 @@ def test_partial_staging_write_does_not_change_retained_source(project, monkeypa
     assert (source / "value.cpp").read_bytes() == original
     compiler.update_workspace_patches(archive, source, recipe, directory, work, workspace, compatibility)
     assert (source / "value.cpp").read_text() == "int value() { return 2; }\n"
+
+
+def test_guest_build_directory_preserves_unrelated_object_on_appended_patch(project):
+    archive, source, recipe, directory, work, workspace, compatibility, ninja = project
+    build = work / "threaded"
+    (work / "build").rename(build)
+    object_file = build / "main.o"
+    before = object_file.read_bytes(), object_file.stat().st_mtime_ns
+    compiler.update_workspace_patches(
+        archive, source, recipe, directory, work, workspace, compatibility, build_directory=build
+    )
+    subprocess.run([str(ninja), "-C", str(build)], check=True, capture_output=True)
+    assert subprocess.run([str(build / "program")], check=False).returncode == 2
+    assert (object_file.read_bytes(), object_file.stat().st_mtime_ns) == before
+
+
+def test_appended_patch_rejects_changed_nonpatch_compatibility(project):
+    archive, source, recipe, directory, work, workspace, compatibility, _ = project
+    workspace["compatibility"]["target"] = "admitted target"
+    incompatible = {**compatibility, "target": "other target"}
+    with pytest.raises(ValueError):
+        compiler.update_workspace_patches(archive, source, recipe, directory, work, workspace, incompatible)
+    assert subprocess.run([str(work / "build/program")], check=False).returncode == 1
+
+
+def test_preparation_dry_run_never_builds_or_marks_ready(tmp_path):
+    source, build = tmp_path / "source", tmp_path / "threaded"
+    source.mkdir()
+    build.mkdir()
+    (source / "value.cpp").write_text("int main(void) { return 0; }\n")
+    ninja, cxx = shutil.which("ninja"), shutil.which("c++")
+    if ninja is None or cxx is None:
+        pytest.skip("requires Ninja and a native C++ compiler")
+    (build / "CMakeCache.txt").write_text("pinned configuration\n")
+    (build / "build.ninja").write_text(
+        f"rule compile\n  command = {shlex.quote(cxx)} $in -o $out\nbuild program: compile {source}/value.cpp\n"
+    )
+    state = {"phase": "ready", "configuration_sha256": hash_file(build / "CMakeCache.txt")}
+    attempts = tmp_path / "attempts"
+    attempts.mkdir()
+    receipt = tmp_path / "workspace.json"
+    commands = [[shutil.which("true")], [ninja, "-C", str(build), "program"]]
+    compiler.configure_and_build(commands, build, state, receipt, attempts, None, prepare_only=True)
+    assert not (build / "program").exists()
+    assert json.loads(receipt.read_text())["phase"] == "building"
+    compiler.configure_and_build(commands, build, state, receipt, attempts, None)
+    assert subprocess.run([str(build / "program")], check=False).returncode == 0
+    assert json.loads(receipt.read_text())["phase"] == "ready"
