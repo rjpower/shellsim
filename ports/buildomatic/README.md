@@ -64,7 +64,7 @@ without writing or claiming a generation. It returns `None` only for an absent
 journal and rejects malformed data. `request_id(request)` returns the public
 canonical request identity without accepting or dispatching the request.
 Attempt IDs and assigned workers are durable before dispatch. Worker RPC errors
-retain assignments; they never imply loss. Only explicit `UNKNOWN` permits a
+retain assignments; they never imply loss. Explicit `UNKNOWN` permits a
 bounded retry, after cancellation tombstones fence delayed dispatch. A worker
 endpoint removed from the mapping remains uncertain until restored.
 
@@ -88,12 +88,35 @@ executed again. Cancellation kills the action process group. Pending nodes
 become cancelled, failed dependency branches become blocked, and independent
 branches continue after failures. Retries are bounded by `max_attempts`.
 
+Worker RPCs perform bounded durable metadata work. `submit` persists the full
+plan before returning; `poll` reports `RUNNING` while input preparation or output
+sealing is pending. Store I/O and workspace cleanup run outside the shared
+worker lock, so large SDKs/products do not hold RPCs or independent actions.
+One advisory transfer lock owns each attempt's transport. The durable plan,
+prepared marker, supervisor launch intent, terminal status and sealed result
+drive recovery on worker construction and later polls. Preparation can repeat
+after interruption only before launch intent. Interrupted publication reseals
+the completed quiescent output, without rerunning argv. Immutable chunk writes
+are safe to repeat. This requires the same durable worker root and accessible
+store after restart; a permanently lost worker instance uses the coordinator
+loss protocol above.
+
+Cancellation writes its durable tombstone immediately. Transfers check it
+between bounded blob operations before granting execution or result authority;
+an already issued storage operation must return before that transfer can stop.
+Actor-owned threads execute the work, while durable records preserve recovery
+intent if the actor exits. No in-memory future is required for reconciliation.
+Callers must poll to reconcile finished supervisors and receive sealed results.
+
 Completed worker results remain until `Coordinator.acknowledge()` after the
 caller consumes a terminal build result. The accepted journal and final result
 remain for recovery and idempotency. A failed acknowledgement is retried on
 later ticks, including after restart. `WorkerExecutor.read_log(attempt_id,
 max_bytes=16384)` returns a bounded stdout/stderr tail, with a 64 KiB per-read
 cap. Logs remain until acknowledgement and do not affect identity or publishing.
+Worker acknowledgement persists immediately; private workspace/log cleanup is
+asynchronous and resumes after restart. Acknowledged attempts report `UNKNOWN`
+and cannot be dispatched again, even before cleanup completes.
 
 Output bundles are cache references. Successful execution records do not promise
 release durability, cache retention or a TTL. Retrieving an expired manifest or

@@ -10,8 +10,11 @@ import json
 import os
 import shutil
 import signal
+import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -150,6 +153,7 @@ def test_pending_dispatch_launch_is_bounded_under_rapid_poll(worker, monkeypatch
     monkeypatch.setattr("ports.buildomatic.worker.subprocess.Popen", spawn)
     item = attempt("pass")
     worker.submit(item)
+    eventually(lambda: len(launches), bool)
     for _ in range(100):
         assert worker.poll(item.id).state == WorkerState.RUNNING
         worker.submit(item)
@@ -253,7 +257,8 @@ def test_terminal_status_published_between_read_and_lock_check(
             return running(path)
 
         monkeypatch.setattr(implementation, "_running", publish_then_unlock)
-        result = worker.poll(item.id).result
+        assert worker._status(directory) == completed
+    result = complete(worker, item)
     assert result.state == state
     assert result.returncode == completed["returncode"]
     assert result.error == completed["error"]
@@ -415,7 +420,7 @@ def test_acknowledge_removes_read_only_input_copies(worker, store, tmp_path):
     assert complete(worker, item).state == AttemptState.SUCCEEDED
     worker.acknowledge(item.id)
     worker.acknowledge(item.id)
-    assert not (worker.root / "attempts/test/work").exists()
+    eventually(lambda: not (worker.root / "attempts/test/work").exists(), bool)
     (root / "readonly").chmod(0o755)
 
 
@@ -454,10 +459,136 @@ def test_reused_action_pid_terminalizes_without_signalling_unrelated_group(worke
         raise AssertionError("reused process must never be signalled")
 
     monkeypatch.setattr(implementation, "kill_group", unexpected_signal)
-    result = worker.poll(item.id).result
+    result = complete(worker, item)
     assert result.state == AttemptState.FAILED
     assert result.error == "worker supervisor lost"
     assert worker.poll(item.id).result == result
+
+
+@pytest.mark.parametrize("phase", ["prepare", "publish"])
+def test_blocked_transport_does_not_block_rpcs_or_independent_actions(tmp_path, phase):
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingStore(LocalStore):
+        blocked_digest = None
+
+        def get_blob(self, digest):
+            if digest == self.blocked_digest:
+                entered.set()
+                assert release.wait(10), "test transport was never released"
+            return super().get_blob(digest)
+
+        def put_blob(self, data):
+            if phase == "publish" and data == b"held-output":
+                entered.set()
+                assert release.wait(10), "test transport was never released"
+            return super().put_blob(data)
+
+    store = BlockingStore(tmp_path / "store")
+    source = tmp_path / "sdk"
+    source.mkdir()
+    (source / "input").write_text("shared sdk")
+    bundle = capture_tree(source, store)
+    mounts = (InputMount("sdk", bundle),) if phase == "prepare" else ()
+    if mounts:
+        store.blocked_digest = bundle.digest
+    worker = WorkerExecutor(store, tmp_path / "worker", max_running=2)
+    held = attempt(
+        "import pathlib,os; pathlib.Path('ran').touch(); "
+        "pathlib.Path(os.environ['BUILD_OUTPUT_DIR'],'result').write_bytes(b'held-output')",
+        inputs=mounts,
+    )
+    other = attempt("pass", key="independent")
+    with ThreadPoolExecutor(max_workers=2) as rpc:
+        try:
+            submitted = rpc.submit(worker.submit, held)
+            if phase == "publish":
+                polling = rpc.submit(lambda: eventually(lambda: (worker.poll(held.id), entered.is_set())[1], bool))
+            assert entered.wait(5), "transport handshake did not start"
+            # No timeout/performance assertion: neither RPC may depend on the
+            # deliberately unreleased transport operation completing.
+            submitted.result(timeout=5)
+            if phase == "publish":
+                polling.result(timeout=5)
+            assert rpc.submit(worker.poll, held.id).result(timeout=5).state == WorkerState.RUNNING
+            rpc.submit(worker.submit, other).result(timeout=5)
+            assert complete(worker, other).state == AttemptState.SUCCEEDED
+            rpc.submit(worker.cancel, held.id).result(timeout=5)
+            assert worker.poll(other.id).result.state == AttemptState.SUCCEEDED
+        finally:
+            release.set()
+    result = complete(worker, held)
+    assert result.state == AttemptState.CANCELLED
+    if phase == "prepare":
+        assert not (worker.root / "attempts/test/work/ran").exists()
+    for child in worker._children:
+        child.wait(timeout=10)
+
+
+@pytest.mark.parametrize("phase", ["prepare", "publish"])
+def test_process_crash_during_transport_recovers_without_reexecuting_argv(tmp_path, phase):
+    store = LocalStore(tmp_path / "store")
+    source = tmp_path / "sdk"
+    source.mkdir()
+    (source / "input").write_text("shared sdk")
+    bundle = capture_tree(source, store)
+    counter = tmp_path / "executions"
+    code = (
+        f"import os,pathlib; pathlib.Path({str(counter)!r}).open('a').write('run\\n'); "
+        "pathlib.Path(os.environ['BUILD_OUTPUT_DIR'],'result').write_bytes(b'recovered-output')"
+    )
+    item = attempt(code, inputs=(InputMount("sdk", bundle),))
+    plan = asdict(item)
+    script = f"""
+import json,os,time
+from pathlib import Path
+from ports.buildomatic import Attempt,InputMount,TreeBundle,LocalStore,WorkerExecutor
+from ports.buildomatic.contracts import action_from_dict
+class CrashStore(LocalStore):
+    def get_blob(self,digest):
+        if {phase!r} == 'prepare':
+            os._exit(0)
+        return super().get_blob(digest)
+    def put_blob(self,data):
+        if {phase!r} == 'publish' and data == b'recovered-output':
+            os._exit(0)
+        return super().put_blob(data)
+value=json.loads({json.dumps(plan)!r})
+item=Attempt(value['id'],value['request_id'],action_from_dict(value['action']),
+    tuple(InputMount(m['name'],TreeBundle(m['bundle']['digest'])) for m in value['inputs']),value['generation'])
+worker=WorkerExecutor(CrashStore(Path({str(store.root)!r})),Path({str(tmp_path / "worker")!r}))
+worker.submit(item)
+while True:
+    worker.poll(item.id)
+    time.sleep(0.005)
+"""
+    environment = {"PATH": os.defpath, "PYTHONPATH": str(Path(__file__).resolve().parents[3])}
+    child = subprocess.Popen([sys.executable, "-c", script], env=environment)
+    try:
+        assert child.wait(timeout=10) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+    directory = tmp_path / "worker/attempts/test"
+    assert (directory / "plan.json").exists()
+    assert not (directory / "result.json").exists()
+    if phase == "prepare":
+        assert not (directory / "launch.json").exists()
+        assert not counter.exists()
+    else:
+        assert json.loads((directory / "status.json").read_bytes())["phase"] == "completed"
+        assert counter.read_text() == "run\n"
+    restarted = WorkerExecutor(store, tmp_path / "worker")
+    result = complete(restarted, item)
+    assert result.state == AttemptState.SUCCEEDED, result.error
+    restarted.submit(item)
+    assert restarted.poll(item.id).result == result
+    assert counter.read_text() == "run\n"
+    extract_tree(result.bundle, store, tmp_path / "recovered")
+    assert (tmp_path / "recovered/result").read_bytes() == b"recovered-output"
+    for process in restarted._children:
+        process.wait(timeout=10)
 
 
 def test_real_dag_dependency_bundle_and_independent_progress(worker, store, tmp_path):
