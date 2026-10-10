@@ -30,6 +30,10 @@
     {
       "file": "wasi.patch",
       "sha256": "999a594b1af99474348cdf8a521c32805a8cdfc3729d82a9f8bd3aa92148c11a"
+    },
+    {
+      "file": "private-portability.patch",
+      "sha256": "bf0da39c36e44d46c8fbc78fa52df149b3b7eebcb2d595756e42b69059b02aa3"
     }
   ],
   "target_dependencies": [

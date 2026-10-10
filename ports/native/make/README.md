@@ -39,3 +39,10 @@ recipe through the public release installation API.
 The graph recipe is a distinct threaded build from the earlier standalone
 `recipe.json` profile. Its successful build alone does not establish guest
 execution; use `--output ... --check` to build and run the declared check.
+
+On WASI, Make retains its bundled GNU option parser and glob implementation,
+including directory callbacks used by wildcard expansion. The graph patch gives
+these functions and parser state private names so they coexist with the canonical
+executable's exported libc implementations. Configure still rejects the SDK glob
+as a GNU glob provider. The shell check exercises long options, wildcard includes,
+parallel recipes and recovery after an invalid option.
