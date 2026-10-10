@@ -274,7 +274,24 @@ def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
     assert intervals and set(intervals) == {1.0}
 
 
-def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
+@pytest.fixture
+def iris_connection(tmp_path):
+    return {
+        "schema_version": 1,
+        "job_id": "/power/service",
+        "prefix": "durable",
+        "cache_prefix": "cache",
+        "controller_url": "https://iris.oa.dev",
+        "cluster_name": "marin",
+        "workspace": str(tmp_path),
+        "config_sha256": "a" * 64,
+        "task_image": "image@sha256:" + "b" * 64,
+        "service_id": "service",
+    }
+
+
+@pytest.mark.parametrize("task_image", [None, "image@sha256:" + "b" * 64])
+def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch, iris_connection, task_image):
     from contextlib import contextmanager
 
     import ports.buildomatic.ports as bridge
@@ -316,18 +333,7 @@ def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
         module.__dict__.update(exports)
         monkeypatch.setitem(sys.modules, name, module)
     service = tmp_path / "service.json"
-    connection = {
-        "schema_version": 1,
-        "job_id": "/power/service",
-        "prefix": "durable",
-        "cache_prefix": "cache",
-        "controller_url": "https://iris.oa.dev",
-        "cluster_name": "marin",
-        "workspace": str(tmp_path),
-        "config_sha256": "a" * 64,
-        "task_image": "image@sha256:" + "b" * 64,
-        "service_id": "service",
-    }
+    connection = {**iris_connection, "task_image": task_image}
     service.write_text(json.dumps(connection))
     actual_run = bridge.run_graph
 
@@ -335,7 +341,9 @@ def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
         assert isinstance(kwargs["remote_backend"], Backend)
         assert kwargs["blob_store"] is sentinel
         assert kwargs["worker_identity"] == {
-            name: connection[name] for name in ("config_sha256", "task_image", "service_id")
+            name: connection[name]
+            for name in ("config_sha256", "task_image", "service_id")
+            if connection[name] is not None
         }
         return sentinel
 
@@ -350,3 +358,36 @@ def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):
         service.write_text(json.dumps(invalid))
         with pytest.raises(ValueError):
             actual_run(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service)
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", True),
+        ("job_id", 12),
+        ("prefix", None),
+        ("cache_prefix", []),
+        ("controller_url", {}),
+        ("cluster_name", False),
+        ("workspace", None),
+        ("config_sha256", 1),
+        ("task_image", {}),
+        ("service_id", []),
+        ("controller_url", "https://user:password@iris.oa.dev"),
+    ],
+)
+def test_iris_connection_rejects_wrong_types_before_cloud_imports(tmp_path, monkeypatch, iris_connection, field, value):
+    import builtins
+
+    original = builtins.__import__
+
+    def reject_cloud(name, *args, **kwargs):
+        if name.split(".")[0] == "iris":
+            raise AssertionError("invalid descriptor imported Iris")
+        return original(name, *args, **kwargs)
+
+    service = tmp_path / "service.json"
+    service.write_text(json.dumps({**iris_connection, field: value}))
+    monkeypatch.setattr(builtins, "__import__", reject_cloud)
+    with pytest.raises(ValueError):
+        run_graph(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service)

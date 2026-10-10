@@ -17,6 +17,7 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
+from urllib.parse import urlsplit
 
 from ports._support.graph import Graph, plan
 from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
@@ -495,7 +496,7 @@ def run_graph(
             if iris_service.stat().st_size > 64 * 1024:
                 raise ValueError("Iris connection descriptor exceeds its size bound")
             connection = json.loads(iris_service.read_text())
-            if set(connection) != {
+            if not isinstance(connection, dict) or set(connection) != {
                 "schema_version",
                 "job_id",
                 "prefix",
@@ -510,6 +511,22 @@ def run_graph(
                 raise ValueError("unsupported Iris connection fields")
             if type(connection["schema_version"]) is not int or connection["schema_version"] != 1:
                 raise ValueError("unsupported Iris connection schema")
+            for name, value in connection.items():
+                if name == "schema_version" or (name in {"task_image", "cache_prefix"} and value is None):
+                    continue
+                if not isinstance(value, str) or not value or len(value) > 4096 or "\0" in value:
+                    raise ValueError("invalid public Iris connection field: " + name)
+            origin = urlsplit(connection["controller_url"])
+            if (
+                origin.scheme not in {"http", "https"}
+                or not origin.netloc
+                or origin.username
+                or origin.password
+                or origin.query
+                or origin.fragment
+                or origin.path not in {"", "/"}
+            ):
+                raise ValueError("Iris controller URL must be a public origin")
             from iris.cli.connect import open_iris_client
             from iris.cluster.types import JobName, Namespace
 
@@ -541,7 +558,11 @@ def run_graph(
                     port_timeout_seconds=port_timeout_seconds,
                     compiler_cache=compiler_cache,
                     build_key=build_key,
-                    worker_identity={name: connection[name] for name in ("config_sha256", "task_image", "service_id")},
+                    worker_identity={
+                        name: connection[name]
+                        for name in ("config_sha256", "task_image", "service_id")
+                        if connection[name] is not None
+                    },
                 )
         if blob_store is None or remote_backend is None:
             raise ValueError("Iris builds require a connected remote service and its blob store")

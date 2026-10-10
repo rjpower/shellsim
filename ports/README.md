@@ -85,6 +85,10 @@ descriptor contains no credentials; authentication belongs to the Iris client.
 Public `config_sha256`, `task_image` (use an image digest pin) and `service_id`
 fields bind service provenance into the request and checked manifest. Backend
 worker journals record the actual task-image and implementation identity.
+Default pilot services may emit `task_image: null`; the CLI omits that unknown
+image from request and manifest provenance. It retains explicit image identities
+for pinned deployments. `cache_prefix` may also be null to use the backend's
+configured default. Other connection fields require bounded nonempty strings.
 
 Repeating an unchanged build resumes its content-derived request. After cache
 eviction, supply a new explicit `--build-key` to accept a fresh request and
@@ -111,10 +115,14 @@ dependency and output path operands relative to the compilation working director
 External SDK paths and the compiler driver symlink remain exact. Cached Clang
 debug compiles use `-fdebug-compilation-dir=.`; GCC debug paths remain unchanged
 and may prevent reuse. Link commands retain their original response arguments.
-The opt-in acceptance test uses `SHELLSIM_TEST_SCCACHE` for the pinned v0.18.0
-binary and `SHELLSIM_TEST_WASM_CLANG` for an existing Clang. It proves an initial
+The native adapter wrapper tests use `SHELLSIM_TEST_SCCACHE` for the pinned v0.18.0
+binary and `SHELLSIM_TEST_WASM_CLANG` for an existing Clang. They prove an initial
 miss/write and a cross-workspace hit through generated C and Wasm wrappers,
 compares direct compiler bytes, and verifies linking leaves counters unchanged.
+The standalone core harness tests use `BUILDOMATIC_SCCACHE` and
+`BUILDOMATIC_PROBE_WASM_CLANG`; its command-line entry point is
+`python -m ports.buildomatic.acceptance.compiler_cache --sccache BINARY
+--compiler CLANG --root FRESH_ROOT --target wasm --local [--debug]`.
 
 ## Author a port
 
