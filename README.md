@@ -196,6 +196,10 @@ through that virtual toolchain. This is a tested subset of libc, not full POSIX 
 `wasm32-wasip1` command that uses only the listed imports can be written to the VFS with
 executable permissions and invoked by path or through `PATH`.
 
+Wasm compilation uses a host-private persistent cache with an 8 GiB soft disk limit and a
+bounded process-local module/admission cache. Host cache state does not change simulated
+resource charges. See [guest Clang loading measurements and cache settings](docs/guest-clang-performance.md).
+
 The [virtual display](docs/virtual-display.md) lets a Wasm guest present RGBA frames and poll
 bounded key events. A host-driven session can resume the guest between frames without granting it
 ambient display, input, or network access.

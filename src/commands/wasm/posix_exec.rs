@@ -145,10 +145,11 @@ fn resolve(
         {
             return Err(SyscallError::ResourceExhausted);
         }
-        let validation = (|| {
+        let validation: Result<(), SyscallError> = (|| {
             let bytes = interp.vfs.read_limited("/", &executable, MAX_WASM_BYTES)?;
-            threads::reject_raw_waits(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
-            let profile = threads::profile(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
+            let admission =
+                executable_admission(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
+            let profile = &admission.profile;
             let module = compiled_executable_module(&bytes, profile.as_ref())
                 .map_err(|_| SyscallError::ExecutableFormat)?;
             validate_imports(
@@ -159,7 +160,9 @@ fn resolve(
                     .as_ref()
                     .is_some_and(|profile| !profile.executable.needed.is_empty()),
             )
-            .map_err(|_| SyscallError::ExecutableFormat)
+            .map_err(|_| SyscallError::ExecutableFormat)?;
+            retain_executable_admission(&bytes, admission);
+            Ok(())
         })();
         interp.resources.release_memory(scratch);
         validation?;

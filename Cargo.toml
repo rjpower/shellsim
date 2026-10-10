@@ -10,6 +10,8 @@ repository = "https://github.com/rjpower/shellsim"
 publish = false
 include = [
     "/src/**",
+    "/build.rs",
+    "/python/native/Cargo.lock",
     "/vendor/wasmtime/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -31,6 +33,7 @@ name = "shellsim"
 path = "src/lib.rs"
 
 [dependencies]
+directories-next = "2"
 regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
@@ -43,7 +46,7 @@ base64 = "0.22"
 crc32fast = "1"
 flate2 = "1"
 memchr = "2"
-wasmtime = { path = "vendor/wasmtime", version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook", "threads"] }
+wasmtime = { path = "vendor/wasmtime", version = "49.0.0", default-features = false, features = ["runtime", "cranelift", "gc-drc", "std", "async", "call-hook", "threads", "cache", "parallel-compilation"] }
 wasmparser = "0.258.0"
 async-trait = "0.1.92"
 num-bigint = "0.4"
@@ -56,6 +59,7 @@ unicode-normalization = "0.1"
 # network/exec/fork so no Python-level trick can reach the real OS for those. shellsim
 # itself never opens sockets, execs, or forks, so this is safe for its own file I/O.
 [target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", features = ["process"] }
 seccompiler = "0.5"
 libc = "0.2"
 
@@ -63,6 +67,9 @@ libc = "0.2"
 default = []
 # Retained as an empty compatibility feature. Python is now always the minimal `-c` shim.
 python = []
+
+[build-dependencies]
+sha2 = "0.10"
 
 [dev-dependencies]
 wat = "1"

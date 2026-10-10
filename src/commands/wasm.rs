@@ -13,17 +13,18 @@
 //! instantiation. Neither path grants ambient host capabilities. [`WasmSession`] runs one guest
 //! against buffered standard streams for display-driven embedding.
 
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 use std::future::poll_fn;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
     AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, ExternType, Linker,
-    Module, Store, StoreContextMut, StoreLimitsBuilder,
+    Module, ModuleVersionStrategy, Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{
@@ -39,6 +40,7 @@ use crate::vfs::{resolve_against, VfsError};
 
 use super::util::ewln;
 
+mod compilation_cache;
 mod dynamic;
 mod ffi;
 mod fibers;
@@ -100,10 +102,18 @@ const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
 const ERRNO_NOSPC: i32 = 51;
 const ERRNO_RANGE: i32 = 68;
 
+type CompilationFlights = BTreeMap<[u8; 32], Weak<Mutex<()>>>;
+
 struct CachedModule {
     source: Vec<u8>,
     module: Module,
     bytes: usize,
+    admission: Option<ExecutableAdmission>,
+}
+
+#[derive(Clone)]
+struct ExecutableAdmission {
+    profile: Option<threads::Profile>,
 }
 
 #[derive(Default)]
@@ -145,41 +155,133 @@ impl ModuleCache {
             source: source.to_vec(),
             module,
             bytes,
+            admission: None,
         });
         self.bytes += bytes;
     }
+}
+
+/// Keep compiler settings identical for host caching and runtime compatibility checks.
+fn configure_command_engine(config: &mut Config) {
+    config
+        .consume_fuel(true)
+        .async_stack_size(ASYNC_STACK_BYTES)
+        .wasm_exceptions(true)
+        .wasm_threads(true)
+        .shared_memory(true)
+        .wasm_gc(false)
+        .collector(Collector::DeferredReferenceCounting);
+    config
+        .module_version(ModuleVersionStrategy::Custom(format!(
+            "shellsim-wasmtime-49-{}",
+            compilation_cache::BUILD_ID
+        )))
+        .expect("bounded patched Wasmtime identity");
 }
 
 fn command_engine() -> &'static Engine {
     static ENGINE: OnceLock<Engine> = OnceLock::new();
     ENGINE.get_or_init(|| {
         let mut config = Config::default();
-        config
-            .consume_fuel(true)
-            .async_stack_size(ASYNC_STACK_BYTES)
-            .wasm_exceptions(true)
-            .wasm_threads(true)
-            .shared_memory(true)
-            .wasm_gc(false)
-            .collector(Collector::DeferredReferenceCounting);
+        configure_command_engine(&mut config);
+        config.cache(compilation_cache::from_host());
         Engine::new(&config).expect("valid Wasmtime configuration")
     })
 }
 
-fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
-    threads::reject_raw_waits(source)?;
+fn command_module_cache() -> &'static Mutex<ModuleCache> {
     static CACHE: OnceLock<Mutex<ModuleCache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(ModuleCache::default()));
+    CACHE.get_or_init(|| Mutex::new(ModuleCache::default()))
+}
+
+/// Only original executable bytes may reuse a positive main-module admission profile.
+/// Side-module compilation entries have no profile, and rewritten startup images are separate
+/// keys. Failed admission is never retained. Guest resource charges precede this lookup.
+fn executable_admission(source: &[u8]) -> Result<ExecutableAdmission, Error> {
+    if let Some(admission) = command_module_cache()
+        .lock()
+        .expect("module cache lock")
+        .entries
+        .iter()
+        .find(|entry| entry.source == source)
+        .and_then(|entry| entry.admission.clone())
+    {
+        return Ok(admission);
+    }
+    threads::reject_raw_waits(source)?;
+    Ok(ExecutableAdmission {
+        profile: threads::profile(source)?,
+    })
+}
+
+fn retain_executable_admission(source: &[u8], admission: ExecutableAdmission) {
+    let metadata_bytes = std::mem::size_of::<ExecutableAdmission>().saturating_add(
+        admission
+            .profile
+            .as_ref()
+            .map_or(0, threads::Profile::cache_bytes),
+    );
+    let mut cache = command_module_cache().lock().expect("module cache lock");
+    let Some(index) = cache
+        .entries
+        .iter()
+        .position(|entry| entry.source == source)
+    else {
+        return;
+    };
+    if cache.entries[index].admission.is_some()
+        || cache.entries[index].bytes.saturating_add(metadata_bytes) > MAX_CACHED_MODULE_BYTES
+    {
+        return;
+    }
+    let mut entry = cache
+        .entries
+        .remove(index)
+        .expect("matching module cache entry");
+    while cache.bytes.saturating_add(metadata_bytes) > MAX_CACHED_MODULE_BYTES {
+        let old = cache.entries.pop_front().expect("other entry to evict");
+        cache.bytes -= old.bytes;
+    }
+    entry.bytes = entry.bytes.saturating_add(metadata_bytes);
+    entry.admission = Some(admission);
+    cache.bytes = cache.bytes.saturating_add(metadata_bytes);
+    cache.entries.push_back(entry);
+}
+
+fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
+    let cache = command_module_cache();
+    if let Some(module) = cache.lock().expect("module cache lock").get(source) {
+        return Ok(module);
+    }
+    threads::reject_raw_waits(source)?;
+    // Deduplicate only the same source. A cold tool must not block unrelated LRU hits.
+    static FLIGHTS: OnceLock<Mutex<CompilationFlights>> = OnceLock::new();
+    let digest: [u8; 32] = Sha256::digest(source).into();
+    let flight = {
+        let mut flights = FLIGHTS
+            .get_or_init(Mutex::default)
+            .lock()
+            .expect("compilation flights lock");
+        flights.retain(|_, flight| flight.strong_count() != 0);
+        flights
+            .entry(digest)
+            .or_default()
+            .upgrade()
+            .unwrap_or_else(|| {
+                let flight = Arc::new(Mutex::new(()));
+                flights.insert(digest, Arc::downgrade(&flight));
+                flight
+            })
+    };
+    let _compiling = flight.lock().expect("source compilation lock");
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
         return Ok(module);
     }
     let module = Module::new(command_engine(), source)?;
-    let mut cache = cache.lock().expect("module cache lock");
-    // A concurrent miss may have populated the cache while compilation ran.
-    if let Some(existing) = cache.get(source) {
-        return Ok(existing);
-    }
-    cache.insert(source, module.clone());
+    cache
+        .lock()
+        .expect("module cache lock")
+        .insert(source, module.clone());
     Ok(module)
 }
 
@@ -2590,9 +2692,9 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
     {
         return Err((137, format!("{path}: wasm compilation budget exhausted")));
     }
-    threads::reject_raw_waits(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
-    let thread_profile =
-        threads::profile(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let admission =
+        executable_admission(&wasm).map_err(|error| (126, format!("{path}: {error}")))?;
+    let thread_profile = admission.profile.clone();
     // Include the rewritten executable image retained beside compilation scratch.
     let scratch = (wasm.len() as u64).saturating_mul(66).saturating_add(4096);
     if !interp.resources.reserve_memory(scratch) {
@@ -2616,6 +2718,7 @@ fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, S
             .is_some_and(|profile| !profile.executable.needed.is_empty()),
     )
     .map_err(|error| (126, format!("{path}: {error}")))?;
+    retain_executable_admission(&wasm, admission);
     let mut linker = build_linker(command_engine());
     let mut dynamic_abi = None;
     let mut ffi_requested = false;
@@ -3364,6 +3467,29 @@ mod tests {
         snapshot_process.release_owned_memory(&mut snapshot);
         assert_eq!(original.resources.memory_mark(), 0);
         assert_eq!(snapshot.resources.memory_mark(), 0);
+    }
+
+    #[test]
+    #[ignore = "set SHELLSIM_CLANG_FIXTURE to measure host admission scans"]
+    fn measure_guest_admission_scans() {
+        use std::time::Instant;
+        let source = std::fs::read(std::env::var("SHELLSIM_CLANG_FIXTURE").unwrap()).unwrap();
+        for _ in 0..2 {
+            let started = Instant::now();
+            threads::reject_raw_waits(&source).unwrap();
+            let waits = started.elapsed();
+            let started = Instant::now();
+            let profile = threads::profile(&source).unwrap();
+            let profile_time = started.elapsed();
+            let started = Instant::now();
+            let rewritten = profile
+                .as_ref()
+                .filter(|profile| !profile.executable.needed.is_empty())
+                .map(|profile| {
+                    threaded_dynamic::layout::defer_start(&source, &profile.executable).unwrap()
+                });
+            eprintln!("wait rejection: {waits:?}; thread profile: {profile_time:?}; rewrite: {:?}; rewritten bytes: {}", started.elapsed(), rewritten.as_ref().map_or(0, Vec::len));
+        }
     }
 
     #[test]

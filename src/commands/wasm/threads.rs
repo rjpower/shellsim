@@ -13,7 +13,8 @@ pub(super) const MAX_THREADS: usize = 16;
 const MAX_THREAD_ID: u32 = 0x1fff_ffff;
 
 /// Raw Wasmtime waits use host blocking and time. Reject them before compiling
-/// either a main module or a side module, including on a compilation cache hit.
+/// either a main module or a side module. Exact bytes already admitted to the process-local
+/// module cache carry this successful check. Native disk-cache hits still require admission.
 pub(super) fn reject_raw_waits(bytes: &[u8]) -> Result<(), wasmtime::Error> {
     for payload in wasmparser::Parser::new(0).parse_all(bytes) {
         if let wasmparser::Payload::CodeSectionEntry(body) = payload? {
@@ -241,6 +242,7 @@ mod tests {
 
 /// Static threaded ABI memory must be imported, bounded and wasm32. Dynamic
 /// graph/TLS replay needs a separate coherent ABI before sharing these Stores.
+#[derive(Clone)]
 pub(super) struct Profile {
     pub(super) minimum_pages: u64,
     pub(super) maximum_pages: u64,
@@ -250,6 +252,18 @@ pub(super) struct Profile {
 }
 
 impl Profile {
+    /// Account both TLS sets: main_tls owns a clone of the executable's TLS exports.
+    pub(super) fn cache_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(64)
+            .saturating_add(super::threaded_dynamic::layout::executable_cache_bytes(
+                &self.executable,
+            ))
+            .saturating_add(super::threaded_dynamic::layout::string_set_cache_bytes(
+                &self.main_tls,
+            ))
+    }
+
     pub(super) fn table_limit(&self) -> usize {
         if self.dynamic {
             super::threaded_dynamic::MAX_TABLE_ELEMENTS
