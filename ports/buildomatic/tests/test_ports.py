@@ -150,9 +150,8 @@ def test_preparation_missing_source_fails_offline(tmp_path):
 
 @pytest.mark.parametrize("failure", ["request", "node", "duplicate"])
 def test_collection_rejects_wrong_request_or_action_closure(tmp_path, failure):
-    from ports.buildomatic.contracts import request_id
-
     from ports.buildomatic import BuildResult, BuildState, LocalStore, NodeResult, NodeState
+    from ports.buildomatic.contracts import request_id
 
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store, "example", [])
@@ -174,9 +173,8 @@ def test_collection_rejects_wrong_request_or_action_closure(tmp_path, failure):
 
 
 def test_explicit_build_key_changes_request_but_not_action_inputs(tmp_path):
-    from ports.buildomatic.contracts import request_id
-
     from ports.buildomatic import LocalStore
+    from ports.buildomatic.contracts import request_id
 
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store, "example", [])

@@ -14,7 +14,6 @@ from dataclasses import replace
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from ports.buildomatic.contracts import request_id
 
 from ports.buildomatic import (
     Action,
@@ -45,6 +44,7 @@ from ports.buildomatic.backends.iris import (
     _WorkerActor,
     compiler_cache_environment,
 )
+from ports.buildomatic.contracts import request_id
 from ports.buildomatic.remote_store import DEFAULT_PREFIX, RemoteStore
 
 
