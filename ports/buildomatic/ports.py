@@ -196,6 +196,7 @@ def prepare_graph(
     jobs: int | None = None,
     default_sdk: str = "default",
     max_workers: int = 1,
+    port_timeout_seconds: float = 4 * 3600,
     compiler_cache: CompilerCacheLauncher | None = None,
     build_key: str | None = None,
     worker_identity: Mapping[str, str] | None = None,
@@ -207,6 +208,8 @@ def prepare_graph(
     graph = plan(
         ports, requests, target_profile=sdk_context.dynamic_abi if sdk_context else None, default_sdk=default_sdk
     )
+    if not 0 < port_timeout_seconds <= 86400:
+        raise ValueError("port timeout must be positive and at most one day")
     if jobs is not None and not 1 <= jobs <= 16:
         raise ValueError("build jobs must be between one and sixteen")
     worker_identity = dict(worker_identity or {})
@@ -302,6 +305,8 @@ def prepare_graph(
                         *sdk_mounts,
                     ),
                     env=(("PYTHONDONTWRITEBYTECODE", "1"),),
+                    timeout_seconds=port_timeout_seconds,
+                    max_attempts=1,
                 )
             )
     request = BuildRequest(
@@ -471,6 +476,7 @@ def run_graph(
     blob_store: Store | None = None,
     workers: Mapping[str, Worker] | None = None,
     max_workers: int = 1,
+    port_timeout_seconds: float = 4 * 3600,
     compiler_cache: CompilerCacheLauncher | None = None,
     remote_backend: IrisBackend | None = None,
     iris_service: Path | None = None,
@@ -532,6 +538,7 @@ def run_graph(
                     blob_store=remote.store,
                     remote_backend=remote,
                     max_workers=max_workers,
+                    port_timeout_seconds=port_timeout_seconds,
                     compiler_cache=compiler_cache,
                     build_key=build_key,
                     worker_identity={name: connection[name] for name in ("config_sha256", "task_image", "service_id")},
@@ -562,6 +569,7 @@ def run_graph(
         jobs=jobs,
         default_sdk=default_sdk,
         max_workers=max_workers,
+        port_timeout_seconds=port_timeout_seconds,
         compiler_cache=compiler_cache,
         build_key=build_key,
         worker_identity=worker_identity,
@@ -576,7 +584,7 @@ def run_graph(
         result = remote_backend.get(build_id) if backend == "iris" else coordinator.tick()
         if result.state in {BuildState.SUCCEEDED, BuildState.FAILED, BuildState.CANCELLED}:
             break
-        time.sleep(0.05)
+        time.sleep(1.0 if backend == "iris" else 0.05)
     build = collect_graph(prepared, result, blob_store, store)
     if backend == "iris":
         remote_backend.acknowledge(build_id)

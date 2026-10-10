@@ -47,6 +47,7 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executabl
         "SCCACHE_S3_USE_SSL",
         "SCCACHE_IDLE_TIMEOUT",
         "SCCACHE_SERVER_PORT",
+        "SCCACHE_CLIENT_SIDE",
         "SCCACHE_BASEDIRS",
         "SCCACHE_GCS_BUCKET",
         "SCCACHE_GCS_KEY_PREFIX",
@@ -71,6 +72,11 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executabl
         raise ValueError("compiler cache endpoint must not contain credentials")
     if "SCCACHE_ENDPOINT" in environment and (endpoint.scheme not in {"http", "https"} or not endpoint.netloc):
         raise ValueError("compiler cache endpoint must be an HTTP or HTTPS URL")
+    if environment.get("SCCACHE_CLIENT_SIDE", "1") != "1":
+        raise ValueError("compiler cache must compile inside the action process group")
+    # The persistent daemon owns cache storage, while compilers must inherit
+    # the action's process group and resource limits for reliable cancellation.
+    environment["SCCACHE_CLIENT_SIDE"] = "1"
     return {"path": str(launcher.path), "sha256": launcher.sha256, "environment": environment}
 
 

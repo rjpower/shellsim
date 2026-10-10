@@ -62,6 +62,11 @@ Retained `--workspace` directories are unsupported for distributed actions.
 Target graphs require `--sdk-descriptor`; the distributed CLI never calls the SDK
 materializer. `--max-workers` selects independent port actions; `--jobs` remains
 the per-port bound.
+Each action has an explicit four-hour wall budget by default, configurable with
+`--port-timeout` (positive seconds, at most one day), and exactly one attempt.
+Native builds can be expensive, so the bridge does not retry them automatically.
+Workers also enforce their separately configured CPU limits; an Iris service
+operator sets those limits independently of the caller's wall budget.
 
 For Iris, pass a connected persistent `IrisBackend` as `remote_backend` and its
 `RemoteStore` as `blob_store` to `run_graph(..., backend="iris")`. The service owns
@@ -83,16 +88,24 @@ worker journals record the actual task-image and implementation identity.
 
 Repeating an unchanged build resumes its content-derived request. After cache
 eviction, supply a new explicit `--build-key` to accept a fresh request and
-rebuild the missing blobs. A failed retrieval never creates a checked manifest.
+rebuild the missing blobs. FAILED and CANCELLED requests also retain their
+terminal state; use a new key to retry them. A failed retrieval never creates a checked manifest.
 For clients that disconnect, reconstruct the unchanged prepared request and use
 the service's `get(build_id)` followed by `collect_graph`; acknowledge only after
 collection. Corrupt blobs fail verification and are never treated as valid
 results or repaired silently.
+The client polls remote service snapshots once per second. Local workers use a
+shorter interval for cheap builds.
 
 Compiler caching is opt-in through the typed `CompilerCacheLauncher` binding.
 Its worker-image executable is hash-admitted and only `-c` calls use it. Linking
 uses the real compiler. Public S3/GCS configuration is allowlisted; credentials
 belong to the worker's cache daemon and never enter code bundles or receipts.
+With pinned sccache v0.18.0, cached build environments select
+`SCCACHE_CLIENT_SIDE=1`: compilers run inside the action's process group and
+inherit its resource limits, while the daemon handles storage. Disabling this
+mode, `SCCACHE_ERROR_LOG`, and distributed scheduler configuration are rejected
+because they can move compilation outside the action's cancellation boundary.
 Cached compiles expand bounded GNU response arguments and rewrite source, build,
 dependency and output path operands relative to the compilation working directory.
 External SDK paths and the compiler driver symlink remain exact. Cached Clang

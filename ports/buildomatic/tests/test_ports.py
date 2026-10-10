@@ -186,6 +186,23 @@ def test_explicit_build_key_changes_request_but_not_action_inputs(tmp_path):
     assert request_id(first.request) != request_id(second.request)
 
 
+def test_port_actions_have_explicit_wall_budget_and_one_attempt(tmp_path):
+    from ports.buildomatic import LocalStore
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    blobs = LocalStore(tmp_path / "blobs")
+    prepared = prepare_graph(ports, ["python/example"], None, store, blobs, offline=True)
+    assert prepared.request.actions[0].timeout_seconds == 4 * 3600
+    assert prepared.request.actions[0].max_attempts == 1
+    changed = prepare_graph(ports, ["python/example"], None, store, blobs, offline=True, port_timeout_seconds=7200)
+    assert changed.request.actions[0].timeout_seconds == 7200
+    assert changed.request.idempotency_key != prepared.request.idempotency_key
+    for timeout in (0, -1, 86401, float("nan"), float("inf")):
+        with pytest.raises(ValueError):
+            prepare_graph(ports, ["python/example"], None, store, blobs, offline=True, port_timeout_seconds=timeout)
+
+
 def test_independent_ports_enter_ready_queue_concurrently(tmp_path, monkeypatch):
     import ports.buildomatic as core
 
@@ -208,12 +225,21 @@ def test_independent_ports_enter_ready_queue_concurrently(tmp_path, monkeypatch)
 
 def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
     import ports.buildomatic as core
+    import ports.buildomatic.ports as bridge
 
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store, "example", [])
     blobs = core.LocalStore(tmp_path / "blobs")
     service = core.Coordinator(blobs, "remote-service", {"worker": core.WorkerExecutor(blobs, tmp_path / "worker")})
     calls = []
+    intervals = []
+    sleep = bridge.time.sleep
+
+    def observe_sleep(interval):
+        intervals.append(interval)
+        sleep(0.001)
+
+    monkeypatch.setattr(bridge.time, "sleep", observe_sleep)
 
     class RemoteService:
         def submit(self, request):
@@ -245,6 +271,7 @@ def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
     assert len(build.results) == 1
     assert calls[0] == "submit" and calls[-1] == "acknowledge"
     assert "get" in calls
+    assert intervals and set(intervals) == {1.0}
 
 
 def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch):

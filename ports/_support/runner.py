@@ -612,8 +612,11 @@ def main() -> None:
     parser.add_argument("--backend", choices=("local", "buildomatic", "iris"), default="local")
     parser.add_argument("--sdk-descriptor", type=Path, help="admitted portable SDK for distributed builds")
     parser.add_argument("--iris-service", type=Path, help="public connection descriptor for an existing Iris service")
-    parser.add_argument("--build-key", help="explicit distributed request identity; change to rebuild evicted blobs")
+    parser.add_argument("--build-key", help="fresh distributed identity after eviction, failure or cancellation")
     parser.add_argument("--max-workers", type=int, default=1, help="distributed port concurrency, between one and 32")
+    parser.add_argument(
+        "--port-timeout", type=float, default=4 * 3600, help="distributed per-port wall seconds, at most 86400"
+    )
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
@@ -705,6 +708,7 @@ def main() -> None:
                 "iris_service": args.iris_service,
                 "build_key": args.build_key,
                 "max_workers": args.max_workers,
+                "port_timeout_seconds": args.port_timeout,
             }
             if args.backend != "local"
             else {}

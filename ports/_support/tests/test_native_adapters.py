@@ -275,6 +275,7 @@ def test_admitted_cache_launcher_handles_only_object_compilation(build_request, 
     monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
     environment = build_environment(context, {})
     assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert environment["SCCACHE_CLIENT_SIDE"] == "1"
     assert environment["SCCACHE_BASEDIRS"] == ":".join(
         map(str, (context.source, context.build, context.dependency_sysroot))
     )
@@ -383,7 +384,7 @@ def test_cache_wrapper_normalizes_owned_paths_and_preserves_link_responses(build
 @pytest.mark.parametrize("target,debug", [("host", False), ("wasm", False), ("wasm", True)])
 def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, tmp_path, target, debug):
     """Opt-in pinned-binary acceptance exercises generated wrappers, not a cache model."""
-    from ports._support.native_adapters import CompilerCacheLauncher, compiler_wrapper_text
+    from ports._support.native_adapters import CompilerCacheLauncher, build_environment, compiler_wrapper_text
     from ports._support.store import file_hash
 
     binary = os.environ.get("SHELLSIM_TEST_SCCACHE")
@@ -435,8 +436,8 @@ def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, t
                 source=source,
                 build=build,
                 dependency_sysroot=dependencies,
-                host_tools={"python": Path(sys.executable)},
-                target_tools={"cc": compiler},
+                host_tools={"python": Path(sys.executable), "pkg-config": Path("/admitted/pkg-config"), "cc": compiler},
+                target_tools={"cc": compiler, "ar": Path("/admitted/ar"), "ranlib": Path("/admitted/ranlib")},
                 compiler_flags=flags,
                 compiler_cache=CompilerCacheLauncher(sccache, pinned, (("SCCACHE_SERVER_PORT", port),)),
             )
@@ -451,7 +452,10 @@ def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, t
                     ["-I" + str(dependencies / "include"), "-c", str(source / "probe.c"), "-o", str(build / "probe.o")]
                 )
             )
-            run([str(wrapper), "@compile.rsp"], build)
+            environment = build_environment(context, {})
+            assert environment["SCCACHE_CLIENT_SIDE"] == "1"
+            assert "SCCACHE_ERROR_LOG" not in environment and "SCCACHE_DIST_SCHEDULER_URL" not in environment
+            run([str(wrapper), "@compile.rsp"], build, environment)
             after = stats()
             assert [value - previous for value, previous in zip(after, before)] == (
                 [0, 1, 1] if index == 0 else [1, 0, 0]
@@ -478,7 +482,7 @@ def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, t
                 "-o",
                 str(build / "probe"),
             ]
-            run(link, build)
+            run(link, build, environment)
             if target == "host":
                 run([str(build / "probe")], build)
             assert stats() == after
@@ -489,7 +493,15 @@ def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, t
 
 
 @pytest.mark.parametrize(
-    "binding", [("AWS_SECRET_ACCESS_KEY", "secret"), ("CC", "ambient"), ("SCCACHE_DIR", "bad\0path")]
+    "binding",
+    [
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("CC", "ambient"),
+        ("SCCACHE_DIR", "bad\0path"),
+        ("SCCACHE_CLIENT_SIDE", "0"),
+        ("SCCACHE_ERROR_LOG", "/tmp/log"),
+        ("SCCACHE_DIST_SCHEDULER_URL", "https://scheduler.invalid"),
+    ],
 )
 def test_cache_launcher_rejects_unadmitted_environment(tmp_path, binding):
     from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
