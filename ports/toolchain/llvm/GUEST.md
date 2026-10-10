@@ -34,6 +34,10 @@ new workspace when source, generators or headers change. Verified library
 updates replace archives at stable paths and let Ninja relink existing objects.
 Installed commands are stripped with the admitted host `llvm-strip`, preserving
 the main TLS classification in `dylink.0` and the `shellsim.abi` section.
+The producer checks stripped commands for the versioned TLS metadata, required
+function and global exports, a growable exported function table and the bounded
+shared memory import before publishing them. Default compiler configs apply
+the same table and TLS export requirements to generated executables.
 Completed command products are immutable and verified before
 being copied into the graph's private staging directory.
 

@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 
 from ports._support.build import apply_patch, check_build_scripts
 from ports._support.native_adapters import NativeBuildCommand, NativeBuildOutput
+from ports._support.wasm_metadata import number, string
 from ports.native.dependencies import verify_artifact
 from ports.toolchain.llvm.build import digest, run
 from ports.toolchain.llvm.compiler import (
@@ -28,6 +29,123 @@ PORT = Path(__file__).resolve().parent
 TARGETS = ("clang", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy")
 GENERATORS = ("llvm-tblgen", "llvm-min-tblgen", "clang-tblgen")
 HOST_TOOLS = ("clang", "clang++", "wasm-ld", "llvm-ar", "llvm-ranlib", *GENERATORS)
+
+
+def validate_guest_abi(path):
+    """Reject stripped commands whose main-module ABI cannot enter the runtime.
+
+    Inspect metadata before expensive guest JIT compilation. The graph seals
+    the cohort marker separately; the linker must preserve all other ABI data.
+    """
+    data = path.read_bytes()
+    if data[:8] != b"\0asm\x01\0\0\0":
+        raise ValueError("guest command is not a Wasm core module")
+    exports, tls = {}, set()
+    protocol = False
+    growable = False
+    shared_memory = False
+    offset = 8
+    while offset < len(data):
+        kind = data[offset]
+        size, start = number(data, offset + 1)
+        offset = start + size
+        if offset > len(data):
+            raise ValueError("truncated guest Wasm section")
+        section = data[start:offset]
+        if kind == 2:
+            count, cursor = number(section, 0)
+            for _ in range(count):
+                module, cursor = string(section, cursor)
+                name, cursor = string(section, cursor)
+                import_kind = section[cursor]
+                cursor += 1
+                if import_kind == 0:
+                    _, cursor = number(section, cursor)
+                elif import_kind == 3:
+                    cursor += 2
+                elif import_kind == 4:
+                    _, cursor = number(section, cursor)
+                    _, cursor = number(section, cursor)
+                elif import_kind in (1, 2):
+                    if import_kind == 1:
+                        cursor += 1
+                    flags, cursor = number(section, cursor)
+                    minimum, cursor = number(section, cursor)
+                    maximum = None
+                    if flags & 1:
+                        maximum, cursor = number(section, cursor)
+                    if import_kind == 2:
+                        if shared_memory or (module, name) != ("env", "memory") or flags != 3:
+                            raise ValueError("guest command requires one imported shared memory")
+                        if not minimum <= maximum <= 4096:
+                            raise ValueError("guest command exceeds threaded memory ABI")
+                        shared_memory = True
+                else:
+                    raise ValueError("unsupported guest Wasm import")
+        elif kind == 7:
+            count, cursor = number(section, 0)
+            for _ in range(count):
+                name, cursor = string(section, cursor)
+                export_kind = section[cursor]
+                _, cursor = number(section, cursor + 1)
+                if name in exports:
+                    raise ValueError("duplicate guest Wasm export")
+                exports[name] = export_kind
+        elif kind == 4:
+            count, cursor = number(section, 0)
+            if count != 1 or section[cursor] != 0x70:
+                raise ValueError("guest command requires one function table")
+            flags, cursor = number(section, cursor + 1)
+            minimum, cursor = number(section, cursor)
+            growable = flags == 0 and minimum < 65536
+        elif kind == 0:
+            name, cursor = string(section, 0)
+            if name != "dylink.0":
+                continue
+            while cursor < len(section):
+                subsection = section[cursor]
+                length, start = number(section, cursor + 1)
+                cursor = start + length
+                payload = section[start:cursor]
+                if len(payload) != length:
+                    raise ValueError("truncated guest dylink metadata")
+                if subsection == 129:
+                    name, pos = string(payload, 0)
+                    version, pos = number(payload, pos)
+                    if protocol or name != "shellsim.main-tls" or version != 1 or pos != len(payload):
+                        raise ValueError("invalid guest main TLS protocol")
+                    protocol = True
+                elif subsection == 3:
+                    count, pos = number(payload, 0)
+                    for _ in range(count):
+                        name, pos = string(payload, pos)
+                        flags, pos = number(payload, pos)
+                        if flags & ~0x3FF or (flags & 0x100 and name in tls):
+                            raise ValueError("invalid guest main TLS classification")
+                        if flags & 0x100:
+                            tls.add(name)
+                    if pos != len(payload):
+                        raise ValueError("invalid guest main TLS payload")
+    required = {
+        "_start": 0,
+        "wasi_thread_start": 0,
+        "__wasm_init_tls": 0,
+        "__wasm_apply_global_tls_relocs": 0,
+        "__indirect_function_table": 1,
+        "memory": 2,
+        "__stack_pointer": 3,
+        "__tls_base": 3,
+        "__tls_size": 3,
+        "__tls_align": 3,
+        **dict.fromkeys(tls, 3),
+    }
+    if (
+        not shared_memory
+        or not protocol
+        or not growable
+        or any(exports.get(name) != kind for name, kind in required.items())
+    ):
+        raise ValueError("guest command lacks required threaded main ABI exports or growable table")
 
 
 def workspace_compatibility(recipe, compiler, sysroot, sdk, dependencies, host_tools, target):
@@ -249,6 +367,8 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     ):
         raise ValueError("sealed guest compiler differs")
     destination = context.staging_prefix / "usr/local"
+    for name in TARGETS:
+        validate_guest_abi(prefix / "bin" / name)
     shutil.copytree(prefix, destination, dirs_exist_ok=True)
     return NativeBuildOutput(
         context.staging_prefix,
@@ -288,6 +408,8 @@ def _commands(context, workspace, source, jobs):
         "-Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory",
         "-Wl,--initial-memory=134217728,--max-memory=268435456,-z,stack-size=16777216",
         "-Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base",
+        "-Wl,--export-table,--growable-table,--export=__tls_size,--export=__tls_align",
+        "-Wl,--export=__wasm_init_tls,--export=wasi_thread_start,--undefined=pthread_create",
         "-Wl,--export-if-defined=__wasm_apply_global_tls_relocs",
     ]
     toolchain = workspace / "guest-toolchain.cmake"
@@ -382,6 +504,7 @@ def _install_commands(build, destination, source, strip, attempts):
             attempts / (name + "-strip.log"),
             {"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
         )
+        validate_guest_abi(destination / "bin" / name)
     for alias, name in {
         "llvm-ranlib": "llvm-ar",
         "llvm-strip": "llvm-objcopy",
@@ -413,6 +536,8 @@ def _install_commands(build, destination, source, strip, attempts):
 -Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory
 -Wl,--initial-memory=16777216,--max-memory=67108864
 -Wl,--emit-main-tls-info,--export=__stack_pointer,--export=__tls_base
+-Wl,--export-table,--growable-table,--export=__tls_size,--export=__tls_align
+-Wl,--export=__wasm_init_tls,--export=wasi_thread_start,--undefined=pthread_create
 -Wl,--export-if-defined=__wasm_apply_global_tls_relocs
 """
     for name in ("clang.cfg", "clang++.cfg"):
