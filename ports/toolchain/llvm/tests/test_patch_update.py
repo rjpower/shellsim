@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import shlex
+import shutil
 import subprocess
 import tarfile
 from pathlib import Path
@@ -28,12 +30,14 @@ def project(tmp_path):
     build = work / "build"
     build.mkdir(parents=True)
     (build / "CMakeCache.txt").write_text("pinned configuration\n")
-    ninja = Path("/tmp/shellsim-scipy-build/tools/bin/ninja")
-    if not ninja.is_file():
-        pytest.skip("requires admitted Ninja for the compiled producer regression")
+    ninja_path, cxx = shutil.which("ninja"), shutil.which("c++")
+    if ninja_path is None or cxx is None:
+        pytest.skip("requires Ninja and a native C++ compiler")
+    ninja = Path(ninja_path)
+    cxx_command = shlex.quote(cxx).replace("$", "$$")
     (build / "build.ninja").write_text(
-        "rule compile\n  command = /usr/bin/c++ -c $in -o $out\n"
-        "rule link\n  command = /usr/bin/c++ $in -o $out\n"
+        f"rule compile\n  command = {cxx_command} -c $in -o $out\n"
+        f"rule link\n  command = {cxx_command} $in -o $out\n"
         f"build value.o: compile {source}/value.cpp\n"
         f"build main.o: compile {source}/main.cpp\n"
         "build program: link value.o main.o\n"
