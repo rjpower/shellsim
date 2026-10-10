@@ -9,8 +9,9 @@ The source patch fixes flexible `dirent.d_name` allocation, selects the existing
 SDK-compatible two-argument main, and guards unavailable signal-mask/callback
 facilities. NLS and Guile are disabled. Ordinary parallel recipes use real virtual
 spawn/wait and work with `-j2`. Recursive jobserver coordination and asynchronous
-signal callbacks remain unsupported. This package supplies make; the separate C
-compiler distribution does not provide C++ or a full build-essential collection.
+signal callbacks remain unsupported. This package supplies make; combine its
+graph recipe with the [guest Clang port](../../toolchain/llvm/GUEST.md) for C and
+C++ compilation, linking and archiving inside the guest.
 
 Configure's synchronous-posix-spawn cache describes the measured non-null-pid
 spawn path used by make. The upstream probe passes a null pid, which this bounded

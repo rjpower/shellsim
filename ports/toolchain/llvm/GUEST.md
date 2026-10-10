@@ -38,6 +38,9 @@ The producer checks stripped commands for the versioned TLS metadata, required
 function and global exports, a growable exported function table and the bounded
 shared memory import before publishing them. Default compiler configs apply
 the same table and TLS export requirements to generated executables.
+Default configs select modern Wasm exception instructions, matching the SDK
+libraries and runtime. The provider version `23.1.0rc3` represents the pinned
+upstream Clang version `23.1.0-rc3`.
 Completed command products are immutable and verified before
 being copied into the graph's private staging directory.
 

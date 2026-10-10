@@ -531,6 +531,8 @@ def _install_commands(build, destination, source, strip, attempts):
 -resource-dir=/usr/local/lib/clang/23
 -fuse-ld=/usr/bin/wasm-ld
 -fwasm-exceptions
+-mllvm
+-wasm-use-legacy-eh=false
 -lunwind
 -Wl,/usr/local/wasi-sysroot/lib/wasm32-wasip1-threads/shellsim-abi.o
 -Wl,--shared-memory,--serial-memory-init,--import-memory,--export-memory

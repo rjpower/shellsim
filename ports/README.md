@@ -233,20 +233,21 @@ from shellsim import Environment, Limits
 
 env = Environment.from_release(
     "/path/to/release.json",
-    tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
+    tools=["make>=4.4,<5", "clang==23.1.0rc3", "zlib==1.3.1"],
     project="/path/to/project",
-    limits=Limits(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2),
+    limits=Limits(cpu=500_000_000_000, memory=8 * 1024**3, disk=512 * 1024**2),
 )
 result = env.run("cd /work; make -j2")
 assert result.returncode == 0, result.stderr
 ```
 
 The factory mounts the project and Makefile at `/work`. The catalog provides GNU make,
-a TinyCC C compiler, and zlib headers/archive. Provider hashes and compiled
+upstream Clang and LLD for C and C++, and zlib headers/archive. Default make
+rules use the installed `cc`, `c++`, `ar` and `ranlib` commands. Provider hashes and compiled
 relationships are verified before one mount transaction. Successive installs
 reuse compatible installed artifacts and reject replacement or destination
-conflicts. Upgrade and uninstall are not implemented. Recursive make jobserver
-coordination and a C++ compiler remain missing.
+conflicts. Upgrade, uninstall and recursive make jobserver coordination remain
+unsupported.
 
 Set memory and disk budgets for the selected tools. The default 64 MiB memory
 budget is too small for large Wasm executables: execution reserves compilation
