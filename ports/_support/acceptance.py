@@ -2,7 +2,7 @@
 
 The graph runner supplies a sealed release and exact port selection. Each probe
 uses a fresh guest, so package installation and execution are both part of the
-result. Native probes are compiled only by an admitted target cohort and their
+result. Native probes are compiled only by an admitted target SDK and their
 Wasm output runs only inside the guest.
 """
 
@@ -26,7 +26,7 @@ from ports.native.dependencies import target_environment
 if TYPE_CHECKING:
     from shellsim import Limits
 
-    from ports._support.cohort import BuildCohort
+    from ports._support.sdk_products import MaterializedSDK
 
 _MAX_TESTS = 32
 _MAX_SOURCE_BYTES = 16 * 1024**2
@@ -41,7 +41,7 @@ class AcceptanceRequest:
     descriptor: Path
     output: Path
     install_kind: Literal["pypi", "native", "pypi+native"]
-    cohort: BuildCohort | None = None
+    sdk_context: MaterializedSDK | None = None
     dependency_sysroot: Path | None = None
     limits: Limits | None = None
 
@@ -146,16 +146,16 @@ def _fixtures(port: Port, raw: object) -> dict[str, bytes]:
 
 
 def _native_command(
-    cohort: BuildCohort,
+    sdk_context: MaterializedSDK,
     dependency_sysroot: Path,
     source: Path,
     destination: Path,
     link_inputs: list[str],
-    cohort_link_inputs: list[str],
+    sdk_link_inputs: list[str],
     include_directories: list[str],
     link_flags: list[str] | None = None,
 ) -> tuple[str, ...]:
-    if not cohort.has_frontend:
+    if not sdk_context.has_frontend:
         raise ValueError("native acceptance needs the admitted standard Clang frontend")
     if not dependency_sysroot.is_absolute():
         raise ValueError("native acceptance dependency sysroot must be absolute")
@@ -200,31 +200,31 @@ def _native_command(
         ):
             raise ValueError("native acceptance link input is missing or unsupported")
         links.append(str(path))
-    cohort_root = cohort.sysroot.root / "sysroot"
-    for raw in cohort_link_inputs:
+    sdk_context_root = sdk_context.sysroot.root / "sysroot"
+    for raw in sdk_link_inputs:
         if not isinstance(raw, str) or not raw or len(raw) > 4096 or "\\" in raw or "\0" in raw:
-            raise ValueError("native acceptance cohort link input is invalid")
+            raise ValueError("native acceptance SDK link input is invalid")
         relative = PurePosixPath(raw)
         if relative.is_absolute() or ".." in relative.parts or relative.as_posix() != raw:
-            raise ValueError("native acceptance cohort link input escapes verified sysroot")
-        path = cohort_root.joinpath(*relative.parts)
+            raise ValueError("native acceptance SDK link input escapes verified sysroot")
+        path = sdk_context_root.joinpath(*relative.parts)
         if (
             path.is_symlink()
             or not path.is_file()
-            or not path.resolve().is_relative_to(cohort_root.resolve())
+            or not path.resolve().is_relative_to(sdk_context_root.resolve())
             or path.suffix not in {".a", ".so"}
             or path.stat().st_size > 128 * 1024**2
         ):
-            raise ValueError("native acceptance cohort link input is missing or unsupported")
-        expected = cohort.sysroot.contents["artifacts"].get("sysroot/" + raw)
+            raise ValueError("native acceptance SDK link input is missing or unsupported")
+        expected = sdk_context.sysroot.contents["artifacts"].get("sysroot/" + raw)
         if not isinstance(expected, str) or _bounded_digest(path, 128 * 1024**2) != expected:
-            raise ValueError("native acceptance cohort link input differs from verified sysroot")
+            raise ValueError("native acceptance SDK link input differs from verified sysroot")
         links.append(str(path))
     return (
-        str(cohort.compiler()),
-        *cohort.compiler_flags,
-        *cohort.linker_flags,
-        *cohort.executable_flags,
+        str(sdk_context.compiler()),
+        *sdk_context.compiler_flags,
+        *sdk_context.linker_flags,
+        *sdk_context.executable_flags,
         "-I" + str(dependency_sysroot / "usr/local/include"),
         *includes,
         "-L" + str(dependency_sysroot / "usr/local/lib"),
@@ -268,7 +268,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             raise ValueError("native acceptance needs a native port selection")
         path, data = _source(request.port, test.get("source" if kind == "native" else "script"))
         link_inputs = test.get("link_inputs", [])
-        cohort_link_inputs = test.get("cohort_link_inputs", [])
+        sdk_link_inputs = test.get("sdk_link_inputs", [])
         include_directories = test.get("include_directories", [])
         link_flags = test.get("link_flags", [])
         args = test.get("args", [])
@@ -280,36 +280,35 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         ):
             raise ValueError("acceptance arguments are invalid")
         if kind == "native":
-            if request.cohort is None or request.dependency_sysroot is None:
-                raise ValueError("native acceptance needs a verified build cohort and dependency sysroot")
+            if request.sdk_context is None or request.dependency_sysroot is None:
+                raise ValueError("native acceptance needs a verified SDK and dependency sysroot")
             if (
                 not isinstance(link_inputs, list)
-                or not isinstance(cohort_link_inputs, list)
+                or not isinstance(sdk_link_inputs, list)
                 or not isinstance(include_directories, list)
                 or len(link_inputs) > 256
-                or len(cohort_link_inputs) > 256
+                or len(sdk_link_inputs) > 256
                 or len(include_directories) > 256
             ):
                 raise ValueError("native acceptance link inputs and include directories must be lists")
             _native_command(
-                request.cohort,
+                request.sdk_context,
                 request.dependency_sysroot,
                 path,
                 request.output / "check.wasm",
                 link_inputs,
-                cohort_link_inputs,
+                sdk_link_inputs,
                 include_directories,
                 link_flags,
             )
         elif any(
-            key in test
-            for key in ("link_inputs", "cohort_link_inputs", "include_directories", "link_flags", "libraries")
+            key in test for key in ("link_inputs", "sdk_link_inputs", "include_directories", "link_flags", "libraries")
         ):
             raise ValueError("Python acceptance does not take native compiler options")
         if "libraries" in test:
             raise ValueError("native acceptance requires exact link_inputs rather than -l search")
         prepared.append(
-            (kind, path, data, link_inputs, cohort_link_inputs, include_directories, link_flags, args, fixtures)
+            (kind, path, data, link_inputs, sdk_link_inputs, include_directories, link_flags, args, fixtures)
         )
 
     request.output.mkdir(parents=True)
@@ -326,7 +325,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             path,
             data,
             link_inputs,
-            cohort_link_inputs,
+            sdk_link_inputs,
             include_directories,
             link_flags,
             args,
@@ -335,15 +334,15 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             proof = request.output / f"probe-{index}"
             proof.mkdir()
             if kind == "native":
-                assert request.cohort is not None and request.dependency_sysroot is not None
+                assert request.sdk_context is not None and request.dependency_sysroot is not None
                 artifact = proof / "check.wasm"
                 command = _native_command(
-                    request.cohort,
+                    request.sdk_context,
                     request.dependency_sysroot,
                     path,
                     artifact,
                     link_inputs,
-                    cohort_link_inputs,
+                    sdk_link_inputs,
                     include_directories,
                     link_flags,
                 )
@@ -351,12 +350,12 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                     subprocess.run(
                         command,
                         cwd=proof,
-                        env=target_environment(request.cohort.sdk.root),
+                        env=target_environment(request.sdk_context.sdk.root),
                         stdout=log,
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
-                mark_abi(artifact, request.cohort.dynamic_abi.encode())
+                mark_abi(artifact, request.sdk_context.dynamic_abi.encode())
                 (proof / "build-command.json").write_text(json.dumps(command) + "\n")
                 with artifact.open("rb") as stream:
                     wasm_header = stream.read(8)
@@ -403,7 +402,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 "release_sha256": descriptor_sha,
                 "installed_requirement": spec,
                 "install_kind": request.install_kind,
-                "cohort": request.cohort.identity if request.cohort is not None else None,
+                "sdk_context": request.sdk_context.identity if request.sdk_context is not None else None,
                 "test_limits": dataclasses.asdict(limits) if limits is not None else None,
                 "results": [dataclasses.asdict(item) for item in results],
             },

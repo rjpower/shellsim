@@ -128,7 +128,7 @@
       "link_inputs": [
         "lib/libshellsim-posix.a"
       ],
-      "cohort_link_inputs": [
+      "sdk_link_inputs": [
         "lib/wasm32-wasip1-threads/libwasi-emulated-signal.a"
       ],
       "link_flags": [
@@ -136,5 +136,5 @@
       ]
     }
   ],
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

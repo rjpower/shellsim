@@ -221,7 +221,7 @@ def test_guest_host_wheel_error_identifies_complete_dependency_chain(tmp_path):
 
 
 @pytest.fixture
-def profiled_recipes(recipes):
+def sdk_recipes(recipes):
     root, write = recipes
     compiler = write("compiler", variant="host.json", profile=None)
     compiler.write_text(json.dumps({"name": "compiler", "version": "1", "role": "host-tool"}))
@@ -232,14 +232,16 @@ def profiled_recipes(recipes):
     consumer = write("consumer", dependencies=[dependency("base")], profile=None)
     recipe = json.loads(consumer.read_text())
     recipe.pop("target_profile")
-    recipe["build_profile"] = "test"
+    recipe["sdk"] = "test"
     consumer.write_text(json.dumps(recipe))
-    profile = root / "profiles/test.json"
+    profile = root / "sdks/test.json"
     profile.parent.mkdir()
     profile.write_text(
         json.dumps(
             {
                 "schema_version": 1,
+                "host": "linux-x86_64",
+                "products": {},
                 "target": "wasm32-wasip1-threads",
                 "target_profile": "test-target",
                 "abi": "test-abi",
@@ -252,8 +254,8 @@ def profiled_recipes(recipes):
     return root, write, consumer, profile
 
 
-def test_profile_resolves_pinned_native_closure_and_explicit_overrides(profiled_recipes):
-    root, write, consumer, _ = profiled_recipes
+def test_sdk_resolves_pinned_native_closure_and_explicit_overrides(sdk_recipes):
+    root, write, consumer, _ = sdk_recipes
     graph = plan(root, ["native/consumer"], target_profile="test-target")
     assert [(port.reference, port.role) for port in graph.ports] == [
         ("native/compiler/host.json", "host-tool"),
@@ -280,8 +282,8 @@ def test_profile_resolves_pinned_native_closure_and_explicit_overrides(profiled_
         plan(root, ["native/consumer", "native/base/shared.json"])
 
 
-def test_profile_cannot_relax_dependency_version_or_cohort(profiled_recipes):
-    root, _, consumer, profile = profiled_recipes
+def test_sdk_cannot_relax_dependency_version_or_cohort(sdk_recipes):
+    root, _, consumer, profile = sdk_recipes
     with pytest.raises(ValueError, match="target profile differs"):
         plan(root, ["native/consumer"], target_profile="other-target")
     authored = json.loads(consumer.read_text())
@@ -297,8 +299,8 @@ def test_profile_cannot_relax_dependency_version_or_cohort(profiled_recipes):
 @pytest.mark.parametrize(
     "failure", ["scalar", "compiler", "host", "pin", "unknown", "schema", "variant", "oversize", "link"]
 )
-def test_invalid_profiles_fail_before_graph_admission(profiled_recipes, failure):
-    root, _, consumer, profile_path = profiled_recipes
+def test_invalid_sdks_fail_before_graph_admission(sdk_recipes, failure):
+    root, _, consumer, profile_path = sdk_recipes
     recipe = json.loads(consumer.read_text())
     profile = json.loads(profile_path.read_text())
     if failure == "scalar":
@@ -328,10 +330,10 @@ def test_invalid_profiles_fail_before_graph_admission(profiled_recipes, failure)
 
 
 @pytest.mark.parametrize("name", ["../escape", "test.json", "Test", "", None, ["test"]])
-def test_profile_names_cannot_escape_the_named_registry(profiled_recipes, name):
-    root, _, consumer, _ = profiled_recipes
+def test_sdk_names_cannot_escape_the_named_registry(sdk_recipes, name):
+    root, _, consumer, _ = sdk_recipes
     recipe = json.loads(consumer.read_text())
-    recipe["build_profile"] = name
+    recipe["sdk"] = name
     consumer.write_text(json.dumps(recipe))
     with pytest.raises(ValueError):
         plan(root, ["native/consumer"])

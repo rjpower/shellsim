@@ -9,8 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.cohort import verify_host_files
 from ports._support.host_tools import make_read_only, meson_receipt, python_closure, verify_python_closure
+from ports._support.sdk_products import verify_host_files
 
 
 @pytest.fixture

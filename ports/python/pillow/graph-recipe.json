@@ -105,5 +105,5 @@
       "sha256": "529d11de7e5004e9416d8cc20f070aff410c06ef48292a88d890fffdd7f4eb1a"
     }
   ],
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

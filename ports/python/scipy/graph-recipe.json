@@ -164,5 +164,5 @@
     "memory": 4294967296,
     "disk": 805306368
   },
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }

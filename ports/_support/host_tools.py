@@ -297,7 +297,7 @@ def verify_source(root: Path, producer: dict, name: str) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cohort", type=Path, required=True)
+    parser.add_argument("--host-seed", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--cache", type=Path, required=True)
     parser.add_argument("--base-python", type=Path, required=True)
@@ -330,31 +330,28 @@ def main() -> None:
         offline=args.offline,
         materialize=args.materialize_meson,
     )
-    value = json.loads(args.cohort.read_text())
-    # Resolve every old binding before moving the descriptor to its new directory.
-    for name in ("sdk", "llvm", "sysroot", "cpython", "runtime"):
-        if value[name] is not None:
-            for field in ("root", "manifest"):
-                value[name][field] = str((args.cohort.parent / value[name][field]).resolve())
-    for item in value["host_tools"].values():
-        item["path"] = str((args.cohort.parent / item["path"]).absolute())
+    value = json.loads(args.host_seed.read_text())
+    for item in value["tools"].values():
+        item["path"] = str((args.host_seed.parent / item["path"]).absolute())
         if item["receipt"] is not None:
-            item["receipt"]["path"] = str((args.cohort.parent / item["receipt"]["path"]).resolve())
+            item["receipt"]["path"] = str((args.host_seed.parent / item["receipt"]["path"]).resolve())
+    for item in [*value["compiler_tools"].values(), *([value["python_helper"]] if value["python_helper"] else [])]:
+        item["path"] = str((args.host_seed.parent / item["path"]).resolve())
     args.output.mkdir(parents=True)
     for name, receipt in receipts.items():
         path = (args.output / (name + "-receipt.json")).resolve()
         path.write_text(json.dumps(receipt, sort_keys=True) + "\n")
-        item = value["host_tools"][name]
+        item = value["tools"].setdefault(name, {})
         executable = Path(receipt["root"]) / receipt["executable"]
         item["path"] = str(executable)
         item["sha256"] = file_hash(executable)
         item["receipt"] = {"path": str(path), "sha256": file_hash(path)}
-    descriptor = args.output / "cohort.json"
+    descriptor = args.output / "host-seed.json"
     descriptor.write_text(json.dumps(value, sort_keys=True) + "\n")
-    from ports._support.cohort import load_cohort
+    from ports._support.sdk import load_seed
 
-    cohort = load_cohort(descriptor)
-    print(str(descriptor.resolve()), cohort.identity)
+    load_seed(descriptor)
+    print(str(descriptor.resolve()))
 
 
 if __name__ == "__main__":

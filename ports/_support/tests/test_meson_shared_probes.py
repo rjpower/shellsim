@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.cohort import load_cohort
+from ports._support.import_sdk import load_legacy_cohort
 from ports._support.native_adapters import NativeAdapter, NativeBuildContext, NativeBuildRequest, build_native
 from ports.native.dependencies import verify_artifact
 
@@ -15,7 +15,7 @@ def test_meson_shared_provider_symbol_and_call_checks(tmp_path):
     prefix = os.environ.get("SHELLSIM_OPENBLAS_PREFIX")
     if descriptor is None or prefix is None:
         pytest.skip("requires an admitted cohort and sealed OpenBLAS provider")
-    cohort = load_cohort(Path(descriptor))
+    cohort = load_legacy_cohort(Path(descriptor))
     prefix = Path(prefix).resolve()
     artifact = verify_artifact(prefix)
     assert artifact["inputs"]["recipe"]["name"] == "openblas"
@@ -47,6 +47,9 @@ def test_meson_shared_provider_symbol_and_call_checks(tmp_path):
         compiler_prefix=cohort.llvm.root,
         sysroot=cohort.sysroot.root / "sysroot",
         target=cohort.target,
+        abi=cohort.dynamic_abi,
+        compiler_resource_directory=cohort.compiler_resource_directory,
+        linker=cohort.linker,
         compiler_flags=cohort.compiler_flags,
         linker_flags=cohort.linker_flags,
         dependencies={},

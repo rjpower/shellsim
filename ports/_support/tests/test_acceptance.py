@@ -61,7 +61,7 @@ def test_acceptance_rejects_test_kind_mismatch_before_release_fetch(tmp_path: Pa
         accept_port(AcceptanceRequest(port, descriptor, output, "pypi"))
     assert not output.exists()
 
-    with pytest.raises(ValueError, match="verified build cohort"):
+    with pytest.raises(ValueError, match="verified SDK"):
         accept_port(AcceptanceRequest(port, descriptor, output, "native"))
     assert not output.exists()
 
@@ -80,21 +80,27 @@ def test_native_acceptance_rejects_include_escape_before_build(tmp_path: Path) -
     output = tmp_path / "proof"
     with pytest.raises(ValueError, match="escapes dependency sysroot"):
         accept_port(
-            AcceptanceRequest(port, descriptor, output, "native", cohort=cohort, dependency_sysroot=tmp_path / "deps")
+            AcceptanceRequest(
+                port, descriptor, output, "native", sdk_context=cohort, dependency_sysroot=tmp_path / "deps"
+            )
         )
     assert not output.exists()
 
     port = _port(tmp_path, [{"kind": "native", "source": "test.c", "link_inputs": ["lib/libz.a"] * 257}])
     with pytest.raises(ValueError, match="must be lists"):
         accept_port(
-            AcceptanceRequest(port, descriptor, output, "native", cohort=cohort, dependency_sysroot=tmp_path / "deps")
+            AcceptanceRequest(
+                port, descriptor, output, "native", sdk_context=cohort, dependency_sysroot=tmp_path / "deps"
+            )
         )
     assert not output.exists()
 
-    port = _port(tmp_path, [{"kind": "native", "source": "test.c", "cohort_link_inputs": ["../host.a"]}])
+    port = _port(tmp_path, [{"kind": "native", "source": "test.c", "sdk_link_inputs": ["../host.a"]}])
     with pytest.raises(ValueError, match="escapes verified sysroot"):
         accept_port(
-            AcceptanceRequest(port, descriptor, output, "native", cohort=cohort, dependency_sysroot=tmp_path / "deps")
+            AcceptanceRequest(
+                port, descriptor, output, "native", sdk_context=cohort, dependency_sysroot=tmp_path / "deps"
+            )
         )
     assert not output.exists()
 
@@ -199,13 +205,13 @@ def test_native_probe_passes_exact_wrapper_switches(tmp_path):
 
 
 def test_native_probe_links_declared_shared_provider_with_real_lld(tmp_path):
-    from ports._support.cohort import load_cohort
+    from ports._support.import_sdk import load_legacy_cohort
     from ports._support.wasm_metadata import function_signatures, needed_libraries
 
     descriptor = os.environ.get("SHELLSIM_BUILD_COHORT")
     if descriptor is None:
         pytest.skip("requires an explicitly admitted build cohort")
-    cohort = load_cohort(Path(descriptor))
+    cohort = load_legacy_cohort(Path(descriptor))
     dependency_sysroot = tmp_path / "dependencies"
     library = dependency_sysroot / "usr/local/lib/libactual.so"
     library.parent.mkdir(parents=True)

@@ -8,8 +8,8 @@ from dataclasses import dataclass
 import pytest
 
 from ports._support import runner
-from ports._support.cohort import Receipt
 from ports._support.graph import Graph, Port
+from ports._support.sdk_products import Receipt
 
 
 @dataclass(frozen=True)
@@ -141,9 +141,9 @@ def test_acceptance_uses_port_namespace_when_names_collide(tmp_path, monkeypatch
 
 def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkeypatch):
     from ports._support import acceptance, native_artifacts
-    from ports._support import cohort as cohort_module
+    from ports._support import sdk_products as cohort_module
     from ports._support.acceptance import _native_command
-    from ports._support.cohort import BuildCohort, Receipt, resolved_toolchain
+    from ports._support.sdk_products import MaterializedSDK, Receipt, resolved_toolchain
     from ports.native import dependencies
 
     recipe = {"name": "admitted-producer", "sdk": {"version": "34.0", "sha256": "7" * 64}}
@@ -158,7 +158,20 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     original_compiler = product("original-compiler", "a")
     original_platform = product("original-platform", "b")
     sdk = product("sdk", "c")
-    original = BuildCohort(sdk, original_compiler, original_platform, None, None, None, {}, {}, "d" * 64, True)
+    original = MaterializedSDK(
+        sdk,
+        original_compiler,
+        original_platform,
+        None,
+        None,
+        None,
+        {},
+        {},
+        "d" * 64,
+        True,
+        "wasm32-wasip1-threads",
+        "test-abi",
+    )
     bootstrap_compiler = product("bootstrap-compiler", "e")
     bootstrap_platform = product("bootstrap-platform", "f")
     monkeypatch.setattr(cohort_module, "local_recipe", lambda _name: recipe)
@@ -189,7 +202,13 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
     def observed_accept(request):
         commands.append(
             _native_command(
-                request.cohort, request.dependency_sysroot, tmp_path / "probe.c", tmp_path / "probe.wasm", [], [], []
+                request.sdk_context,
+                request.dependency_sysroot,
+                tmp_path / "probe.c",
+                tmp_path / "probe.wasm",
+                [],
+                [],
+                [],
             )
         )
         request.output.mkdir(parents=True)
@@ -226,15 +245,15 @@ def test_executable_archive_admission_rejects_modified_and_unrecorded_files(tmp_
         {"artifacts": {"sysroot/lib/setjmp.a": hashlib.sha256(path.read_bytes()).hexdigest()}},
     )
     cohort = PlatformCohort(receipt)
-    declared = {"executable_cohort_link_inputs": ["lib/setjmp.a"]}
-    assert runner._executable_cohort_link_inputs(cohort, declared) == (path,)
+    declared = {"executable_sdk_link_inputs": ["lib/setjmp.a"]}
+    assert runner._executable_sdk_link_inputs(cohort, declared) == (path,)
     path.write_bytes(b"!<arch>\nmodified archive")
     with pytest.raises(ValueError, match="differs"):
-        runner._executable_cohort_link_inputs(cohort, declared)
+        runner._executable_sdk_link_inputs(cohort, declared)
     unrecorded = path.with_name("ambient.a")
     unrecorded.write_bytes(b"!<arch>\nambient archive")
     with pytest.raises(ValueError, match="differs"):
-        runner._executable_cohort_link_inputs(cohort, {"executable_cohort_link_inputs": ["lib/ambient.a"]})
+        runner._executable_sdk_link_inputs(cohort, {"executable_sdk_link_inputs": ["lib/ambient.a"]})
 
 
 @pytest.mark.parametrize("declared", [["../host.a"], ["/host.a"], ["lib/setjmp.a", "lib/setjmp.a"]])
@@ -249,7 +268,7 @@ def test_executable_archive_admission_rejects_escaping_or_duplicate_inputs(tmp_p
         {"artifacts": {"sysroot/lib/setjmp.a": hashlib.sha256(path.read_bytes()).hexdigest()}},
     )
     with pytest.raises(ValueError):
-        runner._executable_cohort_link_inputs(PlatformCohort(receipt), {"executable_cohort_link_inputs": declared})
+        runner._executable_sdk_link_inputs(PlatformCohort(receipt), {"executable_sdk_link_inputs": declared})
 
 
 def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
@@ -260,13 +279,13 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
     import shellsim
     from shellsim._cpython_universe import Universe
 
-    from ports._support.cohort import load_cohort
+    from ports._support.import_sdk import load_legacy_cohort
 
     cohort_path = os.environ.get("SHELLSIM_PILLOW_GRAPH_COHORT")
     store_path = os.environ.get("SHELLSIM_PILLOW_GRAPH_STORE")
     if cohort_path is None or store_path is None:
         pytest.skip("real Pillow graph inputs were not supplied")
-    cohort = load_cohort(Path(cohort_path))
+    cohort = load_legacy_cohort(Path(cohort_path))
     build = runner.build_graph(
         Path(__file__).parents[2], ["python/pillow/graph-recipe.json"], cohort, Path(store_path), offline=True
     )
@@ -284,59 +303,11 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
     assert result.returncode == 0 and result.stop_reason is None, result.stderr
 
 
-def test_profile_provider_selection_rebuilds_verified_wheel_consumers(tmp_path, monkeypatch):
+def test_pure_wheels_do_not_acquire_sdk_dependencies(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    provider, provider_recipe = _wheel_port(ports, store, "provider", [])
-    alternate = provider.with_name("alternate.json")
-    alternate.write_text(json.dumps({**provider_recipe, "features": {"alternate-build": True}}))
-    consumer, recipe = _wheel_port(ports, store, "consumer", ["provider"])
-    consumer.write_text(json.dumps({**recipe, "build_profile": "pure-test"}))
-    profile_path = ports / "profiles/pure-test.json"
-    profile_path.parent.mkdir()
-    profile = {
-        "schema_version": 1,
-        "target": PureCohort.target,
-        "target_profile": PureCohort.dynamic_abi,
-        "abi": PureCohort.dynamic_abi,
-        "build_dependencies": [],
-        "platform_dependencies": [],
-        "dependency_recipes": {"python/provider": "python/provider/recipe.json"},
-    }
-    profile_path.write_text(json.dumps(profile))
-    calls = []
-    real_build = runner.build_pure_wheel
-
-    def observed_build(request):
-        calls.append(request.recipe["name"])
-        return real_build(request)
-
-    monkeypatch.setattr(runner, "build_pure_wheel", observed_build)
-    first = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    receipt = json.loads((first.results["python/consumer/recipe.json"] / "build-receipt.json").read_text())
-    assert receipt["inputs"]["build_profile"] == {
-        "reference": "profiles/pure-test.json",
-        "sha256": hashlib.sha256(profile_path.read_bytes()).hexdigest(),
-    }
-    calls.clear()
-    cached = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert not calls
-    assert cached.results == first.results
-    profile["dependency_recipes"]["python/provider"] = "python/provider/alternate.json"
-    profile_path.write_text(json.dumps(profile))
-    changed = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert calls == ["provider", "consumer"]
-    assert "python/provider/recipe.json" not in changed.results
-    assert changed.results["python/consumer/recipe.json"] != first.results["python/consumer/recipe.json"]
-    calls.clear()
-    # Equal resolved values still retain the exact authored profile bytes.
-    profile_path.write_text(json.dumps(profile, indent=2))
-    reauthored = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert calls == ["consumer"]
-    assert reauthored.results["python/provider/alternate.json"] == changed.results["python/provider/alternate.json"]
-    assert reauthored.results["python/consumer/recipe.json"] != changed.results["python/consumer/recipe.json"]
-    calls.clear()
-    artifact = reauthored.results["python/consumer/recipe.json"] / "wheels/consumer-1-py3-none-any.whl"
-    artifact.write_bytes(b"corrupt")
-    with pytest.raises(ValueError):
-        runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert not calls
+    _wheel_port(ports, store, "provider", [])
+    _wheel_port(ports, store, "consumer", ["provider"])
+    result = runner.build_graph(ports, ["python/consumer"], None, store, offline=True)
+    assert {port.name for port in result.graph.ports} == {"consumer", "provider"}
+    assert all(port.sdk_selection is None for port in result.graph.ports)
+    assert all(context is None for context in result.sdks.values())

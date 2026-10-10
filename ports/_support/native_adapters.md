@@ -1,13 +1,13 @@
 # Native build adapters
 
-The graph runner admits source, patches, cohort, host tools and target dependency
+The graph runner admits source, patches, SDK, host tools and target dependency
 exports before invoking `build_native`. The adapter returns unpublished staging
 files and the exact command vectors. Fetching, sealing, cache publication and
 catalog assembly remain runner operations.
 
 `NativeBuildContext.target_tools` supplies absolute `cc`, `cxx`, `ar`, `ranlib`
 and, for Meson, `strip` entrypoints. Compiler drivers may perform the admitted
-cohort's LLVM lowering; the adapter never guesses a compiler from SDK layout.
+SDK's LLVM lowering; the adapter never guesses a compiler from SDK layout.
 Compiler and linker flags are separate admitted argument tuples.
 
 The standard host build baseline includes Python, a POSIX shell and core build
@@ -22,7 +22,7 @@ Upstream installation uses logical `/usr/local` and `DESTDIR=staging_prefix`.
 The runner merges verified dependency exports, with collision checks, under
 `dependency_sysroot`. pkg-config receives this sysroot and only its
 `usr/local/lib/pkgconfig` and `usr/local/share/pkgconfig` directories. CMake
-uses only the dependency sysroot and admitted cohort sysroot for target searches.
+uses only the dependency sysroot and admitted SDK sysroot for target searches.
 Meson disables downloading wrapped projects. Upstream `.pc` files retain their
 original prefix; the adapter does not rewrite them.
 
@@ -32,7 +32,7 @@ A recipe build section selects `adapter` (`cmake`, `meson`, `configure-make`),
 recipes provide their upstream-specific cross options explicitly. Meson accepts
 its standard `install` target. The runner converts these fields into a typed
 `NativeBuildRequest`; it also consumes dependency recipe variants resolved from explicit selections or
-a named build profile.
+a selected SDK.
 
 The compatibility probes build upstream zlib 1.3.1 through CMake and
 configure/make, and FreeType 2.13.3 through Meson using the configure-built zlib.
@@ -42,7 +42,7 @@ threaded dynamic TLS lowering. zlib's upstream CMake script also needs an
 explicit WASI library-name portability patch before its generated `-lz`
 pkg-config interface can be published.
 
-`NativeBuildContext.shared_library_flags` contains the cohort's side-module
+`NativeBuildContext.shared_library_flags` contains the SDK's side-module
 flags. The compiler flag wrapper adds them only when the upstream build requests
 its explicit `-shared` mode. Executable compiler checks receive common
 `linker_flags` instead.
@@ -59,7 +59,7 @@ file/directory collision reject the merge before publication.
 payload-relative files; `export_directories` lists payload-relative directories
 by group. For example, headers may declare `include` while shared libraries
 name `lib/libexample.so` explicitly. Contained file links become regular file
-snapshots. Shared library exports receive the exact cohort ABI marker and must
+snapshots. Shared library exports receive the exact SDK ABI marker and must
 have the declared direct providers in their emitted dependency list. The
 artifact envelope retains the resolved graph recipe and digest separately from
 the effective recipe with expanded exact file exports. Source and cache
@@ -74,25 +74,15 @@ Build edges select host tools; platform edges select target platforms. Target
 edges supply link prefixes. Runtime edges supply installed guest requirements
 and retain their artifact identities without entering the link prefix.
 
-Native builds select `build_profile: "wasi-threads-v3"` to share target/ABI fields,
-compiler/platform pins and dependency variant defaults. The planner expands this
-into `toolchain/llvm/host-recipe.json` as a build dependency and
-`toolchain/wasi_threads/graph-recipe.json` as a platform dependency. Exact
-per-port dependency versions and explicit variant overrides remain in the recipe.
-Profile bytes and the authored recipe participate in its build identity; receipts
-retain the profile reference and hash. See [port authoring](../README.md).
-These
-small graph recipes pin the existing immutable producer recipes. The runner
-verifies their products and provides the selected compiler, sysroot and library
-prefixes to adapters. The SDK resource directory remains the admitted source of
-compiler-rt builtins, which the host LLVM product does not build.
-
-`--bootstrap` names a JSON descriptor with `schema_version: 1`,
-`archive: {path, sha256}`, `work`, and `tools` containing exact `cc`, `cxx`,
-`cmake` and `ninja` entries `{path, sha256}`. Paths resolve relative to that
-file. The graph calls the LLVM producer with these explicit seed inputs;
-verified products in its persistent workspace are reused. Without a bootstrap,
-the graph verifies and selects the cohort's existing compiler product.
+Native builds may omit `sdk`, select `"sdk": "default"`, or name a supported SDK.
+The planner expands compiler/platform edges and ordinary dependency variants from
+one versioned SDK definition. Exact per-port version pins and explicit variants
+remain in the recipe. Receipts retain the selection and actual product identities.
+The SDK materializer invokes pinned producers for missing products. Its typed
+`MaterializedSDK` supplies concrete compiler tools, sysroot, resource directory,
+flags, Python build data and admitted host tools. `NativeBuildContext` adds the
+consumer's own verified dependency sysroot and staging paths. See
+[SDK materialization](SDK.md) for native host seeds and migration.
 
 An in-tree platform source can declare `source.files` as a list of exact
 `{path, destination, sha256}` entries. Paths are relative to the ports tree;
@@ -120,31 +110,16 @@ adapters reject this option.
 `llvm-guest-sdk` stages admitted target development data without running a
 compiler and requires its explicit platform dependency.
 
-A trusted cohort descriptor pins the historical CPython manifest in full.
-Admission verifies its runtime files, headers, sysroot build profile and matching
-assembled interpreter. Its recipe must match the accepted Python source, patches,
-version, ABI and every other policy field. Historical Python driver and JSON
-metadata hashes remain provenance in that pinned manifest; their current pins
-govern new builds. The declared input paths must match exactly, and compiled
-facade sources, headers and patches must retain their current accepted hashes.
+The explicit migration command verifies historical CPython runtime files,
+headers, platform provenance and the matching assembled interpreter. Source,
+patch, ABI and compiled facade pins must match; historical driver hashes remain
+in the original immutable receipt. New compilation uses current pinned producers.
 
-The `wasi-sysroot` platform node invokes the pinned libc producer when
-`--platform-bootstrap` supplies a schema-1 descriptor with `sdk_archive` and
-`libc_archive` objects (`path`, `sha256`) and a `work` path. Paths are relative to
-the descriptor. The node consumes its explicit host LLVM build dependency and
-cohort-admitted CMake/Ninja tools. A complete existing workspace product is
-reused only after exact recipe, compiler, tool and output-byte verification.
-Without bootstrap archives, the explicit cohort platform receipt is reused.
-Guest LLVM workspace compatibility tracks compiler and generator bytes and
-consumed headers; changed linker tools or archives update verified snapshots
-at stable paths and trigger relinking. Result identities still bind all files.
-
-Each native graph node seals a resolved toolchain receipt with the actual
-compiler and platform manifest hashes. Its cohort identity derives from the
-input cohort and those two receipts. Graph acceptance retains that per-node
-context and compiles probes with the same selected compiler and sysroot; it
-also records the resolved receipts in `graph.json`. Bootstrap-selected products
-therefore cannot retain the original cohort toolchain label.
+Native artifact toolchain receipts retain actual compiler and platform manifest
+hashes and SDK resource identities. Graph checks use the same materialized
+compiler and sysroot as their consumer and record these receipts in `graph.json`.
+Guest LLVM retained workspaces continue to track compiler/generator bytes and
+consumed headers; changed linker tools or archives trigger verified relinking.
 
 Port checks may declare `test_limits` with positive integer `cpu`, `memory` and
 `disk` guest budgets. Omitted fields retain the public environment defaults.
@@ -208,7 +183,7 @@ mutable hooks cannot use this mode.
 
 Jobs, install tags, licenses and development-export selections remain packaging
 inputs rather than compilation-workspace inputs. The runner still keys and
-verifies every immutable result with the full recipe, implementation and cohort.
+verifies every immutable result with the full recipe, implementation and SDK.
 A packaging change reuses the verified Meson configuration, runs Ninja's selected
 install targets and writes a fresh install and wheel directory. Unchanged
 compiler wrappers and machine files retain their timestamps so Ninja does not
@@ -266,7 +241,7 @@ remains discoverable. Inherited Git directory/work-tree overrides are excluded
 by the existing target environment allowlist. Retained generated VCS headers
 may change once when this boundary corrects a previously embedded parent hash.
 
-`build.executable_cohort_link_inputs` declares at most 32 static archives by
+`build.executable_sdk_link_inputs` declares at most 32 static archives by
 canonical path relative to the resolved platform sysroot, for example
 `lib/wasm32-wasip1-threads/libsetjmp.a`. The runner rejects escaping paths,
 symlinks, missing files, duplicate entries, archives larger than 128 MiB, and

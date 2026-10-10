@@ -82,6 +82,9 @@ def _extension_request(tmp_path: Path) -> ExtensionBuildRequest:
         target_tools={"cc": tmp_path / "cc", "cxx": tmp_path / "cxx"},
         dependency_sysroot=tmp_path / "dependency-sysroot",
         shared_library_flags=("-shared",),
+        abi="test-abi",
+        compiler_resource_directory=tmp_path / "sdk/lib/clang/23",
+        linker=tmp_path / "compiler/bin/wasm-ld",
     )
     cpython = CPythonBuildContext(
         include_dir=tmp_path / "include",

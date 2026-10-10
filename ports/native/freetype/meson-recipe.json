@@ -73,11 +73,11 @@
         "lib/libfreetype.a",
         "lib/libz.a"
       ],
-      "cohort_link_inputs": [
+      "sdk_link_inputs": [
         "lib/wasm32-wasip1-threads/libsetjmp.a"
       ]
     }
   ],
   "role": "target-library",
-  "build_profile": "wasi-threads-v3"
+  "sdk": "default"
 }
