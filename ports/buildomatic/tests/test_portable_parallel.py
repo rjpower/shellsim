@@ -7,7 +7,12 @@ import threading
 import pytest
 
 from ports.buildomatic import portable
-from ports.buildomatic.tests.test_portable import sdk_fixture as sdk_fixture
+from ports.buildomatic.tests import test_portable
+
+
+@pytest.fixture
+def sdk_fixture(tmp_path, monkeypatch):
+    yield from test_portable.sdk_fixture.__wrapped__(tmp_path, monkeypatch)
 
 
 def test_parallel_export_joins_workers_before_descriptor(tmp_path, sdk_fixture, monkeypatch):
@@ -154,8 +159,9 @@ def test_worker_bound_rejects_before_mutation(tmp_path, sdk_fixture, workers):
 def test_inventory_and_free_space_bounds_precede_cache_mutation(tmp_path, sdk_fixture, monkeypatch):
     context = sdk_fixture()
     with pytest.raises(ValueError):
-        portable.export_sdk(context, tmp_path / "output", blob_cache=tmp_path / "cache",
-                            limits=portable.PortableLimits(max_files=1))
+        portable.export_sdk(
+            context, tmp_path / "output", blob_cache=tmp_path / "cache", limits=portable.PortableLimits(max_files=1)
+        )
     assert not (tmp_path / "cache").exists()
     monkeypatch.setattr(portable.shutil, "disk_usage", lambda _p: type("Usage", (), {"free": 1})())
     with pytest.raises(OSError):
