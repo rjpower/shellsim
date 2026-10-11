@@ -33,14 +33,16 @@ import sys
 import threading
 import uuid
 import zipfile
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from importlib.metadata import requires
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Mapping
+from typing import TYPE_CHECKING, Callable, ContextManager, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import tomllib
 
+from ports.buildomatic import ResourceLimits
 from ports.buildomatic.remote_store import (
     DEFAULT_PREFIX,
     MAX_METADATA_BYTES,
@@ -51,12 +53,33 @@ from ports.buildomatic.remote_store import (
     sign_blob,
     validate_prefix,
 )
+from ports.buildomatic.transfers import (
+    DEFAULT_LIMITS as _TRANSFER_LIMITS,
+)
+from ports.buildomatic.transfers import (
+    TransferCounts,
+)
+from ports.buildomatic.transfers import (
+    download_bundles as _download_bundles,
+)
+from ports.buildomatic.transfers import (
+    upload_bundles as _upload_bundles,
+)
 
 if TYPE_CHECKING:
     from iris.client.workload import AttemptStatus, TaskStatus
     from iris.resources.state import TaskState
 
-    from ports.buildomatic import Attempt, BuildRequest, BuildResult, Store, Worker, WorkerReport
+    from ports.buildomatic import (
+        Attempt,
+        BuildRequest,
+        BuildResult,
+        LocalStore,
+        Store,
+        TreeBundle,
+        Worker,
+        WorkerReport,
+    )
 
 logger = logging.getLogger(__name__)
 _SERVICE_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
@@ -866,6 +889,9 @@ class _CapabilityRPC:
 
         return call_with_retry(f"{self._name}.{method}", invoke, max_attempts=3)
 
+    def close(self) -> None:
+        self._client.close()
+
 
 class IrisBackend:
     """External client for durable short RPCs through a scoped bearer proxy.
@@ -884,12 +910,14 @@ class IrisBackend:
         rpc_seconds: float = 30,
         prefix: str = DEFAULT_PREFIX,
         cache_prefix: str | None = None,
+        transfer_factory: Callable[[], ContextManager[IrisBackend]] | None = None,
     ):
         self.store = SignedBlobStore(self.sign_blob)
         self._controller = controller_client
         self._name = f"{namespace.rstrip('/')}/coordinator"
         self._rpc_seconds = rpc_seconds
         self._controller_url = controller_url
+        self._transfer_factory = transfer_factory
         self.refresh_capability()
 
     def refresh_capability(self) -> None:
@@ -921,6 +949,93 @@ class IrisBackend:
 
     def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
         return self._actor.call("GetLogs", build_id)
+
+    def close(self) -> None:
+        """Close this backend's capability transport; caller owns its controller."""
+        self._actor.close()
+
+    @contextmanager
+    def _transfer_store(self):
+        if self._transfer_factory is None:
+            raise ValueError("bundle transfers require an independent backend context factory")
+        with self._transfer_factory() as backend:
+            yield backend.store
+
+    def upload_bundles(
+        self,
+        source: LocalStore,
+        bundles: Sequence[TreeBundle],
+        *,
+        max_parallel: int = 8,
+        limits: ResourceLimits = _TRANSFER_LIMITS,
+    ) -> TransferCounts:
+        """Upload local closures before Submit, with one owned backend per loop.
+
+        ResourceLimits apply to each distinct tree, never their aggregate.
+        This operation neither submits nor changes a service or build request.
+        """
+        if self._transfer_factory is None:
+            raise ValueError("bundle transfers require an independent backend context factory")
+        return _upload_bundles(source, bundles, factory=self._transfer_store, max_parallel=max_parallel, limits=limits)
+
+    def download_bundles(
+        self,
+        destination: LocalStore,
+        bundles: Sequence[TreeBundle],
+        *,
+        max_parallel: int = 8,
+        limits: ResourceLimits = _TRANSFER_LIMITS,
+    ) -> TransferCounts:
+        """Warm verified local output blobs before normal checked collection."""
+        if self._transfer_factory is None:
+            raise ValueError("bundle transfers require an independent backend context factory")
+        return _download_bundles(
+            destination, bundles, factory=self._transfer_store, max_parallel=max_parallel, limits=limits
+        )
+
+
+def backend_context_factory(
+    *,
+    job_id: str,
+    cluster_name: str,
+    controller_url: str,
+    workspace: Path | None = None,
+    prefix: str = DEFAULT_PREFIX,
+    cache_prefix: str | None = None,
+    rpc_seconds: float = 30,
+) -> Callable[[], ContextManager[IrisBackend]]:
+    """Connect independently to one existing service from public connection info.
+
+    Each context resolves fresh authentication providers inside its own thread,
+    creates a controller client and scoped capability transport, and closes both
+    on exit. No task deployment, request recovery/submission or acknowledgement
+    occurs. The job's namespace is fixed; only capabilities are newly minted.
+    """
+    validate_prefix(prefix)
+    if cache_prefix is not None:
+        validate_prefix(cache_prefix)
+
+    @contextmanager
+    def connect():
+        from iris.cli.connect import open_iris_client
+        from iris.cluster.types import JobName, Namespace
+
+        with open_iris_client(cluster_name=cluster_name, workspace=workspace) as client:
+            backend = IrisBackend(
+                client,
+                controller_url,
+                str(Namespace.from_job_id(JobName.from_wire(job_id))),
+                rpc_seconds=rpc_seconds,
+                prefix=prefix,
+                cache_prefix=cache_prefix,
+                transfer_factory=connect,
+            )
+            try:
+                yield backend
+            finally:
+                backend.close()
+
+    return connect
 
 
 def discover(client, controller_url: str, job, config: IrisConfig, *, rpc_seconds: float = 30) -> IrisBackend:
