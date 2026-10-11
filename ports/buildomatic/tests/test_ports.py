@@ -227,10 +227,9 @@ def test_independent_ports_enter_ready_queue_concurrently(tmp_path, monkeypatch)
 
 @pytest.fixture
 def remote_service(tmp_path, monkeypatch):
-    from ports.buildomatic.transfers import download_bundles, upload_bundles
-
     import ports.buildomatic as core
     import ports.buildomatic.ports as bridge
+    from ports.buildomatic.transfers import download_bundles, upload_bundles
 
     blobs = core.LocalStore(tmp_path / "remote-blobs")
     coordinator = core.Coordinator(blobs, "remote-service", {"worker": core.WorkerExecutor(blobs, tmp_path / "worker")})
