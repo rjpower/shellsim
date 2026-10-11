@@ -1,0 +1,96 @@
+{
+  "name": "aiohttp",
+  "version": "3.14.5",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/6c/4c/bdccd81e9ee225b69c60e7766c9a5b05364f118f4d383713b89a682d772d/aiohttp-3.14.5.tar.gz",
+    "sha256": "5558a7f5a05af9ecf744af91e5baefc436f93c9333e656c27ec253f9a6bbe178",
+    "filename": "aiohttp-3.14.5.tar.gz",
+    "subdirectory": "aiohttp-3.14.5"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "aiohappyeyeballs>=2.5.0",
+    "aiosignal>=1.4.0",
+    "async-timeout<6.0,>=4.0; python_version < \"3.11\"",
+    "attrs>=17.3.0",
+    "frozenlist>=1.1.1",
+    "multidict<8.0,>=4.5",
+    "propcache>=0.2.0",
+    "typing_extensions>=4.4; python_version < \"3.13\"",
+    "yarl<2.0,>=1.25.1",
+    "aiodns>=3.3.0; (sys_platform != \"android\" and sys_platform != \"ios\") and extra == \"speedups\"",
+    "Brotli>=1.2; (platform_python_implementation == \"CPython\" and sys_platform != \"android\" and sys_platform != \"ios\") and extra == \"speedups\"",
+    "brotlicffi>=1.2; platform_python_implementation != \"CPython\" and extra == \"speedups\"",
+    "backports.zstd; (platform_python_implementation == \"CPython\" and python_version < \"3.14\" and sys_platform != \"android\" and sys_platform != \"ios\") and extra == \"speedups\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/aiohappyeyeballs",
+      "version": "2.7.1"
+    },
+    {
+      "port": "python/aiosignal",
+      "version": "1.4.0"
+    },
+    {
+      "port": "python/attrs",
+      "version": "26.1.0"
+    },
+    {
+      "port": "python/frozenlist",
+      "version": "1.8.0"
+    },
+    {
+      "port": "python/multidict",
+      "version": "7.1.0"
+    },
+    {
+      "port": "python/propcache",
+      "version": "0.5.4"
+    },
+    {
+      "port": "python/yarl",
+      "version": "1.25.1"
+    },
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/pkgconfig",
+      "version": "1.6.0"
+    }
+  ],
+  "patches": [
+    {
+      "file": "wasi-llhttp.patch",
+      "sha256": "4d9ea18dd71f45ee15361c5f8da75269373d8f815af1476a75b1e8387316284d"
+    }
+  ]
+}

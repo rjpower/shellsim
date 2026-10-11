@@ -1,0 +1,55 @@
+--- a/src/c/_cffi_backend.c
++++ b/src/c/_cffi_backend.c
+@@ -10,10 +10,19 @@
+ #else
+ #include <stddef.h>
+ #include <stdint.h>
++#ifdef __wasi__
++/* Route library access through the virtual process loader. */
++#define dlopen __wrap_dlopen
++#define dlsym __wrap_dlsym
++#define dlerror __wrap_dlerror
++#define dlclose __wrap_dlclose
++#endif
+ #include <dlfcn.h>
+ #include <errno.h>
+ #include <ffi.h>
++#ifndef __wasi__
+ #include <sys/mman.h>
++#endif
+ #include "misc_thread_posix.h"
+ #endif
+
+@@ -99,7 +108,7 @@
+  * This is also used on macOS, provided we are executing on macOS 10.15 or
+  * above.  It's a mess because it needs runtime checks in that case.
+  */
+-#ifdef __NetBSD__
++#if defined(__NetBSD__) || defined(__wasi__)
+
+ # define CFFI_CHECK_FFI_CLOSURE_ALLOC 1
+ # define CFFI_CHECK_FFI_CLOSURE_ALLOC_MAYBE 1
+--- a/src/c/malloc_closure.h
++++ b/src/c/malloc_closure.h
+@@ -1,3 +1,15 @@
++/* WASI callbacks use libffi table slots, never executable mmap pages. */
++#ifdef __wasi__
++static void cffi_closure_free(ffi_closure *closure)
++{
++    ffi_closure_free(closure);
++}
++static ffi_closure *cffi_closure_alloc(void)
++{
++    void *code;
++    return ffi_closure_alloc(sizeof(ffi_closure), &code);
++}
++#else
+ /*
+  * This file is from CPython's Modules/_ctypes/malloc_closure.c
+  * and has received some edits.
+@@ -189,3 +201,5 @@
+     MALLOC_CLOSURE_UNLOCK();
+     return &item->closure;
+ }
++
++#endif

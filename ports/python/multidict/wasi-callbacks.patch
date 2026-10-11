@@ -1,0 +1,254 @@
+--- a/multidict/_multidict.c
++++ b/multidict/_multidict.c
+@@ -1,4 +1,10 @@
+ #include <Python.h>
++#ifdef __wasi__
++#define MD_NOARGS(name) name##_wasi_noargs
++#else
++#define MD_NOARGS(name) name
++#endif
++
+ #include <structmember.h>
+
+ #include "_multilib/bulk_update.h"
+@@ -1099,6 +1105,72 @@
+     return PyLong_FromSsize_t(size);
+ }
+
++/* CPython passes two arguments even to METH_NOARGS callbacks. */
++#ifdef __wasi__
++static PyObject *
++multidict_keys_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_keys((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_items_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_items((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_values_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_values((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_copy_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_copy((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_to_dict_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_to_dict((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_clear_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_clear((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_popitem_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_popitem((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_reduce_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_reduce((MultiDictObject*)self);
++}
++
++static PyObject *
++multidict_sizeof_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_sizeof((MultiDictObject*)self);
++}
++#endif
++
+ static PyMethodDef multidict_methods[] = {
+     {"getall",
+      (PyCFunction)multidict_getall,
+@@ -1112,26 +1184,26 @@
+      (PyCFunction)multidict_get,
+      METH_FASTCALL | METH_KEYWORDS,
+      multidict_get_doc},
+-    {"keys", (PyCFunction)multidict_keys, METH_NOARGS, multidict_keys_doc},
+-    {"items", (PyCFunction)multidict_items, METH_NOARGS, multidict_items_doc},
++    {"keys", (PyCFunction)MD_NOARGS(multidict_keys), METH_NOARGS, multidict_keys_doc},
++    {"items", (PyCFunction)MD_NOARGS(multidict_items), METH_NOARGS, multidict_items_doc},
+     {"values",
+-     (PyCFunction)multidict_values,
++     (PyCFunction)MD_NOARGS(multidict_values),
+      METH_NOARGS,
+      multidict_values_doc},
+     {"add",
+      (PyCFunction)multidict_add,
+      METH_FASTCALL | METH_KEYWORDS,
+      multidict_add_doc},
+-    {"copy", (PyCFunction)multidict_copy, METH_NOARGS, multidict_copy_doc},
++    {"copy", (PyCFunction)MD_NOARGS(multidict_copy), METH_NOARGS, multidict_copy_doc},
+     {"to_dict",
+-     (PyCFunction)multidict_to_dict,
++     (PyCFunction)MD_NOARGS(multidict_to_dict),
+      METH_NOARGS,
+      multidict_to_dict_doc},
+     {"extend",
+      (PyCFunction)multidict_extend,
+      METH_VARARGS | METH_KEYWORDS,
+      multidict_extend_doc},
+-    {"clear", (PyCFunction)multidict_clear, METH_NOARGS, multidict_clear_doc},
++    {"clear", (PyCFunction)MD_NOARGS(multidict_clear), METH_NOARGS, multidict_clear_doc},
+     {"setdefault",
+      (PyCFunction)multidict_setdefault,
+      METH_FASTCALL | METH_KEYWORDS,
+@@ -1149,7 +1221,7 @@
+      METH_FASTCALL | METH_KEYWORDS,
+      multidict_popall_doc},
+     {"popitem",
+-     (PyCFunction)multidict_popitem,
++     (PyCFunction)MD_NOARGS(multidict_popitem),
+      METH_NOARGS,
+      multidict_popitem_doc},
+     {"update",
+@@ -1162,7 +1234,7 @@
+      multidict_merge_doc},
+     {
+         "__reduce__",
+-        (PyCFunction)multidict_reduce,
++        (PyCFunction)MD_NOARGS(multidict_reduce),
+         METH_NOARGS,
+         NULL,
+     },
+@@ -1172,7 +1244,7 @@
+      NULL},
+     {
+         "__sizeof__",
+-        (PyCFunction)multidict_sizeof,
++        (PyCFunction)MD_NOARGS(multidict_sizeof),
+         METH_NOARGS,
+         sizeof__doc__,
+     },
+@@ -1514,6 +1586,51 @@
+ {
+     return md_repr(self->md, (PyObject*)self, true, true);
+ }
++
++/* CPython passes two arguments even to METH_NOARGS callbacks. */
++#ifdef __wasi__
++static PyObject *
++multidict_proxy_keys_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_keys((MultiDictProxyObject*)self);
++}
++
++static PyObject *
++multidict_proxy_items_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_items((MultiDictProxyObject*)self);
++}
++
++static PyObject *
++multidict_proxy_values_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_values((MultiDictProxyObject*)self);
++}
++
++static PyObject *
++multidict_proxy_copy_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_copy((MultiDictProxyObject*)self);
++}
++
++static PyObject *
++multidict_proxy_reduce_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_reduce((MultiDictProxyObject*)self);
++}
++
++static PyObject *
++multidict_proxy_to_dict_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return multidict_proxy_to_dict((MultiDictProxyObject*)self);
++}
++#endif
+
+ static PyMethodDef multidict_proxy_methods[] = {
+     {"getall",
+@@ -1529,28 +1646,28 @@
+      METH_FASTCALL | METH_KEYWORDS,
+      multidict_get_doc},
+     {"keys",
+-     (PyCFunction)multidict_proxy_keys,
++     (PyCFunction)MD_NOARGS(multidict_proxy_keys),
+      METH_NOARGS,
+      multidict_keys_doc},
+     {"items",
+-     (PyCFunction)multidict_proxy_items,
++     (PyCFunction)MD_NOARGS(multidict_proxy_items),
+      METH_NOARGS,
+      multidict_items_doc},
+     {"values",
+-     (PyCFunction)multidict_proxy_values,
++     (PyCFunction)MD_NOARGS(multidict_proxy_values),
+      METH_NOARGS,
+      multidict_values_doc},
+     {"copy",
+-     (PyCFunction)multidict_proxy_copy,
++     (PyCFunction)MD_NOARGS(multidict_proxy_copy),
+      METH_NOARGS,
+      multidict_copy_doc},
+-    {"__reduce__", (PyCFunction)multidict_proxy_reduce, METH_NOARGS, NULL},
++    {"__reduce__", (PyCFunction)MD_NOARGS(multidict_proxy_reduce), METH_NOARGS, NULL},
+     {"__class_getitem__",
+      (PyCFunction)Py_GenericAlias,
+      METH_O | METH_CLASS,
+      NULL},
+     {"to_dict",
+-     (PyCFunction)multidict_proxy_to_dict,
++     (PyCFunction)MD_NOARGS(multidict_proxy_to_dict),
+      METH_NOARGS,
+      multidict_to_dict_doc},
+     {NULL, NULL} /* sentinel */
+--- a/multidict/_multilib/istr.h
++++ b/multidict/_multilib/istr.h
+@@ -252,8 +252,18 @@
+     return result;
+ }
+
++/* CPython passes two arguments even to METH_NOARGS callbacks. */
++#ifdef __wasi__
++static PyObject *
++istr_reduce_wasi_noargs(PyObject *self, PyObject *unused)
++{
++    (void)unused;
++    return istr_reduce((PyObject*)self);
++}
++#endif
++
+ static PyMethodDef istr_methods[] = {
+-    {"__reduce__", (PyCFunction)istr_reduce, METH_NOARGS, NULL},
++    {"__reduce__", (PyCFunction)MD_NOARGS(istr_reduce), METH_NOARGS, NULL},
+     {NULL, NULL} /* sentinel */
+ };

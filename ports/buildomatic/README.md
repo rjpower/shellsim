@@ -219,3 +219,7 @@ Output bundles are cache references. Successful execution records do not promise
 release durability, cache retention or a TTL. Retrieving an expired manifest or
 chunk raises `FileNotFoundError`. The caller must
 request a new build rather than treat a missing cached output as published.
+
+Qualification recipe limits accept positive values in the native unsigned 64-bit
+range. CPU, memory and disk allowances are chosen for the workload; the runner
+uses the same integer bounds as the native API. Guest execution meters each allowance.

@@ -355,9 +355,16 @@ def build_pep517(request: PEP517BuildRequest) -> PythonBuildOutput:
         (str(context.host_tools["python"]), "-I", "-S", str(driver), str(arguments)), context.source
     )
     with (context.build / "backend.log").open("wb") as log:
-        subprocess.run(
-            command.argv, cwd=command.directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
-        )
+        try:
+            subprocess.run(
+                command.argv, cwd=command.directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
+            )
+        except subprocess.CalledProcessError as error:
+            log.flush()
+            with Path(log.name).open("rb") as source:
+                source.seek(max(0, source.seek(0, 2) - 8192))
+                error.add_note(source.read().decode(errors="replace"))
+            raise
     result = json.loads(Path(payload["response"]).read_text())
     filename = relative_path(result["wheel"])
     if "/" in filename or not filename.endswith(".whl"):

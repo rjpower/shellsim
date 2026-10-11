@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ports._support.acceptance import AcceptanceRequest, _fixtures, _native_command, accept_port
+from ports._support.acceptance import AcceptanceRequest, _fixtures, _native_command, _test_limits, accept_port
 from ports._support.graph import Port
 
 
@@ -35,7 +35,7 @@ def test_acceptance_requires_existing_declared_probe_before_release_fetch(tmp_pa
     assert not output.exists()
 
 
-@pytest.mark.parametrize("limits", [{"cpu": -1}, {"memory": True}, {"disk": 2**32}, {"host": 1}, []])
+@pytest.mark.parametrize("limits", [{"cpu": -1}, {"memory": True}, {"disk": 2**64}, {"host": 1}, []])
 def test_acceptance_rejects_invalid_resource_budgets_before_release_fetch(tmp_path, limits):
     port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
     port = dataclasses.replace(port, recipe={**port.recipe, "test_limits": limits})
@@ -43,6 +43,14 @@ def test_acceptance_rejects_invalid_resource_budgets_before_release_fetch(tmp_pa
     with pytest.raises(ValueError, match="test_limits"):
         accept_port(AcceptanceRequest(port, tmp_path / "missing-release.json", output, "pypi"))
     assert not output.exists()
+
+
+def test_acceptance_allows_workload_selected_resource_budgets():
+    values = {"cpu": 2**63, "memory": 64 * 1024**3, "disk": 16 * 1024**3}
+    limits = _test_limits({"test_limits": values})
+    assert limits.cpu == values["cpu"]
+    assert limits.memory == values["memory"]
+    assert limits.disk == values["disk"]
 
 
 @pytest.mark.parametrize("extras", ["pandas", [None], [""], ["pandas; sys_platform=='linux'"], ["pandas", "pandas"]])

@@ -1,0 +1,38 @@
+{
+  "name": "aiosignal",
+  "version": "1.4.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/fb/76/641ae371508676492379f16e2fa48f4e2c11741bd63c48be4b12a6b09cba/aiosignal-1.4.0-py3-none-any.whl",
+    "sha256": "053243f8b92b990551949e63930a839ff0cf0b0ebbe0597b0f3fb19e1a0fe82e",
+    "filename": "aiosignal-1.4.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "frozenlist>=1.1.0",
+    "typing-extensions>=4.2; python_version < \"3.13\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/frozenlist",
+      "version": "1.8.0"
+    },
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

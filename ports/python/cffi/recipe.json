@@ -1,0 +1,60 @@
+{
+  "name": "cffi",
+  "version": "2.1.1",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "sdk": "default",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/9e/ef/008a1939e372c06329a3fce4279c02f328488f3526744906eeec3da7ad5f/cffi-2.1.1.tar.gz",
+    "sha256": "dd31f52ea1086513bb9df30f8fcee9b8918323ae067a3d5b78bc826a000712be",
+    "filename": "cffi-2.1.1.tar.gz",
+    "subdirectory": "cffi-2.1.1"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "pycparser; implementation_name != \"PyPy\""
+  ],
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ],
+  "target_dependencies": [
+    {
+      "port": "native/libffi",
+      "version": "3.5.2"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/pycparser",
+      "version": "3.11"
+    }
+  ],
+  "needed_libraries": [
+    "libffi.so"
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "patches": [
+    {
+      "file": "wasi-closures.patch",
+      "sha256": "7f4b6bc7df8e80200fa90fd85f445b0bc7a4642a8aa0109bfb8c090b66cafa15"
+    }
+  ]
+}

@@ -1,0 +1,51 @@
+{
+  "name": "propcache",
+  "version": "0.5.4",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/b3/9a/9fbf4e4ec0c2d7f1c32519fff782ef467859b8faa9fbc5331a96f6395d43/propcache-0.5.4.tar.gz",
+    "sha256": "ff6b113f50bc066a698db5d944d2c6dc7507168dd3341e255a8892fd0715a558",
+    "filename": "propcache-0.5.4.tar.gz",
+    "subdirectory": "propcache-0.5.4"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build": {
+    "config_settings": {
+      "pure-python": "false"
+    }
+  },
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/expandvars",
+      "version": "1.1.2"
+    },
+    {
+      "port": "python/cython",
+      "version": "3.3.0"
+    }
+  ]
+}

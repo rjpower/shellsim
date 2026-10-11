@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import subprocess
 import zipfile
 from pathlib import Path
 
@@ -284,3 +285,36 @@ def test_malformed_backend_declaration_fails_before_host_execution(tmp_path, tab
     with pytest.raises(ValueError, match="build-system|build-backend"):
         build_pep517(request)
     assert not extension.context.build.exists()
+
+
+def test_failed_backend_reports_bounded_compiler_diagnostics(tmp_path, monkeypatch):
+    from ports._support.python_pep517 import BackendWheel, PEP517BuildRequest, build_pep517
+
+    extension = _extension_request(tmp_path)
+    context = dataclasses.replace(
+        extension.context,
+        host_tools={name: tmp_path / name for name in ("python", "pkg-config")},
+        target_tools={name: tmp_path / name for name in ("cc", "cxx", "ar", "ranlib")},
+    )
+    (context.source / "pyproject.toml").write_text('[build-system]\nrequires = []\nbuild-backend = "example"\n')
+    sysconfig = tmp_path / "sysconfig.py"
+    sysconfig.write_text("build_time_vars = {}\n")
+    backend = tmp_path / "example-1.0-py3-none-any.whl"
+    request = PEP517BuildRequest(
+        context,
+        extension.cpython,
+        sysconfig,
+        extension.recipe,
+        (BackendWheel(backend, {**_wheel(backend), "build_system": "pure-wheel"}),),
+    )
+
+    def fail(argv, **kwargs):
+        kwargs["stdout"].write(b"old progress\n" * 1000 + b"compiler diagnostic: missing target header\n")
+        raise subprocess.CalledProcessError(1, argv)
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    with pytest.raises(subprocess.CalledProcessError) as failure:
+        build_pep517(request)
+    note = failure.value.__notes__[0]
+    assert note.endswith("compiler diagnostic: missing target header\n")
+    assert len(note) <= 8192

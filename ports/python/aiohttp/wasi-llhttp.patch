@@ -1,0 +1,60 @@
+--- a/aiohttp/resolver.py
++++ b/aiohttp/resolver.py
+@@ -18,9 +18,11 @@
+     aiodns_default = False
+
+
+-_NUMERIC_SOCKET_FLAGS = socket.AI_NUMERICHOST | socket.AI_NUMERICSERV
++_NUMERIC_SOCKET_FLAGS = socket.AI_NUMERICHOST
++if sys.platform != "wasi":
++    _NUMERIC_SOCKET_FLAGS |= socket.AI_NUMERICSERV
+ _NAME_SOCKET_FLAGS = socket.NI_NUMERICHOST | socket.NI_NUMERICSERV
+-_AI_ADDRCONFIG = socket.AI_ADDRCONFIG
++_AI_ADDRCONFIG = 0 if sys.platform == "wasi" else socket.AI_ADDRCONFIG
+ if hasattr(socket, "AI_MASK"):
+     _AI_ADDRCONFIG &= socket.AI_MASK
+ _IS_WINDOWS = sys.platform == "win32"
+--- a/vendor/llhttp/build/c/llhttp.c
++++ b/vendor/llhttp/build/c/llhttp.c
+@@ -14,7 +14,7 @@
+  #include <arm_neon.h>
+ #endif  /* __ARM_NEON__ */
+
+-#ifdef __wasm__
++#if defined(__wasm__) && !defined(__wasi__)
+  #include <wasm_simd128.h>
+ #endif  /* __wasm__ */
+
+--- a/vendor/llhttp/build/llhttp.h
++++ b/vendor/llhttp/build/llhttp.h
+@@ -551,7 +551,7 @@
+ #endif
+ #include <stddef.h>
+
+-#if defined(__wasm__)
++#if defined(__wasm__) && !defined(__wasi__)
+ #define LLHTTP_EXPORT __attribute__((visibility("default")))
+ #elif defined(_WIN32)
+ #define LLHTTP_EXPORT __declspec(dllexport)
+--- a/vendor/llhttp/src/native/api.c
++++ b/vendor/llhttp/src/native/api.c
+@@ -39,7 +39,7 @@
+ }
+
+
+-#if defined(__wasm__)
++#if defined(__wasm__) && !defined(__wasi__)
+
+ extern int wasm_on_message_begin(llhttp_t * p);
+ extern int wasm_on_url(llhttp_t* p, const char* at, size_t length);
+--- a/vendor/llhttp/src/native/api.h
++++ b/vendor/llhttp/src/native/api.h
+@@ -5,7 +5,7 @@
+ #endif
+ #include <stddef.h>
+
+-#if defined(__wasm__)
++#if defined(__wasm__) && !defined(__wasi__)
+ #define LLHTTP_EXPORT __attribute__((visibility("default")))
+ #elif defined(_WIN32)
+ #define LLHTTP_EXPORT __declspec(dllexport)
