@@ -27,7 +27,7 @@ from ports.api import implementation
 
 if TYPE_CHECKING:
     from ports._support.sdk_products import MaterializedSDK
-    from ports.buildomatic import BuildRequest, BuildResult, Store, Worker
+    from ports.buildomatic import BuildRequest, BuildResult, NodeResult, Store, Worker
     from ports.buildomatic.backends.iris import IrisBackend
 
 PRODUCT_SYSTEMS = frozenset({"llvm-host", "wasi-sysroot", "sdk-tooling", "cpython-threaded", "uv-host"})
@@ -322,13 +322,12 @@ def prepare_graph(
     )
 
 
-def collect_graph(prepared: PreparedGraph, result: BuildResult, blob_store: Store, ports_store: Path) -> GraphBuild:
-    """Verify every returned tree before atomically publishing caller cache entries."""
-    from ports.buildomatic import BuildState, NodeState, extract_tree, request_id
+def _checked_results(prepared: PreparedGraph, result: BuildResult) -> dict[str, NodeResult]:
+    """Reject another request or incomplete action closure before reading blobs."""
+    from ports.buildomatic import BuildState, NodeState, request_id
 
     if result.state is not BuildState.SUCCEEDED:
         raise RuntimeError("Buildomatic graph did not succeed: " + str(result))
-    admitted = {}
     nodes = {node.action_id: node for node in result.nodes}
     if result.request_id != request_id(prepared.request):
         raise ValueError("returned request identity differs from the prepared request")
@@ -336,12 +335,21 @@ def collect_graph(prepared: PreparedGraph, result: BuildResult, blob_store: Stor
         raise ValueError("returned action closure differs from the prepared request")
     if any(node.state is not NodeState.SUCCEEDED for node in result.nodes):
         raise ValueError("successful graph contains an unsuccessful recipe")
+    if any(node.bundle is None for node in result.nodes):
+        raise ValueError("successful recipe has no result bundle")
+    return nodes
+
+
+def collect_graph(prepared: PreparedGraph, result: BuildResult, blob_store: Store, ports_store: Path) -> GraphBuild:
+    """Verify every returned tree before atomically publishing caller cache entries."""
+    from ports.buildomatic import extract_tree
+
+    nodes = _checked_results(prepared, result)
+    admitted = {}
     ports_store.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=".buildomatic-collect-", dir=ports_store) as temporary:
         for reference, action_id in prepared.action_ids.items():
             node = nodes[action_id]
-            if node.bundle is None:
-                raise ValueError("successful recipe has no result bundle")
             destination = Path(temporary) / action_id
             extract_tree(node.bundle, blob_store, destination)
             metadata = json.loads((destination / "node.json").read_text())
@@ -484,14 +492,24 @@ def run_graph(
     build_key: str | None = None,
     worker_identity: Mapping[str, str] | None = None,
 ) -> GraphBuild:
-    """Run through the core ready queue; optional Iris imports occur only here."""
+    """Build checked cache results; Iris transfers use a persistent local CAS.
+
+    Iris backends need their explicit independent-client transfer factory.
+    Inputs upload before Submit; outputs warm locally only after exact request
+    and action validation. Acknowledgement follows checked collection.
+    """
     from ports.buildomatic import BuildState, Coordinator, LocalStore, ResourceLimits, WorkerExecutor
 
     if workspaces:
         raise ValueError("Buildomatic actions require private build workspaces")
     if backend not in {"buildomatic", "iris"}:
         raise ValueError("unsupported Buildomatic backend")
+    limits = (
+        ResourceLimits(output_bytes=40 * 1024**3, max_files=400_000) if sdk_context is not None else ResourceLimits()
+    )
     if backend == "iris":
+        if blob_store is not None:
+            raise ValueError("Iris builds use the persistent local blob cache under the ports store")
         if remote_backend is None and iris_service is not None:
             if iris_service.stat().st_size > 64 * 1024:
                 raise ValueError("Iris connection descriptor exceeds its size bound")
@@ -527,22 +545,17 @@ def run_graph(
                 or origin.path not in {"", "/"}
             ):
                 raise ValueError("Iris controller URL must be a public origin")
-            from iris.cli.connect import open_iris_client
-            from iris.cluster.types import JobName, Namespace
+            from ports.buildomatic.backends.iris import backend_context_factory
 
-            from ports.buildomatic.backends.iris import IrisBackend
-
-            with open_iris_client(
+            factory = backend_context_factory(
+                job_id=connection["job_id"],
                 cluster_name=connection["cluster_name"],
+                controller_url=connection["controller_url"],
                 workspace=Path(connection["workspace"]),
-            ) as client:
-                remote = IrisBackend(
-                    client,
-                    connection["controller_url"],
-                    str(Namespace.from_job_id(JobName.from_wire(connection["job_id"]))),
-                    prefix=connection["prefix"],
-                    cache_prefix=connection["cache_prefix"],
-                )
+                prefix=connection["prefix"],
+                cache_prefix=connection["cache_prefix"],
+            )
+            with factory() as remote:
                 return run_graph(
                     ports,
                     requests,
@@ -552,7 +565,6 @@ def run_graph(
                     jobs=jobs,
                     default_sdk=default_sdk,
                     backend="iris",
-                    blob_store=remote.store,
                     remote_backend=remote,
                     max_workers=max_workers,
                     port_timeout_seconds=port_timeout_seconds,
@@ -564,16 +576,12 @@ def run_graph(
                         if connection[name] is not None
                     },
                 )
-        if blob_store is None or remote_backend is None:
-            raise ValueError("Iris builds require a connected remote service and its blob store")
+        if remote_backend is None:
+            raise ValueError("Iris builds require a connected remote service")
+        blob_store = LocalStore(store / "buildomatic/blobs")
     else:
         blob_store = LocalStore(store / "buildomatic/blobs") if blob_store is None else blob_store
         if workers is None:
-            limits = (
-                ResourceLimits(output_bytes=40 * 1024**3, max_files=400_000)
-                if sdk_context is not None
-                else ResourceLimits()
-            )
             workers = {
                 f"local-{index}": WorkerExecutor(
                     blob_store, store / f"buildomatic/worker-{index}", max_running=1, limits=limits
@@ -596,6 +604,8 @@ def run_graph(
         worker_identity=worker_identity,
     )
     if backend == "iris":
+        inputs = tuple(dict.fromkeys(mount.bundle for action in prepared.request.actions for mount in action.inputs))
+        remote_backend.upload_bundles(blob_store, inputs, max_parallel=8, limits=limits)
         build_id = remote_backend.submit(prepared.request)
         print("ports: accepted remote build: " + build_id, file=sys.stderr, flush=True)
     else:
@@ -606,6 +616,10 @@ def run_graph(
         if result.state in {BuildState.SUCCEEDED, BuildState.FAILED, BuildState.CANCELLED}:
             break
         time.sleep(1.0 if backend == "iris" else 0.05)
+    if backend == "iris":
+        nodes = _checked_results(prepared, result)
+        outputs = tuple(dict.fromkeys(nodes[action.id].bundle for action in prepared.request.actions))
+        remote_backend.download_bundles(blob_store, outputs, max_parallel=8, limits=limits)
     build = collect_graph(prepared, result, blob_store, store)
     if backend == "iris":
         remote_backend.acknowledge(build_id)

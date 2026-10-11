@@ -68,13 +68,32 @@ Native builds can be expensive, so the bridge does not retry them automatically.
 Workers also enforce their separately configured CPU limits; an Iris service
 operator sets those limits independently of the caller's wall budget.
 
-For Iris, pass a connected persistent `IrisBackend` as `remote_backend` and its
-`RemoteStore` as `blob_store` to `run_graph(..., backend="iris")`. The service owns
-accepted builds after client disconnect. `prepare_graph` and `collect_graph`
-also support separate submit and retrieval clients. Cache blobs and durable
-request journals use independently configured storage; evicted blobs are cache
-misses and must be rebuilt. Iris imports occur only when explicitly connecting
-to that backend.
+For Iris, connect to an existing service through
+`ports.buildomatic.backends.iris.backend_context_factory`. Use
+`with factory() as backend` and pass that backend as `remote_backend` to
+`run_graph(..., backend="iris")`. The factory takes the public `job_id`,
+`cluster_name`, `controller_url`, `workspace`, `prefix` and `cache_prefix` from
+the service descriptor. It gives each transfer thread an independent authenticated
+client for the same service. Programmatic backends must provide that transfer
+factory explicitly; the bridge does not share one client across threads.
+
+The bridge prepares raw input trees in the persistent local blob cache at
+`<store>/buildomatic/blobs`, uploads unique input bundles, then submits the
+request. It validates the terminal request identity and exact action set before
+downloading output bundles into the same local cache. Normal tree and port
+receipt verification creates the checked manifest, then the caller acknowledges.
+Both transfer directions use at most eight worker loops, independently of
+`max_workers` and per-port build jobs. Resource limits apply to each distinct
+bundle: 2 GiB/100,000 entries for pure graphs, or 40 GiB/400,000 entries when an
+SDK is admitted. Workers still enforce aggregate mounted-tree and workspace
+limits per action. Portable SDK descriptors, blobs, stable roots and receipts
+are transported unchanged.
+
+The service owns accepted builds after client disconnect. Cache blobs and
+durable request journals use independently configured storage; evicted blobs
+are cache misses and must be rebuilt. Iris imports occur only when explicitly
+connecting to that backend. `blob_store` injection is supported only for the
+local Buildomatic backend.
 
 The CLI can attach to an existing service with `--backend iris --iris-service
 /path/to/service.json`. `ports.buildomatic.backends.iris.connection_descriptor`
@@ -94,9 +113,14 @@ Repeating an unchanged build resumes its content-derived request. After cache
 eviction, supply a new explicit `--build-key` to accept a fresh request and
 rebuild the missing blobs. FAILED and CANCELLED requests also retain their
 terminal state; use a new key to retry them. A failed retrieval never creates a checked manifest.
-For clients that disconnect, reconstruct the unchanged prepared request and use
-the service's `get(build_id)` followed by `collect_graph`; acknowledge only after
-collection. Corrupt blobs fail verification and are never treated as valid
+For clients that disconnect, reconstruct the unchanged prepared request using the
+persistent local blob cache and call the service's `get(build_id)`. Validate the
+returned core request identity and exact successful action set, call
+`download_bundles(local_store, bundles, max_parallel=8, limits=limits)`, then
+`collect_graph` against that local store. Acknowledge only after verified
+collection. Separate submission clients likewise call `prepare_graph` locally
+and `upload_bundles` before `submit`. Transfer limits must match the admitted
+SDK bounds above. Corrupt blobs fail verification and are never treated as valid
 results or repaired silently.
 The client polls remote service snapshots once per second. Local workers use a
 shorter interval for cheap builds.

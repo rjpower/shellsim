@@ -4,6 +4,8 @@ import json
 import shutil
 import subprocess
 import sys
+import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from types import ModuleType
 
@@ -223,16 +225,18 @@ def test_independent_ports_enter_ready_queue_concurrently(tmp_path, monkeypatch)
     assert states[0] == 2
 
 
-def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
+@pytest.fixture
+def remote_service(tmp_path, monkeypatch):
+    from ports.buildomatic.transfers import download_bundles, upload_bundles
+
     import ports.buildomatic as core
     import ports.buildomatic.ports as bridge
 
-    ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "example", [])
-    blobs = core.LocalStore(tmp_path / "blobs")
-    service = core.Coordinator(blobs, "remote-service", {"worker": core.WorkerExecutor(blobs, tmp_path / "worker")})
-    calls = []
-    intervals = []
+    blobs = core.LocalStore(tmp_path / "remote-blobs")
+    coordinator = core.Coordinator(blobs, "remote-service", {"worker": core.WorkerExecutor(blobs, tmp_path / "worker")})
+    calls, transfers, intervals = [], [], []
+    opened, closed = [], []
+    lock, barrier = threading.Lock(), threading.Barrier(2)
     sleep = bridge.time.sleep
 
     def observe_sleep(interval):
@@ -242,36 +246,209 @@ def test_iris_dispatch_uses_remote_service_only(tmp_path, monkeypatch):
     monkeypatch.setattr(bridge.time, "sleep", observe_sleep)
 
     class RemoteService:
+        fault = None
+        corrupt = None
+        missing = None
+        limits = core.ResourceLimits()
+        parallel_contexts = 0
+        peak_contexts = 0
+
+        @contextmanager
+        def context(self):
+            owner = threading.get_ident()
+            parallel = threading.current_thread().name.startswith("buildomatic-transfer")
+            with lock:
+                opened.append(owner)
+                self.parallel_contexts += int(parallel)
+                self.peak_contexts = max(self.peak_contexts, self.parallel_contexts)
+                wait = parallel and sum(thread != threading.main_thread().ident for thread in opened) <= 2
+
+            class Client:
+                def get_blob(client, key):
+                    assert threading.get_ident() == owner
+                    if key == self.missing:
+                        raise FileNotFoundError(key)
+                    return b"corrupt" if key == self.corrupt else blobs.get_blob(key)
+
+                def put_blob(client, data):
+                    assert threading.get_ident() == owner
+                    return blobs.put_blob(data)
+
+            try:
+                if wait:
+                    barrier.wait(timeout=10)
+                yield Client()
+            finally:
+                with lock:
+                    closed.append(owner)
+                    self.parallel_contexts -= int(parallel)
+
+        def upload_bundles(self, source, bundles, **kwargs):
+            calls.append("upload")
+            assert source.root == (tmp_path / "store/buildomatic/blobs").resolve()
+            assert len(bundles) == len(set(bundles))
+            assert kwargs == {"max_parallel": 8, "limits": self.limits}
+            counts = upload_bundles(source, bundles, factory=self.context, **kwargs)
+            transfers.append(("upload", counts))
+
         def submit(self, request):
             calls.append("submit")
-            return service.submit(request)
+            self.request = request
+            return coordinator.submit(request)
 
         def get(self, build_id):
             calls.append("get")
-            return service.tick()
+            result = coordinator.tick()
+            if result.state is not core.BuildState.SUCCEEDED or self.fault is None:
+                return result
+            node = result.nodes[0]
+            if self.fault in {"failed", "cancelled"}:
+                return replace(result, state=core.BuildState(self.fault))
+            if self.fault == "request":
+                return replace(result, request_id="0" * 64)
+            if self.fault == "action":
+                return replace(result, nodes=(replace(node, action_id="different"),))
+            if self.fault == "duplicate":
+                return replace(result, nodes=(node, node))
+            if self.fault == "missing":
+                return replace(result, nodes=(replace(node, bundle=None),))
+            if self.fault == "state":
+                return replace(result, nodes=(replace(node, state=core.NodeState.FAILED),))
+            if self.fault in {"corrupt", "evicted"}:
+                manifest = json.loads(blobs.get_blob(node.bundle.digest))
+                receipt = next(entry for entry in manifest["entries"] if entry["path"] == "result/build-receipt.json")
+                if self.fault == "corrupt":
+                    self.corrupt = receipt["chunks"][0]
+                else:
+                    self.missing = receipt["chunks"][0]
+                return result
+            destination = tmp_path / "tampered-result"
+            core.extract_tree(node.bundle, blobs, destination)
+            if self.fault == "key":
+                metadata = json.loads((destination / "node.json").read_text())
+                (destination / "node.json").write_text(json.dumps({**metadata, "key": "0" * 64}))
+            elif self.fault == "mode":
+                next((destination / "result/wheels").iterdir()).chmod(0o755)
+            else:
+                next((destination / "result/wheels").iterdir()).write_bytes(b"changed")
+            return replace(result, nodes=(replace(node, bundle=core.capture_tree(destination, blobs)),))
+
+        def download_bundles(self, destination, bundles, **kwargs):
+            calls.append("download")
+            assert len(bundles) == len(set(bundles))
+            assert kwargs == {"max_parallel": 8, "limits": self.limits}
+            counts = download_bundles(destination, bundles, factory=self.context, **kwargs)
+            transfers.append(("download", counts))
 
         def acknowledge(self, build_id):
             calls.append("acknowledge")
-            service.acknowledge()
+            assert list((tmp_path / "store/buildomatic/manifests").glob("*.json"))
+            coordinator.acknowledge()
 
     def reject_local_coordinator(*args, **kwargs):
         raise AssertionError("Iris bridge cannot create a local coordinator")
 
     monkeypatch.setattr(core, "Coordinator", reject_local_coordinator)
-    build = run_graph(
-        ports,
-        ["python/example"],
-        None,
-        store,
-        backend="iris",
-        blob_store=blobs,
-        remote_backend=RemoteService(),
-        offline=True,
-    )
-    assert len(build.results) == 1
-    assert calls[0] == "submit" and calls[-1] == "acknowledge"
-    assert "get" in calls
+    remote = RemoteService()
+    yield remote, calls, transfers, intervals
+    assert sorted(opened) == sorted(closed)
+    assert remote.parallel_contexts == 0
+
+
+def test_iris_dispatch_transfers_locally_prepared_bundles_and_reuses_cas(tmp_path, remote_service):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "first", [])
+    _wheel_port(ports, store, "second", [])
+    remote, calls, transfers, intervals = remote_service
+    arguments = {"backend": "iris", "remote_backend": remote, "offline": True}
+    build = run_graph(ports, ["python/first", "python/second"], None, store, **arguments)
+    assert len(build.results) == 2
+    assert calls[0:2] == ["upload", "submit"]
+    assert calls[-2:] == ["download", "acknowledge"]
+    assert transfers[0][1].bundles == 3  # One shared code bundle, two recipe bundles.
+    assert remote.peak_contexts >= 2
     assert intervals and set(intervals) == {1.0}
+    assert not (store / "release.json").exists()
+    first_blobs = set((store / "buildomatic/blobs/blobs").iterdir())
+    calls.clear()
+    repeated = run_graph(ports, ["python/first", "python/second"], None, store, **arguments)
+    assert repeated.results == build.results
+    assert transfers[-1][0] == "download" and transfers[-1][1].bytes == 0
+    assert set((store / "buildomatic/blobs/blobs").iterdir()) == first_blobs
+    assert calls[-2:] == ["download", "acknowledge"]
+
+
+@pytest.mark.parametrize("fault", ["request", "action", "duplicate", "missing", "state"])
+def test_iris_rejects_result_identity_before_download_or_ack(tmp_path, remote_service, fault):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    remote, calls, _, _ = remote_service
+    remote.fault = fault
+    with pytest.raises(ValueError):
+        run_graph(ports, ["python/example"], None, store, backend="iris", remote_backend=remote, offline=True)
+    assert "download" not in calls and "acknowledge" not in calls
+    assert not (store / "buildomatic/manifests").exists()
+
+
+@pytest.mark.parametrize("fault", ["failed", "cancelled"])
+def test_iris_terminal_failure_prevents_download_and_ack(tmp_path, remote_service, fault):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    remote, calls, _, _ = remote_service
+    remote.fault = fault
+    with pytest.raises(RuntimeError):
+        run_graph(ports, ["python/example"], None, store, backend="iris", remote_backend=remote, offline=True)
+    assert "download" not in calls and "acknowledge" not in calls
+
+
+@pytest.mark.parametrize("fault", ["corrupt", "evicted", "key", "mode", "bytes"])
+def test_iris_rejects_transferred_corruption_and_invalid_receipts_before_ack(tmp_path, remote_service, fault):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    remote, calls, _, _ = remote_service
+    remote.fault = fault
+    with pytest.raises(FileNotFoundError if fault == "evicted" else ValueError):
+        run_graph(ports, ["python/example"], None, store, backend="iris", remote_backend=remote, offline=True)
+    assert "download" in calls and "acknowledge" not in calls
+    assert not (store / "buildomatic/manifests").exists()
+
+
+def test_iris_passes_explicit_sdk_bundle_limits_in_both_directions(tmp_path, remote_service, monkeypatch):
+    import ports.buildomatic as core
+    import ports.buildomatic.ports as bridge
+
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    remote, _, transfers, _ = remote_service
+    remote.limits = core.ResourceLimits(output_bytes=40 * 1024**3, max_files=400_000)
+    prepare = bridge.prepare_graph
+
+    def pure_fixture(ports, requests, sdk, *args, **kwargs):
+        # Exercise SDK transport policy without admitting or materializing SDKs.
+        return prepare(ports, requests, None, *args, **kwargs)
+
+    monkeypatch.setattr(bridge, "prepare_graph", pure_fixture)
+    run_graph(ports, ["python/example"], object(), store, backend="iris", remote_backend=remote, offline=True)
+    assert [direction for direction, _ in transfers] == ["upload", "download"]
+
+
+def test_iris_upload_failure_prevents_submission(tmp_path, remote_service, monkeypatch):
+    ports, store = tmp_path / "ports", tmp_path / "store"
+    _wheel_port(ports, store, "example", [])
+    remote, calls, _, _ = remote_service
+
+    def fail(*args, **kwargs):
+        raise FileNotFoundError()
+
+    monkeypatch.setattr(remote, "upload_bundles", fail)
+    with pytest.raises(FileNotFoundError):
+        run_graph(ports, ["python/example"], None, store, backend="iris", remote_backend=remote, offline=True)
+    assert calls == []
+
+
+def test_iris_rejects_caller_remote_blob_store(tmp_path):
+    with pytest.raises(ValueError):
+        run_graph(tmp_path, [], None, tmp_path, backend="iris", blob_store=object(), remote_backend=object())
 
 
 @pytest.fixture
@@ -291,65 +468,58 @@ def iris_connection(tmp_path):
 
 
 @pytest.mark.parametrize("task_image", [None, "image@sha256:" + "b" * 64])
-def test_iris_service_descriptor_converts_wire_job_name(tmp_path, monkeypatch, iris_connection, task_image):
-    from contextlib import contextmanager
-
+def test_iris_service_descriptor_uses_backend_context_factory(tmp_path, monkeypatch, iris_connection, task_image):
     import ports.buildomatic.ports as bridge
 
     calls = []
     sentinel = object()
 
-    class JobName:
-        @classmethod
-        def from_wire(cls, value):
-            assert value == "/power/service"
-            return cls()
-
-    class Namespace:
-        @staticmethod
-        def from_job_id(value):
-            assert isinstance(value, JobName)
-            return "/power/service"
-
     @contextmanager
-    def connect(**kwargs):
+    def connect():
+        calls.append("enter")
+        try:
+            yield sentinel
+        finally:
+            calls.append("close")
+
+    def factory(**kwargs):
         calls.append(kwargs)
-        yield sentinel
+        return connect
 
-    class Backend:
-        store = sentinel
-
-        def __init__(self, client, url, namespace, **kwargs):
-            assert client is sentinel
-            assert url == "https://iris.oa.dev" and namespace == "/power/service"
-            assert kwargs == {"prefix": "durable", "cache_prefix": "cache"}
-
-    for name, exports in {
-        "iris.cli.connect": {"open_iris_client": connect},
-        "iris.cluster.types": {"JobName": JobName, "Namespace": Namespace},
-        "ports.buildomatic.backends.iris": {"IrisBackend": Backend},
-    }.items():
-        module = ModuleType(name)
-        module.__dict__.update(exports)
-        monkeypatch.setitem(sys.modules, name, module)
+    module = ModuleType("ports.buildomatic.backends.iris")
+    module.backend_context_factory = factory
+    monkeypatch.setitem(sys.modules, module.__name__, module)
     service = tmp_path / "service.json"
     connection = {**iris_connection, "task_image": task_image}
     service.write_text(json.dumps(connection))
     actual_run = bridge.run_graph
 
     def capture_remote(*args, **kwargs):
-        assert isinstance(kwargs["remote_backend"], Backend)
-        assert kwargs["blob_store"] is sentinel
+        assert kwargs["remote_backend"] is sentinel
+        assert "blob_store" not in kwargs
         assert kwargs["worker_identity"] == {
             name: connection[name]
             for name in ("config_sha256", "task_image", "service_id")
             if connection[name] is not None
         }
+        calls.append("run")
         return sentinel
 
     monkeypatch.setattr(bridge, "run_graph", capture_remote)
     assert actual_run(tmp_path, ["python/example"], None, tmp_path, backend="iris", iris_service=service) is sentinel
-    assert calls == [{"cluster_name": "marin", "workspace": tmp_path}]
+    assert calls == [
+        {
+            "job_id": "/power/service",
+            "cluster_name": "marin",
+            "workspace": tmp_path,
+            "controller_url": "https://iris.oa.dev",
+            "prefix": "durable",
+            "cache_prefix": "cache",
+        },
+        "enter",
+        "run",
+        "close",
+    ]
     for invalid in (
         {**connection, "schema_version": 2},
         {**connection, "token": "unexpected"},
