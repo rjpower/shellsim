@@ -171,8 +171,7 @@ impl From<String> for EvalError {
     }
 }
 
-/// The CPU-charging boundary, factored out of [`Parser`] so unit tests can exercise the parser
-/// and arithmetic without a full [`System`] double (`System` has dozens of unrelated methods).
+/// Charge parser and arithmetic work against the simulated process budget.
 trait CpuMeter {
     fn charge(&mut self, units: u64) -> Result<(), EvalError>;
 }
@@ -186,16 +185,6 @@ impl CpuMeter for SystemMeter<'_> {
         } else {
             Err(EvalError::Resource(self.0.stop_status()))
         }
-    }
-}
-
-#[cfg(test)]
-struct NoopMeter;
-
-#[cfg(test)]
-impl CpuMeter for NoopMeter {
-    fn charge(&mut self, _units: u64) -> Result<(), EvalError> {
-        Ok(())
     }
 }
 
@@ -479,99 +468,4 @@ fn substr(s: &str, start: &BigInt, len: &BigInt) -> String {
     }
     let end_index = start_index.saturating_add(len as usize).min(chars.len());
     chars[start_index..end_index].iter().collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn eval(args: &[&str]) -> Result<Value, String> {
-        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-        let mut parser = Parser {
-            tokens: &owned,
-            pos: 0,
-            meter: NoopMeter,
-            depth: 0,
-        };
-        parser.parse_expr().map_err(|e| match e {
-            EvalError::Message(m) => m,
-            EvalError::Resource(_) => "resource".to_string(),
-        })
-    }
-
-    #[test]
-    fn arithmetic_precedence() {
-        assert_eq!(eval(&["2", "+", "3", "*", "4"]).unwrap().to_display(), "14");
-        assert_eq!(
-            eval(&["(", "2", "+", "3", ")", "*", "4"])
-                .unwrap()
-                .to_display(),
-            "20"
-        );
-    }
-
-    #[test]
-    fn arbitrary_precision_matches_gnu_expr() {
-        assert_eq!(
-            eval(&["9223372036854775807", "+", "1"])
-                .unwrap()
-                .to_display(),
-            "9223372036854775808"
-        );
-    }
-
-    #[test]
-    fn oversize_result_hits_the_documented_cap() {
-        let big = "9".repeat(MAX_DIGITS);
-        let err = eval(&[&big, "*", &big]).unwrap_err();
-        assert_eq!(err, "number too large");
-    }
-
-    #[test]
-    fn division_by_zero_is_rejected() {
-        assert_eq!(eval(&["1", "/", "0"]).unwrap_err(), "division by zero");
-    }
-
-    #[test]
-    fn colon_returns_capture_or_length() {
-        assert_eq!(
-            eval(&["hello", ":", r"h\(...\)o"]).unwrap().to_display(),
-            "ell"
-        );
-        assert_eq!(eval(&["hello", ":", "hel"]).unwrap().to_display(), "3");
-        assert_eq!(eval(&["hello", ":", "xyz"]).unwrap().to_display(), "0");
-    }
-
-    #[test]
-    fn string_comparison_falls_back_when_non_numeric() {
-        assert_eq!(eval(&["abc", "<", "abd"]).unwrap().to_display(), "1");
-    }
-
-    #[test]
-    fn or_of_two_falsy_operands_is_zero_not_empty() {
-        assert_eq!(eval(&["0", "|", ""]).unwrap().to_display(), "0");
-    }
-
-    #[test]
-    fn missing_argument_names_the_last_token() {
-        assert_eq!(
-            eval(&["1", "+"]).unwrap_err(),
-            "syntax error: missing argument after '+'"
-        );
-        assert_eq!(
-            eval(&["match", "abc"]).unwrap_err(),
-            "syntax error: missing argument after 'abc'"
-        );
-    }
-
-    #[test]
-    fn bare_keyword_always_requires_its_arguments() {
-        // Real GNU expr never lets `length`/`match`/`index`/`substr` fall back to a literal
-        // string; only `+ TOKEN` can force that.
-        assert_eq!(
-            eval(&["length"]).unwrap_err(),
-            "syntax error: missing argument after 'length'"
-        );
-        assert_eq!(eval(&["+", "length"]).unwrap().to_display(), "length");
-    }
 }

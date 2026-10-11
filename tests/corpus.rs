@@ -34,6 +34,22 @@ fn stock_manifest_runs_shell_python_and_explicit_skip_cases() {
 }
 
 #[test]
+fn stock_profile_applies_home_identity_and_umask_to_child_commands() {
+    let mut environment = shellsim::EnvironmentProfile::StockAgentV1
+        .create(shellsim::Limits::default())
+        .unwrap();
+    let (outcome, stdout, stderr) = environment.run_script_capture(
+        r#"sh -c 'pwd; printf "%s:%s:%s\n" "$HOME" "$USER" "$TZ"; id -u; cd; pwd; touch created; stat -c "%a" created'"#,
+    );
+    assert_eq!(outcome.exit_status, 0, "{stderr:?}");
+    assert_eq!(
+        stdout,
+        b"/work\n/home/shellsim:shellsim:UTC\n1000\n/home/shellsim\n644\n"
+    );
+    assert!(stderr.is_empty());
+}
+
+#[test]
 fn corpus_cli_emits_a_machine_readable_report() {
     let output = Command::new(env!("CARGO_BIN_EXE_shellsim"))
         .arg("corpus")

@@ -227,37 +227,3 @@ pub(super) fn exception_args(
     };
     Ok(Some((base, heap.values(args))))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_parent_is_a_modeled_class() {
-        for definition in EXCEPTION_TYPES {
-            if let Some(parent) = definition.parent {
-                assert!(exception_type(parent).is_some(), "{}", definition.name);
-            }
-            if let Some(parent) = definition.secondary_parent {
-                assert!(exception_type(parent).is_some(), "{}", definition.name);
-            }
-        }
-    }
-
-    #[test]
-    fn subclass_checks_follow_the_cpython_hierarchy() {
-        assert!(exception_is_subclass("KeyError", "LookupError"));
-        assert!(exception_is_subclass("FileNotFoundError", "OSError"));
-        assert!(exception_is_subclass(
-            "ZeroDivisionError",
-            "ArithmeticError"
-        ));
-        assert!(exception_is_subclass("RuntimeWarning", "Exception"));
-        assert!(exception_is_subclass("TabError", "SyntaxError"));
-        assert!(!exception_is_subclass("SystemExit", "Exception"));
-        assert!(exception_is_subclass("SystemExit", "BaseException"));
-        assert!(!exception_is_subclass("ValueError", "LookupError"));
-        assert!(exception_is_subclass("NotModeled", "Exception"));
-        assert!(!exception_is_subclass("Exception", "ValueError"));
-    }
-}

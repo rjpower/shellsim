@@ -6,7 +6,6 @@ import io
 import subprocess
 import sys
 import sysconfig
-from importlib.metadata import distribution
 from pathlib import Path
 
 import pytest
@@ -25,14 +24,12 @@ def run_cli(*arguments: str, stdin: bytes = b"") -> subprocess.CompletedProcess[
     )
 
 
-def test_distribution_exposes_shellsim_console_script() -> None:
-    scripts = {
-        entry.name: entry.value for entry in distribution("shellsim").entry_points if entry.group == "console_scripts"
-    }
-
-    assert scripts["shellsim"] == "shellsim._cli:main"
+def test_installed_console_script_forwards_output_and_status() -> None:
     executable = Path(sysconfig.get_path("scripts")) / ("shellsim.exe" if sys.platform == "win32" else "shellsim")
-    assert executable.is_file()
+    completed = subprocess.run([str(executable), "-c", "printf installed; exit 7"], capture_output=True, check=False)
+    assert completed.returncode == 7
+    assert completed.stdout == b"installed"
+    assert completed.stderr == b""
 
 
 def test_command_forwards_stdin_output_and_exit_status() -> None:

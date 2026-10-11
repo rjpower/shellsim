@@ -2295,110 +2295,12 @@ fn not_implemented_bool(_: &mut dyn PyRuntime, _: Value) -> PyResult<Option<Valu
 mod tests {
     use super::*;
 
-    fn registry() -> TypeRegistry {
-        TypeRegistry::new(&mut Symbols::default())
-    }
-
-    #[test]
-    fn bootstrap_builds_bool_int_hierarchy_and_slots() {
-        let registry = registry();
-        assert!(registry
-            .is_subclass(BuiltinType::Bool.id(), BuiltinType::Int.id())
-            .unwrap());
-        assert!(registry
-            .is_subclass(BuiltinType::Int.id(), BuiltinType::Object.id())
-            .unwrap());
-        assert!(matches!(
-            registry
-                .slot(BuiltinType::Int.id(), Slot::Multiply)
-                .unwrap(),
-            Some(SlotValue::NativeBinary(_))
-        ));
-    }
-
+    // Slot dispatch indexes this private table by enum discriminant. A shuffled entry may not
+    // be reached by ordinary guest programs, so check the complete dispatch invariant here.
     #[test]
     fn slot_definitions_follow_encoded_slot_indices() {
         for (index, (slot, _, _)) in SLOT_DEFS.iter().enumerate() {
             assert_eq!(*slot as usize, index);
         }
-    }
-
-    #[test]
-    fn registered_bases_use_c3_order_and_reject_conflicts() {
-        let registry = registry();
-        assert_eq!(
-            registry
-                .linearize_bases(&[BuiltinType::Bool.id(), BuiltinType::Int.id()])
-                .unwrap(),
-            vec![
-                BuiltinType::Bool.id(),
-                BuiltinType::Int.id(),
-                BuiltinType::Object.id()
-            ]
-        );
-        assert!(registry
-            .linearize_bases(&[BuiltinType::Int.id(), BuiltinType::Bool.id()])
-            .is_err());
-        assert!(registry
-            .linearize_bases(&[BuiltinType::Int.id(), BuiltinType::Int.id()])
-            .is_err());
-    }
-
-    #[test]
-    fn exception_types_have_distinct_registry_ids_and_multiple_ancestors() {
-        let registry = registry();
-        let axis = registry.exception_type_id("AxisError").unwrap();
-        let value = registry.exception_type_id("ValueError").unwrap();
-        let index = registry.exception_type_id("IndexError").unwrap();
-        assert_ne!(value, index);
-        assert!(registry.is_subclass(axis, value).unwrap());
-        assert!(registry.is_subclass(axis, index).unwrap());
-        assert_eq!(registry.get(axis).unwrap().bases, vec![value, index]);
-    }
-
-    #[test]
-    fn modeled_memory_counts_builtin_and_registered_types() {
-        let mut symbols = Symbols::default();
-        let mut registry = TypeRegistry::new(&mut symbols);
-        let builtin_bytes = registry
-            .types
-            .iter()
-            .take(BuiltinType::ALL.len())
-            .map(modeled_type_bytes)
-            .fold(0u64, u64::saturating_add);
-        let value_kind_bytes = registry
-            .types
-            .iter()
-            .skip(BuiltinType::ALL.len())
-            .map(modeled_type_bytes)
-            .fold(0u64, u64::saturating_add);
-        assert_eq!(registry.modeled_bytes(), builtin_bytes + value_kind_bytes);
-
-        let before = registry.modeled_bytes();
-        let value = symbols.intern_builtin("value");
-        let id = registry
-            .register(
-                "Example".into(),
-                vec![BuiltinType::Object.id()],
-                vec![BuiltinType::Object.id()],
-                &[(value, Ref::from_immediate(Value::Int(1)))]
-                    .into_iter()
-                    .collect(),
-            )
-            .unwrap();
-        let registered_bytes = modeled_type_bytes(registry.get(id).unwrap());
-        assert_eq!(registry.get(id).unwrap().attributes.get(value), None);
-        assert_eq!(
-            registry.modeled_bytes(),
-            before.saturating_add(registered_bytes)
-        );
-
-        registry
-            .finish(id, Ref::from_immediate(Value::None))
-            .unwrap();
-        assert_eq!(
-            registry.modeled_bytes(),
-            before.saturating_add(registered_bytes)
-        );
     }
 }

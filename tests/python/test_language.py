@@ -678,6 +678,11 @@ def test_numeric_literals_and_arithmetic_match_python():
     assert 1e9999 == float("inf")
     assert 1e-9999 == 0.0
 
+    for left, right, quotient, remainder in [(7, 3, 2, 1), (-7, 3, -3, 2), (7, -3, -3, -2), (-7, -3, 2, -1)]:
+        assert (left // right, left % right) == (quotient, remainder)
+    assert -9223372036854775808 // -1 == 9223372036854775808
+    assert -9223372036854775808 % -1 == 0
+
     large = 9223372036854775808
     assert 9223372036854775807 + 1 == large
     assert large * large == 85070591730234615865843651857942052864

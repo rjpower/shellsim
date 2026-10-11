@@ -1500,23 +1500,3 @@ fn ewln(err: Out, message: &str) {
     err.extend_from_slice(message.as_bytes());
     err.push(b'\n');
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Expr, Parser};
-
-    #[test]
-    fn parses_tasktrove_filter_shape() {
-        let parsed = Parser::parse(
-            r#"[.[] | select(.status == "active") | {name: .username, role: (.roles | if length > 0 then .[0] else null end)}] | sort_by(.name)"#,
-        );
-        assert!(matches!(parsed, Ok(Expr::Pipe(_, _))), "{parsed:?}");
-    }
-
-    #[test]
-    fn rejects_incomplete_filters() {
-        for source in ["select(", "{name}", "if . then . end", ".[x"] {
-            assert!(Parser::parse(source).is_err(), "{source}");
-        }
-    }
-}

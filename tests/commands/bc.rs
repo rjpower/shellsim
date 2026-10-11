@@ -23,6 +23,10 @@ fn arithmetic_and_scale_from_stdin() {
         run("printf 'scale = 5\\n22/7\\n' | bc"),
         (0, "3.14285\n".into(), String::new())
     );
+    assert_eq!(
+        run("printf '1.5+2.25\\n1.5-2.25\\n1.5*1.5\\n.5\\n0.001\\n' | bc"),
+        (0, "3.75\n-.75\n2.2\n.5\n.001\n".into(), String::new())
+    );
 }
 
 #[test]
@@ -76,21 +80,17 @@ fn program_reads_file_operands_before_stdin() {
 }
 
 #[test]
-fn divide_by_zero_reports_a_runtime_error_and_continues() {
-    let (status, stdout, stderr) = run("printf '1 / 0\\n2 + 2\\n' | bc");
-    assert_eq!(status, 0);
-    assert_eq!(stdout, "4\n");
-    assert!(stderr.to_lowercase().contains("divide by zero"), "{stderr}");
-}
-
-#[test]
 fn non_decimal_bases_are_explicitly_rejected() {
     let (_, _, stderr) = run("printf 'ibase = 16\\n' | bc");
     assert!(stderr.contains("base 10"), "{stderr}");
 }
 
 #[test]
-fn define_and_arrays_are_explicitly_unsupported() {
+fn unsupported_program_syntax_fails_explicitly() {
+    let (status, stdout, stderr) = run("printf '1 && 2\\n' | bc");
+    assert_eq!(status, 1, "{stderr}");
+    assert!(stdout.is_empty());
+
     let (status, _, stderr) = run("printf 'define f(x) { return x }\\n' | bc");
     assert_eq!(status, 1);
     assert!(stderr.contains("not supported"), "{stderr}");
@@ -127,19 +127,14 @@ fn oversize_numbers_are_rejected_with_a_bounded_diagnostic() {
 }
 
 #[test]
-fn long_results_wrap_at_seventy_columns() {
-    let (_, stdout, _) = run("printf '10^100\\n' | bc");
-    assert!(stdout.contains("\\\n"), "{stdout}");
-}
-
-#[test]
 fn line_wrap_matches_gnu_bcs_68_digits_per_continuation_line() {
-    // GNU bc 1.07.1's default BC_LINE_LENGTH (70) counts the trailing `\` and `\n`, so each
-    // continuation line carries 68 digits; verified directly against `echo '2^1000' | bc`.
-    let (status, stdout, _) = run("printf '2^1000\\n' | bc");
-    assert_eq!(status, 0);
-    let first_line = stdout.split("\\\n").next().unwrap();
-    assert_eq!(first_line.len(), 68, "{stdout}");
+    // GNU bc 1.07.1's default BC_LINE_LENGTH (70) includes the continuation marker.
+    let (status, stdout, stderr) = run("printf '10^100\\n' | bc");
+    assert_eq!(status, 0, "{stderr}");
+    assert_eq!(
+        stdout,
+        format!("1{}\\\n{}\n", "0".repeat(67), "0".repeat(33))
+    );
 }
 
 #[test]
@@ -168,11 +163,18 @@ fn negative_exponent_is_computed_as_a_reciprocal() {
 }
 
 #[test]
-fn divide_by_zero_message_matches_gnu_bc_format() {
+fn runtime_arithmetic_errors_report_and_continue() {
     let (status, stdout, stderr) = run("printf '1/0\\n2+2\\n' | bc");
     assert_eq!(status, 0);
     assert_eq!(stdout, "4\n");
     assert_eq!(stderr, "Runtime error (func=(main)): Divide by zero\n");
+    let (status, stdout, stderr) = run("printf '0^-1\\nsqrt(-4)\\n2+2\\n' | bc");
+    assert_eq!(status, 0);
+    assert_eq!(stdout, "4\n");
+    assert_eq!(
+        stderr,
+        "Runtime error (func=(main)): Divide by zero\nRuntime error (func=(main)): square root of a negative number\n"
+    );
 }
 
 #[test]

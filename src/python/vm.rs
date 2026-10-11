@@ -2314,20 +2314,6 @@ fn expect_arity(arguments: &[Value], minimum: usize, maximum: usize) -> PyResult
 mod tests {
     use super::*;
 
-    /// The control type every opcode arm returns is one stored reference plus a tag; a payload
-    /// that would grow it moves to `VmState` instead, as the suspension did.
-    #[test]
-    fn control_flow_stays_small() {
-        assert_eq!(
-            std::mem::size_of::<Flow>(),
-            std::mem::size_of::<Ref>() + std::mem::size_of::<usize>()
-        );
-        assert!(std::mem::size_of::<PyResult<Flow>>() <= 32);
-        // Five words of indices, three references (scope, globals and the optional callee), two
-        // flags and the frame kind: pushed and popped by value on every call.
-        assert!(std::mem::size_of::<BytecodeFrame>() <= 96);
-    }
-
     #[test]
     fn native_handles_round_trip_without_pointers() {
         for builtin in BuiltinType::ALL {

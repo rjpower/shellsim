@@ -143,11 +143,12 @@ def test_moveaxis_moves_single_and_multiple_axes():
         np.moveaxis(a, 3, 0)
 
 
-def test_axis_error_is_a_value_error():
+def test_axis_error_matches_value_and_index_errors():
     # `AxisError` is a plain exception constructor here: shellsim's own axis-checking code
     # builds the "axis N is out of bounds..." message itself before raising, so a direct
     # `AxisError(axis, ndim)` call just stores its arguments like any other exception.
-    assert isinstance(np.exceptions.AxisError(2, 1), ValueError)
+    error = np.exceptions.AxisError(2, 1)
+    assert isinstance(error, ValueError) and isinstance(error, IndexError)
     assert str(np.exceptions.AxisError("custom")) == "custom"
 
 

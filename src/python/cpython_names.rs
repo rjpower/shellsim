@@ -492,19 +492,4 @@ mod tests {
         assert!(BUILTIN_NAMES.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(STDLIB_MODULES.windows(2).all(|pair| pair[0] < pair[1]));
     }
-
-    #[test]
-    fn lookup_distinguishes_builtins() {
-        assert!(is_cpython_builtin("eval"));
-        assert!(is_cpython_builtin("ValueError"));
-        assert!(!is_cpython_builtin("undefined_name"));
-    }
-
-    #[test]
-    fn stdlib_lookup_checks_the_top_level_package() {
-        assert!(is_cpython_stdlib_module("threading"));
-        assert!(is_cpython_stdlib_module("xml.etree.ElementTree"));
-        assert!(!is_cpython_stdlib_module("requests"));
-        assert!(!is_cpython_stdlib_module("numpy"));
-    }
 }

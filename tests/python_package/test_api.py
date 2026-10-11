@@ -144,13 +144,12 @@ def test_multiple_shell_sessions_share_files_but_not_shell_state() -> None:
     environment = shellsim.Environment()
     first = environment.create_shell()
     second = environment.create_shell()
-    assert isinstance(first, shellsim.ShellSession)
     assert first.pid != second.pid
 
     assert first.run("cd /work; export LABEL=first; printf common > note").returncode == 0
     assert second.run("cd /tmp; export LABEL=second; cat /work/note").stdout == b"common"
-    assert first.run("printf '%s:%s' \"$PWD\" \"$LABEL\"").stdout == b"/work:first"
-    assert second.run("printf '%s:%s' \"$PWD\" \"$LABEL\"").stdout == b"/tmp:second"
+    assert first.run('printf \'%s:%s\' "$PWD" "$LABEL"').stdout == b"/work:first"
+    assert second.run('printf \'%s:%s\' "$PWD" "$LABEL"').stdout == b"/tmp:second"
     assert environment.run("printf '%s' \"${LABEL-unset}\"").stdout == b"unset"
     assert first.run("cat", stdin=b"session input").stdout == b"session input"
 

@@ -1742,36 +1742,3 @@ pub(super) fn runtime_repeat_count(
             .ok_or_else(|| PyError::overflow_error("sequence repeat is too large"))
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{parse_integer_text, python_floor_div, python_remainder};
-
-    #[test]
-    fn integer_text_parsing_handles_bases_signs_and_separators() {
-        assert_eq!(parse_integer_text("ff", 16).unwrap(), 255.into());
-        assert_eq!(parse_integer_text(" -0b1_010 ", 0).unwrap(), (-10).into());
-        assert_eq!(parse_integer_text("0x_ff", 16).unwrap(), 255.into());
-        assert!(parse_integer_text("10", 1).is_err());
-        assert!(parse_integer_text("_10", 10).is_err());
-        assert!(parse_integer_text("1__0", 10).is_err());
-        assert!(parse_integer_text("2", 2).is_err());
-    }
-
-    #[test]
-    fn immediate_floor_division_and_remainder_follow_python_signs() {
-        for (left, right, quotient, remainder) in [
-            (7, 3, 2, 1),
-            (-7, 3, -3, 2),
-            (7, -3, -3, -2),
-            (-7, -3, 2, -1),
-        ] {
-            assert_eq!(python_floor_div(left, right), Some(quotient));
-            assert_eq!(python_remainder(left, right), Some(remainder));
-        }
-        assert_eq!(python_floor_div(i64::MIN, -1), None);
-        assert_eq!(python_remainder(i64::MIN, -1), Some(0));
-        assert_eq!(python_floor_div(1, 0), None);
-        assert_eq!(python_remainder(1, 0), None);
-    }
-}

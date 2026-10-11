@@ -1333,57 +1333,6 @@ mod tests {
         )
     }
 
-    #[test]
-    fn literal_print_and_write() {
-        assert_eq!(
-            run("import sys; print('hello'); sys.stdout.write(\"!\")"),
-            (0, "hello\n!".into(), String::new())
-        );
-    }
-
-    #[test]
-    fn multiline_assignments_and_multiple_print_arguments() {
-        assert_eq!(
-            run("import sys\nx = 3\nprint('hello', x + 2)"),
-            (0, "hello 5\n".into(), String::new())
-        );
-    }
-
-    #[test]
-    fn unsupported_python_fails_loudly() {
-        let (status, _, err) = run("breakpoint()");
-        assert_eq!(status, 2);
-        assert!(err.contains("unsupported"));
-    }
-
-    #[test]
-    fn starred_assignment_obeys_python_minimum_arity_and_tail_shape() {
-        assert_eq!(
-            run("head, *tail = [1, 2, 3, 4]\nprint(head, tail)"),
-            (0, "1 [2, 3, 4]\n".into(), String::new())
-        );
-        let (status, _, error) = run("head, *tail, last = [1]\n");
-        assert_eq!(status, 1);
-        assert!(error
-            .ends_with("ValueError: not enough values to unpack (expected at least 2, got 1)\n"));
-    }
-
-    #[test]
-    fn starred_calls_expand_iterables_in_source_order() {
-        assert_eq!(
-            run("def join(a, b, c):\n    return a * 100 + b * 10 + c\nargs = [1, 2]\nprint(join(0, *args))"),
-            (0, "12\n".into(), String::new())
-        );
-    }
-
-    #[test]
-    fn basic_fstrings_render_expressions_and_escaped_braces() {
-        assert_eq!(
-            run("name = 'Ada'\nvalue = 7\nprint(f'Hello, {name}: {{{value}}}')"),
-            (0, "Hello, Ada: {7}\n".into(), String::new())
-        );
-    }
-
     /// Collect before every allocation while running a program that exercises calls, classes,
     /// generators (delegation, `send`, `throw`, `close`, and exceptions leaving them),
     /// exceptions, sorting and containers. Any value Rust code holds without a pin

@@ -65,6 +65,10 @@ use another headless agent. Raw prompts and results are written below `/tmp/mari
 
 ## Testing
 
+Read [TESTING.md](TESTING.md) before adding or reviewing tests. Tests must justify their
+maintenance cost with a distinct failure they catch. Prefer regressions through existing
+interfaces; reserve unit tests for behavior difficult to exercise or diagnose that way.
+
 Run the narrowest useful test while editing:
 
 ```sh
@@ -96,10 +100,11 @@ The safe suite is the full shellsim suite because it is local, deterministic, an
 Docker, a cluster, or network access. Reference-implementation differentials skip their live
 comparison when the named reference binary is unavailable, while checked fixtures still run.
 
-Use the following testing layers for new behavior:
+Choose the existing test location that best exposes the regression. These are alternatives,
+not a checklist of layers to cover:
 
-1. Put private algorithm and invariant tests beside the implementation. Keep a few tests inline;
-   use a module-local `tests.rs` when private unit coverage becomes substantial.
+1. When a unit test is warranted, put private algorithm and invariant tests beside the
+   implementation. Keep a few tests inline; use a module-local `tests.rs` for substantial cases.
 2. Put command behavior in the plainly named module under `tests/commands/`. These modules share
    one integration-test crate to avoid compiling and linking one harness per command. Put
    cross-command shell behavior in the relevant top-level integration suite.
@@ -116,8 +121,10 @@ Use the following testing layers for new behavior:
    exception and warning types rather than message text. `infra/scientific-reference.py` builds
    that environment, runs the suites, and prints the `SHELLSIM_SCIENTIFIC_PYTHON` export that
    makes `cargo test` repeat the check.
-7. Test malformed input, limits, and unsupported behavior as well as the success path. Compare
-   compatibility surfaces with CPython or coreutils where practical.
+
+Cover relevant malformed input, limits, and unsupported behavior when the change can break those
+boundaries. Reuse existing cases rather than multiplying coverage at each layer. Compare
+compatibility surfaces with CPython or coreutils where practical.
 
 Tests for the installed Python package live under `tests/python_package/`. Tests for repository
 Python tools live under `tests/tooling/`; neither belongs in the simulated Python source suites.
@@ -134,7 +141,7 @@ iteration order.
   boundary or after the pattern repeats.
 - Keep simulated input capability-free and resource-metered. Unsupported behavior must fail
   loudly instead of reaching the host.
-- Add direct tests for tricky logic.
+- Add focused unit tests only when a regression cannot reasonably exercise the behavior.
 - Keep documentation factual and concise. Record limitations as current behavior, not promises.
 
 ## Issues and pull requests
@@ -150,13 +157,14 @@ A pull request should lead with what changed and why. Before opening it:
 3. Run `make test`.
 4. Run `make review` for a substantial change and evaluate each advisory finding.
 5. Review the diff for unrelated edits and accidental capability expansion.
-6. Report the exact validation results and remaining caveats.
+6. Summarize validation results in the handoff; keep test-run narration out of the PR description.
 7. Link the issue with `Fixes #NNN` or `Part of #NNN` when applicable.
 
 Use an imperative title of at most 72 characters, optionally beginning with a `[scope]` prefix.
 Do not use Conventional Commit prefixes such as `feat:` or `fix:`. Write the body so it can stand
 alone as the squash-commit message: changed behavior first, then motivation, evidence, and material
-caveats. Avoid file-by-file narration and boilerplate test headings.
+caveats. Describe the resulting behavior, not the tests run. Avoid file-by-file narration and
+boilerplate test headings.
 
 Project prose should be plain, factual, and direct. Support claims with named evidence and state
 limitations clearly. Avoid hype, generic significance claims, filler, decorative headings, emoji,

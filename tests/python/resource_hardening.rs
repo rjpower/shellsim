@@ -923,10 +923,10 @@ fn native_scratch_survives_nested_python_frames() {
 
 #[test]
 fn deeply_nested_sequence_ordering_raises_recursion_error() {
-    // Comparing 100k-deep tuples used to recurse on the host stack; the bound surfaces as the
-    // same exception CPython raises.
+    // Sequence comparison used to recurse on the host stack. A thousand levels exceeds the
+    // supported recursion depth without building a hundred thousand unused levels.
     let (status, stdout, stderr, _) = run_with_limits(
-        "x = ()\ny = ()\nfor i in range(100000):\n    x = (x,)\n    y = (y,)\n\
+        "x = ()\ny = ()\nfor i in range(1000):\n    x = (x,)\n    y = (y,)\n\
          try:\n    x < y\nexcept RecursionError:\n    print('bounded')\n\
          print((1, 2) < (1, 3), [[1]] < [[2]], sorted([(2, 1), (1, 2)]))",
         Limits::unlimited(),

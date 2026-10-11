@@ -115,39 +115,3 @@ impl SlicePlan {
         })
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::SlicePlan;
-
-    #[test]
-    fn normalizes_forward_reverse_and_empty_slices() {
-        assert_eq!(
-            SlicePlan::new(6, Some(1), Some(5), Some(2))
-                .unwrap()
-                .indices()
-                .collect::<Vec<_>>(),
-            [1, 3]
-        );
-        assert_eq!(
-            SlicePlan::new(6, None, None, Some(-2))
-                .unwrap()
-                .indices()
-                .collect::<Vec<_>>(),
-            [5, 3, 1]
-        );
-        assert_eq!(
-            SlicePlan::new(3, Some(20), Some(30), None)
-                .unwrap()
-                .contiguous_range(),
-            Some(3..3)
-        );
-    }
-
-    #[test]
-    fn rejects_zero_step() {
-        assert!(SlicePlan::new(3, None, None, Some(0))
-            .unwrap_err()
-            .is_exception("ValueError"));
-    }
-}

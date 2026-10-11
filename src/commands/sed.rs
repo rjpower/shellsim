@@ -785,24 +785,3 @@ fn unescape_chars(value: &str) -> Vec<char> {
     }
     output
 }
-
-#[cfg(test)]
-mod tests {
-    use super::ScriptParser;
-
-    #[test]
-    fn parses_delimiters_ranges_and_common_commands() {
-        let commands =
-            ScriptParser::new(r#"/start/,/end/p; s/;/x/g; 3q; y/ab/AB/; /skip/!p"#, false)
-                .parse()
-                .unwrap();
-        assert_eq!(commands.len(), 5);
-    }
-
-    #[test]
-    fn rejects_incomplete_or_unknown_commands() {
-        assert!(ScriptParser::new("s/a", false).parse().is_err());
-        assert!(ScriptParser::new("h", false).parse().is_err());
-        assert!(ScriptParser::new("y/ab/a/", false).parse().is_err());
-    }
-}

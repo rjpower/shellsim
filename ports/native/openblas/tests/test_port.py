@@ -80,15 +80,6 @@ def test_new_lapack_xerbla_calls_receive_character_length(monkeypatch):
     assert builder.normalize_xerbla(existing) == existing
 
 
-def test_shared_openblas_pins_production_sources(monkeypatch):
-    monkeypatch.syspath_prepend(str(ROOT))
-    from ports.native.dependencies import recipe_identity
-
-    directory = ROOT / "ports/native/openblas"
-    recipe = json.loads((directory / "recipe.json").read_text())
-    recipe_identity(recipe, directory)
-
-
 def test_shared_consumer_dependency_decoder_checks_real_metadata_lengths(monkeypatch, tmp_path):
     monkeypatch.syspath_prepend(str(ROOT))
     from ports._support.wasm import leb

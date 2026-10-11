@@ -70,6 +70,12 @@ fn rejects_invalid_script_files_and_occurrence_numbers() {
     assert_eq!(outcome.exit_status, 2);
     assert!(String::from_utf8_lossy(&stderr).contains("not valid UTF-8"));
 
+    for script in ["s/a", "h", "y/ab/a/"] {
+        let (status, stdout, stderr) = run(&format!("printf a | sed '{script}'"));
+        assert_eq!(status, 2, "{script}: {stderr}");
+        assert!(stdout.is_empty(), "{script}: {stdout}");
+    }
+
     let (status, _, stderr) = run("printf a | sed 's/a/b/99999999999999999999'");
     assert_eq!(status, 2);
     assert!(
