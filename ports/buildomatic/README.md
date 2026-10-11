@@ -71,6 +71,35 @@ selected workload while retaining explicit memory and disk bounds.
 The current resolver installation helper uses host Python 3.13.7 or newer.
 Cache outputs have no retention promise; creating a release is explicit.
 
+Serve any selected S3 prefix with the standalone read-only proxy:
+
+```sh
+uv run --no-project --with botocore python ports/buildomatic/s3_proxy.py \
+  --prefix s3://my-bucket/ports --bind 127.0.0.1 --port 8080
+```
+
+`s3_proxy.py` is one file and needs only Python and botocore. It uses the standard
+AWS credential chain. S3-compatible stores can set `--endpoint-url` and
+`--region`; CoreWeave uses `https://cwobject.com` and the bucket's signing region.
+Virtual-host S3 addressing is the default; `--addressing-style path` supports
+endpoints that require bucket names in the URL path.
+Credentials stay on the server. HTTP `/assets/example.whl` maps to
+`s3://my-bucket/ports/assets/example.whl`. Directory URLs map to `index.html`;
+there is no bucket listing or object rewriting. GET and HEAD support byte ranges
+and ETag conditionals. Object bodies stream without local staging or digest
+verification. Requests with `If-Range` receive the full object, preventing mixed
+versions during download retries. Stored content encodings are preserved.
+Traversal, ambiguous encoding, alternate authorities and writes
+are rejected before accessing S3.
+
+The listener defaults to loopback. Put an authenticated HTTPS reverse proxy in
+front of it when exposing private objects beyond the host. Every object under
+the selected prefix is readable through the proxy; choose a delivery prefix
+rather than a whole bucket containing journals or internal build metadata.
+Exported catalogs can use this HTTP base URL for their stable asset links.
+Individual delivery objects and metadata-only `ports export` remain planned;
+the proxy serves ordinary stored objects and does not unpack build archives.
+
 Pure-wheel builds fetch no SDK. Other workers fetch just their consumed
 components: native builds need compiler/platform/tooling, Python builds add
 CPython, and resolver builds add Rust/resolver inputs. Installing a release
