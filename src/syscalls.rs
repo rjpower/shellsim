@@ -4,7 +4,8 @@
 //! table, so a guest cannot keep a second, unaccounted set of file handles or cursors.
 
 use crate::descriptors::{
-    DescriptorError, DescriptorReady, DescriptorState, Fd, FileState, IoPoll, MAX_FDS_PER_PROCESS,
+    DescriptorError, DescriptorReady, DescriptorState, Fd, FileLockMode, FileState, IoPoll,
+    MAX_FDS_PER_PROCESS,
 };
 use crate::display::{DisplayError, KeyEvent};
 use crate::interp::Interp;
@@ -142,6 +143,10 @@ pub(crate) trait System {
     fn duplicate(&mut self, source: Fd, destination: Fd) -> Result<(), SyscallError>;
     /// Inspect the access and type of any virtual descriptor, including streams and devices.
     fn descriptor_state(&self, fd: Fd) -> Result<DescriptorState, SyscallError>;
+    /// Try an inode-scoped advisory lock; false reports contention for the caller's wait policy.
+    fn file_lock(&mut self, fd: Fd, mode: Option<FileLockMode>) -> Result<bool, SyscallError>;
+    /// Stable inode captured when the virtual file or directory was opened.
+    fn file_lock_inode(&self, fd: Fd) -> Result<u64, SyscallError>;
     /// Observe virtual descriptor readiness without performing I/O.
     fn descriptor_readiness(
         &self,
@@ -554,6 +559,31 @@ impl System for ActiveSystem<'_> {
             .interp
             .descriptors
             .state(self.interp.process.fds.get(fd)?)?)
+    }
+
+    fn file_lock(&mut self, fd: Fd, mode: Option<FileLockMode>) -> Result<bool, SyscallError> {
+        if !self
+            .interp
+            .resources
+            .charge_cpu(crate::descriptors::MAX_OPEN_DESCRIPTIONS as u64)
+        {
+            return Err(SyscallError::ResourceExhausted);
+        }
+        let inode = self.file_lock_inode(fd)?;
+        let description = self.interp.process.fds.get(fd)?;
+        let acquired = self
+            .interp
+            .descriptors
+            .file_lock(description, inode, mode)?;
+        self.interp.wake_file_lock_waiters();
+        Ok(acquired)
+    }
+
+    fn file_lock_inode(&self, fd: Fd) -> Result<u64, SyscallError> {
+        Ok(self
+            .interp
+            .descriptors
+            .inode(self.interp.process.fds.get(fd)?)?)
     }
 
     fn descriptor_readiness(
@@ -1326,6 +1356,7 @@ fn open_file_at(
                     return Err(DescriptorError::DescriptorLimit.into());
                 }
                 let description = interp.descriptors.open_directory(path)?;
+                interp.descriptors.bind_inode(description, node.inode)?;
                 interp.install_new_description(fd, description)?;
                 return Ok(());
             }
@@ -1367,6 +1398,8 @@ fn open_file_at(
         options.append,
         created_by_open,
     )?;
+    let inode = interp.vfs.metadata_ref("/", &absolute, true)?.inode;
+    interp.descriptors.bind_inode(description, inode)?;
     interp.install_new_description(fd, description)?;
     Ok(())
 }
@@ -1473,6 +1506,93 @@ fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, Sys
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_lock_prepays_the_bounded_arena_scan() {
+        let mut interp = Interp::with_limits(crate::resources::Limits {
+            cpu: crate::descriptors::MAX_OPEN_DESCRIPTIONS as u64 - 1,
+            ..crate::resources::Limits::default()
+        });
+        assert!(matches!(
+            ActiveSystem::new(&mut interp).file_lock(255, Some(FileLockMode::Exclusive)),
+            Err(SyscallError::ResourceExhausted)
+        ));
+        assert_eq!(
+            interp.resources.stop_reason(),
+            Some(crate::resources::StopReason::CpuExhausted)
+        );
+    }
+
+    #[test]
+    fn file_lock_follows_orphan_inode_and_preserves_last_alias() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let options = OpenFile {
+            readable: true,
+            writable: true,
+            create: true,
+            exclusive: false,
+            truncate: false,
+            append: false,
+        };
+        let first = system.open_file("/", "/work/lock", options).unwrap();
+        let second = system.open_file("/", "/work/lock", options).unwrap();
+        assert!(system
+            .file_lock(first, Some(FileLockMode::Exclusive))
+            .unwrap());
+        system.duplicate(first, 200).unwrap();
+        system.close(first).unwrap();
+        assert!(!system
+            .file_lock(second, Some(FileLockMode::Exclusive))
+            .unwrap());
+        let old_inode = system.metadata_fd(second).unwrap().inode;
+        system.unlink("/", "/work/lock").unwrap();
+        let replacement = system.open_file("/", "/work/lock", options).unwrap();
+        assert_ne!(system.metadata_fd(replacement).unwrap().inode, old_inode);
+        assert_eq!(system.metadata_fd(second).unwrap().inode, old_inode);
+        assert!(system
+            .file_lock(replacement, Some(FileLockMode::Exclusive))
+            .unwrap());
+        system.close(200).unwrap();
+        assert!(system
+            .file_lock(second, Some(FileLockMode::Exclusive))
+            .unwrap());
+    }
+
+    #[test]
+    fn file_lock_keeps_open_inode_across_rename_and_path_replacement() {
+        let mut interp = Interp::new();
+        let mut system = ActiveSystem::new(&mut interp);
+        let options = OpenFile {
+            readable: true,
+            writable: true,
+            create: true,
+            exclusive: false,
+            truncate: false,
+            append: false,
+        };
+        let owner = system.open_file("/", "/work/original", options).unwrap();
+        let old_inode = system.file_lock_inode(owner).unwrap();
+        system
+            .rename("/", "/work/original", "/work/renamed")
+            .unwrap();
+        assert!(system
+            .file_lock(owner, Some(FileLockMode::Exclusive))
+            .unwrap());
+        let same_file = system.open_file("/", "/work/renamed", options).unwrap();
+        assert!(!system
+            .file_lock(same_file, Some(FileLockMode::Exclusive))
+            .unwrap());
+        let replacement = system.open_file("/", "/work/original", options).unwrap();
+        assert_ne!(system.file_lock_inode(replacement).unwrap(), old_inode);
+        assert!(system
+            .file_lock(replacement, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(system.file_lock(owner, None).unwrap());
+        assert!(system
+            .file_lock(same_file, Some(FileLockMode::Exclusive))
+            .unwrap());
+    }
 
     #[test]
     fn pseudo_inode_identity_is_distinct_and_matches_self_aliases() {

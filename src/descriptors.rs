@@ -31,6 +31,13 @@ pub struct DescriptorState {
     pub nonblocking: bool,
 }
 
+/// Whole-file advisory lock shared by all aliases of one open description.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileLockMode {
+    Shared,
+    Exclusive,
+}
+
 /// Types needed by guest descriptor APIs without exposing arena identities.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DescriptorKind {
@@ -164,6 +171,8 @@ struct DescriptionEntry {
     description: OpenDescription,
     references: u32,
     nonblocking: bool,
+    file_lock: Option<(u64, FileLockMode)>,
+    inode: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -193,6 +202,8 @@ pub struct DescriptorArena {
     next_pipe: PipeId,
     descriptions: BTreeMap<DescriptionId, DescriptionEntry>,
     pipes: BTreeMap<PipeId, Pipe>,
+    file_locks_changed: bool,
+    file_lock_generation: u64,
 }
 
 impl Default for DescriptorArena {
@@ -229,6 +240,8 @@ impl DescriptorArena {
             next_pipe: 1,
             descriptions: BTreeMap::new(),
             pipes: BTreeMap::new(),
+            file_locks_changed: false,
+            file_lock_generation: 0,
         }
     }
 
@@ -458,6 +471,8 @@ impl DescriptorArena {
                 description,
                 references: 0,
                 nonblocking: false,
+                file_lock: None,
+                inode: None,
             },
         );
         Ok(id)
@@ -517,6 +532,10 @@ impl DescriptorArena {
             .descriptions
             .remove(&id)
             .ok_or(DescriptorError::InvalidFd)?;
+        if entry.file_lock.is_some() {
+            self.file_locks_changed = true;
+            self.file_lock_generation = self.file_lock_generation.wrapping_add(1);
+        }
         let pipe = match entry.description {
             OpenDescription::PipeReader(pipe) => {
                 if let Some(state) = self.pipes.get_mut(&pipe) {
@@ -547,6 +566,80 @@ impl DescriptorArena {
     /// Release a machine-owned continuation reference created by [`Self::retain_handle`].
     pub(crate) fn release_handle(&mut self, id: DescriptionId) -> Result<(), DescriptorError> {
         self.release(id)
+    }
+
+    /// Try to change an inode lock without consulting host files or blocking.
+    ///
+    /// Locks belong to open descriptions, so dup/fork share them and the last close
+    /// releases them. A conversion releases the previous lock before trying the new
+    /// mode, matching flock's non-atomic upgrade semantics. The scan is bounded by
+    /// MAX_OPEN_DESCRIPTIONS; the syscall caller prepays that work.
+    pub(crate) fn file_lock(
+        &mut self,
+        id: DescriptionId,
+        inode: u64,
+        mode: Option<FileLockMode>,
+    ) -> Result<bool, DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        if entry.file_lock == mode.map(|mode| (inode, mode)) {
+            return Ok(true);
+        }
+        if entry.file_lock.take().is_some() {
+            self.file_locks_changed = true;
+            self.file_lock_generation = self.file_lock_generation.wrapping_add(1);
+        }
+        let Some(mode) = mode else {
+            return Ok(true);
+        };
+        if self.descriptions.values().any(|entry| {
+            entry.file_lock.is_some_and(|(other_inode, other_mode)| {
+                other_inode == inode
+                    && (mode == FileLockMode::Exclusive || other_mode == FileLockMode::Exclusive)
+            })
+        }) {
+            return Ok(false);
+        }
+        self.descriptions
+            .get_mut(&id)
+            .expect("validated description")
+            .file_lock = Some((inode, mode));
+        Ok(true)
+    }
+
+    /// Consume the bounded wake flag after any descriptor release or conversion.
+    pub(crate) fn take_file_lock_changes(&mut self) -> bool {
+        std::mem::take(&mut self.file_locks_changed)
+    }
+
+    /// Observe releases even after the process scheduler consumed its wake flag.
+    /// A bounded thread quantum cannot perform enough releases to wrap this counter.
+    pub(crate) fn file_lock_generation(&self) -> u64 {
+        self.file_lock_generation
+    }
+
+    /// Bind the VFS identity once at open; renaming a path must not change lock ownership.
+    pub(crate) fn bind_inode(
+        &mut self,
+        id: DescriptionId,
+        inode: u64,
+    ) -> Result<(), DescriptorError> {
+        let entry = self
+            .descriptions
+            .get_mut(&id)
+            .ok_or(DescriptorError::InvalidFd)?;
+        entry.inode = Some(inode);
+        Ok(())
+    }
+
+    pub(crate) fn inode(&self, id: DescriptionId) -> Result<u64, DescriptorError> {
+        self.descriptions
+            .get(&id)
+            .ok_or(DescriptorError::InvalidFd)?
+            .inode
+            .ok_or(DescriptorError::WrongAccess)
     }
 
     pub fn read(
@@ -1042,6 +1135,78 @@ impl FdTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_locks_share_alias_lifetime_and_release_on_last_close() {
+        let mut arena = DescriptorArena::new();
+        let first = arena
+            .open_file("/lock".into(), 0, true, true, false, false)
+            .unwrap();
+        let second = arena
+            .open_file("/lock".into(), 0, true, true, false, false)
+            .unwrap();
+        let mut fds = FdTable::new();
+        fds.install(3, first, &mut arena).unwrap();
+        fds.install(4, second, &mut arena).unwrap();
+        fds.duplicate(3, 5, &mut arena).unwrap();
+        assert!(arena
+            .file_lock(first, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(arena
+            .file_lock(fds.get(5).unwrap(), 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(!arena
+            .file_lock(second, 10, Some(FileLockMode::Shared))
+            .unwrap());
+        fds.close(3, &mut arena).unwrap();
+        assert!(!arena.take_file_lock_changes());
+        assert!(!arena
+            .file_lock(second, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        fds.close(5, &mut arena).unwrap();
+        assert!(arena.take_file_lock_changes());
+        assert!(arena
+            .file_lock(second, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+    }
+
+    #[test]
+    fn file_lock_conversion_releases_old_mode_and_distinguishes_inodes() {
+        let mut arena = DescriptorArena::new();
+        let first = arena
+            .open_file("/lock".into(), 0, true, true, false, false)
+            .unwrap();
+        let second = arena
+            .open_file("/lock".into(), 0, true, true, false, false)
+            .unwrap();
+        let replacement = arena
+            .open_file("/lock".into(), 0, true, true, false, false)
+            .unwrap();
+        assert!(arena
+            .file_lock(first, 10, Some(FileLockMode::Shared))
+            .unwrap());
+        assert!(arena
+            .file_lock(second, 10, Some(FileLockMode::Shared))
+            .unwrap());
+        assert!(!arena
+            .file_lock(first, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(arena.take_file_lock_changes());
+        assert!(arena
+            .file_lock(second, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(arena
+            .file_lock(replacement, 11, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert!(arena.file_lock(second, 10, None).unwrap());
+        assert!(arena
+            .file_lock(first, 10, Some(FileLockMode::Exclusive))
+            .unwrap());
+        assert_eq!(
+            arena.file_lock(0, 10, None),
+            Err(DescriptorError::InvalidFd)
+        );
+    }
 
     #[test]
     fn duplicated_input_descriptors_share_a_cursor() {

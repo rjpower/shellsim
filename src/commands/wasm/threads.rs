@@ -440,6 +440,8 @@ pub(super) struct ThreadGroup {
     control: Arc<Mutex<Control>>,
     guests: BTreeMap<u32, Guest>,
     blocked: BTreeMap<u32, WaitReason>,
+    aggregate_blocked: bool,
+    file_lock_generation: u64,
     template: Template,
     module: Module,
     path: String,
@@ -497,6 +499,8 @@ pub(super) fn start(
         control,
         guests: BTreeMap::new(),
         blocked: BTreeMap::new(),
+        aggregate_blocked: false,
+        file_lock_generation: 0,
         template,
         module,
         path,
@@ -512,6 +516,29 @@ pub(super) fn start(
 }
 
 impl ThreadGroup {
+    /// Park individual host continuations while siblings run. A release within this
+    /// process can precede aggregate parking, so readiness is checked after each poll.
+    fn wake_blocked(&mut self, interp: &Interp, retry_all: bool) {
+        let generation = interp.descriptors.file_lock_generation();
+        let locks_changed = generation != self.file_lock_generation;
+        self.file_lock_generation = generation;
+        let now = interp.clock.monotonic_ns();
+        let ready: Vec<_> = self
+            .blocked
+            .iter()
+            .filter_map(|(&tid, reason)| {
+                (retry_all || thread_wait_ready(interp, reason, now, locks_changed)).then_some(tid)
+            })
+            .collect();
+        let mut control = self.control.lock().expect("thread control");
+        for tid in ready {
+            self.blocked.remove(&tid);
+            if !control.ready.contains(&tid) {
+                control.ready.push_back(tid);
+            }
+        }
+    }
+
     fn insert(&mut self, tid: u32, argument: u32, main: Option<Host>) {
         let machine = self.template.machine.fork_thread();
         let mut host = main.unwrap_or_else(|| Host {
@@ -603,16 +630,10 @@ impl ThreadGroup {
             let expired = control.waits.expire(now);
             control.ready.extend(expired);
         }
-        // The process was rescheduled by its aggregate descriptor/timer reason.
-        // Retrying bounded nonblocking host operations is safe; it cannot perform
-        // duplicate I/O because suspended host calls retain their continuation.
-        for tid in std::mem::take(&mut self.blocked).into_keys() {
-            self.control
-                .lock()
-                .expect("thread control")
-                .ready
-                .push_back(tid);
-        }
+        // An aggregate wake may carry an edge-triggered child/descriptor event.
+        // Ordinary quanta only retry continuations whose resources changed.
+        let retry_all = std::mem::take(&mut self.aggregate_blocked);
+        self.wake_blocked(interp, retry_all);
         let next = self
             .control
             .lock()
@@ -657,9 +678,11 @@ impl ThreadGroup {
         }
         let process = self.control.lock().expect("thread control").dynamic.clone();
         let ready = process.take_ready();
+        self.wake_blocked(interp, false);
         let mut control = self.control.lock().expect("thread control");
         for tid in ready {
             if self.guests.contains_key(&tid) && !control.ready.contains(&tid) {
+                self.blocked.remove(&tid);
                 control.ready.push_back(tid);
             }
         }
@@ -687,12 +710,50 @@ impl ThreadGroup {
         if reasons.is_empty() {
             // An indefinite futex wait has no external wake source, but remains
             // cancellable through the owning process's normal lifecycle.
+            self.aggregate_blocked = true;
             GuestPoll::Blocked(WaitReason::Any(Vec::new()))
         } else if reasons.len() == 1 {
+            self.aggregate_blocked = true;
             GuestPoll::Blocked(reasons.pop().expect("one reason"))
         } else {
+            self.aggregate_blocked = true;
             GuestPoll::Blocked(WaitReason::Any(reasons))
         }
+    }
+}
+
+fn thread_wait_ready(interp: &Interp, reason: &WaitReason, now: u64, locks_changed: bool) -> bool {
+    match reason {
+        WaitReason::ShellSession(_) | WaitReason::HostHttp(_) => false,
+        WaitReason::FileLock(_) => locks_changed,
+        WaitReason::Timer(deadline) => *deadline <= now,
+        // Invalidated endpoints must retry too, so their continuation reports EBADF
+        // rather than parking on a resource removed by a sibling thread.
+        WaitReason::InputReadable(description) => {
+            interp.descriptors.state(*description).is_err()
+                || interp.descriptors.input_readable(*description)
+        }
+        WaitReason::PipeReadable(pipe) => {
+            !interp.descriptors.contains_pipe(*pipe) || interp.descriptors.pipe_readable(*pipe)
+        }
+        WaitReason::PipeWritable(pipe) => {
+            !interp.descriptors.contains_pipe(*pipe) || interp.descriptors.pipe_writable(*pipe)
+        }
+        WaitReason::Child(pid) | WaitReason::ChildActivity(pid) => matches!(
+            interp.processes.get(*pid).map(|record| record.status),
+            Some(crate::process::ProcessStatus::Exited(_))
+        ),
+        WaitReason::ChildDeadline(pid, deadline)
+        | WaitReason::ChildActivityDeadline(pid, deadline) => {
+            *deadline <= now
+                || matches!(
+                    interp.processes.get(*pid).map(|record| record.status),
+                    Some(crate::process::ProcessStatus::Exited(_))
+                )
+        }
+        WaitReason::Any(reasons) => reasons
+            .iter()
+            .any(|reason| thread_wait_ready(interp, reason, now, locks_changed)),
     }
 }
 

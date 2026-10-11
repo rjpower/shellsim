@@ -20,6 +20,8 @@ pub enum WaitReason {
     InputReadable(u32),
     PipeReadable(u32),
     PipeWritable(u32),
+    /// An advisory whole-file lock released by another open description.
+    FileLock(u64),
     /// A virtual HTTP request awaiting an explicit host response.
     HostHttp(u64),
     Child(ProcessId),
@@ -293,6 +295,18 @@ impl Scheduler {
     /// Wake tasks coordinating pipe activity anywhere beneath one child handle.
     pub fn wake_child_activity_waiters(&mut self, child: ProcessId) -> usize {
         self.wake_matching(|reason| reason.waits_for_child_activity(child))
+    }
+
+    /// Retry advisory locks in stable blocking order after a release or conversion.
+    pub(crate) fn wake_file_lock_waiters(&mut self) -> usize {
+        fn contains_lock(reason: &WaitReason) -> bool {
+            match reason {
+                WaitReason::FileLock(_) => true,
+                WaitReason::Any(reasons) => reasons.iter().any(contains_lock),
+                _ => false,
+            }
+        }
+        self.wake_matching(contains_lock)
     }
 
     fn wake_matching(&mut self, predicate: impl Fn(&WaitReason) -> bool) -> usize {

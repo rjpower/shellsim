@@ -37,7 +37,7 @@ pub fn register(m: &mut HashMap<&'static str, CommandSpec>) {
     reg_resumable(m, &["fg"], Trust::Real, start_fg);
     reg(m, &["bg"], Trust::Real, cmd_bg);
     reg(m, &["trap"], Trust::Real, cmd_trap);
-    reg(m, &["flock"], Trust::Partial, cmd_flock);
+    reg_resumable(m, &["flock"], Trust::Partial, start_flock);
     reg(m, &["disown"], Trust::Real, cmd_disown);
     reg(m, &["umask"], Trust::Partial, cmd_umask);
     reg(m, &["ulimit"], Trust::Partial, cmd_ulimit);
@@ -318,14 +318,19 @@ fn cmd_exec(_interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
 
 const MAX_TRAP_STATE_BYTES: u64 = 1024 * 1024;
 
-/// Validate the common descriptor-lock form. A shellsim process has no ambient competing host
-/// processes, so acquiring or releasing an advisory lock on one of its own open descriptors is
-/// deterministic and immediate. Path-and-command forms are a separate process-control surface.
-fn cmd_flock(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {
+/// Parse descriptor locks over the virtual kernel. Contention can suspend this shell;
+/// path-and-command forms remain a separate, unsupported process-control surface.
+fn start_flock(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> CommandPoll {
+    use crate::descriptors::FileLockMode;
+    let mut mode = Some(FileLockMode::Exclusive);
+    let mut nonblocking = false;
     let mut operand = None;
     for argument in args {
         match argument.as_str() {
-            "-x" | "--exclusive" | "-s" | "--shared" | "-u" | "--unlock" | "-n" | "--nonblock" => {}
+            "-x" | "--exclusive" => mode = Some(FileLockMode::Exclusive),
+            "-s" | "--shared" => mode = Some(FileLockMode::Shared),
+            "-u" | "--unlock" => mode = None,
+            "-n" | "--nonblock" => nonblocking = true,
             "--" if operand.is_none() => {}
             value if operand.is_none() => operand = Some(value),
             _ => {
@@ -333,26 +338,70 @@ fn cmd_flock(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i
                     io.err,
                     "flock: path-and-command locking is not supported; use an open file descriptor",
                 );
-                return 2;
+                return CommandPoll::Ready(2);
             }
         }
     }
     let Some(operand) = operand else {
         ewln(io.err, "flock: missing file descriptor");
-        return 2;
+        return CommandPoll::Ready(2);
     };
     let Ok(fd) = operand.parse::<i32>() else {
         ewln(
             io.err,
             "flock: path-and-command locking is not supported; use an open file descriptor",
         );
-        return 2;
+        return CommandPoll::Ready(2);
     };
-    if interp.fds.get(fd).is_err() {
-        ewln(io.err, &format!("flock: {fd}: bad file descriptor"));
-        return 1;
+    crate::commands::resume(
+        interp,
+        CommandResume::FileLock {
+            fd,
+            mode,
+            nonblocking,
+        },
+    )
+}
+
+/// Retry the parsed shell lock after another description releases its ownership.
+pub(super) fn resume_flock(
+    interp: &mut Interp,
+    fd: i32,
+    mode: Option<crate::descriptors::FileLockMode>,
+    nonblocking: bool,
+) -> CommandPoll {
+    let mut system = crate::syscalls::ActiveSystem::new(interp);
+    let result = system.file_lock(fd, mode);
+    let error = match result {
+        Ok(true) => return CommandPoll::Ready(0),
+        Ok(false) if nonblocking => return CommandPoll::Ready(1),
+        Ok(false) => match system.file_lock_inode(fd) {
+            Ok(inode) => {
+                return CommandPoll::Blocked(
+                    crate::scheduler::WaitReason::FileLock(inode),
+                    CommandResume::FileLock {
+                        fd,
+                        mode,
+                        nonblocking,
+                    },
+                )
+            }
+            Err(error) => error,
+        },
+        Err(error) => error,
+    };
+    let detail = match error {
+        crate::syscalls::SyscallError::Descriptor(
+            crate::descriptors::DescriptorError::InvalidFd,
+        ) => "bad file descriptor".to_string(),
+        error => error.to_string(),
+    };
+    CommandPoll::ReadyOutput {
+        command: "flock".to_string(),
+        status: 1,
+        stdout: Vec::new(),
+        stderr: format!("flock: {fd}: {detail}\n").into_bytes(),
     }
-    0
 }
 
 fn cmd_trap(interp: &mut CommandContext<'_>, args: &[String], io: &mut Io) -> i32 {

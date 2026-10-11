@@ -1,0 +1,81 @@
+{
+  "name": "dask",
+  "version": "2026.8.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/f8/3a/4fc99e788bcfa1b3b3f21abf57da45898d807d007e7f6fd1c7300904eb70/dask-2026.8.0-py3-none-any.whl",
+    "sha256": "ccc0c83a189b0398602435189771d28dad7b5773b6089bb8dce14ae732dd782c",
+    "filename": "dask-2026.8.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "click>=8.1",
+    "cloudpickle>=3.0.0",
+    "fsspec>=2021.09.0",
+    "packaging>=20.0",
+    "partd>=1.4.0",
+    "pyyaml>=5.4.1",
+    "toolz>=0.12.0",
+    "importlib_metadata>=4.13.0; python_version < \"3.12\"",
+    "numpy>=1.24; extra == \"array\"",
+    "dask[array]; extra == \"dataframe\"",
+    "pandas>=2.0; extra == \"dataframe\"",
+    "pyarrow>=16.0; extra == \"dataframe\"",
+    "distributed<2026.8.1,>=2026.8.0; extra == \"distributed\"",
+    "bokeh>=3.1.0; extra == \"diagnostics\"",
+    "jinja2>=2.10.3; extra == \"diagnostics\"",
+    "dask[array,dataframe,diagnostics,distributed]; extra == \"complete\"",
+    "lz4>=4.3.2; extra == \"complete\"",
+    "pandas[test]; extra == \"test\"",
+    "pytest; extra == \"test\"",
+    "pytest-cov; extra == \"test\"",
+    "pytest-mock; extra == \"test\"",
+    "pytest-rerunfailures; extra == \"test\"",
+    "pytest-timeout; extra == \"test\"",
+    "pytest-xdist; extra == \"test\"",
+    "pre-commit; extra == \"test\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/click",
+      "version": "8.5.0"
+    },
+    {
+      "port": "python/cloudpickle",
+      "version": "3.1.2"
+    },
+    {
+      "port": "python/fsspec",
+      "version": "2026.9.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/partd",
+      "version": "1.4.2"
+    },
+    {
+      "port": "python/pyyaml",
+      "version": "6.0.3"
+    },
+    {
+      "port": "python/toolz",
+      "version": "1.2.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

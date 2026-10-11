@@ -406,7 +406,68 @@ async fn wait(
     }
 }
 
+/// Retry a whole-file lock after a virtual descriptor release, never a host wait.
+async fn flock(mut caller: Caller<'_, Host>, (fd, flags): (i32, i32)) -> Result<i32, Error> {
+    use crate::descriptors::FileLockMode;
+
+    if flags & !15 != 0 {
+        return Ok(ERRNO_INVAL);
+    }
+    let mode = match flags & !4 {
+        1 => Some(FileLockMode::Shared),
+        2 => Some(FileLockMode::Exclusive),
+        8 => None,
+        _ => return Ok(ERRNO_INVAL),
+    };
+    if let Err(error) = guest_descriptor(&mut caller, fd) {
+        return Ok(error);
+    }
+    let description = caller
+        .data()
+        .machine
+        .get()
+        .process
+        .fds
+        .get(fd)
+        .expect("validated descriptor");
+    loop {
+        // Pending descriptor close/reuse is an explicit frontier. Never apply the
+        // suspended request to a replacement file opened by another guest thread.
+        if caller.data().machine.get().process.fds.get(fd).ok() != Some(description) {
+            return Ok(ERRNO_NOTSUP);
+        }
+        if let Err(error) = guest_descriptor(&mut caller, fd) {
+            return Ok(error);
+        }
+        let result = ActiveSystem::new(&mut caller.data_mut().machine.get()).file_lock(fd, mode);
+        match result {
+            Ok(true) => return Ok(ERRNO_SUCCESS),
+            Ok(false) if flags & 4 != 0 => return Ok(ERRNO_AGAIN),
+            Ok(false) => {}
+            Err(SyscallError::ResourceExhausted) => return Err(exhausted()),
+            Err(error) => return Ok(syscall_errno(&error)),
+        }
+        threaded_dynamic::can_block(caller.data())?;
+        let inode =
+            match ActiveSystem::new(&mut caller.data_mut().machine.get()).file_lock_inode(fd) {
+                Ok(inode) => inode,
+                Err(error) => return Ok(syscall_errno(&error)),
+            };
+        caller
+            .data()
+            .machine
+            .clone()
+            .suspend(Suspension::Blocked(WaitReason::FileLock(inode)))
+            .await;
+    }
+}
+
 pub(super) fn register(linker: &mut Linker<Host>) {
+    linker
+        .func_wrap_async("shellsim_posix_v1", "descriptor_flock", |caller, params| {
+            Box::new(flock(caller, params))
+        })
+        .expect("unique descriptor lock import");
     linker
         .func_wrap(
             "shellsim_posix_v1",

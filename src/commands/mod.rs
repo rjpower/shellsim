@@ -151,6 +151,11 @@ pub(crate) enum CommandPoll {
 /// Command-owned state retained by the shell while a native command is suspended.
 #[derive(Clone)]
 pub(crate) enum CommandResume {
+    FileLock {
+        fd: i32,
+        mode: Option<crate::descriptors::FileLockMode>,
+        nonblocking: bool,
+    },
     Wait {
         pids: Vec<crate::process::ProcessId>,
         status: i32,
@@ -612,6 +617,11 @@ pub(crate) fn buffers_standard_input(interp: &Interp, argv: &[String]) -> bool {
 /// Continue command-owned state after the scheduler wakes its process.
 pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> CommandPoll {
     let result = match continuation {
+        CommandResume::FileLock {
+            fd,
+            mode,
+            nonblocking,
+        } => builtins::resume_flock(interp, fd, mode, nonblocking),
         CommandResume::Wait {
             mut pids,
             mut status,
