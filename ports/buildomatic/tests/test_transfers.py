@@ -12,11 +12,18 @@ from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
-
-from ports.buildomatic import ConditionalWriteError, LocalStore, ResourceLimits, TreeBundle, capture_tree, extract_tree
-from ports.buildomatic import transfers
-from ports.buildomatic.backends import iris
 from ports.buildomatic.contracts import encode
+
+from ports.buildomatic import (
+    ConditionalWriteError,
+    LocalStore,
+    ResourceLimits,
+    TreeBundle,
+    capture_tree,
+    extract_tree,
+    transfers,
+)
+from ports.buildomatic.backends import iris
 
 
 @pytest.fixture
@@ -213,13 +220,13 @@ def test_exact_chunk_length_is_checked(tmp_path, source, remote, operation):
     key = source.put_blob(b"12345")
     bundle = manifest(source, [file_entry(b"12345", size=4)])
     if operation == "upload":
-        run = lambda: transfers.upload_bundles(source, [bundle], factory=remote.factory)
+        target, run = source, transfers.upload_bundles
     else:
         remote.blobs = {key: b"12345", bundle.digest: source.get_blob(bundle.digest)}
         destination = LocalStore(tmp_path / "destination")
-        run = lambda: transfers.download_bundles(destination, [bundle], factory=remote.factory)
+        target, run = destination, transfers.download_bundles
     with pytest.raises(ValueError):
-        run()
+        run(target, [bundle], factory=remote.factory)
     assert bundle.digest not in remote.puts
     assert sorted(remote.opened) == sorted(remote.closed)
 
@@ -558,7 +565,11 @@ def test_context_factory_owns_auth_controller_and_capability_per_thread(tmp_path
         assert value == "/owner/existing"
         return value
 
-    connect, types, rigging = ModuleType("iris.cli.connect"), ModuleType("iris.cluster.types"), ModuleType("rigging.connect")
+    connect, types, rigging = (
+        ModuleType("iris.cli.connect"),
+        ModuleType("iris.cluster.types"),
+        ModuleType("rigging.connect"),
+    )
     connect.open_iris_client = open_client
     types.JobName = SimpleNamespace(from_wire=parse)
     types.Namespace = SimpleNamespace(from_job_id=lambda job: "namespace/existing")
@@ -594,7 +605,11 @@ def test_context_factory_closes_auth_when_capability_discovery_fails(monkeypatch
         finally:
             closed.append(threading.get_ident())
 
-    connect, types, rigging = ModuleType("iris.cli.connect"), ModuleType("iris.cluster.types"), ModuleType("rigging.connect")
+    connect, types, rigging = (
+        ModuleType("iris.cli.connect"),
+        ModuleType("iris.cluster.types"),
+        ModuleType("rigging.connect"),
+    )
     connect.open_iris_client = open_client
     types.JobName = SimpleNamespace(from_wire=lambda value: value)
     types.Namespace = SimpleNamespace(from_job_id=lambda job: "namespace/existing")
