@@ -12,7 +12,8 @@ RUN curl -fsSL https://github.com/mozilla/sccache/releases/download/v0.18.0/scca
       | tar -xz --strip-components=1 -C /usr/local/bin --wildcards '*/sccache' \
     && chmod +x /usr/local/bin/sccache
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --profile minimal --default-toolchain 1.97.1
+      | sh -s -- -y --profile minimal --default-toolchain 1.97.1 \
+    && /root/.cargo/bin/rustup target add wasm32-wasip1-threads
 
 # Runtime/code transport installs Iris into its own environment. Generators
 # and the native CPython build helper are reusable image dependencies.

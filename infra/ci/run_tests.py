@@ -28,12 +28,19 @@ def main(arguments: Sequence[str] | None = None) -> int:
     logging.info("[tests] %s", " ".join(command))
     environment = os.environ.copy()
     environment.setdefault("RUST_BACKTRACE", "1")
-    return subprocess.run(
+    result = subprocess.run(
         command,
         cwd=REPOSITORY_ROOT,
         env=environment,
         check=False,
     ).returncode
+    if result:
+        return result
+    command = ["cargo", "test", "--locked", "--manifest-path", "ports/toolchain/wasm-scheduler/Cargo.toml"]
+    if forwarded:
+        command.extend(["--", *forwarded])
+    logging.info("[tests] %s", " ".join(command))
+    return subprocess.run(command, cwd=REPOSITORY_ROOT, env=environment, check=False).returncode
 
 
 if __name__ == "__main__":

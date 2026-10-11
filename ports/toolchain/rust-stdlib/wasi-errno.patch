@@ -1,0 +1,22 @@
+--- a/rust-src/lib/rustlib/src/rust/library/std/src/sys/io/error/wasi.rs
++++ b/rust-src/lib/rustlib/src/rust/library/std/src/sys/io/error/wasi.rs
+@@ -3,16 +3,14 @@
+
+ unsafe extern "C" {
+-    #[thread_local]
+-    #[link_name = "errno"]
+-    static mut libc_errno: libc::c_int;
++    fn __errno_location() -> *mut libc::c_int;
+ }
+
+ pub fn errno() -> i32 {
+-    unsafe { libc_errno as i32 }
++    unsafe { *__errno_location() as i32 }
+ }
+
+ pub fn set_errno(val: i32) {
+     unsafe {
+-        libc_errno = val;
++        *__errno_location() = val;
+     }
+ }

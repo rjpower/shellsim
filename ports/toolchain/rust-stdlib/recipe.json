@@ -1,0 +1,23 @@
+{
+  "name": "rust-stdlib",
+  "version": "1.97.1",
+  "role": "host-tool",
+  "kind": "rust-stdlib",
+  "build_system": "source-tree",
+  "target": "wasm32-wasip1-threads",
+  "source": {
+    "url": "https://static.rust-lang.org/dist/rust-src-1.97.1.tar.xz",
+    "filename": "rust-src-1.97.1.tar.xz",
+    "sha256": "e9a1e616d04c6845895c827a178b9227f7c7199f3f4a80af81ab3aff7b80156b",
+    "subdirectory": "rust-src-1.97.1"
+  },
+  "helpers": [
+    "_support/rust_tools.py"
+  ],
+  "patches": [
+    {
+      "file": "wasi-errno.patch",
+      "sha256": "d682627a6077fe59ac8273b64799d0f291c63b32f5e5933c24ab3af41a5cbb4e"
+    }
+  ]
+}

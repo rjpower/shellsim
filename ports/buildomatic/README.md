@@ -34,6 +34,8 @@ artifact keys exclude worker count, build jobs, host binary hashes and sccache
 configuration. They include recipes, source/patch inputs, relevant build code,
 target SDK products and dependency identities. SDK catalogs likewise track
 producer metadata and code, so changed producer inputs require bootstrap.
+Scheduling, storage orchestration and context record definitions do not affect
+product keys. Changes to actual patch application and build helpers still do.
 
 Fetching and guest checks are explicit, separate workflows:
 
@@ -79,6 +81,13 @@ The worker image uses Ubuntu packages, normal Python environments, Rust and
 sccache. Allocate CPUs to match build jobs; linking has its own smaller
 concurrency limit. One port is a scheduling action; dependency-ready ports run
 on independent workers without wave barriers.
+
+Rust Python ports declare two build-only products: the PIC Rust standard
+library and the isolated Wasm scheduler translator. Workers build them with
+ordinary installed Rust, shared Cargo storage and sccache. Extensions consume
+their canonical references and the cached SDK linker; runtime publication
+omits both host products. See `toolchain/rust-stdlib` and
+`toolchain/wasm-scheduler` for their standalone build paths.
 
 `BuildRequest(idempotency_key, actions, max_workers=1)` admits at most 512 nodes
 and 32 workers. `Action(id, argv, dependencies=(), inputs=(), env=(),

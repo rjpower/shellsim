@@ -446,6 +446,10 @@ def test_changed_patch_driver_rebuilds_a_real_cached_source_component(tmp_path, 
     reference = "toolchain/example/recipe.json"
     assert first.results == repeat.results and calls == ["value.patch"]
     assert (first.results[reference] / "source/value.txt").read_text() == "first\n"
+    for name in ("runner.py", "store.py"):
+        (driver / name).write_text("# changed orchestration\n")
+    unchanged = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
+    assert unchanged.results == first.results and calls == ["value.patch"]
     change_driver("second\n")
     changed = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
     assert changed.results != first.results and calls == ["value.patch", "value.patch"]

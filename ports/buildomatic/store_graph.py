@@ -22,7 +22,7 @@ from ports.api import implementation
 from ports.buildomatic import Action, BuildRequest, BuildState, InputMount, LocalStore, capture_tree
 from ports.buildomatic.artifacts import write_reference
 from ports.buildomatic.ports import PRODUCT_SYSTEMS, _stage_code, code_files
-from ports.buildomatic.sdk_artifacts import sdk_inputs
+from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 
 
 @dataclass(frozen=True)
@@ -114,19 +114,12 @@ def prepare(
                 "implementation": implementation(port),
                 "driver": {
                     name: file_hash(Path(__file__).resolve().parents[1] / name)
-                    for name in (
-                        "_support/runner.py",
-                        "_support/store.py",
-                        "buildomatic/store_worker.py",
-                        "buildomatic/sdk_artifacts.py",
-                        *(["_support/local_sources.py"] if "files" in port.recipe["source"] else []),
-                        *(["_support/build.py"] if port.recipe.get("patches") else []),
-                    )
+                    for name in (["_support/build.py"] if port.recipe.get("patches") else [])
                 },
                 "sdk": sdk["identity"] if sdk and system not in {"pure-wheel", "host-wheel", "source-tree"} else None,
                 "dependencies": {edge.recipe: keys[edge.recipe] for edge in port.dependencies},
             }
-            if system in {"python-extension", "python-meson", "python-pep517"}:
+            if system in {"python-extension", "python-meson", "python-pep517", "python-rust"}:
                 if sdk is None or "cpython" not in sdk["products"]:
                     raise ValueError("Python extensions require an SDK bootstrapped with --python")
                 inputs["python"] = sdk["products"]["cpython"]["receipt_id"]
@@ -235,7 +228,7 @@ def run(
         sdk = backend.resolve_artifact("sdk/" + sdk_name) if needs_sdk else None
         if needs_sdk and sdk is None:
             raise ValueError("SDK cache miss: explicitly bootstrap " + sdk_name)
-        if sdk is not None and sdk["inputs"] != sdk_inputs(ports, sdk_name):
+        if sdk is not None and not sdk_inputs_match(sdk["inputs"], sdk_inputs(ports, sdk_name)):
             raise ValueError("SDK build inputs changed: explicitly bootstrap " + sdk_name)
         local = LocalStore(scratch / "transport")
         graph, request, results, keys = prepare(

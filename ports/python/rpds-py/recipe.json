@@ -1,0 +1,38 @@
+{
+  "name": "rpds-py",
+  "version": "2026.9.1",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-rust",
+  "sdk": "default",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/42/68/3bd46b8a5e01d3c2ebdf9c5e9497912e3fe0cde02bac21a7130ca866e403/rpds_py-2026.9.1.tar.gz",
+    "filename": "rpds_py-2026.9.1.tar.gz",
+    "sha256": "4793ef7f78268b124b73fa933440f01d258bbae01de9fa53e9080c9ab0425a12",
+    "subdirectory": "rpds_py-2026.9.1"
+  },
+  "requires_python": ">=3.11",
+  "requires_dist": [],
+  "build_dependencies": [
+    {
+      "port": "toolchain/rust-stdlib",
+      "version": "1.97.1"
+    },
+    {
+      "port": "toolchain/wasm-scheduler",
+      "version": "0.1.0"
+    }
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

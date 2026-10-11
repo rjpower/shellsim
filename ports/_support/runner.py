@@ -235,11 +235,9 @@ def build_graph(
             target = _native_target(build_sdk)
         sdks[port.reference] = build_sdk
         executable_inputs = _executable_sdk_link_inputs(build_sdk, recipe) if not pure else ()
-        driver_files = ["runner.py", "store.py"]
-        if "files" in recipe["source"]:
-            driver_files.append("local_sources.py")
-        if recipe.get("patches"):
-            driver_files.append("build.py")
+        # Scheduling and storage code do not produce port bytes. Patch
+        # application does, so keep that input alongside builder code.
+        driver_files = ["build.py"] if recipe.get("patches") else []
         inputs = {
             "recipe_sha256": port.digest,
             "local_inputs": local_inputs[port.reference],
@@ -294,7 +292,20 @@ def build_graph(
                         source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
                         for patch in recipe.get("patches", []):
                             apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
-                    build_port(BuildContext(port, source, slot.result, sdk=build_sdk, jobs=jobs))
+                    build_port(
+                        BuildContext(
+                            port,
+                            source,
+                            slot.result,
+                            sdk=build_sdk,
+                            jobs=jobs,
+                            compiler_cache=compiler_cache,
+                            offline=offline,
+                            build_artifacts={
+                                item.port: results[item.recipe] for item in port.dependencies if item.kind == "build"
+                            },
+                        )
+                    )
                 else:
                     if system != "llvm-guest" and "files" not in recipe["source"]:
                         source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
@@ -388,6 +399,11 @@ def build_graph(
                             if system == "python-pep517"
                             else (),
                             jobs=jobs,
+                            offline=offline,
+                            compiler_cache=compiler_cache,
+                            build_artifacts={
+                                item.port: results[item.recipe] for item in port.dependencies if item.kind == "build"
+                            },
                             workspace=workspaces.get(port.reference) if workspaces else None,
                         )
                     )
@@ -657,7 +673,7 @@ def main() -> None:
     )
     needs_python = args.output is not None or any(
         port.recipe["build_system"]
-        in {"python-extension", "python-pep517", "python-meson", "cpython-threaded", "uv-host"}
+        in {"python-extension", "python-pep517", "python-meson", "python-rust", "cpython-threaded", "uv-host"}
         for port in graph.ports
     )
     if args.check:

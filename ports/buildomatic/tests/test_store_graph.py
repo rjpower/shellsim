@@ -7,6 +7,24 @@ from ports.buildomatic.backends.iris import CoordinatorService
 from ports.buildomatic.store_graph import prepare
 
 
+def test_sdk_interface_changes_keep_products_but_producer_changes_do_not():
+    from copy import deepcopy
+
+    from ports.buildomatic.sdk_artifacts import sdk_inputs_match
+
+    current = {
+        "definition": {"target": "wasm32-wasip1-threads"},
+        "producers": {"compiler": {"policy": {"version": "23"}, "implementation": {"builder": "compiler-code"}}},
+    }
+    recorded = deepcopy(current)
+    recorded["producers"]["compiler"]["implementation"]["_support/build_context.py"] = "old-interface"
+    assert sdk_inputs_match(recorded, current)
+    for field, value in [("policy", {"version": "24"}), ("implementation", {"builder": "changed-compiler"})]:
+        changed = deepcopy(current)
+        changed["producers"]["compiler"][field] = value
+        assert not sdk_inputs_match(recorded, changed)
+
+
 class CatalogBackend:
     def __init__(self, store):
         self.store = store

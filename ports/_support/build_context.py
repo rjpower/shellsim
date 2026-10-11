@@ -36,6 +36,7 @@ class BuildContext:
     host_seed: HostSeed | None = None
     work: Path | None = None
     offline: bool = False
+    build_artifacts: Mapping[str, Path] = field(default_factory=dict)
 
     @property
     def metadata(self) -> Mapping:

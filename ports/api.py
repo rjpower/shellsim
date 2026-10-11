@@ -47,6 +47,7 @@ _HELPER_FILES = {
     "configure-make": (*_NATIVE_FILES, "_support/make_adapter.py"),
     "plain-make": (*_NATIVE_FILES, "_support/make_adapter.py"),
     "python-extension": _PYTHON_FILES,
+    "python-rust": (*_PYTHON_FILES, "_support/python_rust.py", "_support/rust_tools.py"),
     "python-meson": (
         *_PYTHON_FILES,
         "_support/python_meson.py",
@@ -92,10 +93,13 @@ def implementation(port: Port) -> dict[str, str]:
     local_root = port.directory.resolve().parents[depth - 1] if depth else port.directory.resolve()
     paths = {}
     system = port.recipe["build_system"]
+    # Context records and the adapter registry do not produce artifact bytes.
+    # Keep API functions where builders call them, without tying independent
+    # producers to interface-only additions elsewhere in this module.
     core = (
-        ("_support/build_context.py",)
-        if system in {"llvm-host", "wasi-sysroot", "sdk-tooling", "cpython-threaded", "uv-host"}
-        else ("api.py", "_support/build_context.py")
+        ()
+        if system in {"python-rust", "llvm-host", "wasi-sysroot", "sdk-tooling", "cpython-threaded", "uv-host"}
+        else ("api.py",)
     )
     candidates = {name: root / name for name in (*core, *_HELPER_FILES[system])}
     helpers = port.recipe.get("helpers", [])
@@ -119,8 +123,8 @@ def implementation(port: Port) -> dict[str, str]:
     return paths
 
 
-def build_port(ctx: BuildContext) -> NativeBuildOutput | PythonBuildOutput | ProductBuildOutput:
-    """Execute one port-owned entrypoint after its static graph was admitted."""
+def build_port(ctx: BuildContext) -> NativeBuildOutput | PythonBuildOutput | ProductBuildOutput | None:
+    """Execute an admitted builder; source-tree builders write result in place."""
     path = ctx.port.directory / "build.py"
     if path.exists():
         if path.is_symlink():
