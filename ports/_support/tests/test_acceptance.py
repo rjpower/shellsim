@@ -219,7 +219,8 @@ def test_native_probe_rejects_nonwrapper_link_flags(tmp_path, flag):
         _native_command(cohort, tmp_path, tmp_path / "test.c", tmp_path / "test.wasm", [], [], [], [flag])
 
 
-def test_native_probe_passes_exact_wrapper_switches(tmp_path):
+@pytest.mark.parametrize("flag", ["-Wl,--wrap=signal,--wrap=open,--wrap=openat", "-std=c++20"])
+def test_native_probe_passes_exact_wrapper_and_cpp_standard_switches(tmp_path, flag):
     cohort = SimpleNamespace(
         has_frontend=True,
         compiler=lambda *, cxx=False: tmp_path / ("cxx" if cxx else "cc"),
@@ -228,7 +229,6 @@ def test_native_probe_passes_exact_wrapper_switches(tmp_path):
         executable_flags=(),
         sysroot=SimpleNamespace(root=tmp_path),
     )
-    flag = "-Wl,--wrap=signal,--wrap=open,--wrap=openat"
     command = _native_command(cohort, tmp_path, tmp_path / "test.c", tmp_path / "test.wasm", [], [], [], [flag])
     assert flag in command
 

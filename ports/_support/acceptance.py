@@ -183,11 +183,15 @@ def _native_command(
         or any(
             not isinstance(flag, str)
             or len(flag) > 4096
-            or re.fullmatch(r"-Wl,--wrap=[A-Za-z_][A-Za-z0-9_]*(?:,--wrap=[A-Za-z_][A-Za-z0-9_]*)*", flag) is None
+            or re.fullmatch(
+                r"(?:-Wl,--wrap=[A-Za-z_][A-Za-z0-9_]*(?:,--wrap=[A-Za-z_][A-Za-z0-9_]*)*|-std=c\+\+(?:11|14|17|20|23))",
+                flag,
+            )
+            is None
             for flag in link_flags
         )
     ):
-        raise ValueError("native acceptance link_flags must be bounded linker wrapper switches")
+        raise ValueError("native acceptance link_flags must be bounded linker wrapper or C++ standard switches")
     includes = []
     include_root = dependency_sysroot / "usr/local"
     for raw in include_directories:
