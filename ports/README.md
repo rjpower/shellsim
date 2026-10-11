@@ -19,6 +19,138 @@ The driver verifies cached inventories on every reuse. `--check` installs the se
 release through the public API and runs each declared guest probe before publication.
 Failed work remains available for diagnosis. This command creates local release assets.
 
+## Buildomatic cache builds
+
+The default `--backend local` keeps the existing build, release and acceptance
+workflow and imports no Iris dependencies. `--backend buildomatic` uses the same
+generic action protocol as remote workers, with isolated local worker processes:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports python/packaging --backend buildomatic \
+  --store /path/to/ports-store --offline
+```
+
+This writes verified results into the local ports cache and prints the checked
+manifest under `store/buildomatic/manifests`. Distributed builds do not accept
+`--output` or `--check`. Publication is a separate explicit operation:
+
+```sh
+uv run --no-project --python /path/to/installed-shellsim/bin/python \
+  python -m ports.buildomatic.ports publish /path/to/cache-manifest.json \
+  --sdk-descriptor /path/to/exported-sdk/sdk.json \
+  --store /path/to/ports-store --output /path/to/release --check
+```
+
+The publisher imports an already admitted SDK, verifies current recipe,
+implementation, predecessor and result identities, and invokes the existing
+release and guest acceptance functions. It never builds a missing SDK product.
+The Python API is `publish_manifest(manifest, ports, sdk_context, store, output,
+check=False)`. Missing results require a separate cache build before publication.
+Published releases have their own destination and lifetime; cache retention does
+not establish release retention.
+
+`ports.buildomatic.ports.prepare_graph` seals one action per canonical consumer
+recipe. The core ready queue owns port concurrency; `--jobs` bounds each port's
+Ninja or make parallelism. Preparation fetches hash-pinned sources, packages
+enumerated implementation files and selected recipe inputs, and exports admitted
+SDK products. Workers import original SDK and host Python roots, preload complete
+verified predecessor trees, then run the ordinary driver offline for one node.
+Changed predecessor keys or absent results fail before predecessor execution.
+SDK producers use imported products; the bridge never bootstraps LLVM remotely.
+Retained `--workspace` directories are unsupported for distributed actions.
+Target graphs require `--sdk-descriptor`; the distributed CLI never calls the SDK
+materializer. `--max-workers` selects independent port actions; `--jobs` remains
+the per-port bound.
+Each action has an explicit four-hour wall budget by default, configurable with
+`--port-timeout` (positive seconds, at most one day), and exactly one attempt.
+Native builds can be expensive, so the bridge does not retry them automatically.
+Workers also enforce their separately configured CPU limits; an Iris service
+operator sets those limits independently of the caller's wall budget.
+
+For Iris, connect to an existing service through
+`ports.buildomatic.backends.iris.backend_context_factory`. Use
+`with factory() as backend` and pass that backend as `remote_backend` to
+`run_graph(..., backend="iris")`. The factory takes the public `job_id`,
+`cluster_name`, `controller_url`, `workspace`, `prefix` and `cache_prefix` from
+the service descriptor. It gives each transfer thread an independent authenticated
+client for the same service. Programmatic backends must provide that transfer
+factory explicitly; the bridge does not share one client across threads.
+
+The bridge prepares raw input trees in the persistent local blob cache at
+`<store>/buildomatic/blobs`, uploads unique input bundles, then submits the
+request. It validates the terminal request identity and exact action set before
+downloading output bundles into the same local cache. Normal tree and port
+receipt verification creates the checked manifest, then the caller acknowledges.
+Both transfer directions use at most eight worker loops, independently of
+`max_workers` and per-port build jobs. Resource limits apply to each distinct
+bundle: 2 GiB/100,000 entries for pure graphs, or 40 GiB/400,000 entries when an
+SDK is admitted. Workers still enforce aggregate mounted-tree and workspace
+limits per action. Portable SDK descriptors, blobs, stable roots and receipts
+are transported unchanged.
+
+The service owns accepted builds after client disconnect. Cache blobs and
+durable request journals use independently configured storage; evicted blobs
+are cache misses and must be rebuilt. Iris imports occur only when explicitly
+connecting to that backend. `blob_store` injection is supported only for the
+local Buildomatic backend.
+
+The CLI can attach to an existing service with `--backend iris --iris-service
+/path/to/service.json`. `ports.buildomatic.backends.iris.connection_descriptor`
+creates the canonical public document with `schema_version: 1`, `job_id`, the durable
+`prefix`, `cache_prefix`, `controller_url`, `cluster_name` and runtime `workspace`.
+The workspace must supply the optional Iris and Rigging dependencies. The
+descriptor contains no credentials; authentication belongs to the Iris client.
+Public `config_sha256`, `task_image` (use an image digest pin) and `service_id`
+fields bind service provenance into the request and checked manifest. Backend
+worker journals record the actual task-image and implementation identity.
+Default pilot services may emit `task_image: null`; the CLI omits that unknown
+image from request and manifest provenance. It retains explicit image identities
+for pinned deployments. `cache_prefix` may also be null to use the backend's
+configured default. Other connection fields require bounded nonempty strings.
+
+Repeating an unchanged build resumes its content-derived request. After cache
+eviction, supply a new explicit `--build-key` to accept a fresh request and
+rebuild the missing blobs. FAILED and CANCELLED requests also retain their
+terminal state; use a new key to retry them. A failed retrieval never creates a checked manifest.
+For clients that disconnect, reconstruct the unchanged prepared request using the
+persistent local blob cache and call the service's `get(build_id)`. Validate the
+returned core request identity and exact successful action set, call
+`download_bundles(local_store, bundles, max_parallel=8, limits=limits)`, then
+`collect_graph` against that local store. Acknowledge only after verified
+collection. Separate submission clients likewise call `prepare_graph` locally
+and `upload_bundles` before `submit`. Transfer limits must match the admitted
+SDK bounds above. Corrupt blobs fail verification and are never treated as valid
+results or repaired silently.
+The client polls remote service snapshots once per second. Local workers use a
+shorter interval for cheap builds.
+
+Compiler caching is opt-in through the typed `CompilerCacheLauncher` binding.
+Its worker-image executable is hash-admitted and only `-c` calls use it. Linking
+uses the real compiler. Public S3/GCS configuration is allowlisted; credentials
+belong to the worker's cache daemon and never enter code bundles or receipts.
+With pinned sccache v0.18.0, cached build environments select
+`SCCACHE_CLIENT_SIDE=1`: compilers run inside the action's process group and
+inherit its resource limits, while the daemon handles storage. Disabling this
+mode, `SCCACHE_ERROR_LOG`, and distributed scheduler configuration are rejected
+because they can move compilation outside the action's cancellation boundary.
+Public daemon bindings select either `SCCACHE_SERVER_UDS` (an absolute socket
+path inside the worker's private filesystem) or `SCCACHE_SERVER_PORT`, never
+both. Omitting both preserves sccache's ordinary local disk-cache endpoint.
+Cached compiles expand bounded GNU response arguments and rewrite source, build,
+dependency and output path operands relative to the compilation working directory.
+External SDK paths and the compiler driver symlink remain exact. Cached Clang
+debug compiles use `-fdebug-compilation-dir=.`; GCC debug paths remain unchanged
+and may prevent reuse. Link commands retain their original response arguments.
+The native adapter wrapper tests use `SHELLSIM_TEST_SCCACHE` for the pinned v0.18.0
+binary and `SHELLSIM_TEST_WASM_CLANG` for an existing Clang. They prove an initial
+miss/write and a cross-workspace hit through generated C and Wasm wrappers,
+compares direct compiler bytes, and verifies linking leaves counters unchanged.
+The standalone core harness tests use `BUILDOMATIC_SCCACHE` and
+`BUILDOMATIC_PROBE_WASM_CLANG`; its command-line entry point is
+`python -m ports.buildomatic.acceptance.compiler_cache --sccache BINARY
+--compiler CLANG --root FRESH_ROOT --target wasm --local [--debug]`.
+
 ## Author a port
 
 Each production port has one `recipe.json`. It declares source URLs and checksums,

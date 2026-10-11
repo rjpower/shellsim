@@ -1,9 +1,13 @@
 """Reject invalid build requests before creating an unpublished staging tree."""
 
+import json
+import os
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
+import uuid
 from dataclasses import replace
 from pathlib import Path, PurePosixPath
 
@@ -237,3 +241,331 @@ def test_executable_archive_tail_resolves_real_symbol_only_for_links(build_reque
         check=False,
     )
     assert result.returncode != 0
+
+
+def test_admitted_cache_launcher_handles_only_object_compilation(build_request, monkeypatch):
+    from ports._support.native_adapters import CompilerCacheLauncher, build_environment, compiler_wrapper_text
+    from ports._support.store import file_hash
+
+    context = build_request.context
+    context.source.mkdir()
+    compiler = shutil.which("cc")
+    assert compiler is not None
+    log = context.source / "cache-calls.jsonl"
+    launcher = context.source / "sccache"
+    launcher.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        f"with open({str(log)!r}, 'a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+        "os.execv(sys.argv[1], sys.argv[1:])\n"
+    )
+    launcher.chmod(0o755)
+    context = replace(
+        context,
+        host_tools={"python": Path(sys.executable), "pkg-config": Path("/admitted/pkg-config"), "cc": Path(compiler)},
+        target_tools={
+            "cc": Path(compiler),
+            "cxx": Path(compiler),
+            "ar": Path("/admitted/ar"),
+            "ranlib": Path("/admitted/ranlib"),
+        },
+        compiler_cache=CompilerCacheLauncher(
+            launcher, file_hash(launcher), (("SCCACHE_DIR", str(context.source / "cache")),)
+        ),
+    )
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", "ambient-secret")
+    environment = build_environment(context, {})
+    assert "AWS_SECRET_ACCESS_KEY" not in environment
+    assert environment["SCCACHE_CLIENT_SIDE"] == "1"
+    assert environment["SCCACHE_BASEDIRS"] == ":".join(
+        map(str, (context.source, context.build, context.dependency_sysroot))
+    )
+    wrapper = context.source / "cc"
+    wrapper.write_text(
+        compiler_wrapper_text(context, "cc", (Path(__file__).parents[1] / "compiler_response.py").read_text())
+    )
+    wrapper.chmod(0o755)
+    source = context.source / "main.c"
+    source.write_text("int main(void) { return 0; }\n")
+    response = context.source / "compile.rsp"
+    response.write_text("-c " + str(source) + " -o " + str(context.source / "main.o"))
+    subprocess.run([str(wrapper), "@" + str(response)], env=environment, check=True)
+    subprocess.run(
+        [str(wrapper), str(context.source / "main.o"), "-o", str(context.source / "main")], env=environment, check=True
+    )
+    subprocess.run([str(wrapper), "-E", str(source)], env=environment, stdout=subprocess.DEVNULL, check=True)
+    import json
+
+    calls = [json.loads(line) for line in log.read_text().splitlines()]
+    assert len(calls) == 1
+    assert calls[0][0] == compiler
+    assert calls[0][1:] == [
+        "-c",
+        os.path.relpath(source),
+        "-o",
+        os.path.relpath(context.source / "main.o"),
+    ]
+
+
+@pytest.mark.parametrize("debug_flags,stable_debug", [([], False), (["-g"], True), (["-g", "-g0"], False)])
+def test_cache_wrapper_normalizes_owned_paths_and_preserves_link_responses(build_request, debug_flags, stable_debug):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_wrapper_text
+    from ports._support.store import file_hash
+
+    context = build_request.context
+    context.source.mkdir()
+    context.build.mkdir()
+    context.compiler_prefix.mkdir()
+    log = context.build / "arguments.json"
+    compiler = context.compiler_prefix / "clang-driver"
+    compiler.write_text(f"#!{sys.executable}\nimport json, sys\nopen({str(log)!r}, 'w').write(json.dumps(sys.argv))\n")
+    compiler.chmod(0o755)
+    driver = context.compiler_prefix / "clang"
+    driver.symlink_to(compiler.name)
+    launcher = context.compiler_prefix / "sccache"
+    launcher.write_text(f"#!{sys.executable}\nimport os, sys\nos.execv(sys.argv[1], sys.argv[1:])\n")
+    launcher.chmod(0o755)
+    external = context.source.parent / "source-other/header.h"
+    context = replace(
+        context,
+        host_tools={"python": Path(sys.executable)},
+        target_tools={"cc": driver},
+        compiler_flags=("--sysroot=" + str(context.sysroot), "-I" + str(context.dependency_sysroot / "include")),
+        compiler_cache=CompilerCacheLauncher(launcher, file_hash(launcher)),
+    )
+    wrapper = context.build / "cc"
+    wrapper.write_text(
+        compiler_wrapper_text(context, "cc", (Path(__file__).parents[1] / "compiler_response.py").read_text())
+    )
+    wrapper.chmod(0o755)
+    source = context.source / "space name.c"
+    nested = context.build / "nested.rsp"
+    nested.write_text(shlex.join(["-c", str(source), "-I" + str(context.source / "include"), *debug_flags]))
+    arguments = [
+        "@nested.rsp",
+        "-isystem",
+        str(context.dependency_sysroot / "include"),
+        "-iquote" + str(context.source / "quotes"),
+        "-include",
+        str(external),
+        "-MF" + str(context.build / "dep.d"),
+        "-o",
+        str(context.build / "obj.o"),
+        "-DORIGINAL=" + str(context.source),
+    ]
+    outer = context.build / "outer.rsp"
+    outer.write_text(shlex.join(arguments))
+    subprocess.run([str(wrapper), "@outer.rsp"], cwd=context.build, check=True)
+    observed = json.loads(log.read_text())
+    assert observed == [
+        str(driver),
+        "--sysroot=" + str(context.sysroot),
+        "-I../dependencies/include",
+        "-c",
+        "../source/space name.c",
+        "-I../source/include",
+        *debug_flags,
+        "-isystem",
+        "../dependencies/include",
+        "-iquote../source/quotes",
+        "-include",
+        str(external),
+        "-MFdep.d",
+        "-o",
+        "obj.o",
+        "-DORIGINAL=" + str(context.source),
+        *(["-fdebug-compilation-dir=."] if stable_debug else []),
+    ]
+    link = context.build / "link.rsp"
+    link.write_text(shlex.join([str(context.build / "obj.o"), "-o", str(context.build / "program")]))
+    subprocess.run([str(wrapper), "@link.rsp"], cwd=context.build, check=True)
+    assert json.loads(log.read_text()) == [str(driver), *context.compiler_flags, "@link.rsp"]
+
+
+@pytest.mark.parametrize("target,debug", [("host", False), ("wasm", False), ("wasm", True)])
+def test_real_cache_wrapper_reuses_objects_across_private_roots(build_request, tmp_path, target, debug):
+    """Opt-in pinned-binary acceptance exercises generated wrappers, not a cache model."""
+    from ports._support.native_adapters import CompilerCacheLauncher, build_environment, compiler_wrapper_text
+    from ports._support.store import file_hash
+
+    binary = os.environ.get("SHELLSIM_TEST_SCCACHE")
+    compiler = os.environ.get("SHELLSIM_TEST_WASM_CLANG") if target == "wasm" else shutil.which("cc")
+    if not binary or not compiler:
+        pytest.skip("provide pinned sccache and an existing Wasm Clang for real cache acceptance")
+    sccache = Path(binary).absolute()
+    compiler = Path(compiler).absolute()
+    pinned = "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59"
+    assert file_hash(sccache) == pinned
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = str(reservation.getsockname()[1])
+    client = {"PATH": os.defpath, "HOME": str(tmp_path), "LC_ALL": "C", "SCCACHE_SERVER_PORT": port}
+    daemon = {**client, "SCCACHE_DIR": str(tmp_path / "cache")}
+
+    def run(argv, directory, environment=client):
+        return subprocess.run(argv, cwd=directory, env=environment, capture_output=True, timeout=30, check=True)
+
+    def stats():
+        report = json.loads(run([str(sccache), "--show-stats", "--stats-format=json"], tmp_path).stdout)
+        assert report["basedirs"] == []
+        values = report["stats"]
+        return [sum(values[name]["counts"].values()) for name in ("cache_hits", "cache_misses")] + [
+            values["cache_writes"]
+        ]
+
+    run([str(sccache), "--start-server"], tmp_path, daemon)
+    try:
+        nonce = uuid.uuid4().hex
+        source_text = (
+            '#include "value.h"\nconst char probe_file[] = __FILE__;\n'
+            f'const char nonce[] = "{nonce}";\nint probe(void) {{ return VALUE; }}\n'
+            + ("int main(void) { return probe() != 42; }\n" if target == "host" else "")
+        )
+        before = stats()
+        objects = []
+        for index in range(2):
+            workspace = tmp_path / (f"private-{index}-" + nonce)
+            source, build, dependencies = (workspace / name for name in ("source", "build", "dependencies"))
+            source.mkdir(parents=True)
+            build.mkdir()
+            (dependencies / "include").mkdir(parents=True)
+            (source / "probe.c").write_text(source_text)
+            (dependencies / "include/value.h").write_text("#define VALUE 42\n")
+            flags = ("-O2", *(("--target=wasm32-wasip1",) if target == "wasm" else ()), *(("-g",) if debug else ()))
+            context = replace(
+                build_request.context,
+                source=source,
+                build=build,
+                dependency_sysroot=dependencies,
+                host_tools={"python": Path(sys.executable), "pkg-config": Path("/admitted/pkg-config"), "cc": compiler},
+                target_tools={"cc": compiler, "ar": Path("/admitted/ar"), "ranlib": Path("/admitted/ranlib")},
+                compiler_flags=flags,
+                compiler_cache=CompilerCacheLauncher(sccache, pinned, (("SCCACHE_SERVER_PORT", port),)),
+            )
+            wrapper = build / "cc"
+            wrapper.write_text(
+                compiler_wrapper_text(context, "cc", (Path(__file__).parents[1] / "compiler_response.py").read_text())
+            )
+            wrapper.chmod(0o755)
+            response = build / "compile.rsp"
+            response.write_text(
+                shlex.join(
+                    ["-I" + str(dependencies / "include"), "-c", str(source / "probe.c"), "-o", str(build / "probe.o")]
+                )
+            )
+            environment = build_environment(context, {})
+            assert environment["SCCACHE_CLIENT_SIDE"] == "1"
+            assert "SCCACHE_ERROR_LOG" not in environment and "SCCACHE_DIST_SCHEDULER_URL" not in environment
+            run([str(wrapper), "@compile.rsp"], build, environment)
+            after = stats()
+            assert [value - previous for value, previous in zip(after, before)] == (
+                [0, 1, 1] if index == 0 else [1, 0, 0]
+            )
+            objects.append((build / "probe.o").read_bytes())
+            assert str(workspace).encode() not in objects[-1]
+            assert b"../source/probe.c" in objects[-1]
+            direct = [
+                str(compiler),
+                *flags,
+                *(("-fdebug-compilation-dir=.",) if debug else ()),
+                "-I../dependencies/include",
+                "-c",
+                "../source/probe.c",
+                "-o",
+                "direct.o",
+            ]
+            run(direct, build)
+            assert (build / "direct.o").read_bytes() == objects[-1]
+            link = [
+                str(wrapper),
+                *(("-nostdlib", "-Wl,--no-entry,--export=probe") if target == "wasm" else ()),
+                str(build / "probe.o"),
+                "-o",
+                str(build / "probe"),
+            ]
+            run(link, build, environment)
+            if target == "host":
+                run([str(build / "probe")], build)
+            assert stats() == after
+            before = after
+        assert objects[0] == objects[1]
+    finally:
+        run([str(sccache), "--stop-server"], tmp_path)
+
+
+@pytest.mark.parametrize(
+    "binding",
+    [
+        ("AWS_SECRET_ACCESS_KEY", "secret"),
+        ("CC", "ambient"),
+        ("SCCACHE_DIR", "bad\0path"),
+        ("SCCACHE_CLIENT_SIDE", "0"),
+        ("SCCACHE_ERROR_LOG", "/tmp/log"),
+        ("SCCACHE_DIST_SCHEDULER_URL", "https://scheduler.invalid"),
+    ],
+)
+def test_cache_launcher_rejects_unadmitted_environment(tmp_path, binding):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+    from ports._support.store import file_hash
+
+    launcher = tmp_path / "sccache"
+    launcher.write_text("executable fixture")
+    launcher.chmod(0o755)
+    with pytest.raises(ValueError):
+        compiler_cache_identity(CompilerCacheLauncher(launcher, file_hash(launcher), (binding,)))
+
+
+def test_worker_image_cache_identity_does_not_require_caller_executable(tmp_path):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-image-only-sccache", "a" * 64)
+    assert compiler_cache_identity(launcher, verify_executable=False)["sha256"] == "a" * 64
+    with pytest.raises(FileNotFoundError):
+        compiler_cache_identity(launcher)
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        (("SCCACHE_SERVER_UDS", "/app/.buildomatic/sccache.sock"),),
+        (("SCCACHE_SERVER_PORT", "4226"),),
+        (("SCCACHE_DIR", "/local/cache"),),
+    ],
+)
+def test_cache_launcher_accepts_one_endpoint_or_default_local_cache(tmp_path, environment):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-sccache", "a" * 64, environment)
+    identity = compiler_cache_identity(launcher, verify_executable=False)
+    assert identity["environment"] == {**dict(environment), "SCCACHE_CLIENT_SIDE": "1"}
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [
+        (("SCCACHE_SERVER_PORT", "4226"), ("SCCACHE_SERVER_UDS", "/app/.buildomatic/sccache.sock")),
+        (("SCCACHE_SERVER_UDS", "relative.sock"),),
+        (("SCCACHE_SERVER_UDS", ""),),
+    ],
+)
+def test_cache_launcher_rejects_conflicting_or_relative_socket_endpoints(tmp_path, environment):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+
+    launcher = CompilerCacheLauncher(tmp_path / "worker-sccache", "a" * 64, environment)
+    with pytest.raises(ValueError):
+        compiler_cache_identity(launcher, verify_executable=False)
+
+
+def test_cache_launcher_rejects_changed_binary_and_endpoint_credentials(tmp_path):
+    from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
+    from ports._support.store import file_hash
+
+    path = tmp_path / "sccache"
+    path.write_bytes(b"admitted")
+    path.chmod(0o755)
+    launcher = CompilerCacheLauncher(path, file_hash(path))
+    path.write_bytes(b"changed")
+    with pytest.raises(ValueError):
+        compiler_cache_identity(launcher)
+    credential = replace(launcher, environment=(("SCCACHE_ENDPOINT", "https://user:secret@cache.invalid"),))
+    with pytest.raises(ValueError):
+        compiler_cache_identity(credential, verify_executable=False)

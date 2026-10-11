@@ -339,6 +339,75 @@ def node_inputs(node: SDKProduct, products: Mapping[str, Receipt], seed: HostSee
     }
 
 
+def admit_cached_sdk(
+    ports: Path,
+    graph: Graph,
+    store: Path,
+    *,
+    default: str = "default",
+    host_seed: Path | None = None,
+) -> MaterializedSDK:
+    """Read and admit a complete retained SDK without producing or publishing.
+
+    All five product records must match current inputs and verified dependency
+    receipts. Missing or stale inputs fail rather than entering a producer.
+    Products, CPython runtime and host tools keep their original inventory roots;
+    no locks, directories, registry records or materialized manifests are written.
+    The caller must provide a quiescent retained product store.
+    """
+    from ports._support.build import check_build_scripts
+
+    sdk = definition(ports, graph, default)
+    missing = {"compiler", "platform", "tooling", "cpython", "resolver"} - {node.name for node in sdk.products}
+    if missing:
+        raise ValueError("SDK omits required products: " + ", ".join(sorted(missing)))
+    index = store.resolve() / "sdk-products" / sdk.name
+    seed_path = host_seed or (index / "host-seed.json" if (index / "host-seed.json").exists() else None)
+    seed = load_seed(seed_path)
+    products: dict[str, Receipt] = {}
+    for node in sdk.products:
+        check_build_scripts(node.recipe, node.recipe_path.parent)
+        inputs = node_inputs(node, products, seed)
+        record = read_json(index / (node.name + ".json"))
+        if type(record["schema_version"]) is not int or record["schema_version"] != 1:
+            raise ValueError("unsupported retained SDK product record")
+        if not compatible_inputs(record, inputs):
+            raise ValueError("retained SDK product inputs differ: " + node.name)
+        product = receipt(index, record["product"])
+        verify_node(node, product)
+        verify_dependencies(node, product, products)
+        products[node.name] = product
+    resolver = products["resolver"]
+    executable = resolver.contents["executable"]
+    tools = dict(seed.tools)
+    tools["uv"] = Tool(resolver.root / executable["file"], executable["sha256"], resolver.path, resolver.sha256)
+    entries = {
+        name: {
+            "provider": "llvm",
+            "path": "bin/" + executable,
+            "sha256": file_hash(products["compiler"].root / "bin" / executable),
+        }
+        for name, executable in {
+            "cc": "clang",
+            "cxx": "clang++",
+            "ar": "llvm-ar",
+            "ranlib": "llvm-ranlib",
+            "strip": "llvm-strip",
+        }.items()
+    }
+    return admit_sdk(
+        products["tooling"],
+        products["compiler"],
+        products["platform"],
+        products["cpython"],
+        products["cpython"],
+        tools,
+        entries,
+        target=sdk.metadata["target"],
+        abi=sdk.metadata["abi"],
+    )
+
+
 def materialize(
     ports: Path,
     graph: Graph,
