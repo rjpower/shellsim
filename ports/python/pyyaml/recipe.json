@@ -1,0 +1,44 @@
+{
+  "name": "pyyaml",
+  "version": "6.0.3",
+  "role": "target-library",
+  "kind": "pure-python-sdist",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/05/8e/961c0007c59b8dd7729d542c61a4d537767a59645b82a0b521206e1e25c2/pyyaml-6.0.3.tar.gz",
+    "sha256": "d76623373421df22fb4cf8817020cbb7ef15c725b9d5e45f17e189bfc384190f",
+    "filename": "pyyaml-6.0.3.tar.gz",
+    "subdirectory": "pyyaml-6.0.3"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ],
+  "patches": [
+    {
+      "file": "pure-python.patch",
+      "sha256": "b26c3c5b381339e74ef27d7070830b623588535babd6ccce0b2f369cac7212f6"
+    }
+  ]
+}

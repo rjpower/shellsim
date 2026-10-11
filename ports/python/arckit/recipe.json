@@ -1,0 +1,43 @@
+{
+  "name": "arckit",
+  "version": "0.1.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/4f/9d/47866ae3ae517df13919a69f34a6c86e7ddf52ecc219f08e2cf8301ec5d5/arckit-0.1.0-py3-none-any.whl",
+    "sha256": "5a22619309d2c29b04796eadf2a58792e563d6b811ee021e5d8ca97880ebbe80",
+    "filename": "arckit-0.1.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.7",
+  "requires_dist": [
+    "numpy",
+    "rich",
+    "drawsvg"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    },
+    {
+      "port": "python/rich",
+      "version": "15.0.0"
+    },
+    {
+      "port": "python/drawsvg",
+      "version": "2.4.2"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

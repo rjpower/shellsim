@@ -127,7 +127,8 @@ def test_dynamic_mount_rolls_back_launcher_conflict(tmp_path: Path) -> None:
         environment.read_file("/usr/bin/python3.wasm")
 
 
-def test_console_script_relocation_uses_guest_venv_shebang(tmp_path: Path) -> None:
+@pytest.mark.parametrize("declaration", ["entry_points", "record"])
+def test_console_script_relocation_uses_guest_venv_shebang(tmp_path: Path, declaration: str) -> None:
     staging = tmp_path / "staging"
     site = staging / "work/.venv/lib/python3.13/site-packages"
     scripts = site / "bin"
@@ -137,7 +138,10 @@ def test_console_script_relocation_uses_guest_venv_shebang(tmp_path: Path) -> No
     script.chmod(0o755)
     metadata = site / "sample_tool-1.0.dist-info"
     metadata.mkdir()
-    (metadata / "entry_points.txt").write_text("[console_scripts]\nsample-tool = sample_tool:main\n")
+    if declaration == "entry_points":
+        (metadata / "entry_points.txt").write_text("[console_scripts]\nsample-tool = sample_tool:main\n")
+    else:
+        (metadata / "RECORD").write_text("bin/sample-tool,,\n")
     _stage_console_scripts(site, staging, "/work/.venv")
     staged = staging / "work/.venv/bin/sample-tool"
     assert staged.read_bytes() == b"#!/work/.venv/bin/python\nprint('ready')\n"
@@ -226,20 +230,24 @@ def test_native_wheel_rejects_undeclared_extension(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("collision", [False, True])
-def test_wheel_data_uses_installed_paths_for_collision_checks(tmp_path: Path, collision: bool) -> None:
+@pytest.mark.parametrize(("scheme", "destination"), [("data", "share/man/man1/sample.1"), ("scripts", "bin/sample")])
+def test_wheel_data_uses_installed_paths_for_collision_checks(
+    tmp_path: Path, collision: bool, scheme: str, destination: str
+) -> None:
     path = tmp_path / "sample-1.0-py3-none-any.whl"
     with zipfile.ZipFile(path, "w") as archive:
         archive.writestr("sample-1.0.dist-info/METADATA", "Metadata-Version: 2.3\nName: sample\nVersion: 1.0\n")
         archive.writestr("sample-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
-        archive.writestr("sample-1.0.data/data/share/man/man1/sample.1", b"manual page")
+        suffix = destination.removeprefix("bin/") if scheme == "scripts" else destination
+        archive.writestr(f"sample-1.0.data/{scheme}/{suffix}", b"installed data")
         if collision:
-            archive.writestr("share/man/man1/sample.1", b"conflicting page")
+            archive.writestr(destination, b"conflicting data")
     if collision:
         with pytest.raises(shellsim.PackageInstallError):
             _inspect_wheel(path, name="sample", version="1.0", abi=ABI, curated=True)
         return
     inspection = _inspect_wheel(path, name="sample", version="1.0", abi=ABI, curated=True)
-    assert inspection.members["share/man/man1/sample.1"] == (False, hashlib.sha256(b"manual page").hexdigest())
+    assert inspection.members[destination] == (False, hashlib.sha256(b"installed data").hexdigest())
     assert not any(".data/" in name for name in inspection.members)
 
 

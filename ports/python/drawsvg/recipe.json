@@ -1,0 +1,38 @@
+{
+  "name": "drawsvg",
+  "version": "2.4.2",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/15/5a/c47c10de42c49a3a9957123d77e5692b56b4fbc342b55285b52c41a8f1c1/drawsvg-2.4.2-py3-none-any.whl",
+    "sha256": "b1c101e187aa395cb13c039549e4f26fb7b7ee03974f53dc9798436463781bf1",
+    "filename": "drawsvg-2.4.2-py3-none-any.whl"
+  },
+  "requires_python": ">=3.13",
+  "requires_dist": [
+    "cairoSVG~=2.3; extra == \"raster\"",
+    "numpy<3,>=1.16; extra == \"raster\"",
+    "imageio~=2.5; extra == \"raster\"",
+    "imageio_ffmpeg~=0.4; extra == \"raster\"",
+    "pwkit~=1.0; extra == \"color\"",
+    "numpy<3,>=1.16; extra == \"color\"",
+    "cairoSVG~=2.3; extra == \"all\"",
+    "numpy<3,>=1.16; extra == \"all\"",
+    "imageio~=2.5; extra == \"all\"",
+    "imageio_ffmpeg~=0.4; extra == \"all\"",
+    "pwkit~=1.0; extra == \"all\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

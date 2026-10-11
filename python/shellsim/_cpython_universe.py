@@ -7,6 +7,7 @@ unpacking happen before one atomic VFS mount; guest code never sees host paths.
 from __future__ import annotations
 
 import configparser
+import csv
 import email
 import hashlib
 import json
@@ -353,13 +354,16 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             if relative.parts[0].endswith(".data"):
                 if member.is_dir() and len(relative.parts) == 1:
                     continue
-                if len(relative.parts) < 2 or relative.parts[1] != "data":
+                if len(relative.parts) < 2 or relative.parts[1] not in {"data", "scripts"}:
                     raise PackageInstallError("unsupported wheel data scheme")
                 if member.is_dir() and len(relative.parts) == 2:
                     continue
                 # uv --target places ordinary wheel data beside site packages.
                 # Compare that destination so relocated aliases cannot collide.
-                relative = _relative(PurePosixPath(*relative.parts[2:]).as_posix())
+                parts = relative.parts[2:]
+                if relative.parts[1] == "scripts":
+                    parts = ("bin", *parts)
+                relative = _relative(PurePosixPath(*parts).as_posix())
             elif any(part.endswith(".data") for part in relative.parts):
                 raise PackageInstallError("unsupported nested wheel data directory")
             for parent in relative.parents:
@@ -470,6 +474,10 @@ def _stage_console_scripts(site: Path, staging: Path, venv: str) -> None:
     if not scripts.exists():
         return
     declared: set[str] = set()
+    for record in site.glob("*.dist-info/RECORD"):
+        for row in csv.reader(record.read_text(encoding="utf-8").splitlines()):
+            if row and PurePosixPath(row[0]).parent == PurePosixPath("bin"):
+                declared.add(PurePosixPath(row[0]).name)
     for metadata in site.glob("*.dist-info/entry_points.txt"):
         if metadata.stat().st_size > 65536:
             raise PackageInstallError("installed entry point metadata exceeds 64 KiB")
@@ -492,7 +500,7 @@ def _stage_console_scripts(site: Path, staging: Path, venv: str) -> None:
             or script.name in {"python", "python3", "python3.13", "activate"}
             or script.name not in declared
         ):
-            raise PackageInstallError("installed script is not a supported console entry point")
+            raise PackageInstallError("installed script is not a supported Python entry point")
         source = script.read_bytes()
         first, separator, body = source.partition(b"\n")
         try:

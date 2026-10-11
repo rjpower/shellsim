@@ -180,7 +180,7 @@ def _stage_wheel(path: Path, stage: Path, request: PEP517BuildRequest) -> None:
     metadata = email.message_from_bytes((stage / dist / "METADATA").read_bytes())
     wheel = email.message_from_bytes((stage / dist / "WHEEL").read_bytes())
     if (
-        metadata["Name"] != recipe["name"]
+        re.sub(r"[-_.]+", "-", metadata["Name"]).lower() != re.sub(r"[-_.]+", "-", recipe["name"]).lower()
         or metadata["Version"] != recipe["version"]
         or metadata["Requires-Python"] != recipe.get("requires_python")
         or sorted(metadata.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", []))
