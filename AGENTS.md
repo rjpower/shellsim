@@ -8,6 +8,15 @@ shellsim's Rust codebase. See `CONTRIBUTING.md` for the human-facing workflow.
 - Read the nearest module documentation and tests before editing.
 - Keep changes tied to a concrete behavior, bug, or documented design goal. Avoid speculative
   refactors and unrelated cleanup.
+- Before adding an entry point, worker, or orchestration path, trace the existing workflow from
+  request to output. In graph-based workflows, declare producers and consumed outputs as nodes
+  and edges; do not hide prerequisites or follow-up work in command-specific orchestration.
+- Share workflow semantics across execution backends. Local execution should invoke the same
+  worker logic that a remote backend dispatches. Keep placement and storage independent, reuse
+  existing storage APIs, and retain backend-specific adapters where their contracts differ.
+- Check the incremental path as well as a fresh run. A cache hit should avoid materializing or
+  rebuilding build-only prerequisites. Key products on declared inputs; justify repeated scans,
+  transfers, packaging, or machine-specific identity with a concrete correctness requirement.
 - Preserve existing user changes in a dirty worktree.
 - Treat simulation boundaries as security boundaries: simulated programs must not gain ambient
   host filesystem, process, network, environment, or clock capabilities.
@@ -61,6 +70,9 @@ the intended behavior.
 
 ## Tests and reviews
 
+- Review new commands and workers against the existing workflow, including unchanged callers.
+  Flag bypassed graph edges, duplicated scheduling or execution semantics, and avoidable work on
+  cache hits using the concrete rules in [the design review lane](infra/lint/design.md).
 - Read [TESTING.md](TESTING.md) before writing or reviewing tests. Tests are a maintenance cost;
   each addition must catch a distinct plausible bug that existing coverage would miss.
 - Extend an existing regression before adding a test or harness. Do not add unit coverage merely
