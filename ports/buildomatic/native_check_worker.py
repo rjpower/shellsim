@@ -45,7 +45,9 @@ def main() -> None:
         "-o",
         str(output),
     ]
-    subprocess.run(command, check=True)
+    result = subprocess.run(command)
+    if result.returncode:
+        raise RuntimeError(f"native probe compiler exited with status {result.returncode}")
     mark_abi(output, sdk.dynamic_abi.encode())
     libraries = output.parent / "lib"
     libraries.mkdir()

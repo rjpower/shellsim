@@ -117,6 +117,10 @@ def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, mo
 
     def compile(command, directory, environment, log):
         assert "--locked" in command and "--offline" in command
+        assert command[command.index("--manifest-path") + 1] == str(
+            source / ("src/rust/Cargo.toml" if packaged else "Cargo.toml")
+        )
+        assert environment["OPENSSL_STATIC"] == "1"
         assert directory == source
         assert str(stdlib) in environment["RUSTFLAGS"]
         assert environment["RUSTC_WRAPPER"] == "/usr/bin/sccache"
@@ -141,6 +145,8 @@ def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, mo
             python_sources=(("python/example", "example"),) if packaged else (),
             licenses=("LICENSE",),
             stubs=("example.pyi",),
+            manifest_path="src/rust/Cargo.toml" if packaged else "Cargo.toml",
+            configure_environment={"OPENSSL_STATIC": "1"},
         )
 
     output = build(context)

@@ -1,0 +1,29 @@
+--- a/src/_cffi_src/openssl/ssl.py
++++ b/src/_cffi_src/openssl/ssl.py
+@@ -147,7 +147,6 @@
+ int SSL_session_reused(const SSL *);
+ SSL *SSL_new(SSL_CTX *);
+ void SSL_free(SSL *);
+-int SSL_set_fd(SSL *, int);
+ SSL_CTX *SSL_set_SSL_CTX(SSL *, SSL_CTX *);
+ void SSL_set_bio(SSL *, BIO *, BIO *);
+ void SSL_set_connect_state(SSL *);
+@@ -394,7 +393,6 @@
+ long Cryptography_DTLSv1_get_timeout(SSL *, time_t *, long *);
+ long DTLSv1_handle_timeout(SSL *);
+ long SSL_set_mtu(SSL *, long);
+-int DTLSv1_listen(SSL *, BIO_ADDR *);
+ size_t DTLS_get_data_mtu(SSL *);
+
+
+--- a/src/_cffi_src/openssl/bio.py
++++ b/src/_cffi_src/openssl/bio.py
+@@ -30,8 +30,6 @@
+ int BIO_should_io_special(BIO *);
+ int BIO_should_retry(BIO *);
+
+-BIO_ADDR *BIO_ADDR_new(void);
+-void BIO_ADDR_free(BIO_ADDR *);
+ """
+
+ CUSTOMIZATIONS = """

@@ -1,0 +1,59 @@
+{
+  "name": "cryptography",
+  "version": "50.0.2",
+  "kind": "python-project",
+  "role": "target-library",
+  "build_system": "python-rust",
+  "sdk": "default",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/9d/af/182eb91b0df3fe75c4d9f26fe70684569566745f6ba7e5c9c73a862c5252/cryptography-50.0.2.tar.gz",
+    "filename": "cryptography-50.0.2.tar.gz",
+    "sha256": "7b46165bb56eb4704e2eaaf86f3c940d19154535d9b0ca7d6d590b04060e00d5",
+    "subdirectory": "cryptography-50.0.2"
+  },
+  "requires_python": ">=3.9, !=3.9.0, !=3.9.1",
+  "requires_dist": [
+    "cffi>=2.0.0 ; platform_python_implementation != 'PyPy'",
+    "typing-extensions>=4.13.2 ; python_full_version < '3.11'",
+    "bcrypt>=3.1.5 ; extra == 'ssh'"
+  ],
+  "build_dependencies": [
+    {
+      "port": "toolchain/rust-stdlib",
+      "version": "1.97.1"
+    },
+    {
+      "port": "toolchain/wasm-scheduler",
+      "version": "0.1.0"
+    }
+  ],
+  "target_dependencies": [
+    {
+      "port": "native/openssl",
+      "version": "3.5.9"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/cffi",
+      "version": "2.1.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "patches": [
+    {
+      "file": "no-socket-bindings.patch",
+      "sha256": "328b429481bdd20f26bde7dff4b650707ee0f794fb7834385eec9c70f62a3417"
+    }
+  ]
+}

@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from typing import Mapping
 
 from packaging.utils import canonicalize_name
 
@@ -75,6 +76,8 @@ def build_rust_extension(
     licenses: tuple[str, ...],
     stubs: tuple[str, ...] = (),
     python_sources: tuple[tuple[str, str], ...] = (),
+    manifest_path: str = "Cargo.toml",
+    configure_environment: Mapping[str, str] | None = None,
 ) -> PythonBuildOutput:
     """Preserve source metadata and stage an ABI-marked native extension wheel."""
     native, python = ctx.require_native(), ctx.require_cpython()
@@ -86,7 +89,7 @@ def build_rust_extension(
         raise ValueError("Rust extension needs the admitted CPython 3.13 WASI target")
     environment = rust_environment(ctx)
     rustc, cargo, _, _ = rust_tools("1.97.1", environment)
-    native.build.mkdir(parents=True)
+    native.build.mkdir(parents=True, exist_ok=True)
     configuration_text = (
         "implementation=CPython\nversion="
         + ".".join(python.version.split(".")[:2])
@@ -120,7 +123,18 @@ def build_rust_extension(
             ),
         }
     )
-    command = [str(cargo), "build", "--release", "--locked", "--target", native.target, "--message-format=json"]
+    environment.update(configure_environment or {})
+    command = [
+        str(cargo),
+        "build",
+        "--manifest-path",
+        str(native.source / manifest_path),
+        "--release",
+        "--locked",
+        "--target",
+        native.target,
+        "--message-format=json",
+    ]
     if ctx.offline:
         command.append("--offline")
     result = run_cargo(command, native.source, environment, native.build / "cargo.log")
