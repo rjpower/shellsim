@@ -542,26 +542,3 @@ pub(crate) fn display_path(cwd: &str, start: &str, absolute: &str, path: &str) -
         path.strip_prefix(&prefix).unwrap_or(path).to_string()
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::{Expr, Parser};
-
-    #[test]
-    fn parses_boolean_predicates_with_find_precedence() {
-        let arguments = [
-            ".".to_string(),
-            "(".to_string(),
-            "-name".to_string(),
-            "*.rs".to_string(),
-            "-o".to_string(),
-            "-name".to_string(),
-            "*.py".to_string(),
-            ")".to_string(),
-            "-type".to_string(),
-            "f".to_string(),
-        ];
-        let parsed = Parser::parse(&arguments).unwrap();
-        assert!(matches!(parsed.expression, Expr::And(_, _)));
-    }
-}

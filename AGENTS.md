@@ -28,8 +28,8 @@ shellsim's Rust codebase. See `CONTRIBUTING.md` for the human-facing workflow.
 - Keep resource costs simple and roughly proportional to real work. Order-of-magnitude CPU and
   memory estimates are sufficient; prefer a conservative constant or linear bound over complex
   exact accounting. Resource limits are safety and scheduling controls, not a profiler.
-- Add a small unit test for tricky logic and an integration or differential test for observable
-  compatibility behavior.
+- Prefer regression tests through an existing public or simulated interface. Add unit tests only
+  for behavior that would be difficult to exercise or diagnose through a regression test.
 - Treat CPython, NumPy, SciPy and other reference libraries as behavioral references, never as
   code to port. Implement a small public subset in shellsim's own structure: one frozen module
   per public module, over a private native module only for elementwise or inner-loop work. Match
@@ -61,6 +61,13 @@ the intended behavior.
 
 ## Tests and reviews
 
+- Read [TESTING.md](TESTING.md) before writing or reviewing tests. Tests are a maintenance cost;
+  each addition must catch a distinct plausible bug that existing coverage would miss.
+- Extend an existing regression before adding a test or harness. Do not add unit coverage merely
+  because a function, type, field, or validation branch exists.
+- Reject assertions that repeat type guarantees, constructor assignments, constants, internal
+  helper calls, or the implementation itself. Delete redundant cases instead of preserving them
+  in a parameterized table. Test count and coverage percentage are not goals.
 - Tests must be deterministic and must not rely on elapsed host time, host locale, network access,
   or unordered collection output.
 - Prefer semantic assertions over snapshots. Use checked output fixtures when exact compatibility
@@ -69,8 +76,9 @@ the intended behavior.
   the contract, such as shellsim's own frontier messages or CPython's formatting behavior.
 - Differential tests may invoke a reference implementation only from the test harness. Product
   code must remain capability-free.
-- Cover success, invalid input, resource exhaustion, and the explicit unsupported frontier when
-  adding a parser, VM, command, or stdlib feature.
+- For a new capability, cover the changed behavior and relevant isolation, resource-exhaustion,
+  malformed-input, or unsupported boundaries through regressions. Reuse existing boundary
+  coverage; do not generate a case for every guard or a matrix of equivalent inputs.
 
 ## Writing and pull requests
 
@@ -83,7 +91,8 @@ the intended behavior.
   filler, decorative headings, emoji, stock contrasts, synonym rotation, and em-dash asides.
 - Write imperative pull-request and commit titles of at most 72 characters. An optional `[scope]`
   prefix is fine; do not use Conventional Commit prefixes such as `feat:` or `fix:`.
-- In a handoff or pull request, describe behavior before motivation, then give validation evidence
-  and material caveats. Do not narrate the diff file by file or add an empty `Testing` scaffold.
+- In a handoff, describe behavior before motivation and summarize validation and material caveats
+  briefly. In a pull request, describe the resulting behavior and rationale, not the tests run.
+  Do not narrate the diff file by file or add a `Testing` scaffold.
 - Make the description stand on its own as a useful squash-commit message. Link the originating
   issue with `Fixes #NNN` or `Part of #NNN` when relevant.

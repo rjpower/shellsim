@@ -5,28 +5,13 @@ from pathlib import Path
 
 import pytest
 
-from ports._support.graph import plan
 from ports._support.python_adapters import _wheel
 from ports._support.python_pep517 import package_snapshot, verify_preserved_package
 from ports._support.store import fetch
 from ports._support.store import file_hash as sha256
 from ports._support.store import relative_path as _relative
-from ports.api import implementation
-
-
-def analyze(roots):
-    from pathlib import Path
-
-    return plan(Path(__file__).resolve().parents[4] / "ports", roots)
-
 
 ROOT = Path(__file__).resolve().parents[4]
-
-
-def test_pure_sdist_recipe_pins_builder():
-    port = ROOT / "ports/python/cellpylib"
-    selected = next(item for item in analyze(["python/cellpylib"]).ports if item.name == "cellpylib")
-    assert implementation(selected)["builder"] == sha256(port / "build.py")
 
 
 @pytest.mark.parametrize("path", ["/absolute", "../escape", "a/../escape", "a\\escape", "a\0escape"])

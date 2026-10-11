@@ -151,6 +151,11 @@ fn missing_argument_after_operator_matches_gnu_expr() {
     let (status, _, stderr) = run("expr 1 +");
     assert_eq!(status, 2);
     assert_eq!(stderr, "expr: syntax error: missing argument after '+'\n");
+    for source in ["expr length", "expr match abc"] {
+        let (status, stdout, stderr) = run(source);
+        assert_eq!(status, 2, "{source}: {stderr}");
+        assert!(stdout.is_empty(), "{source}: {stdout}");
+    }
 }
 
 #[test]

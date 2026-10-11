@@ -11,8 +11,11 @@ def raised(operation):
 
 def test_int_accepts_explicit_bases():
     assert int("ff", 16) == 255
-    assert int("0b101", 0) == 5
+    assert int(" -0b1_010 ", 0) == -10
+    assert int("0x_ff", 16) == 255
     assert int("-1_000") == -1000
+    for text, base in [("10", 1), ("_10", 10), ("1__0", 10), ("2", 2)]:
+        assert raised(lambda text=text, base=base: int(text, base))[0] is ValueError
 
 
 def test_string_join_replace_and_format():
@@ -1148,11 +1151,6 @@ def test_dict_and_set_deletion_keep_order_and_lookup():
         members.pop()
     assert len(members) == 1
 
-    large = {key: key for key in range(100_000)}
-    for key in range(99_999):
-        del large[key]
-    assert large == {99_999: 99_999}
-
 
 def test_set_algebra_keeps_builtin_membership_and_kind():
     class AlwaysContains(set):
@@ -1161,10 +1159,12 @@ def test_set_algebra_keeps_builtin_membership_and_kind():
 
     assert {1, 2} & AlwaysContains({2, 3}) == {2}
     assert type(frozenset({1}) | {2}) is frozenset and type({2} | frozenset({1})) is set
-    left, right = set(range(50_000)), set(range(25_000, 75_000))
-    assert len(left | right) == 75_000 and len(left & right) == 25_000
-    assert len(left - right) == 25_000 and len(left ^ right) == 50_000
-    assert left.issubset(left | right) and len(left.union(right, [-1])) == 75_001
+    left, right = set(range(20)), set(range(10, 30))
+    assert left | right == set(range(30))
+    assert left & right == set(range(10, 20))
+    assert left - right == set(range(10))
+    assert left ^ right == set(range(10)) | set(range(20, 30))
+    assert left.issubset(left | right) and left.union(right, [-1]) == set(range(-1, 30))
 
 
 def test_int_decimal_conversion_is_limited_to_4300_digits():

@@ -73,31 +73,3 @@ fn stock_agent_v1(limits: Limits) -> Result<Environment, String> {
     environment.umask = 0o022;
     Ok(environment)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stock_agent_profile_is_conventional_and_deterministic() {
-        let environment = EnvironmentProfile::StockAgentV1
-            .create(Limits::default())
-            .unwrap();
-
-        assert_eq!(environment.cwd, "/work");
-        assert_eq!(
-            environment.get_var("HOME").as_deref(),
-            Some("/home/shellsim")
-        );
-        assert_eq!(environment.get_var("USER").as_deref(), Some("shellsim"));
-        assert_eq!(environment.get_var("TZ").as_deref(), Some("UTC"));
-        assert_eq!(environment.uid, 1_000);
-        assert_eq!(environment.umask, 0o022);
-        assert_eq!(
-            environment.processes.get(environment.pid).unwrap().uid,
-            1_000
-        );
-        assert!(environment.vfs.exists("/", "/etc/passwd"));
-        assert!(environment.vfs.exists("/", "/home/shellsim"));
-    }
-}

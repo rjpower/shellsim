@@ -14,7 +14,6 @@ from pathlib import Path
 import pytest
 import shellsim
 
-
 GUEST_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "host_tools"
 SPEC = shellsim.PackageSpec(
     name="arithmetic-grader",
@@ -112,7 +111,9 @@ def test_missing_tools_digest_and_live_export_are_rejected(source_tree: Path) ->
     with pytest.raises(ValueError, match="missing required tool"):
         package.instantiate(tools={})
     with pytest.raises(ValueError, match="SHA-256 mismatch"):
-        shellsim.Package.from_url("memory://grader.shl", expected_sha256="0" * 64, fetcher=lambda url: (package.to_bytes(),))
+        shellsim.Package.from_url(
+            "memory://grader.shl", expected_sha256="0" * 64, fetcher=lambda url: (package.to_bytes(),)
+        )
     with pytest.raises(ValueError, match="HTTPS"):
         shellsim.Package.from_url("http://localhost/grader.shl", expected_sha256=package.sha256)
 
@@ -154,9 +155,13 @@ def test_loader_rejects_tampered_or_undeclared_payload(source_tree: Path) -> Non
     with pytest.raises(ValueError, match="undeclared"):
         shellsim.Package.from_bytes(_rewrite_package(blob, extra={"rootfs/extra": b"hidden"}))
     with pytest.raises(ValueError, match="workspace path"):
-        shellsim.Package.from_bytes(_rewrite_package(blob, manifest_change=lambda manifest: manifest["entries"][0].update(path="../escape")))
+        shellsim.Package.from_bytes(
+            _rewrite_package(blob, manifest_change=lambda manifest: manifest["entries"][0].update(path="../escape"))
+        )
     with pytest.raises(ValueError, match="working directory is missing"):
-        shellsim.Package.from_bytes(_rewrite_package(blob, manifest_change=lambda manifest: manifest.update(working_directory="/work/missing")))
+        shellsim.Package.from_bytes(
+            _rewrite_package(blob, manifest_change=lambda manifest: manifest.update(working_directory="/work/missing"))
+        )
 
     too_many_members = bytearray(blob)
     directory_end = too_many_members.rfind(b"PK\x05\x06")
@@ -170,7 +175,9 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
     with pytest.raises(ValueError, match="unsupported source entry"):
         shellsim.Package.build_from_directory(source_tree, spec=SPEC)
     (source_tree / "link").unlink()
-    (source_tree / "huge").write_bytes(b"x" * (64 * 1024 * 1024 + 1))
+    # Admission uses the declared size before reading the source bytes.
+    with (source_tree / "huge").open("wb") as output:
+        output.truncate(64 * 1024 * 1024 + 1)
     with pytest.raises(ValueError, match="exceeds 64 MiB"):
         shellsim.Package.build_from_directory(source_tree, spec=SPEC)
 
@@ -193,9 +200,14 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
 
     compressed = io.BytesIO()
     with zipfile.ZipFile(compressed, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("bomb", b"x" * (64 * 1024 * 1024 + 1))
+        archive.writestr("bomb", b"x")
+    oversized = bytearray(compressed.getvalue())
+    # Oversized member metadata must be rejected before decompression.
+    struct.pack_into("<I", oversized, 22, 64 * 1024 * 1024 + 1)
+    directory = oversized.index(b"PK\x01\x02")
+    struct.pack_into("<I", oversized, directory + 24, 64 * 1024 * 1024 + 1)
     with pytest.raises(ValueError, match="exceeds 64 MiB"):
-        shellsim.Package.build_from_zip(compressed.getvalue(), spec=SPEC)
+        shellsim.Package.build_from_zip(bytes(oversized), spec=SPEC)
 
 
 def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
@@ -234,10 +246,23 @@ def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch:
     )
     monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
 
-    assert main([
-        "run", "https://example.com/c-build.shl", "--sha256", package.sha256,
-        "--cpu", "10g", "--memory", "128m", "--disk", "128m",
-    ]) == 0
+    assert (
+        main(
+            [
+                "run",
+                "https://example.com/c-build.shl",
+                "--sha256",
+                package.sha256,
+                "--cpu",
+                "10g",
+                "--memory",
+                "128m",
+                "--disk",
+                "128m",
+            ]
+        )
+        == 0
+    )
     assert capsys.readouterr().out == "compiled in guest\n"
 
 
@@ -344,9 +369,7 @@ def test_package_accepts_large_file_and_requests_host_clock(tmp_path: Path) -> N
     (tmp_path / "large.wad").write_bytes(content)
     package = shellsim.Package.build_from_directory(
         tmp_path,
-        spec=shellsim.PackageSpec(
-            name="large-game", version="1", entrypoint=("true",), requested_clock="real_time"
-        ),
+        spec=shellsim.PackageSpec(name="large-game", version="1", entrypoint=("true",), requested_clock="real_time"),
     )
     loaded = shellsim.Package.from_bytes(package.to_bytes())
     assert loaded.spec.requested_clock == "real_time"

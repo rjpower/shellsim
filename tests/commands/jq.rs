@@ -144,6 +144,11 @@ fn exit_status_slices_and_compound_sort_keys_match_common_jq_behavior() {
 #[test]
 fn invalid_filters_and_output_growth_fail_explicitly() {
     let mut environment = Environment::new();
+    let (status, stdout, stderr) = run(&mut environment, "jq -n 'select('");
+    assert_eq!(status, 3, "{stderr}");
+    assert!(stdout.is_empty());
+
+    let mut environment = Environment::new();
     let (status, _, stderr) = run(&mut environment, "printf '{}' | jq 'map(.)'");
     assert_eq!(status, 3);
     assert!(stderr.contains("unsupported function"), "{stderr}");
