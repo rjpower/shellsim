@@ -71,7 +71,7 @@
   "patches": [
     {
       "file": "wasi-downloads.patch",
-      "sha256": "00e218ea79d07a0c222dc7a93d96890374da54e409a997dcdb1ee3266c141fb0"
+      "sha256": "b2c7d20f3dd934ab2e7a7e4d9bfba53ab95922928746a8f5418d843d3897e045"
     }
   ],
   "build_dependencies": [

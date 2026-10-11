@@ -53,3 +53,14 @@
 +    if sys.platform == "wasi":
 +        raise NotImplementedError("network downloads are unavailable on WASI")
      url_str = url.full_url if hasattr(url, "full_url") else str(url)
+--- a/nltk/corpus/reader/panlex_lite.py
++++ b/nltk/corpus/reader/panlex_lite.py
+@@ -14,3 +14,2 @@
+ import os
+-import sqlite3
+
+@@ -45,2 +44,4 @@
+     def __init__(self, root):
++        import sqlite3
++
+         from nltk.pathsec import validate_path

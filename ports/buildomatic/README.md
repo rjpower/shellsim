@@ -43,9 +43,9 @@ uv run --no-project python -m ports.buildomatic.publish fetch \
   --output build/fetched
 uv run --no-project python -m ports.buildomatic.publish check \
   --results build/port-client/results.json --iris-service service.json \
-  --output build/checks --cpu 100000000000 --memory 8589934592
+  --output build/checks --cpu 1000000000000 --memory 8589934592
 uv run --no-project python -m ports.buildomatic.publish guest \
-  --output build/checks --cpu 200000000000 --memory 8589934592
+  --output build/checks --cpu 1000000000000 --memory 8589934592
 uv run --no-project python -m ports.buildomatic.publish release \
   --results build/port-client/results.json --iris-service service.json \
   --output build/release-client
@@ -64,6 +64,8 @@ including the patched resolver. Build-only packages stay out of that closure.
 Publication imports pure Python metadata APIs without copying a host execution
 adapter. `accept` runs Python/shell probes locally from that saved release;
 `--only` selects ports and CPU/memory overrides allow guest-only retries.
+The default qualification CPU allowance is one trillion units; adjust it to the
+selected workload while retaining explicit memory and disk bounds.
 The current resolver installation helper uses host Python 3.13.7 or newer.
 Cache outputs have no retention promise; creating a release is explicit.
 
