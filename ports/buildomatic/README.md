@@ -71,43 +71,15 @@ selected workload while retaining explicit memory and disk bounds.
 The current resolver installation helper uses host Python 3.13.7 or newer.
 Cache outputs have no retention promise; creating a release is explicit.
 
-Serve a selected S3/GCS prefix or local directory with the standalone read-only
-proxy. Use an environment with `marin-rigging` installed, such as the Iris worker
-environment:
+Serve a storage prefix locally with `marin-rigging` installed:
 
 ```sh
 uv run python ports/buildomatic/s3_proxy.py \
-  --prefix s3://my-bucket/ports --bind 127.0.0.1 --port 8080
+  --prefix s3://my-bucket/ports
 ```
 
-`s3_proxy.py` is one file with no Shellsim or Iris imports. Rigging's
-`StoragePath` and bucket-routed `filesystem_for()` own S3/GCS credentials,
-permissions, endpoints and request bounds. The configured CoreWeave credentials
-work directly; no separate AWS credential or endpoint setup is needed.
-An editable Rigging checkout discovers cluster configuration from the Marin
-working directory; run there with an absolute proxy script path. Installed
-Rigging wheels include the cluster configuration.
-HTTP `/assets/example.whl` maps to
-`s3://my-bucket/ports/assets/example.whl`. Directory URLs map to `index.html`;
-there is no bucket listing or object rewriting. GET and HEAD support byte ranges
-and ETag conditionals. Object bodies stream without local staging or digest
-verification. Requests with `If-Range` receive the full object, preventing mixed
-versions during download retries. Stored content encodings are preserved.
-GCS objects with HTTP content encoding, such as `Content-Encoding: gzip`, return
-501 because gcsfs may decode their bodies; ordinary JSON, HTML and ZIP wheels
-need no such encoding. GCS reads use generation-qualified URLs to keep each
-stream on one object version.
-Decoded paths are normalized and must remain beneath the configured storage
-base. Local paths resolve symlinks before the same containment check. Encoded
-separators, malformed encoding, alternate authorities and writes are rejected.
-
-The listener defaults to loopback. Put an authenticated HTTPS reverse proxy in
-front of it when exposing private objects beyond the host. Every object under
-the selected prefix is readable through the proxy; choose a delivery prefix
-rather than a whole bucket containing journals or internal build metadata.
-Exported catalogs can use this HTTP base URL for their stable asset links.
-Individual delivery objects and metadata-only `ports export` remain planned;
-the proxy serves ordinary stored objects and does not unpack build archives.
+Rigging supplies cloud settings; editable installs need the Marin working
+directory. HTTP-encoded GCS objects return 501.
 
 Pure-wheel builds fetch no SDK. Other workers fetch just their consumed
 components: native builds need compiler/platform/tooling, Python builds add
