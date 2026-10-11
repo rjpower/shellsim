@@ -1,0 +1,69 @@
+{
+  "name": "opencv",
+  "version": "5.0.0",
+  "role": "target-library",
+  "kind": "native-library",
+  "build_system": "cmake",
+  "sdk": "default",
+  "linkage": "static",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1d/99/76b7c80252aa83c1af16393454aafd125a0287101afe8deb0a6821af0e30/opencv_python_headless-5.0.0.93.tar.gz",
+    "filename": "opencv_python_headless-5.0.0.93.tar.gz",
+    "sha256": "b82f9831daab90b725c7c1ee1b36cb5732c367096ac76d119e64e14eb70d5f3c",
+    "subdirectory": "opencv_python_headless-5.0.0.93/opencv"
+  },
+  "target_dependencies": [],
+  "exports": {
+    "archives": [
+      "lib/libopencv_core.a",
+      "lib/libopencv_imgproc.a",
+      "lib/libopencv_geometry.a",
+      "lib/libopencv_flann.a",
+      "lib/opencv5/3rdparty/libzlib.a"
+    ],
+    "licenses": [
+      "licenses/opencv.txt"
+    ],
+    "headers": [
+      "include/dlpack/dlpack.h"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include/opencv5"
+    ]
+  },
+  "needed_libraries": [],
+  "source_exports": [
+    {
+      "source": "LICENSE",
+      "destination": "licenses/opencv.txt"
+    },
+    {
+      "source": "3rdparty/dlpack/include/dlpack/dlpack.h",
+      "destination": "include/dlpack/dlpack.h"
+    }
+  ],
+  "patches": [
+    {
+      "file": "wasi-affinity.patch",
+      "sha256": "a963b2f26eec4d8eaccb88ad2fe3cf3b8302e4913832ae1668b1180f92312f64"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/operations.cpp",
+      "include_directories": [
+        "include/opencv5"
+      ],
+      "link_inputs": [
+        "lib/libopencv_imgproc.a",
+        "lib/libopencv_core.a",
+        "lib/libopencv_geometry.a",
+        "lib/libopencv_flann.a",
+        "lib/opencv5/3rdparty/libzlib.a"
+      ]
+    }
+  ]
+}

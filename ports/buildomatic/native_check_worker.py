@@ -30,7 +30,7 @@ def main() -> None:
     test = specification["test"]
     output = Path(os.environ["BUILD_OUTPUT_DIR"]) / "acceptance.wasm"
     command = [
-        str(sdk.compiler()),
+        str(sdk.compiler(cxx=Path(test["source"]).suffix in {".cc", ".cpp", ".cxx"})),
         *sdk.compiler_flags,
         *sdk.linker_flags,
         *sdk.executable_flags,

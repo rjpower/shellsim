@@ -350,7 +350,9 @@ def python_extension(
     from ports._support.python_adapters import ExtensionBuildRequest, build_extension
 
     return build_extension(
-        ExtensionBuildRequest(ctx.require_native(), ctx.require_cpython(), _recipe(ctx, "python-extension", options))
+        ExtensionBuildRequest(
+            ctx.require_native(), ctx.require_cpython(), _recipe(ctx, "python-extension", options), ctx.jobs or 1
+        )
     )
 
 

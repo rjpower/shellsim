@@ -13,13 +13,23 @@ import hashlib
 import io
 import json
 import re
+import shutil
 import subprocess
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
-from ports._support.native_adapters import NativeBuildCommand, NativeBuildContext
+from packaging.utils import canonicalize_name
+
+from ports._support.native_adapters import (
+    NativeBuildCommand,
+    NativeBuildContext,
+    build_environment,
+    compiler_wrapper_text,
+)
 from ports._support.pure_wheel import verified_files, verified_host_files
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries
@@ -69,6 +79,7 @@ class ExtensionBuildRequest:
     context: NativeBuildContext
     cpython: CPythonBuildContext
     recipe: Mapping[str, Any]
+    jobs: int = 1
 
 
 def build_pure_wheel(request: PureWheelBuildRequest) -> PythonBuildOutput:
@@ -158,6 +169,19 @@ def _wheel(stage: Path, destination: Path, record: str) -> None:
                 archive.writestr(member, path.read_bytes())
 
 
+def _run_extension_command(command: NativeBuildCommand, log_path: Path, *, environment: Mapping[str, str]) -> None:
+    """Keep parallel compiler logs separate and surface the failing unit's tail."""
+    with log_path.open("wb") as log:
+        result = subprocess.run(
+            command.argv, cwd=command.directory, env=environment, stdout=log, stderr=subprocess.STDOUT
+        )
+    if result.returncode:
+        with log_path.open("rb") as log:
+            log.seek(max(0, log_path.stat().st_size - 8192))
+            diagnostic = log.read().decode(errors="replace")
+        raise RuntimeError(f"extension compilation failed ({result.returncode}):\n{diagnostic}")
+
+
 def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     """Compile a declared C/C++ extension and stage one ABI-marked native wheel.
 
@@ -202,7 +226,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     if output_kind == "wheel":
         metadata = _source_file(context.source, build["metadata"])
         message = email.message_from_bytes(metadata.read_bytes())
-        if message["Name"] != name or message["Version"] != version:
+        if canonicalize_name(message["Name"]) != canonicalize_name(name) or message["Version"] != version:
             raise ValueError("extension source metadata differs from recipe")
         if sorted(message.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", [])):
             raise ValueError("extension dependencies differ from recipe")
@@ -231,11 +255,7 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
         raise ValueError("invalid extension native dependency list")
     declared_ports = recipe.get("target_dependencies", [])
     native_ports = (
-        [
-            item["port"]
-            for item in declared_ports
-            if isinstance(item, dict) and isinstance(item.get("port"), str) and item["port"].startswith("native/")
-        ]
+        [item["port"] for item in declared_ports if isinstance(item, dict) and isinstance(item.get("port"), str)]
         if isinstance(declared_ports, list)
         else []
     )
@@ -272,52 +292,57 @@ def build_extension(request: ExtensionBuildRequest) -> PythonBuildOutput:
     if output_kind == "wheel":
         (context.staging_prefix / "wheels").mkdir(parents=True)
     environment = target_environment(context.sdk)
-    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    environment.update(build_environment(context, {}))
+    tools = context.build / "adapter-tools"
+    tools.mkdir()
+    response = Path(__file__).with_name("compiler_response.py").read_text()
+    for role in ("cc", "cxx"):
+        driver = tools / role
+        driver.write_text(compiler_wrapper_text(context, role, response))
+        driver.chmod(0o755)
     commands = []
     objects = []
-    with (context.build / "build.log").open("wb") as log:
-        for index, source in enumerate(sources):
-            obj = context.build / f"source-{index}.o"
-            compiler = context.target_tools["cxx"] if source.suffix != ".c" else context.target_tools["cc"]
-            command = NativeBuildCommand(
-                (
-                    str(compiler),
-                    *context.compiler_flags,
-                    "-fPIC",
-                    "-I" + str(cpython.include_dir),
-                    "-I" + str(cpython.generated_config_dir),
-                    *("-I" + str(path) for path in python_includes),
-                    *("-I" + str(path) for path in includes),
-                    *("-D" + item for item in defines),
-                    "-c",
-                    str(source),
-                    "-o",
-                    str(obj),
-                ),
-                context.build,
-            )
-            subprocess.run(
-                command.argv, cwd=command.directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
-            )
-            commands.append(command)
-            objects.append(obj)
-        extension = wheel_stage / f"{module}.so"
-        linker = (
-            context.target_tools["cxx"] if any(path.suffix != ".c" for path in sources) else context.target_tools["cc"]
+    for index, source in enumerate(sources):
+        obj = context.build / f"source-{index}.o"
+        compiler = tools / ("cxx" if source.suffix != ".c" else "cc")
+        command = NativeBuildCommand(
+            (
+                str(compiler),
+                "-fPIC",
+                "-I" + str(cpython.include_dir),
+                "-I" + str(cpython.generated_config_dir),
+                *("-I" + str(path) for path in python_includes),
+                *("-I" + str(path) for path in includes),
+                *("-D" + item for item in defines),
+                "-c",
+                str(source),
+                "-o",
+                str(obj),
+            ),
+            context.build,
         )
+        commands.append(command)
+        objects.append(obj)
+
+    compile_logs = [context.build / f"source-{index}.log" for index in range(len(commands))]
+    with ThreadPoolExecutor(max_workers=min(max(1, request.jobs), len(commands))) as pool:
+        list(pool.map(partial(_run_extension_command, environment=environment), commands, compile_logs))
+    with (context.build / "build.log").open("wb") as log:
+        for index in range(len(commands)):
+            with (context.build / f"source-{index}.log").open("rb") as unit_log:
+                shutil.copyfileobj(unit_log, log)
+        extension = wheel_stage / f"{module}.so"
+        linker = tools / ("cxx" if any(path.suffix != ".c" for path in sources) else "cc")
         command = NativeBuildCommand(
             (
                 str(linker),
-                *context.compiler_flags,
-                *context.linker_flags,
-                *context.shared_library_flags,
+                "-shared",
                 "-Wl,--export=PyInit_" + module,
                 "-Wl,--export-all,--fatal-warnings",
                 *(str(obj) for obj in objects),
                 *(str(path) for path in links),
                 "-o",
                 str(extension),
-                *(str(path) for path in context.shared_library_inputs),
             ),
             context.build,
         )
