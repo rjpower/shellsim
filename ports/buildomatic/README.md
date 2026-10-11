@@ -8,7 +8,8 @@ State defaults to `build/ports`.
 
 ```sh
 uv run --no-project python -m ports build python/scipy --backend iris --jobs 128
-uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 --simple
+uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 \
+  --output s3://my-bucket/ports/export --simple
 uv run python ports/buildomatic/s3_proxy.py --prefix s3://my-bucket/ports
 ```
 
@@ -18,7 +19,7 @@ bootstrap its SDK explicitly with `ports.buildomatic.bootstrap --python` first.
 one port. Export to another store with `--output <prefix> --copy-assets` to copy
 only missing assets. Cloud access needs `marin-rigging` bucket settings.
 
-Point `Environment(pypi_packages=["scipy"], pypi_catalog="<catalog.json URL>")`
+Point `Environment(pypi_packages=["scipy"], pypi_catalog="http://127.0.0.1:8080/export/catalog.json")`
 at the exported catalog. It resolves the curated WASI closure and caches only
 selected assets, without patched uv or SDK downloads. The older cohort workflow
 in `ports.buildomatic.publish` still requires its patched resolver.
