@@ -186,7 +186,7 @@ def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore
 
         manifest = json.loads((root / "native/artifact.json").read_text())
         exports = manifest["inputs"]["recipe"]["exports"]
-        for kind, destination in (("shared_libraries", "/lib/"), ("executables", "/usr/bin/")):
+        for kind, destination in (("shared_libraries", "/lib/"), ("tools", "/usr/bin/")):
             for path in exports.get(kind, []):
                 source = root / "native" / relative_path(path)
                 relative = f"assets/{build_key}/native/{path}"
@@ -211,7 +211,8 @@ def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore
 def delivery_graph(graph: Graph, products: dict[str, dict], *, abi: str | None = None) -> dict:
     """Select guest records and retain the static recipe dependency edges."""
     packages, native, nodes = [], [], []
-    for port in guest_graph(graph).ports:
+    selected = guest_graph(graph)
+    for port in selected.ports:
         if port.role in {"host-tool", "target-platform"} or port.reference not in products:
             continue
         record = products[port.reference]["delivery"]
@@ -224,9 +225,10 @@ def delivery_graph(graph: Graph, products: dict[str, dict], *, abi: str | None =
                 "dependencies": [edge.recipe for edge in port.dependencies if edge.kind in {"target", "runtime"}],
             }
         )
+    delivered = {node["reference"] for node in nodes}
     return {
         "schema_version": 1,
-        "roots": list(graph.roots),
+        "roots": [reference for reference in selected.roots if reference in delivered],
         "abi": abi,
         "ports": nodes,
         "packages": packages,

@@ -108,10 +108,14 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path):
     assert package["native_dependencies"] == ["libopenblas.so"] and package["extras"] == ["fast"]
 
 
-def test_native_providers_are_emitted_with_destinations(tmp_path):
+@pytest.mark.parametrize("destination", ["/lib/libtest.so", "/usr/lib/python3.13/lib-dynload/libtest.so"])
+def test_native_providers_are_emitted_with_destinations(tmp_path, destination):
+    from dataclasses import replace
+
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store, "provider", [])
     port = plan(ports, ["python/provider"]).ports[-1]
+    port = replace(port, recipe={**port.recipe, "install": {"destinations": {"lib/libtest.so": destination}}})
     root = tmp_path / "product"
     (root / "native/lib").mkdir(parents=True)
     (root / "native/lib/libtest.so").write_bytes(b"\x00asm\x01\x00\x00\x00")
@@ -119,8 +123,21 @@ def test_native_providers_are_emitted_with_destinations(tmp_path):
         json.dumps({"inputs": {"recipe": {"abi": "test", "exports": {"shared_libraries": ["lib/libtest.so"]}}}})
     )
     record = publish_product(port, root, "provider-key", DeliveryStore(store))
-    assert record["native"][0]["destination"] == "/lib/libtest.so"
+    assert record["native"][0]["destination"] == destination
     assert record["native"][0]["native_dependencies"] == []
+
+
+def test_guest_tools_are_emitted_as_executables(tmp_path):
+    port = plan(Path(__file__).resolve().parents[2], ["native/make"]).ports[-1]
+    root = tmp_path / "product"
+    (root / "native/bin").mkdir(parents=True)
+    (root / "native/bin/make").write_bytes(b"\x00asm\x01\x00\x00\x00")
+    (root / "native/artifact.json").write_text(json.dumps({"inputs": {"recipe": port.recipe}}))
+    store = DeliveryStore(tmp_path / "canonical")
+    record = publish_product(port, root, "make-key", store)
+    tool = record["native"][0]
+    assert tool["destination"] == "/usr/bin/make" and tool["kind"] == "tools"
+    assert (store.local / tool["path"]).read_bytes() == b"\x00asm\x01\x00\x00\x00"
 
 
 @pytest.mark.parametrize("path", ["../secret", "/secret", "a/../secret"])
@@ -190,3 +207,27 @@ def test_backfill_worker_reuses_product_without_building(built, monkeypatch, tmp
     assert result["delivery"]["wheels"][0]["name"] == "app"
     assert (canonical / result["delivery"]["wheels"][0]["path"]).is_file()
     assert json.loads((tmp_path / "result/result.json").read_text()) == result
+
+
+def test_guest_catalog_omits_host_and_platform_roots(built):
+    from dataclasses import replace
+
+    from ports._support.graph import Graph
+    from ports.buildomatic.delivery import delivery_graph
+
+    _, state, build = built
+    base = build.graph.ports[0]
+    host = replace(
+        base, reference="host/tool/recipe.json", recipe={**base.recipe, "role": "host-tool"}, dependencies=()
+    )
+    platform = replace(
+        base,
+        reference="native/platform/recipe.json",
+        recipe={**base.recipe, "role": "target-platform"},
+        dependencies=(),
+    )
+    graph = Graph((host.reference, platform.reference, *build.graph.roots), (host, platform, *build.graph.ports))
+    products = json.loads((state / "results.json").read_text())["products"]
+    catalog = delivery_graph(graph, products)
+    assert catalog["roots"] == list(build.graph.roots)
+    assert {node["reference"] for node in catalog["ports"]} == set(build.results)
