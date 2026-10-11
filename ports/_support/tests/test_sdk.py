@@ -116,7 +116,8 @@ def product_graph(tmp_path, monkeypatch):
         else:
             (work / "inventory").write_bytes(name.encode())
         inventory = {str(path.relative_to(work)): file_hash(path) for path in work.rglob("*") if path.is_file()}
-        manifest = {"identity": {"recipe": recipes[name]}, "artifacts": inventory}
+        current = next(node.recipe for node in sdk.definition(None, None).products if node.name == name)
+        manifest = {"identity": {"recipe": current}, "artifacts": inventory}
         (work / "manifest.json").write_text(json.dumps(manifest))
         return work
 
