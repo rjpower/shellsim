@@ -11,6 +11,7 @@ from ports._support.python_adapters import CPythonBuildContext
 
 if TYPE_CHECKING:
     from ports._support.graph import Port
+    from ports._support.native_adapters import CompilerCacheLauncher
     from ports._support.python_pep517 import BackendWheel
     from ports._support.sdk import HostSeed
     from ports._support.sdk_products import MaterializedSDK, Receipt
@@ -28,6 +29,7 @@ class BuildContext:
     cpython: CPythonBuildContext | None = None
     backend_wheels: tuple[BackendWheel, ...] = ()
     jobs: int | None = None
+    compiler_cache: CompilerCacheLauncher | None = None
     workspace: Path | None = None
     sources: Mapping[str, Path] = field(default_factory=dict)
     product_dependencies: Mapping[str, Receipt] = field(default_factory=dict)

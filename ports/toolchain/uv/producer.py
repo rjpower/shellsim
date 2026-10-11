@@ -33,7 +33,7 @@ def _tool(name: str, version_flag: str = "--version") -> dict[str, str]:
         raise ValueError(f"required host build tool is missing: {name}")
     return {
         "path": str(Path(path).absolute()),
-        "sha256": file_hash(Path(path)),
+        "sha256": "",
         "version": subprocess.check_output([path, version_flag], text=True).strip(),
     }
 
@@ -46,7 +46,7 @@ def _pinned_rust_tool(name: str, rustup: str) -> dict[str, str]:
         raise ValueError(f"pinned Rust tool is missing: {name}")
     return {
         "path": str(path),
-        "sha256": file_hash(path),
+        "sha256": "",
         "version": subprocess.check_output([str(path), "--version"], text=True).strip(),
     }
 
@@ -78,8 +78,8 @@ def _host_elf(path: Path, *, objdump: str, readelf: str) -> tuple[str, list[str]
 
 def build(output: Path, *, source: str | None = None, offline: bool = False, jobs: int = 2) -> Path:
     """Publish executable and provenance together after a real WASI target probe."""
-    if jobs < 1 or jobs > 32:
-        raise ValueError("Cargo jobs must be between 1 and 32")
+    if jobs < 1 or jobs > 256:
+        raise ValueError("Cargo jobs must be between 1 and 256")
     if sys.version_info < (3, 11):
         raise ValueError("the pinned uv target verifier requires host Python 3.11 or newer")
     inputs = _inputs()
@@ -109,6 +109,8 @@ def build(output: Path, *, source: str | None = None, offline: bool = False, job
     environment["CARGO_TARGET_DIR"] = str(target_dir)
     environment["CARGO_INCREMENTAL"] = "0"
     environment["RUSTC"] = tools["rustc"]["path"]
+    if shutil.which("sccache"):
+        environment["RUSTC_WRAPPER"] = shutil.which("sccache")
     with tempfile.TemporaryDirectory(prefix=".shellsim-uv-release-", dir=output.parent) as temporary:
         work = Path(temporary)
         source_dir = work / "source"

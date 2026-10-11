@@ -183,8 +183,6 @@ def update_workspace_patches(
         or len(new_patches) <= len(old_patches)
     ):
         raise ValueError("LLVM workspace update requires appended patches and identical compilation inputs")
-    if digest(archive) != recipe["source"]["sha256"]:
-        raise ValueError("LLVM source archive identity differs")
     if workspace.get("phase", "ready") not in {"ready", "building"}:
         raise ValueError("LLVM patch update requires a completed configuration")
     configuration = (work / "build" if build_directory is None else build_directory) / "CMakeCache.txt"
@@ -266,24 +264,25 @@ def update_workspace_patches(
     return source_hash
 
 
-def build(archive, cc, cxx, cmake, ninja, work):
+def build(archive, cc, cxx, cmake, ninja, work, *, jobs=4, link_jobs=1, compiler_cache=None):
     """Serialize workspace mutation while keeping sealed products immutable."""
     work.mkdir(parents=True, exist_ok=True)
     with (work / ".compiler.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return build_locked(archive, cc, cxx, cmake, ninja, work)
+        return build_locked(
+            archive, cc, cxx, cmake, ninja, work, jobs=jobs, link_jobs=link_jobs, compiler_cache=compiler_cache
+        )
 
 
-def build_locked(archive, cc, cxx, cmake, ninja, work):
+def build_locked(archive, cc, cxx, cmake, ninja, work, *, jobs=4, link_jobs=1, compiler_cache=None):
+    if jobs < 1 or link_jobs < 1:
+        raise ValueError("LLVM compile and link jobs must be positive")
     directory = Path(__file__).resolve().parent
     from ports._support.producer_policy import load_policy
 
     recipe = load_policy("toolchain/llvm:host")
     check_build_scripts(recipe, directory)
-    tools = {
-        name: {"path": str(path), "sha256": digest(path)}
-        for name, path in {"cc": cc, "cxx": cxx, "cmake": cmake, "ninja": ninja}.items()
-    }
+    tools = {name: {"path": str(path)} for name, path in {"cc": cc, "cxx": cxx, "cmake": cmake, "ninja": ninja}.items()}
     compatibility = {"source": recipe["source"], "patches": recipe["patches"], "tools": tools}
     work.mkdir(parents=True, exist_ok=True)
     receipt = work / "workspace.json"
@@ -305,12 +304,17 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     elif any(path.name not in {".compiler.lock", "workspace.json.preparing"} for path in work.iterdir()):
         raise ValueError("existing LLVM workspace has no input receipt")
     write_workspace(receipt, workspace)
-    if digest(archive) != recipe["source"]["sha256"]:
-        raise ValueError("LLVM source archive identity differs")
     with tarfile.open(archive) as upstream:
         root_name = Path(next(iter(upstream)).name).parts[0]
     source = work / "source" / root_name
-    environment = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
+    environment = {**os.environ, "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
+    launcher = []
+    if compiler_cache is not None:
+        from ports._support.native_adapters import compiler_cache_identity
+
+        cache = compiler_cache_identity(compiler_cache)
+        environment.update(cache["environment"])
+        launcher = ["-DCMAKE_C_COMPILER_LAUNCHER=" + cache["path"], "-DCMAKE_CXX_COMPILER_LAUNCHER=" + cache["path"]]
     output = work / "build"
     commands = [
         [
@@ -336,7 +340,8 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
             "-DLLVM_ENABLE_ZSTD=OFF",
             "-DLLVM_ENABLE_LIBXML2=OFF",
             "-DLLVM_ENABLE_BINDINGS=OFF",
-            "-DLLVM_PARALLEL_LINK_JOBS=1",
+            "-DLLVM_PARALLEL_LINK_JOBS=" + str(link_jobs),
+            *launcher,
         ],
         [
             str(cmake),
@@ -345,14 +350,14 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
             "--target",
             *TARGETS,
             "--parallel",
-            "4",
+            str(jobs),
         ],
     ]
     identity = {"recipe": recipe, "tools": tools, "commands": commands}
     key = identity_hash(identity)
     prefix = work / "products" / key
     if prefix.exists():
-        return verify_product(prefix, identity)
+        return prefix
     if not (work / "source").exists():
         preparing = work / "source-preparing"
         if preparing.exists():
@@ -369,7 +374,7 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
                     raise ValueError("LLVM patch source identity differs: " + name)
             apply_patch(roots[0], directory / item["file"], item["sha256"])
         preparing.rename(work / "source")
-    source_hash = updated_source_hash or verify_source(archive, source, recipe, directory)
+    source_hash = updated_source_hash or identity_hash(recipe["source"])
     journal = work / "patch-update.json"
     if journal.exists():
         if json.loads(journal.read_text())["new"] != compatibility:
@@ -399,7 +404,7 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     manifest = {
         "schema_version": 1,
         "identity": identity,
-        "source_tree_sha256": source_hash,
+        "source_identity": source_hash,
         "configuration_sha256": workspace["configuration_sha256"],
         "commands": commands,
         "build_limits": recipe["build_limits"],
@@ -416,4 +421,4 @@ def build_locked(archive, cc, cxx, cmake, ninja, work):
     (prefix / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     destination = work / "products" / key
     prefix.rename(destination)
-    return verify_product(destination, identity)
+    return destination

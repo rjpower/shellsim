@@ -1,4 +1,7 @@
 {
+  "inputs": {
+    "toolchain/wasi_sdk/notices/llvm-LICENSE.TXT": "8d85c1057d742e597985c7d4e6320b015a9139385cff4cbae06ffc0ebe89afee"
+  },
   "kind": "native-library",
   "name": "openblas",
   "version": "0.3.31",

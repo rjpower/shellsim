@@ -19,6 +19,8 @@ def build(ctx: BuildContext):
             products["compiler"].root,
             seed.tools["make"].path,
             ctx.work,
+            jobs=ctx.jobs,
+            compiler_cache=ctx.compiler_cache,
         )
         return ProductBuildOutput(root, root / "manifest.json")
     if ctx.variant == "stdlib-zlib":

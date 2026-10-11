@@ -19,5 +19,4 @@ def build(ctx: BuildContext):
         ],
         jobs=2,
         install_prefix="/usr/local",
-        executable_sdk_link_inputs=["lib/wasm32-wasip1-threads/libsetjmp.a"],
     )

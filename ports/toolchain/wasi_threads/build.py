@@ -28,5 +28,7 @@ def build(ctx: BuildContext) -> ProductBuildOutput:
         seed.tools["cmake"].path,
         seed.tools["ninja"].path,
         ctx.work,
+        jobs=ctx.jobs or 4,
+        compiler_cache=ctx.compiler_cache,
     )
     return ProductBuildOutput(root, root / "manifest.json")

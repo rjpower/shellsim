@@ -100,3 +100,27 @@ def test_source_rejects_escape_and_links(tmp_path, name, link):
     with pytest.raises(ValueError):
         extract(archive, tmp_path / "source", subdirectory="release")
     assert not (tmp_path / "outside").exists()
+
+
+def test_commit_source_reuses_archive_without_packaging_checksum(tmp_path, monkeypatch):
+    commit = "a" * 40
+    source = {
+        "commit": commit,
+        "sha256": "b" * 64,
+        "url": "https://codeload.github.com/example/project/tar.gz/" + commit,
+    }
+    cached = tmp_path / commit / commit
+    cached.parent.mkdir()
+    cached.write_bytes(b"cached archive of the selected commit")
+
+    def reject_network(*args):
+        pytest.fail("cached commit sources must not be fetched again")
+
+    monkeypatch.setattr("urllib.request.urlopen", reject_network)
+    assert fetch(source, tmp_path, offline=True) == cached
+
+
+def test_commit_source_rejects_a_floating_archive_url(tmp_path):
+    source = {"commit": "a" * 40, "sha256": "b" * 64, "url": "https://codeload.github.com/example/project/tar.gz/main"}
+    with pytest.raises(ValueError):
+        fetch(source, tmp_path)

@@ -5,10 +5,79 @@ this context. Adapters build into its staging prefix; the runner alone seals
 exports, publishes cache entries and emits catalogs. Commands are argv vectors.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from typing import Mapping
+
+
+@dataclass(frozen=True)
+class CompilerCacheLauncher:
+    """Explicit worker-image executable and public cache configuration.
+
+    Credentials remain a worker service concern. This binding carries no ambient
+    environment and enables caching only for compilation to object files.
+    """
+
+    path: Path
+    sha256: str
+    environment: tuple[tuple[str, str], ...] = ()
+
+
+def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executable: bool = True) -> dict:
+    """Bind public cache identity; verify executable bytes on the worker before use.
+
+    Preparation may name a pinned worker-image binary absent on the caller.
+    Execution always verifies its bytes and executable mode.
+    """
+    from urllib.parse import urlsplit
+
+    allowed = {
+        "SCCACHE_DIR",
+        "SCCACHE_CACHE_SIZE",
+        "SCCACHE_ENDPOINT",
+        "SCCACHE_BUCKET",
+        "SCCACHE_REGION",
+        "SCCACHE_S3_KEY_PREFIX",
+        "SCCACHE_S3_USE_SSL",
+        "SCCACHE_IDLE_TIMEOUT",
+        "SCCACHE_SERVER_PORT",
+        "SCCACHE_SERVER_UDS",
+        "SCCACHE_CLIENT_SIDE",
+        "SCCACHE_BASEDIRS",
+        "SCCACHE_GCS_BUCKET",
+        "SCCACHE_GCS_KEY_PREFIX",
+        "SCCACHE_GCS_RW_MODE",
+        "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE",
+    }
+    if not launcher.path.is_absolute():
+        raise ValueError("compiler cache requires an absolute path")
+    if verify_executable and not launcher.path.stat().st_mode & 0o111:
+        raise ValueError("compiler cache requires an absolute executable")
+    environment = dict(launcher.environment)
+    if (
+        len(environment) != len(launcher.environment)
+        or environment.keys() - allowed
+        or any(not isinstance(value, str) or len(value) > 4096 or "\0" in value for value in environment.values())
+    ):
+        raise ValueError("unsupported compiler cache environment")
+    endpoint = urlsplit(environment.get("SCCACHE_ENDPOINT", ""))
+    if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+        raise ValueError("compiler cache endpoint must not contain credentials")
+    if "SCCACHE_ENDPOINT" in environment and (endpoint.scheme not in {"http", "https"} or not endpoint.netloc):
+        raise ValueError("compiler cache endpoint must be an HTTP or HTTPS URL")
+    if {"SCCACHE_SERVER_PORT", "SCCACHE_SERVER_UDS"} <= environment.keys():
+        raise ValueError("compiler cache must select either a port or a Unix socket")
+    if "SCCACHE_SERVER_UDS" in environment and not Path(environment["SCCACHE_SERVER_UDS"]).is_absolute():
+        raise ValueError("compiler cache Unix socket must have an absolute worker path")
+    if environment.get("SCCACHE_CLIENT_SIDE", "1") != "1":
+        raise ValueError("compiler cache must compile inside the action process group")
+    # The persistent daemon owns cache storage, while compilers must inherit
+    # the action's process group and resource limits for reliable cancellation.
+    environment["SCCACHE_CLIENT_SIDE"] = "1"
+    return {"path": str(launcher.path), "sha256": launcher.sha256, "environment": environment}
 
 
 def write_build_file(path: Path, contents: str) -> None:
@@ -49,6 +118,7 @@ class NativeBuildContext:
     retained_workspace: bool = False
     shared_library_inputs: tuple[Path, ...] = ()
     executable_link_inputs: tuple[Path, ...] = ()
+    compiler_cache: CompilerCacheLauncher | None = None
 
 
 @dataclass(frozen=True)
@@ -110,11 +180,13 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
     """Generate the exact compiler driver consumed by every native adapter."""
     python = context.host_tools["python"]
     base = [str(context.target_tools[role]), *context.compiler_flags]
+    cache = compiler_cache_identity(context.compiler_cache) if context.compiler_cache is not None else None
     return (
         "#!"
         + str(python)
         + "\n"
         + response_source
+        + (_CACHE_COMPILE_ARGUMENTS if cache else "")
         + "\nimport os, sys\n"
         + "command = "
         + repr(base)
@@ -122,6 +194,8 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "options = response_arguments(arguments, Path.cwd())\n"
         + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
         + 'is_shared = is_link and "-shared" in options\n'
+        + "if is_link and any('--start-group' in arg or '--end-group' in arg for arg in options if arg.startswith('-Wl,')):\n"
+        + "    arguments = wasm_link_arguments(options)\n"
         + "if is_link:\n"
         + "    command += "
         + repr(list(context.linker_flags))
@@ -134,12 +208,72 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "    command += "
         + repr(list(context.executable_flags))
         + "\n"
+        + (
+            "if '-c' in options and not any(flag in options for flag in ('-S', '-E')):\n"
+            + "    arguments = cached_compile_arguments(command[1:] + options, "
+            + repr([str(context.source), str(context.build), str(context.dependency_sysroot)])
+            + ", Path.cwd(), "
+            + repr(context.target_tools[role].name.startswith("clang"))
+            + ")\n"
+            + "    command = ["
+            + repr(cache["path"])
+            + ", command[0]]\n"
+            if cache
+            else ""
+        )
         + "os.execv(command[0], command + arguments + ("
         + repr([str(path) for path in context.shared_library_inputs])
         + " if is_shared else "
         + repr([str(path) for path in context.executable_link_inputs])
         + " if is_link else []))\n"
     )
+
+
+# Embedded in the standalone compiler wrapper so private build processes do not
+# need to import the caller's repository. Response expansion uses the bounded
+# LLVM GNU parser above; only admitted compile operands change.
+_CACHE_COMPILE_ARGUMENTS = """
+import os, re
+
+def cached_compile_arguments(arguments, roots, directory, clang):
+    def relative(value):
+        if not os.path.isabs(value) or '..' in Path(value).parts:
+            return value
+        path = Path(value)
+        if any(path.is_relative_to(Path(root)) for root in roots):
+            return os.path.relpath(value, directory)
+        return value
+
+    separate = {'-I', '-isystem', '-iquote', '-idirafter', '-include',
+                '-include-pch', '-imacros', '-o', '-MF', '-MJ', '-MT', '-MQ',
+                '-isysroot', '-serialize-diagnostics', '--sysroot'}
+    joined = ('--sysroot=', '-isystem', '-iquote', '-idirafter',
+              '-include-pch', '-include', '-imacros', '-isysroot',
+              '-I', '-MF', '-MJ', '-MT', '-MQ', '-o')
+    result, operand, debug = [], False, False
+    for argument in arguments:
+        if operand:
+            result.append(relative(argument))
+            operand = False
+            continue
+        if argument in separate:
+            result.append(argument)
+            operand = True
+            continue
+        if argument in {'-g0', '-ggdb0'}:
+            debug = False
+        elif re.fullmatch(r'-g(?:[123]|gdb[0-3]?|line-tables-only|dwarf(?:-[0-9]+)?|full|codeview)?', argument):
+            debug = True
+        for flag in joined:
+            if argument.startswith(flag) and len(argument) > len(flag):
+                result.append(flag + relative(argument[len(flag):]))
+                break
+        else:
+            result.append(relative(argument) if not argument.startswith('-') else argument)
+    if clang and debug:
+        result.append('-fdebug-compilation-dir=.')
+    return result
+"""
 
 
 def build_environment(context: NativeBuildContext, configure_environment: Mapping[str, str]) -> dict[str, str]:
@@ -171,6 +305,12 @@ def build_environment(context: NativeBuildContext, configure_environment: Mappin
         }
     )
     environment.update(configure_environment)
+    if context.compiler_cache is not None:
+        environment.update(compiler_cache_identity(context.compiler_cache)["environment"])
+        roots = [str(context.source), str(context.build), str(context.dependency_sysroot)]
+        if environment.get("SCCACHE_BASEDIRS"):
+            roots.append(environment["SCCACHE_BASEDIRS"])
+        environment["SCCACHE_BASEDIRS"] = os.pathsep.join(roots)
     return environment
 
 
@@ -210,8 +350,8 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         raise ValueError("plain-make adapter has no configure phase")
     if request.adapter is NativeAdapter.MESON and request.install_targets != ("install",):
         raise ValueError("Meson adapter supports its normal install target only")
-    if not 1 <= request.jobs <= 16:
-        raise ValueError("native build jobs must be between one and sixteen")
+    if not 1 <= request.jobs <= 256:
+        raise ValueError("native build jobs must be between one and 256")
     if request.install_prefix != PurePosixPath("/usr/local"):
         raise ValueError("native adapters currently install under /usr/local")
     if context.target not in ("wasm32-wasip1", "wasm32-wasip1-threads"):
@@ -299,9 +439,16 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         )
         started = time.perf_counter()
         with (context.build / f"adapter-{len(commands)}.log").open("wb") as log:
-            subprocess.run(
-                command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
-            )
+            try:
+                subprocess.run(
+                    command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
+                )
+            except subprocess.CalledProcessError as error:
+                log.flush()
+                with Path(log.name).open("rb") as source:
+                    source.seek(max(0, source.seek(0, 2) - 8192))
+                    error.add_note(source.read().decode(errors="replace"))
+                raise
         phase = (
             "configure"
             if (

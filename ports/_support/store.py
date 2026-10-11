@@ -72,10 +72,16 @@ def fetch(source: Mapping[str, Any], cache: Path, *, offline: bool = False) -> P
     name = relative_path(source.get("filename") or PurePosixPath(parsed.path).name)
     if "/" in name:
         raise ValueError("source filename must be a basename")
-    directory = cache / expected
+    commit = source.get("commit")
+    commit_pinned = (
+        commit is not None and parsed.hostname == "codeload.github.com" and parsed.path.endswith("/" + commit)
+    )
+    if commit is not None and (not commit_pinned or re.fullmatch(r"[a-f0-9]{40}", commit) is None):
+        raise ValueError("source commit must identify an immutable GitHub archive URL")
+    directory = cache / (commit if commit_pinned else expected)
     destination = directory / name
     if destination.exists() or destination.is_symlink():
-        if file_hash(destination, limit=_MAX_SOURCE) != expected:
+        if not commit_pinned and file_hash(destination, limit=_MAX_SOURCE) != expected:
             raise ValueError(f"cached source hash mismatch: {destination}")
         return destination
     if offline:
@@ -94,7 +100,7 @@ def fetch(source: Mapping[str, Any], cache: Path, *, offline: bool = False) -> P
                         raise ValueError("download exceeds source bounds")
                     output.write(chunk)
             output.flush()
-            if file_hash(temporary, limit=_MAX_SOURCE) != expected:
+            if not commit_pinned and file_hash(temporary, limit=_MAX_SOURCE) != expected:
                 raise ValueError(f"downloaded source hash mismatch: {name}")
             os.replace(temporary, destination)
         finally:

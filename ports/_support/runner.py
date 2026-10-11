@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 from ports._support.build import apply_patch
 from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.native_adapters import (
+    CompilerCacheLauncher,
     NativeBuildContext,
 )
 from ports._support.python_adapters import (
@@ -157,20 +158,28 @@ def build_graph(
     jobs: int | None = None,
     default_sdk: str = "default",
     workspaces: Mapping[str, Path] | None = None,
+    admitted_predecessors: Mapping[str, str] | None = None,
+    compiler_cache: CompilerCacheLauncher | None = None,
 ) -> GraphBuild:
-    """Execute admitted port builders and publish byte-verified immutable results."""
+    """Execute admitted port builders and publish byte-verified immutable results.
+
+    Transferred predecessors must have their current key and a verified cached
+    result. They never build on a miss, including when implementation bytes change.
+    """
     from ports._support.local_sources import stage_local_sources
     from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot, seal_native_install
-    from ports._support.sdk_products import resolved_toolchain, verify_product
-    from ports._support.store import identity
+    from ports._support.sdk_products import resolved_toolchain
+    from ports._support.store import identity, verify
     from ports.api import BuildContext, build_port, implementation
 
-    if jobs is not None and not 1 <= jobs <= 16:
-        raise ValueError("build jobs must be between one and sixteen")
+    if jobs is not None and not 1 <= jobs <= 256:
+        raise ValueError("build jobs must be between one and 256")
     graph = plan(
         ports, requests, target_profile=sdk_context.dynamic_abi if sdk_context else None, default_sdk=default_sdk
     )
     selected = {port.reference: port for port in graph.ports}
+    if set(admitted_predecessors or {}) - selected.keys():
+        raise ValueError("admitted predecessor is outside the requested graph")
     for reference in workspaces or {}:
         if reference not in selected or selected[reference].recipe["build_system"] not in {
             "llvm-guest",
@@ -203,11 +212,12 @@ def build_graph(
                 )
             if product is None:
                 raise ValueError("selected SDK product was not materialized")
-            if system in {"llvm-host", "wasi-sysroot"}:
-                verify_product(product)
             products[port.reference] = product
             results[port.reference] = product.root
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
+            if port.reference in (admitted_predecessors or {}):
+                if admitted_predecessors[port.reference] != keys[port.reference]:
+                    raise ValueError("admitted predecessor key differs: " + port.reference)
             continue
         build_sdk = sdk_context
         pure = system in {"pure-wheel", "host-wheel", "source-tree"}
@@ -241,11 +251,6 @@ def build_graph(
             inputs["sdk_selection"] = asdict(port.sdk_selection)
         if not pure:
             inputs["sdk"] = build_sdk.identity
-            inputs["host_tools"] = {
-                name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
-                for name, tool in build_sdk.host_tools.items()
-                if name != "uv"
-            }
             inputs["target_flags"] = {
                 "compiler": build_sdk.compiler_flags,
                 "linker": build_sdk.linker_flags,
@@ -265,6 +270,14 @@ def build_graph(
                 }
         # Cache receipts use JSON arrays for the typed toolchain argument tuples.
         inputs = json.loads(json.dumps(inputs, sort_keys=True))
+        if port.reference in (admitted_predecessors or {}):
+            expected = admitted_predecessors[port.reference]
+            if expected != identity(inputs):
+                raise ValueError("admitted predecessor key differs: " + port.reference)
+            predecessor = store.resolve() / "results" / expected
+            if not predecessor.is_dir():
+                raise ValueError("admitted predecessor result is missing: " + port.reference)
+            verify(predecessor, inputs)
         with build_slot(store, inputs) as slot:
             keys[port.reference] = slot.key
             print(
@@ -344,6 +357,7 @@ def build_graph(
                         executable_flags=build_sdk.executable_flags,
                         shared_library_inputs=(build_sdk.compiler_runtime_archive,),
                         executable_link_inputs=executable_inputs,
+                        compiler_cache=compiler_cache,
                     )
                     python_context = None
                     if system.startswith("python-"):
@@ -584,12 +598,48 @@ def main() -> None:
         help="actual compatible retained Ninja build directory; producer state lives in its parent",
     )
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--backend", choices=("local", "buildomatic", "iris"), default="local")
+    parser.add_argument("--sdk-descriptor", type=Path, help="admitted portable SDK for distributed builds")
+    parser.add_argument("--iris-service", type=Path, help="public connection descriptor for an existing Iris service")
+    parser.add_argument("--build-key", help="fresh distributed identity after eviction, failure or cancellation")
+    parser.add_argument("--max-workers", type=int, default=1, help="distributed port concurrency, between one and 32")
+    parser.add_argument(
+        "--port-timeout", type=float, default=4 * 3600, help="distributed per-port wall seconds, at most 86400"
+    )
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
     args = parser.parse_args()
+    if args.backend != "local" and not 1 <= args.max_workers <= 32:
+        parser.error("distributed builds require 1..32 workers")
+    if args.backend != "local" and args.output is not None:
+        parser.error(
+            "distributed builds emit cache manifests; use ports.buildomatic.ports.publish_manifest for releases"
+        )
     if args.check and args.output is None:
         parser.error("--check requires --output")
+    if args.backend == "iris" and args.iris_service is None:
+        parser.error("--backend iris requires --iris-service")
+    if args.backend == "iris":
+        if args.offline or args.workspace or args.sdk_descriptor or args.host_seed:
+            parser.error(
+                "Iris uses store references and installed worker tools; --offline, --workspace, --sdk-descriptor and --host-seed are local options"
+            )
+        from ports.buildomatic.store_graph import run
+
+        result = run(
+            args.ports,
+            args.recipes,
+            args.sdk,
+            args.iris_service,
+            args.store,
+            jobs=16 if args.jobs is None else args.jobs,
+            max_workers=args.max_workers,
+            build_key=args.build_key,
+            port_timeout=args.port_timeout,
+        )
+        print(json.dumps(result.results, sort_keys=True, indent=2))
+        return
     workspaces = {}
     for declaration in args.workspace:
         reference, separator, directory = declaration.partition("=")
@@ -621,21 +671,41 @@ def main() -> None:
                 if not isinstance(test, dict) or test.get("kind") not in {"python", "native", "shell"}:
                     raise ValueError("unsupported guest test kind")
                 _local_file(port, test.get("source" if test["kind"] == "native" else "script"))
-    sdk_context = (
-        materialize(
-            args.ports,
-            graph,
-            args.store,
-            default=args.sdk,
-            host_seed=args.host_seed,
-            python=needs_python,
-            offline=args.offline,
+    if args.backend == "local":
+        sdk_context = (
+            materialize(
+                args.ports,
+                graph,
+                args.store,
+                default=args.sdk,
+                host_seed=args.host_seed,
+                python=needs_python,
+                offline=args.offline,
+                jobs=args.jobs,
+            )
+            if needs_target or needs_python
+            else None
         )
-        if needs_target or needs_python
-        else None
-    )
+    else:
+        if (needs_target or needs_python) and args.sdk_descriptor is None:
+            parser.error("distributed target builds require --sdk-descriptor; SDK products are never bootstrapped")
+        sdk_context = None
+        if args.sdk_descriptor is not None:
+            from ports.buildomatic.portable import import_sdk, original_root_bindings
 
-    result = build_graph(
+            sdk_context = import_sdk(
+                args.sdk_descriptor,
+                args.store / "sdk-import",
+                original_bindings=True,
+                bindings=original_root_bindings(args.sdk_descriptor),
+            )
+
+    execute = build_graph
+    if args.backend != "local":
+        from ports.buildomatic.ports import run_graph
+
+        execute = run_graph
+    result = execute(
         args.ports,
         args.recipes,
         sdk_context,
@@ -644,6 +714,17 @@ def main() -> None:
         jobs=args.jobs,
         default_sdk=args.sdk,
         workspaces=workspaces,
+        **(
+            {
+                "backend": args.backend,
+                "iris_service": args.iris_service,
+                "build_key": args.build_key,
+                "max_workers": args.max_workers,
+                "port_timeout_seconds": args.port_timeout,
+            }
+            if args.backend != "local"
+            else {}
+        ),
     )
     if args.output is not None:
         if args.check:

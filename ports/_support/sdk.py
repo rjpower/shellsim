@@ -10,15 +10,18 @@ from __future__ import annotations
 import fcntl
 import json
 import platform
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
 
 from ports._support.graph import Graph, Port, _document, canonical_reference
+from ports._support.native_adapters import CompilerCacheLauncher
 from ports._support.producer_policy import load_policy, policy, verify_policy
 from ports._support.producer_policy import metadata as producer_metadata
 from ports._support.sdk_products import (
+    HOST_TOOLS,
     MaterializedSDK,
     Receipt,
     Tool,
@@ -194,6 +197,17 @@ def load_seed(path: Path | None) -> HostSeed:
     return HostSeed(tools, compiler_tools, helper)
 
 
+def installed_seed() -> HostSeed:
+    """Use normal installed build tools without hashing or copying their packages."""
+    tools = {name: Tool(Path(path), "") for name in HOST_TOOLS if (path := shutil.which(name))}
+    compiler = {
+        name: Tool(Path(path), "")
+        for name, executable in {"cc": "cc", "cxx": "c++", "cmake": "cmake", "ninja": "ninja"}.items()
+        if (path := shutil.which(executable))
+    }
+    return HostSeed(tools, compiler, Tool(Path(sys.executable), ""))
+
+
 def _seed_tool(base: Path, binding: dict) -> Tool:
     if set(binding) != {"path", "sha256"}:
         raise ValueError("native seed executable fields differ")
@@ -249,7 +263,15 @@ def verify_dependencies(node: SDKProduct, product: Receipt, products: Mapping[st
 
 
 def _produce(
-    node: SDKProduct, products: Mapping[str, Receipt], seed: HostSeed, store: Path, work: Path, offline: bool
+    node: SDKProduct,
+    products: Mapping[str, Receipt],
+    seed: HostSeed,
+    store: Path,
+    work: Path,
+    offline: bool,
+    *,
+    jobs: int | None = None,
+    compiler_cache: CompilerCacheLauncher | None = None,
 ) -> Receipt:
     """Call the existing producer once its declared products are available."""
     from ports._support.build import check_build_scripts
@@ -282,6 +304,8 @@ def _produce(
             host_seed=seed,
             work=work,
             offline=offline,
+            jobs=jobs,
+            compiler_cache=compiler_cache,
         )
     )
     if not isinstance(output, ProductBuildOutput):
@@ -321,22 +345,80 @@ def _require_tools(seed: HostSeed, names: tuple[str, ...]) -> None:
 
 def node_inputs(node: SDKProduct, products: Mapping[str, Receipt], seed: HostSeed) -> dict:
     """Invalidate only the producer inputs consumed by this product node."""
-    tools = {}
-    helper = None
-    if node.adapter == "llvm-host":
-        tools = seed.compiler_tools
-    elif node.adapter == "wasi-sysroot":
-        tools = {name: seed.tools[name] for name in ("cmake", "ninja") if name in seed.tools}
-    elif node.adapter == "cpython-threaded":
-        tools = {name: seed.tools[name] for name in ("make",) if name in seed.tools}
-        helper = seed.python_helper.sha256 if seed.python_helper else None
     return {
         "producer_policy": json_hash(policy(node.port.recipe)),
         "implementation": implementation(node.port),
         "dependencies": {name: products[name].sha256 for name in node.dependencies},
-        "host_tools": {name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256} for name, tool in tools.items()},
-        "python_helper": helper,
     }
+
+
+def admit_cached_sdk(
+    ports: Path,
+    graph: Graph,
+    store: Path,
+    *,
+    default: str = "default",
+    host_seed: Path | None = None,
+) -> MaterializedSDK:
+    """Read and admit a complete retained SDK without producing or publishing.
+
+    All five product records must match current inputs and verified dependency
+    receipts. Missing or stale inputs fail rather than entering a producer.
+    Products, CPython runtime and host tools keep their original inventory roots;
+    no locks, directories, registry records or materialized manifests are written.
+    The caller must provide a quiescent retained product store.
+    """
+    from ports._support.build import check_build_scripts
+
+    sdk = definition(ports, graph, default)
+    missing = {"compiler", "platform", "tooling", "cpython", "resolver"} - {node.name for node in sdk.products}
+    if missing:
+        raise ValueError("SDK omits required products: " + ", ".join(sorted(missing)))
+    index = store.resolve() / "sdk-products" / sdk.name
+    seed_path = host_seed or (index / "host-seed.json" if (index / "host-seed.json").exists() else None)
+    seed = load_seed(seed_path)
+    products: dict[str, Receipt] = {}
+    for node in sdk.products:
+        check_build_scripts(node.recipe, node.recipe_path.parent)
+        inputs = node_inputs(node, products, seed)
+        record = read_json(index / (node.name + ".json"))
+        if type(record["schema_version"]) is not int or record["schema_version"] != 1:
+            raise ValueError("unsupported retained SDK product record")
+        if not compatible_inputs(record, inputs):
+            raise ValueError("retained SDK product inputs differ: " + node.name)
+        product = receipt(index, record["product"])
+        verify_node(node, product)
+        verify_dependencies(node, product, products)
+        products[node.name] = product
+    resolver = products["resolver"]
+    executable = resolver.contents["executable"]
+    tools = dict(seed.tools)
+    tools["uv"] = Tool(resolver.root / executable["file"], executable["sha256"], resolver.path, resolver.sha256)
+    entries = {
+        name: {
+            "provider": "llvm",
+            "path": "bin/" + executable,
+            "sha256": file_hash(products["compiler"].root / "bin" / executable),
+        }
+        for name, executable in {
+            "cc": "clang",
+            "cxx": "clang++",
+            "ar": "llvm-ar",
+            "ranlib": "llvm-ranlib",
+            "strip": "llvm-strip",
+        }.items()
+    }
+    return admit_sdk(
+        products["tooling"],
+        products["compiler"],
+        products["platform"],
+        products["cpython"],
+        products["cpython"],
+        tools,
+        entries,
+        target=sdk.metadata["target"],
+        abi=sdk.metadata["abi"],
+    )
 
 
 def materialize(
@@ -348,6 +430,10 @@ def materialize(
     host_seed: Path | None = None,
     python: bool = False,
     offline: bool = False,
+    jobs: int | None = None,
+    compiler_cache: CompilerCacheLauncher | None = None,
+    seed: HostSeed | None = None,
+    resolver: bool = True,
 ) -> MaterializedSDK:
     """Serialize publication of SDK products, then return concrete driver inputs."""
     sdk = definition(ports, graph, default)
@@ -355,19 +441,40 @@ def materialize(
     index.mkdir(parents=True, exist_ok=True)
     with (index / "materialize.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        return _materialize(sdk, store, host_seed, python, offline)
+        return _materialize(
+            sdk,
+            store,
+            host_seed,
+            python,
+            offline,
+            jobs=jobs,
+            compiler_cache=compiler_cache,
+            seed=seed,
+            resolver=resolver,
+        )
 
 
 def _materialize(
-    sdk: SDKDefinition, store: Path, host_seed: Path | None, python: bool, offline: bool
+    sdk: SDKDefinition,
+    store: Path,
+    host_seed: Path | None,
+    python: bool,
+    offline: bool,
+    *,
+    jobs: int | None = None,
+    compiler_cache: CompilerCacheLauncher | None = None,
+    seed: HostSeed | None = None,
+    resolver: bool = True,
 ) -> MaterializedSDK:
     """Resolve SDK products, compile missing nodes and emit a materialized manifest."""
     index = store.resolve() / "sdk-products" / sdk.name
     seed_path = host_seed or (index / "host-seed.json" if (index / "host-seed.json").exists() else None)
-    seed = load_seed(seed_path)
+    seed = seed or load_seed(seed_path)
     required = {"compiler", "platform", "tooling"}
     if python:
-        required.update(("cpython", "resolver"))
+        required.add("cpython")
+        if resolver:
+            required.add("resolver")
     nodes = {node.name: node for node in sdk.products}
     pending = list(required)
     while pending:
@@ -390,13 +497,20 @@ def _materialize(
         record = read_json(path) if path.exists() else None
         if record is not None and compatible_inputs(record, inputs):
             product = receipt(path.parent, record["product"])
-            verify_node(node, product)
             verify_dependencies(node, product, products)
             print("ports: SDK product cache hit: " + node.name, file=sys.stderr, flush=True)
         else:
             print("ports: SDK product cache miss: " + node.name, file=sys.stderr, flush=True)
-            product = _produce(node, products, seed, store.resolve(), producer_work(node, inputs, seed, store), offline)
-            verify_node(node, product)
+            product = _produce(
+                node,
+                products,
+                seed,
+                store.resolve(),
+                producer_work(node, inputs, seed, store),
+                offline,
+                jobs=jobs,
+                compiler_cache=compiler_cache,
+            )
             verify_dependencies(node, product, products)
             record = {
                 "schema_version": 1,
@@ -412,15 +526,22 @@ def _materialize(
         # Imported assembled runtimes remain preserved in their original records.
         runtime = products["cpython"]
     tools = dict(seed.tools)
-    if python:
-        resolver = products["resolver"]
-        executable = resolver.contents["executable"]
-        tools["uv"] = Tool(resolver.root / executable["file"], executable["sha256"], resolver.path, resolver.sha256)
+    if python and resolver:
+        resolver_product = products["resolver"]
+        executable = resolver_product.contents["executable"]
+        tools["uv"] = Tool(
+            resolver_product.root / executable["file"],
+            executable["sha256"],
+            resolver_product.path,
+            resolver_product.sha256,
+        )
     entries = {
         name: {
             "provider": "llvm",
             "path": "bin/" + executable,
-            "sha256": file_hash(products["compiler"].root / "bin" / executable),
+            "sha256": products["compiler"].contents["artifacts"][
+                "bin/" + products["compiler"].contents.get("symlinks", {}).get("bin/" + executable, executable)
+            ],
         }
         for name, executable in {
             "cc": "clang",

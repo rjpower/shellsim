@@ -116,16 +116,17 @@ def product_graph(tmp_path, monkeypatch):
         else:
             (work / "inventory").write_bytes(name.encode())
         inventory = {str(path.relative_to(work)): file_hash(path) for path in work.rglob("*") if path.is_file()}
-        manifest = {"identity": {"recipe": recipes[name]}, "artifacts": inventory}
+        current = next(node.recipe for node in sdk.definition(None, None).products if node.name == name)
+        manifest = {"identity": {"recipe": current}, "artifacts": inventory}
         (work / "manifest.json").write_text(json.dumps(manifest))
         return work
 
-    def compiler(archive, cc, cxx, cmake, ninja, work):
+    def compiler(archive, cc, cxx, cmake, ninja, work, *, jobs, link_jobs, compiler_cache):
         assert archive.read_bytes() == cached.read_bytes()
         assert (cc, cxx, cmake, ninja) == (tool.path,) * 4
         return product("compiler", work / "products" / str(len(list((work / "products").glob("*")))))
 
-    def platform(archive, libc, compiler, cmake, ninja, work):
+    def platform(archive, libc, compiler, cmake, ninja, work, *, jobs, compiler_cache):
         assert (compiler / "manifest.json").exists()
         assert archive == libc == cached
         result = product("platform", work)
@@ -135,7 +136,7 @@ def product_graph(tmp_path, monkeypatch):
         path.write_text(json.dumps(manifest))
         return result
 
-    def cpython(archive, helper, tooling, platform, compiler, make, work):
+    def cpython(archive, helper, tooling, platform, compiler, make, work, *, jobs, compiler_cache):
         assert helper == make == tool.path
         assert (tooling / "lib/clang/23/include/stddef.h").is_file()
         assert (platform / "manifest.json").exists() and (compiler / "manifest.json").exists()
@@ -201,15 +202,17 @@ def test_missing_products_use_existing_producers_and_repeat_without_build(produc
     assert list((store / "materialized-sdks").glob("*.json"))
 
 
-def test_native_materialization_omits_python_and_resolver_and_rejects_corruption(product_graph):
+def test_native_materialization_omits_python_and_resolver_and_trusts_cached_products(product_graph, monkeypatch):
     store, calls, _, _ = product_graph
     sdk.materialize(store, Graph((), ()), store, offline=True)
     assert calls == ["compiler", "platform"]
-    record = json.loads((store / "sdk-products/fixture/compiler.json").read_text())
-    (Path(record["product"]["root"]) / "bin/clang").write_bytes(b"corrupt")
+
+    def reject_scan(*args):
+        pytest.fail("cached products must not be rescanned")
+
+    monkeypatch.setattr(sdk, "verify_node", reject_scan)
     calls.clear()
-    with pytest.raises(ValueError):
-        sdk.materialize(store, Graph((), ()), store, offline=True)
+    sdk.materialize(store, Graph((), ()), store, offline=True)
     assert not calls
 
 
@@ -245,11 +248,8 @@ def test_producer_policy_change_rebuilds_its_product_and_dependents(product_grap
     )
     monkeypatch.setattr(sdk, "definition", lambda *_args: replace(definition, products=changed))
     calls.clear()
-    # The fixture producer emits its old recipe, which must fail admission; the
-    # changed input must reach that producer instead of failing on a stale hit.
-    with pytest.raises(ValueError):
-        sdk.materialize(store, Graph((), ()), store, offline=True)
-    assert calls == ["compiler"]
+    sdk.materialize(store, Graph((), ()), store, offline=True)
+    assert calls == ["compiler", "platform"]
 
 
 def test_missing_host_compiler_fails_with_a_specific_prerequisite(product_graph, monkeypatch):
@@ -324,13 +324,13 @@ def test_failed_nonresumable_producer_retries_in_a_fresh_attempt(product_graph, 
     actual = dynamic.build
     attempts = []
 
-    def failing_once(archive, libc, compiler, cmake, ninja, work):
+    def failing_once(archive, libc, compiler, cmake, ninja, work, **settings):
         attempts.append(work)
         if len(attempts) == 1:
             work.mkdir(parents=True)
             (work / "failure.log").write_text("interrupted fixture build")
             raise RuntimeError("fixture interruption")
-        return actual(archive, libc, compiler, cmake, ninja, work)
+        return actual(archive, libc, compiler, cmake, ninja, work, **settings)
 
     monkeypatch.setattr(dynamic, "build", failing_once)
     with pytest.raises(RuntimeError, match="fixture interruption"):
@@ -348,9 +348,9 @@ def test_llvm_patch_update_reuses_the_producers_retained_workspace(product_graph
     actual = compiler.build
     workspaces = []
 
-    def observed(archive, cc, cxx, cmake, ninja, work):
+    def observed(archive, cc, cxx, cmake, ninja, work, **settings):
         workspaces.append(work)
-        return actual(archive, cc, cxx, cmake, ninja, work)
+        return actual(archive, cc, cxx, cmake, ninja, work, **settings)
 
     monkeypatch.setattr(compiler, "build", observed)
     sdk.materialize(store, Graph((), ()), store, offline=True)
