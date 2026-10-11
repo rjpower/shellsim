@@ -1,0 +1,39 @@
+{
+  "name": "rich",
+  "version": "15.0.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/82/3b/64d4899d73f91ba49a8c18a8ff3f0ea8f1c1d75481760df8c68ef5235bf5/rich-15.0.0-py3-none-any.whl",
+    "sha256": "33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb",
+    "filename": "rich-15.0.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9.0",
+  "requires_dist": [
+    "ipywidgets (>=7.5.1,<9) ; extra == \"jupyter\"",
+    "markdown-it-py (>=2.2.0)",
+    "pygments (>=2.13.0,<3.0.0)"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/markdown-it-py",
+      "version": "4.2.0"
+    },
+    {
+      "port": "python/pygments",
+      "version": "2.19.2"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

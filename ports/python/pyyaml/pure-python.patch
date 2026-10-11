@@ -1,0 +1,27 @@
+--- a/setup.py
++++ b/setup.py
+@@ -347,11 +347,7 @@
+
+         package_dir={'': 'lib'},
+         packages=['yaml', '_yaml'],
+-        ext_modules=[
+-            Extension('yaml._yaml', ['yaml/_yaml.pyx'],
+-                'libyaml', "LibYAML bindings", LIBYAML_CHECK,
+-                libraries=['yaml']),
+-        ],
++        ext_modules=[],
+
+         distclass=Distribution,
+         cmdclass=cmdclass,
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,8 +1,4 @@
+ [build-system]
+-requires = [
+-    "setuptools",  # FIXME: declare min/max setuptools versions?
+-    "Cython; python_version < '3.13'",
+-    "Cython>=3.0; python_version >= '3.13'"
+-]
++requires = ["setuptools"]
+ backend-path = ["packaging"]
+ build-backend = "_pyyaml_pep517"

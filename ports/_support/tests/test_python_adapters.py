@@ -214,6 +214,28 @@ def test_backend_output_rejects_changed_runtime_dependencies_and_relocation(tmp_
     assert not (stage / "example-1.0.dist-info/shellsim-native.json").exists()
 
 
+@pytest.mark.parametrize("name", ["example", "Example", "EXAMPLE", "different"])
+def test_backend_distribution_identity_ignores_case(tmp_path, name):
+    from ports._support.python_pep517 import PEP517BuildRequest, _stage_wheel
+
+    extension = _extension_request(tmp_path)
+    request = PEP517BuildRequest(extension.context, extension.cpython, tmp_path / "sysconfig.py", extension.recipe, ())
+    wheel = tmp_path / "example-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example.py", "VALUE = 42\n")
+        archive.writestr("example-1.0.dist-info/METADATA", f"Name: {name}\nVersion: 1.0\n")
+        archive.writestr("example-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("example-1.0.dist-info/RECORD", "")
+    stage = tmp_path / "wheel-root"
+    stage.mkdir()
+    if name == "different":
+        with pytest.raises(ValueError):
+            _stage_wheel(wheel, stage, request)
+        return
+    _stage_wheel(wheel, stage, request)
+    assert (stage / "example.py").read_text() == "VALUE = 42\n"
+
+
 @pytest.mark.parametrize(
     "table",
     ["build-system = []", "[build-system]\nbuild-backend = 42", "[build-system]\nrequires = []\nbuild-backend = 42"],

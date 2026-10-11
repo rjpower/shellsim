@@ -1,0 +1,94 @@
+{
+  "name": "reasoning-gym",
+  "version": "0.1.25",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/42/21/bb9f6d2f76424f8b516fe83f8026e52e466b0202341bb4ee7a9861e06277/reasoning_gym-0.1.25-py3-none-any.whl",
+    "sha256": "7f17a3eddb13c015d7d4a755ed576a061df889faf9468bcc2cca334ebe9e0435",
+    "filename": "reasoning_gym-0.1.25-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "arckit==0.1.0",
+    "bfi==1.0.4",
+    "cellpylib==2.4.0",
+    "magiccube==0.3.0",
+    "pycosat==0.6.6",
+    "pyfiglet==1.0.2",
+    "pytz>=2024.1",
+    "pyyaml>=6.0.2",
+    "sympy>=1.13.1",
+    "tabulate==0.9.0",
+    "zss>=1.2.0",
+    "httpx>=0.27.0; extra == 'cli'",
+    "pyyaml>=6.0.1; extra == 'cli'",
+    "rich>=13.7.0; extra == 'cli'",
+    "typer>=0.9.0; extra == 'cli'",
+    "datasets>=3.5.0; extra == 'scripts'",
+    "fastapi>=0.109.0; extra == 'server'",
+    "pydantic-settings>=2.1.0; extra == 'server'",
+    "uvicorn>=0.27.0; extra == 'server'",
+    "httpx>=0.27.0; extra == 'test'",
+    "pytest-cov>=4.0.0; extra == 'test'",
+    "pytest>=7.0.0; extra == 'test'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/arckit",
+      "version": "0.1.0"
+    },
+    {
+      "port": "python/bfi",
+      "version": "1.0.4"
+    },
+    {
+      "port": "python/cellpylib",
+      "version": "2.4.0"
+    },
+    {
+      "port": "python/magiccube",
+      "version": "0.3.0"
+    },
+    {
+      "port": "python/pycosat",
+      "version": "0.6.6"
+    },
+    {
+      "port": "python/pyfiglet",
+      "version": "1.0.2"
+    },
+    {
+      "port": "python/pytz",
+      "version": "2026.5"
+    },
+    {
+      "port": "python/pyyaml",
+      "version": "6.0.3"
+    },
+    {
+      "port": "python/sympy",
+      "version": "1.13.3"
+    },
+    {
+      "port": "python/tabulate",
+      "version": "0.9.0"
+    },
+    {
+      "port": "python/zss",
+      "version": "1.2.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

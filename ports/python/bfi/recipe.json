@@ -1,0 +1,26 @@
+{
+  "name": "bfi",
+  "version": "1.0.4",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/a4/47/6a303e4e0fadf5b8604b229b84f786a3f02bf8825468ca29c1e8a2201cea/bfi-1.0.4-py3-none-any.whl",
+    "sha256": "d58a10b1f3ba2c7cfd9a9ebba3756455850a0cf9e63223c67e88438676c28579",
+    "filename": "bfi-1.0.4-py3-none-any.whl"
+  },
+  "requires_python": ">=3.13",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
