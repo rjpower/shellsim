@@ -1,0 +1,32 @@
+{
+  "name": "itsdangerous",
+  "version": "2.2.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/04/96/92447566d16df59b2a776c0fb82dbc4d9e07cd95062562af01e408583fc4/itsdangerous-2.2.0-py3-none-any.whl",
+    "sha256": "c6242fc49e35958c8b15141343aa660db5fc54d4f13a1db01a3f5891b98700ef",
+    "filename": "itsdangerous-2.2.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [],
+  "runtime_dependencies": [
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

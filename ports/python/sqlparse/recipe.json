@@ -1,0 +1,30 @@
+{
+  "name": "sqlparse",
+  "version": "0.6.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/d9/50/f00935da0ec7cbf325f8dc4f772ae46fbc7b672dd62876e73f0a94adda57/sqlparse-0.6.0-py3-none-any.whl",
+    "sha256": "b861c0288ce2fa56209a9a6412d2e066ac664b3873b89c26c9d8415e8e32996f",
+    "filename": "sqlparse-0.6.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "build; extra == 'dev'",
+    "furo; extra == 'doc'",
+    "sphinx; extra == 'doc'"
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

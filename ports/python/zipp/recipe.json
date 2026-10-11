@@ -1,0 +1,45 @@
+{
+  "name": "zipp",
+  "version": "4.1.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/b5/98/df615823cd9419131ce19fba00de53a663794369e198aade064a244b385d/zipp-4.1.1-py3-none-any.whl",
+    "sha256": "8979f52d874162f485ff2981e3891f3a3317b7a3dd43ff1e1775b9304f307a9c",
+    "filename": "zipp-4.1.1-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "pytest!=8.1.*,>=6; extra == \"test\"",
+    "jaraco.itertools; extra == \"test\"",
+    "jaraco.functools; extra == \"test\"",
+    "more_itertools; extra == \"test\"",
+    "big-O; extra == \"test\"",
+    "pytest-ignore-flaky; extra == \"test\"",
+    "jaraco.test; extra == \"test\"",
+    "sphinx>=3.5; extra == \"doc\"",
+    "jaraco.packaging>=9.3; extra == \"doc\"",
+    "rst.linker>=1.9; extra == \"doc\"",
+    "furo; extra == \"doc\"",
+    "sphinx-lint; extra == \"doc\"",
+    "jaraco.tidelift>=1.4; extra == \"doc\"",
+    "pytest-checkdocs>=2.14; extra == \"check\"",
+    "pytest-ruff>=0.2.1; sys_platform != \"cygwin\" and extra == \"check\"",
+    "pytest-cov; extra == \"cover\"",
+    "pytest-enabler>=3.4; extra == \"enabler\"",
+    "pytest-mypy>=1.0.1; platform_python_implementation != \"PyPy\" and extra == \"type\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

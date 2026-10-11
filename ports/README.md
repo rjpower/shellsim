@@ -415,6 +415,10 @@ recipe integrity, build inputs, and failure handling. Guest tests import or link
 the actual package, exercise useful behavior, and include invalid-input cases.
 Avoid tests that copy recipe values, enumerate archive members, count extensions,
 or match patched source text. Verify the installed package's behavior instead.
+Use `test_extras` to select upstream Python extras needed by a guest probe, for
+example `["pandas"]` for Narwhals' Pandas adapter. Supply their artifacts through
+runtime dependency edges; the extra selects their installation through upstream
+wheel metadata. A runtime edge alone only makes a product available in the release.
 Archive checks should enforce integrity or safe extraction; dependency checks
 should exercise resolution, compatibility, or link ordering.
 Shared helpers in `_support/testing.py` mount verified bundles and install through
