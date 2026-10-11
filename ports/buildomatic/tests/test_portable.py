@@ -99,7 +99,7 @@ def sdk_fixture(tmp_path, monkeypatch):
     native = write(tmp_path / "host-native", "sh", b"native-tool", 0o755)
     hosts = {"sh": {"path": str(native), "sha256": file_hash(native), "receipt": None}}
 
-    def create(python=False, host_python=False):
+    def create(python=False, host_python=False, host_aliases=None):
         cpython = runtime = None
         if python:
             root = tmp_path / "original-cpython"
@@ -144,6 +144,8 @@ def sdk_fixture(tmp_path, monkeypatch):
                 ("home = " + str(base / "bin") + "\ninclude-system-site-packages = false\n").encode(),
             )
             write(environment, "lib/python3.13/site-packages/package/__init__.py", b"package closure")
+            for alias, target in (host_aliases or {}).items():
+                (environment / alias).symlink_to(target, target_is_directory=True)
             value = {
                 "schema_version": 2,
                 "kind": "host-tool-files",
@@ -152,7 +154,7 @@ def sdk_fixture(tmp_path, monkeypatch):
                 "root": str(environment),
                 "executable": "bin/python",
                 "files": hashes(environment),
-                "symlinks": {},
+                "symlinks": host_aliases or {},
                 "source": {"definition": definition()["python"], "base_python": python_closure(environment, base)},
             }
             host_receipt = proof(tmp_path / "host-receipts", value, "python.json")
@@ -254,6 +256,104 @@ def test_host_python_closure_and_receipts_keep_absolute_roots(tmp_path, sdk_fixt
     with pytest.raises(ValueError):
         import_sdk(descriptor, tmp_path / "other", bindings={root_name: tmp_path / "relocated-host"})
     assert not (tmp_path / "other").exists()
+
+
+@pytest.mark.parametrize("kind", ["relative", "absolute", "chain"])
+def test_host_directory_alias_round_trip_preserves_declared_closure(tmp_path, sdk_fixture, kind):
+    environment = tmp_path / "host-environment"
+    aliases = {"lib64": str(environment / "lib") if kind == "absolute" else "lib"}
+    if kind == "chain":
+        aliases["lib-alias"] = "lib64"
+    context = sdk_fixture(host_python=True, host_aliases=aliases)
+    receipt_bytes = context.host_tools["python"].receipt_path.read_bytes()
+    config_bytes = (environment / "pyvenv.cfg").read_bytes()
+    environment.chmod(0o755)
+    (environment / "lib").chmod(0o755)
+    (environment / "lib/unrelated").mkdir()
+    descriptor = export_sdk(context, tmp_path / "export")
+    root = next(value for value in load(descriptor)["roots"].values() if value["path"] == str(environment))
+    assert root["symlinks"] == aliases
+    assert "lib" in root["directories"]
+    assert "lib/unrelated" not in root["directories"]
+    assert all(not name.startswith("lib64/") for name in root["files"])
+    for path in (environment, *environment.rglob("*")):
+        if path.is_dir() and not path.is_symlink():
+            path.chmod(0o755)
+    shutil.rmtree(environment)
+    imported = import_sdk(descriptor, tmp_path / "fresh", bindings=original_root_bindings(descriptor))
+    assert imported.host_tools == context.host_tools
+    assert imported.host_tools["python"].receipt_path.read_bytes() == receipt_bytes
+    assert (environment / "pyvenv.cfg").read_bytes() == config_bytes
+    assert all(os.readlink(environment / name) == target for name, target in aliases.items())
+    assert (environment / "lib64/python3.13/site-packages/package/__init__.py").read_bytes() == b"package closure"
+    assert not (environment / "lib/unrelated").exists()
+
+
+@pytest.mark.parametrize("kind", ["tamper", "missing", "missing-alias", "escape", "cycle", "parent", "product"])
+def test_host_directory_alias_descriptor_frontiers(tmp_path, sdk_fixture, kind):
+    descriptor = export_sdk(sdk_fixture(host_python=True, host_aliases={"lib64": "lib"}), tmp_path / "export")
+    value = load(descriptor)
+    root = next(root for root in value["roots"].values() if root["path"] == str(tmp_path / "host-environment"))
+    if kind == "tamper":
+        root["symlinks"]["lib64"] = "bin"
+    elif kind == "missing":
+        root["directories"].pop("lib")
+    elif kind == "missing-alias":
+        root["symlinks"].pop("lib64")
+    elif kind == "escape":
+        root["symlinks"]["lib64"] = "../host-base/lib"
+    elif kind == "cycle":
+        root["symlinks"].update({"lib64": "lib-alias", "lib-alias": "lib64"})
+    elif kind == "parent":
+        root["files"]["lib64/injected"] = next(iter(root["files"].values()))
+    else:
+        value["roots"]["llvm"]["symlinks"]["lib64"] = "bin"
+    rewrite(descriptor, value)
+    with pytest.raises(ValueError):
+        import_sdk(descriptor, tmp_path / "fresh")
+    assert not (tmp_path / "fresh").exists()
+
+
+@pytest.mark.parametrize("target", ["bin", "../host-base/lib", None])
+def test_host_directory_alias_mount_tamper_is_not_overwritten(tmp_path, sdk_fixture, target):
+    descriptor = export_sdk(sdk_fixture(host_python=True, host_aliases={"lib64": "lib"}), tmp_path / "export")
+    environment = tmp_path / "host-environment"
+    environment.chmod(0o755)
+    alias = environment / "lib64"
+    alias.unlink()
+    if target is not None:
+        alias.symlink_to(target, target_is_directory=True)
+    with pytest.raises(ValueError):
+        import_sdk(descriptor, tmp_path / "fresh")
+    if target is None:
+        assert not alias.exists()
+    else:
+        assert os.readlink(alias) == target
+    assert not (tmp_path / "fresh").exists()
+
+
+def test_directory_alias_export_cannot_select_an_undeclared_directory(tmp_path):
+    from ports.buildomatic.portable import _inventory
+
+    root = tmp_path / "host"
+    write(root, "bin/python")
+    (root / "unselected").mkdir()
+    (root / "lib64").symlink_to("unselected", target_is_directory=True)
+    with pytest.raises(ValueError):
+        _inventory(root, {"bin/python": file_hash(root / "bin/python")}, {"lib64": "unselected"}, stable=True)
+
+
+def test_host_directory_alias_inventory_does_not_traverse_unselected_files(tmp_path):
+    from ports.buildomatic.portable import _inventory
+
+    root = tmp_path / "host"
+    selected = write(root, "lib/package/__init__.py", b"declared package")
+    write(root, "lib/unselected.py", b"exclude undeclared file")
+    (root / "lib64").symlink_to("lib", target_is_directory=True)
+    inventory = _inventory(root, {"lib/package/__init__.py": file_hash(selected)}, {"lib64": "lib"}, stable=True)
+    assert set(inventory.files) == {"lib/package/__init__.py"}
+    assert inventory.symlinks == {"lib64": "lib"}
+    assert set(inventory.directories) == {".", "lib", "lib/package"}
 
 
 def test_explicit_original_bindings_preserve_flags_and_verify_mounts(tmp_path, sdk_fixture):

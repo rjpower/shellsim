@@ -93,7 +93,7 @@ def _blob(directory: Path, digest: str) -> Path:
 
 
 def _alias_target(name: str, aliases: Mapping[str, str], root: Path, stable: bool) -> str:
-    """Resolve file alias chains lexically without following host filesystem links."""
+    """Resolve alias chains lexically without following host filesystem links."""
     visited = set()
     while name in aliases:
         if name in visited:
@@ -137,7 +137,11 @@ def _stream(source: Path, destination: Path, expected: FileEntry, limits: Portab
 def _inventory(
     root: Path, files: Mapping[str, str], aliases: Mapping[str, str], *, stable: bool = False
 ) -> RootInventory:
-    """Select declared files and internal alias targets, excluding unrelated work."""
+    """Select declared files and aliases without traversing host directory aliases.
+
+    Stable hosts may alias directories already selected as inventory parents;
+    products retain their existing regular-file alias requirement.
+    """
     root = root.resolve()
     regular = {}
     links = dict(aliases)
@@ -155,14 +159,17 @@ def _inventory(
             raise ValueError("portable alias escapes its product root")
         if path.is_symlink():
             links[name] = os.readlink(path)
-            if not path.resolve().is_file():
-                raise ValueError("portable aliases must resolve to regular files")
-            target = Path(links[name])
-            pending.append(
-                target.relative_to(root).as_posix()
-                if target.is_absolute()
-                else os.path.normpath(str(Path(name).parent / target))
-            )
+            if path.resolve().is_file():
+                target = Path(links[name])
+                pending.append(
+                    target.relative_to(root).as_posix()
+                    if target.is_absolute()
+                    else os.path.normpath(str(Path(name).parent / target))
+                )
+            elif not stable or not path.resolve().is_dir() or name in files:
+                raise ValueError("unsupported portable alias target")
+            # Directory aliases reuse selected parents; never traverse them to
+            # add files or otherwise extend an admitted host package closure.
             if name in files and file_hash(path) != files[name]:
                 raise ValueError("portable alias bytes differ")
         else:
@@ -173,6 +180,14 @@ def _inventory(
             if name in files and digest != files[name]:
                 raise ValueError("portable inventory differs from its receipt")
             regular[name] = FileEntry(digest, info.st_size, stat.S_IMODE(info.st_mode) & 0o777)
+    for name in (*regular, *links):
+        for parent in _relative(name).parents:
+            if parent == Path("."):
+                break
+            path = root / parent
+            if path.is_symlink():
+                raise ValueError("portable inventory has a symlink parent")
+            directories[parent.as_posix()] = stat.S_IMODE(path.stat().st_mode) & 0o777
     for name, target in links.items():
         _relative(name)
         path = root / name
@@ -182,16 +197,8 @@ def _inventory(
         if (Path(target).is_absolute() and not stable) or not path.resolve().is_relative_to(root) or not path.exists():
             raise ValueError("unsupported portable alias")
         canonical = path.resolve().relative_to(root).as_posix()
-        if canonical not in regular:
+        if canonical not in regular and not (stable and canonical in directories):
             raise ValueError("portable alias target is outside selected inventory")
-    for name in (*regular, *links):
-        for parent in _relative(name).parents:
-            if parent == Path("."):
-                break
-            path = root / parent
-            if path.is_symlink():
-                raise ValueError("portable inventory has a symlink parent")
-            directories[parent.as_posix()] = stat.S_IMODE(path.stat().st_mode) & 0o777
     return RootInventory(str(root), stable, regular, links, directories)
 
 
@@ -394,8 +401,8 @@ def _validate(value: dict, limits: PortableLimits) -> dict[str, RootInventory]:
         for relative in aliases:
             _relative(relative)
             normalized = _alias_target(relative, aliases, Path(item["path"]), item["stable"])
-            if normalized not in files:
-                raise ValueError("portable alias target is not a selected regular file")
+            if normalized not in files and not (item["stable"] and normalized in directories):
+                raise ValueError("portable alias target is outside selected inventory")
         for relative in (*files, *aliases, *directories):
             if relative == ".":
                 continue
