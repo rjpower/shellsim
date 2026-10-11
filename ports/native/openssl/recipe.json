@@ -1,0 +1,63 @@
+{
+  "name": "openssl",
+  "version": "3.5.9",
+  "kind": "native-library",
+  "role": "target-library",
+  "build_system": "configure-make",
+  "sdk": "default",
+  "linkage": "static",
+  "source": {
+    "url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+    "filename": "openssl-3.5.9.tar.gz",
+    "sha256": "603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a",
+    "subdirectory": "openssl-3.5.9"
+  },
+  "target_dependencies": [
+    {
+      "port": "native/shellsim-posix",
+      "version": "1"
+    }
+  ],
+  "exports": {
+    "archives": [
+      "lib/libssl.a",
+      "lib/libcrypto.a"
+    ],
+    "licenses": [
+      "licenses/openssl.txt"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include"
+    ]
+  },
+  "needed_libraries": [],
+  "source_exports": [
+    {
+      "source": "LICENSE.txt",
+      "destination": "licenses/openssl.txt"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/digest.c",
+      "link_inputs": [
+        "lib/libcrypto.a",
+        "lib/libshellsim-posix.a"
+      ],
+      "sdk_link_inputs": [
+        "lib/wasm32-wasip1-threads/libwasi-emulated-signal.a"
+      ],
+      "link_flags": [
+        "-Wl,--wrap=signal,--wrap=open,--wrap=openat"
+      ]
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
