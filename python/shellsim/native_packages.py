@@ -13,14 +13,16 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from packaging.requirements import Requirement
 from packaging.utils import canonicalize_name
 from packaging.version import Version
 
-from ._api import Environment, _NativeInstallation
 from .pypi import PackageInstallError, _mount_package_tree
+
+if TYPE_CHECKING:
+    from ._api import Environment
 
 _MAX_JSON = 1024 * 1024
 _MAX_PACKAGES = 256
@@ -569,6 +571,8 @@ class _NativePackageUniverse:
                     destination = "/" + directory.relative_to(staging).as_posix()
                     directory.chmod(directories.get(destination, 0o755))
             _mount_package_tree(environment, staging, "/", replace_builtin_tools=tools)
+        from ._api import _NativeInstallation
+
         environment._native_installation = _NativeInstallation(
             installed.artifacts | identities, cumulative, cumulative_directories
         )
