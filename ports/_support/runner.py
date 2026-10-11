@@ -621,6 +621,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
     args = parser.parse_args()
+    if args.backend != "local" and not 1 <= args.max_workers <= 32:
+        parser.error("distributed builds require 1..32 workers")
     if args.backend != "local" and args.output is not None:
         parser.error(
             "distributed builds emit cache manifests; use ports.buildomatic.ports.publish_manifest for releases"

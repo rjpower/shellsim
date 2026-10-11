@@ -5,6 +5,7 @@ same-name admission. Bridge spies reject setup before invalid count admission.
 """
 
 import json
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -207,3 +208,80 @@ def test_worker_count_bounds_preserve_local_default(tmp_path, monkeypatch, count
     assert bridge.run_graph(tmp_path, [], None, tmp_path, **kwargs) is result
     assert accepted == [expected]
     assert roots == [tmp_path / f"buildomatic/worker-{index}" for index in range(expected)]
+
+
+@pytest.mark.parametrize("backend", ["local", "buildomatic", "iris"])
+@pytest.mark.parametrize("count", ["0", "33", "-1", str(10**100), "True", "1.0", "1", "32"])
+def test_cli_worker_count_preflight_precedes_graph_and_sdk_setup(tmp_path, monkeypatch, backend, count):
+    from ports._support import runner, sdk
+    from ports.buildomatic import portable
+    from ports.buildomatic import ports as bridge
+    from ports.buildomatic.backends import iris
+
+    calls = []
+    context = object()
+    graph = SimpleNamespace(ports=(SimpleNamespace(recipe={"build_system": "python-extension"}),))
+
+    def spy(name, result):
+        def invoke(*args, **kwargs):
+            calls.append(name)
+            return result
+
+        return invoke
+
+    def execute(ports, requests, sdk_context, store, **kwargs):
+        calls.append("execute")
+        assert sdk_context is context
+        if backend == "local":
+            assert "max_workers" not in kwargs
+        else:
+            assert kwargs["max_workers"] == int(count)
+        return SimpleNamespace(results={})
+
+    def reject_setup(*args, **kwargs):
+        calls.append("unexpected setup")
+        raise AssertionError("CLI spy reached preparation, connection or writes")
+
+    monkeypatch.setattr(runner, "plan", spy("graph", graph))
+    monkeypatch.setattr(sdk, "materialize", spy("materialize", context))
+    monkeypatch.setattr(portable, "original_root_bindings", spy("bindings", {}))
+    monkeypatch.setattr(portable, "import_sdk", spy("import", context))
+    monkeypatch.setattr(runner, "build_graph", execute)
+    monkeypatch.setattr(bridge, "run_graph", execute)
+    monkeypatch.setattr(bridge, "prepare_graph", reject_setup)
+    monkeypatch.setattr(iris, "backend_context_factory", reject_setup)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ports",
+            "native/example",
+            "--store",
+            str(tmp_path / "store"),
+            "--backend",
+            backend,
+            "--max-workers",
+            count,
+            "--sdk-descriptor",
+            str(tmp_path / "sdk.json"),
+            "--iris-service",
+            str(tmp_path / "iris.json"),
+        ],
+    )
+    accepted = count in {"1", "32"} or (backend == "local" and count not in {"True", "1.0"})
+    with monkeypatch.context() as guarded:
+        for method in ("mkdir", "open", "write_text", "write_bytes"):
+            guarded.setattr(type(tmp_path), method, reject_setup)
+        if accepted:
+            runner.main()
+        else:
+            with pytest.raises(SystemExit) as error:
+                runner.main()
+            assert error.value.code == 2
+    expected = []
+    if accepted:
+        expected = (
+            ["graph", "materialize", "execute"] if backend == "local" else ["graph", "bindings", "import", "execute"]
+        )
+    assert calls == expected
+    assert list(tmp_path.iterdir()) == []
