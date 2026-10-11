@@ -1,0 +1,80 @@
+{
+  "name": "fastapi",
+  "version": "0.136.3",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/e0/82/45359b62a067409bd929ae8a56b8ed13e5a8c8a61194b3c236920999ab83/fastapi-0.136.3-py3-none-any.whl",
+    "filename": "fastapi-0.136.3-py3-none-any.whl",
+    "sha256": "3d2a69bdf04b7e9f3afa292c3bc7a98816bbfafa10bc9b45f3f3700d2f761620"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "starlette>=0.46.0",
+    "pydantic>=2.9.0",
+    "typing-extensions>=4.8.0",
+    "typing-inspection>=0.4.2",
+    "annotated-doc>=0.0.2",
+    "fastapi-cli[standard]>=0.0.8; extra == \"standard\"",
+    "fastar>=0.9.0; extra == \"standard\"",
+    "httpx<1.0.0,>=0.23.0; extra == \"standard\"",
+    "jinja2>=3.1.5; extra == \"standard\"",
+    "python-multipart>=0.0.18; extra == \"standard\"",
+    "email-validator>=2.0.0; extra == \"standard\"",
+    "uvicorn[standard]>=0.12.0; extra == \"standard\"",
+    "pydantic-settings>=2.0.0; extra == \"standard\"",
+    "pydantic-extra-types>=2.0.0; extra == \"standard\"",
+    "fastapi-cli[standard-no-fastapi-cloud-cli]>=0.0.8; extra == \"standard-no-fastapi-cloud-cli\"",
+    "httpx<1.0.0,>=0.23.0; extra == \"standard-no-fastapi-cloud-cli\"",
+    "jinja2>=3.1.5; extra == \"standard-no-fastapi-cloud-cli\"",
+    "python-multipart>=0.0.18; extra == \"standard-no-fastapi-cloud-cli\"",
+    "email-validator>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+    "uvicorn[standard]>=0.12.0; extra == \"standard-no-fastapi-cloud-cli\"",
+    "pydantic-settings>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+    "pydantic-extra-types>=2.0.0; extra == \"standard-no-fastapi-cloud-cli\"",
+    "fastapi-cli[standard]>=0.0.8; extra == \"all\"",
+    "httpx<1.0.0,>=0.23.0; extra == \"all\"",
+    "jinja2>=3.1.5; extra == \"all\"",
+    "python-multipart>=0.0.18; extra == \"all\"",
+    "itsdangerous>=1.1.0; extra == \"all\"",
+    "pyyaml>=5.3.1; extra == \"all\"",
+    "email-validator>=2.0.0; extra == \"all\"",
+    "uvicorn[standard]>=0.12.0; extra == \"all\"",
+    "pydantic-settings>=2.0.0; extra == \"all\"",
+    "pydantic-extra-types>=2.0.0; extra == \"all\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/starlette",
+      "version": "1.7.0"
+    },
+    {
+      "port": "python/pydantic",
+      "version": "2.14.0"
+    },
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    },
+    {
+      "port": "python/typing-inspection",
+      "version": "0.4.4"
+    },
+    {
+      "port": "python/annotated-doc",
+      "version": "0.0.5"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

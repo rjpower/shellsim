@@ -4,6 +4,7 @@ import json
 import subprocess
 import sys
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,18 +14,52 @@ from ports._support import runner
 from ports._support.build_context import BuildContext
 from ports._support.native_adapters import CompilerCacheLauncher, NativeBuildContext
 from ports._support.python_adapters import CPythonBuildContext
-from ports._support.python_rust import build_rust_extension, linker_script
+from ports._support.python_rust import build_rust_extension, generated_file, linker_script
 from ports._support.rust_tools import run_cargo, rust_environment
 from ports._support.store import file_hash, identity
 
 
-def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, monkeypatch):
+def test_shared_generated_file_is_complete_and_executable_when_published(tmp_path, monkeypatch):
+    from ports._support import python_rust
+
+    path = tmp_path / "tools/linker"
+    replace_file = python_rust.os.replace
+    seen = []
+
+    def publish(source, destination):
+        assert destination == path
+        assert not destination.exists()
+        assert source.read_text() == "complete\n"
+        assert source.stat().st_mode & 0o111
+        seen.append(source)
+        replace_file(source, destination)
+
+    monkeypatch.setattr(python_rust.os, "replace", publish)
+    generated_file(path, "complete\n", executable=True)
+    generated_file(path, "complete\n", executable=True)
+    assert len(seen) == 1 and path.read_text() == "complete\n"
+    assert not seen[0].exists()
+
+
+@pytest.mark.parametrize("packaged", [False, True])
+def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, monkeypatch, packaged):
+    # The command is mocked; this directory holds only generated text fixtures.
+    monkeypatch.setenv("CARGO_TARGET_DIR", str(tmp_path / "generated"))
     source = tmp_path / "source"
     source.mkdir()
-    metadata = "Metadata-Version: 2.1\nName: example\nVersion: 1.0\n\nRust example\n"
+    name = "example-project" if packaged else "example"
+    dist = name.replace("-", "_") + "-1.0.dist-info"
+    module = "example._native" if packaged else "example"
+    extension_path = module.replace(".", "/") + ".so"
+    metadata = "Metadata-Version: 2.1\nName: " + name.replace("-", "_") + "\nVersion: 1.0\n\nRust example\n"
     (source / "PKG-INFO").write_text(metadata)
     (source / "LICENSE").write_text("upstream license\n")
     (source / "example.pyi").write_text("def value() -> int: ...\n")
+    if packaged:
+        package = source / "python/example"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("from ._native import value\n")
+        (package / "py.typed").touch()
     library = tmp_path / "example.wasm"
     library.write_bytes(b"\0asm\x01\0\0\0")
     stdlib = tmp_path / "stdlib"
@@ -63,7 +98,7 @@ def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, mo
         wheel_platform="wasm32_wasip1",
         receipt={"version": "3.13.7"},
     )
-    recipe = {"name": "example", "version": "1.0", "requires_dist": []}
+    recipe = {"name": name, "version": "1.0", "requires_dist": []}
     context = BuildContext(
         port=SimpleNamespace(recipe=recipe),
         source=source,
@@ -78,12 +113,15 @@ def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, mo
         "ports._support.python_rust.rust_tools", lambda *args: (Path("/rustc"), Path("/cargo"), None, None)
     )
 
+    configurations = []
+
     def compile(command, directory, environment, log):
         assert "--locked" in command and "--offline" in command
         assert directory == source
         assert str(stdlib) in environment["RUSTFLAGS"]
         assert environment["RUSTC_WRAPPER"] == "/usr/bin/sccache"
         assert environment["SCCACHE_BUCKET"] == "cache"
+        configurations.append((environment["PYO3_CONFIG_FILE"], environment["RUSTFLAGS"]))
         return SimpleNamespace(
             stdout=json.dumps(
                 {
@@ -95,18 +133,34 @@ def test_rust_wheel_contains_extension_metadata_licenses_and_record(tmp_path, mo
         )
 
     monkeypatch.setattr("ports._support.python_rust.run_cargo", compile)
-    output = build_rust_extension(context, module="example", licenses=("LICENSE",), stubs=("example.pyi",))
-    wheel = output.staging_prefix / "wheels/example-1.0-cp313-cp313-wasm32_wasip1.whl"
+
+    def build(selected):
+        return build_rust_extension(
+            selected,
+            module=module,
+            python_sources=(("python/example", "example"),) if packaged else (),
+            licenses=("LICENSE",),
+            stubs=("example.pyi",),
+        )
+
+    output = build(context)
+    wheel = output.staging_prefix / ("wheels/" + name.replace("-", "_") + "-1.0-cp313-cp313-wasm32_wasip1.whl")
     with zipfile.ZipFile(wheel) as archive:
-        assert archive.read("example.so").startswith(b"\0asm")
-        assert archive.read("example-1.0.dist-info/METADATA").decode() == metadata
+        assert archive.read(extension_path).startswith(b"\0asm")
+        assert archive.read(dist + "/METADATA").decode() == metadata
         assert archive.read("example.pyi").decode() == "def value() -> int: ...\n"
-        assert archive.read("example-1.0.dist-info/licenses/Rust-LICENSE-MIT") == b"Rust license\n"
-        manifest = json.loads(archive.read("example-1.0.dist-info/shellsim-native.json"))
+        if packaged:
+            assert archive.read("example/__init__.py").decode() == "from ._native import value\n"
+            assert archive.read("example/py.typed") == b""
+        assert archive.read(dist + "/licenses/Rust-LICENSE-MIT") == b"Rust license\n"
+        manifest = json.loads(archive.read(dist + "/shellsim-native.json"))
         assert manifest["cpython_receipt"] == python.receipt
-        assert manifest["artifacts"][0]["sha256"] == file_hash(native.build / "wheel/example.so")
-        record = archive.read("example-1.0.dist-info/RECORD").decode()
-        assert "example.so,sha256=" in record and "example.pyi,sha256=" in record
+        assert manifest["artifacts"][0]["path"] == extension_path
+        assert manifest["artifacts"][0]["sha256"] == file_hash(native.build / "wheel" / extension_path)
+        record = archive.read(dist + "/RECORD").decode()
+        assert extension_path + ",sha256=" in record and "example.pyi,sha256=" in record
+    build(replace(context, native=replace(native, build=tmp_path / "retry", staging_prefix=tmp_path / "retry-install")))
+    assert configurations[0] == configurations[1]
 
 
 def test_shared_link_uses_process_libc_and_discards_unused_exports(tmp_path):

@@ -1,0 +1,50 @@
+{
+  "name": "pydantic",
+  "version": "2.14.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/2d/eb/9146591cc819d040475bf7f2be786710c7f7eb8083693bf859728da2ca9c/pydantic-2.14.0-py3-none-any.whl",
+    "filename": "pydantic-2.14.0-py3-none-any.whl",
+    "sha256": "15fab1bea6f1dc5003b54fc2ecab230c1fd1dbade2acd4addc52d81e32416d4b"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "annotated-types>=0.6.0",
+    "pydantic-core==2.50.0",
+    "typing-extensions>=4.16.0",
+    "typing-inspection>=0.4.4",
+    "email-validator>=2.0.0; extra == 'email'",
+    "tzdata; (platform_system == 'Windows') and extra == 'timezone'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/annotated-types",
+      "version": "0.8.0"
+    },
+    {
+      "port": "python/pydantic-core",
+      "version": "2.50.0"
+    },
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    },
+    {
+      "port": "python/typing-inspection",
+      "version": "0.4.4"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

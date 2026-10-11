@@ -2,17 +2,21 @@
 
 import email
 import json
+import os
 import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from packaging.utils import canonicalize_name
 
 from ports._support.build_context import BuildContext
 from ports._support.native_adapters import NativeBuildCommand
 from ports._support.python_adapters import PythonBuildOutput, _source_file, _wheel
 from ports._support.rust_tools import run_cargo, rust_environment, rust_tools
-from ports._support.store import file_hash
+from ports._support.store import file_hash, identity
 from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import validate_provider_signatures
 
@@ -48,8 +52,29 @@ def linker_script(linker: Path, inputs: tuple[Path, ...]) -> str:
     )
 
 
+def generated_file(path: Path, contents: str, *, executable: bool = False) -> None:
+    """Publish immutable generated text atomically for concurrent Cargo users.
+
+    The caller keys the path by its contents. Existing complete entries need
+    no reads or rewrites; the executable mode is set before publication.
+    """
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".generated-", dir=path.parent) as temporary:
+        staged = Path(temporary) / path.name
+        staged.write_text(contents)
+        staged.chmod(0o755 if executable else 0o644)
+        os.replace(staged, path)
+
+
 def build_rust_extension(
-    ctx: BuildContext, *, module: str, licenses: tuple[str, ...], stubs: tuple[str, ...] = ()
+    ctx: BuildContext,
+    *,
+    module: str,
+    licenses: tuple[str, ...],
+    stubs: tuple[str, ...] = (),
+    python_sources: tuple[tuple[str, str], ...] = (),
 ) -> PythonBuildOutput:
     """Preserve source metadata and stage an ABI-marked native extension wheel."""
     native, python = ctx.require_native(), ctx.require_cpython()
@@ -62,15 +87,19 @@ def build_rust_extension(
     environment = rust_environment(ctx)
     rustc, cargo, _, _ = rust_tools("1.97.1", environment)
     native.build.mkdir(parents=True)
-    configuration = native.build / "pyo3-config.txt"
-    configuration.write_text(
+    configuration_text = (
         "implementation=CPython\nversion="
         + ".".join(python.version.split(".")[:2])
         + "\nshared=true\nabi3=false\npointer_width=32\nsuppress_build_script_link_lines=true\n"
     )
-    linker = native.build / "rust-shared-linker"
-    linker.write_text(linker_script(native.linker, native.shared_library_inputs))
-    linker.chmod(0o755)
+    linker_text = linker_script(native.linker, native.shared_library_inputs)
+    # Stable generated paths keep Cargo dependency fingerprints warm between
+    # private source workspaces. These keys cover text, not host executable bytes.
+    tools = Path(environment["CARGO_TARGET_DIR"]) / "shellsim-tools"
+    configuration = tools / identity({"pyo3": configuration_text}) / "pyo3-config.txt"
+    generated_file(configuration, configuration_text)
+    linker = tools / identity({"linker": linker_text}) / "rust-shared-linker"
+    generated_file(linker, linker_text, executable=True)
     stdlib = ctx.build_artifacts["toolchain/rust-stdlib"]
     scheduler = ctx.build_artifacts["toolchain/wasm-scheduler"] / "bin/shellsim-wasm-scheduler"
     environment.update(
@@ -107,7 +136,10 @@ def build_rust_extension(
         raise ValueError("Rust project must produce one target extension")
     stage = native.build / "wheel"
     stage.mkdir()
-    extension = stage / (module + ".so")
+    for source, destination in python_sources:
+        shutil.copytree(native.source / source, stage / destination)
+    extension = stage / (module.replace(".", "/") + ".so")
+    extension.parent.mkdir(parents=True, exist_ok=True)
     subprocess.run([str(scheduler), str(libraries[0]), str(extension), "shellsim_threads_v2"], check=True)
     mark_abi(extension, native.abi.encode())
     needed = validate_provider_signatures(extension, {})
@@ -115,7 +147,7 @@ def build_rust_extension(
     message = email.message_from_bytes(metadata.read_bytes())
     recipe = ctx.metadata
     if (
-        message["Name"] != recipe["name"]
+        canonicalize_name(message["Name"]) != canonicalize_name(recipe["name"])
         or message["Version"] != recipe["version"]
         or sorted(message.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", []))
     ):
@@ -142,7 +174,13 @@ def build_rust_extension(
         "abi": native.abi,
         "recipe": dict(recipe),
         "cpython_receipt": dict(python.receipt),
-        "artifacts": [{"path": extension.name, "sha256": file_hash(extension), "native_dependencies": needed}],
+        "artifacts": [
+            {
+                "path": extension.relative_to(stage).as_posix(),
+                "sha256": file_hash(extension),
+                "native_dependencies": needed,
+            }
+        ],
     }
     (info / "shellsim-native.json").write_text(json.dumps(manifest) + "\n")
     wheel = (
