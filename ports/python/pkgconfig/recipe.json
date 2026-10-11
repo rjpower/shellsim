@@ -1,0 +1,15 @@
+{
+  "name": "pkgconfig",
+  "version": "1.6.0",
+  "role": "host-tool",
+  "kind": "pure-wheel",
+  "build_system": "host-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/75/6f/f7ec07fba48f07c555cc4099481df644fbbc12067879072c17ac229f6556/pkgconfig-1.6.0-py3-none-any.whl",
+    "sha256": "98e71754855e9563838d952a160eb577edabb57782e49853edb5381927e6bea1",
+    "filename": "pkgconfig-1.6.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9.0,<4.0.0",
+  "requires_dist": [],
+  "build_dependencies": []
+}

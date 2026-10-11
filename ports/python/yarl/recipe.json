@@ -1,0 +1,68 @@
+{
+  "name": "yarl",
+  "version": "1.25.1",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/75/16/e8be8e2fb175bbf41a0680381a319f1199fae256588241a2ac8677eafb49/yarl-1.25.1.tar.gz",
+    "sha256": "03dd38de09bc213e9a8b29761eec33ee1d5318dac0e49d8af36e4d27830e23a7",
+    "filename": "yarl-1.25.1.tar.gz",
+    "subdirectory": "yarl-1.25.1"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "idna>=2.0",
+    "multidict>=4.0",
+    "propcache>=0.2.1"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/idna",
+      "version": "3.20"
+    },
+    {
+      "port": "python/multidict",
+      "version": "7.1.0"
+    },
+    {
+      "port": "python/propcache",
+      "version": "0.5.4"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build": {
+    "config_settings": {
+      "pure-python": "false"
+    }
+  },
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/expandvars",
+      "version": "1.1.2"
+    },
+    {
+      "port": "python/cython",
+      "version": "3.3.0"
+    }
+  ]
+}
