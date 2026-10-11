@@ -154,8 +154,8 @@ bundles create an isolated guest venv and install ABI-verified native or pure
 wheel dependencies from an explicit package universe. Mounting selects CPython
 for shell `python` and `python3` commands; `python3.14` remains the modeled VM.
 See [CPython WASI ports](ports/README.md) for build, mount, package installation,
-resource limits, and current capability limits. `Environment.run_python`
-continues to use shellsim's Python VM.
+resource limits, and current capability limits. `Environment.run_python` uses
+the mounted CPython interpreter when present, otherwise shellsim's Python VM.
 
 ## Clock modes
 
@@ -177,6 +177,14 @@ exported environment variables, the virtual clock, deterministic random bytes, a
 file access relative to the virtual working directory. It does not expose host files, processes,
 network, environment, or time. Invalid modules and imports outside the WASI namespace fail with a
 diagnostic. Unavailable WASI calls trap if reached; they never report fake success.
+
+Shellsim vendors the Wasmtime 49.0.0 crate with one runtime patch:
+`CallHook::FuelResume` runs after a fuel yield, before guest execution resumes.
+Threaded CPython uses this boundary to install newly loaded shared modules and
+callback bindings into each thread's Wasmtime Store. Upstream's host-call hooks
+do not cover a thread suspended by fuel while computing. See
+[the Wasmtime overlay rationale and maintenance contract](docs/wasmtime-overlay.md)
+for the patch, provenance, reproduction, and packaging limits.
 
 A Wasm executable runs as its own scheduled process on that process's virtual descriptors. A
 read or write that would block suspends the guest until the pipe or terminal is ready, so a guest

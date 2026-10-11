@@ -71,6 +71,16 @@ selected workload while retaining explicit memory and disk bounds.
 The current resolver installation helper uses host Python 3.13.7 or newer.
 Cache outputs have no retention promise; creating a release is explicit.
 
+Serve a storage prefix locally with `marin-rigging` installed:
+
+```sh
+uv run python ports/buildomatic/s3_proxy.py \
+  --prefix s3://my-bucket/ports
+```
+
+Rigging supplies cloud settings; editable installs need the Marin working
+directory. HTTP-encoded GCS objects return 501.
+
 Pure-wheel builds fetch no SDK. Other workers fetch just their consumed
 components: native builds need compiler/platform/tooling, Python builds add
 CPython, and resolver builds add Rust/resolver inputs. Installing a release

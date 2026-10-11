@@ -74,6 +74,9 @@ the intended behavior.
 
 ## Writing and pull requests
 
+- Keep README, AGENTS, and other documentation compact to preserve reader and agent context.
+  A few sentences and a minimal usage example suffice for a small tool; omit self-evident
+  behavior, repeated implementation details, and filler.
 - Use plain, sober technical English. Lead with the result, decision, or changed behavior and
   support claims with named evidence.
 - State scope, uncertainty, and limitations directly. Avoid hype, generic claims of importance,
