@@ -21,7 +21,7 @@ from ports.buildomatic import Action, BuildRequest, BuildState, InputMount, Loca
 from ports.buildomatic.artifacts import write_reference
 from ports.buildomatic.backends.iris import backend_context_factory
 from ports.buildomatic.ports import _stage_code, code_files
-from ports.buildomatic.sdk_artifacts import sdk_inputs
+from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 
 
 def main() -> None:
@@ -57,7 +57,11 @@ def main() -> None:
         required.add("resolver")
     with factory() as backend:
         cached = backend.resolve_artifact("sdk/" + sdk.name)
-        if cached and cached["inputs"] == sdk_inputs(args.ports, sdk.name) and required <= cached["products"].keys():
+        if (
+            cached
+            and sdk_inputs_match(cached["inputs"], sdk_inputs(args.ports, sdk.name))
+            and required <= cached["products"].keys()
+        ):
             write_reference(args.store / "sdk.json", cached)
             print("buildomatic: SDK cache hit " + sdk.name)
             return

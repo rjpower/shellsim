@@ -1,0 +1,43 @@
+{
+  "name": "openapi-schema-validator",
+  "version": "0.6.3",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/21/c6/ad0fba32775ae749016829dace42ed80f4407b171da41313d1a3a5f102e4/openapi_schema_validator-0.6.3-py3-none-any.whl",
+    "sha256": "f3b9870f4e556b5a62a1c39da72a6b4b16f3ad9c73dc80084b1b11e74ba148a3",
+    "filename": "openapi_schema_validator-0.6.3-py3-none-any.whl"
+  },
+  "requires_python": ">=3.8.0,<4.0.0",
+  "requires_dist": [
+    "jsonschema (>=4.19.1,<5.0.0)",
+    "jsonschema-specifications (>=2023.5.2)",
+    "rfc3339-validator"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/jsonschema",
+      "version": "4.26.0"
+    },
+    {
+      "port": "python/jsonschema-specifications",
+      "version": "2025.9.1"
+    },
+    {
+      "port": "python/rfc3339-validator",
+      "version": "0.1.4"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

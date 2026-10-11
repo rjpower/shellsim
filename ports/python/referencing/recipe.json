@@ -1,0 +1,39 @@
+{
+  "name": "referencing",
+  "version": "0.37.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/2c/58/ca301544e1fa93ed4f80d724bf5b194f6e4b945841c5bfd555878eea9fcb/referencing-0.37.0-py3-none-any.whl",
+    "sha256": "381329a9f99628c9069361716891d34ad94af76e461dcb0335825aecc7692231",
+    "filename": "referencing-0.37.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "attrs>=22.2.0",
+    "rpds-py>=0.7.0",
+    "typing-extensions>=4.4.0; python_version < '3.13'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/attrs",
+      "version": "26.1.0"
+    },
+    {
+      "port": "python/rpds-py",
+      "version": "2026.9.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "name": "jsonschema",
+  "version": "4.26.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/69/90/f63fb5873511e014207a475e2bb4e8b2e570d655b00ac19a9a0ca0a385ee/jsonschema-4.26.0-py3-none-any.whl",
+    "sha256": "d489f15263b8d200f8387e64b4c3a75f06629559fb73deb8fdfb525f2dab50ce",
+    "filename": "jsonschema-4.26.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "attrs>=22.2.0",
+    "jsonschema-specifications>=2023.03.6",
+    "referencing>=0.28.4",
+    "rpds-py>=0.25.0",
+    "fqdn; extra == 'format'",
+    "idna; extra == 'format'",
+    "isoduration; extra == 'format'",
+    "jsonpointer>1.13; extra == 'format'",
+    "rfc3339-validator; extra == 'format'",
+    "rfc3987; extra == 'format'",
+    "uri-template; extra == 'format'",
+    "webcolors>=1.11; extra == 'format'",
+    "fqdn; extra == 'format-nongpl'",
+    "idna; extra == 'format-nongpl'",
+    "isoduration; extra == 'format-nongpl'",
+    "jsonpointer>1.13; extra == 'format-nongpl'",
+    "rfc3339-validator; extra == 'format-nongpl'",
+    "rfc3986-validator>0.1.0; extra == 'format-nongpl'",
+    "rfc3987-syntax>=1.1.0; extra == 'format-nongpl'",
+    "uri-template; extra == 'format-nongpl'",
+    "webcolors>=24.6.0; extra == 'format-nongpl'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/attrs",
+      "version": "26.1.0"
+    },
+    {
+      "port": "python/jsonschema-specifications",
+      "version": "2025.9.1"
+    },
+    {
+      "port": "python/referencing",
+      "version": "0.37.0"
+    },
+    {
+      "port": "python/rpds-py",
+      "version": "2026.9.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

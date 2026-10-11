@@ -20,7 +20,7 @@ from ports._support.sdk import installed_seed, materialize
 from ports._support.sdk_products import Tool
 from ports.buildomatic.artifacts import register, resolve, upload, write_reference
 from ports.buildomatic.remote_store import RemoteStore
-from ports.buildomatic.sdk_artifacts import sdk_inputs
+from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 
 
 def bootstrap(
@@ -44,7 +44,7 @@ def bootstrap(
         required.add("cpython")
     if resolver:
         required.add("resolver")
-    if cached and cached.get("inputs") == inputs and required <= cached["products"].keys():
+    if cached and sdk_inputs_match(cached["inputs"], inputs) and required <= cached["products"].keys():
         write_reference(output, cached)
         return cached
     cache.mkdir(parents=True, exist_ok=True)

@@ -84,12 +84,29 @@ def checks(*, fix: bool, all_files: bool) -> Sequence[Check]:
         "--manifest-path",
         "python/native/Cargo.toml",
     )
+    scheduler_format_command = ("cargo", "fmt", "--manifest-path", "ports/toolchain/wasm-scheduler/Cargo.toml")
     if not fix:
         format_command += ("--", "--check")
         adapter_format_command += ("--", "--check")
+        scheduler_format_command += ("--", "--check")
     return (
         Check("rustfmt", format_command),
         Check("python adapter rustfmt", adapter_format_command),
+        Check("scheduler translator rustfmt", scheduler_format_command),
+        Check(
+            "scheduler translator clippy",
+            (
+                "cargo",
+                "clippy",
+                "--locked",
+                "--all-targets",
+                "--manifest-path",
+                "ports/toolchain/wasm-scheduler/Cargo.toml",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
         Check(
             "clippy",
             (

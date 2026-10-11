@@ -1,0 +1,30 @@
+{
+  "name": "wasm-scheduler",
+  "version": "0.1.0",
+  "role": "host-tool",
+  "kind": "host-tool",
+  "build_system": "source-tree",
+  "source": {
+    "files": [
+      {
+        "path": "toolchain/wasm-scheduler/Cargo.toml",
+        "destination": "Cargo.toml",
+        "sha256": "3753bf978c999589aa4fb76d60d1e029699ed353ba89bf2712d7b6495c41bf39"
+      },
+      {
+        "path": "toolchain/wasm-scheduler/Cargo.lock",
+        "destination": "Cargo.lock",
+        "sha256": "c2b2525fcc33a7eb4c772f4be42ceb2c2d85c8a1e14a79df3c8ad4e6691304de"
+      },
+      {
+        "path": "toolchain/wasm-scheduler/src/main.rs",
+        "destination": "src/main.rs",
+        "sha256": "2d24a6453ff46b0e4acc13dc4484b63cbd75126451289c4a6a2f9a032f395ac3"
+      }
+    ],
+    "sha256": "fea4d8477458fd9bfc24f88ca339fed60fe99222ad3c56a20002893a1929d6eb"
+  },
+  "helpers": [
+    "_support/rust_tools.py"
+  ]
+}

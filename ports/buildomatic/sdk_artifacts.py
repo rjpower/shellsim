@@ -25,6 +25,33 @@ def sdk_inputs(ports: Path, name: str) -> dict:
     }
 
 
+def sdk_inputs_match(recorded: dict, current: dict) -> bool:
+    """Compare producer inputs without fingerprinting their context records.
+
+    Context objects carry selected paths, recipes and job counts. Their class
+    definitions are orchestration code; source, patches and the producer's
+    actual build implementation remain part of this comparison.
+    """
+
+    def project(value: dict) -> dict:
+        return {
+            **value,
+            "producers": {
+                name: {
+                    **producer,
+                    "implementation": {
+                        path: digest
+                        for path, digest in producer["implementation"].items()
+                        if path != "_support/build_context.py"
+                    },
+                }
+                for name, producer in value["producers"].items()
+            },
+        }
+
+    return project(recorded) == project(current)
+
+
 def load_sdk(store: Store, manifest: dict, cache: Path):
     """Fetch only components listed in the SDK manifest, without host imports."""
     products = {}
