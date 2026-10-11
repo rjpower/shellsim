@@ -1,0 +1,52 @@
+{
+  "name": "redis",
+  "version": "8.1.0",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "source": {
+    "filename": "redis-8.1.0.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/a8/99/604f0b666d4c616d891cf77ebb9db6bb21601344c051aebf1b72b9ff915f/redis-8.1.0.tar.gz",
+    "sha256": "6e1a19beef9225c83efd689c7e6b7da2d5215b1f42cd13b7fc3714d0a09c7b25",
+    "subdirectory": "redis-8.1.0"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "async-timeout>=4.0.3; python_full_version < '3.11.3'",
+    "pybreaker>=1.4.0; extra == 'circuit-breaker'",
+    "hiredis>=3.2.0; extra == 'hiredis'",
+    "pyjwt>=2.13.0; extra == 'jwt'",
+    "cryptography>=36.0.1; extra == 'ocsp'",
+    "pyopenssl>=20.0.1; extra == 'ocsp'",
+    "requests>=2.31.0; extra == 'ocsp'",
+    "opentelemetry-api>=1.39.1; extra == 'otel'",
+    "opentelemetry-exporter-otlp-proto-http>=1.39.1; extra == 'otel'",
+    "opentelemetry-sdk>=1.39.1; extra == 'otel'",
+    "xxhash~=3.6.0; extra == 'xxhash'"
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build_dependencies": [
+    {
+      "port": "python/hatchling",
+      "version": "1.32.4"
+    }
+  ],
+  "patches": [
+    {
+      "file": "optional-ssl-annotation.patch",
+      "sha256": "47886174cea6226cd61a14b2b84fd54a4b231b862ff5bc22baf17f33f012d94d"
+    }
+  ]
+}

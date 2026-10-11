@@ -1,0 +1,46 @@
+{
+  "name": "django",
+  "version": "6.1.2",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/c9/83/90ff2dbfac7b519ed77620bdbb827cd2d1a83faf00d076bf95056428bce7/django-6.1.2-py3-none-any.whl",
+    "sha256": "141efee6ec64d1db6db90683bf734c550102450f444fb099063b0be1bd27d991",
+    "filename": "django-6.1.2-py3-none-any.whl"
+  },
+  "requires_python": ">=3.12",
+  "requires_dist": [
+    "asgiref>=3.9.1",
+    "sqlparse>=0.5.0",
+    "tzdata; sys_platform == \"win32\"",
+    "argon2-cffi>=23.1.0; extra == \"argon2\"",
+    "bcrypt>=4.1.1; extra == \"bcrypt\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/asgiref",
+      "version": "3.12.1"
+    },
+    {
+      "port": "python/sqlparse",
+      "version": "0.6.0"
+    },
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

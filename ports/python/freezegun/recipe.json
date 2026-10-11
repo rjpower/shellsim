@@ -1,0 +1,33 @@
+{
+  "name": "freezegun",
+  "version": "1.5.5",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/5e/2e/b41d8a1a917d6581fc27a35d05561037b048e47df50f27f8ac9c7e27a710/freezegun-1.5.5-py3-none-any.whl",
+    "sha256": "cd557f4a75cf074e84bc374249b9dd491eaeacd61376b9eb3c423282211619d2",
+    "filename": "freezegun-1.5.5-py3-none-any.whl"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [
+    "python-dateutil>=2.7"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/python-dateutil",
+      "version": "2.9.0.post0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

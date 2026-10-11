@@ -1,0 +1,42 @@
+{
+  "name": "hatchling",
+  "version": "1.32.4",
+  "role": "host-tool",
+  "build_system": "host-wheel",
+  "source": {
+    "filename": "hatchling-1.32.4-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/5f/80/91f51f439c05d4ec4623c22928ce16a938d6d793bf709477830823497859/hatchling-1.32.4-py3-none-any.whl",
+    "sha256": "08ecf7548fb48205e7f213d70c71e67b8271b7242093dc3f1da578b42c734a2c"
+  },
+  "requires_dist": [
+    "packaging>=24.2",
+    "pathspec>=0.10.1",
+    "pluggy>=1.0.0",
+    "tomli>=1.2.2; python_version < '3.11'",
+    "tomlkit>=0.11.1",
+    "trove-classifiers"
+  ],
+  "requires_python": ">=3.10",
+  "build_dependencies": [
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/pluggy",
+      "version": "1.6.0"
+    },
+    {
+      "port": "python/pathspec",
+      "version": "1.1.1"
+    },
+    {
+      "port": "python/trove-classifiers",
+      "version": "2026.9.21.13"
+    },
+    {
+      "port": "python/tomlkit",
+      "version": "0.15.1"
+    }
+  ]
+}

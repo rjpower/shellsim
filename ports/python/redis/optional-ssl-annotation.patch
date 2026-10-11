@@ -1,0 +1,20 @@
+--- a/redis/asyncio/connection.py
++++ b/redis/asyncio/connection.py
+@@ -1519,7 +1519,7 @@
+         self,
+         ssl_keyfile: Optional[str] = None,
+         ssl_certfile: Optional[str] = None,
+-        ssl_cert_reqs: Union[str, ssl.VerifyMode] = "required",
++        ssl_cert_reqs: "Union[str, ssl.VerifyMode]" = "required",
+         ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+         ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+         ssl_ca_certs: Optional[str] = None,
+@@ -1613,7 +1613,7 @@
+         self,
+         keyfile: Optional[str] = None,
+         certfile: Optional[str] = None,
+-        cert_reqs: Optional[Union[str, ssl.VerifyMode]] = None,
++        cert_reqs: "Optional[Union[str, ssl.VerifyMode]]" = None,
+         include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+         exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
+         ca_certs: Optional[str] = None,

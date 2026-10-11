@@ -1,0 +1,33 @@
+{
+  "name": "opentelemetry-api",
+  "version": "1.45.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1e/41/f7dcf80b81ee8e71c1a2b59f14208bc723edbd89ed027a73b175abf6348e/opentelemetry_api-1.45.1-py3-none-any.whl",
+    "sha256": "b31553efa588ae44bc306f863c785c5333a9ecc091248c6ee68b4b6c87fdedfb",
+    "filename": "opentelemetry_api-1.45.1-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "typing-extensions>=4.5.0"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

@@ -1,0 +1,65 @@
+{
+  "name": "sqlalchemy",
+  "version": "2.1.4",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/f7/62/dbf11a262f6fbb41390cab2d8e47a30ec0961018b68201607b599dd489f5/sqlalchemy-2.1.4-py3-none-any.whl",
+    "sha256": "0b96edcc2cd60fe1e35f67a46f4eb076e57297841b9eae949ac5f196593f00a7",
+    "filename": "sqlalchemy-2.1.4-py3-none-any.whl"
+  },
+  "requires_python": ">=3.11",
+  "requires_dist": [
+    "typing-extensions>=4.6.0",
+    "greenlet>=1; extra == \"asyncio\"",
+    "mypy>=2.4; extra == \"mypy\"",
+    "types-greenlet>=2; extra == \"mypy\"",
+    "pyodbc; extra == \"mssql\"",
+    "pymssql; extra == \"mssql-pymssql\"",
+    "pyodbc; extra == \"mssql-pyodbc\"",
+    "mssql-python>=1.9.0; extra == \"mssql-python\"",
+    "mysqlclient>=1.4.0; extra == \"mysql\"",
+    "mysql-connector-python; extra == \"mysql-connector\"",
+    "mariadb!=1.1.10,!=1.1.2,!=1.1.5,>=1.0.1; extra == \"mariadb-connector\"",
+    "oracledb>=2.0.1; extra == \"oracle\"",
+    "cx_oracle>=8; extra == \"oracle-cxoracle\"",
+    "oracledb>=2.0.1; extra == \"oracle-oracledb\"",
+    "psycopg!=3.1.15,>=3.0.7; extra == \"postgresql\"",
+    "pg8000>=1.29.3; extra == \"postgresql-pg8000\"",
+    "sqlalchemy[asyncio]; extra == \"postgresql-asyncpg\"",
+    "asyncpg; extra == \"postgresql-asyncpg\"",
+    "psycopg2-binary; extra == \"postgresql-psycopg2binary\"",
+    "psycopg2cffi; extra == \"postgresql-psycopg2cffi\"",
+    "psycopg!=3.1.15,>=3.0.7; extra == \"postgresql-psycopg\"",
+    "psycopg[binary]!=3.1.15,>=3.0.7; extra == \"postgresql-psycopgbinary\"",
+    "pymysql; extra == \"pymysql\"",
+    "cymysql; extra == \"cymysql\"",
+    "sqlalchemy[asyncio]; extra == \"aiomysql\"",
+    "aiomysql; extra == \"aiomysql\"",
+    "sqlalchemy[asyncio]; extra == \"aioodbc\"",
+    "aioodbc; extra == \"aioodbc\"",
+    "sqlalchemy[asyncio]; extra == \"asyncmy\"",
+    "asyncmy>=0.2.12; extra == \"asyncmy\"",
+    "sqlalchemy[asyncio]; extra == \"aiosqlite\"",
+    "aiosqlite; extra == \"aiosqlite\"",
+    "sqlcipher3_binary; extra == \"sqlcipher\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

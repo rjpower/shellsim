@@ -1,0 +1,61 @@
+{
+  "name": "flask",
+  "version": "3.1.3",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/7f/9c/34f6962f9b9e9c71f6e5ed806e0d0ff03c9d1b0b2340088a0cf4bce09b18/flask-3.1.3-py3-none-any.whl",
+    "sha256": "f4bcbefc124291925f1a26446da31a5178f9483862233b23c0c96a20701f670c",
+    "filename": "flask-3.1.3-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "blinker>=1.9.0",
+    "click>=8.1.3",
+    "importlib-metadata>=3.6.0; python_version < '3.10'",
+    "itsdangerous>=2.2.0",
+    "jinja2>=3.1.2",
+    "markupsafe>=2.1.1",
+    "werkzeug>=3.1.0",
+    "asgiref>=3.2 ; extra == \"async\"",
+    "python-dotenv ; extra == \"dotenv\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/blinker",
+      "version": "1.9.0"
+    },
+    {
+      "port": "python/click",
+      "version": "8.5.0"
+    },
+    {
+      "port": "python/itsdangerous",
+      "version": "2.2.0"
+    },
+    {
+      "port": "python/jinja2",
+      "version": "3.1.6"
+    },
+    {
+      "port": "python/markupsafe",
+      "version": "3.0.4"
+    },
+    {
+      "port": "python/werkzeug",
+      "version": "3.1.9"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
