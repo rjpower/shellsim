@@ -8,7 +8,7 @@ for `wasm32-wasip1-threads` and ABI `shellsim-wasi-sdk34-cpython3137-threads-v3`
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports python/cpython:stdlib-zlib python/cpython:stdlib-ctypes \
+  python -m ports build python/cpython:stdlib-zlib python/cpython:stdlib-ctypes \
   --store /path/to/ports-store --output /path/to/release --check
 ```
 

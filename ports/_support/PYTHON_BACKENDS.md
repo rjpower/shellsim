@@ -59,7 +59,7 @@ For example, build the current pilot with the default threaded SDK:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports python/kiwisolver python/packaging python/zss \
+  python -m ports build python/kiwisolver python/packaging python/zss \
   --store /path/to/ports-cache \
   --output /path/to/backend-release --check
 ```

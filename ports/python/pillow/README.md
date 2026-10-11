@@ -7,7 +7,7 @@ Pillow builds through its pinned upstream PEP 517 backend. Its static graph sele
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports python/pillow --store /path/to/ports-store \
+  python -m ports build python/pillow --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

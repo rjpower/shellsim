@@ -7,7 +7,7 @@ OpenBLAS 0.3.31 builds through the shared plain make helper. Typed source prepar
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/openblas --store /path/to/ports-store \
+  python -m ports build native/openblas --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

@@ -597,7 +597,7 @@ def accept_graph(build: GraphBuild, sdk_context: MaterializedSDK, descriptor: Pa
     )
 
 
-def main() -> None:
+def main(arguments: Sequence[str] | None = None) -> None:
     from ports._support.sdk import materialize
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -605,7 +605,7 @@ def main() -> None:
     parser.add_argument("--ports", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--sdk", default="default", help="default SDK for unopinionated target ports")
     parser.add_argument("--host-seed", type=Path, help="explicit native host tools; no target products")
-    parser.add_argument("--store", type=Path, required=True)
+    parser.add_argument("--store", type=Path, default=Path("build/ports"))
     parser.add_argument(
         "--workspace",
         action="append",
@@ -625,7 +625,7 @@ def main() -> None:
     parser.add_argument("--jobs", type=int, help="override each recipe's build parallelism")
     parser.add_argument("--output", type=Path, help="seal a locally installable graph release")
     parser.add_argument("--check", action="store_true", help="install and run every declared guest probe")
-    args = parser.parse_args()
+    args = parser.parse_args(arguments)
     if args.backend != "local" and not 1 <= args.max_workers <= 32:
         parser.error("distributed builds require 1..32 workers")
     if args.backend != "local" and args.output is not None:
@@ -635,7 +635,7 @@ def main() -> None:
     if args.check and args.output is None:
         parser.error("--check requires --output")
     if args.backend == "iris" and args.iris_service is None:
-        parser.error("--backend iris requires --iris-service")
+        args.iris_service = args.store / "service.json"
     if args.backend == "iris":
         if args.offline or args.workspace or args.sdk_descriptor or args.host_seed:
             parser.error(
@@ -742,6 +742,9 @@ def main() -> None:
             else {}
         ),
     )
+    from ports.buildomatic.delivery import save_local_graph
+
+    save_local_graph(result, args.store)
     if args.output is not None:
         if args.check:
             if args.output.exists() or args.output.is_symlink():
