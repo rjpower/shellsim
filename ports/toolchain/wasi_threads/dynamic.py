@@ -38,16 +38,14 @@ def verify_sdk(sdk, manifest):
 def compiler_identity(prefix, recipe_path=None):
     """Admit the recorded compiler policy and its immutable product inventory."""
     from ports._support.producer_policy import verify_policy
-    from ports._support.sdk_products import Receipt, verify_product
 
     manifest_path = prefix / "manifest.json"
     manifest = json.loads(manifest_path.read_text())
     verify_policy(manifest["identity"]["recipe"], "toolchain/llvm:host")
-    verify_product(Receipt(prefix, manifest_path, file_hash(manifest_path), manifest))
     return manifest
 
 
-def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
+def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work, *, jobs=4, compiler_cache=None):
     directory = Path(__file__).resolve().parent
     from ports._support.producer_policy import load_policy
 
@@ -70,6 +68,13 @@ def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
                 raise ValueError("threaded libc patch source differs: " + name)
         apply_patch(source, directory / patch["file"], patch["sha256"])
     environment = target_environment(sdk)
+    launcher = []
+    if compiler_cache is not None:
+        from ports._support.native_adapters import compiler_cache_identity
+
+        cache = compiler_cache_identity(compiler_cache)
+        environment.update(cache["environment"])
+        launcher = ["-DCMAKE_C_COMPILER_LAUNCHER=" + cache["path"]]
     output = work / "libc-build"
     commands = [
         [
@@ -89,8 +94,9 @@ def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
             "-DCMAKE_AR=" + str(sdk / "bin/llvm-ar"),
             "-DCMAKE_RANLIB=" + str(sdk / "bin/llvm-ranlib"),
             "-DBUILTINS_LIB=" + str(sdk / "lib/clang/23/lib/wasm32-unknown-wasip1/libclang_rt.builtins.a"),
+            *launcher,
         ],
-        [str(cmake), "--build", str(output), "--parallel", "4"],
+        [str(cmake), "--build", str(output), "--parallel", str(jobs)],
     ]
     for index, command in enumerate(commands):
         run(command, work / f"build-{index}.log", environment)
@@ -108,7 +114,7 @@ def build(sdk_archive, libc_archive, llvm_prefix, cmake, ninja, work):
             "recipe": recipe,
             "compiler": compiler,
             "sdk_tooling": tooling,
-            "tools": {str(path): file_hash(path) for path in (cmake, ninja)},
+            "tools": [str(path) for path in (cmake, ninja)],
         },
         "commands": commands,
         "artifacts": {

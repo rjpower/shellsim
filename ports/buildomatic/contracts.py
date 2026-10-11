@@ -236,7 +236,7 @@ class ConditionalWriteError(RuntimeError):
 
 
 class Store(Protocol):
-    """Immutable, verified bounded blobs and linearizable native journal CAS.
+    """Immutable bounded blobs and linearizable native journal CAS.
 
     Missing blobs raise FileNotFoundError. Blob methods accept at most
     MAX_METADATA_BYTES. Journal writes are durable before returning. None means

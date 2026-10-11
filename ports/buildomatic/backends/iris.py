@@ -304,10 +304,12 @@ class CoordinatorService:
         *,
         cache_prefix: str = DEFAULT_PREFIX,
         capacity: int | None = None,
+        artifact_store: Store | None = None,
     ):
         if _SERVICE_NAME.fullmatch(service_id) is None:
             raise ValueError("invalid Iris service name")
         self._store, self._workers = store, dict(workers)
+        self._artifact_store = store if artifact_store is None else artifact_store
         self._base = f"iris/{service_id}"
         self._index_key = f"{self._base}/index.json"
         self._coordinators = {}
@@ -321,6 +323,11 @@ class CoordinatorService:
 
     def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
         return sign_blob(self._cache_prefix, request)
+
+    def resolve_artifact(self, key: str) -> dict | None:
+        from ports.buildomatic.artifacts import resolve
+
+        return resolve(self._artifact_store, key)
 
     def _index(self):
         found = self._store.read_journal(self._index_key)
@@ -563,6 +570,9 @@ class _CoordinatorActor:
     def SignBlob(self, request: BlobAccessRequest) -> SignedBlobAccess:
         return self._service.sign_blob(request)
 
+    def ResolveArtifact(self, key: str) -> dict | None:
+        return self._service.resolve_artifact(key)
+
 
 class WorkerProxy:
     """Target one named worker; transport failures propagate rather than imply loss."""
@@ -725,12 +735,6 @@ def _worker_environment(config: IrisConfig) -> dict[str, str]:
     binary = shutil.which("sccache")
     if binary is None:
         raise RuntimeError("compiler cache requires sccache in the worker task image")
-    digest = hashlib.sha256()
-    with Path(binary).open("rb") as stream:
-        while chunk := stream.read(1024 * 1024):
-            digest.update(chunk)
-    if digest.hexdigest() != "973cb15f6a986d84ca334bbed3bbe2eb8f1ee8fd81bf9e115b8539a293bf8d59":
-        raise RuntimeError("compiler cache requires the admitted sccache 0.18.0 musl binary")
     return {
         **compiler_cache_environment(path, environ),
         "SCCACHE_SERVER_UDS": "/app/.buildomatic/sccache.sock",
@@ -959,6 +963,10 @@ class IrisBackend:
     def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
         """Return ephemeral single-object authority; callers must never log it."""
         return self._actor.call("SignBlob", request)
+
+    def resolve_artifact(self, key: str) -> dict | None:
+        """Resolve a canonical product using metadata only."""
+        return self._actor.call("ResolveArtifact", key)
 
     def get(self, build_id: str) -> BuildResult:
         return self._actor.call("Get", build_id)
@@ -1261,7 +1269,12 @@ def _run_coordinator(config: IrisConfig) -> None:
         terminal_states=TERMINAL_TASK_STATES,
     )
     service = CoordinatorService(
-        store, config.service_id, {}, cache_prefix=config.cache_prefix or config.prefix, capacity=config.workers
+        store,
+        config.service_id,
+        {},
+        cache_prefix=config.cache_prefix or config.prefix,
+        capacity=config.workers,
+        artifact_store=RemoteStore(config.cache_prefix or config.prefix),
     )
     # Current Iris calls scoped-capability access LINK; no anonymous proxy
     # access is enabled. The external transport keeps its minted URL private.

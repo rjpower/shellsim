@@ -42,7 +42,7 @@ def action_child(directory: Path, gate: int) -> None:
     plan = json.loads(read_bounded(directory / "plan.json"))
     workspace = directory / "work"
     action = plan["attempt"]["action"]
-    environment = {"PATH": os.defpath, "HOME": str(workspace), "TMPDIR": str(workspace / "tmp")}
+    environment = {**os.environ, "HOME": str(workspace), "TMPDIR": str(workspace / "tmp")}
     environment.update(action["env"])
     for mount in plan["attempt"]["inputs"]:
         environment["BUILD_INPUT_" + mount["name"]] = str(workspace / "inputs" / mount["name"])
@@ -99,7 +99,7 @@ def run(directory: Path) -> None:
             next_usage_check = started
             log_size = 0
             selector = selectors.DefaultSelector()
-            with selector, (directory / "log").open("wb") as log:
+            with selector, (directory / "log").open("wb", buffering=0) as log:
                 selector.register(process.stdout, selectors.EVENT_READ)
                 while True:
                     if (directory / "cancelled").exists():

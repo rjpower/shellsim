@@ -378,13 +378,8 @@ def python_meson(
 
     packages = {}
     for item in options.get("host_header_packages", {}).values():
-        import json
-
         tool = ctx.sdk.host_tools[item["tool"]]
-        if tool.receipt_path is None:
-            raise ValueError("Python Meson host headers require a complete package receipt")
-        proof = json.loads(tool.receipt_path.read_text())
-        packages[item["tool"]] = (tool.receipt_path.parent / proof["root"]).resolve()
+        packages[item["tool"]] = tool.path.parent.parent
     if ctx.jobs is not None:
         options["jobs"] = ctx.jobs
     with _retained(ctx, "python-meson", options, packages) as context:

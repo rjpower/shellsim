@@ -39,7 +39,7 @@ def build_request(tmp_path):
     return NativeBuildRequest(NativeAdapter.CMAKE, context)
 
 
-@pytest.mark.parametrize("jobs", [0, 17])
+@pytest.mark.parametrize("jobs", [0, 257])
 def test_invalid_parallelism_leaves_staging_absent(build_request, jobs):
     with pytest.raises(ValueError):
         build_native(replace(build_request, jobs=jobs))
@@ -379,6 +379,18 @@ def test_cache_wrapper_normalizes_owned_paths_and_preserves_link_responses(build
     link.write_text(shlex.join([str(context.build / "obj.o"), "-o", str(context.build / "program")]))
     subprocess.run([str(wrapper), "@link.rsp"], cwd=context.build, check=True)
     assert json.loads(log.read_text()) == [str(driver), *context.compiler_flags, "@link.rsp"]
+    link.write_text(
+        shlex.join(["-shared", "-Wl,-O1,--start-group", "object with space.o", "archive.a", "-Wl,--end-group"])
+    )
+    subprocess.run([str(wrapper), "@link.rsp"], cwd=context.build, check=True)
+    assert json.loads(log.read_text()) == [
+        str(driver),
+        *context.compiler_flags,
+        "-shared",
+        "-Wl,-O1",
+        "object with space.o",
+        "archive.a",
+    ]
 
 
 @pytest.mark.parametrize("target,debug", [("host", False), ("wasm", False), ("wasm", True)])
@@ -555,7 +567,7 @@ def test_cache_launcher_rejects_conflicting_or_relative_socket_endpoints(tmp_pat
         compiler_cache_identity(launcher, verify_executable=False)
 
 
-def test_cache_launcher_rejects_changed_binary_and_endpoint_credentials(tmp_path):
+def test_cache_launcher_accepts_installed_binary_and_rejects_endpoint_credentials(tmp_path):
     from ports._support.native_adapters import CompilerCacheLauncher, compiler_cache_identity
     from ports._support.store import file_hash
 
@@ -564,8 +576,7 @@ def test_cache_launcher_rejects_changed_binary_and_endpoint_credentials(tmp_path
     path.chmod(0o755)
     launcher = CompilerCacheLauncher(path, file_hash(path))
     path.write_bytes(b"changed")
-    with pytest.raises(ValueError):
-        compiler_cache_identity(launcher)
+    assert compiler_cache_identity(launcher)["path"] == str(path)
     credential = replace(launcher, environment=(("SCCACHE_ENDPOINT", "https://user:secret@cache.invalid"),))
     with pytest.raises(ValueError):
         compiler_cache_identity(credential, verify_executable=False)

@@ -1,8 +1,64 @@
-# Buildomatic core
+# Buildomatic
 
 This package runs trusted host build actions. It has no Iris dependency and does
 not expose host capabilities to shellsim guests. The ports bridge owns recipe
 translation and publishing; backends own deployment and remote storage.
+
+For Iris, the configured S3 cache owns SDK component archives, port products
+and their small catalog records. The client plans from metadata and returns
+references in `results.json`. Workers fetch components on demand into a
+persistent local cache. No client SDK download is needed to build a port.
+Ordinary local builds keep using the configured `--store` directory:
+
+```sh
+uv run --no-project python -m ports python/six --store build/ports
+```
+
+An existing Iris service's public connection descriptor selects its workers
+and cache prefix. Bootstrap its SDK, then build complete ports with parallel
+Ninja/make jobs within each worker:
+
+```sh
+uv run --no-project python -m ports.buildomatic.bootstrap \
+  --iris-service service.json --store build/sdk-client --jobs 128 --python
+uv run --no-project python -m ports native/freetype python/pillow \
+  --backend iris --iris-service service.json --store build/port-client \
+  --max-workers 8 --jobs 32
+```
+
+These commands need an environment with Iris installed. `--python` adds
+CPython headers/runtime; `--resolver` separately adds the patched host WASI
+resolver. Bootstrap preserves completed products and retained LLVM Ninja state.
+`--build-key` starts a fresh request after a failed or evicted attempt. Port
+artifact keys exclude worker count, build jobs, host binary hashes and sccache
+configuration. They include recipes, source/patch inputs, relevant build code,
+target SDK products and dependency identities. SDK catalogs likewise track
+producer metadata and code, so changed producer inputs require bootstrap.
+
+Fetching and guest checks are explicit, separate workflows:
+
+```sh
+uv run --no-project python -m ports.buildomatic.publish fetch \
+  --results build/port-client/results.json --iris-service service.json \
+  --output build/fetched
+uv run --no-project python -m ports.buildomatic.publish check \
+  --results build/port-client/results.json --iris-service service.json \
+  --output build/checks --cpu 100000000000 --memory 8589934592
+uv run --no-project python -m ports.buildomatic.publish guest \
+  --output build/checks --cpu 200000000000 --memory 8589934592
+```
+
+`check` currently supports native probes: it compiles beside the remote
+artifacts and downloads only the probe and its required shared libraries.
+`guest` reruns saved bytes locally, including after a failed budget setting.
+Python/shell acceptance and sealed release assembly remain available through
+the ordinary ports publish/accept interfaces. Cache outputs have no retention
+promise; creating a release is an explicit operation.
+
+The worker image uses Ubuntu packages, normal Python environments, Rust and
+sccache. Allocate CPUs to match build jobs; linking has its own smaller
+concurrency limit. One port is a scheduling action; dependency-ready ports run
+on independent workers without wave barriers.
 
 `BuildRequest(idempotency_key, actions, max_workers=1)` admits at most 512 nodes
 and 32 workers. `Action(id, argv, dependencies=(), inputs=(), env=(),
@@ -15,8 +71,9 @@ private workspace. Successful dependencies mount under their action IDs.
 `BUILD_INPUT_<name>` and `BUILD_OUTPUT_DIR` provide absolute paths. The designated
 output directory is `output`; intermediates belong elsewhere in the workspace.
 Worker argv starting with `python` or `python3` resolves to `sys.executable` on
-the worker. The environment starts with PATH, HOME and TMPDIR plus explicit
-action entries. No shell is used unless the trusted argv explicitly selects one.
+the worker. The environment inherits installed worker tools and storage/cache
+settings, with private HOME and TMPDIR plus explicit action entries. No shell
+is used unless the trusted argv explicitly selects one.
 
 ```python
 from pathlib import Path
@@ -34,7 +91,7 @@ Tree manifests reference immutable SHA256 chunks of at most 4 MiB. Manifest and
 blob reads have a 32 MiB bound, enforced by stores before allocating beyond that
 bound. Files, directories, executable permission bits and internal relative
 symlinks round trip. Extraction rejects traversal, linked parents, link cycles,
-special files, inconsistent chunk sizes and corrupted digests. Capture requires
+special files and inconsistent chunk sizes. Capture requires
 a quiescent tree. Failed extraction removes the new destination.
 
 `ResourceLimits(memory_bytes=8*1024**3, cpu_seconds=3600,
@@ -48,8 +105,10 @@ a container isolation boundary. The local subprocess executor requires Linux.
 
 `Store` supplies `put_blob(data)->digest`, `get_blob(digest)->bytes`,
 `read_journal(key)->VersionedBytes|None` and
-`write_journal(key, data, expected_version)->version`. Blob writes verify
-content and are immutable; reads reject corruption and oversized data. Journal
+`write_journal(key, data, expected_version)->version`. Blob keys are computed
+once for addressing. Writes use conditional creation; reads trust storage
+transfer integrity and reject oversized data. No artifact byte/digest or full-tree
+verification runs on upload, installation or warm reuse. Journal
 CAS uses opaque backend revisions, with `None` meaning create-if-absent. Even
 identical writes must receive a new revision. Conflicts raise
 `ConditionalWriteError`. A remote store can use native conditional objects.
@@ -138,5 +197,5 @@ from active cleanup history; private worker deletion may still be pending.
 
 Output bundles are cache references. Successful execution records do not promise
 release durability, cache retention or a TTL. Retrieving an expired manifest or
-chunk raises `FileNotFoundError`; corruption raises `ValueError`. The caller must
+chunk raises `FileNotFoundError`. The caller must
 request a new build rather than treat a missing cached output as published.

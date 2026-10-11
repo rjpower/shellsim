@@ -171,19 +171,14 @@ def code_files(ports: Path, graph: Graph, *, portable: bool = False) -> dict[str
 
 
 def _stage_code(files: Mapping[str, Path], destination: Path) -> None:
-    """Copy exactly the manifest, verifying byte and executable-mode preservation."""
+    """Stage the selected source files and preserve executable modes."""
     for name, source in files.items():
         output = destination / "ports" / name
         output.parent.mkdir(parents=True, exist_ok=True)
-        expected = file_hash(source)
         shutil.copyfile(source, output)
         output.chmod(0o755 if source.stat().st_mode & 0o111 else 0o644)
-        if file_hash(output) != expected:
-            raise ValueError("code input changed during preparation: " + name)
     worker = Path(__file__).with_name("port_worker.py")
     shutil.copyfile(worker, destination / "port_worker.py")
-    if file_hash(destination / "port_worker.py") != file_hash(worker):
-        raise ValueError("worker implementation changed during preparation")
 
 
 def prepare_graph(
@@ -214,8 +209,8 @@ def prepare_graph(
     )
     if not 0 < port_timeout_seconds <= 86400:
         raise ValueError("port timeout must be positive and at most one day")
-    if jobs is not None and not 1 <= jobs <= 16:
-        raise ValueError("build jobs must be between one and sixteen")
+    if jobs is not None and not 1 <= jobs <= 256:
+        raise ValueError("build jobs must be between one and 256")
     worker_identity = dict(worker_identity or {})
     if worker_identity.keys() - {"config_sha256", "task_image", "service_id"} or any(
         not isinstance(value, str) or len(value) > 4096 or "\0" in value for value in worker_identity.values()

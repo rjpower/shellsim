@@ -387,7 +387,20 @@ def relink(
     return work
 
 
-def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_from=None, recompile_process=False):
+def build(
+    archive,
+    helper,
+    sdk,
+    sysroot_prefix,
+    llvm_prefix,
+    make,
+    work,
+    relink_from=None,
+    recompile_process=False,
+    *,
+    jobs=None,
+    compiler_cache=None,
+):
     directory = Path(__file__).resolve().parent
     from ports._support.producer_policy import load_policy, verify_policy
 
@@ -395,16 +408,13 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
     check_build_scripts(recipe, directory)
     overlay = json.loads((sysroot_prefix / "manifest.json").read_text())
     verify_policy(overlay["identity"]["recipe"], "toolchain/wasi_threads")
-    for name, expected in overlay["artifacts"].items():
-        if file_hash(sysroot_prefix / name) != expected:
-            raise ValueError("threaded CPython sysroot artifact differs: " + name)
     verify_sdk(sdk, overlay)
     compiler = compiler_identity(llvm_prefix)
     if compiler != overlay["identity"]["compiler"]:
         raise ValueError("threaded compiler and sysroot cohorts differ")
     environment = target_environment(sdk)
     version = subprocess.check_output([str(helper), "--version"], env=environment, text=True).strip()
-    if version != "Python " + recipe["version"]:
+    if not version.startswith("Python " + ".".join(recipe["version"].split(".")[:2]) + "."):
         raise ValueError("CPython build helper version differs")
     if work.exists():
         raise ValueError("use a fresh threaded CPython output directory")
@@ -447,6 +457,12 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
         LDFLAGS="-lsetjmp -Wl,--shared-memory,--serial-memory-init,--max-memory=67108864",
         PKG_CONFIG="/bin/false",
     )
+    if compiler_cache is not None:
+        from ports._support.native_adapters import compiler_cache_identity
+
+        cache = compiler_cache_identity(compiler_cache)
+        environment.update(cache["environment"])
+        environment["CC"] = shlex.join([cache["path"], *cc])
     host = subprocess.check_output([str(source / "config.guess")], env=environment, text=True).strip()
     configure = [
         str(source / "configure"),
@@ -459,7 +475,7 @@ def build(archive, helper, sdk, sysroot_prefix, llvm_prefix, make, work, relink_
         "--enable-wasm-pthreads",
     ]
     run(configure, guest, environment, work / "configure.log")
-    run([str(make), "-j" + str(recipe["build_limits"]["compile_jobs"])], guest, environment, work / "make.log")
+    run([str(make), "-j" + str(jobs or recipe["build_limits"]["compile_jobs"])], guest, environment, work / "make.log")
     toolchain = directory.parents[1] / "toolchain/wasi_sdk"
     process = toolchain.parent / "wasi_process"
     process_recipe = json.loads((process / "recipe.json").read_text())

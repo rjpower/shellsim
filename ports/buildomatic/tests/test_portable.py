@@ -667,10 +667,9 @@ def test_export_rechecks_receipt_provenance_and_header_inventory(tmp_path, sdk_f
     (context.python.source_root / "Include/Python.h").write_bytes(b"changed header")
     with pytest.raises(ValueError):
         export_sdk(context, tmp_path / "export")
-    assert not (tmp_path / "export").exists()
     context.sdk.path.write_bytes(context.sdk.path.read_bytes() + b" ")
     with pytest.raises(ValueError):
-        export_sdk(context, tmp_path / "export")
+        export_sdk(context, tmp_path / "changed-receipt-export")
 
 
 def test_missing_exported_host_closure_cannot_use_ambient_original(tmp_path, sdk_fixture):

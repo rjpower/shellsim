@@ -13,6 +13,23 @@ _MAX_RESPONSE_DEPTH = 16
 _MAX_RESPONSE_ARGUMENTS = 65536
 
 
+def wasm_link_arguments(arguments: list[str]) -> list[str]:
+    """Omit ELF archive groups, which wasm-ld's lazy symbol table does not need.
+
+    Meson can emit these GNU switches while detecting a Clang cross-linker.
+    Other linker arguments retain their order and values.
+    """
+    result = []
+    for argument in arguments:
+        if argument.startswith("-Wl,"):
+            flags = [flag for flag in argument[4:].split(",") if flag not in {"--start-group", "--end-group"}]
+            if flags:
+                result.append("-Wl," + ",".join(flags))
+        else:
+            result.append(argument)
+    return result
+
+
 def _response_tokens(text: str) -> list[str]:
     """Match LLVM TokenizeGNUCommandLine quotes and next-character escapes."""
     tokens, token = [], []

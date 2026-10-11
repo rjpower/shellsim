@@ -248,6 +248,13 @@ def test_cli_worker_count_preflight_precedes_graph_and_sdk_setup(tmp_path, monke
     monkeypatch.setattr(portable, "import_sdk", spy("import", context))
     monkeypatch.setattr(runner, "build_graph", execute)
     monkeypatch.setattr(bridge, "run_graph", execute)
+
+    def execute_from_store(*args, **kwargs):
+        calls.append("execute")
+        assert kwargs["max_workers"] == int(count)
+        return SimpleNamespace(results={})
+
+    monkeypatch.setattr("ports.buildomatic.store_graph.run", execute_from_store)
     monkeypatch.setattr(bridge, "prepare_graph", reject_setup)
     monkeypatch.setattr(iris, "backend_context_factory", reject_setup)
     monkeypatch.setattr(
@@ -262,8 +269,7 @@ def test_cli_worker_count_preflight_precedes_graph_and_sdk_setup(tmp_path, monke
             backend,
             "--max-workers",
             count,
-            "--sdk-descriptor",
-            str(tmp_path / "sdk.json"),
+            *(["--sdk-descriptor", str(tmp_path / "sdk.json")] if backend != "iris" else []),
             "--iris-service",
             str(tmp_path / "iris.json"),
         ],
@@ -281,7 +287,13 @@ def test_cli_worker_count_preflight_precedes_graph_and_sdk_setup(tmp_path, monke
     expected = []
     if accepted:
         expected = (
-            ["graph", "materialize", "execute"] if backend == "local" else ["graph", "bindings", "import", "execute"]
+            ["execute"]
+            if backend == "iris"
+            else (
+                ["graph", "materialize", "execute"]
+                if backend == "local"
+                else ["graph", "bindings", "import", "execute"]
+            )
         )
     assert calls == expected
     assert list(tmp_path.iterdir()) == []

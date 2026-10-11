@@ -11,7 +11,12 @@ def build(ctx: BuildContext):
         if seed is None or set(seed.compiler_tools) != {"cc", "cxx", "cmake", "ninja"}:
             raise ValueError("host compiler requires admitted cc, cxx, cmake and ninja")
         root = compile_host(
-            ctx.source, *(seed.compiler_tools[name].path for name in ("cc", "cxx", "cmake", "ninja")), ctx.work
+            ctx.source,
+            *(seed.compiler_tools[name].path for name in ("cc", "cxx", "cmake", "ninja")),
+            ctx.work,
+            jobs=ctx.jobs or 4,
+            link_jobs=min(4, max(1, (ctx.jobs or 4) // 32)),
+            compiler_cache=ctx.compiler_cache,
         )
         return ProductBuildOutput(root, root / "manifest.json")
     if ctx.variant == "guest":

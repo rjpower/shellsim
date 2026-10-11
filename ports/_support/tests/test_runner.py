@@ -154,7 +154,7 @@ def test_bootstrap_products_bind_native_metadata_and_acceptance(tmp_path, monkey
         (root / "bin").mkdir(parents=True)
         for tool in ("clang", "clang++", "llvm-ar", "llvm-ranlib", "llvm-strip"):
             (root / "bin" / tool).write_bytes(name.encode())
-        return Receipt(root, root / "manifest.json", digest * 64, {"identity": {"recipe": recipe}})
+        return Receipt(root, root / "manifest.json", digest * 64, {"identity": {"recipe": recipe}, "artifacts": {}})
 
     original_compiler = product("original-compiler", "a")
     original_platform = product("original-platform", "b")

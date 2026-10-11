@@ -168,12 +168,12 @@ def build_graph(
     """
     from ports._support.local_sources import stage_local_sources
     from ports._support.native_artifacts import NativeArtifact, merge_dependency_sysroot, seal_native_install
-    from ports._support.sdk_products import resolved_toolchain, verify_product
+    from ports._support.sdk_products import resolved_toolchain
     from ports._support.store import identity, verify
     from ports.api import BuildContext, build_port, implementation
 
-    if jobs is not None and not 1 <= jobs <= 16:
-        raise ValueError("build jobs must be between one and sixteen")
+    if jobs is not None and not 1 <= jobs <= 256:
+        raise ValueError("build jobs must be between one and 256")
     graph = plan(
         ports, requests, target_profile=sdk_context.dynamic_abi if sdk_context else None, default_sdk=default_sdk
     )
@@ -212,8 +212,6 @@ def build_graph(
                 )
             if product is None:
                 raise ValueError("selected SDK product was not materialized")
-            if system in {"llvm-host", "wasi-sysroot"}:
-                verify_product(product)
             products[port.reference] = product
             results[port.reference] = product.root
             keys[port.reference] = identity({"recipe": port.digest, "product": product.sha256})
@@ -252,16 +250,7 @@ def build_graph(
         if port.sdk_selection is not None:
             inputs["sdk_selection"] = asdict(port.sdk_selection)
         if not pure:
-            if compiler_cache is not None:
-                from ports._support.native_adapters import compiler_cache_identity
-
-                inputs["compiler_cache"] = compiler_cache_identity(compiler_cache, verify_executable=False)
             inputs["sdk"] = build_sdk.identity
-            inputs["host_tools"] = {
-                name: {"sha256": tool.sha256, "receipt": tool.receipt_sha256}
-                for name, tool in build_sdk.host_tools.items()
-                if name != "uv"
-            }
             inputs["target_flags"] = {
                 "compiler": build_sdk.compiler_flags,
                 "linker": build_sdk.linker_flags,
@@ -631,6 +620,26 @@ def main() -> None:
         parser.error("--check requires --output")
     if args.backend == "iris" and args.iris_service is None:
         parser.error("--backend iris requires --iris-service")
+    if args.backend == "iris":
+        if args.offline or args.workspace or args.sdk_descriptor or args.host_seed:
+            parser.error(
+                "Iris uses store references and installed worker tools; --offline, --workspace, --sdk-descriptor and --host-seed are local options"
+            )
+        from ports.buildomatic.store_graph import run
+
+        result = run(
+            args.ports,
+            args.recipes,
+            args.sdk,
+            args.iris_service,
+            args.store,
+            jobs=16 if args.jobs is None else args.jobs,
+            max_workers=args.max_workers,
+            build_key=args.build_key,
+            port_timeout=args.port_timeout,
+        )
+        print(json.dumps(result.results, sort_keys=True, indent=2))
+        return
     workspaces = {}
     for declaration in args.workspace:
         reference, separator, directory = declaration.partition("=")
@@ -672,6 +681,7 @@ def main() -> None:
                 host_seed=args.host_seed,
                 python=needs_python,
                 offline=args.offline,
+                jobs=args.jobs,
             )
             if needs_target or needs_python
             else None

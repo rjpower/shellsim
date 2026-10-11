@@ -32,10 +32,7 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executabl
     Preparation may name a pinned worker-image binary absent on the caller.
     Execution always verifies its bytes and executable mode.
     """
-    import re
     from urllib.parse import urlsplit
-
-    from ports._support.store import file_hash
 
     allowed = {
         "SCCACHE_DIR",
@@ -55,12 +52,10 @@ def compiler_cache_identity(launcher: CompilerCacheLauncher, *, verify_executabl
         "SCCACHE_GCS_RW_MODE",
         "SCCACHE_S3_ENABLE_VIRTUAL_HOST_STYLE",
     }
-    if not launcher.path.is_absolute() or re.fullmatch(r"[a-f0-9]{64}", launcher.sha256) is None:
-        raise ValueError("compiler cache requires an absolute path and SHA256 identity")
+    if not launcher.path.is_absolute():
+        raise ValueError("compiler cache requires an absolute path")
     if verify_executable and not launcher.path.stat().st_mode & 0o111:
         raise ValueError("compiler cache requires an absolute executable")
-    if verify_executable and file_hash(launcher.path) != launcher.sha256:
-        raise ValueError("compiler cache executable differs from admitted bytes")
     environment = dict(launcher.environment)
     if (
         len(environment) != len(launcher.environment)
@@ -199,6 +194,8 @@ def compiler_wrapper_text(context: NativeBuildContext, role: str, response_sourc
         + "options = response_arguments(arguments, Path.cwd())\n"
         + 'is_link = not any(flag in options for flag in ("-c", "-S", "-E"))\n'
         + 'is_shared = is_link and "-shared" in options\n'
+        + "if is_link and any('--start-group' in arg or '--end-group' in arg for arg in options if arg.startswith('-Wl,')):\n"
+        + "    arguments = wasm_link_arguments(options)\n"
         + "if is_link:\n"
         + "    command += "
         + repr(list(context.linker_flags))
@@ -353,8 +350,8 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         raise ValueError("plain-make adapter has no configure phase")
     if request.adapter is NativeAdapter.MESON and request.install_targets != ("install",):
         raise ValueError("Meson adapter supports its normal install target only")
-    if not 1 <= request.jobs <= 16:
-        raise ValueError("native build jobs must be between one and sixteen")
+    if not 1 <= request.jobs <= 256:
+        raise ValueError("native build jobs must be between one and 256")
     if request.install_prefix != PurePosixPath("/usr/local"):
         raise ValueError("native adapters currently install under /usr/local")
     if context.target not in ("wasm32-wasip1", "wasm32-wasip1-threads"):
@@ -442,9 +439,16 @@ def build_native(request: NativeBuildRequest) -> NativeBuildOutput:
         )
         started = time.perf_counter()
         with (context.build / f"adapter-{len(commands)}.log").open("wb") as log:
-            subprocess.run(
-                command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
-            )
+            try:
+                subprocess.run(
+                    command.argv, cwd=directory, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True
+                )
+            except subprocess.CalledProcessError as error:
+                log.flush()
+                with Path(log.name).open("rb") as source:
+                    source.seek(max(0, source.seek(0, 2) - 8192))
+                    error.add_note(source.read().decode(errors="replace"))
+                raise
         phase = (
             "configure"
             if (

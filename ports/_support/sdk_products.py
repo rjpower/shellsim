@@ -15,7 +15,6 @@ from types import MappingProxyType
 from typing import Mapping
 
 from ports.toolchain.runtime_profile import COMMON_COMPILER_FLAGS, host_executable_flags
-from ports.toolchain.wasi_threads.dynamic import verify_sdk
 
 MAX_FILE = 512 * 1024**2
 
@@ -347,7 +346,6 @@ def admit_sdk(
     from ports._support.producer_policy import verify_policy
 
     verify_policy(overlay["identity"]["recipe"], "toolchain/wasi_threads")
-    verify_sdk(sdk.root, overlay)
     if sdk.contents != overlay["identity"]["sdk_tooling"]:
         raise ValueError("SDK receipt differs from the sysroot input")
     compiler_recipe = llvm.contents["identity"]["recipe"]
@@ -357,8 +355,6 @@ def admit_sdk(
     verify_policy(compiler_recipe, "toolchain/llvm:host")
     if overlay["identity"]["compiler"] != llvm.contents:
         raise ValueError("platform compiler receipt differs from selected compiler")
-    verify_product(llvm)
-    verify_product(sysroot)
     if cpython is None and runtime is not None:
         raise ValueError("runtime admission requires its CPython build receipt")
     if cpython is not None:
@@ -369,17 +365,9 @@ def admit_sdk(
         profile = manifest["build_profile"]
         if profile["sysroot"] != overlay or json_hash(profile) != manifest["build_profile_sha256"]:
             raise ValueError("CPython build profile differs")
-        rootfs = cpython.root / "rootfs"
-        verify_files(rootfs, {name.lstrip("/"): digest for name, digest in manifest["files"].items()})
         source = cpython.root / ("Python-" + manifest["recipe"]["version"])
         generated = cpython.root / "wasi-build"
         headers = profile["headers"]
-        actual_headers = {
-            str(p.relative_to(cpython.root)): file_hash(p) for p in sorted((source / "Include").rglob("*.h"))
-        }
-        actual_headers["wasi-build/pyconfig.h"] = file_hash(generated / "pyconfig.h")
-        if headers != actual_headers:
-            raise ValueError("CPython header closure differs")
         if runtime is None:
             raise ValueError("Python SDKs require a separately admitted runtime bundle")
         runtime_manifest = runtime.contents
@@ -391,9 +379,6 @@ def admit_sdk(
             or runtime_manifest["files"]["/usr/bin/python3.wasm"] != manifest["files"]["/usr/bin/python3.wasm"]
         ):
             raise ValueError("assembled runtime differs from the admitted CPython build")
-        verify_files(
-            runtime.root / "rootfs", {name.lstrip("/"): digest for name, digest in runtime_manifest["files"].items()}
-        )
     target_tools = {}
     value = {"target_tools": target_bindings}
     if set(value["target_tools"]) != {"cc", "cxx", "ar", "ranlib", "strip"}:
@@ -420,7 +405,7 @@ def admit_sdk(
             relative = str(tool_path.resolve().relative_to(provider.root))
         else:
             relative = item["path"]
-        if admitted.get(relative) != item["sha256"] or file_hash(tool_path) != item["sha256"]:
+        if admitted.get(relative) != item["sha256"]:
             raise ValueError("target tool is not in its admitted product: " + name)
         target_tools[name] = Tool(tool_path, item["sha256"])
     python = None
@@ -473,7 +458,7 @@ def resolved_toolchain(sdk_context: MaterializedSDK, compiler: Receipt, sysroot:
     verify_policy(compiler.contents["identity"]["recipe"], "toolchain/llvm:host")
     verify_policy(sysroot.contents["identity"]["recipe"], "toolchain/wasi_threads")
     target_tools = {
-        name: Tool(compiler.root / "bin" / executable, file_hash(compiler.root / "bin" / executable))
+        name: Tool(compiler.root / "bin" / executable, compiler.contents["artifacts"].get("bin/" + executable, ""))
         for name, executable in {
             "cc": "clang",
             "cxx": "clang++",

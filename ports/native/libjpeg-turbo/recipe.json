@@ -1,4 +1,5 @@
 {
+  "executable_sdk_link_inputs": ["lib/wasm32-wasip1-threads/libsetjmp.a"],
   "kind": "native-library",
   "name": "libjpeg-turbo",
   "version": "2.1.5.1",

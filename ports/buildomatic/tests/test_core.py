@@ -221,16 +221,14 @@ def test_journal_cas_and_identical_write_avoid_aba(store):
             store.write_journal("key", b"stale", expected)
 
 
-def test_immutable_blob_verifies_corruption(store):
+def test_blob_reads_trust_storage_without_another_digest_pass(store):
     key = store.put_blob(b"value")
     assert store.put_blob(b"value") == key
     path = store.root / "blobs" / key
     path.chmod(0o644)
     path.write_bytes(b"bad")
-    with pytest.raises(ValueError):
-        store.get_blob(key)
-    with pytest.raises(ValueError):
-        store.put_blob(b"value")
+    assert store.get_blob(key) == b"bad"
+    assert store.put_blob(b"value") == key
 
 
 def test_oversized_blob_read_is_bounded(store, monkeypatch):

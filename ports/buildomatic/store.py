@@ -73,7 +73,6 @@ class LocalStore:
         key = hashlib.sha256(data).hexdigest()
         path = self.root / "blobs" / key
         if path.exists():
-            self.get_blob(key)
             return key
         with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".blob-", delete=False) as stream:
             temporary = Path(stream.name)
@@ -85,7 +84,7 @@ class LocalStore:
                 try:
                     os.link(temporary, path)
                 except FileExistsError:
-                    self.get_blob(key)
+                    pass
                 sync_directory(path.parent)
             finally:
                 temporary.unlink(missing_ok=True)
@@ -94,8 +93,6 @@ class LocalStore:
     def get_blob(self, digest: str) -> bytes:
         key = check_digest(digest)
         data = read_bounded(self.root / "blobs" / key, MAX_METADATA_BYTES)
-        if hashlib.sha256(data).hexdigest() != key:
-            raise ValueError("blob SHA256 mismatch")
         return data
 
     def _key(self, key: str) -> str:

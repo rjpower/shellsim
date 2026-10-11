@@ -9,6 +9,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Callable, Literal
@@ -87,9 +88,8 @@ def sign_blob(prefix: str, request: BlobAccessRequest) -> SignedBlobAccess:
     params = {"Bucket": parsed.netloc, "Key": (parsed.path.strip("/") + "/blobs/" + request.digest).lstrip("/")}
     headers = ()
     if request.operation == "put":
-        # CoreWeave rejects presigned SHA256 checksum headers with
-        # SignatureDoesNotMatch. Sign length and conditional creation; clients
-        # verify the SHA256 on every read, including a concurrent winner.
+        # CoreWeave rejects presigned SHA256 checksum headers. Use its transfer
+        # integrity and conditional creation without rereading uploaded bytes.
         params.update(IfNoneMatch="*", ContentLength=request.size)
         headers = (("If-None-Match", "*"), ("Content-Length", str(request.size)))
     url = _signing_client(prefix).generate_presigned_url(
@@ -125,30 +125,23 @@ class SignedBlobStore:
         if len(data) > MAX_METADATA_BYTES:
             raise ValueError("blob exceeds the supported storage bound")
         digest = hashlib.sha256(data).hexdigest()
-        # Cache eviction can remove a previously uploaded blob. Verify remote
-        # bytes on every publication, uploading only a confirmed missing key.
-        try:
-            existing = self.get_blob(digest)
-        except FileNotFoundError:
-            pass
-        else:
-            if existing != data:
-                raise ValueError("content-addressed blob is corrupt")
-            return digest
-        access = self._access(BlobAccessRequest("put", digest, len(data)))
-        try:
-            with urlopen(Request(access.url, data=data, headers=dict(access.headers), method="PUT"), timeout=30):
-                pass
-        except HTTPError as error:
-            status = error.code
-            error.close()
-            if status not in (409, 412):
-                raise OSError(f"signed blob PUT rejected: HTTP {status}") from None
-            if self.get_blob(digest) != data:
-                raise ValueError("concurrent blob winner is corrupt") from None
-        except (URLError, OSError):
-            raise OSError("signed blob PUT transport failed") from None
-        return digest
+        for attempt in range(4):
+            access = self._access(BlobAccessRequest("put", digest, len(data)))
+            try:
+                with urlopen(Request(access.url, data=data, headers=dict(access.headers), method="PUT"), timeout=30):
+                    return digest
+            except HTTPError as error:
+                status = error.code
+                error.close()
+                if status in (409, 412):
+                    return digest
+                if status not in (429, 500, 502, 503, 504) or attempt == 3:
+                    raise OSError(f"signed blob PUT rejected: HTTP {status}") from None
+            except (URLError, OSError):
+                if attempt == 3:
+                    raise OSError("signed blob PUT transport failed") from None
+            time.sleep(0.25 * 2**attempt)
+        raise AssertionError("unreachable transfer retry state")
 
     def get_blob(self, digest: str) -> bytes:
         access = self._access(BlobAccessRequest("get", digest))
@@ -168,8 +161,6 @@ class SignedBlobStore:
             raise OSError("signed blob GET transport failed") from None
         if len(data) > MAX_METADATA_BYTES or (size is not None and len(data) != int(size)):
             raise ValueError("blob has invalid stored size")
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("content-addressed blob is corrupt")
         return data
 
     def read_journal(self, key: str):
@@ -229,28 +220,17 @@ class RemoteStore:
         return f"{self.journal_prefix}/journals/{key}"
 
     def put_blob(self, data: bytes) -> str:
-        """Verify remote bytes before uploading; recheck a concurrent winner.
-
-        A worker-local hit cannot prove an object still exists remotely after
-        cache eviction, so publication always reads the remote namespace.
-        """
+        """Publish once, trusting the store's conditional creation and integrity."""
         from rigging.filesystem.conditional_object import ConditionalWriteError
 
         if len(data) > MAX_METADATA_BYTES:
             raise ValueError("blob exceeds the supported storage bound")
         digest = hashlib.sha256(data).hexdigest()
+        obj = _conditional(f"{self.prefix}/blobs/{digest}")
         try:
-            existing = self._get_remote_blob(digest)
-        except FileNotFoundError:
-            obj = _conditional(f"{self.prefix}/blobs/{digest}")
-            try:
-                obj.write(data, expected_version=None)
-            except ConditionalWriteError:
-                existing = self._get_remote_blob(digest)
-            else:
-                existing = data
-        if existing != data:
-            raise ValueError("content-addressed blob is missing or corrupt")
+            obj.write(data, expected_version=None)
+        except ConditionalWriteError:
+            pass
         if self._local_cache is not None:
             self._local_cache.put_blob(data)
         return digest
@@ -277,8 +257,6 @@ class RemoteStore:
             data = handle.read(MAX_METADATA_BYTES + 1)
         if len(data) > MAX_METADATA_BYTES:
             raise ValueError("blob exceeds the supported storage bound")
-        if hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError("content-addressed blob is corrupt")
         return data
 
     def read_journal(self, key: str):

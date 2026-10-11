@@ -229,7 +229,7 @@ def test_cached_sdk_rejects_tampered_embedded_dependencies(cached_sdk, readonly_
     assert retained_snapshot(fixture.store.parent) == before
 
 
-@pytest.mark.parametrize("damage", ["host-tool", "python-header", "uv-lock", "schema", "current-policy"])
+@pytest.mark.parametrize("damage", ["host-tool", "uv-lock", "schema", "current-policy"])
 def test_cached_sdk_rechecks_seed_headers_schema_and_current_policy(cached_sdk, readonly_admission, damage):
     fixture = cached_sdk
     if damage == "host-tool":

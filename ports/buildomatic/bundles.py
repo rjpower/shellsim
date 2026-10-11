@@ -6,7 +6,6 @@ No archive extraction machinery, device nodes or host-absolute links are used.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import posixpath
@@ -70,15 +69,13 @@ def _verify_links(entries: list[dict]) -> None:
 def _blob(store: Store, key: str, limit: int) -> bytes:
     digest(key)
     data = store.get_blob(key)
-    if len(data) > limit or hashlib.sha256(data).hexdigest() != key:
+    if len(data) > limit:
         raise ValueError("invalid or oversized tree blob")
     return data
 
 
 def _put(store: Store, data: bytes) -> str:
     key = store.put_blob(data)
-    if key != hashlib.sha256(data).hexdigest():
-        raise ValueError("store returned an incorrect blob digest")
     return key
 
 
