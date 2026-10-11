@@ -148,14 +148,21 @@ Shellsim copies compatible pure Python packages into virtual site-packages witho
 environment's working directory. Resolution failures and native wheels raise
 `shellsim.PackageInstallError`; source distributions may run build code on the host.
 
-An opt-in `shellsim.CPythonRuntime` mounts a source-built upstream CPython 3.13.7
-WASI interpreter and runs it through the virtual process boundary. Dynamic
-bundles create an isolated guest venv and install ABI-verified native or pure
-wheel dependencies from an explicit package universe. Mounting selects CPython
-for shell `python` and `python3` commands; `python3.14` remains the modeled VM.
-See [CPython WASI ports](ports/README.md) for build, mount, package installation,
-resource limits, and current capability limits. `Environment.run_python` uses
-the mounted CPython interpreter when present, otherwise shellsim's Python VM.
+For compiled packages, use an exported [ports catalog](ports/buildomatic/README.md):
+
+```python
+environment = shellsim.Environment(
+    pypi_packages=["scipy"], pypi_catalog="http://localhost:8080/export/catalog.json",
+)
+result = environment.run_python("from scipy.special import factorial; print(factorial(5))")
+```
+
+This mounts upstream CPython 3.13.7 WASI and downloads only the selected wheels,
+native dependencies, and interpreter, caching them between environments. Set
+`SHELLSIM_PYPI_CATALOG` to omit `pypi_catalog`; `cache_dir` and `offline=True` control
+cache use. No patched uv is needed. Each guest has a private filesystem;
+`install_pypi` can add catalog packages later. See [CPython WASI ports](ports/README.md)
+for capability limits and the explicit `CPythonRuntime` API.
 
 ## Clock modes
 

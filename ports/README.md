@@ -14,7 +14,8 @@ uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 --
 State defaults to `build/ports`. Builds retain individual assets; export writes
 JSON and optional HTML from `graph.json`. Add `--output <store> --copy-assets` to
 promote only missing assets. See [Buildomatic](buildomatic/README.md) for Iris
-and the storage proxy. The catalog installer remains a follow-up.
+and the storage proxy. `Environment(pypi_packages=["scipy"], pypi_catalog="<catalog URL>")`
+fetches only its selected WASI closure and interpreter; patched uv is unnecessary.
 
 ## Build and check a graph
 

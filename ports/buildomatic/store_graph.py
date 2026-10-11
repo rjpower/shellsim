@@ -211,6 +211,32 @@ def prepare(
                     max_attempts=1,
                 )
             )
+        if sdk is not None and "cpython" in sdk["products"]:
+            component = sdk["products"]["cpython"]
+            runtime_record = backend.resolve_artifact("runtime/" + component["receipt_id"])
+            if runtime_record is None or backend.resolve_artifact("runtime/" + sdk_name) != runtime_record:
+                recipe = root / "runtime"
+                recipe.mkdir()
+                write_reference(
+                    recipe / "node.json",
+                    {
+                        "prefix": prefix,
+                        "sdk_name": sdk_name,
+                        "component": {"receipt_id": component["receipt_id"], "artifact": component["artifact"]},
+                    },
+                )
+                recipe_bundle = capture_tree(recipe, local)
+                bundles.append(recipe_bundle)
+                actions.append(
+                    Action(
+                        "runtime-export",
+                        ("python", "-m", "ports.buildomatic.runtime_worker"),
+                        inputs=(InputMount("code", code_bundle), InputMount("recipe", recipe_bundle)),
+                        env=(("PYTHONPATH", "inputs/code"),),
+                        timeout_seconds=3600,
+                        max_attempts=1,
+                    )
+                )
         if actions:
             backend.upload_bundles(local, bundles)
     request = (
@@ -260,10 +286,10 @@ def run(
         needs_sdk = any(
             port.recipe["build_system"] not in {"pure-wheel", "host-wheel", "source-tree"} for port in initial.ports
         )
-        sdk = backend.resolve_artifact("sdk/" + sdk_name) if needs_sdk else None
+        sdk = backend.resolve_artifact("sdk/" + sdk_name)
         if needs_sdk and sdk is None:
             raise ValueError("SDK cache miss: explicitly bootstrap " + sdk_name)
-        if sdk is not None and not sdk_inputs_match(sdk["inputs"], sdk_inputs(ports, sdk_name)):
+        if needs_sdk and sdk is not None and not sdk_inputs_match(sdk["inputs"], sdk_inputs(ports, sdk_name)):
             raise ValueError("SDK build inputs changed: explicitly bootstrap " + sdk_name)
         local = LocalStore(scratch / "transport")
         print(f"buildomatic: checking product cache for {len(initial.ports)} graph nodes", flush=True)
@@ -283,9 +309,10 @@ def run(
         )
         actions = request.actions if request else ()
         backfills = sum(action.id.startswith("delivery-") for action in actions)
+        runtime_exports = sum(action.id == "runtime-export" for action in actions)
         print(
             f"buildomatic: product cache: {len(results)} hits, "
-            f"{len(actions) - backfills} builds, {backfills} asset backfills",
+            f"{len(actions) - backfills - runtime_exports} builds, {backfills} asset backfills, {runtime_exports} runtime exports",
             flush=True,
         )
         if request is not None:
@@ -316,10 +343,15 @@ def run(
                 )
             )
             backend.acknowledge(build_id)
+        runtime_key = sdk["products"]["cpython"]["receipt_id"] if sdk and "cpython" in sdk["products"] else sdk_name
+        runtime_record = backend.resolve_artifact("runtime/" + runtime_key)
+        runtime = runtime_record["runtime"] if runtime_record is not None else None
     result = StoreBuild(graph, sdk, results)
     write_reference(
         scratch / "results.json",
         {"roots": graph.roots, "sdk": sdk, "sdk_name": sdk_name, "products": results, "prefix": prefix},
     )
-    write_reference(scratch / "graph.json", delivery_graph(graph, results, abi=sdk["dynamic_abi"] if sdk else None))
+    write_reference(
+        scratch / "graph.json", delivery_graph(graph, results, abi=sdk["dynamic_abi"] if sdk else None, runtime=runtime)
+    )
     return result

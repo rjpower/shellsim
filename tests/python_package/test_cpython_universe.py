@@ -408,3 +408,72 @@ def test_conflict_preserves_existing_files_and_skips_extension(live_universe) ->
     assert environment.read_file("/lib/libz.so") == existing_provider
     with pytest.raises(shellsim.SimulationError):
         environment.read_file(runtime.site_packages + "/zlib_consumer.so")
+
+
+@pytest.fixture
+def delivery_catalog(tmp_path):
+    from ports.buildomatic.delivery import DeliveryStore, catalog, publish_runtime, wheel_metadata
+    from dataclasses import asdict
+
+    store = tmp_path / "delivery"
+    store.mkdir()
+    runtime = publish_runtime(make_bundle(tmp_path / "bundle"), "runtime-key", DeliveryStore(store))
+    runtime["native_dependencies"] = []
+    packages = []
+    definitions = {
+        "base": ([], []),
+        "speed": ([], []),
+        "app": (["base>=1", 'speed; extra == "fast-mode"', 'host-only; sys_platform != "wasi"'], ["fast-mode"]),
+    }
+    for name, (requirements, extras) in definitions.items():
+        wheel = store / f"{name}-1.0-py3-none-any.whl"
+        with zipfile.ZipFile(wheel, "w") as output:
+            output.writestr(name + ".py", "VALUE = 42\n")
+            info = name + "-1.0.dist-info/"
+            output.writestr(info + "METADATA", f"Name: {name}\nVersion: 1.0\nRequires-Python: >=3.13\n" +
+                "".join("Requires-Dist: " + requirement + "\n" for requirement in requirements) +
+                "".join("Provides-Extra: " + extra + "\n" for extra in extras))
+            output.writestr(info + "WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
+            if name == "app":
+                output.writestr(info + "entry_points.txt", "[console_scripts]\napp-command = app:main\n")
+                output.writestr("app-1.0.data/scripts/app-raw", "#!python\nprint(42)\n")
+                output.writestr(info + "RECORD", "app-1.0.data/scripts/app-raw,,\n")
+        relative = f"assets/{name}-key/{wheel.name}"
+        DeliveryStore(store).emit(wheel, relative)
+        packages.append(asdict(wheel_metadata(wheel, relative)))
+    document = catalog({"packages": packages, "native": [], "runtime": runtime}, store.as_uri())
+    path = store / "catalog.json"
+    path.write_text(json.dumps(document))
+    return path, tmp_path / "cache"
+
+
+def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(delivery_catalog):
+    path, cache = delivery_catalog
+    environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
+    site = "/work/.venv/lib/python3.13/site-packages/"
+    assert environment.read_file(site + "base.py") == b"VALUE = 42\n"
+    assert environment.run("test ! -e " + site + "speed.py").returncode == 0
+    assert environment.read_file("/work/.venv/bin/app-command").startswith(b"#!/work/.venv/bin/python\n")
+    assert environment.read_file("/work/.venv/bin/app-raw") == b"#!/work/.venv/bin/python\nprint(42)\n"
+    assert environment.run("test -x /work/.venv/bin/app-raw").returncode == 0
+    environment.install_pypi("app[fast_mode]")
+    assert environment.read_file(site + "speed.py") == b"VALUE = 42\n"
+    assert environment.run("test ! -e " + site + "host_only.py").returncode == 0
+    environment.write_file("/private", b"first guest")
+    second = shellsim.Environment(pypi_packages=["app[fast_mode]"], pypi_catalog=path, cache_dir=cache, offline=True)
+    assert second.read_file(site + "app.py") == b"VALUE = 42\n"
+    assert second.run("test ! -e /private").returncode == 0
+    path.write_text("{}")
+    with pytest.raises(shellsim.PackageInstallError):
+        shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
+    third = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache, offline=True)
+    assert third.read_file(site + "app.py") == b"VALUE = 42\n"
+
+
+def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog):
+    path, cache = delivery_catalog
+    environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
+    before = environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py")
+    with pytest.raises(shellsim.PackageInstallError):
+        environment.install_pypi("base<1")
+    assert environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py") == before
