@@ -71,26 +71,35 @@ selected workload while retaining explicit memory and disk bounds.
 The current resolver installation helper uses host Python 3.13.7 or newer.
 Cache outputs have no retention promise; creating a release is explicit.
 
-Serve any selected S3 prefix with the standalone read-only proxy:
+Serve a selected S3/GCS prefix or local directory with the standalone read-only
+proxy. Use an environment with `marin-rigging` installed, such as the Iris worker
+environment:
 
 ```sh
-uv run --no-project --with botocore python ports/buildomatic/s3_proxy.py \
+uv run python ports/buildomatic/s3_proxy.py \
   --prefix s3://my-bucket/ports --bind 127.0.0.1 --port 8080
 ```
 
-`s3_proxy.py` is one file and needs only Python and botocore. It uses the standard
-AWS credential chain. S3-compatible stores can set `--endpoint-url` and
-`--region`; CoreWeave uses `https://cwobject.com` and the bucket's signing region.
-Virtual-host S3 addressing is the default; `--addressing-style path` supports
-endpoints that require bucket names in the URL path.
-Credentials stay on the server. HTTP `/assets/example.whl` maps to
+`s3_proxy.py` is one file with no Shellsim or Iris imports. Rigging's
+`StoragePath` and bucket-routed `filesystem_for()` own S3/GCS credentials,
+permissions, endpoints and request bounds. The configured CoreWeave credentials
+work directly; no separate AWS credential or endpoint setup is needed.
+An editable Rigging checkout discovers cluster configuration from the Marin
+working directory; run there with an absolute proxy script path. Installed
+Rigging wheels include the cluster configuration.
+HTTP `/assets/example.whl` maps to
 `s3://my-bucket/ports/assets/example.whl`. Directory URLs map to `index.html`;
 there is no bucket listing or object rewriting. GET and HEAD support byte ranges
 and ETag conditionals. Object bodies stream without local staging or digest
 verification. Requests with `If-Range` receive the full object, preventing mixed
 versions during download retries. Stored content encodings are preserved.
-Traversal, ambiguous encoding, alternate authorities and writes
-are rejected before accessing S3.
+GCS objects with HTTP content encoding, such as `Content-Encoding: gzip`, return
+501 because gcsfs may decode their bodies; ordinary JSON, HTML and ZIP wheels
+need no such encoding. GCS reads use generation-qualified URLs to keep each
+stream on one object version.
+Decoded paths are normalized and must remain beneath the configured storage
+base. Local paths resolve symlinks before the same containment check. Encoded
+separators, malformed encoding, alternate authorities and writes are rejected.
 
 The listener defaults to loopback. Put an authenticated HTTPS reverse proxy in
 front of it when exposing private objects beyond the host. Every object under
