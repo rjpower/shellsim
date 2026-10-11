@@ -19,7 +19,7 @@ from ._cpython_release import (
     _native_asset,
     _read_descriptor,
 )
-from .native_packages import verify_release_catalog
+from .native_packages import _MAX_JSON, verify_release_catalog
 from .pypi import PackageInstallError
 
 
@@ -46,7 +46,7 @@ def _validate_entry(entry: Path, native: dict[str, Any]) -> None:
                 raise PackageInstallError("native release cache exceeds its size limit")
             actual.add(path.relative_to(entry).as_posix())
     catalog = entry / "native/catalog.json"
-    if _digest(catalog, 1024 * 1024) != native["catalog_sha256"]:
+    if _digest(catalog, _MAX_JSON) != native["catalog_sha256"]:
         raise PackageInstallError("cached native catalog differs from the release descriptor")
     try:
         expected = {"native/" + name for name in verify_release_catalog(catalog)}

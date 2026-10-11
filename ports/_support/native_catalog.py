@@ -33,7 +33,7 @@ def _publication_size(prefix: Path, remaining: int) -> tuple[int, int]:
         with os.scandir(directory) as stream:
             for entry in stream:
                 entries += 1
-                if entries > 20_000 or entry.is_symlink():
+                if entries > 200_000 or entry.is_symlink():
                     raise ValueError("native publication artifact has too many or linked entries")
                 if entry.is_dir(follow_symlinks=False):
                     pending.append((Path(entry.path), depth + 1))
@@ -41,8 +41,8 @@ def _publication_size(prefix: Path, remaining: int) -> tuple[int, int]:
                 if not entry.is_file(follow_symlinks=False):
                     raise ValueError("native publication artifact contains a special file")
                 size = entry.stat(follow_symlinks=False).st_size
-                if size > remaining or (entry.name == "artifact.json" and size > 1024**2):
-                    raise ValueError("native publication exceeds its byte bound")
+                if size > remaining or (entry.name == "artifact.json" and size > 16 * 1024**2):
+                    raise ValueError(f"native publication exceeds its byte bound: {entry.path} ({size} bytes)")
                 remaining -= size
                 files += 1
     return remaining, files
@@ -85,12 +85,12 @@ def publish_native_catalog(graph: Graph, results: dict[str, Path], output: Path)
     ]
     if not selected:
         return None
-    remaining = 2 * 1024**3
+    remaining = 16 * 1024**3
     file_count = 0
     for port in selected:
         remaining, files = _publication_size(results[port.reference] / "native", remaining)
         file_count += files
-        if file_count > 10_000:
+        if file_count > 200_000:
             raise ValueError("native publication exceeds its file bound")
     records = []
     aliases = {port.reference: installation(port) for port in selected}

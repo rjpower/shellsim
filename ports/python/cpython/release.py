@@ -12,10 +12,10 @@ import tempfile
 import zipfile
 from pathlib import Path
 
-from shellsim._cpython_release import _descriptor, _digest, _validate_entry
+from shellsim._cpython_release import _MAX_ARCHIVE, _descriptor, _digest, _validate_entry
 from shellsim._native_release import _validate_entry as _validate_native_entry
 from shellsim.cpython import _MAX_MANIFEST_BYTES, _PYTHON_PACKAGE_PLATFORM
-from shellsim.native_packages import verify_release_catalog
+from shellsim.native_packages import _MAX_JSON, verify_release_catalog
 
 
 def _host_requirements(uv: Path) -> tuple[str, list[str]]:
@@ -110,16 +110,16 @@ def build_release(
             native_stage.mkdir()
             shutil.copytree(native_catalog.parent, native_stage / "native", symlinks=True)
             native = {
-                "catalog_sha256": _digest(native_stage / "native/catalog.json", 1024 * 1024),
+                "catalog_sha256": _digest(native_stage / "native/catalog.json", _MAX_JSON),
                 "archive": {"url": (base_url or "") + "native.zip"},
             }
             _validate_native_entry(native_stage, native)
             native_archive = work / "native.zip"
             _archive(native_stage, native_archive, empty_directories=True)
-            if native_archive.stat().st_size > 256 * 1024 * 1024:
-                raise ValueError("native release archive exceeds 256 MiB")
+            if native_archive.stat().st_size > _MAX_ARCHIVE:
+                raise ValueError("native release archive exceeds its byte bound")
             native["archive"].update(
-                {"sha256": _digest(native_archive, 256 * 1024 * 1024), "size": native_archive.stat().st_size}
+                {"sha256": _digest(native_archive, _MAX_ARCHIVE), "size": native_archive.stat().st_size}
             )
             descriptor["native"] = native
         (work / "release.json").write_text(json.dumps(descriptor, sort_keys=True, indent=2) + "\n")

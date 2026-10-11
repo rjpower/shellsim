@@ -11,7 +11,8 @@ use std::path::{Path, PathBuf};
 
 use crate::Environment;
 
-pub const MAX_HOST_FILES: usize = 10_000;
+/// Scientific header trees need room beyond the original small-project bound.
+pub const MAX_HOST_FILES: usize = 200_000;
 pub const DEFAULT_SKIPPED_DIRECTORIES: &[&str] = &[
     ".git",
     ".venv",
