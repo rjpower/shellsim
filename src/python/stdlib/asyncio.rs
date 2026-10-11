@@ -223,6 +223,7 @@ fn wait_token(runtime: &mut dyn PyRuntime, reason: crate::scheduler::WaitReason)
         crate::scheduler::WaitReason::ChildActivity(value) => ("child_activity", i64::from(value)),
         crate::scheduler::WaitReason::ChildDeadline(_, _)
         | crate::scheduler::WaitReason::ChildActivityDeadline(_, _)
+        | crate::scheduler::WaitReason::FileLock(_)
         | crate::scheduler::WaitReason::Any(_) => {
             return Err(PyError::runtime_error(
                 "unsupported nested asyncio resource wait",

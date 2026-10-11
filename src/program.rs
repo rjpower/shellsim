@@ -679,6 +679,18 @@ mod tests {
             unreachable!("native writer does not inspect files")
         }
 
+        fn file_lock(
+            &mut self,
+            _fd: i32,
+            _mode: Option<crate::descriptors::FileLockMode>,
+        ) -> Result<bool, SyscallError> {
+            unreachable!("native writer does not lock files")
+        }
+
+        fn file_lock_inode(&self, _fd: i32) -> Result<u64, SyscallError> {
+            unreachable!("native writer does not inspect inodes")
+        }
+
         fn close(&mut self, _fd: i32) -> Result<(), SyscallError> {
             unreachable!("native writer does not close files")
         }

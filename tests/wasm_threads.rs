@@ -11,6 +11,66 @@ fn install(environment: &mut Environment, source: &str) {
 }
 
 #[test]
+fn blocked_file_lock_rejects_descriptor_reuse_by_another_thread() {
+    let source = r#"(module
+        (import "env" "memory" (memory 1 256 shared))
+        (import "shellsim_threads_v1" "wait32" (func $wait (param i32 i32 i64) (result i32)))
+        (import "shellsim_threads_v1" "notify" (func $notify (param i32 i32) (result i32)))
+        (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+        (import "shellsim_posix_v1" "descriptor_open" (func $open (param i32 i32 i32 i32) (result i32)))
+        (import "shellsim_posix_v1" "descriptor_flock" (func $lock (param i32 i32) (result i32)))
+        (export "memory" (memory 0))
+        (data $lock "/lock\00")
+        (data $replacement "/replacement\00")
+        (global $owner (mut i32) (i32.const 0))
+        (global $pending (mut i32) (i32.const 0))
+        (func $check (param $value i32)
+            (if (local.get $value) (then unreachable)))
+        (func (export "_start")
+            (memory.init $lock (i32.const 16) (i32.const 0) (i32.const 6))
+            (memory.init $replacement (i32.const 32) (i32.const 0) (i32.const 13))
+            (global.set $owner (call $open (i32.const -2) (i32.const 16) (i32.const 67108864) (i32.const 0)))
+            (global.set $pending (call $open (i32.const -2) (i32.const 16) (i32.const 67108864) (i32.const 0)))
+            (call $check (call $lock (global.get $owner) (i32.const 2)))
+            (drop (call $spawn (global.get $pending)))
+            (drop (call $wait (i32.const 0) (i32.const 0) (i64.const -1)))
+            ;; The owner sleeps while its sibling is parked on the file lock.
+            (i32.store (i32.const 80) (i32.const 1))
+            (i64.store (i32.const 88) (i64.const 10000000))
+            (call $check (call $poll (i32.const 64) (i32.const 128) (i32.const 1) (i32.const 192)))
+            (call $check (call $close (global.get $pending)))
+            (call $check (i32.ne (global.get $pending)
+                (call $open (i32.const -2) (i32.const 32) (i32.const 67108864) (i32.const 0))))
+            (call $check (call $lock (global.get $owner) (i32.const 8)))
+            (drop (call $wait (i32.const 4) (i32.const 0) (i64.const -1)))
+            (call $check (call $lock (global.get $pending) (i32.const 6))))
+        (func (export "wasi_thread_start") (param $tid i32) (param $fd i32)
+            (i32.atomic.store (i32.const 0) (i32.const 1))
+            (drop (call $notify (i32.const 0) (i32.const 1)))
+            (call $check (i32.ne (call $lock (local.get $fd) (i32.const 2)) (i32.const 58)))
+            (i32.atomic.store (i32.const 4) (i32.const 1))
+            (drop (call $notify (i32.const 4) (i32.const 1)))))"#;
+    let mut environment = Environment::new();
+    environment.vfs.write("/", "/lock", b"", 0o644).unwrap();
+    environment
+        .vfs
+        .write("/", "/replacement", b"", 0o644)
+        .unwrap();
+    install(&mut environment, source);
+    let (outcome, stdout, stderr) = environment.run_script_capture("/threads");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stdout.is_empty() && stderr.is_empty());
+    assert_eq!(environment.clock.monotonic_ns(), 10_000_000);
+}
+
+#[test]
 fn raw_atomic_waits_and_notifications_are_rejected_before_execution() {
     for operation in [
         "(drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1)))",
@@ -86,6 +146,55 @@ fn threaded(body: &str, worker: &str, maximum: u32) -> String {
         (func (export "_start") {body})
         (func (export "wasi_thread_start") (param $tid i32) (param $arg i32) {worker}))"#
     )
+}
+
+#[test]
+fn closing_both_pipe_ends_resumes_a_blocked_sibling_read() {
+    let source = threaded(
+        r#"
+        (if (call $pipe (i32.const 0) (i32.const 16) (i32.const 20)) (then unreachable))
+        (i32.store (i32.const 32) (i32.const 256))
+        (i32.store (i32.const 36) (i32.const 1))
+        (drop (call $spawn (i32.load (i32.const 16))))
+        (drop (call $wait (i32.const 4) (i32.const 0) (i64.const -1)))
+        (i32.store (i32.const 80) (i32.const 1))
+        (i64.store (i32.const 88) (i64.const 1000000))
+        (if (call $poll (i32.const 64) (i32.const 128) (i32.const 1) (i32.const 192)) (then unreachable))
+        (if (call $close (i32.load (i32.const 16))) (then unreachable))
+        (if (call $close (i32.load (i32.const 20))) (then unreachable))
+        (drop (call $wait (i32.const 8) (i32.const 0) (i64.const -1)))
+        "#,
+        r#"
+        (i32.atomic.store (i32.const 4) (i32.const 1))
+        (drop (call $notify (i32.const 4) (i32.const 1)))
+        (if (i32.ne (call $read (local.get $arg) (i32.const 32) (i32.const 1) (i32.const 40)) (i32.const 8))
+            (then unreachable))
+        (i32.atomic.store (i32.const 8) (i32.const 1))
+        (drop (call $notify (i32.const 8) (i32.const 1)))
+        "#,
+        256,
+    )
+    .replace(
+        "(export \"memory\" (memory 0))",
+        r#"
+        (import "shellsim_posix_v1" "process_pipe" (func $pipe (param i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (import "wasi_snapshot_preview1" "poll_oneoff" (func $poll (param i32 i32 i32 i32) (result i32)))
+        (export "memory" (memory 0))
+        "#,
+    );
+    let mut environment = Environment::new();
+    install(&mut environment, &source);
+    let (outcome, stdout, stderr) = environment.run_script_capture("/threads");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert!(stdout.is_empty() && stderr.is_empty());
+    assert_eq!(environment.clock.monotonic_ns(), 1_000_000);
 }
 
 #[test]

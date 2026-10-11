@@ -649,6 +649,13 @@ impl DerefMut for Environment {
 }
 
 impl Environment {
+    /// A single arena flag catches releases through close, dup2, exec and process exit.
+    pub(crate) fn wake_file_lock_waiters(&mut self) {
+        if self.descriptors.take_file_lock_changes() {
+            self.scheduler.wake_file_lock_waiters();
+        }
+    }
+
     /// Release capacity only when every alias of both pipe endpoints has closed.
     pub(crate) fn release_closed_pipe_memory(&mut self) {
         let closed = self
@@ -676,6 +683,7 @@ impl Environment {
             });
         }
         self.release_closed_pipe_memory();
+        self.wake_file_lock_waiters();
     }
     pub fn new() -> Self {
         Self::with_limits(Limits::default())
@@ -1872,6 +1880,7 @@ impl Environment {
             })
             .collect::<Vec<_>>();
         self.process.fds.close_all(&mut self.descriptors);
+        self.wake_file_lock_waiters();
         self.release_closed_pipe_memory();
         self.vfs.retain_orphans(&self.descriptors.live_orphans());
         for (pipe, reader) in endpoints {

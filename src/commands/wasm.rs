@@ -2632,6 +2632,7 @@ pub(super) fn validate_imports(
                 && matches!(
                     import.name(),
                     "descriptor_control"
+                        | "descriptor_flock"
                         | "descriptor_open"
                         | "umask"
                         | "cwd_get"

@@ -2961,6 +2961,7 @@ pub(crate) fn poll_machine(
     target_pid: u32,
     advance_time: bool,
 ) -> Result<MachinePoll, String> {
+    interp.wake_file_lock_waiters();
     if interp.scheduler.current().is_none() && !dispatch_available(interp, advance_time)? {
         return Ok(MachinePoll::Blocked);
     }
@@ -3069,6 +3070,7 @@ pub(crate) fn poll_machine(
 }
 
 fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, String> {
+    interp.wake_file_lock_waiters();
     // Physical time passes whether or not the caller asked to advance time.
     interp.sync_host_time()?;
     handle_ready_events(interp)?;

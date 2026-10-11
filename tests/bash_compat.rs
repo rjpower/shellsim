@@ -262,6 +262,18 @@ fn multi_digit_descriptors_support_common_flock_guards() {
 }
 
 #[test]
+fn flock_contends_across_opens_and_releases_through_aliases() {
+    assert_eq!(run("exec 200>/tmp/lock; exec 201>/tmp/lock; flock -x 200; flock -n -x 201; echo $?; exec 202>&200; exec 200>&-; flock -n -s 201; echo $?; exec 202>&-; flock -n -x 201; echo $?"),
+        (0, "1\n1\n0\n".into(), String::new()));
+}
+
+#[test]
+fn flock_blocking_child_wakes_when_parent_unlocks() {
+    assert_eq!(run("exec 200>/tmp/lock; flock -x 200; (exec 200>&-; exec 201>/tmp/lock; flock -x 201; echo child) & sleep 0.01; flock -u 200; wait"),
+        (0, "child\n".into(), String::new()));
+}
+
+#[test]
 fn exit_traps_run_once_at_script_completion_and_preserve_status() {
     assert_eq!(
         run("trap 'printf cleanup:$?' EXIT; printf body:; false"),
