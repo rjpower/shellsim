@@ -75,7 +75,10 @@ def build_release(
         work = Path(temporary)
         stage = work / "stage"
         stage.mkdir()
-        shutil.copytree(runtime, stage / "runtime", symlinks=True)
+        # SDK installations also carry headers and producer receipts. Releases
+        # deliver the runtime manifest and rootfs, independent of that layout.
+        shutil.copytree(runtime / "rootfs", stage / "runtime/rootfs", symlinks=True)
+        shutil.copy2(runtime / "manifest.json", stage / "runtime/manifest.json")
         shutil.copytree(universe, stage / "universe", symlinks=True)
         shutil.copy2(uv, stage / "uv")
         (stage / "uv").chmod(0o755)

@@ -1,0 +1,66 @@
+{
+  "name": "joblib",
+  "version": "1.6.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/18/53/84099323c2ec4be98d935f63c033ac4151ee83836ca1050ede3b3aadf155/joblib-1.6.0-py3-none-any.whl",
+    "sha256": "3dbbf9f6e4b592a2357b854608e980fe6390d131d7a82f011a377ef2ebef7aba",
+    "filename": "joblib-1.6.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "cloudpickle>=3.0",
+    "distributed; extra == \"test\"",
+    "lz4; extra == \"test\"",
+    "numpy; extra == \"test\"",
+    "memory_profiler; extra == \"test\"",
+    "pytest; extra == \"test\"",
+    "pytest-asyncio; extra == \"test\"",
+    "pytest-cov; extra == \"test\"",
+    "pytest-run-parallel; extra == \"test\"",
+    "pytest-timeout; extra == \"test\"",
+    "threadpoolctl; extra == \"test\"",
+    "distributed; extra == \"docs\"",
+    "lz4; extra == \"docs\"",
+    "numpy; extra == \"docs\"",
+    "numpydoc; extra == \"docs\"",
+    "matplotlib; extra == \"docs\"",
+    "pandas; extra == \"docs\"",
+    "psutil; extra == \"docs\"",
+    "sphinx; extra == \"docs\"",
+    "pydata-sphinx-theme; extra == \"docs\"",
+    "sphinx-gallery; extra == \"docs\"",
+    "sphinx-copybutton; extra == \"docs\"",
+    "sphinx-design; extra == \"docs\"",
+    "tqdm; extra == \"docs\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/cloudpickle",
+      "version": "3.1.2"
+    },
+    {
+      "port": "python/cpython-stdlib-ctypes",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-ctypes"
+    },
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
