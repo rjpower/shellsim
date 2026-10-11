@@ -12,7 +12,6 @@ from contextlib import contextmanager
 from types import ModuleType, SimpleNamespace
 
 import pytest
-from ports.buildomatic.contracts import encode
 
 from ports.buildomatic import (
     ConditionalWriteError,
@@ -24,6 +23,7 @@ from ports.buildomatic import (
     transfers,
 )
 from ports.buildomatic.backends import iris
+from ports.buildomatic.contracts import encode
 
 
 @pytest.fixture
