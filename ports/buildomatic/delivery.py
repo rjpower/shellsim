@@ -10,6 +10,7 @@ import json
 import shutil
 import tempfile
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -208,7 +209,39 @@ def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore
     return record
 
 
-def delivery_graph(graph: Graph, products: dict[str, dict], *, abi: str | None = None) -> dict:
+def publish_runtime(bundle: Path, key: str, store: DeliveryStore) -> dict:
+    """Emit the interpreter once, independently of package additions."""
+    if (record := store.record("runtime/" + key)) is not None:
+        return record["runtime"]
+    manifest = json.loads((bundle / "manifest.json").read_text())
+    relative = f"assets/{key}/runtime.zip"
+    if not store.exists(relative):
+        with tempfile.TemporaryDirectory(prefix=".runtime-", dir=bundle.parent) as temporary:
+            archive = Path(temporary) / "runtime.zip"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
+                for path in [bundle / "manifest.json", *sorted((bundle / "rootfs").rglob("*"))]:
+                    if path.is_file():
+                        output.write(path, "runtime/" + path.relative_to(bundle).as_posix())
+            size = archive.stat().st_size
+            store.emit(archive, relative)
+    else:
+        size = (
+            (store.local / relative).stat().st_size if store.local is not None else store.fs.size(store.key(relative))
+        )
+    runtime = {
+        "path": relative,
+        "size": size,
+        "abi": manifest["dynamic_abi"],
+        "python_version": manifest["recipe"]["version"],
+        "runtime_target": manifest["recipe"]["target"],
+    }
+    store.write("records/runtime/" + relative_path(key) + ".json", _json({"runtime": runtime}))
+    return runtime
+
+
+def delivery_graph(
+    graph: Graph, products: dict[str, dict], *, abi: str | None = None, runtime: dict | None = None
+) -> dict:
     """Select guest records and retain the static recipe dependency edges."""
     packages, native, nodes = [], [], []
     selected = guest_graph(graph)
@@ -233,10 +266,24 @@ def delivery_graph(graph: Graph, products: dict[str, dict], *, abi: str | None =
         "ports": nodes,
         "packages": packages,
         "native": native,
+        **(
+            {
+                "runtime": {
+                    **runtime,
+                    "native_dependencies": [
+                        item["name"]
+                        for item in native
+                        if item["destination"].startswith("/usr/lib/python3.13/lib-dynload/")
+                    ],
+                }
+            }
+            if runtime is not None
+            else {}
+        ),
     }
 
 
-def save_local_graph(build, state: Path) -> None:
+def save_local_graph(build, state: Path, default_sdk: str = "default") -> None:
     """Record delivery metadata for existing local results without rebuilding."""
     store = DeliveryStore(state)
     products = {}
@@ -245,11 +292,22 @@ def save_local_graph(build, state: Path) -> None:
             continue
         root = build.results[port.reference]
         products[port.reference] = {"build_key": root.name, "delivery": publish_product(port, root, root.name, store)}
-    abi = next((sdk.dynamic_abi for sdk in build.sdks.values() if sdk is not None), None)
+    sdk = next((sdk for sdk in build.sdks.values() if sdk is not None), None)
+    abi = sdk.dynamic_abi if sdk is not None else None
+    runtime = (
+        publish_runtime(sdk.python.runtime_bundle, sdk.cpython_manifest.sha256, store)
+        if sdk is not None and sdk.python is not None
+        else None
+    )
+    if runtime is not None:
+        store.write("records/runtime/" + relative_path(default_sdk) + ".json", _json({"runtime": runtime}))
+    elif (cached := store.record("runtime/" + default_sdk)) is not None:
+        runtime = cached["runtime"]
+        abi = runtime["abi"]
     write_reference(
         state / "results.json", {"roots": build.graph.roots, "prefix": str(state.resolve()), "products": products}
     )
-    write_reference(state / "graph.json", delivery_graph(build.graph, products, abi=abi))
+    write_reference(state / "graph.json", delivery_graph(build.graph, products, abi=abi, runtime=runtime))
 
 
 def _json(value: dict) -> bytes:
@@ -269,6 +327,11 @@ def catalog(graph: dict, url_prefix: str) -> dict:
             {**item, "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/")}
             for item in graph[section]
         ]
+    if "runtime" in graph:
+        value["runtime"] = {
+            **graph["runtime"],
+            "url": url_prefix.rstrip("/") + "/" + quote(relative_path(graph["runtime"]["path"]), safe="/"),
+        }
     return value
 
 
@@ -282,7 +345,7 @@ def export(
     copied = 0
     if copy_assets:
         source = DeliveryStore(json.loads((state / "results.json").read_text())["prefix"])
-        for item in [*graph["packages"], *graph["native"]]:
+        for item in [*graph["packages"], *graph["native"], *([graph["runtime"]] if "runtime" in graph else [])]:
             copied += source.promote(item["path"], destination)
     destination.write("catalog.json", _json(value))
     if simple:
@@ -297,6 +360,7 @@ def export(
                 + "\n"
             ).encode(),
         )
+        pages = []
         for name, packages in projects.items():
             links = []
             for package in packages:
@@ -305,9 +369,13 @@ def export(
                 links.append(
                     f'<a href="{html.escape(package["url"], quote=True)}"{attribute}>{html.escape(package["filename"])}</a>'
                 )
-            destination.write(
-                f"simple/{relative_path(name)}/index.html", ("<!doctype html>\n" + "\n".join(links) + "\n").encode()
+            pages.append(
+                (f"simple/{relative_path(name)}/index.html", ("<!doctype html>\n" + "\n".join(links) + "\n").encode())
             )
+        with ThreadPoolExecutor(max_workers=16) as executor:
+            futures = [executor.submit(destination.write, path, content) for path, content in pages]
+            for future in futures:
+                future.result()
     return {"packages": len(value["packages"]), "native": len(value["native"]), "assets_copied": copied}
 
 

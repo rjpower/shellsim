@@ -744,7 +744,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     )
     from ports.buildomatic.delivery import save_local_graph
 
-    save_local_graph(result, args.store)
+    save_local_graph(result, args.store, args.sdk)
     if args.output is not None:
         if args.check:
             if args.output.exists() or args.output.is_symlink():

@@ -25,6 +25,7 @@ from .pypi import _REQUIREMENT, PackageInstallError, _compatibility_blockers, _m
 
 if TYPE_CHECKING:
     from ._api import Environment, RunResult
+    from ._pypi_catalog import Catalog
 
 _EXECUTABLE = "/usr/bin/python3.wasm"
 _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
@@ -59,7 +60,7 @@ def _requirements(value: Union[str, Sequence[str]]) -> tuple[str, ...]:
 
 
 class CPythonRuntime:
-    """A verified CPython 3.13.7 bundle, separate from shellsim's Python VM.
+    """A CPython 3.13.7 bundle, separate from shellsim's Python VM.
 
     The bundle is a trusted host build directory containing ``manifest.json``
     and ``rootfs``. Keep that directory unchanged while mounting it.
@@ -72,8 +73,10 @@ class CPythonRuntime:
         universe: Union[str, Path, None] = None,
         uv: Union[str, Path, None] = None,
         venv: Union[str, Path, None] = None,
+        _catalog: Catalog | None = None,
     ) -> None:
         self.bundle = Path(bundle)
+        self._catalog = _catalog
         self.universe = Path(universe) if universe is not None else None
         self.uv = Path(uv).resolve() if uv is not None else None
         if (self.universe is None) != (self.uv is None):
@@ -124,6 +127,14 @@ class CPythonRuntime:
         self._verify()
 
     @classmethod
+    def from_catalog(cls, catalog: Catalog) -> CPythonRuntime:
+        """Mount an independently cached interpreter supplied by a delivery catalog."""
+        runtime = cls(catalog.bundle(), _catalog=catalog)
+        if runtime.version != catalog.version or runtime.manifest.get("dynamic_abi") != catalog.abi:
+            raise PackageInstallError("catalog and interpreter ABI differ")
+        return runtime
+
+    @classmethod
     def from_release(
         cls,
         descriptor: Union[str, Path],
@@ -148,6 +159,8 @@ class CPythonRuntime:
         root = self.bundle / "rootfs"
         if root.is_symlink() or not root.is_dir():
             raise ValueError("CPython rootfs must be a real directory")
+        if self._catalog is not None:
+            return
         files = self.manifest["files"]
         if not isinstance(files, dict) or len(files) > _MAX_FILES:
             raise ValueError("invalid CPython file manifest")
@@ -177,7 +190,7 @@ class CPythonRuntime:
             raise ValueError("CPython executable has no execute permission")
 
     def mount(self, environment: Environment) -> None:
-        """Mount the verified bundle and select its VFS Python launchers."""
+        """Mount the bundle and select its VFS Python launchers."""
         from ._api import SimulationError
 
         if environment._cpython_runtime is not None and environment._cpython_runtime is not self:
@@ -204,9 +217,12 @@ class CPythonRuntime:
     def install_pypi(self, environment: Environment, requirement: Union[str, Sequence[str]]) -> None:
         """Resolve one or more specs together for the bundle's Python and WASI ABI.
 
-        A dynamic bundle requires an explicit local universe and patched uv.
-        Static bundles retain their existing pure-wheel installation path.
+        Catalog bundles fetch their selected assets directly. Legacy dynamic
+        bundles require a local universe and patched uv; static bundles accept pure wheels.
         """
+        if self._catalog is not None:
+            self._catalog.install(self, environment, requirement)
+            return
         requirements = _requirements(requirement)
         self._verify()
         if self.manifest.get("dynamic_abi"):

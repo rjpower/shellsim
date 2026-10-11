@@ -224,3 +224,43 @@ def test_legacy_product_backfills_assets_without_sdk_or_dependencies(tmp_path):
     extract_tree(action.inputs[1].bundle, local, node)
     specification = json.loads((node / "node.json").read_text())
     assert specification["sdk"] is None and specification["existing"] == existing
+
+
+def test_cached_runtime_repairs_sdk_alias_without_fetching_component(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from ports._support import sdk as policies
+    from ports.buildomatic import runtime_worker
+
+    ports = tmp_path / "ports"
+    _wheel_port(ports, tmp_path / "sources", "example", [])
+    monkeypatch.setattr(policies, "definition", lambda *args: SimpleNamespace(products=()))
+    local = LocalStore(tmp_path / "transport")
+    backend = CatalogBackend(LocalStore(tmp_path / "canonical"))
+    args = local, backend, str(tmp_path / "canonical"), tmp_path, 32, 8
+    manifest = {
+        "identity": "sdk",
+        "dynamic_abi": "fixture",
+        "products": {"cpython": {"receipt_id": "current-runtime", "artifact": {"id": "component"}}},
+    }
+    runtime = {"runtime": {"path": "assets/current-runtime/runtime.zip", "size": 123}}
+    register(backend.store, "runtime/current-runtime", runtime)
+    register(backend.store, "runtime/default", {"runtime": {"path": "assets/older/runtime.zip", "size": 99}})
+    _, request, _, _ = prepare(ports, ["python/example"], manifest, *args)
+    action = next(action for action in request.actions if action.id == "runtime-export")
+    recipe = tmp_path / "recipe"
+    extract_tree(action.inputs[1].bundle, local, recipe)
+    monkeypatch.setenv("BUILD_INPUT_recipe", str(recipe))
+    monkeypatch.setenv("BUILD_OUTPUT_DIR", str(tmp_path / "output"))
+    monkeypatch.setattr(runtime_worker, "RemoteStore", lambda prefix: backend.store)
+
+    def reject_component_fetch(*args):
+        raise AssertionError("alias repair must not fetch an SDK component")
+
+    monkeypatch.setattr(backend.store, "get_blob", reject_component_fetch)
+    runtime_worker.main()
+    assert resolve(backend.store, "runtime/default") == runtime
+    assert json.loads((tmp_path / "output/result.json").read_text()) == runtime
+    _, repeat, _, _ = prepare(ports, ["python/example"], manifest, *args)
+    assert all(action.id != "runtime-export" for action in repeat.actions)

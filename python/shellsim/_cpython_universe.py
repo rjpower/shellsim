@@ -335,7 +335,9 @@ def _native_path(path: str) -> bool:
     return lower.endswith(_NATIVE_SUFFIXES) or ".so." in lower
 
 
-def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bool) -> _WheelInspection:
+def _inspect_wheel(
+    path: Path, *, name: str, version: str, abi: str, curated: bool, verify_digests: bool = True
+) -> _WheelInspection:
     dependencies: set[str] = set()
     artifacts: dict[str, str] = {}
     file_members: dict[str, tuple[bool, str | None]] = {}
@@ -381,7 +383,10 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             else:
                 if key in file_members:
                     raise PackageInstallError("wheel file conflicts with another installed member")
-                file_members[key] = (False, hashlib.sha256(archive.read(member)).hexdigest())
+                file_members[key] = (
+                    False,
+                    hashlib.sha256(archive.read(member)).hexdigest() if verify_digests else None,
+                )
         dist_infos = [part for part in {path.parts[0] for path in seen} if part.endswith(".dist-info")]
         if len(dist_infos) != 1:
             raise PackageInstallError("resolved wheel has invalid distribution metadata")
@@ -431,7 +436,7 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
                 if relative in artifacts or not _native_path(relative):
                     raise PackageInstallError("duplicate or invalid native artifact")
                 data = archive.read(relative)
-                if hashlib.sha256(data).hexdigest() != _sha(entry["sha256"]):
+                if verify_digests and hashlib.sha256(data).hexdigest() != _sha(entry["sha256"]):
                     raise PackageInstallError(f"native artifact SHA-256 mismatch: {relative}")
                 _verify_wasm(data, abi)
                 artifacts[relative] = entry["sha256"]
@@ -476,8 +481,12 @@ def _stage_console_scripts(site: Path, staging: Path, venv: str) -> None:
     declared: set[str] = set()
     for record in site.glob("*.dist-info/RECORD"):
         for row in csv.reader(record.read_text(encoding="utf-8").splitlines()):
-            if row and PurePosixPath(row[0]).parent == PurePosixPath("bin"):
-                declared.add(PurePosixPath(row[0]).name)
+            if not row:
+                continue
+            path = PurePosixPath(row[0])
+            parent = path.parent.parts
+            if parent == ("bin",) or (len(parent) == 2 and parent[0].endswith(".data") and parent[1] == "scripts"):
+                declared.add(path.name)
     for metadata in site.glob("*.dist-info/entry_points.txt"):
         if metadata.stat().st_size > 65536:
             raise PackageInstallError("installed entry point metadata exceeds 64 KiB")
