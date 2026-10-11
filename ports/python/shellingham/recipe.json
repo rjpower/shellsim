@@ -1,0 +1,48 @@
+{
+  "name": "shellingham",
+  "version": "1.5.4",
+  "role": "target-library",
+  "kind": "python-project",
+  "build_system": "python-pep517",
+  "source": {
+    "filename": "shellingham-1.5.4.tar.gz",
+    "url": "https://files.pythonhosted.org/packages/58/15/8b3609fd3830ef7b27b655beb4b4e9c62313a4e8da8c676e142cc210d58e/shellingham-1.5.4.tar.gz",
+    "sha256": "8dbca0739d487e5bd35ab3ca4b36e11c4078f3a234bfce294b0a0291363404de",
+    "subdirectory": "shellingham-1.5.4"
+  },
+  "requires_python": ">=3.7",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/wheel",
+      "version": "0.48.0"
+    }
+  ],
+  "patches": [
+    {
+      "file": "linux-status.patch",
+      "sha256": "1213975af7fe291c304db86dc48100f5dd61676f64052de94a4377a62086419b"
+    }
+  ]
+}

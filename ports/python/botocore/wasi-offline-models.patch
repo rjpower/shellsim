@@ -1,0 +1,102 @@
+--- a/botocore/httpsession.py
++++ b/botocore/httpsession.py
+@@ -21,42 +21,45 @@
+ from urllib3.exceptions import SSLError as URLLib3SSLError
+ from urllib3.poolmanager import PoolKey
+ from urllib3.util.retry import Retry
+-from urllib3.util.ssl_ import (
+-    OP_NO_COMPRESSION,
+-    PROTOCOL_TLS,
+-    OP_NO_SSLv2,
+-    OP_NO_SSLv3,
+-    is_ipaddress,
+-    ssl,
+-)
+ from urllib3.util.url import parse_url
+
+-try:
+-    from urllib3.util.ssl_ import OP_NO_TICKET, PROTOCOL_TLS_CLIENT
+-except ImportError:
+-    # Fallback directly to ssl for version of urllib3 before 1.26.
+-    # They are available in the standard library starting in Python 3.6.
+-    from ssl import OP_NO_TICKET, PROTOCOL_TLS_CLIENT
+-
+-try:
+-    # pyopenssl will be removed in urllib3 2.0, we'll fall back to ssl_ at that point.
+-    # This can be removed once our urllib3 floor is raised to >= 2.0.
+-    with warnings.catch_warnings():
+-        warnings.simplefilter("ignore", category=DeprecationWarning)
+-        # Always import the original SSLContext, even if it has been patched
+-        from urllib3.contrib.pyopenssl import (
+-            orig_util_SSLContext as SSLContext,
+-        )
+-except (AttributeError, ImportError):
+-    from urllib3.util.ssl_ import SSLContext
+-
+-try:
+-    from urllib3.util.ssl_ import DEFAULT_CIPHERS
+-except ImportError:
+-    # Defer to system configuration starting with
+-    # urllib3 2.0. This will choose the ciphers provided by
+-    # Openssl 1.1.1+ or secure system defaults.
+-    DEFAULT_CIPHERS = None
++# Offline model loading does not require the unavailable WASI TLS backend.
++if sys.platform != "wasi":
++    from urllib3.util.ssl_ import (
++        OP_NO_COMPRESSION,
++        PROTOCOL_TLS,
++        OP_NO_SSLv2,
++        OP_NO_SSLv3,
++        is_ipaddress,
++        ssl,
++    )
++
++    try:
++        from urllib3.util.ssl_ import OP_NO_TICKET, PROTOCOL_TLS_CLIENT
++    except ImportError:
++        # Fallback directly to ssl for version of urllib3 before 1.26.
++        # They are available in the standard library starting in Python 3.6.
++        from ssl import OP_NO_TICKET, PROTOCOL_TLS_CLIENT
++
++    try:
++        # pyopenssl will be removed in urllib3 2.0, we'll fall back to ssl_ at that point.
++        # This can be removed once our urllib3 floor is raised to >= 2.0.
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", category=DeprecationWarning)
++            # Always import the original SSLContext, even if it has been patched
++            from urllib3.contrib.pyopenssl import (
++                orig_util_SSLContext as SSLContext,
++            )
++    except (AttributeError, ImportError):
++        from urllib3.util.ssl_ import SSLContext
++
++    try:
++        from urllib3.util.ssl_ import DEFAULT_CIPHERS
++    except ImportError:
++        # Defer to system configuration starting with
++        # urllib3 2.0. This will choose the ciphers provided by
++        # Openssl 1.1.1+ or secure system defaults.
++        DEFAULT_CIPHERS = None
+
+ import botocore.awsrequest
+ from botocore.compat import (
+@@ -118,6 +121,9 @@
+     We vendor this function to ensure that the SSL contexts we construct
+     always use the std lib SSLContext instead of pyopenssl.
+     """
++    if sys.platform == "wasi":
++        raise NotImplementedError("Botocore TLS is unavailable in WASI")
++
+     # PROTOCOL_TLS is deprecated in Python 3.10
+     if not ssl_version or ssl_version == PROTOCOL_TLS:
+         ssl_version = PROTOCOL_TLS_CLIENT
+@@ -305,6 +311,9 @@
+         client_cert=None,
+         proxies_config=None,
+     ):
++        if sys.platform == "wasi":
++            raise NotImplementedError("Botocore HTTP transport is unavailable in WASI")
++
+         self._verify = verify
+         self._proxy_config = ProxyConfiguration(
+             proxies=proxies, proxies_settings=proxies_config

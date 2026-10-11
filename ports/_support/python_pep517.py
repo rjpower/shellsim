@@ -21,6 +21,9 @@ from pathlib import Path, PurePosixPath
 from typing import Mapping
 
 import tomllib
+from packaging.requirements import Requirement
+from packaging.specifiers import SpecifierSet
+from packaging.utils import canonicalize_name
 
 from ports._support.native_adapters import (
     NativeBuildCommand,
@@ -157,6 +160,18 @@ def _unpack_backends(wheels: tuple[BackendWheel, ...], destination: Path) -> Non
             path.write_bytes(data)
 
 
+def _requirement_identity(raw: str) -> tuple:
+    """Compare dependency meaning across backend metadata formatting changes."""
+    requirement = Requirement(raw)
+    return (
+        canonicalize_name(requirement.name),
+        tuple(sorted(canonicalize_name(extra) for extra in requirement.extras)),
+        str(requirement.specifier),
+        requirement.url or "",
+        str(requirement.marker) if requirement.marker is not None else "",
+    )
+
+
 def _stage_wheel(path: Path, stage: Path, request: PEP517BuildRequest) -> None:
     if path.is_symlink() or path.stat().st_size > 64 * 1024**2:
         raise ValueError("backend wheel is missing or oversized")
@@ -182,8 +197,9 @@ def _stage_wheel(path: Path, stage: Path, request: PEP517BuildRequest) -> None:
     if (
         re.sub(r"[-_.]+", "-", metadata["Name"]).lower() != re.sub(r"[-_.]+", "-", recipe["name"]).lower()
         or metadata["Version"] != recipe["version"]
-        or metadata["Requires-Python"] != recipe.get("requires_python")
-        or sorted(metadata.get_all("Requires-Dist", [])) != sorted(recipe.get("requires_dist", []))
+        or SpecifierSet(metadata["Requires-Python"] or "") != SpecifierSet(recipe.get("requires_python") or "")
+        or sorted(_requirement_identity(raw) for raw in metadata.get_all("Requires-Dist", []))
+        != sorted(_requirement_identity(raw) for raw in recipe.get("requires_dist", []))
     ):
         raise ValueError("upstream wheel metadata differs from recipe")
     pure = wheel["Root-Is-Purelib"] == "true"

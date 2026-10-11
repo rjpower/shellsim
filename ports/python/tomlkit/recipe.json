@@ -1,0 +1,13 @@
+{
+  "name": "tomlkit",
+  "version": "0.15.1",
+  "role": "host-tool",
+  "build_system": "host-wheel",
+  "source": {
+    "filename": "tomlkit-0.15.1-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/13/bc/8c13eb66537dce1d2bd3a57132902f38d0e7f5bb46fa9f4daed9fe9d76ee/tomlkit-0.15.1-py3-none-any.whl",
+    "sha256": "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": []
+}

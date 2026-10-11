@@ -1,0 +1,21 @@
+{
+  "name": "wheel",
+  "version": "0.48.0",
+  "role": "host-tool",
+  "build_system": "host-wheel",
+  "source": {
+    "filename": "wheel-0.48.0-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/2e/29/69cfbb602cd91690c55d38ba9fe53e6a7e76a6fa647bf38f19c138d25449/wheel-0.48.0-py3-none-any.whl",
+    "sha256": "3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "packaging >= 24.0"
+  ],
+  "build_dependencies": [
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ]
+}

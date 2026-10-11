@@ -1,0 +1,54 @@
+{
+  "name": "responses",
+  "version": "0.26.3",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/6d/86/ca7958de70cb0752350575e98229368a3a2f746a2942034b3364e17312bb/responses-0.26.3-py3-none-any.whl",
+    "sha256": "74474f799334ac4f37d93b6437ecc3bb1bb5c77a8d31780a338643be2dce0af8",
+    "filename": "responses-0.26.3-py3-none-any.whl"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [
+    "requests<3.0,>=2.30.0",
+    "urllib3<3.0,>=1.25.10",
+    "pyyaml",
+    "pytest>=7.0.0; extra == \"tests\"",
+    "coverage>=6.0.0; extra == \"tests\"",
+    "pytest-cov; extra == \"tests\"",
+    "pytest-asyncio; extra == \"tests\"",
+    "pytest-httpserver; extra == \"tests\"",
+    "flake8; extra == \"tests\"",
+    "types-PyYAML; extra == \"tests\"",
+    "types-requests; extra == \"tests\"",
+    "mypy; extra == \"tests\"",
+    "tomli; python_version < \"3.11\" and extra == \"tests\"",
+    "tomli-w; extra == \"tests\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/requests",
+      "version": "2.34.2"
+    },
+    {
+      "port": "python/urllib3",
+      "version": "2.8.0"
+    },
+    {
+      "port": "python/pyyaml",
+      "version": "6.0.3"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

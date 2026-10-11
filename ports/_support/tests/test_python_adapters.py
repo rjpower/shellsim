@@ -236,6 +236,40 @@ def test_backend_distribution_identity_ignores_case(tmp_path, name):
     assert (stage / "example.py").read_text() == "VALUE = 42\n"
 
 
+@pytest.mark.parametrize("changed", [None, "constraint", "extra", "python"])
+def test_backend_metadata_preserves_constraints_across_formatting(tmp_path, changed):
+    from ports._support.python_pep517 import PEP517BuildRequest, _stage_wheel
+
+    extension = _extension_request(tmp_path)
+    recipe = {
+        **extension.recipe,
+        "requires_python": ">= 3.12",
+        "requires_dist": ["foo_bar (<2,>=1) ; extra == 'test'"],
+    }
+    request = PEP517BuildRequest(extension.context, extension.cpython, tmp_path / "sysconfig.py", recipe, ())
+    dependency = 'Foo-Bar>=1,<2; extra == "test"'
+    if changed == "constraint":
+        dependency = 'Foo-Bar>=2,<3; extra == "test"'
+    elif changed == "extra":
+        dependency = 'Foo-Bar>=1,<2; extra == "other"'
+    python = ">=3.13" if changed == "python" else ">=3.12"
+    metadata = f"Name: example\nVersion: 1.0\nRequires-Python: {python}\nRequires-Dist: {dependency}\n"
+    wheel = tmp_path / "example-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr("example.py", "VALUE = 42\n")
+        archive.writestr("example-1.0.dist-info/METADATA", metadata)
+        archive.writestr("example-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("example-1.0.dist-info/RECORD", "")
+    stage = tmp_path / "wheel-root"
+    stage.mkdir()
+    if changed:
+        with pytest.raises(ValueError, match="metadata differs"):
+            _stage_wheel(wheel, stage, request)
+        return
+    _stage_wheel(wheel, stage, request)
+    assert (stage / "example-1.0.dist-info/METADATA").read_text() == metadata
+
+
 @pytest.mark.parametrize(
     "table",
     ["build-system = []", "[build-system]\nbuild-backend = 42", "[build-system]\nrequires = []\nbuild-backend = 42"],
