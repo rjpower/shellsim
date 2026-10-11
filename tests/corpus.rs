@@ -39,7 +39,7 @@ fn stock_profile_applies_home_identity_and_umask_to_child_commands() {
         .create(shellsim::Limits::default())
         .unwrap();
     let (outcome, stdout, stderr) = environment.run_script_capture(
-        r#"sh -c 'pwd; printf "%s:%s:%s\n" "$HOME" "$USER" "$TZ"; id -u; cd; pwd; touch created; stat -c "%a" created'"#,
+        r#"sh -c 'pwd; printf "%s:%s:%s\n" "$HOME" "$USER" "$TZ"; id -u; cd; pwd; printf data > created; stat -c "%a" created'"#,
     );
     assert_eq!(outcome.exit_status, 0, "{stderr:?}");
     assert_eq!(
