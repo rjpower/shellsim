@@ -20,7 +20,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv python install 3.13 \
     && uv venv --python 3.13 /opt/buildomatic/venv \
     && uv pip install --python /opt/buildomatic/venv/bin/python \
-      packaging meson cython numpy==2.3.5 pybind11 setuptools wheel
+      packaging meson meson-python==0.16.0 cython numpy==2.3.5 \
+      pybind11 setuptools setuptools-scm==8.3.1 wheel
 ENV PATH="/opt/buildomatic/venv/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 ENV CARGO_TARGET_DIR=/app/.buildomatic/cargo-build
 ENV RUSTUP_HOME=/root/.rustup

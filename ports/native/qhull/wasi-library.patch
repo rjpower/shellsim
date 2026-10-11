@@ -1,0 +1,23 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -363,8 +363,6 @@
+         ${libqhullr_SOURCES}
+         src/libqhull_r/qhull_r-exports.def)
+ set_target_properties(${qhull_SHAREDR} PROPERTIES
+-    SOVERSION ${qhull_SOVERSION}
+-    VERSION ${qhull_VERSION}
+     OUTPUT_NAME "${qhull_SHAREDR}$<$<CONFIG:Debug>:d>")
+
+ if(UNIX)
+@@ -677,9 +675,9 @@
+ # Define install
+ # ---------------------------------------
+
+-set(qhull_TARGETS_INSTALL ${qhull_TARGETS_APPLICATIONS})
++set(qhull_TARGETS_INSTALL ${qhull_SHAREDR})
+ if (BUILD_SHARED_LIBS)
+-    list(APPEND qhull_TARGETS_INSTALL ${qhull_TARGETS_SHARED})
++
+ endif()
+ if (BUILD_STATIC_LIBS)
+     list(APPEND qhull_TARGETS_INSTALL ${qhull_TARGETS_STATIC})

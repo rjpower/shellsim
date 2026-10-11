@@ -559,7 +559,7 @@ fn weak_side(weak: bool, direct: bool) -> Vec<u8> {
     .unwrap()
 }
 
-fn weak_environment(provider: bool, body: &str) -> Environment {
+fn weak_environment(provider: bool, body: &str, worker: &str) -> Environment {
     let provider = if provider {
         r#"(func (export "optional") (i32.store (i32.const 0) (i32.const 42)))"#
     } else {
@@ -570,7 +570,10 @@ fn weak_environment(provider: bool, body: &str) -> Environment {
         (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-threads-v3")
         (@custom "dylink.0" "\81\13\11shellsim.main-tls\01")
         (import "env" "memory" (memory 1 4 shared))
-        (import "shellsim_threads_v2" "thread_ready" (func (param i32 i32)))
+        (import "shellsim_threads_v2" "thread_ready" (func $ready (param i32 i32)))
+        (import "shellsim_threads_v2" "wait32" (func $wait (param i32 i32 i64) (result i32)))
+        (import "shellsim_threads_v2" "notify" (func $notify (param i32 i32) (result i32)))
+        (import "wasi" "thread-spawn" (func $spawn (param i32) (result i32)))
         (import "shellsim_dylink_v3" "open" (func $open (param i32 i32 i32) (result i32)))
         (import "shellsim_dylink_v3" "symbol" (func $symbol (param i32 i32 i32) (result i32)))
         (export "memory" (memory 0))
@@ -583,7 +586,7 @@ fn weak_environment(provider: bool, body: &str) -> Environment {
         (func (export "malloc") (param $size i32) (result i32) (local $base i32)
             (local.set $base (global.get $heap))
             (global.set $heap (i32.add (global.get $heap) (local.get $size))) (local.get $base))
-        (func (export "wasi_thread_start") (param i32 i32))
+        (func (export "wasi_thread_start") (param i32 i32) (local $handle i32) {worker})
         {provider}
         (func (export "_start") (local $handle i32)
             (memory.init $path (i32.const 32) (i32.const 0) (i32.const 8))
@@ -612,7 +615,7 @@ fn unresolved_weak_function_has_null_address_and_guarded_call_skips_it() {
                 (call $symbol (local.get $handle) (i32.const 64) (i32.const 6)))
                 (i32.const {expected})) (then unreachable))"#
         );
-        let mut environment = weak_environment(provider, &body);
+        let mut environment = weak_environment(provider, &body, "");
         environment
             .vfs
             .write("/", "/side.so", &weak_side(true, false), 0o644)
@@ -635,6 +638,7 @@ fn calling_unresolved_weak_function_traps_instead_of_returning_success() {
         (if (i32.eqz (local.get $handle)) (then unreachable))
         (drop (call_indirect (result i32)
             (call $symbol (local.get $handle) (i32.const 64) (i32.const 6))))"#,
+        "",
     );
     environment
         .vfs
@@ -647,7 +651,8 @@ fn calling_unresolved_weak_function_traps_instead_of_returning_success() {
 
 #[test]
 fn missing_strong_function_still_prevents_side_publication() {
-    let mut environment = weak_environment(false, "(if (local.get $handle) (then unreachable))");
+    let mut environment =
+        weak_environment(false, "(if (local.get $handle) (then unreachable))", "");
     environment
         .vfs
         .write("/", "/side.so", &weak_side(false, false), 0o644)
@@ -655,4 +660,114 @@ fn missing_strong_function_still_prevents_side_publication() {
     let (outcome, _, stderr) = environment.run_script_capture("/app");
     assert_eq!(outcome.exit_status, 126);
     assert!(String::from_utf8_lossy(&stderr).contains("missing dynamic symbol: optional"));
+}
+
+fn self_import_side(definition: &str, weak: bool) -> Vec<u8> {
+    let flags = if weak {
+        r"\04\0f\01\03env\08optional\11"
+    } else {
+        ""
+    };
+    wat::parse_str(format!(
+        r#"(module
+        (@custom "shellsim.abi" "shellsim-wasi-sdk34-cpython3137-threads-v3")
+        (@custom "dylink.0" "\01\04\00\00\00\00\80\18\16shellsim.deferred-init\01{flags}")
+        (import "env" "memory" (memory 1 4 shared))
+        (import "env" "optional" (func $imported))
+        {definition}
+        (func (export "__wasm_call_ctors") (call $imported))
+        (func (export "answer") (result i32) (call $imported) (i32.load (i32.const 0))))"#
+    ))
+    .unwrap()
+}
+
+#[test]
+fn own_direct_imports_work_in_constructors_and_preserve_provider_precedence() {
+    for (provider, expected) in [(false, 7), (true, 42)] {
+        for weak in [false, true] {
+            let body = format!(
+                r#"
+                (if (i32.eqz (local.get $handle)) (then unreachable))
+                (if (i32.ne (i32.load (i32.const 0)) (i32.const {expected})) (then unreachable))
+                (if (i32.ne (call_indirect (result i32)
+                    (call $symbol (local.get $handle) (i32.const 64) (i32.const 6)))
+                    (i32.const {expected})) (then unreachable))"#
+            );
+            let mut environment = weak_environment(provider, &body, "");
+            let side = self_import_side(
+                r#"(func (export "optional") (i32.store (i32.const 0) (i32.const 7)))"#,
+                weak,
+            );
+            environment
+                .vfs
+                .write("/", "/side.so", &side, 0o644)
+                .unwrap();
+            let (outcome, _, stderr) = environment.run_script_capture("/app");
+            assert_eq!(
+                outcome.exit_status,
+                0,
+                "{}",
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+    }
+}
+
+#[test]
+fn self_import_requires_an_owned_definition_with_matching_type() {
+    for (definition, diagnostic) in [
+        (
+            r#"(export "optional" (func $imported))"#,
+            "missing dynamic symbol: optional",
+        ),
+        (
+            r#"(func (export "optional") (param i32))"#,
+            "self import type mismatch: optional",
+        ),
+    ] {
+        let mut environment = weak_environment(false, "", "");
+        environment
+            .vfs
+            .write("/", "/side.so", &self_import_side(definition, false), 0o644)
+            .unwrap();
+        let (outcome, _, stderr) = environment.run_script_capture("/app");
+        assert_eq!(outcome.exit_status, 126);
+        assert!(String::from_utf8_lossy(&stderr).contains(diagnostic));
+    }
+}
+
+#[test]
+fn own_direct_imports_rebind_in_a_worker_store() {
+    let body = r#"
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.le_s (call $spawn (i32.const 0)) (i32.const 0)) (then unreachable))
+        (block $done (loop $join
+            (br_if $done (i32.atomic.load (i32.const 8)))
+            (drop (call $wait (i32.const 8) (i32.const 0) (i64.const -1)))
+            (br $join)))"#;
+    let worker = r#"
+        (call $ready (i32.const 32768) (i32.const 65536))
+        (local.set $handle (call $open (i32.const 32) (i32.const 8) (i32.const 2)))
+        (if (i32.eqz (local.get $handle)) (then unreachable))
+        (if (i32.ne (call_indirect (result i32)
+            (call $symbol (local.get $handle) (i32.const 64) (i32.const 6)))
+            (i32.const 7)) (then unreachable))
+        (i32.atomic.store (i32.const 8) (i32.const 1))
+        (drop (call $notify (i32.const 8) (i32.const 1)))"#;
+    let mut environment = weak_environment(false, body, worker);
+    let side = self_import_side(
+        r#"(func (export "optional") (i32.store (i32.const 0) (i32.const 7)))"#,
+        false,
+    );
+    environment
+        .vfs
+        .write("/", "/side.so", &side, 0o644)
+        .unwrap();
+    let (outcome, _, stderr) = environment.run_script_capture("/app");
+    assert_eq!(
+        outcome.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
 }

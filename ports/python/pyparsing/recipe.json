@@ -1,0 +1,29 @@
+{
+  "name": "pyparsing",
+  "version": "3.3.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/8b/40/2614036cdd416452f5bf98ec037f38a1afb17f327cb8e6b652d4729e0af8/pyparsing-3.3.1-py3-none-any.whl",
+    "sha256": "023b5e7e5520ad96642e2c6db4cb683d3970bd640cdf7115049a6e9c3682df82",
+    "filename": "pyparsing-3.3.1-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "railroad-diagrams ; extra == \"diagrams\"",
+    "jinja2 ; extra == \"diagrams\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
