@@ -1,0 +1,85 @@
+{
+  "name": "xarray",
+  "version": "2026.9.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/3f/44/3159af4fb3c868970a412e294320ed6bb1a9fbdfa6431050eda8e0b34b6e/xarray-2026.9.0-py3-none-any.whl",
+    "sha256": "fe349fa871628b1a0a5217af3fe1283a2862d5485156e6eda354fffb81c3bb7c",
+    "filename": "xarray-2026.9.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.11",
+  "requires_dist": [
+    "numpy>=1.26",
+    "packaging>=24.2",
+    "pandas>=2.2",
+    "scipy>=1.15; extra == \"accel\"",
+    "bottleneck; extra == \"accel\"",
+    "numbagg!=0.9.5,>=0.9; extra == \"accel\"",
+    "numba>=0.62; extra == \"accel\"",
+    "flox>=0.10; extra == \"accel\"",
+    "opt_einsum; extra == \"accel\"",
+    "xarray[accel,etc,io,parallel,viz]; extra == \"complete\"",
+    "netCDF4>=1.6.0; extra == \"io\"",
+    "h5netcdf[h5py]>=1.8.0; extra == \"io\"",
+    "pydap; extra == \"io\"",
+    "scipy>=1.15; extra == \"io\"",
+    "zarr>=3.0; extra == \"io\"",
+    "fsspec; extra == \"io\"",
+    "cftime; extra == \"io\"",
+    "pooch; extra == \"io\"",
+    "pyarrow; extra == \"arrow\"",
+    "sparse>=0.15; extra == \"etc\"",
+    "dask[complete]; extra == \"parallel\"",
+    "cartopy>=0.24; extra == \"viz\"",
+    "matplotlib>=3.10; extra == \"viz\"",
+    "nc-time-axis; extra == \"viz\"",
+    "seaborn; extra == \"viz\"",
+    "pandas-stubs; extra == \"types\"",
+    "scipy-stubs; extra == \"types\"",
+    "types-colorama; extra == \"types\"",
+    "types-decorator; extra == \"types\"",
+    "types-defusedxml; extra == \"types\"",
+    "types-docutils; extra == \"types\"",
+    "types-gevent; extra == \"types\"",
+    "types-networkx; extra == \"types\"",
+    "types-openpyxl; extra == \"types\"",
+    "types-pexpect; extra == \"types\"",
+    "types-psutil; extra == \"types\"",
+    "types-pycurl; extra == \"types\"",
+    "types-Pygments; extra == \"types\"",
+    "types-pysocks; extra == \"types\"",
+    "types-python-dateutil; extra == \"types\"",
+    "types-pytz; extra == \"types\"",
+    "types-PyYAML; extra == \"types\"",
+    "types-requests; extra == \"types\"",
+    "types-setuptools; extra == \"types\"",
+    "types-xlrd; extra == \"types\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/pandas",
+      "version": "2.3.3"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

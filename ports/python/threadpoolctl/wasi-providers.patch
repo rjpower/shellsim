@@ -1,0 +1,25 @@
+--- a/threadpoolctl.py
++++ b/threadpoolctl.py
+@@ -200,3 +200,3 @@
+         self.filepath = filepath
+-        self.dynlib = ctypes.CDLL(filepath, mode=_RTLD_NOLOAD)
++        self.dynlib = ctypes.CDLL(filepath, mode=0 if sys.platform == "wasi" else _RTLD_NOLOAD)
+         self._symbol_prefix, self._symbol_suffix = self._find_affixes()
+@@ -329,2 +329,6 @@
+         if set_num_threads_func is not None:
++            if sys.platform == "wasi":
++                # Wasm indirect calls require the C void(int) signature.
++                set_num_threads_func.restype = None
++                set_num_threads_func.argtypes = [ctypes.c_int]
+             return set_num_threads_func(num_threads)
+@@ -1139,3 +1143,9 @@
+
+-        if sys.platform == "linux" and os.path.exists("/proc/self/maps"):
++        if sys.platform == "wasi":
++            # WASI has no ELF link map. The guest mounts its curated providers
++            # in /lib; bind those files using the existing native controllers.
++            for name in sorted(os.listdir("/lib")):
++                if name.endswith(".so"):
++                    self._make_controller_from_path(os.path.join("/lib", name))
++        elif sys.platform == "linux" and os.path.exists("/proc/self/maps"):
+             # On glibc, dl_iterate_phdr has an internal lock, and that plus

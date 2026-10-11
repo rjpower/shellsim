@@ -1,0 +1,26 @@
+{
+  "name": "click",
+  "version": "8.5.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/58/50/6c0d534c5f134586a8e1ba4e330569e32f057e33372ae556463212fb4cd3/click-8.5.0-py3-none-any.whl",
+    "sha256": "255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360",
+    "filename": "click-8.5.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

@@ -135,5 +135,21 @@
   "build_system": "python-meson",
   "needed_libraries": [
     "libopenblas.so"
-  ]
+  ],
+  "development_exports": [
+    {
+      "source": "scipy/linalg/cython_blas.pxd",
+      "destination": "python/scipy/linalg/cython_blas.pxd"
+    },
+    {
+      "source": "scipy/special/cython_special.pxd",
+      "destination": "python/scipy/special/cython_special.pxd"
+    }
+  ],
+  "exports": {
+    "headers": [
+      "python/scipy/linalg/cython_blas.pxd",
+      "python/scipy/special/cython_special.pxd"
+    ]
+  }
 }

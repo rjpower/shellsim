@@ -157,6 +157,22 @@ def test_release_is_deterministic_and_offline_cache_is_verified(release_inputs, 
         shellsim.CPythonRuntime.from_release(first, cache_dir=cache, offline=True)
 
 
+def test_release_omits_sdk_headers_and_producer_receipts(release_inputs, tmp_path):
+    runtime, _, _ = release_inputs
+    (runtime / ".buildomatic-receipt.json").write_text('{"producer": "cpython"}')
+    headers = runtime / "Include"
+    headers.mkdir()
+    (headers / "Python.h").write_text("host build header")
+    descriptor = _built(release_inputs, tmp_path / "release")
+    with zipfile.ZipFile(descriptor.parent / "cohort.zip") as archive:
+        assert {name for name in archive.namelist() if name.startswith("runtime/")} == {
+            "runtime/manifest.json",
+            "runtime/rootfs/usr/bin/python3.wasm",
+        }
+    loaded = shellsim.CPythonRuntime.from_release(descriptor, cache_dir=tmp_path / "cache")
+    assert loaded.manifest["dynamic_abi"] == ABI
+
+
 def test_threaded_release_keeps_wheel_platform_and_pins_runtime_target(release_inputs, tmp_path):
     runtime, universe, _ = release_inputs
     manifest_path = runtime / "manifest.json"

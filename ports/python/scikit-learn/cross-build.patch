@@ -1,0 +1,18 @@
+--- a/meson.build
++++ b/meson.build
+@@ -3,3 +3,3 @@
+   'c', 'cpp', 'cython',
+-  version: run_command('sklearn/_build_utils/version.py', check: true).stdout().strip(),
++  version: '1.8.0',
+   license: 'BSD-3',
+@@ -50,3 +50,3 @@
+ # py.install_sources and needing to list them explicitly one by one
+-install_subdir('sklearn', install_dir: py.get_install_dir())
++install_subdir('sklearn', install_dir: py.get_install_dir(), install_tag: 'python-runtime')
+
+--- a/sklearn/meson.build
++++ b/sklearn/meson.build
+@@ -191,2 +191,3 @@
+   '--include-dir', meson.global_build_root(),
++  '--include-dir', meson.get_external_property('scipy-include-dir'),
+ ]
