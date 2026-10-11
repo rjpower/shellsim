@@ -21,6 +21,13 @@ def test_int_accepts_explicit_bases():
 def test_string_join_replace_and_format():
     assert ",".join(["a", "b", "c"]) == "a,b,c"
     assert "banana".replace("a", "o", 2) == "bonona"
+    assert "banana".replace("a", "o", count=1) == "bonana"
+    assert "a,b,c".split(maxsplit=1, sep=",") == ["a", "b,c"]
+    assert "a b c".rsplit(maxsplit=1) == ["a b", "c"]
+    assert "a,b,c".rsplit(sep=",", maxsplit=1) == ["a,b", "c"]
+    assert raised(lambda: "a,b".split(",", sep=","))[0] is TypeError
+    assert raised(lambda: "a b".rsplit(None, 1, maxsplit=1))[0] is TypeError
+    assert raised(lambda: "aa".replace("a", "b", 1, count=1))[0] is TypeError
     assert "{}:{}:{name}:{{ok}}".format("x", 2, name="n") == "x:2:n:{ok}"
     assert "{1}:{0}".format("x", 2) == "2:x"
 
@@ -367,12 +374,15 @@ def test_bytes_like_strip_split_and_join():
         assert kind(b" a b c ").split(None, 1) == [b"a", b"b c "]
         assert kind(b"a,,b").split(b",") == [b"a", b"", b"b"]
         assert kind(b"a,b,c").split(b",", 1) == [b"a", b"b,c"]
+        assert kind(b"a,b,c").split(maxsplit=1, sep=b",") == [b"a", b"b,c"]
+        assert kind(b" a b c ").split(maxsplit=1) == [b"a", b"b c "]
         assert kind(b"").split() == []
         assert kind(b"").split(b",") == [b""]
         assert all(type(part) is kind for part in kind(b"a b").split())
         assert kind(b", ").join([b"a", bytearray(b"b"), kind(b"c")]) == b"a, b, c"
         assert type(kind(b",").join([])) is kind
     assert raised(lambda: b"a".split(b"")) == (ValueError, "empty separator")
+    assert raised(lambda: b"a b".split(None, 1, maxsplit=1))[0] is TypeError
     assert raised(lambda: b",".join([b"a", "b"])) == (
         TypeError,
         "sequence item 1: expected a bytes-like object, str found",
@@ -1196,3 +1206,42 @@ def test_unhashable_dict_keys_and_set_members_raise_type_error():
     keys = [1, 1.0, True]
     merged = dict(zip(keys, "abc"))
     assert merged == {1: "c"} and type(next(iter(merged))) is int
+
+
+def test_sum_pow_enumerate_and_round_accept_named_arguments():
+    assert sum([1, 2], start=10) == 13
+    assert sum([], start=[]) == []
+    assert pow(exp=-1, mod=7, base=3) == 5
+    assert pow(2, exp=3, mod=None) == 8
+    assert list(enumerate(["a", "b"], start=1)) == [(1, "a"), (2, "b")]
+    assert list(enumerate(start=-2, iterable=["x"])) == [(-2, "x")]
+    assert round(number=1.25, ndigits=1) == 1.2
+    assert round(number=Rounded(), ndigits=2) == ("round", 2)
+    for call in (
+        lambda: sum([1], 2, start=3),
+        lambda: sum(iterable=[1]),
+        lambda: pow(2, 3, base=4),
+        lambda: pow(base=2),
+        lambda: enumerate([1], iterable=[2]),
+        lambda: enumerate(start=1),
+        lambda: round(1.25, number=2.5),
+        lambda: round(ndigits=1),
+        lambda: enumerate([1], beginning=1),
+    ):
+        assert raised(call)[0] is TypeError
+
+
+def test_zip_and_map_strict_detect_unequal_inputs():
+    assert list(zip([1, 2], [3, 4], strict=True)) == [(1, 3), (2, 4)]
+    assert list(zip([1, 2], [3], strict=False)) == [(1, 3)]
+    assert list(zip(strict=True)) == []
+    assert list(map(pow, [2, 3], [3, 2], strict=True)) == [8, 9]
+    assert list(map(pow, [2, 3], [3], strict=False)) == [8]
+    for combine in (zip, lambda *args, **kwargs: map(pow, *args, **kwargs)):
+        for left, right in (([1], [2, 3]), ([1, 2], [3]), ([], [1])):
+            assert (
+                raised(lambda combine=combine, left=left, right=right: list(combine(left, right, strict=True)))[0]
+                is ValueError
+            )
+    for call in (lambda: zip([1], unknown=True), lambda: map(abs, [1], unknown=True)):
+        assert raised(call)[0] is TypeError

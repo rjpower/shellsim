@@ -9,6 +9,7 @@ import datetime
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
 import math
 import random
@@ -381,3 +382,22 @@ def test_datetime_arithmetic_formatting_and_parsing():
             pass
         else:
             raise AssertionError("ValueError or TypeError expected")
+
+
+def test_itertools_accepts_named_inputs_and_counts():
+    assert list(itertools.combinations(r=2, iterable="abc")) == [("a", "b"), ("a", "c"), ("b", "c")]
+    assert list(itertools.permutations("ab", r=None)) == [("a", "b"), ("b", "a")]
+    assert list(itertools.permutations(r=1, iterable="ab")) == [("a",), ("b",)]
+    assert list(itertools.islice(itertools.count(step=2, start=3), 3)) == [3, 5, 7]
+    for call in (
+        lambda: itertools.combinations("ab", 1, r=2),
+        lambda: itertools.permutations("ab", iterable="cd"),
+        lambda: itertools.count(1, start=2),
+        lambda: itertools.combinations(r=1),
+    ):
+        try:
+            call()
+        except TypeError:
+            pass
+        else:
+            raise AssertionError("TypeError expected")

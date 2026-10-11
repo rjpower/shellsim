@@ -553,6 +553,10 @@ impl<'s> Vm<'s> {
                     | Builtin::Minimum
                     | Builtin::Maximum
                     | Builtin::Format
+                    | Builtin::Sum
+                    | Builtin::Power
+                    | Builtin::Enumerate
+                    | Builtin::Zip
             )
         {
             return Err("this builtin does not accept keyword arguments".into());
@@ -1015,9 +1019,14 @@ impl<'s> Vm<'s> {
                 }
             }
             Builtin::Sum => {
-                expect_arity(&arguments, 1, 2)?;
-                let values = self.iterable_values(&arguments[0])?;
-                let start = arguments.get(1).copied().unwrap_or(Value::Int(0));
+                let args = CallArgs::new(arguments, keyword_arguments);
+                args.expect_positional("sum", 1, 2)?;
+                args.reject_unknown_keywords("sum", &["start"])?;
+                let start = args
+                    .argument("sum", 1, "start")?
+                    .copied()
+                    .unwrap_or(Value::Int(0));
+                let values = self.iterable_values(&args.positional()[0])?;
                 {
                     let value = self.builtin_sum(values, start)?;
                     Ok(self.produce(value))
@@ -1031,8 +1040,17 @@ impl<'s> Vm<'s> {
                 }
             }
             Builtin::Power => {
-                expect_arity(&arguments, 2, 3)?;
-                if arguments.len() == 3 && !arguments[2].is_none() {
+                let args = CallArgs::new(arguments, keyword_arguments);
+                args.expect_positional("pow", 0, 3)?;
+                args.reject_unknown_keywords("pow", &["base", "exp", "mod"])?;
+                let arguments = [
+                    args.required_argument("pow", 0, "base")?,
+                    args.required_argument("pow", 1, "exp")?,
+                    args.argument("pow", 2, "mod")?
+                        .copied()
+                        .unwrap_or(Value::None),
+                ];
+                if !arguments[2].is_none() {
                     let parsed = self.pow_integer_argument(&arguments[0]);
                     let (base, base_len) = parsed?;
                     let parsed = self.pow_integer_argument(&arguments[1]);
@@ -1163,12 +1181,15 @@ impl<'s> Vm<'s> {
                 Ok(self.produce(value))
             }
             Builtin::Enumerate => {
-                expect_arity(&arguments, 1, 2)?;
-                let values = self.iterable_values(&arguments[0])?;
-                let start = match arguments.get(1) {
+                let args = CallArgs::new(arguments, keyword_arguments);
+                args.expect_positional("enumerate", 0, 2)?;
+                args.reject_unknown_keywords("enumerate", &["iterable", "start"])?;
+                let iterable = args.required_argument("enumerate", 0, "iterable")?;
+                let start = match args.argument("enumerate", 1, "start")? {
                     Some(value) => self.index_argument(value)?,
                     None => 0,
                 };
+                let values = self.iterable_values(&iterable)?;
                 let mut result = Vec::new();
                 for (offset, value) in values.into_iter().enumerate() {
                     self.charge_cpu(1)?;
@@ -1186,11 +1207,24 @@ impl<'s> Vm<'s> {
                 }
             }
             Builtin::Zip => {
-                let sequences = arguments
+                let args = CallArgs::new(arguments, keyword_arguments);
+                args.reject_unknown_keywords("zip", &["strict"])?;
+                let strict = args
+                    .keyword("zip", "strict")?
+                    .map(|value| self.truth_value(value))
+                    .transpose()?
+                    .unwrap_or(false);
+                let sequences = args
+                    .positional()
                     .iter()
                     .map(|value| self.iterable_values(value))
                     .collect::<Result<Vec<_>, _>>()?;
                 let length = sequences.iter().map(Vec::len).min().unwrap_or(0);
+                if strict && sequences.iter().any(|values| values.len() != length) {
+                    return Err(PyError::value_error(
+                        "zip() arguments have different lengths",
+                    ));
+                }
                 let mut result = Vec::new();
                 for index in 0..length {
                     self.charge_cpu(1)?;

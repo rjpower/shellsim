@@ -1320,13 +1320,15 @@ fn bytes_strip_impl(
     new_bytes_like(runtime, kind, result)
 }
 
-/// `split(sep=None, maxsplit=-1)` with positional arguments, as `str.split` accepts them.
+/// `split(sep=None, maxsplit=-1)` on bytes and bytearray, preserving the receiver's type.
 fn bytes_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("bytes.split", 0, 2)?;
-    args.reject_keywords("bytes.split")?;
+    args.reject_unknown_keywords("bytes.split", &["sep", "maxsplit"])?;
+    let separator = args.argument("bytes.split", 0, "sep")?;
+    let maximum = args.argument("bytes.split", 1, "maxsplit")?;
     let kind = runtime.kind(&receiver)?;
     let PyBytes(value) = receiver.cast(runtime)?;
-    let separator = match args.positional().first() {
+    let separator = match separator {
         None => None,
         Some(value) if runtime.kind(value)? == PyKind::None => None,
         Some(value) => {
@@ -1337,9 +1339,7 @@ fn bytes_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
             Some(separator)
         }
     };
-    let maximum = args
-        .positional()
-        .get(1)
+    let maximum = maximum
         .map(|value| index_argument(runtime, value))
         .transpose()?
         .and_then(|maximum| usize::try_from(maximum).ok());
@@ -2215,9 +2215,11 @@ fn string_partition_impl(
 
 fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.split", 0, 2)?;
-    args.reject_keywords("str.split")?;
+    args.reject_unknown_keywords("str.split", &["sep", "maxsplit"])?;
+    let separator = args.argument("str.split", 0, "sep")?;
+    let maximum = args.argument("str.split", 1, "maxsplit")?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
-    let separator = match args.positional().first() {
+    let separator = match separator {
         None => None,
         Some(value) if runtime.kind(value)? == super::super::native::PyKind::None => None,
         Some(value) => {
@@ -2228,9 +2230,7 @@ fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
             Some(value)
         }
     };
-    let maximum = args
-        .positional()
-        .get(1)
+    let maximum = maximum
         .map(|value| {
             runtime
                 .int_value(value)
@@ -2247,9 +2247,11 @@ fn string_split(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) 
 
 fn string_rsplit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.rsplit", 0, 2)?;
-    args.reject_keywords("str.rsplit")?;
+    args.reject_unknown_keywords("str.rsplit", &["sep", "maxsplit"])?;
+    let separator = args.argument("str.rsplit", 0, "sep")?;
+    let maximum = args.argument("str.rsplit", 1, "maxsplit")?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
-    let separator = match args.positional().first() {
+    let separator = match separator {
         None => None,
         Some(value) if runtime.kind(value)? == PyKind::None => None,
         Some(value) => {
@@ -2260,9 +2262,7 @@ fn string_rsplit(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs)
             Some(value)
         }
     };
-    let maximum = args
-        .positional()
-        .get(1)
+    let maximum = maximum
         .map(|value| {
             runtime
                 .int_value(value)
@@ -2420,11 +2420,12 @@ fn string_join(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -
 
 fn string_replace(runtime: &mut dyn PyRuntime, receiver: PyValue, args: CallArgs) -> PyResult {
     args.expect_positional("str.replace", 2, 3)?;
-    args.reject_keywords("str.replace")?;
+    args.reject_unknown_keywords("str.replace", &["count"])?;
+    let count = args.argument("str.replace", 2, "count")?;
     let OwnedPyString(value) = receiver.cast(runtime)?;
     let OwnedPyString(old) = args.positional()[0].cast(runtime)?;
     let OwnedPyString(new) = args.positional()[1].cast(runtime)?;
-    let count = args.positional().get(2).map_or(Ok(None), |value| {
+    let count = count.map_or(Ok(None), |value| {
         runtime
             .int_value(value)
             .ok_or_else(|| PyError::type_error("replace count must be an integer"))
@@ -4271,7 +4272,12 @@ fn indexed_contains(runtime: &mut dyn PyRuntime, set: PyValue, value: &PyValue) 
 
 fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("map", 2, usize::MAX)?;
-    args.reject_keywords("map")?;
+    args.reject_unknown_keywords("map", &["strict"])?;
+    let strict = args
+        .keyword("map", "strict")?
+        .map(|value| runtime.truth(value))
+        .transpose()?
+        .unwrap_or(false);
     let function = args.positional()[0].cast::<PyCallable>(runtime)?;
     let mut iterators = Vec::new();
     for value in &args.positional()[1..] {
@@ -4283,8 +4289,22 @@ fn builtin_map(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     while !exhausted {
         runtime.nested(&mut |runtime| {
             let mut values = Vec::with_capacity(iterators.len());
-            for iterator in &iterators {
+            for (index, iterator) in iterators.iter().enumerate() {
                 let Some(value) = runtime.iterator_next(*iterator)? else {
+                    if strict {
+                        if index != 0 {
+                            return Err(PyError::value_error(
+                                "map() arguments have different lengths",
+                            ));
+                        }
+                        for remaining in &iterators[1..] {
+                            if runtime.iterator_next(*remaining)?.is_some() {
+                                return Err(PyError::value_error(
+                                    "map() arguments have different lengths",
+                                ));
+                            }
+                        }
+                    }
                     exhausted = true;
                     return Ok(());
                 };
@@ -4446,15 +4466,11 @@ fn builtin_hasattr(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("round", 1, 2)?;
-    args.reject_unknown_keywords("round", &["ndigits"])?;
-    let keyword_digits = args.keyword("round", "ndigits")?;
-    if args.positional().len() == 2 && keyword_digits.is_some() {
-        return Err(PyError::type_error(
-            "round() got multiple values for argument 'ndigits'",
-        ));
-    }
-    let digits = match args.positional().get(1).or(keyword_digits) {
+    args.expect_positional("round", 0, 2)?;
+    args.reject_unknown_keywords("round", &["number", "ndigits"])?;
+    let value = args.required_argument("round", 0, "number")?;
+    let digit_argument = args.argument("round", 1, "ndigits")?.copied();
+    let digits = match digit_argument.as_ref() {
         Some(value) if runtime.kind(value)? != PyKind::None => Some(integer_argument(
             runtime,
             value,
@@ -4462,7 +4478,6 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
         )?),
         Some(_) | None => None,
     };
-    let value = args.positional()[0];
     if runtime.value_kind_of(&value).is_some()
         || matches!(runtime.kind(&value)?, PyKind::Instance | PyKind::Complex)
     {
@@ -4474,10 +4489,9 @@ fn builtin_round(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
                 runtime.type_name(&value)?
             )));
         };
-        let arguments = args.positional().get(1).or(keyword_digits).copied();
         return runtime.call_value(
             method,
-            CallArgs::new(arguments.into_iter().collect(), Vec::new()),
+            CallArgs::new(digit_argument.into_iter().collect(), Vec::new()),
         );
     }
     match value.cast::<PyNumber>(runtime)? {

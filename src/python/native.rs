@@ -1570,6 +1570,30 @@ impl CallArgs {
         Ok(found)
     }
 
+    /// Read a positional-or-keyword parameter, rejecting a value supplied both ways.
+    pub fn argument(&self, function: &str, index: usize, name: &str) -> PyResult<Option<&PyValue>> {
+        let positional = self.positional.get(index);
+        let keyword = self.keyword(function, name)?;
+        if positional.is_some() && keyword.is_some() {
+            return Err(PyError::type_error(format!(
+                "{function}() got multiple values for argument '{name}'"
+            )));
+        }
+        Ok(positional.or(keyword))
+    }
+
+    /// Read a required positional-or-keyword parameter before executing the operation.
+    pub fn required_argument(&self, function: &str, index: usize, name: &str) -> PyResult<PyValue> {
+        self.argument(function, index, name)?
+            .copied()
+            .ok_or_else(|| {
+                PyError::type_error(format!(
+                    "{function}() missing required argument '{name}' (pos {})",
+                    index + 1
+                ))
+            })
+    }
+
     pub fn reject_unknown_keywords(&self, function: &str, names: &[&str]) -> PyResult<()> {
         if let Some((name, _)) = self
             .keywords

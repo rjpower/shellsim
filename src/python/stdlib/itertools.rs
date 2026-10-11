@@ -125,10 +125,12 @@ fn native_product(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 fn native_permutations(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("permutations", 1, 2)?;
-    args.reject_keywords("permutations")?;
-    let values = collect_iterable_bounded(runtime, args.positional()[0], 64)?;
-    let length = optional_length(runtime, &args, values.len())?;
+    args.expect_positional("permutations", 0, 2)?;
+    args.reject_unknown_keywords("permutations", &["iterable", "r"])?;
+    let iterable = args.required_argument("permutations", 0, "iterable")?;
+    let length = args.argument("permutations", 1, "r")?;
+    let values = collect_iterable_bounded(runtime, iterable, 64)?;
+    let length = optional_length(runtime, length, values.len())?;
     if length > values.len() {
         return runtime.new_iterator(Vec::new());
     }
@@ -178,10 +180,12 @@ fn build_permutations(
 }
 
 fn native_combinations(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("combinations", 2, 2)?;
-    args.reject_keywords("combinations")?;
-    let values = collect_iterable_bounded(runtime, args.positional()[0], 64)?;
-    let length = args.positional()[1].cast::<PyIndex>(runtime)?.0;
+    args.expect_positional("combinations", 0, 2)?;
+    args.reject_unknown_keywords("combinations", &["iterable", "r"])?;
+    let iterable = args.required_argument("combinations", 0, "iterable")?;
+    let length = args.required_argument("combinations", 1, "r")?;
+    let values = collect_iterable_bounded(runtime, iterable, 64)?;
+    let length = length.cast::<PyIndex>(runtime)?.0;
     let length = usize::try_from(length)
         .map_err(|_| PyError::value_error("combination length cannot be negative"))?;
     let count = combination_count(values.len(), length)?;
@@ -252,11 +256,17 @@ fn collect_iterable_bounded(
     Ok(output)
 }
 
-fn optional_length(runtime: &dyn PyRuntime, args: &CallArgs, default: usize) -> PyResult<usize> {
-    args.positional().get(1).map_or(Ok(default), |value| {
-        let value = (*value).cast::<PyIndex>(runtime)?.0;
-        usize::try_from(value).map_err(|_| PyError::value_error("length cannot be negative"))
-    })
+fn optional_length(
+    runtime: &dyn PyRuntime,
+    value: Option<&PyValue>,
+    default: usize,
+) -> PyResult<usize> {
+    value
+        .filter(|value| !value.is_none())
+        .map_or(Ok(default), |value| {
+            let value = (*value).cast::<PyIndex>(runtime)?.0;
+            usize::try_from(value).map_err(|_| PyError::value_error("length cannot be negative"))
+        })
 }
 
 fn tuple_iterator(runtime: &mut dyn PyRuntime, rows: Vec<Vec<PyValue>>) -> PyResult {
@@ -269,18 +279,16 @@ fn tuple_iterator(runtime: &mut dyn PyRuntime, rows: Vec<Vec<PyValue>>) -> PyRes
 
 fn native_count(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
     args.expect_positional("count", 0, 2)?;
-    args.reject_keywords("count")?;
+    args.reject_unknown_keywords("count", &["start", "step"])?;
     let start = args
-        .positional()
-        .first()
-        .cloned()
+        .argument("count", 0, "start")?
+        .copied()
         .map(|value| value.cast::<PyIndex>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or(0);
     let step = args
-        .positional()
-        .get(1)
-        .cloned()
+        .argument("count", 1, "step")?
+        .copied()
         .map(|value| value.cast::<PyIndex>(runtime).map(|value| value.0))
         .transpose()?
         .unwrap_or(1);

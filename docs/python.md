@@ -73,6 +73,14 @@ keyword-variadic parameters, including bounded `*iterable` and `**mapping` expan
 keywords, non-string mapping keys, and non-mapping `**` operands are rejected explicitly. List,
 tuple, and set displays expand `*iterable` items in place.
 
+Named arguments are supported by `enumerate(iterable=..., start=...)`, `sum(..., start=...)`,
+`pow(base=..., exp=..., mod=...)` and `round(number=..., ndigits=...)`.
+`zip` and `map` accept `strict=True` to reject inputs of different lengths. They retain the
+eager input consumption described above. Native `itertools.count`, `combinations`, `permutations`,
+`os.chdir` and `os.getenv` also accept their named parameters.
+String `split` and `rsplit` and bytes/bytearray `split` accept `sep=` and `maxsplit=`;
+string `replace` accepts `count=`.
+
 The `...` literal evaluates to the `Ellipsis` singleton, so `obj[..., 0]` passes the tuple
 `(Ellipsis, 0)` to `__getitem__`. Binary-operator and rich-comparison methods may return
 `NotImplemented` to decline. The runtime then tries the reflected method and then the default:

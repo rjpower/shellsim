@@ -68,21 +68,29 @@ fn getcwd(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
 }
 
 fn chdir(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("os.chdir", 1, 1)?;
-    args.reject_keywords("os.chdir")?;
-    let OwnedPyString(path) = args.positional()[0].cast(runtime)?;
+    args.expect_positional("os.chdir", 0, 1)?;
+    args.reject_unknown_keywords("os.chdir", &["path"])?;
+    let OwnedPyString(path) = args
+        .required_argument("os.chdir", 0, "path")?
+        .cast(runtime)?;
     runtime.filesystem().change_dir(&path)?;
     Ok(Value::None)
 }
 
 fn getenv(runtime: &mut dyn PyRuntime, args: CallArgs) -> PyResult {
-    args.expect_positional("os.getenv", 1, 2)?;
-    args.reject_keywords("os.getenv")?;
-    let OwnedPyString(name) = args.positional()[0].cast(runtime)?;
+    args.expect_positional("os.getenv", 0, 2)?;
+    args.reject_unknown_keywords("os.getenv", &["key", "default"])?;
+    let OwnedPyString(name) = args
+        .required_argument("os.getenv", 0, "key")?
+        .cast(runtime)?;
+    let default = args
+        .argument("os.getenv", 1, "default")?
+        .copied()
+        .unwrap_or(Value::None);
     if let Some(value) = runtime.environment().get(&name) {
         runtime.new_string(value)
     } else {
-        Ok(args.positional().get(1).copied().unwrap_or(Value::None))
+        Ok(default)
     }
 }
 
