@@ -22,8 +22,8 @@ from .pypi import PackageInstallError
 _MAX_DESCRIPTOR = 1024 * 1024
 _MAX_ARCHIVE = 2 * 1024**3
 _MAX_RESOLVER = 256 * 1024 * 1024
-_MAX_UNPACKED = 2 * 1024**3
-_MAX_FILES = 12_000
+_MAX_UNPACKED = 16 * 1024**3
+_MAX_FILES = 200_000
 _HASH = re.compile(r"[0-9a-f]{64}\Z")
 _LOCAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}\Z")
 

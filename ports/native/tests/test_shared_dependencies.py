@@ -34,13 +34,16 @@ def graph(tmp_path):
     providers = {}
     manifests = {}
 
-    def add(name, children=(), *, soname=None, header=None, toolchain=TOOLCHAIN):
+    def add(name, children=(), *, soname=None, header=None, toolchain=TOOLCHAIN, dynamic_children=None):
         port = "native/" + name
         prefix = tmp_path / name
         (prefix / "lib").mkdir(parents=True)
         (prefix / "include").mkdir()
         soname = soname or ("lib" + name + ".so")
-        needed = [manifests["native/" + child]["inputs"]["recipe"]["soname"] for child in children]
+        needed = [
+            manifests["native/" + child]["inputs"]["recipe"]["soname"]
+            for child in (children if dynamic_children is None else dynamic_children)
+        ]
         payload = leb(len(needed)) + b"".join(leb(len(item.encode())) + item.encode() for item in needed)
         custom = leb(8) + b"dylink.0" + b"\x02" + leb(len(payload)) + payload
         (prefix / "lib" / soname).write_bytes(b"\0asm\x01\0\0\0\0" + leb(len(custom)) + custom)
@@ -94,6 +97,15 @@ def test_deep_chain_stages_headers_but_preserves_direct_link_edges(tmp_path, gra
     assert links == [providers["native/parent"] / "lib/libparent.so"]
     assert (tmp_path / "stage/usr/local/include/leaf.h").read_bytes() == b"leaf"
     assert (tmp_path / "stage/usr/local/include/middle.h").read_bytes() == b"middle"
+
+
+def test_shared_provider_can_be_used_only_for_headers_or_static_archives(tmp_path, graph):
+    add, consumer, providers, _ = graph
+    add("leaf")
+    add("parent", ["leaf"], dynamic_children=())
+    _, links = stage_dependencies(consumer("parent"), providers, tmp_path / "stage", TOOLCHAIN)
+    assert links == [providers["native/parent"] / "lib/libparent.so"]
+    assert (tmp_path / "stage/usr/local/include/leaf.h").read_bytes() == b"leaf"
 
 
 def test_diamond_reuses_the_verified_provider(tmp_path, graph, monkeypatch):

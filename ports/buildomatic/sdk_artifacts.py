@@ -76,7 +76,8 @@ def load_sdk(store: Store, manifest: dict, cache: Path):
         path = "bin/" + executable
         real = "bin/" + compiler.contents.get("symlinks", {}).get(path, executable)
         entries[name] = {"provider": "llvm", "path": path, "sha256": compiler.contents["artifacts"][real]}
-    tools = dict(installed_seed().tools)
+    python = products.get("cpython")
+    tools = dict(installed_seed(python_version=python.contents["recipe"]["version"] if python else None).tools)
     if resolver := products.get("resolver"):
         executable = resolver.contents["executable"]
         tools["uv"] = Tool(resolver.root / executable["file"], executable["sha256"], resolver.path, resolver.sha256)

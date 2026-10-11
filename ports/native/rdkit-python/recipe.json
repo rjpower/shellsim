@@ -1,0 +1,68 @@
+{
+  "name": "rdkit-python",
+  "version": "2025.9.3",
+  "kind": "native-library",
+  "role": "target-library",
+  "build_system": "python-extension",
+  "sdk": "default",
+  "linkage": "shared",
+  "source": {
+    "url": "https://codeload.github.com/rdkit/rdkit/tar.gz/fd677c59b21ffbf50157752102216660324ac1f1",
+    "filename": "rdkit-fd677c59.tar.gz",
+    "sha256": "e403131567f2f55998f6dbbf40d05b049fbaeb991e0c90703c07f58168ab0e78",
+    "subdirectory": "rdkit-fd677c59b21ffbf50157752102216660324ac1f1"
+  },
+  "target_dependencies": [
+    {
+      "port": "native/boost",
+      "version": "1.85.0"
+    },
+    {
+      "port": "native/better-enums",
+      "version": "0.11.3"
+    },
+    {
+      "port": "native/boost-python",
+      "version": "1.85.0"
+    },
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    },
+    {
+      "port": "native/zlib",
+      "version": "1.3.1"
+    }
+  ],
+  "exports": {
+    "shared_libraries": [
+      "lib/libRDKitPython.so"
+    ],
+    "licenses": [
+      "licenses/rdkit.txt"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "license.txt",
+      "destination": "licenses/rdkit.txt"
+    }
+  ],
+  "needed_libraries": [
+    "libboost_python313.so",
+    "libz.so"
+  ],
+  "tests": [],
+  "patches": [
+    {
+      "file": "libcxx-headers.patch",
+      "sha256": "a10374a9b715f2cb9f6e8744e32ee371c6261363048691a09425c234dea0ca09"
+    }
+  ],
+  "helpers": [
+    "native/rdkit_bindings.py",
+    "_support/cmake_adapter.py"
+  ],
+  "soname": "libRDKitPython.so",
+  "runtime_dependencies": []
+}

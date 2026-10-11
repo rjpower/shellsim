@@ -229,16 +229,18 @@ def _abi(data: bytes):
 
 
 def _check_libraries(recipe, files, providers, abi, *, require_marker):
-    expected = sorted(
+    allowed = {
         providers[item["port"]].manifest["inputs"]["recipe"]["soname"]
         for item in recipe.get("target_dependencies", [])
         if "soname" in providers[item["port"]].manifest["inputs"]["recipe"]
-    )
+    }
     libraries = recipe.get("exports", {}).get("shared_libraries", []) + recipe.get("exports", {}).get("libraries", [])
     missing = set()
     for path in libraries:
         data = files[path]
-        if sorted(needed_libraries(_SnapshotPath(data))) != expected:
+        # A declared provider may supply only headers or a static archive to this
+        # consumer. Dynamic imports must be admitted, but need not use every edge.
+        if not set(needed_libraries(_SnapshotPath(data))) <= allowed:
             raise ValueError("native library dependencies differ from declared edges")
         marker = _abi(data)
         if abi is None or (marker is not None and marker != abi) or (require_marker and marker is None):

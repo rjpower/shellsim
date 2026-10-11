@@ -197,15 +197,23 @@ def load_seed(path: Path | None) -> HostSeed:
     return HostSeed(tools, compiler_tools, helper)
 
 
-def installed_seed() -> HostSeed:
-    """Use normal installed build tools without hashing or copying their packages."""
+def installed_seed(*, python_version: str | None = None) -> HostSeed:
+    """Use installed tools, selecting a requested Python cohort without hashing packages."""
     tools = {name: Tool(Path(path), "") for name in HOST_TOOLS if (path := shutil.which(name))}
+    helper = Tool(Path(sys.executable), "")
+    if python_version is not None:
+        executable = "python" + ".".join(python_version.split(".")[:2])
+        path = shutil.which(executable)
+        if path is None:
+            raise PrerequisiteError("installed host generator is missing: " + executable)
+        helper = Tool(Path(path), "")
+        tools["python"] = helper
     compiler = {
         name: Tool(Path(path), "")
         for name, executable in {"cc": "cc", "cxx": "c++", "cmake": "cmake", "ninja": "ninja"}.items()
         if (path := shutil.which(executable))
     }
-    return HostSeed(tools, compiler, Tool(Path(sys.executable), ""))
+    return HostSeed(tools, compiler, helper)
 
 
 def _seed_tool(base: Path, binding: dict) -> Tool:

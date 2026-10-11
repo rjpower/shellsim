@@ -25,7 +25,7 @@ const MAX_RETAINED_ACTIONS: usize = 64;
 const MAX_POLL_QUANTA: usize = 100_000;
 const MAX_CANCEL_QUANTA: usize = 100_000;
 const MAX_PACKAGE_SNAPSHOT_BYTES: usize = 128 * 1024 * 1024;
-const MAX_PACKAGE_SNAPSHOT_ENTRIES: usize = 10_000;
+const MAX_PACKAGE_SNAPSHOT_ENTRIES: usize = crate::host_ingest::MAX_HOST_FILES;
 
 /// One protocol request. `id` is echoed verbatim so clients can correlate responses.
 #[derive(Clone, Debug, Deserialize, Serialize)]

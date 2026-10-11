@@ -1,0 +1,7 @@
+--- a/libs/python/src/numpy/dtype.cpp
++++ b/libs/python/src/numpy/dtype.cpp
+@@ -11,0 +12 @@
++#include <numpy/npy_2_compat.h>
+@@ -101 +102 @@
+-int dtype::get_itemsize() const { return reinterpret_cast<PyArray_Descr*>(ptr())->elsize;}
++int dtype::get_itemsize() const { return PyDataType_ELSIZE(reinterpret_cast<PyArray_Descr*>(ptr()));}

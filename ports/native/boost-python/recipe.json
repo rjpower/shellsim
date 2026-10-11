@@ -1,0 +1,42 @@
+{
+  "name": "boost-python",
+  "version": "1.85.0",
+  "kind": "native-library",
+  "role": "target-library",
+  "build_system": "python-extension",
+  "helpers": [
+    "native/boost_bindings.py",
+    "_support/cmake_adapter.py"
+  ],
+  "sdk": "default",
+  "linkage": "shared",
+  "soname": "libboost_python313.so",
+  "source": {
+    "url": "https://archives.boost.io/release/1.85.0/source/boost_1_85_0.tar.gz",
+    "filename": "boost_1_85_0.tar.gz",
+    "sha256": "be0d91732d5b0cc6fbb275c7939974457e79b54d6f07ce2e3dfdd68bef883b0b",
+    "subdirectory": "boost_1_85_0"
+  },
+  "target_dependencies": [
+    {
+      "port": "native/boost",
+      "version": "1.85.0"
+    }
+  ],
+  "exports": {
+    "shared_libraries": [
+      "lib/libboost_python313.so"
+    ],
+    "licenses": [
+      "licenses/boost.txt"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "LICENSE_1_0.txt",
+      "destination": "licenses/boost.txt"
+    }
+  ],
+  "needed_libraries": [],
+  "tests": []
+}
