@@ -5,12 +5,13 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import subprocess
+import threading
 import zipfile
 from pathlib import Path
 
 import pytest
 
-from ports._support.native_adapters import NativeBuildContext
+from ports._support.native_adapters import CompilerCacheLauncher, NativeBuildContext
 from ports._support.python_adapters import (
     CPythonBuildContext,
     ExtensionBuildRequest,
@@ -318,3 +319,55 @@ def test_failed_backend_reports_bounded_compiler_diagnostics(tmp_path, monkeypat
     note = failure.value.__notes__[0]
     assert note.endswith("compiler diagnostic: missing target header\n")
     assert len(note) <= 8192
+
+
+def test_extension_compiles_parallel_cached_units_before_linking(tmp_path, monkeypatch):
+    request = _extension_request(tmp_path)
+    (request.context.source / "second.cpp").write_text("// second compilation unit\n")
+    (request.context.source / "PKG-INFO").write_text("Name: example_project\nVersion: 1.0\n")
+    cache = tmp_path / "sccache"
+    cache.write_text("#!/bin/sh\n")
+    cache.chmod(0o755)
+    headers = request.context.dependency_sysroot / "usr/local/python/numpy/include"
+    headers.mkdir(parents=True)
+    context = dataclasses.replace(
+        request.context,
+        host_tools={name: tmp_path / name for name in ("python", "pkg-config")},
+        target_tools={name: tmp_path / name for name in ("cc", "cxx", "ar", "ranlib")},
+        dependencies={"python/numpy": tmp_path / "numpy"},
+        compiler_cache=CompilerCacheLauncher(cache, "ordinary-tool", (("SCCACHE_DIR", str(tmp_path / "cache")),)),
+    )
+    recipe = {
+        **request.recipe,
+        "name": "example-project",
+        "target_dependencies": [{"port": "python/numpy", "version": "2.3.5"}],
+        "build": {
+            **request.recipe["build"],
+            "sources": ["example.c", "second.cpp"],
+            "include_directories": ["python/numpy/include"],
+        },
+    }
+    barrier = threading.Barrier(2)
+    compiled = []
+
+    def compiler(argv, **kwargs):
+        output = Path(argv[argv.index("-o") + 1])
+        if "-c" in argv:
+            assert kwargs["env"]["SCCACHE_DIR"] == str(tmp_path / "cache")
+            assert "-I" + str(headers) in argv
+            assert "cached_compile_arguments" in Path(argv[0]).read_text()
+            barrier.wait(timeout=10)
+            output.write_bytes(b"object")
+            compiled.append(output)
+        else:
+            assert len(compiled) == 2
+            assert Path(argv[0]).name == "cxx"
+            output.write_bytes(b"\0asm\x01\0\0\0")
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(subprocess, "run", compiler)
+    output = build_extension(ExtensionBuildRequest(context, request.cpython, recipe, jobs=2))
+    assert [Path(command.argv[0]).name for command in output.commands] == ["cc", "cxx", "cxx"]
+    wheel = next((output.staging_prefix / "wheels").glob("*.whl"))
+    with zipfile.ZipFile(wheel) as archive:
+        assert "example_project-1.0.dist-info/METADATA" in archive.namelist()

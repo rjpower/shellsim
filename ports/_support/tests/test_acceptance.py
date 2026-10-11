@@ -100,7 +100,9 @@ def test_native_acceptance_rejects_include_escape_before_build(tmp_path: Path) -
         [{"kind": "native", "source": "test.c", "include_directories": ["../host"], "link_inputs": []}],
     )
     cohort = SimpleNamespace(
-        has_frontend=True, compiler=lambda: tmp_path / "cc", sysroot=SimpleNamespace(root=tmp_path / "cohort")
+        has_frontend=True,
+        compiler=lambda *, cxx=False: tmp_path / ("cxx" if cxx else "cc"),
+        sysroot=SimpleNamespace(root=tmp_path / "cohort"),
     )
     output = tmp_path / "proof"
     with pytest.raises(ValueError, match="escapes dependency sysroot"):
@@ -181,7 +183,8 @@ def test_successful_acceptance_does_not_publish_asset_cache(
     assert not (output / "cache").exists()
 
 
-def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path) -> None:
+@pytest.mark.parametrize("suffix, driver", [(".c", "cc"), (".cpp", "cxx")])
+def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path, suffix, driver) -> None:
     root = tmp_path / "cohort"
     archive = root / "sysroot/lib/wasm32-wasip1-threads/libsetjmp.a"
     archive.parent.mkdir(parents=True)
@@ -189,7 +192,7 @@ def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path) -> None:
     relative = "lib/wasm32-wasip1-threads/libsetjmp.a"
     cohort = SimpleNamespace(
         has_frontend=True,
-        compiler=lambda: tmp_path / "cc",
+        compiler=lambda *, cxx=False: tmp_path / ("cxx" if cxx else "cc"),
         compiler_flags=(),
         linker_flags=(),
         executable_flags=(),
@@ -198,8 +201,9 @@ def test_native_probe_uses_only_hashed_cohort_archive(tmp_path: Path) -> None:
         ),
     )
     command = _native_command(
-        cohort, tmp_path / "dependencies", tmp_path / "probe.c", tmp_path / "probe.wasm", [], [relative], []
+        cohort, tmp_path / "dependencies", tmp_path / ("probe" + suffix), tmp_path / "probe.wasm", [], [relative], []
     )
+    assert command[0] == str(tmp_path / driver)
     assert str(archive) in command
     archive.write_bytes(b"changed")
     with pytest.raises(ValueError, match="differs from verified sysroot"):
@@ -218,7 +222,7 @@ def test_native_probe_rejects_nonwrapper_link_flags(tmp_path, flag):
 def test_native_probe_passes_exact_wrapper_switches(tmp_path):
     cohort = SimpleNamespace(
         has_frontend=True,
-        compiler=lambda: tmp_path / "cc",
+        compiler=lambda *, cxx=False: tmp_path / ("cxx" if cxx else "cc"),
         compiler_flags=(),
         linker_flags=(),
         executable_flags=(),

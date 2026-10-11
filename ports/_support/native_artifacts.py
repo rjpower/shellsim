@@ -19,7 +19,7 @@ from ports._support.wasm import mark_abi
 from ports._support.wasm_metadata import needed_libraries, number, string
 from ports.native.dependencies import digest, exported_paths, recipe_identity, seal_artifact, verify_artifact
 
-MAX_ENTRIES = 16384
+MAX_ENTRIES = 65536
 MAX_BYTES = 1024**3
 MAX_PROVIDERS = 64
 MAX_CLOSURE_BYTES = 1024**3

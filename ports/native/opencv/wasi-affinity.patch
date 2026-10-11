@@ -1,0 +1,10 @@
+--- a/modules/core/src/parallel.cpp
++++ b/modules/core/src/parallel.cpp
+@@ -996,6 +996,7 @@
+ #if defined _GNU_SOURCE \
+     && !defined(__MINGW32__) /* not implemented (2020-03) */ \
+     && !defined(__EMSCRIPTEN__) \
++    && !defined(__wasi__) \
+     && !defined(__ANDROID__)  // TODO: add check for modern Android NDK
+
+     cpu_set_t cpu_set;

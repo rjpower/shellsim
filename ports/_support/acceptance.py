@@ -238,7 +238,7 @@ def _native_command(
             raise ValueError("native acceptance SDK link input differs from verified sysroot")
         links.append(str(path))
     return (
-        str(sdk_context.compiler()),
+        str(sdk_context.compiler(cxx=source.suffix in {".cc", ".cpp", ".cxx"})),
         *sdk_context.compiler_flags,
         *sdk_context.linker_flags,
         *sdk_context.executable_flags,

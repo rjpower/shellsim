@@ -1,0 +1,46 @@
+{
+  "name": "opencv-python-headless",
+  "version": "5.0.0.93",
+  "kind": "python-project",
+  "role": "target-library",
+  "sdk": "default",
+  "build_system": "python-extension",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/1d/99/76b7c80252aa83c1af16393454aafd125a0287101afe8deb0a6821af0e30/opencv_python_headless-5.0.0.93.tar.gz",
+    "filename": "opencv_python_headless-5.0.0.93.tar.gz",
+    "sha256": "b82f9831daab90b725c7c1ee1b36cb5732c367096ac76d119e64e14eb70d5f3c",
+    "subdirectory": "opencv_python_headless-5.0.0.93"
+  },
+  "requires_python": ">=3.6",
+  "requires_dist": [
+    "numpy<2.0; python_version<\"3.9\"",
+    "numpy>=2; python_version>=\"3.9\""
+  ],
+  "target_dependencies": [
+    {
+      "port": "native/opencv",
+      "version": "5.0.0"
+    },
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    }
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/numpy",
+      "version": "2.3.5"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
