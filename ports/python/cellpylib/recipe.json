@@ -30,6 +30,21 @@
     {
       "port": "python/numpy",
       "version": "2.3.5"
+    },
+    {
+      "port": "python/matplotlib",
+      "version": "3.10.8"
     }
-  ]
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
 }

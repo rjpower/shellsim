@@ -1,0 +1,57 @@
+{
+  "name": "qhull",
+  "version": "8.0.2",
+  "role": "target-library",
+  "kind": "native-library",
+  "sdk": "default",
+  "build_system": "cmake",
+  "linkage": "shared",
+  "soname": "libqhull_r.so",
+  "source": {
+    "url": "https://codeload.github.com/qhull/qhull/tar.gz/refs/tags/v8.0.2",
+    "sha256": "8774e9a12c70b0180b95d6b0b563c5aa4bea8d5960c15e18ae3b6d2521d64f8b",
+    "subdirectory": "qhull-8.0.2"
+  },
+  "patches": [
+    {
+      "file": "wasi-library.patch",
+      "sha256": "f4b68ce23aa6025f2238a89ad6be6bd414de068f5a52c2fa35b0fd06830501d4"
+    },
+    {
+      "file": "virtual-clock.patch",
+      "sha256": "c4426c2d3d61aea40b0d1659062b156ad3277bd58667d23fe431f62443c49cff"
+    }
+  ],
+  "exports": {
+    "shared_libraries": [
+      "lib/libqhull_r.so"
+    ],
+    "pkg_config": [
+      "lib/pkgconfig/qhull_r.pc"
+    ],
+    "licenses": [
+      "licenses/qhull.txt"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include/libqhull_r"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "COPYING.txt",
+      "destination": "licenses/qhull.txt"
+    }
+  ],
+  "needed_libraries": [],
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/hull.c",
+      "link_inputs": [
+        "lib/libqhull_r.so"
+      ]
+    }
+  ]
+}

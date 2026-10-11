@@ -243,6 +243,19 @@ def test_wheel_data_uses_installed_paths_for_collision_checks(tmp_path: Path, co
     assert not any(".data/" in name for name in inspection.members)
 
 
+def test_wheel_accepts_long_distribution_description(tmp_path: Path) -> None:
+    path = tmp_path / "sample-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr(
+            "sample-1.0.dist-info/METADATA",
+            "Metadata-Version: 2.3\nName: sample\nVersion: 1.0\nRequires-Dist: six\n\n" + "description\n" * 10_000,
+        )
+        archive.writestr("sample-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
+    inspection = _inspect_wheel(path, name="sample", version="1.0", abi=ABI, curated=True)
+    assert inspection.uncompressed_bytes > 65536
+    assert "sample-1.0.dist-info/METADATA" in inspection.members
+
+
 def test_wheel_tag_must_be_an_exact_metadata_line(tmp_path: Path) -> None:
     path = tmp_path / "native-1.0-cp313-cp313-wasm32_wasip1.whl"
     info = "native-1.0.dist-info"

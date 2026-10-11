@@ -383,8 +383,8 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             raise PackageInstallError("resolved wheel has invalid distribution metadata")
         dist_info = dist_infos[0]
         for filename in (f"{dist_info}/METADATA", f"{dist_info}/WHEEL"):
-            if filename not in archive.namelist() or archive.getinfo(filename).file_size > 65536:
-                raise PackageInstallError("resolved wheel has missing or oversized metadata")
+            if filename not in archive.namelist():
+                raise PackageInstallError("resolved wheel has missing metadata")
         metadata = email.message_from_bytes(archive.read(f"{dist_info}/METADATA"))
         if _name(metadata["Name"]) != name or metadata["Version"] != version:
             raise PackageInstallError("resolved wheel identity differs from uv's resolution")

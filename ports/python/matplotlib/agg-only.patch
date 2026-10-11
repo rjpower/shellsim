@@ -1,0 +1,13 @@
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -126,6 +126,10 @@
+ endif
+
+ foreach ext, kwargs : extension_data
++  # Tk requires a native display and host Tcl/Tk loading.
++  if ext == '_tkagg' and host_machine.system() == 'wasi'
++    continue
++  endif
+   additions = {
+     'cpp_args': [new_preprocessor] + kwargs.get('cpp_args', []),
+   }

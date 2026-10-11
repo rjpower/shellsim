@@ -15,7 +15,7 @@ Build and publish from the repository root:
 
 ```sh
 docker buildx build --push --platform linux/amd64 \
-  --tag ghcr.io/marin-community/iris-task:buildomatic-ubuntu-v4 \
+  --tag ghcr.io/marin-community/iris-task:buildomatic-ubuntu-v5 \
   ports/buildomatic/images
 ```
 

@@ -1,0 +1,23 @@
+--- a/src/libqhull_r/user_r.h
++++ b/src/libqhull_r/user_r.h
+@@ -224,7 +224,19 @@
+ */
+ #define qh_CLOCKtype 1  /* change to the desired number */
+
+-#if (qh_CLOCKtype == 1)
++#if defined(__wasi__)
++/* WASI has no process clock. Report elapsed virtual monotonic time instead. */
++#include <time.h>
++static inline unsigned long qh_wasi_clock(void) {
++    struct timespec now;
++    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
++        return 0;
++    return (unsigned long)now.tv_sec * 1000000UL + (unsigned long)(now.tv_nsec / 1000);
++}
++#define qh_CPUclock qh_wasi_clock()
++#define qh_SECticks 1000000
++
++#elif (qh_CLOCKtype == 1)
+
+ #if defined(CLOCKS_PER_SECOND)
+ #define qh_CPUclock    ((unsigned long)clock())  /* return CPU clock, may be converted to approximate double */
