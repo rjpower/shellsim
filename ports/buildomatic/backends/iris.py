@@ -219,7 +219,12 @@ class WorkerPool:
         self._version = self._store.write_journal(self._key, _encode(self._state), self._version)
 
     def reconcile(self) -> tuple[dict[str, Worker], tuple[str, ...]]:
-        """Resolve current workers and retire only confirmed exact incarnations."""
+        """Retire exact incarnations and return survivors despite admission errors.
+
+        Submission and first-identity lookup failures leave the persisted name
+        pending for identical-name retry. Storage, retained-identity lookup and
+        fencing failures still propagate to stop the scheduler.
+        """
         while len(self._state["slots"]) < self._slots:
             self._state["slots"].append(None)
         ready = {}
@@ -234,9 +239,17 @@ class WorkerPool:
                     self._state["slots"][slot] = None
                     self._save()
                     self._proxies.pop(record["id"], None)
-                    record = None
                 elif status.state in self._terminal_states:
                     continue
+                else:
+                    if record["id"] not in self._proxies:
+                        self._proxies[record["id"]] = self._make_worker(record["id"])
+                    ready[record["id"]] = self._proxies[record["id"]]
+        # Resolve confirmed membership before provisioning. An unavailable
+        # replacement must not prevent core fencing, controls or survivor work.
+        for slot, record in enumerate(self._state["slots"]):
+            if record is not None and "attempt_uid" in record:
+                continue
             if record is None:
                 if len(self._state["retired"]) >= _MAX_BUILDS:
                     raise ValueError("worker lifecycle history is full")
@@ -244,10 +257,19 @@ class WorkerPool:
                 self._state["slots"][slot] = record
                 self._save()
             if "task_id" not in record:
-                record["task_id"] = self._submit_worker(record["id"])
+                try:
+                    task_id = self._submit_worker(record["id"])
+                except Exception:
+                    logger.warning("Iris worker submission uncertain; retrying the persisted name")
+                    continue
+                record["task_id"] = task_id
                 self._save()
             if "attempt_uid" not in record:
-                status = self._task_status(record["task_id"])
+                try:
+                    status = self._task_status(record["task_id"])
+                except Exception:
+                    logger.warning("Iris worker admission lookup uncertain; retaining the persisted task")
+                    continue
                 attempt = next(
                     (item for item in status.attempts if item.attempt_number == status.current_attempt_number), None
                 )

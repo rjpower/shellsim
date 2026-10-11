@@ -301,6 +301,40 @@ def test_worker_pool_transport_failure_preserves_identity(lifecycle_pool):
     assert len(fixture.submitted) == 1
 
 
+@pytest.mark.parametrize("field", ["task_id", "attempt_uid"])
+def test_worker_pool_admission_journal_conflict_is_fatal(lifecycle_pool, monkeypatch, field):
+    fixture = lifecycle_pool
+    pool = fixture.create()
+    write = fixture.store.write_journal
+
+    def conflict(key, data, version):
+        if any(record is not None and field in record for record in json.loads(data)["slots"]):
+            raise ConditionalWriteError("pool claim changed")
+        return write(key, data, version)
+
+    monkeypatch.setattr(fixture.store, "write_journal", conflict)
+    with pytest.raises(ConditionalWriteError):
+        pool.reconcile()
+    assert len(fixture.submitted) == 1
+    journal = json.loads(fixture.store.read_journal("iris/test/workers.json").data)
+    assert field not in journal["slots"][0]
+    assert journal["retired"] == []
+
+
+def test_worker_pool_proxy_creation_failure_is_fatal(lifecycle_pool):
+    fixture = lifecycle_pool
+    pool = fixture.create()
+
+    def invalid_proxy(name):
+        raise ValueError("invalid worker proxy")
+
+    pool._make_worker = invalid_proxy
+    with pytest.raises(ValueError):
+        pool.reconcile()
+    assert len(fixture.submitted) == 1
+    assert json.loads(fixture.store.read_journal("iris/test/workers.json").data)["retired"] == []
+
+
 def test_worker_pool_recovery_fences_old_membership_writer(lifecycle_pool):
     fixture = lifecycle_pool
     original = fixture.create()

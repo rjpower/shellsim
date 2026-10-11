@@ -203,6 +203,9 @@ def prepare_graph(
     worker_identity: Mapping[str, str] | None = None,
 ) -> PreparedGraph:
     """Fetch sources and seal one generic action for every canonical consumer."""
+    if type(max_workers) is not int or not 1 <= max_workers <= 32:
+        raise ValueError("Buildomatic requires 1..32 workers")
+
     from ports._support.local_sources import local_source_files
     from ports.buildomatic import Action, BuildRequest, InputMount, ResourceLimits, capture_tree
 
@@ -498,6 +501,9 @@ def run_graph(
     Inputs upload before Submit; outputs warm locally only after exact request
     and action validation. Acknowledgement follows checked collection.
     """
+    if type(max_workers) is not int or not 1 <= max_workers <= 32:
+        raise ValueError("Buildomatic requires 1..32 workers")
+
     from ports.buildomatic import BuildState, Coordinator, LocalStore, ResourceLimits, WorkerExecutor
 
     if workspaces:
