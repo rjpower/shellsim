@@ -11,6 +11,7 @@ import json
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Sequence
@@ -32,6 +33,15 @@ class StoreBuild:
     graph: Graph
     sdk: dict | None
     results: dict[str, dict]
+
+
+def _resolve_products(backend, keys: dict[str, str]) -> dict[str, dict]:
+    """Resolve catalog metadata with bounded concurrency, without fetching products."""
+    if not keys:
+        return {}
+    with ThreadPoolExecutor(max_workers=min(16, len(keys))) as executor:
+        records = executor.map(backend.resolve_artifact, ("port/" + key for key in keys.values()))
+        return {reference: record for reference, record in zip(keys, records) if record is not None}
 
 
 def consumer_sdk(manifest: dict | None, graph: Graph) -> dict | None:
@@ -125,8 +135,22 @@ def prepare(
                 inputs["python"] = sdk["products"]["cpython"]["receipt_id"]
             key = identity(inputs)
             keys[port.reference] = key
-            if cached := backend.resolve_artifact("port/" + key):
-                results[port.reference] = cached
+
+        # Keys depend on predecessor keys, not on their catalog records. Resolve
+        # the complete key set concurrently before choosing the missing actions.
+        results.update(
+            _resolve_products(
+                backend,
+                {
+                    port.reference: keys[port.reference]
+                    for port in graph.ports
+                    if port.recipe["build_system"] not in PRODUCT_SYSTEMS
+                },
+            )
+        )
+
+        for port in graph.ports:
+            if port.recipe["build_system"] in PRODUCT_SYSTEMS or port.reference in results:
                 continue
             action_id = "port-" + hashlib.sha256(port.reference.encode()).hexdigest()
             action_ids[port.reference] = action_id
@@ -159,7 +183,7 @@ def prepare(
                     "sdk_name": sdk_name,
                     "prefix": prefix,
                     "jobs": jobs,
-                    "build_key": key,
+                    "build_key": keys[port.reference],
                     "predecessors": predecessors,
                 },
             )
@@ -231,6 +255,7 @@ def run(
         if sdk is not None and not sdk_inputs_match(sdk["inputs"], sdk_inputs(ports, sdk_name)):
             raise ValueError("SDK build inputs changed: explicitly bootstrap " + sdk_name)
         local = LocalStore(scratch / "transport")
+        print(f"buildomatic: checking product cache for {len(initial.ports)} graph nodes", flush=True)
         graph, request, results, keys = prepare(
             ports,
             requests,
@@ -245,6 +270,10 @@ def run(
             build_key=build_key,
             port_timeout=port_timeout,
         )
+        print(
+            f"buildomatic: product cache: {len(results)} hits, {len(request.actions) if request else 0} builds",
+            flush=True,
+        )
         if request is not None:
             build_id = backend.submit(request)
             print("buildomatic: submitted " + build_id, flush=True)
@@ -255,9 +284,16 @@ def run(
                 time.sleep(1)
             if outcome.state is not BuildState.SUCCEEDED:
                 raise RuntimeError(str(outcome) + "\n" + str(backend.get_logs(build_id)))
-            for port in graph.ports:
-                if port.reference in keys and port.recipe["build_system"] not in PRODUCT_SYSTEMS:
-                    results[port.reference] = backend.resolve_artifact("port/" + keys[port.reference])
+            results.update(
+                _resolve_products(
+                    backend,
+                    {
+                        port.reference: keys[port.reference]
+                        for port in graph.ports
+                        if port.recipe["build_system"] not in PRODUCT_SYSTEMS and port.reference not in results
+                    },
+                )
+            )
             backend.acknowledge(build_id)
     result = StoreBuild(graph, sdk, results)
     write_reference(
