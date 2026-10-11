@@ -108,6 +108,38 @@ fn posix_duped_file_shares_cursor_and_null_device_keeps_access_rights() {
 }
 
 #[test]
+fn null_device_seek_and_tell_report_zero_and_keep_errors() {
+    let mut environment = Environment::new();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_tell" (func $tell (param i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 128) "dev/null")
+        (func (export "_start") (local $fd i32)
+            (if (call $open (i32.const 4) (i32.const 0) (i32.const 128) (i32.const 8) (i32.const 0) (i64.const 66) (i64.const 0) (i32.const 0) (i32.const 32)) (then unreachable))
+            (local.set $fd (i32.load (i32.const 32)))
+            (if (call $seek (local.get $fd) (i64.const 42) (i32.const 0) (i32.const 40)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 40)) (i64.const 0)) (then unreachable))
+            (if (call $seek (local.get $fd) (i64.const -42) (i32.const 1) (i32.const 40)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 40)) (i64.const 0)) (then unreachable))
+            (if (call $seek (local.get $fd) (i64.const 9223372036854775807) (i32.const 2) (i32.const 40)) (then unreachable))
+            (if (call $tell (local.get $fd) (i32.const 40)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 40)) (i64.const 0)) (then unreachable))
+            (if (i32.ne (call $seek (local.get $fd) (i64.const 0) (i32.const 3) (i32.const 40)) (i32.const 28)) (then unreachable))
+            (if (i32.ne (call $tell (local.get $fd) (i32.const 65535)) (i32.const 21)) (then unreachable))
+            (if (i32.ne (call $tell (i32.const 999) (i32.const 40)) (i32.const 8)) (then unreachable))
+            (if (i32.ne (call $seek (i32.const 1) (i64.const 0) (i32.const 0) (i32.const 40)) (i32.const 8)) (then unreachable))
+            (if (call $close (local.get $fd)) (then unreachable))
+            (if (i32.ne (call $tell (local.get $fd) (i32.const 40)) (i32.const 8)) (then unreachable))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+}
+
+#[test]
 fn inherited_regular_stdin_has_real_stat_and_seek_state() {
     let mut environment = Environment::new();
     environment.vfs.write("/", "/input", b"abc", 0o644).unwrap();

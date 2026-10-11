@@ -1,0 +1,87 @@
+{
+  "name": "nltk",
+  "version": "3.10.3",
+  "role": "target-library",
+  "kind": "pure-python-sdist",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/e0/e6/fe51d2bb1a3b446f59c5c8165999a9fee208bc346af90a7cbf7657bc0d75/nltk-3.10.3.tar.gz",
+    "filename": "nltk-3.10.3.tar.gz",
+    "sha256": "bb9327a461c3811c2fa4900e03840401f2126adfb30c0072827c433bd2444ea4",
+    "subdirectory": "nltk-3.10.3"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "defusedxml",
+    "click",
+    "joblib",
+    "regex>=2021.8.3",
+    "tqdm",
+    "numpy; extra == \"machine-learning\"",
+    "python-crfsuite; extra == \"machine-learning\"",
+    "scikit-learn; extra == \"machine-learning\"",
+    "scipy; extra == \"machine-learning\"",
+    "matplotlib; extra == \"plot\"",
+    "pyparsing; extra == \"tgrep\"",
+    "twython; extra == \"twitter\"",
+    "requests; extra == \"corenlp\"",
+    "scipy; extra == \"all\"",
+    "pyparsing; extra == \"all\"",
+    "twython; extra == \"all\"",
+    "numpy; extra == \"all\"",
+    "requests; extra == \"all\"",
+    "python-crfsuite; extra == \"all\"",
+    "matplotlib; extra == \"all\"",
+    "scikit-learn; extra == \"all\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/defusedxml",
+      "version": "0.7.1"
+    },
+    {
+      "port": "python/click",
+      "version": "8.5.0"
+    },
+    {
+      "port": "python/joblib",
+      "version": "1.6.0"
+    },
+    {
+      "port": "python/regex",
+      "version": "2026.9.29"
+    },
+    {
+      "port": "python/tqdm",
+      "version": "4.70.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "patches": [
+    {
+      "file": "wasi-downloads.patch",
+      "sha256": "00e218ea79d07a0c222dc7a93d96890374da54e409a997dcdb1ee3266c141fb0"
+    }
+  ],
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ]
+}

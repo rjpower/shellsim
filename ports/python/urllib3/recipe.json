@@ -1,0 +1,38 @@
+{
+  "name": "urllib3",
+  "version": "2.8.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl",
+    "sha256": "0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3",
+    "filename": "urllib3-2.8.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "brotli>=1.2.0; (platform_python_implementation == 'CPython') and extra == 'brotli'",
+    "brotlicffi>=1.2.0.0; (platform_python_implementation != 'CPython') and extra == 'brotli'",
+    "h2<5,>=4; extra == 'h2'",
+    "pysocks!=1.5.7,<2.0,>=1.5.6; extra == 'socks'",
+    "backports-zstd>=1.0.0; (python_version < '3.14') and extra == 'zstd'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/cpython-stdlib-zlib",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-zlib"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

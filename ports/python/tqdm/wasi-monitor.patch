@@ -1,0 +1,14 @@
+--- a/tqdm/std.py
++++ b/tqdm/std.py
+@@ -115,2 +115,6 @@
+     def create_mp_lock(cls):
++        if sys.platform == "wasi":
++            # WASI has no process-shared semaphore; retain the thread lock.
++            cls.mp_lock = None
++            return
+         if not hasattr(cls, 'mp_lock'):
+@@ -362,3 +366,3 @@
+
+-    monitor_interval = 10  # set to 0 to disable the thread
++    monitor_interval = 0 if sys.platform == "wasi" else 10  # optional background monitor
+     monitor = None

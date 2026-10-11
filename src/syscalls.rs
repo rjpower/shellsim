@@ -1445,9 +1445,15 @@ fn rename(interp: &mut Interp, cwd: &str, from: &str, to: &str) -> Result<(), Sy
     interp.vfs.rename(cwd, from, to).map_err(Into::into)
 }
 
-/// Seek one regular-file description. The returned cursor is shared with duplicated fds.
+/// Seek a shared file cursor. Synthetic devices ignore offsets and report zero.
 fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, SyscallError> {
     let description = interp.process.fds.get(fd)?;
+    if whence > 2 {
+        return Err(SyscallError::InvalidArgument);
+    }
+    if interp.descriptors.state(description)?.kind == crate::descriptors::DescriptorKind::Device {
+        return Ok(0);
+    }
     let file = file_state(interp, fd)?;
     let base = match whence {
         0 => 0_i128,
