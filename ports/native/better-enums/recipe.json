@@ -1,0 +1,31 @@
+{
+  "name": "better-enums",
+  "version": "0.11.3",
+  "kind": "native-library",
+  "role": "target-library",
+  "build_system": "native",
+  "sdk": "default",
+  "linkage": "static",
+  "source": {
+    "url": "https://codeload.github.com/aantron/better-enums/tar.gz/c35576bed0295689540b39873126129adfa0b4c8",
+    "filename": "better-enums-c35576b.tar.gz",
+    "sha256": "9b78dcef7f88d1345b6f25335bfbcba5f024b08990c7d6dc605b833f4128b8dd",
+    "subdirectory": "better-enums-c35576bed0295689540b39873126129adfa0b4c8"
+  },
+  "target_dependencies": [],
+  "exports": {
+    "headers": [
+      "include/enum.h"
+    ],
+    "licenses": [
+      "licenses/better-enums.txt"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "LICENSE.md",
+      "destination": "licenses/better-enums.txt"
+    }
+  ],
+  "needed_libraries": []
+}
