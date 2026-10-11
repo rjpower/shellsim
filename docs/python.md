@@ -55,8 +55,9 @@ delegating generator, and the expression evaluates to `None`.
 
 `for` loops, `yield from`, `iter`, `next`, and `itertools.islice` advance an iterator returned by
 a class's `__iter__` one `__next__` call at a time, so infinite iterators and side effects in
-`__next__` behave as in CPython. `map`, `filter`, `zip`, `enumerate`, and `itertools.chain`
-still consume their whole input before returning.
+`__next__` behave as in CPython. `map` constructs its result eagerly, stopping at the shortest
+input or the first strict length mismatch. `filter`, `zip`, `enumerate`, and `itertools.chain`
+consume their whole input before returning.
 
 `complex` is a native arena type. Its arithmetic, string parsing, `repr`, and error messages
 follow CPython 3.14, including the mixed-mode rules for real operands. Ordering, floor division,
@@ -75,8 +76,8 @@ tuple, and set displays expand `*iterable` items in place.
 
 Named arguments are supported by `enumerate(iterable=..., start=...)`, `sum(..., start=...)`,
 `pow(base=..., exp=..., mod=...)` and `round(number=..., ndigits=...)`.
-`zip` and `map` accept `strict=True` to reject inputs of different lengths. They retain the
-eager input consumption described above. Native `itertools.count`, `combinations`, `permutations`,
+`zip` and `map` accept `strict=True` to reject inputs of different lengths. They construct their
+results eagerly. Native `itertools.count`, `combinations`, `permutations`,
 `os.chdir` and `os.getenv` also accept their named parameters.
 String `split` and `rsplit` and bytes/bytearray `split` accept `sep=` and `maxsplit=`;
 string `replace` accepts `count=`.
