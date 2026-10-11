@@ -14,7 +14,17 @@ fn os_environ_supports_required_key_lookup() {
     assert_eq!(
         run_in(
             &mut environment,
-            "import os\nprint(os.environ['SHELLSIM_REQUIRED'])"
+            r#"import os
+assert os.getenv(key="SHELLSIM_REQUIRED", default="missing") == "present"
+assert os.getenv("SHELLSIM_MISSING", default="missing") == "missing"
+try:
+    os.getenv("SHELLSIM_REQUIRED", key="SHELLSIM_REQUIRED")
+except TypeError:
+    pass
+else:
+    raise AssertionError("TypeError expected")
+print(os.environ['SHELLSIM_REQUIRED'])
+"#
         ),
         (0, b"present\n".to_vec(), Vec::new())
     );

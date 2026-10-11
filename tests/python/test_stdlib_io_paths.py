@@ -599,7 +599,7 @@ def test_object_and_builtin_surface_used_by_the_stdlib():
     assert os.path.join("a", "b") == "a/b" and os.sep == "/"
 
 
-def test_os_accepts_named_vfs_and_environment_arguments():
+def test_os_chdir_accepts_named_vfs_path():
     original = os.getcwd()
     with tempfile.TemporaryDirectory() as root:
         try:
@@ -607,21 +607,3 @@ def test_os_accepts_named_vfs_and_environment_arguments():
             assert os.getcwd() == root
         finally:
             os.chdir(original)
-    key = "SHELLSIM_KEYWORD_ARGUMENT_TEST"
-    previous = os.environ.get(key)
-    try:
-        os.environ[key] = "present"
-        assert os.getenv(key=key, default="missing") == "present"
-        del os.environ[key]
-        assert os.getenv(key, default="missing") == "missing"
-        try:
-            os.getenv(key, key=key)
-        except TypeError:
-            pass
-        else:
-            raise AssertionError("TypeError expected")
-    finally:
-        if previous is not None:
-            os.environ[key] = previous
-        elif os.environ.get(key) is not None:
-            del os.environ[key]
