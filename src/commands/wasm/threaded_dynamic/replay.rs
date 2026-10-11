@@ -424,6 +424,52 @@ pub(super) async fn install(
                     lookup(store.as_context_mut(), name, &record.dependencies)?
                 {
                     symbol.0
+                } else if let Some(slot) = record.function_slots.get(name).copied().filter(|_| {
+                    !super::super::dynamic::canonical_runtime_symbol(name)
+                        && !record.layout.has_start
+                }) {
+                    let ExternType::Func(expected) = import.ty() else {
+                        return Err(Error::msg("self import must be a function"));
+                    };
+                    let own = record
+                        .module
+                        .exports()
+                        .find(|export| export.name() == name)
+                        .ok_or_else(|| Error::msg("missing own function export"))?;
+                    let ExternType::Func(actual) = own.ty() else {
+                        return Err(Error::msg("self import export must be a function"));
+                    };
+                    if !FuncType::eq(&expected, &actual) {
+                        return Err(Error::msg(format!("self import type mismatch: {name}")));
+                    }
+                    // LLVM can retain preemptible calls to an owned definition.
+                    // Its Store-local slot is populated before relocations/ctors.
+                    let name = name.to_owned();
+                    Extern::Func(Func::new_async(
+                        store.as_context_mut(),
+                        expected,
+                        move |mut caller, args, results| {
+                            let name = name.clone();
+                            Box::new(async move {
+                                if !caller
+                                    .data()
+                                    .machine
+                                    .get()
+                                    .resources
+                                    .charge_cpu(name.len() as u64 + 64)
+                                {
+                                    return Err(super::super::exhausted());
+                                }
+                                let Some(Ref::Func(Some(target))) =
+                                    table.get(&mut caller, u64::from(slot))
+                                else {
+                                    return Err(Error::msg(format!("unbound self import: {name}")));
+                                };
+                                let _fiber = fibers::begin(&mut caller)?;
+                                target.call_async(&mut caller, args, results).await
+                            })
+                        },
+                    ))
                 } else if record
                     .layout
                     .weak_imports

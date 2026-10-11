@@ -18,6 +18,5 @@ def build(ctx: BuildContext):
         configure_args=[
             "--buildtype=release",
             "-Dcpp_args=-Wno-error=unused-template",
-            "-Dcpp_link_args=-Wl,-Bsymbolic",
         ],
     )
