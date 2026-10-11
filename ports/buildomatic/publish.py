@@ -11,6 +11,7 @@ import json
 import shutil
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -92,19 +93,29 @@ def publish_release(backend, references: dict, output: Path) -> None:
 
 
 def accept_release(
-    references: dict, descriptor: Path, output: Path, *, cpu: int, memory: int, only: list[str] | None = None
+    references: dict,
+    descriptor: Path,
+    output: Path,
+    *,
+    cpu: int,
+    memory: int,
+    only: list[str] | None = None,
+    max_workers: int = 4,
 ) -> None:
-    """Run Python and shell probes against downloaded runtime/package assets."""
+    """Run independent guest probes concurrently, retaining each port's receipts."""
     from shellsim import Limits
 
     from ports._support.acceptance import AcceptanceRequest, accept_port
     from ports._support.graph import guest_graph
 
     ports = Path(__file__).resolve().parents[1]
+    if not 1 <= max_workers <= 32:
+        raise ValueError("guest concurrency must be between one and 32")
     graph = plan(ports, references["roots"], default_sdk=references["sdk_name"])
     guests = guest_graph(graph).ports
     if only and set(only) - {port.name for port in guests}:
         raise ValueError("--only names must belong to the selected guest graph")
+    requests = []
     for port in guests:
         if port.role in {"host-tool", "target-platform"}:
             continue
@@ -122,10 +133,24 @@ def accept_release(
             else "pypi"
         )
         proof = output / (port.name + ("-" + port.variant if port.variant else ""))
-        accept_port(
+        requests.append(
             AcceptanceRequest(port, descriptor, proof, kind, limits=Limits(cpu=cpu, memory=memory, disk=1024**3))
         )
-        print("buildomatic: guest passed " + port.reference, flush=True)
+    failures = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        pending = {executor.submit(accept_port, request): request.port.reference for request in requests}
+        for future in as_completed(pending):
+            reference = pending[future]
+            try:
+                future.result()
+            except Exception as error:
+                failures.append((reference, error))
+                print("buildomatic: guest failed " + reference, flush=True)
+            else:
+                print("buildomatic: guest passed " + reference, flush=True)
+    if failures:
+        details = "\n".join(f"{reference}: {error}" for reference, error in failures)
+        raise RuntimeError("guest acceptance failures:\n" + details) from failures[0][1]
 
 
 def run_guest(executable: Path, libraries: Path, output: Path, *, cpu: int, memory: int) -> None:
@@ -153,11 +178,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--release", type=Path, help="saved release descriptor for Python/shell acceptance")
     parser.add_argument("--only", nargs="+", help="run acceptance only for these guest port names")
+    parser.add_argument("--max-workers", type=int, help="concurrent guest checks for accept (default: four)")
     parser.add_argument("--cpu", type=int, default=1_000_000_000_000)
     parser.add_argument("--memory", type=int, default=8 * 1024**3)
     args = parser.parse_args()
     if args.only and args.command != "accept":
         parser.error("--only applies to accept")
+    if args.max_workers is not None and args.command != "accept":
+        parser.error("--max-workers applies to accept")
     args.output.mkdir(parents=True, exist_ok=True)
     if args.command == "guest":
         run_guest(args.output / "acceptance.wasm", args.output / "lib", args.output, cpu=args.cpu, memory=args.memory)
@@ -172,6 +200,7 @@ def main() -> None:
             cpu=args.cpu,
             memory=args.memory,
             only=args.only,
+            max_workers=args.max_workers if args.max_workers is not None else 4,
         )
         return
     if args.results is None or args.iris_service is None:
