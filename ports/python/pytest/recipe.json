@@ -1,0 +1,58 @@
+{
+  "name": "pytest",
+  "version": "9.0.3",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "source": {
+    "filename": "pytest-9.0.3-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl",
+    "sha256": "2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9"
+  },
+  "requires_dist": [
+    "colorama>=0.4; sys_platform == \"win32\"",
+    "exceptiongroup>=1; python_version < \"3.11\"",
+    "iniconfig>=1.0.1",
+    "packaging>=22",
+    "pluggy<2,>=1.5",
+    "pygments>=2.7.2",
+    "tomli>=1; python_version < \"3.11\"",
+    "argcomplete; extra == \"dev\"",
+    "attrs>=19.2; extra == \"dev\"",
+    "hypothesis>=3.56; extra == \"dev\"",
+    "mock; extra == \"dev\"",
+    "requests; extra == \"dev\"",
+    "setuptools; extra == \"dev\"",
+    "xmlschema; extra == \"dev\""
+  ],
+  "requires_python": ">=3.10",
+  "runtime_dependencies": [
+    {
+      "port": "python/iniconfig",
+      "version": "2.3.0"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    },
+    {
+      "port": "python/pluggy",
+      "version": "1.6.0"
+    },
+    {
+      "port": "python/pygments",
+      "version": "2.19.2"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 4294967296,
+    "disk": 536870912
+  },
+  "build_system": "pure-wheel"
+}

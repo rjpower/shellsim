@@ -19,10 +19,12 @@ import subprocess
 import tempfile
 import zipfile
 from pathlib import Path, PurePosixPath
-from typing import Sequence, Union
+from typing import TYPE_CHECKING, Sequence, Union
 
-from ._api import Environment, RunResult, SimulationError
 from .pypi import _REQUIREMENT, PackageInstallError, _compatibility_blockers, _mount_package_tree
+
+if TYPE_CHECKING:
+    from ._api import Environment, RunResult
 
 _EXECUTABLE = "/usr/bin/python3.wasm"
 _SITE_PACKAGES = "/usr/lib/python3.13/site-packages"
@@ -176,6 +178,8 @@ class CPythonRuntime:
 
     def mount(self, environment: Environment) -> None:
         """Mount the verified bundle and select its VFS Python launchers."""
+        from ._api import SimulationError
+
         if environment._cpython_runtime is not None and environment._cpython_runtime is not self:
             raise SimulationError("a different CPython runtime is already mounted")
         self._verify()

@@ -1,0 +1,38 @@
+{
+  "name": "pytest-json-report",
+  "version": "1.5.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "source": {
+    "filename": "pytest_json_report-1.5.0-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/81/35/d07400c715bf8a88aa0c1ee9c9eb6050ca7fe5b39981f0eea773feeb0681/pytest_json_report-1.5.0-py3-none-any.whl",
+    "sha256": "9897b68c910b12a2e48dd849f9a284b2c79a732a8a9cb398452ddd23d3c8c325"
+  },
+  "requires_dist": [
+    "pytest (>=3.8.0)",
+    "pytest-metadata"
+  ],
+  "requires_python": ">=3.13",
+  "runtime_dependencies": [
+    {
+      "port": "python/pytest",
+      "version": "9.0.3"
+    },
+    {
+      "port": "python/pytest-metadata",
+      "version": "3.1.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 4294967296,
+    "disk": 536870912
+  },
+  "build_system": "pure-wheel"
+}

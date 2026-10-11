@@ -9,8 +9,6 @@ import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Protocol, Sequence
 
-from . import _native
-
 _VERSION_CLAUSE = r"(?:==|!=|<=|>=|<|>|~=)\s*[A-Za-z0-9.*+!_-]+"
 _REQUIREMENT = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._-]*(?:\[[A-Za-z0-9._,-]+\])?"
@@ -48,6 +46,8 @@ def _mount_package_tree(
     Native catalog exports retain their explicit modes. Python data is readable and
     executable entry points remain executable, regardless of the host umask.
     """
+    from . import _native
+
     if normalize_modes:
         for path in target.rglob("*"):
             if path.is_symlink():
@@ -109,6 +109,8 @@ def install_pypi(environment: _StagingEnvironment, requirement: str) -> None:
 
 
 def _check_import_collisions(target: Path) -> None:
+    from . import _native
+
     imports = set()
     for entry in target.iterdir():
         if entry.is_dir() and not entry.name.endswith((".dist-info", ".data")):

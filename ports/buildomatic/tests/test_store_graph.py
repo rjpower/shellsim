@@ -84,3 +84,94 @@ def test_artifact_catalog_is_independent_of_service_journals(tmp_path):
     register(canonical, "sdk/example", {"identity": "sdk"})
     service = CoordinatorService(LocalStore(tmp_path / "service"), "test", {}, artifact_store=canonical)
     assert service.resolve_artifact("sdk/example") == {"identity": "sdk"}
+
+
+def test_saved_roots_keep_build_only_wheels_out_of_guest_release(tmp_path, monkeypatch):
+    import json
+    from contextlib import nullcontext
+
+    from ports._support.graph import guest_graph, plan
+    from ports.buildomatic.backends import iris
+    from ports.buildomatic.store_graph import run
+
+    ports = tmp_path / "ports"
+    for name, dependencies in (("generator", []), ("runtime", []), ("application", ["runtime"])):
+        _wheel_port(ports, tmp_path / "sources", name, dependencies)
+    recipe = ports / "python/application/recipe.json"
+    data = json.loads(recipe.read_text())
+    data["build_dependencies"] = [{"port": "python/generator", "version": "1"}]
+    recipe.write_text(json.dumps(data))
+    backend = CatalogBackend(LocalStore(tmp_path / "canonical"))
+    scratch = tmp_path / "client"
+    scratch.mkdir()
+    _, _, _, keys = prepare(
+        ports,
+        ["python/application"],
+        None,
+        LocalStore(scratch / "transport"),
+        backend,
+        "s3://bucket/cache",
+        scratch,
+        32,
+        8,
+    )
+    for reference, key in keys.items():
+        register(backend.store, "port/" + key, {"reference": reference, "artifact": {"id": reference}})
+    descriptor = tmp_path / "service.json"
+    descriptor.write_text(
+        json.dumps(
+            {
+                "job_id": "test",
+                "cluster_name": "test",
+                "controller_url": "https://controller.invalid",
+                "workspace": str(tmp_path),
+                "prefix": "s3://bucket/cache",
+            }
+        )
+    )
+    monkeypatch.setattr(iris, "backend_context_factory", lambda **kwargs: lambda: nullcontext(backend))
+    run(ports, ["python/application"], "fixture", descriptor, scratch, jobs=32, max_workers=8)
+    saved = json.loads((scratch / "results.json").read_text())
+    assert len(saved["products"]) == 3
+    graph = plan(ports, saved["roots"])
+    assert {port.name for port in guest_graph(graph).ports} == {"application", "runtime"}
+
+
+def test_sdk_fetch_selection_follows_transitive_port_inputs():
+    from pathlib import Path
+
+    from ports._support.graph import plan
+    from ports.buildomatic.store_graph import consumer_sdk
+
+    ports = Path(__file__).resolve().parents[2]
+    manifest = {
+        "products": {role: {"role": role} for role in ("compiler", "platform", "tooling", "cpython", "resolver")}
+    }
+    native = consumer_sdk(manifest, plan(ports, ["native/zlib"]))
+    assert set(native["products"]) == {"compiler", "platform", "tooling"}
+    imageio = consumer_sdk(manifest, plan(ports, ["python/imageio"]))
+    assert set(imageio["products"]) == {"compiler", "platform", "tooling", "cpython"}
+    assert consumer_sdk(manifest, plan(ports, ["python/pytest-json-report"])) is None
+    assert set(manifest["products"]) == {"compiler", "platform", "tooling", "cpython", "resolver"}
+
+
+def test_pure_product_key_does_not_depend_on_incidental_sdk(tmp_path, monkeypatch):
+    import json
+    from types import SimpleNamespace
+
+    from ports._support import sdk as policies
+
+    ports = tmp_path / "ports"
+    _wheel_port(ports, tmp_path / "sources", "example", [])
+    monkeypatch.setattr(policies, "definition", lambda *args: SimpleNamespace(products=()))
+    local = LocalStore(tmp_path / "transport")
+    backend = CatalogBackend(LocalStore(tmp_path / "canonical"))
+    args = local, backend, "s3://bucket/cache", tmp_path, 32, 8
+    _, standalone, _, first = prepare(ports, ["python/example"], None, *args)
+    manifest = {"identity": "incidental-sdk", "dynamic_abi": "fixture", "products": {}}
+    _, mixed, _, second = prepare(ports, ["python/example"], manifest, *args)
+    assert first == second
+    node = tmp_path / "node"
+    extract_tree(mixed.actions[0].inputs[1].bundle, local, node)
+    assert json.loads((node / "node.json").read_text())["sdk"] is None
+    assert standalone.actions[0].id == mixed.actions[0].id

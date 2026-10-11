@@ -225,6 +225,24 @@ def test_native_wheel_rejects_undeclared_extension(tmp_path: Path) -> None:
         _inspect_wheel(path, name="native", version="1.0", abi=ABI, curated=True)
 
 
+@pytest.mark.parametrize("collision", [False, True])
+def test_wheel_data_uses_installed_paths_for_collision_checks(tmp_path: Path, collision: bool) -> None:
+    path = tmp_path / "sample-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("sample-1.0.dist-info/METADATA", "Metadata-Version: 2.3\nName: sample\nVersion: 1.0\n")
+        archive.writestr("sample-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
+        archive.writestr("sample-1.0.data/data/share/man/man1/sample.1", b"manual page")
+        if collision:
+            archive.writestr("share/man/man1/sample.1", b"conflicting page")
+    if collision:
+        with pytest.raises(shellsim.PackageInstallError):
+            _inspect_wheel(path, name="sample", version="1.0", abi=ABI, curated=True)
+        return
+    inspection = _inspect_wheel(path, name="sample", version="1.0", abi=ABI, curated=True)
+    assert inspection.members["share/man/man1/sample.1"] == (False, hashlib.sha256(b"manual page").hexdigest())
+    assert not any(".data/" in name for name in inspection.members)
+
+
 def test_wheel_tag_must_be_an_exact_metadata_line(tmp_path: Path) -> None:
     path = tmp_path / "native-1.0-cp313-cp313-wasm32_wasip1.whl"
     info = "native-1.0.dist-info"

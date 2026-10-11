@@ -46,14 +46,32 @@ uv run --no-project python -m ports.buildomatic.publish check \
   --output build/checks --cpu 100000000000 --memory 8589934592
 uv run --no-project python -m ports.buildomatic.publish guest \
   --output build/checks --cpu 200000000000 --memory 8589934592
+uv run --no-project python -m ports.buildomatic.publish release \
+  --results build/port-client/results.json --iris-service service.json \
+  --output build/release-client
+uv run --no-project python -m ports.buildomatic.publish accept \
+  --results build/port-client/results.json \
+  --release build/release-client/assets/release/release.json \
+  --output build/python-checks --only scipy
 ```
 
 `check` currently supports native probes: it compiles beside the remote
 artifacts and downloads only the probe and its required shared libraries.
 `guest` reruns saved bytes locally, including after a failed budget setting.
-Python/shell acceptance and sealed release assembly remain available through
-the ordinary ports publish/accept interfaces. Cache outputs have no retention
-promise; creating a release is an explicit operation.
+`release` requires an SDK bootstrapped with `--resolver`. It assembles the
+requested guest closure on a worker and downloads runtime/package assets,
+including the patched resolver. Build-only packages stay out of that closure.
+Publication imports pure Python metadata APIs without copying a host execution
+adapter. `accept` runs Python/shell probes locally from that saved release;
+`--only` selects ports and CPU/memory overrides allow guest-only retries.
+The current resolver installation helper uses host Python 3.13.7 or newer.
+Cache outputs have no retention promise; creating a release is explicit.
+
+Pure-wheel builds fetch no SDK. Other workers fetch just their consumed
+components: native builds need compiler/platform/tooling, Python builds add
+CPython, and resolver builds add Rust/resolver inputs. Installing a release
+does not fetch a compiler. Pure-wheel product keys are independent of the SDK
+selected by another port in the same request.
 
 The worker image uses Ubuntu packages, normal Python environments, Rust and
 sccache. Allocate CPUs to match build jobs; linking has its own smaller

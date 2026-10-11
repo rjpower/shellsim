@@ -1,0 +1,28 @@
+{
+  "name": "antlr4-python3-runtime",
+  "version": "4.11.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "source": {
+    "filename": "antlr4_python3_runtime-4.11.0-py3-none-any.whl",
+    "url": "https://files.pythonhosted.org/packages/37/f3/2cab1ffe441ffcc4605bf638f524fed86db6699a25d04bbecb5bfdde372b/antlr4_python3_runtime-4.11.0-py3-none-any.whl",
+    "sha256": "f523f91387283045f129c343b363a8dda3a07eea62721b8eda95f2d8b817b656"
+  },
+  "requires_dist": [
+    "typing ; python_version < \"3.5\""
+  ],
+  "requires_python": ">=3.13",
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 100000000000,
+    "memory": 4294967296,
+    "disk": 536870912
+  },
+  "build_system": "pure-wheel"
+}

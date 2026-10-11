@@ -34,6 +34,25 @@ class StoreBuild:
     results: dict[str, dict]
 
 
+def consumer_sdk(manifest: dict | None, graph: Graph) -> dict | None:
+    """Send references only to SDK components consumed by this port closure."""
+    pure = {"pure-wheel", "host-wheel", "source-tree"}
+    if manifest is None or all(port.recipe["build_system"] in pure for port in graph.ports):
+        return None
+    roles = {"compiler", "platform", "tooling"}
+    if any(
+        port.recipe["build_system"].startswith("python-") or port.recipe["build_system"] == "cpython-threaded"
+        for port in graph.ports
+    ):
+        roles.add("cpython")
+    if any(port.recipe["build_system"] == "uv-host" for port in graph.ports):
+        roles.add("resolver")
+    return {
+        **manifest,
+        "products": {role: component for role, component in manifest["products"].items() if role in roles},
+    }
+
+
 def prepare(
     ports: Path,
     requests: Sequence[str],
@@ -104,7 +123,7 @@ def prepare(
                         *(["_support/build.py"] if port.recipe.get("patches") else []),
                     )
                 },
-                "sdk": sdk["identity"] if sdk else None,
+                "sdk": sdk["identity"] if sdk and system not in {"pure-wheel", "host-wheel", "source-tree"} else None,
                 "dependencies": {edge.recipe: keys[edge.recipe] for edge in port.dependencies},
             }
             if system in {"python-extension", "python-meson", "python-pep517"}:
@@ -141,7 +160,9 @@ def prepare(
                 recipe / "node.json",
                 {
                     "reference": port.reference,
-                    "sdk": sdk,
+                    "sdk": consumer_sdk(
+                        sdk, Graph((port.reference,), tuple(selected[name] for name in closure | {port.reference}))
+                    ),
                     "sdk_name": sdk_name,
                     "prefix": prefix,
                     "jobs": jobs,
@@ -246,5 +267,8 @@ def run(
                     results[port.reference] = backend.resolve_artifact("port/" + keys[port.reference])
             backend.acknowledge(build_id)
     result = StoreBuild(graph, sdk, results)
-    write_reference(scratch / "results.json", {"sdk": sdk, "sdk_name": sdk_name, "products": results, "prefix": prefix})
+    write_reference(
+        scratch / "results.json",
+        {"roots": graph.roots, "sdk": sdk, "sdk_name": sdk_name, "products": results, "prefix": prefix},
+    )
     return result

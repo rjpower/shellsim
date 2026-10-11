@@ -21,10 +21,12 @@ import urllib.request
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Protocol, Sequence
 
-from ._api import Environment
 from .pypi import PackageInstallError, _mount_package_tree
+
+if TYPE_CHECKING:
+    from ._api import Environment
 
 _MAX_CATALOG_BYTES = 1024 * 1024
 _MAX_WHEEL_BYTES = 128 * 1024 * 1024
@@ -347,9 +349,19 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
             mode = member.external_attr >> 16
             if relative in seen or stat.S_ISLNK(mode):
                 raise PackageInstallError("resolved wheel contains a duplicate or linked path")
-            if any(part.endswith(".data") for part in relative.parts):
-                raise PackageInstallError("wheel data relocation is not supported")
             seen.add(relative)
+            if relative.parts[0].endswith(".data"):
+                if member.is_dir() and len(relative.parts) == 1:
+                    continue
+                if len(relative.parts) < 2 or relative.parts[1] != "data":
+                    raise PackageInstallError("unsupported wheel data scheme")
+                if member.is_dir() and len(relative.parts) == 2:
+                    continue
+                # uv --target places ordinary wheel data beside site packages.
+                # Compare that destination so relocated aliases cannot collide.
+                relative = _relative(PurePosixPath(*relative.parts[2:]).as_posix())
+            elif any(part.endswith(".data") for part in relative.parts):
+                raise PackageInstallError("unsupported nested wheel data directory")
             for parent in relative.parents:
                 if parent != PurePosixPath("."):
                     prior = file_members.get(parent.as_posix())
@@ -364,7 +376,7 @@ def _inspect_wheel(path: Path, *, name: str, version: str, abi: str, curated: bo
                 file_members[key] = (True, None)
             else:
                 if key in file_members:
-                    raise PackageInstallError("wheel file conflicts with a directory")
+                    raise PackageInstallError("wheel file conflicts with another installed member")
                 file_members[key] = (False, hashlib.sha256(archive.read(member)).hexdigest())
         dist_infos = [part for part in {path.parts[0] for path in seen} if part.endswith(".dist-info")]
         if len(dist_infos) != 1:
