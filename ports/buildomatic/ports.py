@@ -248,7 +248,7 @@ def prepare_graph(
         if sdk_context is not None:
             from ports.buildomatic.portable import export_sdk
 
-            export_sdk(sdk_context, root / "sdk")
+            export_sdk(sdk_context, root / "sdk", blob_cache=ports_store / "buildomatic-sdk-blobs", max_workers=4)
             sdk_mounts = (
                 InputMount(
                     "sdk",

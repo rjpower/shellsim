@@ -9,11 +9,16 @@ No source checkout, retained build workspace or ambient directory is exported.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import re
+import shutil
 import stat
+import threading
+import uuid
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Mapping
@@ -115,27 +120,56 @@ def _alias_target(name: str, aliases: Mapping[str, str], root: Path, stable: boo
     return name
 
 
-def _stream(source: Path, destination: Path, expected: FileEntry, limits: PortableLimits) -> None:
+def _stream(
+    source: Path,
+    destination: Path | None,
+    expected: FileEntry,
+    limits: PortableLimits,
+    *,
+    stop: threading.Event | None = None,
+    mode: int | None = None,
+) -> None:
     """Copy and hash bounded chunks; partial files are never accepted as blobs."""
     digest = hashlib.sha256()
     size = 0
     fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-    with os.fdopen(fd, "rb") as incoming, destination.open("xb") as outgoing:
+    with os.fdopen(fd, "rb") as incoming:
         info = os.fstat(incoming.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_size != expected.size:
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_size != expected.size
+            or mode is not None
+            and stat.S_IMODE(info.st_mode) != mode
+        ):
             raise ValueError("portable blob is not the declared regular file")
-        for chunk in iter(lambda: incoming.read(_CHUNK), b""):
-            size += len(chunk)
-            if size > expected.size or size > limits.max_file_bytes:
-                raise ValueError("portable blob exceeds its declared size")
-            digest.update(chunk)
-            outgoing.write(chunk)
+        outgoing = destination.open("xb") if destination is not None else None
+        try:
+            for chunk in iter(lambda: incoming.read(_CHUNK), b""):
+                if stop is not None and stop.is_set():
+                    raise RuntimeError("portable export stopped after another file failed")
+                size += len(chunk)
+                if size > expected.size or size > limits.max_file_bytes:
+                    raise ValueError("portable blob exceeds its declared size")
+                digest.update(chunk)
+                if outgoing is not None:
+                    outgoing.write(chunk)
+            after = os.fstat(incoming.fileno())
+            if (info.st_size, info.st_mtime_ns, info.st_mode) != (after.st_size, after.st_mtime_ns, after.st_mode):
+                raise ValueError("portable source changed while streaming")
+        finally:
+            if outgoing is not None:
+                outgoing.close()
     if size != expected.size or digest.hexdigest() != expected.sha256:
         raise ValueError("portable blob changed or differs from inventory")
 
 
 def _inventory(
-    root: Path, files: Mapping[str, str], aliases: Mapping[str, str], *, stable: bool = False
+    root: Path,
+    files: Mapping[str, str],
+    aliases: Mapping[str, str],
+    *,
+    stable: bool = False,
+    verify_files: bool = True,
 ) -> RootInventory:
     """Select declared files and aliases without traversing host directory aliases.
 
@@ -170,13 +204,13 @@ def _inventory(
                 raise ValueError("unsupported portable alias target")
             # Directory aliases reuse selected parents; never traverse them to
             # add files or otherwise extend an admitted host package closure.
-            if name in files and file_hash(path) != files[name]:
+            if verify_files and name in files and file_hash(path) != files[name]:
                 raise ValueError("portable alias bytes differ")
         else:
             info = path.stat()
             if not stat.S_ISREG(info.st_mode):
                 raise ValueError("portable inventory requires regular files")
-            digest = file_hash(path)
+            digest = file_hash(path) if verify_files or name not in files else files[name]
             if name in files and digest != files[name]:
                 raise ValueError("portable inventory differs from its receipt")
             regular[name] = FileEntry(digest, info.st_size, stat.S_IMODE(info.st_mode) & 0o777)
@@ -199,7 +233,88 @@ def _inventory(
         canonical = path.resolve().relative_to(root).as_posix()
         if canonical not in regular and not (stable and canonical in directories):
             raise ValueError("portable alias target is outside selected inventory")
+        if name in files and canonical in regular and files[name] != regular[canonical].sha256:
+            raise ValueError("portable alias bytes differ")
     return RootInventory(str(root), stable, regular, links, directories)
+
+
+def _publish_blob(
+    source: Path, directory: Path, entry: FileEntry, limits: PortableLimits, stop: threading.Event, mode: int
+) -> Path:
+    """Only a completely verified temporary file becomes a cache/output blob."""
+    final = _blob(directory, entry.sha256)
+    temporary = final.with_name("." + entry.sha256 + "." + uuid.uuid4().hex + ".partial")
+    try:
+        _stream(source, temporary, entry, limits, stop=stop, mode=mode)
+        temporary.chmod(0o444)
+        try:
+            os.link(temporary, final)
+        except FileExistsError:
+            _stream(final, None, entry, limits, stop=stop, mode=0o444)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return final
+
+
+def _export_blob(
+    sources: list[tuple[Path, FileEntry, int]],
+    destination: Path,
+    cache: Path | None,
+    limits: PortableLimits,
+    stop: threading.Event,
+) -> None:
+    source, entry, mode = sources[0]
+    blob = _blob(cache if cache is not None else destination, entry.sha256)
+    if cache is not None and blob.exists():
+        _stream(blob, None, entry, limits, stop=stop, mode=0o444)
+        remaining = sources
+    else:
+        blob = _publish_blob(source, cache if cache is not None else destination, entry, limits, stop, mode)
+        remaining = sources[1:]
+    # Different source files with identical bytes still require their own proof.
+    for selected, expected, selected_mode in remaining:
+        _stream(selected, None, expected, limits, stop=stop, mode=selected_mode)
+    if cache is not None:
+        output = _blob(destination, entry.sha256)
+        try:
+            os.link(blob, output)
+        except OSError as error:
+            if error.errno != errno.EXDEV:
+                raise
+            _publish_blob(blob, destination, entry, limits, stop, 0o444)
+
+
+def _export_blobs(
+    jobs: Mapping[str, list[tuple[Path, FileEntry, int]]],
+    destination: Path,
+    cache: Path | None,
+    limits: PortableLimits,
+    max_workers: int,
+) -> None:
+    """Keep at most max_workers futures and 1 MiB read buffers in flight."""
+    stop = threading.Event()
+    pending = iter(jobs.values())
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        active = set()
+        try:
+            for _ in range(max_workers):
+                selected = next(pending, None)
+                if selected is None:
+                    break
+                active.add(executor.submit(_export_blob, selected, destination, cache, limits, stop))
+            while active:
+                done, active = wait(active, return_when=FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                for _ in done:
+                    selected = next(pending, None)
+                    if selected is not None:
+                        active.add(executor.submit(_export_blob, selected, destination, cache, limits, stop))
+        except BaseException:
+            stop.set()
+            for future in active:
+                future.cancel()
+            raise
 
 
 def _target_bindings(context: MaterializedSDK) -> dict:
@@ -233,14 +348,33 @@ def _admit(
     )
 
 
-def export_sdk(context: MaterializedSDK, destination: Path, *, limits: PortableLimits = _DEFAULT_LIMITS) -> Path:
+def export_sdk(
+    context: MaterializedSDK,
+    destination: Path,
+    *,
+    limits: PortableLimits = _DEFAULT_LIMITS,
+    max_workers: int = 4,
+    blob_cache: Path | None = None,
+    minimum_free_bytes: int = 0,
+) -> Path:
     """Re-admit inputs and export exact receipt bytes and selected code closures.
 
     ``destination`` must be absent. Its descriptor and blobs may be transported
     by any directory bundler. Receipts are never serialized anew. Host roots
     are recorded at their stable absolute paths, including receipt locations.
+    File work uses at most ``max_workers`` independent 1 MiB buffers. An explicit
+    task-owned cache retains immutable, verified blobs across interrupted exports;
+    every cache hit is hashed again. The descriptor is published after all workers
+    join. ``minimum_free_bytes`` reserves disk space in addition to selected output
+    blobs, metadata and missing cache blobs before either directory is created.
     """
+    if type(max_workers) is not int or not 1 <= max_workers <= 32:
+        raise ValueError("portable file workers must be between 1 and 32")
+    if type(minimum_free_bytes) is not int or minimum_free_bytes < 0:
+        raise ValueError("portable free-space reserve must be a nonnegative integer")
     destination = destination.absolute()
+    if destination.resolve() != destination:
+        raise ValueError("portable destination must have an unlinked canonical path")
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
     products = dict(
@@ -271,7 +405,7 @@ def export_sdk(context: MaterializedSDK, destination: Path, *, limits: PortableL
             if name == "cpython":
                 files.update(product.contents["build_profile"]["headers"])
             aliases = {}
-        selected = _inventory(product.root, files, aliases)
+        selected = _inventory(product.root, files, aliases, verify_files=False)
         receipt_name = (
             product.path.relative_to(product.root).as_posix()
             if product.path.is_relative_to(product.root)
@@ -294,7 +428,7 @@ def export_sdk(context: MaterializedSDK, destination: Path, *, limits: PortableL
     stable_paths = {}
 
     def stable(root: Path, files: Mapping[str, str], aliases: Mapping[str, str]) -> None:
-        selected = _inventory(root, files, aliases, stable=True)
+        selected = _inventory(root, files, aliases, stable=True, verify_files=False)
         key = stable_paths.setdefault(selected.path, "host-" + str(len(stable_paths)))
         existing = roots.get(key)
         if existing is not None:
@@ -337,23 +471,69 @@ def export_sdk(context: MaterializedSDK, destination: Path, *, limits: PortableL
     payload = json.dumps(descriptor, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     if len(payload) > limits.metadata_bytes:
         raise ValueError("portable descriptor exceeds metadata bound")
+    cache = blob_cache.absolute() if blob_cache is not None else None
+    if cache is not None and (cache.resolve() != cache or cache.is_symlink()):
+        raise ValueError("portable cache must have an unlinked canonical path")
+    if cache is not None and (
+        (cache / "blobs").is_symlink() or ((cache / "blobs").exists() and not (cache / "blobs").is_dir())
+    ):
+        raise ValueError("portable cache blobs must be an unlinked directory")
+    if cache is not None and (cache.is_relative_to(destination) or destination.is_relative_to(cache)):
+        raise ValueError("portable cache overlaps export destination")
     for root in roots.values():
-        if destination.is_relative_to(Path(root.path)):
+        original = Path(root.path)
+        if destination.is_relative_to(original) or original.is_relative_to(destination):
             raise ValueError("export destination overlaps an input root")
-    (destination / "blobs").mkdir(parents=True)
+        if cache is not None and (cache.is_relative_to(original) or original.is_relative_to(cache)):
+            raise ValueError("portable cache overlaps an input root")
+    jobs = {}
+    seen_sources = set()
     for name, root in roots.items():
         for relative, entry in root.files.items():
-            blob = _blob(destination, entry.sha256)
-            if blob.exists():
-                continue
             reference = references.get(name)
             source = (
                 Path(reference["original_manifest"])
                 if reference and relative == reference["manifest"]
                 else Path(root.path) / relative
             )
-            _stream(source, blob, entry, limits)
-            blob.chmod(0o444)
+            mode = (
+                stat.S_IMODE(source.stat().st_mode) & 0o777
+                if reference and relative == reference["manifest"]
+                else entry.mode
+            )
+            group = jobs.setdefault(entry.sha256, [])
+            if group and group[0][1].size != entry.size:
+                raise ValueError("portable digest has inconsistent sizes")
+            key = (source, entry.sha256, mode)
+            if key not in seen_sources:
+                seen_sources.add(key)
+                group.append((source, entry, mode))
+    # The descriptor may declare the same file through several product roles.
+    # There is one cache/output writer per digest and no unbounded future queue.
+    output_bytes = sum(group[0][1].size for group in jobs.values())
+    missing_cache_bytes = (
+        0
+        if cache is None
+        else sum(group[0][1].size for digest, group in jobs.items() if not _blob(cache, digest).exists())
+    )
+    required = minimum_free_bytes + output_bytes + len(payload) + missing_cache_bytes
+    parent = destination.parent
+    while not parent.exists():
+        parent = parent.parent
+    free = shutil.disk_usage(parent).free
+    if free < required:
+        raise OSError(
+            f"portable export free space insufficient: free={free}, B={output_bytes}, cache_missing={missing_cache_bytes}, required={required}"
+        )
+    if cache is not None:
+        cache_parent = cache
+        while not cache_parent.exists():
+            cache_parent = cache_parent.parent
+        if shutil.disk_usage(cache_parent).free < missing_cache_bytes + minimum_free_bytes:
+            raise OSError("portable cache free space insufficient")
+        (cache / "blobs").mkdir(parents=True, exist_ok=True)
+    (destination / "blobs").mkdir(parents=True)
+    _export_blobs(jobs, destination, cache, limits, max_workers)
     path = destination / "sdk.json"
     path.write_bytes(payload)
     path.chmod(0o444)
