@@ -1,244 +1,50 @@
 # Buildomatic
 
-This package runs trusted host build actions. It has no Iris dependency and does
-not expose host capabilities to shellsim guests. The ports bridge owns recipe
-translation and publishing; backends own deployment and remote storage.
-
-For Iris, the configured S3 cache owns SDK component archives, port products
-and their small catalog records. The client plans from metadata and returns
-references in `results.json`. Workers fetch components on demand into a
-persistent local cache. No client SDK download is needed to build a port.
-Ordinary local builds keep using the configured `--store` directory:
+Buildomatic runs trusted host builds, isolated from Shellsim guests. Local builds
+use a directory; Iris workers fetch SDK components and dependencies from their
+canonical S3 cache on demand. The client reads metadata, without downloading an SDK.
 
 ```sh
-uv run --no-project python -m ports python/six --store build/ports
+uv run --no-project python -m ports build python/six
+uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 --simple
 ```
 
-An existing Iris service's public connection descriptor selects its workers
-and cache prefix. Bootstrap its SDK, then build complete ports with parallel
-Ninja/make jobs within each worker:
+State defaults to `build/ports`, including `graph.json`, `results.json` and
+`export/catalog.json`. Builds emit individual wheels/providers once. Export reads
+the saved graph; `--simple` adds repository HTML. The catalog installer is a follow-up.
+For another publication store, add `--output <directory-or-cloud-prefix> --copy-assets`;
+only missing assets are copied. Cloud access uses `marin-rigging` bucket settings.
+
+Iris builds use `--backend iris` and `build/ports/service.json`, overridable with
+`--iris-service`. Bootstrap an SDK explicitly before target builds:
 
 ```sh
 uv run --no-project python -m ports.buildomatic.bootstrap \
-  --iris-service service.json --store build/sdk-client --jobs 128 --python
-uv run --no-project python -m ports native/freetype python/pillow \
-  --backend iris --iris-service service.json --store build/port-client \
-  --max-workers 8 --jobs 32
+  --iris-service build/ports/service.json --store build/sdk-client --jobs 128 --python
+uv run --no-project python -m ports build python/pillow --backend iris --jobs 128
 ```
 
-These commands need an environment with Iris installed. `--python` adds
-CPython headers/runtime; `--resolver` separately adds the patched host WASI
-resolver. Bootstrap preserves completed products and retained LLVM Ninja state.
-`--build-key` starts a fresh request after a failed or evicted attempt. Port
-artifact keys exclude worker count, build jobs, host binary hashes and sccache
-configuration. They include recipes, source/patch inputs, relevant build code,
-target SDK products and dependency identities. SDK catalogs likewise track
-producer metadata and code, so changed producer inputs require bootstrap.
-Scheduling, storage orchestration and context record definitions do not affect
-product keys. Changes to actual patch application and build helpers still do.
-
-Fetching and guest checks are explicit, separate workflows:
-
-```sh
-uv run --no-project python -m ports.buildomatic.publish fetch \
-  --results build/port-client/results.json --iris-service service.json \
-  --output build/fetched
-uv run --no-project python -m ports.buildomatic.publish check \
-  --results build/port-client/results.json --iris-service service.json \
-  --output build/checks --cpu 1000000000000 --memory 8589934592
-uv run --no-project python -m ports.buildomatic.publish guest \
-  --output build/checks --cpu 1000000000000 --memory 8589934592
-uv run --no-project python -m ports.buildomatic.publish release \
-  --results build/port-client/results.json --iris-service service.json \
-  --output build/release-client
-uv run --no-project python -m ports.buildomatic.publish accept \
-  --results build/port-client/results.json \
-  --release build/release-client/assets/release/release.json \
-  --output build/python-checks --only scipy
-```
-
-`check` currently supports native probes: it compiles beside the remote
-artifacts and downloads only the probe and its required shared libraries.
-`guest` reruns saved bytes locally, including after a failed budget setting.
-`release` requires an SDK bootstrapped with `--resolver`. It assembles the
-requested guest closure on a worker and downloads runtime/package assets,
-including the patched resolver. Build-only packages stay out of that closure.
-Publication imports pure Python metadata APIs without copying a host execution
-adapter. `accept` runs Python/shell probes locally from that saved release;
-`--only` selects ports and CPU/memory overrides allow guest-only retries.
-The default qualification CPU allowance is one trillion units; adjust it to the
-selected workload while retaining explicit memory and disk bounds.
-The current resolver installation helper uses host Python 3.13.7 or newer.
-Cache outputs have no retention promise; creating a release is explicit.
+Dependency-ready ports run on separate workers; `--jobs` controls compilation
+within a port and `--max-workers` controls port concurrency. Product keys include
+build inputs and dependency identities, excluding host tool hashes and scheduling.
+Bootstrap preserves completed products and LLVM build state. `--build-key` starts
+a fresh request after failure; caches have no retention promise.
 
 Serve a storage prefix locally with `marin-rigging` installed:
 
 ```sh
-uv run python ports/buildomatic/s3_proxy.py \
-  --prefix s3://my-bucket/ports
+uv run python ports/buildomatic/s3_proxy.py --prefix s3://my-bucket/ports
 ```
 
-Rigging supplies cloud settings; editable installs need the Marin working
-directory. HTTP-encoded GCS objects return 501.
+Editable Rigging installs need the Marin working directory. HTTP-encoded GCS
+objects return 501.
 
-Pure-wheel builds fetch no SDK. Other workers fetch just their consumed
-components: native builds need compiler/platform/tooling, Python builds add
-CPython, and resolver builds add Rust/resolver inputs. Installing a release
-does not fetch a compiler. Pure-wheel product keys are independent of the SDK
-selected by another port in the same request.
+Existing guest qualification uses `ports.buildomatic.publish`: `check` compiles
+native probes, `guest` reruns them, and `release`/`accept` assemble and test a cohort.
+That older release format includes the patched WASI uv tool and requires an SDK
+bootstrapped with `--resolver`. New wheel/catalog export does not use that tool.
 
-The worker image uses Ubuntu packages, normal Python environments, Rust and
-sccache. Allocate CPUs to match build jobs; linking has its own smaller
-concurrency limit. One port is a scheduling action; dependency-ready ports run
-on independent workers without wave barriers.
-
-Rust Python ports declare two build-only products: the PIC Rust standard
-library and the isolated Wasm scheduler translator. Workers build them with
-ordinary installed Rust, shared Cargo storage and sccache. Extensions consume
-their canonical references and the cached SDK linker; runtime publication
-omits both host products. See `toolchain/rust-stdlib` and
-`toolchain/wasm-scheduler` for their standalone build paths.
-
-`BuildRequest(idempotency_key, actions, max_workers=1)` admits at most 512 nodes
-and 32 workers. `Action(id, argv, dependencies=(), inputs=(), env=(),
-timeout_seconds=3600, max_attempts=2)` runs argv directly. IDs and mount names are
-single safe path components; a bridge can hash canonical port references. One
-action can run bounded Ninja or make parallelism within a port.
-
-Each `InputMount(name, TreeBundle(digest))` expands under `inputs/<name>` in a
-private workspace. Successful dependencies mount under their action IDs.
-`BUILD_INPUT_<name>` and `BUILD_OUTPUT_DIR` provide absolute paths. The designated
-output directory is `output`; intermediates belong elsewhere in the workspace.
-Worker argv starting with `python` or `python3` resolves to `sys.executable` on
-the worker. The environment inherits installed worker tools and storage/cache
-settings, with private HOME and TMPDIR plus explicit action entries. No shell
-is used unless the trusted argv explicitly selects one.
-
-```python
-from pathlib import Path
-from ports.buildomatic import Action, BuildRequest, Coordinator, LocalStore, WorkerExecutor
-
-store = LocalStore(Path("build-store"))
-worker = WorkerExecutor(store, Path("build-worker"))
-coordinator = Coordinator(store, "request-123", {"local": worker})
-coordinator.submit(BuildRequest("request-123", (Action("example", ("python", "-c", "print('hello')")),)))
-# Call tick repeatedly to reconcile workers and dispatch ready actions.
-result = coordinator.tick()
-```
-
-Tree manifests reference immutable SHA256 chunks of at most 4 MiB. Manifest and
-blob reads have a 32 MiB bound, enforced by stores before allocating beyond that
-bound. Files, directories, executable permission bits and internal relative
-symlinks round trip. Extraction rejects traversal, linked parents, link cycles,
-special files and inconsistent chunk sizes. Capture requires
-a quiescent tree. Failed extraction removes the new destination.
-
-`ResourceLimits(memory_bytes=8*1024**3, cpu_seconds=3600,
-output_bytes=2*1024**3, max_files=100000, log_bytes=8*1024**2)` configures bounds.
-Raise `output_bytes` explicitly for SDKs larger than 2 GiB. It bounds expanded
-tree transport, the total mounted inputs and workspace files excluding inputs.
-Transport does not load entire product or SDK files into memory. Memory and CPU
-rlimits apply per subprocess; disk and log bounds are monitored during execution
-and checked at completion. These are trusted workloads, not hostile programs or
-a container isolation boundary. The local subprocess executor requires Linux.
-
-`Store` supplies `put_blob(data)->digest`, `get_blob(digest)->bytes`,
-`read_journal(key)->VersionedBytes|None` and
-`write_journal(key, data, expected_version)->version`. Blob keys are computed
-once for addressing. Writes use conditional creation; reads trust storage
-transfer integrity and reject oversized data. No artifact byte/digest or full-tree
-verification runs on upload, installation or warm reuse. Journal
-CAS uses opaque backend revisions, with `None` meaning create-if-absent. Even
-identical writes must receive a new revision. Conflicts raise
-`ConditionalWriteError`. A remote store can use native conditional objects.
-
-One journal key owns one accepted request. Identical submissions return its
-identity; conflicting content or keys raise `IdempotencyConflict`. The journal
-stores the accepted request separately from output cache blobs. Opening its
-coordinator claims a new generation, fencing old coordinators with
-`CoordinatorFenced`. A service lease should serialize coordinator ownership.
-`read_build_result(store, journal_key)` reads a bounded typed journal snapshot
-without writing or claiming a generation. It returns `None` only for an absent
-journal and rejects malformed data. `request_id(request)` returns the public
-canonical request identity without accepting or dispatching the request.
-Attempt IDs and assigned workers are durable before dispatch. Worker RPC errors
-retain assignments; they never imply loss. Explicit `UNKNOWN` permits a
-bounded retry, after cancellation tombstones fence delayed dispatch. A worker
-endpoint removed from the mapping remains uncertain until restored.
-
-`Coordinator` accepts 0..32 available workers. An empty pool leaves undispatched
-nodes pending while still applying cancellation and confirmed instance retirement.
-Active assignments remain uncertain until reconciled or explicitly retired;
-replacement admission is not required to process those recovery controls.
-`BuildRequest.max_workers` remains bounded to 1..32.
-
-`Coordinator.worker_lost(worker_id)` fences a confirmed terminal worker instance
-in the journal before bounded retry. Worker IDs must identify immutable lifecycle
-instances; replacements need fresh IDs and endpoint namespaces. The caller must
-verify matching original instance identity, terminal state and a finished
-timestamp. For Iris this means the original `TaskAttempt(task_id, attempt_id)`
-with matching controller-minted `attempt_uid`, terminal state and non-null
-`finished_at`; current-task status, degradation, RPC timeout or a missing UID
-does not suffice. Retired IDs remain excluded across coordinator restart and
-late completions cannot become authoritative. This guarantees journal fencing:
-old private processes may persist under a partition, so it does not promise
-physical exactly-once compilation. Independent actions continue normally.
-
-`Coordinator.knows_worker(worker_id)` checks whether an ID belongs to the current
-worker mapping, historical assignments or retired instances in this request.
-It checks the current journal claim without writes or worker RPCs. Valid unknown
-IDs return false; invalid IDs and stale claims raise. Services can use this query
-to filter global retirement observations before calling `worker_lost`.
-
-`WorkerExecutor` preserves attempts across client restart using a detached
-supervisor, durable launch records, locks and process start identities. A pipe
-gate prevents argv execution until child identity is durable. Lost supervisors
-cause failure after their action group is stopped; the same attempt is never
-executed again. Cancellation kills the action process group. Pending nodes
-become cancelled, failed dependency branches become blocked, and independent
-branches continue after failures. Retries are bounded by `max_attempts`.
-
-Worker RPCs perform bounded durable metadata work. `submit` persists the full
-plan before returning; `poll` reports `RUNNING` while input preparation or output
-sealing is pending. Store I/O and workspace cleanup run outside the shared
-worker lock, so large SDKs/products do not hold RPCs or independent actions.
-One advisory transfer lock owns each attempt's transport. The durable plan,
-prepared marker, supervisor launch intent, terminal status and sealed result
-drive recovery on worker construction and later polls. Preparation can repeat
-after interruption only before launch intent. Interrupted publication reseals
-the completed quiescent output, without rerunning argv. Immutable chunk writes
-are safe to repeat. This requires the same durable worker root and accessible
-store after restart; a permanently lost worker instance uses the coordinator
-loss protocol above.
-
-Cancellation writes its durable tombstone immediately. Transfers check it
-between bounded blob operations before granting execution or result authority;
-an already issued storage operation must return before that transfer can stop.
-Actor-owned threads execute the work, while durable records preserve recovery
-intent if the actor exits. No in-memory future is required for reconciliation.
-Callers must poll to reconcile finished supervisors and receive sealed results.
-
-Completed worker results remain until `Coordinator.acknowledge()` after the
-caller consumes a terminal build result. The accepted journal and final result
-remain for recovery and idempotency. A failed acknowledgement is retried on
-later ticks, including after restart. `WorkerExecutor.read_log(attempt_id,
-max_bytes=16384)` returns a bounded stdout/stderr tail, with a 64 KiB per-read
-cap. Logs remain until acknowledgement and do not affect identity or publishing.
-Worker acknowledgement persists immediately; private workspace/log cleanup is
-asynchronous and resumes after restart. Acknowledged attempts report `UNKNOWN`
-and cannot be dispatched again, even before cleanup completes.
-
-`Coordinator.cleanup_complete()` checks the current journal claim and returns
-true only after request acknowledgement and every attempt's acknowledgement is
-durably confirmed. It performs no writes or worker RPCs and raises
-`CoordinatorFenced` for a stale coordinator. Services can then retire the request
-from active cleanup history; private worker deletion may still be pending.
-
-Output bundles are cache references. Successful execution records do not promise
-release durability, cache retention or a TTL. Retrieving an expired manifest or
-chunk raises `FileNotFoundError`. The caller must
-request a new build rather than treat a missing cached output as published.
-
-Qualification recipe limits accept positive values in the native unsigned 64-bit
-range. CPU, memory and disk allowances are chosen for the workload; the runner
-uses the same integer bounds as the native API. Guest execution meters each allowance.
+The generic action API is `BuildRequest`/`Action` with local and Iris backends.
+Workers mount admitted inputs, run argv, and publish output cache references.
+Request journals retain assignments and fence lost workers across retries;
+acknowledgement cleans private workspaces. See module APIs for protocol details.

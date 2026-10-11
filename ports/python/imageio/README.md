@@ -1,6 +1,6 @@
 # ImageIO 2.37.0
 
-`uv run --no-project python -m ports python/imageio --store target/ports-store --output target/imageio-release`
+`uv run --no-project python -m ports build python/imageio --store target/ports-store --output target/imageio-release`
 selects the canonical graph. The shared pure-wheel helper verifies the pinned
 upstream pure wheel, its metadata, dependencies and member safety, then copies
 it unchanged. The output manifest records the wheel hash. Add that wheel to an

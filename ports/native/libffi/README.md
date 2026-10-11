@@ -7,7 +7,7 @@ The canonical libffi 3.5.2 builder combines upstream common code with the pinned
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/libffi --store /path/to/ports-store \
+  python -m ports build native/libffi --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

@@ -6,7 +6,7 @@ Build an optimized host executable from the pinned upstream tag and patch:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports toolchain/uv --store /path/to/ports-store
+  python -m ports build toolchain/uv --store /path/to/ports-store
 ```
 
 The builder uses upstream uv's optimized `release` profile, the recipe's Rust

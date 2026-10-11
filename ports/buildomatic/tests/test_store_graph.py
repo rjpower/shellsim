@@ -37,6 +37,14 @@ class CatalogBackend:
         self.uploads.extend(bundles)
 
 
+def cached_product(reference, key):
+    return {
+        "reference": reference,
+        "artifact": {"id": reference},
+        "delivery": {"reference": reference, "build_key": key, "wheels": [], "native": []},
+    }
+
+
 def test_transitive_inputs_and_partial_retry_keep_product_keys(tmp_path):
     ports = tmp_path / "ports"
     for name, dependencies in (("base", []), ("provider", ["base"]), ("consumer", ["provider"])):
@@ -57,7 +65,7 @@ def test_transitive_inputs_and_partial_retry_keep_product_keys(tmp_path):
     assert set(specification["predecessors"]) == {port.reference for port in graph.ports[:2]}
 
     base = graph.ports[0].reference
-    register(backend.store, "port/" + keys[base], {"artifact": {"id": "base"}})
+    register(backend.store, "port/" + keys[base], cached_product(base, keys[base]))
     _, partial, results, partial_keys = prepare(*args, 32, 4)
     assert partial_keys == keys
     assert base in results
@@ -74,7 +82,7 @@ def test_empty_client_hit_uses_only_catalog_metadata(tmp_path, monkeypatch):
     local = LocalStore(tmp_path / "first-client")
     args = ports, ["python/example"], None, local, backend, "s3://bucket/cache", tmp_path
     _, _, _, keys = prepare(*args, 16, 1)
-    reference = {"artifact": {"id": "stored-product"}}
+    reference = cached_product("python/example/recipe.json", next(iter(keys.values())))
     register(backend.store, "port/" + next(iter(keys.values())), reference)
     backend.uploads.clear()
 
@@ -134,7 +142,7 @@ def test_saved_roots_keep_build_only_wheels_out_of_guest_release(tmp_path, monke
         8,
     )
     for reference, key in keys.items():
-        register(backend.store, "port/" + key, {"reference": reference, "artifact": {"id": reference}})
+        register(backend.store, "port/" + key, cached_product(reference, key))
     descriptor = tmp_path / "service.json"
     descriptor.write_text(
         json.dumps(
@@ -193,3 +201,26 @@ def test_pure_product_key_does_not_depend_on_incidental_sdk(tmp_path, monkeypatc
     extract_tree(mixed.actions[0].inputs[1].bundle, local, node)
     assert json.loads((node / "node.json").read_text())["sdk"] is None
     assert standalone.actions[0].id == mixed.actions[0].id
+
+
+def test_legacy_product_backfills_assets_without_sdk_or_dependencies(tmp_path):
+    import json
+
+    ports = tmp_path / "ports"
+    _wheel_port(ports, tmp_path / "sources", "example", [])
+    local = LocalStore(tmp_path / "transport")
+    backend = CatalogBackend(LocalStore(tmp_path / "canonical"))
+    args = ports, ["python/example"], None, local, backend, "s3://bucket/cache", tmp_path
+    _, _, _, keys = prepare(*args, 32, 8)
+    reference = next(iter(keys))
+    existing = {"reference": reference, "artifact": {"id": "legacy-product"}}
+    register(backend.store, "port/" + keys[reference], existing)
+    _, request, _, retry_keys = prepare(*args, 128, 8)
+    assert retry_keys == keys
+    assert len(request.actions) == 1
+    action = request.actions[0]
+    assert action.id.startswith("delivery-") and action.dependencies == ()
+    node = tmp_path / "legacy-node"
+    extract_tree(action.inputs[1].bundle, local, node)
+    specification = json.loads((node / "node.json").read_text())
+    assert specification["sdk"] is None and specification["existing"] == existing

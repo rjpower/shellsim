@@ -26,7 +26,7 @@ class RejectCloud(importlib.abc.MetaPathFinder):
         if fullname.split('.')[0] in {'iris', 'rigging', 'cw'}:
             raise AssertionError(fullname)
 sys.meta_path.insert(0, RejectCloud())
-sys.argv = ['ports', '--help']
+sys.argv = ['ports', 'build', '--help']
 runpy.run_module('ports', run_name='__main__')
 """
     result = subprocess.run([sys.executable, "-c", script], text=True, capture_output=True, check=True)

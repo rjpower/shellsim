@@ -22,6 +22,7 @@ from ports._support.store import file_hash, identity
 from ports.api import implementation
 from ports.buildomatic import Action, BuildRequest, BuildState, InputMount, LocalStore, capture_tree
 from ports.buildomatic.artifacts import write_reference
+from ports.buildomatic.delivery import delivery_graph
 from ports.buildomatic.ports import PRODUCT_SYSTEMS, _stage_code, code_files
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 
@@ -150,9 +151,14 @@ def prepare(
         )
 
         for port in graph.ports:
-            if port.recipe["build_system"] in PRODUCT_SYSTEMS or port.reference in results:
+            if port.recipe["build_system"] in PRODUCT_SYSTEMS:
                 continue
-            action_id = "port-" + hashlib.sha256(port.reference.encode()).hexdigest()
+            existing = results.get(port.reference)
+            if existing is not None and ("delivery" in existing or port.role in {"host-tool", "target-platform"}):
+                continue
+            action_id = ("delivery-" if existing is not None else "port-") + hashlib.sha256(
+                port.reference.encode()
+            ).hexdigest()
             action_ids[port.reference] = action_id
             predecessors = {}
             # The ordinary driver walks the whole transitive graph. Supply
@@ -177,7 +183,9 @@ def prepare(
                 recipe / "node.json",
                 {
                     "reference": port.reference,
-                    "sdk": consumer_sdk(
+                    "sdk": None
+                    if existing is not None
+                    else consumer_sdk(
                         sdk, Graph((port.reference,), tuple(selected[name] for name in closure | {port.reference}))
                     ),
                     "sdk_name": sdk_name,
@@ -185,6 +193,7 @@ def prepare(
                     "jobs": jobs,
                     "build_key": keys[port.reference],
                     "predecessors": predecessors,
+                    **({"existing": existing} if existing is not None else {}),
                 },
             )
             recipe_bundle = capture_tree(recipe, local)
@@ -193,7 +202,9 @@ def prepare(
                 Action(
                     action_id,
                     ("python", "-m", "ports.buildomatic.store_worker"),
-                    dependencies=tuple(value["action_id"] for value in predecessors.values() if "action_id" in value),
+                    dependencies=()
+                    if existing is not None
+                    else tuple(value["action_id"] for value in predecessors.values() if "action_id" in value),
                     inputs=(InputMount("code", code_bundle), InputMount("recipe", recipe_bundle)),
                     env=(("PYTHONPATH", "inputs/code"),),
                     timeout_seconds=port_timeout,
@@ -270,8 +281,11 @@ def run(
             build_key=build_key,
             port_timeout=port_timeout,
         )
+        actions = request.actions if request else ()
+        backfills = sum(action.id.startswith("delivery-") for action in actions)
         print(
-            f"buildomatic: product cache: {len(results)} hits, {len(request.actions) if request else 0} builds",
+            f"buildomatic: product cache: {len(results)} hits, "
+            f"{len(actions) - backfills} builds, {backfills} asset backfills",
             flush=True,
         )
         if request is not None:
@@ -290,7 +304,14 @@ def run(
                     {
                         port.reference: keys[port.reference]
                         for port in graph.ports
-                        if port.recipe["build_system"] not in PRODUCT_SYSTEMS and port.reference not in results
+                        if port.recipe["build_system"] not in PRODUCT_SYSTEMS
+                        and (
+                            port.reference not in results
+                            or (
+                                "delivery" not in results[port.reference]
+                                and port.role not in {"host-tool", "target-platform"}
+                            )
+                        )
                     },
                 )
             )
@@ -300,4 +321,5 @@ def run(
         scratch / "results.json",
         {"roots": graph.roots, "sdk": sdk, "sdk_name": sdk_name, "products": results, "prefix": prefix},
     )
+    write_reference(scratch / "graph.json", delivery_graph(graph, results, abi=sdk["dynamic_abi"] if sdk else None))
     return result

@@ -7,7 +7,7 @@ GNU make 4.4.1 builds through the shared configure/make helper. Python-owned cro
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/make --store /path/to/ports-store \
+  python -m ports build native/make --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

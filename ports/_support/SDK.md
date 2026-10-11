@@ -78,7 +78,7 @@ Run the resulting graph with the ordinary command:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/freetype \
+  python -m ports build native/freetype \
   python/kiwisolver --store /path/to/ports-store \
   --output /path/to/release --check
 ```

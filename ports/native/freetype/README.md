@@ -7,7 +7,7 @@ FreeType 2.13.3 builds through upstream Meson as a shared provider. The canonica
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/freetype --store /path/to/ports-store \
+  python -m ports build native/freetype --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

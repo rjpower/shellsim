@@ -9,6 +9,7 @@ from pathlib import Path
 from ports._support.native_adapters import CompilerCacheLauncher
 from ports._support.runner import build_graph
 from ports.buildomatic.artifacts import install, register, upload, write_reference
+from ports.buildomatic.delivery import DeliveryStore, publish_product
 from ports.buildomatic.remote_store import RemoteStore
 from ports.buildomatic.sdk_artifacts import load_sdk
 
@@ -17,6 +18,20 @@ def main() -> None:
     specification = json.loads((Path(os.environ["BUILD_INPUT_recipe"]) / "node.json").read_text())
     store = RemoteStore(specification["prefix"])
     cache = Path("/app/.buildomatic/artifacts")
+    from ports._support.graph import plan
+
+    port = plan(
+        Path(__file__).resolve().parents[1], [specification["reference"]], default_sdk=specification["sdk_name"]
+    ).ports[-1]
+    if "existing" in specification:
+        result = specification["existing"]
+        root = install(store, result["artifact"], cache)
+        result["delivery"] = publish_product(
+            port, root, specification["build_key"], DeliveryStore(specification["prefix"])
+        )
+        register(store, "port/" + specification["build_key"], result)
+        write_reference(Path(os.environ["BUILD_OUTPUT_DIR"]) / "result.json", result)
+        return
     sdk = load_sdk(store, specification["sdk"], cache) if specification["sdk"] else None
     work = Path("/app/.buildomatic/ports")
     work.mkdir(parents=True, exist_ok=True)
@@ -50,6 +65,7 @@ def main() -> None:
         "reference": specification["reference"],
         "build_key": specification["build_key"],
         "artifact": upload(store, root, work / "archives"),
+        "delivery": publish_product(port, root, specification["build_key"], DeliveryStore(specification["prefix"])),
     }
     register(store, "port/" + specification["build_key"], result)
     write_reference(Path(os.environ["BUILD_OUTPUT_DIR"]) / "result.json", result)

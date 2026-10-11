@@ -248,6 +248,7 @@ def test_cli_worker_count_preflight_precedes_graph_and_sdk_setup(tmp_path, monke
     monkeypatch.setattr(portable, "import_sdk", spy("import", context))
     monkeypatch.setattr(runner, "build_graph", execute)
     monkeypatch.setattr(bridge, "run_graph", execute)
+    monkeypatch.setattr("ports.buildomatic.delivery.save_local_graph", lambda *args: None)
 
     def execute_from_store(*args, **kwargs):
         calls.append("execute")

@@ -7,7 +7,7 @@ libjpeg-turbo 2.1.5.1 builds through upstream CMake with SIMD disabled for the W
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/libjpeg-turbo --store /path/to/ports-store \
+  python -m ports build native/libjpeg-turbo --store /path/to/ports-store \
   --output /path/to/release --check
 ```
 

@@ -4,13 +4,25 @@ Ports build pinned upstream packages for Shellsim's virtual WASI environment.
 Trusted host builders consume admitted SDK products and exact dependency artifacts.
 Guest programs use Shellsim's filesystem, processes, clock, entropy and resource limits.
 
+## Export wheels and metadata
+
+```sh
+uv run --no-project python -m ports build python/six
+uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 --simple
+```
+
+State defaults to `build/ports`. Builds retain individual assets; export writes
+JSON and optional HTML from `graph.json`. Add `--output <store> --copy-assets` to
+promote only missing assets. See [Buildomatic](buildomatic/README.md) for Iris
+and the storage proxy. The catalog installer remains a follow-up.
+
 ## Build and check a graph
 
 From the repository root with Shellsim installed:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports native/freetype python/kiwisolver \
+  python -m ports build native/freetype python/kiwisolver \
   --store /path/to/ports-store --output /path/to/release --check
 ```
 
@@ -33,7 +45,7 @@ generic action protocol as remote workers, with isolated local worker processes:
 
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
-  python -m ports python/packaging --backend buildomatic \
+  python -m ports build python/packaging --backend buildomatic \
   --store /path/to/ports-store --offline
 ```
 
