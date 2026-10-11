@@ -1,0 +1,66 @@
+--- a/nltk/pathsec.py
++++ b/nltk/pathsec.py
+@@ -499,14 +499,15 @@
+
+-class _SafeHTTPSConnection(http.client.HTTPSConnection):
+-    """HTTPS variant of :class:`_SafeHTTPConnection`.
+-
+-    Connects to a validated, pinned IP but keeps SNI / certificate verification
+-    against the original hostname.
+-    """
+-
+-    def connect(self):
+-        sock = _pinned_connection(
+-            self.host, self.port, self.timeout, self.source_address
+-        )
+-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
++if sys.platform != "wasi":
++    class _SafeHTTPSConnection(http.client.HTTPSConnection):
++        """HTTPS variant of :class:`_SafeHTTPConnection`.
++
++        Connects to a validated, pinned IP but keeps SNI / certificate verification
++        against the original hostname.
++        """
++
++        def connect(self):
++            sock = _pinned_connection(
++                self.host, self.port, self.timeout, self.source_address
++            )
++            self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+@@ -518,10 +519,11 @@
+
+-class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
+-    def https_open(self, req):
+-        kwargs = {}
+-        if getattr(self, "_context", None) is not None:
+-            kwargs["context"] = self._context
+-        if getattr(self, "_check_hostname", None) is not None:
+-            kwargs["check_hostname"] = self._check_hostname
+-        return self.do_open(_SafeHTTPSConnection, req, **kwargs)
++if sys.platform != "wasi":
++    class _SafeHTTPSHandler(urllib.request.HTTPSHandler):
++        def https_open(self, req):
++            kwargs = {}
++            if getattr(self, "_context", None) is not None:
++                kwargs["context"] = self._context
++            if getattr(self, "_check_hostname", None) is not None:
++                kwargs["check_hostname"] = self._check_hostname
++            return self.do_open(_SafeHTTPSConnection, req, **kwargs)
+
+@@ -569,2 +571,4 @@
+     """
++    if sys.platform == "wasi":
++        raise NotImplementedError("network downloads are unavailable on WASI")
+     url_str = url.full_url if hasattr(url, "full_url") else str(url)
+--- a/nltk/corpus/reader/panlex_lite.py
++++ b/nltk/corpus/reader/panlex_lite.py
+@@ -14,3 +14,2 @@
+ import os
+-import sqlite3
+
+@@ -45,2 +44,4 @@
+     def __init__(self, root):
++        import sqlite3
++
+         from nltk.pathsec import validate_path

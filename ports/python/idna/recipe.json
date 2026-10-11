@@ -1,0 +1,33 @@
+{
+  "name": "idna",
+  "version": "3.20",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/58/a2/bb081bab032533a855d44de1d56f8e8426114ff1ba5d1f07a438a0a654f8/idna-3.20-py3-none-any.whl",
+    "sha256": "ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c",
+    "filename": "idna-3.20-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "ruff >= 0.16.0 ; extra == \"all\"",
+    "mypy >= 1.11.2 ; extra == \"all\"",
+    "ty >= 0.0.37 ; extra == \"all\"",
+    "pytest >= 8.3.2 ; extra == \"all\"",
+    "hypothesis >= 6.141.1 ; extra == \"all\"",
+    "coverage >= 7.10.0 ; extra == \"all\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

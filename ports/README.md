@@ -21,6 +21,12 @@ Failed work remains available for diagnosis. This command creates local release 
 
 ## Buildomatic cache builds
 
+For store-backed Iris builds, use `--backend iris --iris-service service.json`.
+The service's S3 cache supplies SDK components and dependency products on demand;
+the client returns product references. Parallelism spans ports and each port's
+Ninja/make jobs. Publish and guest acceptance are separate commands described in
+[Buildomatic](buildomatic/README.md).
+
 The default `--backend local` keeps the existing build, release and acceptance
 workflow and imports no Iris dependencies. `--backend buildomatic` uses the same
 generic action protocol as remote workers, with isolated local worker processes:

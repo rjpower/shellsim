@@ -1,0 +1,57 @@
+{
+  "name": "tqdm",
+  "version": "4.70.1",
+  "role": "target-library",
+  "kind": "pure-python-sdist",
+  "build_system": "python-pep517",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/0d/ea/b2a5bd54b28a324dae8211928b2d730b6547500342c7e6c6dea08bd0a485/tqdm-4.70.1.tar.gz",
+    "filename": "tqdm-4.70.1.tar.gz",
+    "sha256": "cefd0eca11b2a37a3aee776544d4f4ae913f02688135b5556b8788dfa474afc4",
+    "subdirectory": "tqdm-4.70.1"
+  },
+  "requires_python": ">=3.8",
+  "requires_dist": [
+    "colorama; platform_system == \"Windows\"",
+    "requests; extra == \"discord\"",
+    "envwrap; extra == \"discord\"",
+    "slack-sdk; extra == \"slack\"",
+    "envwrap; extra == \"slack\"",
+    "requests; extra == \"telegram\"",
+    "envwrap; extra == \"telegram\"",
+    "ipywidgets>=6; extra == \"notebook\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "sdk": "default",
+  "patches": [
+    {
+      "file": "wasi-monitor.patch",
+      "sha256": "36c1ea066fdca8fdd13992fbb538bf08a71f0c0619314ba112780764a4032ac9"
+    }
+  ],
+  "build_dependencies": [
+    {
+      "port": "python/setuptools",
+      "version": "84.0.0"
+    },
+    {
+      "port": "python/setuptools-scm",
+      "version": "8.3.1"
+    },
+    {
+      "port": "python/packaging",
+      "version": "26.3"
+    }
+  ]
+}

@@ -153,7 +153,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--release", type=Path, help="saved release descriptor for Python/shell acceptance")
     parser.add_argument("--only", nargs="+", help="run acceptance only for these guest port names")
-    parser.add_argument("--cpu", type=int, default=100_000_000_000)
+    parser.add_argument("--cpu", type=int, default=1_000_000_000_000)
     parser.add_argument("--memory", type=int, default=8 * 1024**3)
     args = parser.parse_args()
     if args.only and args.command != "accept":

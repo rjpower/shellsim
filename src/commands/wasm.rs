@@ -1191,7 +1191,7 @@ fn fd_close(mut caller: Caller<'_, Host>, fd: u32) -> i32 {
 }
 
 fn fd_seek(mut caller: Caller<'_, Host>, fd: u32, delta: i64, whence: u32, result: u32) -> i32 {
-    if let Err(error) = guest_file(&mut caller, fd as i32) {
+    if let Err(error) = guest_descriptor(&mut caller, fd as i32) {
         return error;
     }
     let position = match ActiveSystem::new(&mut caller.data_mut().machine.get())
@@ -1207,11 +1207,14 @@ fn fd_seek(mut caller: Caller<'_, Host>, fd: u32, delta: i64, whence: u32, resul
 }
 
 fn fd_tell(mut caller: Caller<'_, Host>, fd: u32, result: u32) -> i32 {
-    let file = match guest_file(&mut caller, fd as i32) {
-        Ok(file) => file,
-        Err(error) => return error,
-    };
-    let position = file.cursor;
+    if let Err(error) = guest_descriptor(&mut caller, fd as i32) {
+        return error;
+    }
+    let position =
+        match ActiveSystem::new(&mut caller.data_mut().machine.get()).seek(fd as i32, 0, 1) {
+            Ok(position) => position,
+            Err(error) => return syscall_errno(&error),
+        };
     if write_u64(&mut caller, result, position) {
         ERRNO_SUCCESS
     } else {
