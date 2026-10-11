@@ -1,0 +1,33 @@
+{
+  "name": "mock",
+  "version": "5.2.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/bd/d9/617e6af809bf3a1d468e0d58c3997b1dc219a9a9202e650d30c2fc85d481/mock-5.2.0-py3-none-any.whl",
+    "sha256": "7ba87f72ca0e915175596069dbbcc7c75af7b5e9b9bc107ad6349ede0819982f",
+    "filename": "mock-5.2.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.6",
+  "requires_dist": [
+    "sphinx; extra == \"docs\"",
+    "pytest; extra == \"test\"",
+    "pytest-cov; extra == \"test\"",
+    "twine; extra == \"build\"",
+    "wheel; extra == \"build\"",
+    "blurb; extra == \"build\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "name": "soupsieve",
+  "version": "3.0.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/3a/cd/8092ac4e9009b4a480ba212f5cdfd26dabfc97990b176bbc70c7662d6f05/soupsieve-3.0.1-py3-none-any.whl",
+    "sha256": "dd1d6bd1ba7cd39866edd704321c11b4df5e7ae98620174a9071a9af3a9c05cd",
+    "filename": "soupsieve-3.0.1-py3-none-any.whl"
+  },
+  "requires_python": ">=3.11",
+  "requires_dist": [],
+  "runtime_dependencies": [],
+  "tests": [],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

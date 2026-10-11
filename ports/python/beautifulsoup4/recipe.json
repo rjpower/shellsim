@@ -1,0 +1,43 @@
+{
+  "name": "beautifulsoup4",
+  "version": "4.15.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/88/c6/92fcd42f1ba33e1184263f25bfabf3d27c383410470f169e4b8163bf9c17/beautifulsoup4-4.15.0-py3-none-any.whl",
+    "sha256": "d6f88de62e1d4e38ecb1077eb9724cd0eff29d2a08ca16a401e9b9e93f117cf9",
+    "filename": "beautifulsoup4-4.15.0-py3-none-any.whl"
+  },
+  "requires_python": ">=3.7.0",
+  "requires_dist": [
+    "soupsieve>=1.6.1",
+    "typing-extensions>=4.0.0",
+    "cchardet; extra == 'cchardet'",
+    "chardet; extra == 'chardet'",
+    "charset-normalizer; extra == 'charset-normalizer'",
+    "html5lib; extra == 'html5lib'",
+    "lxml; extra == 'lxml'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/soupsieve",
+      "version": "3.0.1"
+    },
+    {
+      "port": "python/typing-extensions",
+      "version": "4.16.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

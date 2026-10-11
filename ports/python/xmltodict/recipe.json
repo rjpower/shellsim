@@ -1,0 +1,29 @@
+{
+  "name": "xmltodict",
+  "version": "1.0.4",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/38/34/98a2f52245f4d47be93b580dae5f9861ef58977d73a79eb47c58f1ad1f3a/xmltodict-1.0.4-py3-none-any.whl",
+    "sha256": "a4a00d300b0e1c59fc2bfccb53d7b2e88c32f200df138a0dd2229f842497026a",
+    "filename": "xmltodict-1.0.4-py3-none-any.whl"
+  },
+  "requires_python": ">=3.9",
+  "requires_dist": [
+    "pytest; extra == \"test\"",
+    "pytest-cov; extra == \"test\""
+  ],
+  "runtime_dependencies": [],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}

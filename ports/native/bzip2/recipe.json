@@ -1,0 +1,39 @@
+{
+  "name": "bzip2",
+  "version": "1.0.8",
+  "role": "target-library",
+  "kind": "native-library",
+  "linkage": "shared",
+  "soname": "libbz2.so",
+  "sdk": "default",
+  "build_system": "cmake",
+  "source": {
+    "url": "https://sourceware.org/pub/bzip2/bzip2-1.0.8.tar.gz",
+    "sha256": "ab5a03176ee106d3f0fa90e381da478ddae405918153cca248e682cd0c4a2269",
+    "subdirectory": "bzip2-1.0.8"
+  },
+  "target_dependencies": [],
+  "exports": {
+    "shared_libraries": [
+      "lib/libbz2.so"
+    ],
+    "archives": [
+      "lib/libbz2.a"
+    ],
+    "licenses": [
+      "licenses/bzip2.txt"
+    ]
+  },
+  "export_directories": {
+    "headers": [
+      "include"
+    ]
+  },
+  "needed_libraries": [],
+  "source_exports": [
+    {
+      "source": "LICENSE",
+      "destination": "licenses/bzip2.txt"
+    }
+  ]
+}

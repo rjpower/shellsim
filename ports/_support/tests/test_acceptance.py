@@ -45,6 +45,23 @@ def test_acceptance_rejects_invalid_resource_budgets_before_release_fetch(tmp_pa
     assert not output.exists()
 
 
+@pytest.mark.parametrize("extras", ["pandas", [None], [""], ["pandas; sys_platform=='linux'"], ["pandas", "pandas"]])
+def test_acceptance_rejects_invalid_extras_before_release_fetch(tmp_path, extras):
+    port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
+    port = dataclasses.replace(port, recipe={**port.recipe, "test_extras": extras})
+    output = tmp_path / "proof"
+    with pytest.raises(ValueError, match="test_extras"):
+        accept_port(AcceptanceRequest(port, tmp_path / "missing-release.json", output, "pypi"))
+    assert not output.exists()
+
+
+def test_acceptance_rejects_python_extras_for_native_selection(tmp_path):
+    port = _port(tmp_path, [{"kind": "python", "script": "probe.py"}])
+    port = dataclasses.replace(port, recipe={**port.recipe, "test_extras": ["pandas"]})
+    with pytest.raises(ValueError, match="Python package selection"):
+        accept_port(AcceptanceRequest(port, tmp_path / "missing-release.json", tmp_path / "proof", "native"))
+
+
 def test_acceptance_rejects_test_kind_mismatch_before_release_fetch(tmp_path: Path) -> None:
     descriptor = tmp_path / "release.json"
     descriptor.write_text("{}")

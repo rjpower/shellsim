@@ -221,6 +221,7 @@ _VARIANT_FIELDS = frozenset(
         "install",
         "tests",
         "test_limits",
+        "test_extras",
         "needed_libraries",
         "linkage",
         "soname",

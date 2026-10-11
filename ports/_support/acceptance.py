@@ -85,6 +85,22 @@ def _test_limits(recipe: dict) -> Limits | None:
     return Limits(**values)
 
 
+def _test_extras(recipe: dict) -> list[str]:
+    """Select upstream optional features exercised by this port's probes."""
+    extras = recipe.get("test_extras", [])
+    if (
+        not isinstance(extras, list)
+        or len(extras) > 32
+        or any(
+            not isinstance(extra, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", extra)
+            for extra in extras
+        )
+        or len(set(extras)) != len(extras)
+    ):
+        raise ValueError("test_extras must contain distinct Python extra names")
+    return extras
+
+
 def _bounded_digest(path: Path, limit: int) -> str:
     digest = hashlib.sha256()
     size = 0
@@ -248,6 +264,9 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         raise ValueError("port needs between one and 32 declared acceptance probes")
     if request.install_kind not in {"pypi", "native", "pypi+native"}:
         raise ValueError("acceptance installation kind is invalid")
+    extras = _test_extras(request.port.recipe)
+    if extras and request.install_kind == "native":
+        raise ValueError("test_extras requires a Python package selection")
     limits = _test_limits(request.port.recipe)
     if request.limits is not None:
         limits = request.limits
@@ -318,6 +337,10 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
 
     name = request.port.name if request.install_kind == "pypi" else installation(request.port)[0]
     spec = f"{name}=={request.port.version}"
+    python_name = request.port.name + ("[" + ",".join(extras) + "]" if extras else "")
+    python_spec = f"{python_name}=={request.port.version}"
+    if request.install_kind == "pypi":
+        spec = python_spec
     results = []
     with tempfile.TemporaryDirectory(prefix=".release-cache-", dir=request.output) as cache_dir:
         for index, (
@@ -363,7 +386,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                     raise ValueError("native acceptance compiler did not produce bounded core Wasm")
             setup = {"pypi" if request.install_kind == "pypi" else "tools": [spec]}
             if request.install_kind == "pypi+native":
-                setup["pypi"] = [f"{request.port.name}=={request.port.version}"]
+                setup["pypi"] = [python_spec]
             kwargs = {"limits": limits} if limits is not None else {}
             env = Environment.from_release(descriptor, cache_dir=Path(cache_dir), **setup, **kwargs)
             guest_path = "/work/shellsim-acceptance" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[kind]
@@ -404,6 +427,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
                 "install_kind": request.install_kind,
                 "sdk_context": request.sdk_context.identity if request.sdk_context is not None else None,
                 "test_limits": dataclasses.asdict(limits) if limits is not None else None,
+                "test_extras": extras,
                 "results": [dataclasses.asdict(item) for item in results],
             },
             sort_keys=True,

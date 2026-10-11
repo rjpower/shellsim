@@ -1,0 +1,49 @@
+{
+  "name": "importlib-metadata",
+  "version": "9.0.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/b3/55/ecca97ae19075f1fac62def77731e7f535e6c1fb8f92ff08160c5e6dade8/importlib_metadata-9.0.1-py3-none-any.whl",
+    "sha256": "bba5600596a7e21f3eef53281cf28d6a5195634d2f2b78ff9501a3272c6eaab0",
+    "filename": "importlib_metadata-9.0.1-py3-none-any.whl"
+  },
+  "requires_python": ">=3.10",
+  "requires_dist": [
+    "zipp>=3.20",
+    "pytest!=8.1.*,>=6; extra == \"test\"",
+    "packaging; extra == \"test\"",
+    "pyfakefs; extra == \"test\"",
+    "pytest-perf>=0.17; extra == \"test\"",
+    "sphinx>=3.5; extra == \"doc\"",
+    "jaraco.packaging>=9.3; extra == \"doc\"",
+    "rst.linker>=1.9; extra == \"doc\"",
+    "furo; extra == \"doc\"",
+    "sphinx-lint; extra == \"doc\"",
+    "jaraco.tidelift>=1.4; extra == \"doc\"",
+    "ipython; extra == \"perf\"",
+    "pytest-checkdocs>=2.14; extra == \"check\"",
+    "pytest-ruff>=0.2.1; sys_platform != \"cygwin\" and extra == \"check\"",
+    "pytest-cov; extra == \"cover\"",
+    "pytest-enabler>=3.4; extra == \"enabler\"",
+    "pytest-mypy>=1.0.1; platform_python_implementation != \"PyPy\" and extra == \"type\""
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/zipp",
+      "version": "4.1.1"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  }
+}
