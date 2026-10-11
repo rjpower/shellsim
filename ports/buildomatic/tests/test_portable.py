@@ -99,7 +99,7 @@ def sdk_fixture(tmp_path, monkeypatch):
     native = write(tmp_path / "host-native", "sh", b"native-tool", 0o755)
     hosts = {"sh": {"path": str(native), "sha256": file_hash(native), "receipt": None}}
 
-    def create(python=False, host_python=False, host_aliases=None):
+    def create(python=False, host_python=False, host_aliases=None, shared_python=False):
         cpython = runtime = None
         if python:
             root = tmp_path / "original-cpython"
@@ -122,9 +122,12 @@ def sdk_fixture(tmp_path, monkeypatch):
                 },
             }
             cpython = proof(root, manifest)
-            runtime_root = tmp_path / "original-runtime"
-            shutil.copytree(root / "rootfs", runtime_root / "rootfs")
-            runtime = proof(runtime_root, manifest)
+            if shared_python:
+                runtime = cpython
+            else:
+                runtime_root = tmp_path / "original-runtime"
+                shutil.copytree(root / "rootfs", runtime_root / "rootfs")
+                runtime = proof(runtime_root, manifest)
             write(root, "Python-3.13.7/Modules/unrelated.c", b"excluded source")
             write(root, "wasi-build/unrelated.o", b"excluded build work")
         if host_python:
@@ -389,6 +392,140 @@ def test_original_product_bindings_restore_missing_roots_without_build_work(tmp_
     assert imported.python.generated_config_dir == context.python.generated_config_dir
     assert not (context.cpython_manifest.root / "wasi-build/unrelated.o").exists()
     assert not (tmp_path / "unused").exists()
+
+
+@pytest.fixture
+def shared_python_export(tmp_path, sdk_fixture):
+    context = sdk_fixture(python=True, shared_python=True)
+    assert context.cpython_manifest is context.runtime
+    receipt_bytes = context.runtime.path.read_bytes()
+    descriptor = export_sdk(context, tmp_path / "export")
+    for root in {product.root for product in (context.sdk, context.llvm, context.sysroot, context.runtime)}:
+        shutil.rmtree(root)
+    return context, descriptor, receipt_bytes
+
+
+@pytest.mark.parametrize("binding", ["explicit", "original", "relocated"])
+def test_shared_python_receipt_restores_exact_products(tmp_path, shared_python_export, monkeypatch, binding):
+    context, descriptor, receipt_bytes = shared_python_export
+    mkdir = Path.mkdir
+    created = []
+
+    def record_mkdir(path, *args, **kwargs):
+        created.append(path)
+        return mkdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "mkdir", record_mkdir)
+    options = {"bindings": original_root_bindings(descriptor)} if binding == "explicit" else {}
+    if binding == "original":
+        options["original_bindings"] = True
+    imported = import_sdk(descriptor, tmp_path / "fresh", **options)
+    assert imported.identity == context.identity
+    assert imported.host_tools == context.host_tools
+    assert imported.cpython_manifest.path.read_bytes() == receipt_bytes
+    assert imported.runtime.path.read_bytes() == receipt_bytes
+    assert imported.cpython_manifest.sha256 == imported.runtime.sha256 == context.runtime.sha256
+    if binding == "relocated":
+        assert imported.cpython_manifest.root == tmp_path / "fresh/cpython"
+        assert imported.runtime.root == tmp_path / "fresh/runtime"
+    else:
+        assert created.count(context.runtime.root) == 1
+        assert imported.cpython_manifest == imported.runtime == context.runtime
+        assert imported.flags == context.flags
+        assert imported.python == context.python
+        assert imported.sdk.root == context.sdk.root
+        assert imported.llvm.root == context.llvm.root
+        assert imported.sysroot.root == context.sysroot.root
+        assert not (tmp_path / "fresh").exists()
+        assert not (context.runtime.root / "wasi-build/unrelated.o").exists()
+        # Reusing the restored shared root still admits both roles unchanged.
+        assert import_sdk(descriptor, tmp_path / "unused", **options).identity == context.identity
+
+
+def test_shared_inventory_restores_compatible_alias_once(tmp_path, shared_python_export):
+    context, descriptor, _receipt_bytes = shared_python_export
+    value = load(descriptor)
+    for role in ("cpython", "runtime"):
+        value["roots"][role]["symlinks"]["python-alias"] = "rootfs/usr/bin/python3.wasm"
+    rewrite(descriptor, value)
+    imported = import_sdk(descriptor, tmp_path / "unused", bindings=original_root_bindings(descriptor))
+    assert imported.cpython_manifest == imported.runtime == context.runtime
+    assert os.readlink(context.runtime.root / "python-alias") == "rootfs/usr/bin/python3.wasm"
+    assert (context.runtime.root / "python-alias").read_bytes() == b"guest Python"
+
+
+@pytest.fixture
+def reject_mount_writes(monkeypatch):
+    def reject(*_args, **_kwargs):
+        pytest.fail("rejected shared roots must not mutate any mount")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(Path, "mkdir", reject)
+        guarded.setattr(Path, "chmod", reject)
+        guarded.setattr(Path, "symlink_to", reject)
+        guarded.setattr("ports.buildomatic.portable._stream", reject)
+        yield
+
+
+@pytest.mark.parametrize("kind", ["bytes", "size", "file-mode", "directory-mode", "alias", "entry-kind"])
+def test_shared_inventory_conflicts_fail_before_writes(tmp_path, shared_python_export, request, kind):
+    _context, descriptor, _receipt_bytes = shared_python_export
+    value = load(descriptor)
+    left, right = (value["roots"][role] for role in ("cpython", "runtime"))
+    name = "rootfs/usr/bin/python3.wasm"
+    if kind == "bytes":
+        right["files"][name] = dict(right["files"]["rootfs/usr/lib/python3.13/_sysconfigdata.py"])
+    elif kind == "size":
+        right["files"][name]["size"] += 1
+    elif kind == "file-mode":
+        right["files"][name]["mode"] ^= 0o100
+    elif kind == "directory-mode":
+        right["directories"]["rootfs"] ^= 0o100
+    elif kind == "alias":
+        left["symlinks"]["python-alias"] = name
+        right["symlinks"]["python-alias"] = "rootfs/usr/lib/python3.13/_sysconfigdata.py"
+    else:
+        right["files"]["python-alias"] = dict(right["files"][name])
+        left["symlinks"]["python-alias"] = name
+    rewrite(descriptor, value)
+    bindings = original_root_bindings(descriptor)
+    request.getfixturevalue("reject_mount_writes")
+    with pytest.raises(ValueError):
+        import_sdk(descriptor, tmp_path / "unused", bindings=bindings)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    ["receipt", "manifest", "original-root", "relocated", "different-product", "nested", "cycle", "host", "bundle"],
+)
+def test_shared_mount_frontiers_reject_before_writes(tmp_path, shared_python_export, request, kind):
+    context, descriptor, _receipt_bytes = shared_python_export
+    value = load(descriptor)
+    bindings = original_root_bindings(descriptor)
+    if kind == "receipt":
+        replacement = value["roots"]["sdk"]["files"]["manifest.json"]
+        value["products"]["runtime"]["sha256"] = replacement["sha256"]
+        value["roots"]["runtime"]["files"]["manifest.json"] = dict(replacement)
+    elif kind == "manifest":
+        value["products"]["runtime"]["original_manifest"] += ".other"
+    elif kind == "original-root":
+        value["roots"]["runtime"]["path"] += "-other"
+    elif kind == "relocated":
+        bindings.update({"cpython": tmp_path / "other", "runtime": tmp_path / "other"})
+    elif kind == "different-product":
+        bindings["llvm"] = context.runtime.root
+    elif kind == "nested":
+        bindings["llvm"] = context.runtime.root / "nested"
+    elif kind == "cycle":
+        value["roots"]["runtime"]["symlinks"].update({"a": "b", "b": "a"})
+    elif kind == "host":
+        bindings["runtime"] = context.host_tools["sh"].path.parent
+    else:
+        bindings.update({"cpython": descriptor.parent, "runtime": descriptor.parent})
+    rewrite(descriptor, value)
+    request.getfixturevalue("reject_mount_writes")
+    with pytest.raises(ValueError):
+        import_sdk(descriptor, tmp_path / "unused", bindings=bindings)
 
 
 def test_absolute_internal_host_alias_remains_at_its_stable_root(tmp_path, sdk_fixture):

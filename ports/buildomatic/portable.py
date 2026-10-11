@@ -536,6 +536,8 @@ def import_sdk(
     roots cannot relocate, and are restored only when explicitly bound at their
     original path. ``original_root_bindings`` supplies those explicit bindings
     for a fresh worker. Existing mounts must verify and are never overwritten.
+    Roles sharing an original root and receipt restore one compatible inventory
+    union at that root; separately relocated roles remain separate.
     Restored trees are read-only. Failed imports may leave a rejected tree for
     diagnosis; they never return a partially admitted context.
     """
@@ -577,13 +579,48 @@ def import_sdk(
             _verify(path, selected, exact=not inventory.stable and path != original)
         elif inventory.stable and name not in bindings:
             raise ValueError("stable host mount is missing; bind its original path explicitly")
-    new = {name: path for name, path in locations.items() if not path.exists()}
-    for name, path in new.items():
-        if any(
-            path == other or path.is_relative_to(other) or other.is_relative_to(path)
-            for key, other in locations.items()
-            if key != name
+    mounts = {}
+    owners = {}
+    for name, path in locations.items():
+        inventory = inventories[name]
+        if path not in mounts:
+            mounts[path] = inventory
+            owners[path] = name
+            continue
+        owner = owners[path]
+        reference = value["products"].get(name)
+        other = value["products"].get(owner)
+        if (
+            inventory.stable
+            or mounts[path].stable
+            or path != Path(inventory.path)
+            or inventory.path != mounts[path].path
+            or not reference
+            or not other
+            or reference["sha256"] != other["sha256"]
+            or reference["original_manifest"] != other["original_manifest"]
         ):
+            raise ValueError("portable roles cannot share this mount")
+        merged = {}
+        for field, current, incoming in (
+            ("files", mounts[path].files, inventory.files),
+            ("symlinks", mounts[path].symlinks, inventory.symlinks),
+            ("directories", mounts[path].directories, inventory.directories),
+        ):
+            entries = dict(current)
+            for relative, entry in incoming.items():
+                if relative in entries and entries[relative] != entry:
+                    raise ValueError("conflicting shared product inventories")
+                entries[relative] = entry
+            merged[field] = entries
+        if set(merged["files"]) & set(merged["symlinks"]) or (set(merged["files"]) | set(merged["symlinks"])) & set(
+            merged["directories"]
+        ):
+            raise ValueError("shared product inventory entries overlap")
+        mounts[path] = RootInventory(inventory.path, False, **merged)
+    new = {path: inventory for path, inventory in mounts.items() if not path.exists()}
+    for path in new:
+        if any(path.is_relative_to(other) or other.is_relative_to(path) for other in mounts if other != path):
             raise ValueError("restored portable roots overlap")
         if descriptor.is_relative_to(path):
             raise ValueError("portable mount overlaps the input bundle")
@@ -594,8 +631,7 @@ def import_sdk(
             if blob.stat().st_size != entry.size or file_hash(blob) != entry.sha256:
                 raise ValueError("portable input blob differs")
     _verify_host_closures(value, inventories, descriptor.parent)
-    for name, path in new.items():
-        inventory = inventories[name]
+    for path, inventory in new.items():
         path.mkdir(parents=True)
         for relative in sorted(set(inventory.directories) - {"."}, key=lambda item: (len(Path(item).parts), item)):
             (path / relative).mkdir()
