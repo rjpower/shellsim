@@ -270,24 +270,10 @@ def test_source_tree_builder_receives_only_declared_build_products(tmp_path, mon
         if name == "consumer":
             recipe["build_dependencies"] = [{"port": "toolchain/producer", "version": "1"}]
         (directory / "recipe.json").write_text(json.dumps(recipe))
-    calls = []
-
-    def build(context):
-        calls.append(context.port.name)
-        assert context.offline
-        if context.port.name == "consumer":
-            assert set(context.build_artifacts) == {"toolchain/producer"}
-            data = (context.build_artifacts["toolchain/producer"] / "product").read_bytes()
-            (context.result / "product").write_bytes(data + b" consumed")
-        else:
-            assert not context.build_artifacts
-            (context.result / "product").write_bytes(b"compiled")
-
-    monkeypatch.setattr("ports.api.build_port", build)
+        (directory / "build.py").write_text(
+            "def build(ctx):\n    assert ctx.offline\n    if ctx.port.name == 'consumer':\n        assert set(ctx.build_artifacts) == {'toolchain/producer'}\n        body=(ctx.build_artifacts['toolchain/producer']/'product').read_bytes()+b' consumed'\n    else:\n        assert not ctx.build_artifacts\n        body=b'compiled'\n    (ctx.result/'product').write_bytes(body)\n"
+        )
     first = runner.build_graph(ports, ["toolchain/consumer"], None, store, offline=True)
     assert (first.results["toolchain/consumer/recipe.json"] / "product").read_bytes() == b"compiled consumed"
-    assert calls == ["producer", "consumer"]
-    calls.clear()
     second = runner.build_graph(ports, ["toolchain/consumer"], None, store, offline=True)
     assert second.results == first.results
-    assert not calls

@@ -1,8 +1,4 @@
-"""Durable build blobs and journals using Rigging's native object-store CAS.
-
-Rigging owns credentials, endpoint selection and filesystem routing. Import it
-only when a remote operation runs so local builds do not depend on Iris packages.
-"""
+"""Canonical blobs and journals with Rigging storage routing and conditional writes."""
 
 from __future__ import annotations
 
@@ -12,6 +8,7 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Literal
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -286,3 +283,32 @@ class RemoteStore:
             return _conditional(self._journal_path(key)).write(envelope, expected_version=expected_version)
         except NativeConflict as error:
             raise ConditionalWriteError("remote journal changed") from error
+
+
+class StorageStore:
+    """Canonical storage independent of execution placement, routed by Rigging."""
+
+    def __init__(self, prefix: str):
+        from rigging.filesystem.buckets import filesystem_for
+        from rigging.filesystem.storage_path import StoragePath
+
+        from ports.buildomatic.store import LocalStore
+
+        self.path = StoragePath(prefix)
+        if self.path.is_local:
+            _, path = filesystem_for(str(self.path))
+            self.path = StoragePath(str(Path(path).resolve()))
+        self.prefix = str(self.path)
+        self._store = LocalStore(Path(str(self.path))) if self.path.is_local else RemoteStore(self.prefix)
+
+    def put_blob(self, data: bytes) -> str:
+        return self._store.put_blob(data)
+
+    def get_blob(self, key: str) -> bytes:
+        return self._store.get_blob(key)
+
+    def read_journal(self, key: str):
+        return self._store.read_journal(key)
+
+    def write_journal(self, key: str, data: bytes, expected_version: str | None) -> str:
+        return self._store.write_journal(key, data, expected_version)

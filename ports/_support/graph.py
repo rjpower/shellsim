@@ -140,8 +140,14 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
         "platform_dependencies",
         "host",
         "products",
+        "runtime",
     }
-    if set(profile) != fields or type(profile["schema_version"]) is not int or profile["schema_version"] != 1:
+    if (
+        not fields - {"runtime"} <= profile.keys()
+        or set(profile) - fields
+        or type(profile["schema_version"]) is not int
+        or profile["schema_version"] != 1
+    ):
         raise ValueError("unsupported SDK schema")
     _dependencies(recipe, name)
     resolved = dict(recipe)
@@ -169,7 +175,7 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
     return resolved, SDKSelection(
         f"sdks/{name}.json",
         hashlib.sha256(
-            json.dumps({key: profile[key] for key in fields - {"products", "host"}}, sort_keys=True).encode()
+            json.dumps({key: profile[key] for key in fields - {"products", "host", "runtime"}}, sort_keys=True).encode()
         ).hexdigest(),
     )
 

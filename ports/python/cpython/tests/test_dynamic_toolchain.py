@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 
 from ports._support.graph import plan
+from ports._support.node_build import _admit_recipe
 from ports._support.producer_policy import verify_policy
-from ports._support.runner import _admit_recipe
 from ports.native.dependencies import file_hash
 
 

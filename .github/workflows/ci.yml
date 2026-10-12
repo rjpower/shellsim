@@ -67,7 +67,8 @@ jobs:
           python -m pip install "maturin>=1.8,<2" "build>=1,<2" "pytest>=8"
           maturin build --release --locked --out dist
           python -m build toolchain --outdir dist
-          python -m pip install dist/shellsim-*.whl
+          wheels=(dist/shellsim-*.whl)
+          python -m pip install "${wheels[0]}[buildomatic]"
           python - <<'PY'
           import importlib.util
           import tempfile

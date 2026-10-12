@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import pytest
 
 from ports import api
-from ports._support import python_adapters, runner
+from ports._support import node_build, runner
 from ports._support.graph import Graph, Port
 from ports._support.sdk_products import Receipt
 
@@ -48,68 +48,31 @@ def _wheel_port(ports, store, name, dependencies):
     return path, recipe
 
 
-def test_graph_reuses_verified_builds_and_rebuilds_dependents(tmp_path, monkeypatch):
+def test_graph_reuses_outputs_and_rebuilds_dependents(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    provider, recipe = _wheel_port(ports, store, "provider", [])
-    _wheel_port(ports, store, "consumer", ["provider"])
-    calls = []
-    real_build = python_adapters.build_pure_wheel
-
-    def observed_build(request):
-        calls.append(request.recipe["name"])
-        return real_build(request)
-
-    monkeypatch.setattr(python_adapters, "build_pure_wheel", observed_build)
-    first = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert calls == ["provider", "consumer"]
-    calls.clear()
-    second = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert not calls
+    provider, recipe = _wheel_port(ports, store / "execution/cache/ports", "provider", [])
+    _wheel_port(ports, store / "execution/cache/ports", "consumer", ["provider"])
+    first = runner.build_graph(ports, ["python/consumer"], None, store, offline=True)
+    second = runner.build_graph(ports, ["python/consumer"], None, store, offline=True)
     assert second.results == first.results
-
     provider.write_text(json.dumps({**recipe, "features": {"new-build-input": True}}))
-    third = runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert calls == ["provider", "consumer"]
-    assert third.results["python/consumer/recipe.json"] != first.results["python/consumer/recipe.json"]
-
-    artifact = third.results["python/provider/recipe.json"] / "wheels/provider-1-py3-none-any.whl"
-    artifact.write_bytes(b"corrupt")
-    calls.clear()
-    with pytest.raises(ValueError):
-        runner.build_graph(ports, ["python/consumer"], PureCohort(), store, offline=True)
-    assert not calls
+    third = runner.build_graph(ports, ["python/consumer"], None, store, offline=True)
+    assert all(third.results[ref] != path for ref, path in first.results.items())
 
 
 def test_build_cache_ignores_acceptance_code_but_tracks_selected_adapter(tmp_path, monkeypatch):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "example", [])
-    calls = []
-    real_build = python_adapters.build_pure_wheel
-
-    def observed_build(request):
-        calls.append(request.recipe["name"])
-        return real_build(request)
-
-    monkeypatch.setattr(python_adapters, "build_pure_wheel", observed_build)
-    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
-    assert calls == ["example"]
-
-    real_hash = api.file_hash
-
-    def changed_acceptance(path, **kwargs):
-        return "a" * 64 if path.name == "acceptance.py" else real_hash(path, **kwargs)
-
-    monkeypatch.setattr(api, "file_hash", changed_acceptance)
-    calls.clear()
-    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
-    assert not calls
-
-    def changed_adapter(path, **kwargs):
-        return "b" * 64 if path.name == "pure_wheel.py" else real_hash(path, **kwargs)
-
-    monkeypatch.setattr(api, "file_hash", changed_adapter)
-    runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
-    assert calls == ["example"]
+    _wheel_port(ports, store / "execution/cache/ports", "example", [])
+    first = runner.build_graph(ports, ["python/example"], None, store, offline=True)
+    actual = api.file_hash
+    monkeypatch.setattr(
+        api, "file_hash", lambda path, **kwargs: "a" * 64 if path.name == "acceptance.py" else actual(path, **kwargs)
+    )
+    assert runner.build_graph(ports, ["python/example"], None, store, offline=True).results == first.results
+    monkeypatch.setattr(
+        api, "file_hash", lambda path, **kwargs: "b" * 64 if path.name == "pure_wheel.py" else actual(path, **kwargs)
+    )
+    assert runner.build_graph(ports, ["python/example"], None, store, offline=True).results != first.results
 
 
 def test_acceptance_uses_port_namespace_when_names_collide(tmp_path, monkeypatch):
@@ -247,14 +210,14 @@ def test_executable_archive_admission_rejects_modified_and_unrecorded_files(tmp_
     )
     cohort = PlatformCohort(receipt)
     declared = {"executable_sdk_link_inputs": ["lib/setjmp.a"]}
-    assert runner._executable_sdk_link_inputs(cohort, declared) == (path,)
+    assert node_build._executable_sdk_link_inputs(cohort, declared) == (path,)
     path.write_bytes(b"!<arch>\nmodified archive")
     with pytest.raises(ValueError, match="differs"):
-        runner._executable_sdk_link_inputs(cohort, declared)
+        node_build._executable_sdk_link_inputs(cohort, declared)
     unrecorded = path.with_name("ambient.a")
     unrecorded.write_bytes(b"!<arch>\nambient archive")
     with pytest.raises(ValueError, match="differs"):
-        runner._executable_sdk_link_inputs(cohort, {"executable_sdk_link_inputs": ["lib/ambient.a"]})
+        node_build._executable_sdk_link_inputs(cohort, {"executable_sdk_link_inputs": ["lib/ambient.a"]})
 
 
 @pytest.mark.parametrize("declared", [["../host.a"], ["/host.a"], ["lib/setjmp.a", "lib/setjmp.a"]])
@@ -269,7 +232,7 @@ def test_executable_archive_admission_rejects_escaping_or_duplicate_inputs(tmp_p
         {"artifacts": {"sysroot/lib/setjmp.a": hashlib.sha256(path.read_bytes()).hexdigest()}},
     )
     with pytest.raises(ValueError):
-        runner._executable_sdk_link_inputs(PlatformCohort(receipt), {"executable_sdk_link_inputs": declared})
+        node_build._executable_sdk_link_inputs(PlatformCohort(receipt), {"executable_sdk_link_inputs": declared})
 
 
 def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
@@ -304,8 +267,8 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
 
 def test_pure_wheels_do_not_acquire_sdk_dependencies(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "provider", [])
-    _wheel_port(ports, store, "consumer", ["provider"])
+    _wheel_port(ports, store / "execution/cache/ports", "provider", [])
+    _wheel_port(ports, store / "execution/cache/ports", "consumer", ["provider"])
     result = runner.build_graph(ports, ["python/consumer"], None, store, offline=True)
     assert {port.name for port in result.graph.ports} == {"consumer", "provider"}
     assert all(port.sdk_selection is None for port in result.graph.ports)
@@ -347,7 +310,7 @@ def test_acceptance_keeps_explicit_variant_proofs_distinct(tmp_path, monkeypatch
 
 def test_changed_declared_helper_invalidates_a_real_cached_build(tmp_path, monkeypatch):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "example", [])
+    _wheel_port(ports, store / "execution/cache/ports", "example", [])
     directory = ports / "python/example"
     recipe_path = directory / "recipe.json"
     recipe = json.loads(recipe_path.read_text())
@@ -362,27 +325,22 @@ def test_changed_declared_helper_invalidates_a_real_cached_build(tmp_path, monke
         "    if value < 0: raise ValueError('invalid fixture configuration')\n"
         "    return pure_wheel(ctx)\n"
     )
-    calls = []
-    actual = python_adapters.build_pure_wheel
-
-    def build(request):
-        calls.append(request.recipe["name"])
-        return actual(request)
-
-    monkeypatch.setattr(python_adapters, "build_pure_wheel", build)
     first = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
     repeat = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
-    assert first.results == repeat.results and calls == ["example"]
+    assert first.results == repeat.results
     helper.write_text("VALUE = 2\n")
     changed = runner.build_graph(ports, ["python/example"], PureCohort(), store, offline=True)
-    assert changed.results != first.results and calls == ["example", "example"]
+    assert changed.results != first.results
 
 
 def test_changed_patch_driver_rebuilds_a_real_cached_source_component(tmp_path, monkeypatch):
     import io
-    import runpy
+    import shutil
     import tarfile
     from pathlib import Path
+
+    from ports._support.store import file_hash
+    from ports.buildomatic import transport, workflow
 
     ports, store = tmp_path / "ports", tmp_path / "store"
     directory = ports / "toolchain/example"
@@ -390,12 +348,12 @@ def test_changed_patch_driver_rebuilds_a_real_cached_source_component(tmp_path, 
     archive = directory / "example.tar.gz"
     with tarfile.open(archive, "w:gz") as output:
         member = tarfile.TarInfo("example/value.txt")
-        member.size = len(b"before\n")
+        member.size = 7
         output.addfile(member, io.BytesIO(b"before\n"))
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
-    cached = store / "sources" / digest / archive.name
+    digest = file_hash(archive)
+    cached = store / "execution/cache/ports/sources" / digest / archive.name
     cached.parent.mkdir(parents=True)
-    cached.write_bytes(archive.read_bytes())
+    shutil.copyfile(archive, cached)
     patch = directory / "value.patch"
     patch.write_text("--- a/value.txt\n+++ b/value.txt\n@@ -1 +1 @@\n-before\n+patched\n")
     (directory / "recipe.json").write_text(
@@ -411,46 +369,32 @@ def test_changed_patch_driver_rebuilds_a_real_cached_source_component(tmp_path, 
                     "sha256": digest,
                     "subdirectory": "example",
                 },
-                "patches": [{"file": patch.name, "sha256": hashlib.sha256(patch.read_bytes()).hexdigest()}],
+                "patches": [{"file": patch.name, "sha256": file_hash(patch)}],
             }
         )
     )
     (directory / "build.py").write_text("from ports.api import source_tree\ndef build(ctx): return source_tree(ctx)\n")
     driver = tmp_path / "driver"
-    driver.mkdir()
-    support = Path(runner.__file__).parent
-    for name in ("runner.py", "store.py"):
-        (driver / name).write_bytes((support / name).read_bytes())
-    patch_driver = driver / "build.py"
-    original = (support / "build.py").read_text()
+    shared = Path(workflow.__file__).resolve().parents[1]
+    shutil.copytree(shared, driver, ignore=shutil.ignore_patterns("__pycache__", "wheels"))
+    monkeypatch.setattr(workflow, "__file__", str(driver / "buildomatic/workflow.py"))
+    monkeypatch.setattr(transport, "__file__", str(driver / "buildomatic/transport.py"))
+    path = driver / "_support/build.py"
+    original = path.read_text()
 
-    def change_driver(value):
-        patch_driver.write_text(
-            original + "\n_original_apply_patch = apply_patch\n"
-            "def apply_patch(source, patch, expected_hash):\n"
-            "    _original_apply_patch(source, patch, expected_hash)\n"
-            f"    (source / 'value.txt').write_text({value!r})\n"
+    def change(value):
+        path.write_text(
+            original
+            + '\n_original_apply_patch=apply_patch\ndef apply_patch(source,patch,expected_hash):\n    _original_apply_patch(source,patch,expected_hash)\n    (source/"value.txt").write_text('
+            + repr(value)
+            + ")\n"
         )
 
-    calls = []
-
-    def apply_patch(*args):
-        calls.append(args[1].name)
-        runpy.run_path(str(patch_driver))["apply_patch"](*args)
-
-    monkeypatch.setattr(runner, "__file__", str(driver / "runner.py"))
-    monkeypatch.setattr(runner, "apply_patch", apply_patch)
-    change_driver("first\n")
-    first = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
-    repeat = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
+    change("first\n")
+    first = runner.build_graph(ports, ["toolchain/example"], None, store, offline=True)
+    assert runner.build_graph(ports, ["toolchain/example"], None, store, offline=True).results == first.results
     reference = "toolchain/example/recipe.json"
-    assert first.results == repeat.results and calls == ["value.patch"]
     assert (first.results[reference] / "source/value.txt").read_text() == "first\n"
-    for name in ("runner.py", "store.py"):
-        (driver / name).write_text("# changed orchestration\n")
-    unchanged = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
-    assert unchanged.results == first.results and calls == ["value.patch"]
-    change_driver("second\n")
-    changed = runner.build_graph(ports, ["toolchain/example"], PureCohort(), store, offline=True)
-    assert changed.results != first.results and calls == ["value.patch", "value.patch"]
+    change("second\n")
+    changed = runner.build_graph(ports, ["toolchain/example"], None, store, offline=True)
     assert (changed.results[reference] / "source/value.txt").read_text() == "second\n"

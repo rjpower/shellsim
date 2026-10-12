@@ -17,7 +17,7 @@ def sdk_inputs(ports: Path, name: str) -> dict:
     """Track producer recipes and build code without inspecting host tools."""
     sdk = definition(ports, Graph((), ()), name)
     return {
-        "definition": sdk.metadata,
+        "definition": {key: value for key, value in sdk.metadata.items() if key != "runtime"},
         "producers": {
             node.name: {"policy": policy(node.port.recipe), "implementation": implementation(node.port)}
             for node in sdk.products

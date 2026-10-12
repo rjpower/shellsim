@@ -11,7 +11,7 @@ def test_make_recipe_pins_build_inputs():
     port = ROOT / "ports/native/make"
     recipe = json.loads((port / "recipe.json").read_text())
     from ports._support.graph import plan
-    from ports._support.runner import _admit_recipe
+    from ports._support.node_build import _admit_recipe
 
     selected = next(item for item in plan(ROOT / "ports", ["native/make"]).ports if item.name == "make")
     _admit_recipe(selected)
