@@ -25,7 +25,8 @@ fn main() {
         PathBuf::from("Cargo.toml"),
         PathBuf::from("python/native/Cargo.lock"),
         PathBuf::from("rust-toolchain.toml"),
-        PathBuf::from("src/commands/wasm.rs"),
+        PathBuf::from("src/commands/wasm/engine.rs"),
+        PathBuf::from("src/commands/wasm/threaded_dynamic/layout.rs"),
     ];
     source_files(Path::new("vendor/wasmtime"), &mut files);
     files.sort();

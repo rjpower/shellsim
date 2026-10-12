@@ -113,20 +113,28 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
     assert {node["reference"] for node in exported["ports"]} == {app.reference, runtime.reference}
 
 
-def test_failed_delivery_preserves_canonical_build(tmp_path):
+@pytest.mark.parametrize("failure", ["publication", "worker-runtime"])
+def test_failed_delivery_preserves_canonical_build(tmp_path, monkeypatch, failure):
     ports, state = tmp_path / "ports", tmp_path / "state"
     _wheel_port(ports, state / "execution/cache/ports", "example", [])
     store = StorageStore(str(tmp_path / "canonical"))
     backend = LocalBackend(store, state / "execution")
     blocked = Path(store.prefix) / "assets"
-    blocked.write_bytes(b"blocks delivery directories")
-    with pytest.raises(RuntimeError):
-        run(ports, ["python/example"], store, state, backend, offline=True)
+    if failure == "publication":
+        blocked.write_bytes(b"blocks delivery directories")
+    from shellsim import _native
+
+    with monkeypatch.context() as planner:
+        if failure == "worker-runtime":
+            planner.setattr(_native, "precompiled_wasm_build_id", lambda: "mismatched-planner")
+        with pytest.raises(RuntimeError):
+            run(ports, ["python/example"], store, state, backend, offline=True)
     compiled = compile_plan(ports, ["python/example"])
     product = next(node for node in compiled.nodes if node.operation is Operation.BUILD)
     cached = resolve(store, product.record_key)
     assert cached is not None
-    blocked.unlink()
+    assert not blocked.is_dir()
+    blocked.unlink(missing_ok=True)
     # Remove the producer's source/cache; success now depends on its canonical output.
     shutil.rmtree(state / "execution/cache/ports")
     completed = run(ports, ["python/example"], store, state, backend, offline=True)

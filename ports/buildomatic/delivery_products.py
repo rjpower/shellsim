@@ -178,11 +178,14 @@ def publish_product(
             for path in exports.get(kind, []):
                 source = root / "native" / relative_path(path)
                 relative = f"assets/{build_key}/native/{path}"
-                store.emit(source, relative)
                 with source.open("rb") as handle:
-                    wasm = handle.read(4) == b"\0asm"
+                    header = handle.read(4)
+                    wasm = header == b"\0asm"
                 if kind == "shared_libraries" and not wasm:
                     raise ValueError("shared library is not a Wasm module: " + path)
+                if kind == "tools" and not wasm and not header.startswith(b"#!"):
+                    raise ValueError("tool must be Wasm or a script with a shebang: " + path)
+                store.emit(source, relative)
                 companion = (
                     _companion(
                         source,

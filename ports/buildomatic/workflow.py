@@ -464,6 +464,10 @@ def prepare(
                     "abi": plan.sdk.metadata["abi"] if plan.sdk else None,
                 }
             )
+            if node.operation in {Operation.DELIVERY, Operation.RUNTIME}:
+                from shellsim import _native
+
+                spec["wasmtime_build_id"] = _native.precompiled_wasm_build_id()
             write_reference(recipe / "node.json", spec)
             bundle = capture_tree(recipe, local)
             bundles.append(bundle)

@@ -27,5 +27,5 @@ assets with `--output <prefix> --copy-assets`. Serve the store with
 Delivery keeps portable Wasm and adds ordinary Wasmtime companions for the runtime,
 wheel extensions and native exports. Set `trusted_precompiled=True` on `Environment`
 only for trusted catalog and producer bytes: companions contain native host code.
-Incompatible companions fall back to raw Wasm; companions never enter the guest VFS.
+Companions load on first use, with raw Wasm fallback; they never enter the guest VFS.
 Python installs omit development bundles; explicitly selected tools include them.

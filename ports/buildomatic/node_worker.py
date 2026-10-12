@@ -153,6 +153,15 @@ def runtime(node: Node, records: dict, store: StorageStore, cache: Path) -> dict
 def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -> dict:
     if node.operation is not Operation.CHECK and (cached := resolve(store, node.record_key)) is not None:
         return cached
+    if node.operation in {Operation.DELIVERY, Operation.RUNTIME}:
+        from shellsim import _native
+
+        expected = specification["wasmtime_build_id"]
+        actual = _native.precompiled_wasm_build_id()
+        if actual != expected:
+            raise ValueError(
+                f"worker Wasmtime {actual} differs from planner {expected}; install the matching worker image"
+            )
     records = input_records(node, store)
     if node.operation is Operation.BUILD:
         result = build(node, records, store, cache, specification)

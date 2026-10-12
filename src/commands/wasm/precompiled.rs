@@ -9,7 +9,7 @@ use wasmtime::{Error, Module};
 use super::{
     command_engine, command_module_cache, compilation_cache, executable_admission,
     executable_compilation_source, retain_executable_admission, threads, validate_imports,
-    ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
+    CachedCompilation, ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
 };
 
 /// Select ordinary module compilation or main-executable admission and startup rewriting.
@@ -24,9 +24,9 @@ pub enum WasmCompilationKind {
 /// Whether a trusted companion entered the runtime cache or the caller should retain JIT use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrecompiledWasmOutcome {
-    /// The companion is compatible and cached under its exact compilation source.
+    /// The trusted companion is retained; compatibility is checked on its first use.
     Registered,
-    /// The format, runtime identity, target, settings, or cache size bounds are incompatible.
+    /// The companion exceeds cache bounds and ordinary JIT remains available.
     Incompatible,
 }
 
@@ -49,7 +49,10 @@ pub fn precompile_wasm(source: &[u8], kind: WasmCompilationKind) -> Result<Vec<u
         .map(|admission| executable_compilation_source(source, admission.profile.as_ref()))
         .transpose()?
         .flatten();
-    let module = Module::new(command_engine(), rewritten.as_deref().unwrap_or(source))?;
+    let module = Module::new(
+        super::engine::precompile_engine(),
+        rewritten.as_deref().unwrap_or(source),
+    )?;
     if let Some(admission) = &admission {
         admit_imports(&module, admission)?;
     }
@@ -65,9 +68,9 @@ pub fn precompiled_wasm_build_id() -> &'static str {
 
 /// Register a trusted host companion for the exact source used by subsequent guest compilation.
 ///
-/// Incompatibility leaves the ordinary JIT path available. Invalid source or failed executable
-/// admission returns an error. Registration does not bypass guest resource charges or instantiate
-/// a module. Cache eviction can later require recompilation.
+/// Deserialization and compatibility checks happen on the first compilation cache miss, outside
+/// the cache lock. An incompatible companion falls back to JIT. Registration checks source
+/// admission but does not instantiate a module or bypass guest resource charges.
 ///
 /// # Safety
 ///
@@ -99,39 +102,34 @@ pub unsafe fn register_trusted_precompiled_wasm(
         .transpose()?
         .flatten();
     let compilation_source = rewritten.as_deref().unwrap_or(source);
-    if command_module_cache()
-        .lock()
-        .expect("module cache lock")
-        .get(compilation_source)
-        .is_some()
-    {
-        return Ok(PrecompiledWasmOutcome::Registered);
-    }
-    // SAFETY: the host caller guarantees untouched Wasmtime output compiled for this source/kind.
-    // The command engine checks compatibility, including the patched fuel-resume runtime identity.
-    let module = match unsafe { Module::deserialize(command_engine(), companion) } {
-        Ok(module) => module,
-        Err(_) => return Ok(PrecompiledWasmOutcome::Incompatible),
-    };
-    if let Some(admission) = &admission {
-        admit_imports(&module, admission)?;
-    }
-    let image = module.image_range();
-    if compilation_source
-        .len()
-        .saturating_add((image.end as usize).saturating_sub(image.start as usize))
-        > MAX_CACHED_MODULE_BYTES
-    {
+    let bytes = compilation_source.len().saturating_add(companion.len());
+    if bytes > MAX_CACHED_MODULE_BYTES {
         return Ok(PrecompiledWasmOutcome::Incompatible);
     }
-    command_module_cache()
-        .lock()
-        .expect("module cache lock")
-        .insert(compilation_source, module);
+    let mut cache = command_module_cache().lock().expect("module cache lock");
+    if !cache
+        .entries
+        .iter()
+        .any(|entry| entry.source == compilation_source)
+    {
+        cache.insert_entry(
+            compilation_source,
+            CachedCompilation::Precompiled(companion.into()),
+            bytes,
+        );
+    }
+    drop(cache);
     if let Some(admission) = admission {
         retain_executable_admission(source, admission);
     }
     Ok(PrecompiledWasmOutcome::Registered)
+}
+
+#[allow(unsafe_code)]
+pub(super) fn load(companion: Option<&[u8]>) -> Option<Module> {
+    // SAFETY: only the unsafe trusted-host registration API can create pending companions.
+    // Guest resource charges and source admission precede this lookup. Incompatibility falls back.
+    companion.and_then(|bytes| unsafe { Module::deserialize(command_engine(), bytes).ok() })
 }
 
 fn check_source(source: &[u8]) -> Result<(), Error> {
@@ -181,7 +179,8 @@ mod tests {
             .unwrap(),
             PrecompiledWasmOutcome::Registered
         );
-        let module = command_module_cache().lock().unwrap().get(&source).unwrap();
+        let module = super::super::compiled_command_module(&source).unwrap();
+        assert_eq!(module.serialize().unwrap(), bytes);
         let mut store = Store::new(command_engine(), ());
         store.set_fuel(1000).unwrap();
         let instance = Instance::new(&mut store, &module, &[]).unwrap();
@@ -210,7 +209,7 @@ mod tests {
                 register_trusted_precompiled_wasm(&source, &bytes, WasmCompilationKind::Executable)
             }
             .unwrap(),
-            PrecompiledWasmOutcome::Incompatible
+            PrecompiledWasmOutcome::Registered
         );
         let mut environment = crate::Environment::new();
         environment

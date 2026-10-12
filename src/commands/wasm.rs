@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, ExternType, Linker,
-    Module, ModuleVersionStrategy, Store, StoreContextMut, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Config, Engine, Error, Extern, ExternType, Linker, Module,
+    Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{
@@ -49,11 +49,13 @@ mod threaded_dynamic;
 mod threads;
 
 use guest_memory::GuestMemory;
+mod engine;
 mod limits;
 mod posix_exec;
 mod posix_open;
 mod posix_process;
 mod precompiled;
+use engine::{configure_command_engine, ASYNC_STACK_BYTES};
 
 pub use precompiled::{
     precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
@@ -71,7 +73,8 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 // CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
-const MAX_CACHED_MODULES: usize = 64;
+// SciPy ships over 100 extensions; keep its setup from evicting the interpreter.
+const MAX_CACHED_MODULES: usize = 256;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
@@ -104,7 +107,6 @@ const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
-const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
 const ERRNO_NOSPC: i32 = 51;
 const ERRNO_RANGE: i32 = 68;
 
@@ -112,9 +114,14 @@ type CompilationFlights = BTreeMap<[u8; 32], Weak<Mutex<()>>>;
 
 struct CachedModule {
     source: Vec<u8>,
-    module: Module,
+    compilation: CachedCompilation,
     bytes: usize,
     admission: Option<ExecutableAdmission>,
+}
+
+enum CachedCompilation {
+    Ready(Module),
+    Precompiled(Arc<[u8]>),
 }
 
 #[derive(Clone)]
@@ -135,9 +142,12 @@ impl ModuleCache {
             .iter()
             .position(|entry| entry.source == source)?;
         let entry = self.entries.remove(index).expect("index from cache");
-        let module = entry.module.clone();
+        let module = match &entry.compilation {
+            CachedCompilation::Ready(module) => Some(module.clone()),
+            CachedCompilation::Precompiled(_) => None,
+        };
         self.entries.push_back(entry);
-        Some(module)
+        module
     }
 
     fn insert(&mut self, source: &[u8], module: Module) {
@@ -145,6 +155,21 @@ impl ModuleCache {
         let bytes = source
             .len()
             .saturating_add((image.end as usize).saturating_sub(image.start as usize));
+        self.insert_entry(source, CachedCompilation::Ready(module), bytes);
+    }
+
+    fn pending(&self, source: &[u8]) -> Option<Arc<[u8]>> {
+        self.entries
+            .iter()
+            .find_map(|entry| match &entry.compilation {
+                CachedCompilation::Precompiled(bytes) if entry.source == source => {
+                    Some(bytes.clone())
+                }
+                _ => None,
+            })
+    }
+
+    fn insert_entry(&mut self, source: &[u8], compilation: CachedCompilation, bytes: usize) {
         if bytes > MAX_CACHED_MODULE_BYTES {
             return;
         }
@@ -163,34 +188,12 @@ impl ModuleCache {
         }
         self.entries.push_back(CachedModule {
             source: source.to_vec(),
-            module,
+            compilation,
             bytes,
             admission: None,
         });
         self.bytes += bytes;
     }
-}
-
-/// Keep compiler settings identical for host caching and runtime compatibility checks.
-fn configure_command_engine(config: &mut Config) {
-    // A worker's host CPU features must not make published companions require that CPU.
-    config
-        .target(env!("SHELLSIM_WASMTIME_TARGET"))
-        .expect("supported host target");
-    config
-        .consume_fuel(true)
-        .async_stack_size(ASYNC_STACK_BYTES)
-        .wasm_exceptions(true)
-        .wasm_threads(true)
-        .shared_memory(true)
-        .wasm_gc(false)
-        .collector(Collector::DeferredReferenceCounting);
-    config
-        .module_version(ModuleVersionStrategy::Custom(format!(
-            "shellsim-wasmtime-49-{}",
-            compilation_cache::BUILD_ID
-        )))
-        .expect("bounded patched Wasmtime identity");
 }
 
 fn command_engine() -> &'static Engine {
@@ -291,7 +294,11 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
         return Ok(module);
     }
-    let module = Module::new(command_engine(), source)?;
+    let pending = cache.lock().expect("module cache lock").pending(source);
+    let module = match precompiled::load(pending.as_deref()) {
+        Some(module) => module,
+        None => Module::new(command_engine(), source)?,
+    };
     cache
         .lock()
         .expect("module cache lock")
