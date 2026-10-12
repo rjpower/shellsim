@@ -8,7 +8,7 @@ CellPyLib 2.4.0 builds through the shared offline setuptools backend. The helper
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build python/cellpylib --store /path/to/ports-store \
-  --output /path/to/release
+  --state build/ports
 ```
 
 See the [ports authoring guide](../../README.md) for SDK materialization,

@@ -88,8 +88,8 @@ def definition(ports: Path, graph: Graph, default: str = "default") -> SDKDefini
             default = alias["sdk"]
         reference = "sdks/" + relative_path(default) + ".json"
     _, _, metadata = _document(ports, reference)
-    if metadata["host"] != "linux-x86_64" or sys.platform != "linux" or platform.machine() != "x86_64":
-        raise PrerequisiteError("SDK producers currently require an x86-64 Linux host")
+    if metadata["host"] != "linux-x86_64":
+        raise PrerequisiteError("unsupported SDK producer host")
     declarations = metadata["products"]
     if not isinstance(declarations, dict) or not 1 <= len(declarations) <= 32:
         raise ValueError("SDK product graph must have one to thirty-two nodes")
@@ -282,6 +282,8 @@ def _produce(
     compiler_cache: CompilerCacheLauncher | None = None,
 ) -> Receipt:
     """Call the existing producer once its declared products are available."""
+    if node.adapter != "sdk-tooling" and (sys.platform != "linux" or platform.machine() != "x86_64"):
+        raise PrerequisiteError("SDK producers currently require an x86-64 Linux host")
     from ports._support.build import check_build_scripts
 
     check_build_scripts(node.recipe, node.recipe_path.parent)
@@ -330,12 +332,7 @@ def producer_work(node: SDKProduct, inputs: dict, seed: HostSeed, store: Path) -
     """
     root = store.resolve() / "sdk-work" / node.name
     if node.adapter == "llvm-host":
-        compatibility = {
-            "source": node.recipe["source"],
-            "tools": {
-                name: {"path": str(tool.path), "sha256": tool.sha256} for name, tool in seed.compiler_tools.items()
-            },
-        }
+        compatibility = {"source": node.recipe["source"]}
         return root / "workspaces" / json_hash(compatibility)
     import tempfile
 

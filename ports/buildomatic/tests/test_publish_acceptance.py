@@ -1,67 +1,59 @@
-"""Guest failures retain successful sibling receipts and requested-port selection."""
+"""Run real guest probes, retaining completed results when a later probe fails."""
 
 import json
 
 import pytest
 
 from ports._support.tests.test_runner import _wheel_port
-from ports.buildomatic import publish
+from ports.buildomatic.artifacts import resolve
+from ports.buildomatic.backends.local import LocalBackend
+from ports.buildomatic.nodes import Operation
+from ports.buildomatic.remote_store import StorageStore
+from ports.buildomatic.workflow import run
 
 
 @pytest.fixture
-def acceptance_graph(tmp_path, monkeypatch):
-    pytest.importorskip("shellsim._native")
-    ports = tmp_path / "ports"
-    for name in ("good", "bad"):
-        path, recipe = _wheel_port(ports, tmp_path / "sources", name, [])
-        recipe["tests"] = [{"kind": "python", "script": "probe.py"}]
+def acceptance_graph(tmp_path):
+    ports, state = tmp_path / "ports", tmp_path / "state"
+    for name, source in [("good", "print(open('/work/nested/input.txt').read())\n"), ("bad", "assert False\n")]:
+        path, recipe = _wheel_port(ports, state / "execution/cache/ports", name, [])
+        recipe["tests"] = [
+            {
+                "kind": "python",
+                "script": "probe.py",
+                "files": [{"source": "input.txt", "destination": "nested/input.txt"}],
+            }
+        ]
         path.write_text(json.dumps(recipe))
-        (path.parent / "probe.py").write_text("pass\n")
-    monkeypatch.setattr(publish, "__file__", str(ports / "buildomatic/publish.py"))
-    return {"roots": ["python/good", "python/bad"], "sdk_name": "fixture"}
+        (path.parent / "probe.py").write_text(source)
+        (path.parent / "input.txt").write_text("42")
+    store = StorageStore(str(tmp_path / "canonical"))
+    backend = LocalBackend(store, state / "execution")
+    built = run(ports, ["python/good", "python/bad"], store, state, backend, offline=True)
+    return ports, state, store, backend, built
 
 
-@pytest.mark.parametrize("max_workers", [1, 4])
-def test_failed_guest_retains_successful_sibling_receipt(tmp_path, monkeypatch, acceptance_graph, max_workers):
-    calls = {}
-
-    def accept(request):
-        calls[request.port.name] = request.output
-        if request.port.name == "bad":
-            raise RuntimeError("guest probe failed")
-        request.output.mkdir(parents=True)
-        (request.output / "receipt.json").write_text('{"passed": true}\n')
-
-    monkeypatch.setattr("ports._support.acceptance.accept_port", accept)
-    output = tmp_path / "proofs"
+def test_failed_guest_retains_completed_sibling(acceptance_graph):
+    ports, state, store, backend, built = acceptance_graph
     with pytest.raises(RuntimeError):
-        publish.accept_release(
-            acceptance_graph, tmp_path / "release.json", output, cpu=123, memory=456, max_workers=max_workers
-        )
-    assert set(calls) == {"good", "bad"}
-    assert calls["good"] != calls["bad"]
-    assert json.loads((output / "good/receipt.json").read_text())["passed"]
+        run(ports, ["python/good", "python/bad"], store, state, backend, operation=Operation.CHECK)
+    good = next(node for node in built.plan.nodes if node.operation is Operation.CHECK and node.port.name == "good")
+    assert resolve(store, good.record_key)["stdout"] == "42\n"
 
 
-def test_only_selected_guest_receives_requested_limits(tmp_path, monkeypatch, acceptance_graph):
-    calls = []
-    monkeypatch.setattr("ports._support.acceptance.accept_port", calls.append)
-    publish.accept_release(
-        acceptance_graph, tmp_path / "release.json", tmp_path / "proofs", cpu=123, memory=456, only=["good"]
-    )
-    assert [request.port.name for request in calls] == ["good"]
-    assert calls[0].limits.cpu == 123
-    assert calls[0].limits.memory == 456
-
-
-@pytest.mark.parametrize("max_workers", [0, 33])
-def test_invalid_guest_concurrency_fails_before_execution(tmp_path, acceptance_graph, max_workers):
+def test_selected_guest_rechecks_changed_source_without_building(acceptance_graph):
+    ports, state, store, backend, built = acceptance_graph
+    first = run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)
+    (ports / "python/good/probe.py").write_text("print(43)\n")
+    repeat = run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)
+    check = next(node for node in repeat.plan.nodes if node.operation is Operation.CHECK)
+    assert repeat.records[check.reference]["stdout"] == "43\n"
+    first_build = next(node for node in first.plan.nodes if node.operation is Operation.BUILD)
+    assert repeat.records[first_build.reference] == first.records[first_build.reference]
+    outside = ports.parent / "outside.txt"
+    outside.write_text("host-only input")
+    fixture = ports / "python/good/input.txt"
+    fixture.unlink()
+    fixture.symlink_to(outside)
     with pytest.raises(ValueError):
-        publish.accept_release(
-            acceptance_graph,
-            tmp_path / "release.json",
-            tmp_path / "proofs",
-            cpu=123,
-            memory=456,
-            max_workers=max_workers,
-        )
+        run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)

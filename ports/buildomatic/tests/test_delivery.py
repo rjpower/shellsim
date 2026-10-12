@@ -10,28 +10,28 @@ from ports.__main__ import main
 from ports._support import runner
 from ports._support.graph import plan
 from ports._support.tests.test_runner import _wheel_port
-from ports.buildomatic.delivery import DeliveryStore, export, publish_product, save_local_graph
+from ports.buildomatic.delivery import DeliveryStore, export
+from ports.buildomatic.delivery_products import publish_product
 
 
 @pytest.fixture
 def built(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "base", [])
-    _wheel_port(ports, store, "app", ["base"])
+    _wheel_port(ports, store / "execution/cache/ports", "base", [])
+    _wheel_port(ports, store / "execution/cache/ports", "app", ["base"])
     build = runner.build_graph(ports, ["python/app"], None, store, offline=True)
-    save_local_graph(build, store)
     return ports, store, build
 
 
 def test_offline_build_cli_writes_default_state(tmp_path, monkeypatch):
     ports = tmp_path / "ports"
-    _wheel_port(ports, tmp_path / "build/ports", "six", [])
+    _wheel_port(ports, tmp_path / "build/ports/execution/cache/ports", "six", [])
     monkeypatch.chdir(tmp_path)
     main(["build", "python/six", "--ports", str(ports), "--offline"])
     graph = json.loads(Path("build/ports/graph.json").read_text())
     assert graph["packages"][0]["name"] == "six"
-    assert (Path("build/ports") / graph["packages"][0]["path"]).is_file()
-    main(["export", "--url-prefix", "http://127.0.0.1:8080"])
+    assert (Path("build/ports/store") / graph["packages"][0]["path"]).is_file()
+    main(["export", "--ports", str(ports), "--url-prefix", "http://127.0.0.1:8080"])
     catalog = json.loads(Path("build/ports/export/catalog.json").read_text())
     assert catalog["packages"][0]["url"].startswith("http://127.0.0.1:8080/assets/")
 
@@ -56,15 +56,15 @@ def test_export_reads_only_saved_graph(built, monkeypatch, tmp_path):
 
 
 def test_product_records_avoid_reopening_wheels(built, monkeypatch):
-    from ports.buildomatic import delivery
+    from ports.buildomatic import delivery_products as delivery
 
-    _, state, build = built
+    ports, state, build = built
 
     def reject(*args):
         raise AssertionError("warm result reopened wheel metadata")
 
     monkeypatch.setattr(delivery, "wheel_metadata", reject)
-    save_local_graph(build, state)
+    runner.build_graph(ports, ["python/app"], None, state, offline=True)
 
 
 def test_promotion_copies_only_new_packages(built, tmp_path):
@@ -74,9 +74,8 @@ def test_promotion_copies_only_new_packages(built, tmp_path):
     assert first["assets_copied"] == 2
     repeat = export(state, output, "https://packages.example", copy_assets=True)
     assert repeat["assets_copied"] == 0
-    _wheel_port(ports, state, "extra", [])
-    build = runner.build_graph(ports, ["python/app", "python/extra"], None, state, offline=True)
-    save_local_graph(build, state)
+    _wheel_port(ports, state / "execution/cache/ports", "extra", [])
+    runner.build_graph(ports, ["python/app", "python/extra"], None, state, offline=True)
     added = export(state, output, "https://packages.example", copy_assets=True)
     assert added["assets_copied"] == 1
     catalog = json.loads((output / "catalog.json").read_text())
@@ -86,7 +85,7 @@ def test_promotion_copies_only_new_packages(built, tmp_path):
 
 def test_final_wheel_requirements_and_native_metadata(tmp_path):
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "native", [])
+    _wheel_port(ports, store / "execution/cache/ports", "native", [])
     port = plan(ports, ["python/native"]).ports[-1]
     root = tmp_path / "product"
     (root / "wheels").mkdir(parents=True)
@@ -113,7 +112,7 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, destination):
     from dataclasses import replace
 
     ports, store = tmp_path / "ports", tmp_path / "store"
-    _wheel_port(ports, store, "provider", [])
+    _wheel_port(ports, store / "execution/cache/ports", "provider", [])
     port = plan(ports, ["python/provider"]).ports[-1]
     port = replace(port, recipe={**port.recipe, "install": {"destinations": {"lib/libtest.so": destination}}})
     root = tmp_path / "product"
@@ -168,45 +167,6 @@ def test_interrupted_local_promotion_can_retry(tmp_path):
     source.fs.get_file = lambda key, target: Path(target).write_bytes(b"complete")
     assert source.promote("assets/package.whl", output)
     assert (tmp_path / "output/assets/package.whl").read_bytes() == b"complete"
-
-
-def test_backfill_worker_reuses_product_without_building(built, monkeypatch, tmp_path):
-    from ports.buildomatic import LocalStore, store_worker
-    from ports.buildomatic.artifacts import resolve
-
-    _, state, build = built
-    reference = "python/six/recipe.json"
-    key = "legacy-key"
-    canonical = tmp_path / "canonical"
-    store = LocalStore(canonical)
-    spec = tmp_path / "input"
-    spec.mkdir()
-    (spec / "node.json").write_text(
-        json.dumps(
-            {
-                "reference": reference,
-                "sdk_name": "default",
-                "prefix": str(canonical),
-                "build_key": key,
-                "existing": {"artifact": {"id": "legacy"}},
-            }
-        )
-    )
-    monkeypatch.setenv("BUILD_INPUT_recipe", str(spec))
-    monkeypatch.setenv("BUILD_OUTPUT_DIR", str(tmp_path / "result"))
-    monkeypatch.setattr(store_worker, "RemoteStore", lambda prefix: store)
-    monkeypatch.setattr(store_worker, "install", lambda *args: build.results["python/app/recipe.json"])
-
-    def reject(*args, **kwargs):
-        raise AssertionError("backfill tried to build or load SDK")
-
-    monkeypatch.setattr(store_worker, "load_sdk", reject)
-    monkeypatch.setattr(store_worker, "build_graph", reject)
-    store_worker.main()
-    result = resolve(store, "port/" + key)
-    assert result["delivery"]["wheels"][0]["name"] == "app"
-    assert (canonical / result["delivery"]["wheels"][0]["path"]).is_file()
-    assert json.loads((tmp_path / "result/result.json").read_text()) == result
 
 
 def test_guest_catalog_omits_host_and_platform_roots(built):

@@ -1,25 +1,20 @@
 # Buildomatic
 
-Buildomatic runs trusted host builds outside Shellsim guests. Local builds use a
-directory; Iris workers fetch components from the canonical S3 cache on demand.
-Builds emit wheels, native providers, and a separate interpreter asset once;
-export reads `graph.json` and writes catalog metadata, with optional Simple HTML.
-State defaults to `build/ports`.
+`ports build`, `ports export` and `ports check` share a graph and worker. Local
+execution runs that worker here; Iris dispatches it to a pool. `--store` selects
+a canonical directory or S3/GCS prefix independently of execution. Client state
+(`graph.json`, `results.json`) defaults to `build/ports`. Python 3.12+ is required.
 
 ```sh
-uv run --no-project python -m ports build python/scipy --backend iris --jobs 128
-uv run --no-project python -m ports export --url-prefix http://127.0.0.1:8080 \
-  --output s3://my-bucket/ports/export --simple
-uv run python ports/buildomatic/s3_proxy.py --prefix s3://my-bucket/ports
+uv run --extra buildomatic python -m ports build python/scipy --jobs 128
+uv run --extra buildomatic python -m ports export --url-prefix http://127.0.0.1:8080 --simple
+uv run --extra buildomatic python -m ports check
 ```
 
-Omit `--backend iris` for local builds. Iris uses `build/ports/service.json`;
-bootstrap its SDK explicitly with `ports.buildomatic.bootstrap --python` first.
-`--max-workers` controls port concurrency; `--jobs` controls compilation within
-one port. Export to another store with `--output <prefix> --copy-assets` to copy
-only missing assets. Cloud access needs `marin-rigging` bucket settings.
-
-Point `Environment(pypi_packages=["scipy"], pypi_catalog="http://127.0.0.1:8080/export/catalog.json")`
-at the exported catalog. It resolves the curated WASI closure and caches only
-selected assets, without patched uv or SDK downloads. The older cohort workflow
-in `ports.buildomatic.publish` still requires its patched resolver.
+Use `--backend iris --iris-service service.json` for a running pool. SDK producers
+are graph dependencies. `--max-workers` controls port concurrency; `--jobs` controls
+compilation within a port. The trusted local supervisor checks resident RAM
+periodically; Iris also applies its container limits. Builds emit assets once; export can promote missing
+assets with `--output <prefix> --copy-assets`. Serve the store with
+`s3_proxy.py --prefix <prefix>` and pass the catalog URL to
+`Environment(pypi_packages=["scipy"], pypi_catalog="<URL>")`; no patched uv is needed.

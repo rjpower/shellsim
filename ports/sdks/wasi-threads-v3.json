@@ -51,5 +51,14 @@
       "recipe": "toolchain/uv",
       "dependencies": []
     }
+  },
+  "runtime": {
+    "producer": "cpython",
+    "dependencies": [
+      "python/cpython:stdlib-zlib",
+      "python/cpython:stdlib-ctypes",
+      "python/cpython-stdlib-fcntl",
+      "python/cpython-stdlib-bz2"
+    ]
   }
 }

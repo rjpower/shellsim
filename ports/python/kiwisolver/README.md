@@ -8,7 +8,8 @@ supplies its headers through the declared backend closure.
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build python/kiwisolver --store /path/to/ports-store \
-  --output /path/to/release --check
+  --state build/ports
+uv run --extra buildomatic python -m ports check --state build/ports
 ```
 
 The SDK supplies patched compiler tools and CPython configuration. Guest checks

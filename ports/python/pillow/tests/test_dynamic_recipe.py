@@ -8,7 +8,7 @@ import tarfile
 import pytest
 
 from ports._support.graph import plan
-from ports._support.runner import _admit_recipe
+from ports._support.node_build import _admit_recipe
 from ports._support.sdk_products import Receipt, file_hash, verify_product
 from ports._support.store import extract
 

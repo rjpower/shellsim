@@ -17,6 +17,7 @@ import sys
 import threading
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Mapping
 
 from ._process import kill_group, process_token, tree_usage, wait_group
 from .bundles import capture_tree, extract_tree
@@ -123,18 +124,27 @@ def _startup_log(stream, path: Path, maximum: int) -> None:
 class WorkerExecutor:
     """Execute trusted host argv on Linux, with 1..32 durable concurrent slots.
 
-    Resource rlimits bound each process; the supervisor monitors aggregate disk
+    Resource rlimits bound CPU and file size; the supervisor monitors group RAM and disk
     and log growth. Polling resumes durable preparation/publication work. Input mounts
     share a total expanded byte/entry allowance. There is no shell by default.
     The root is private to this worker identity and must survive client restart.
     """
 
-    def __init__(self, store: Store, root: Path, limits: ResourceLimits = _DEFAULT_LIMITS, max_running: int = 1):
+    def __init__(
+        self,
+        store: Store,
+        root: Path,
+        limits: ResourceLimits = _DEFAULT_LIMITS,
+        max_running: int = 1,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ):
         if type(max_running) is not int or not 1 <= max_running <= 32:
             raise ValueError("worker needs 1..32 execution slots")
         if sys.platform != "linux":
             raise ValueError("persistent subprocess workers require Linux")
         self.store, self.root, self.limits, self.max_running = store, Path(root).resolve(), limits, max_running
+        self.environment = dict(environment or {})
         self.root.mkdir(parents=True, exist_ok=True)
         (self.root / "attempts").mkdir(exist_ok=True)
         self._children = []
@@ -156,6 +166,7 @@ class WorkerExecutor:
             return
         self._children = [child for child in self._children if child.poll() is None]
         environment = os.environ.copy()
+        environment.update(self.environment)
         environment["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
         atomic_write(directory / "launch.json", encode({"pid": None, "token": None}))
         gate_read, gate_write = os.pipe()

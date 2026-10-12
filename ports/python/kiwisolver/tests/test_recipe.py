@@ -12,8 +12,8 @@ from pathlib import Path
 import pytest
 
 from ports._support.graph import plan
+from ports._support.node_build import _admit_recipe
 from ports._support.python_adapters import _wheel
-from ports._support.runner import _admit_recipe
 from ports._support.store import extract, fetch
 
 

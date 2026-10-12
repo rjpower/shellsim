@@ -2,47 +2,34 @@
 
 from __future__ import annotations
 
-import argparse
-import email
 import errno
 import html
 import json
 import shutil
 import tempfile
-import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Sequence
-from urllib.parse import quote, unquote, urlsplit
+from urllib.parse import quote, urlsplit
 
-from packaging.utils import canonicalize_name
-
-from ports._support.graph import Graph, Port, guest_graph
+from ports._support.graph import Graph, guest_graph
 from ports._support.store import relative_path
-from ports.buildomatic.artifacts import write_reference
 
 
 class DeliveryStore:
     """Local assets use hard links; cloud access uses Rigging bucket routing."""
 
     def __init__(self, root: str | Path):
-        self.root = str(root).rstrip("/") or "/"
-        self.scheme = urlsplit(self.root).scheme
-        self.local = (
-            Path(unquote(urlsplit(self.root).path))
-            if self.scheme == "file"
-            else Path(root)
-            if not self.scheme
-            else None
-        )
-        self.fs = None
-        self.base = None
-        if self.local is None:
-            from rigging.filesystem.buckets import filesystem_for
+        from rigging.filesystem.buckets import filesystem_for
+        from rigging.filesystem.storage_path import StoragePath
 
-            self.fs, self.base = filesystem_for(self.root)
+        path = StoragePath(str(root))
+        self.fs, self.base = filesystem_for(str(path))
+        self.local = Path(self.base).resolve() if path.is_local else None
+        self.root = str(self.local) if self.local is not None else str(path).rstrip("/")
+        self.scheme = urlsplit(str(path)).scheme
+        if self.local is not None:
+            self.fs = None
 
     def key(self, relative: str) -> str:
         return self.base.rstrip("/") + "/" + relative_path(relative)
@@ -126,119 +113,6 @@ def staged_file(destination: Path):
         temporary.unlink(missing_ok=True)
 
 
-@dataclass(frozen=True)
-class Wheel:
-    """Final wheel metadata needed by a target-aware catalog consumer."""
-
-    name: str
-    version: str
-    filename: str
-    path: str
-    size: int
-    requires_python: str | None
-    requires_dist: list[str]
-    extras: list[str]
-    tags: list[str]
-    abi: str | None
-    native_dependencies: list[str]
-
-
-def wheel_metadata(path: Path, relative: str) -> Wheel:
-    """Read metadata members only, without extracting or hashing a wheel."""
-    with zipfile.ZipFile(path) as archive:
-        members = [name for name in archive.namelist() if name.endswith(".dist-info/METADATA")]
-        if len(members) != 1:
-            raise ValueError("wheel must contain one distribution metadata file")
-        dist = members[0].removesuffix("METADATA")
-        metadata = email.message_from_bytes(archive.read(members[0]))
-        wheel = email.message_from_bytes(archive.read(dist + "WHEEL"))
-        native = (
-            json.loads(archive.read(dist + "shellsim-native.json"))
-            if dist + "shellsim-native.json" in archive.namelist()
-            else {}
-        )
-    return Wheel(
-        canonicalize_name(metadata["Name"]),
-        metadata["Version"],
-        path.name,
-        relative,
-        path.stat().st_size,
-        metadata["Requires-Python"],
-        metadata.get_all("Requires-Dist", []),
-        metadata.get_all("Provides-Extra", []),
-        wheel.get_all("Tag", []),
-        native.get("abi"),
-        sorted({name for item in native.get("artifacts", []) for name in item["native_dependencies"]}),
-    )
-
-
-def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore) -> dict:
-    """Emit a product's wheels/providers once, then publish their metadata record."""
-    if (record := store.record(build_key)) is not None:
-        return record
-    record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": []}
-    for wheel in sorted((root / "wheels").glob("*.whl")):
-        relative = f"assets/{build_key}/{wheel.name}"
-        metadata = wheel_metadata(wheel, relative)
-        store.emit(wheel, relative)
-        record["wheels"].append(asdict(metadata))
-    if (root / "native/artifact.json").exists():
-        from ports._support.wasm_metadata import needed_libraries
-
-        manifest = json.loads((root / "native/artifact.json").read_text())
-        exports = manifest["inputs"]["recipe"]["exports"]
-        for kind, destination in (("shared_libraries", "/lib/"), ("tools", "/usr/bin/")):
-            for path in exports.get(kind, []):
-                source = root / "native" / relative_path(path)
-                relative = f"assets/{build_key}/native/{path}"
-                store.emit(source, relative)
-                record["native"].append(
-                    {
-                        "name": source.name,
-                        "path": relative,
-                        "size": source.stat().st_size,
-                        "kind": kind,
-                        "destination": port.recipe.get("install", {})
-                        .get("destinations", {})
-                        .get(path, destination + source.name),
-                        "abi": manifest["inputs"]["recipe"].get("abi"),
-                        "native_dependencies": needed_libraries(source),
-                    }
-                )
-    store.write("records/" + relative_path(build_key) + ".json", _json(record))
-    return record
-
-
-def publish_runtime(bundle: Path, key: str, store: DeliveryStore) -> dict:
-    """Emit the interpreter once, independently of package additions."""
-    if (record := store.record("runtime/" + key)) is not None:
-        return record["runtime"]
-    manifest = json.loads((bundle / "manifest.json").read_text())
-    relative = f"assets/{key}/runtime.zip"
-    if not store.exists(relative):
-        with tempfile.TemporaryDirectory(prefix=".runtime-", dir=bundle.parent) as temporary:
-            archive = Path(temporary) / "runtime.zip"
-            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-                for path in [bundle / "manifest.json", *sorted((bundle / "rootfs").rglob("*"))]:
-                    if path.is_file():
-                        output.write(path, "runtime/" + path.relative_to(bundle).as_posix())
-            size = archive.stat().st_size
-            store.emit(archive, relative)
-    else:
-        size = (
-            (store.local / relative).stat().st_size if store.local is not None else store.fs.size(store.key(relative))
-        )
-    runtime = {
-        "path": relative,
-        "size": size,
-        "abi": manifest["dynamic_abi"],
-        "python_version": manifest["recipe"]["version"],
-        "runtime_target": manifest["recipe"]["target"],
-    }
-    store.write("records/runtime/" + relative_path(key) + ".json", _json({"runtime": runtime}))
-    return runtime
-
-
 def delivery_graph(
     graph: Graph, products: dict[str, dict], *, abi: str | None = None, runtime: dict | None = None
 ) -> dict:
@@ -281,33 +155,6 @@ def delivery_graph(
             else {}
         ),
     }
-
-
-def save_local_graph(build, state: Path, default_sdk: str = "default") -> None:
-    """Record delivery metadata for existing local results without rebuilding."""
-    store = DeliveryStore(state)
-    products = {}
-    for port in build.graph.ports:
-        if port.reference not in build.results or port.role in {"host-tool", "target-platform"}:
-            continue
-        root = build.results[port.reference]
-        products[port.reference] = {"build_key": root.name, "delivery": publish_product(port, root, root.name, store)}
-    sdk = next((sdk for sdk in build.sdks.values() if sdk is not None), None)
-    abi = sdk.dynamic_abi if sdk is not None else None
-    runtime = (
-        publish_runtime(sdk.python.runtime_bundle, sdk.cpython_manifest.sha256, store)
-        if sdk is not None and sdk.python is not None
-        else None
-    )
-    if runtime is not None:
-        store.write("records/runtime/" + relative_path(default_sdk) + ".json", _json({"runtime": runtime}))
-    elif (cached := store.record("runtime/" + default_sdk)) is not None:
-        runtime = cached["runtime"]
-        abi = runtime["abi"]
-    write_reference(
-        state / "results.json", {"roots": build.graph.roots, "prefix": str(state.resolve()), "products": products}
-    )
-    write_reference(state / "graph.json", delivery_graph(build.graph, products, abi=abi, runtime=runtime))
 
 
 def _json(value: dict) -> bytes:
@@ -377,21 +224,3 @@ def export(
             for future in futures:
                 future.result()
     return {"packages": len(value["packages"]), "native": len(value["native"]), "assets_copied": copied}
-
-
-def main(arguments: Sequence[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--store", type=Path, default=Path("build/ports"))
-    parser.add_argument("--output", help="metadata output directory or cloud prefix; defaults to STORE/export")
-    parser.add_argument("--url-prefix", required=True, help="public base URL for stored assets")
-    parser.add_argument("--copy-assets", action="store_true")
-    parser.add_argument("--simple", action="store_true", help="also write a Simple repository HTML index")
-    args = parser.parse_args(arguments)
-    result = export(
-        args.store,
-        args.output or args.store / "export",
-        args.url_prefix,
-        copy_assets=args.copy_assets,
-        simple=args.simple,
-    )
-    print(json.dumps(result))

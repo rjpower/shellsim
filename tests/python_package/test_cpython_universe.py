@@ -412,7 +412,8 @@ def test_conflict_preserves_existing_files_and_skips_extension(live_universe) ->
 
 @pytest.fixture
 def delivery_catalog(tmp_path):
-    from ports.buildomatic.delivery import DeliveryStore, catalog, publish_runtime, wheel_metadata
+    from ports.buildomatic.delivery import DeliveryStore, catalog
+    from ports.buildomatic.delivery_products import publish_runtime, wheel_metadata
     from dataclasses import asdict
 
     store = tmp_path / "delivery"

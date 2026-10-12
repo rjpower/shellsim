@@ -61,7 +61,8 @@ For example, build the current pilot with the default threaded SDK:
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build python/kiwisolver python/packaging python/zss \
   --store /path/to/ports-cache \
-  --output /path/to/backend-release --check
+  --state build/ports
+uv run --extra buildomatic python -m ports check --state build/ports
 ```
 
 The guest probes solve Kiwi constraints and check translated C++ errors, import

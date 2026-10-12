@@ -51,12 +51,8 @@ selections. The SDK adds compiler/platform edges. Ordinary packages retain their
 own canonical identity. Runtime edges install guest requirements without adding
 link prefixes. Installation requirement ranges remain a separate resolver contract.
 
-Explicit retained Meson trees use
-`--workspace python/numpy=/path/to/build/meson-build`. The workspace binds source,
-configuration, actual target tools, product receipts and host code. It rejects
-unrecorded or incompatible existing trees. Packaging changes can reuse admitted
-compiled objects; immutable result identities still bind current builder code.
-LLVM has its own admitted persistent Ninja state and product inventories.
+Workers retain compatible compilation state in their cache; no caller-supplied
+build workspace is required. LLVM retains its own Ninja state.
 
 The alternative zlib configure and static FreeType Meson demonstrations live in
 `tests/fixtures/adapters`. They do not create alternate production package identities.

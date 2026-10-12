@@ -1,25 +1,18 @@
 # Buildomatic worker image
 
-The worker uses ordinary Ubuntu packages for GCC, headers, CMake, Ninja,
-pkg-config and other build utilities. uv installs a Python 3.13 build helper
-and Python generators in an image environment. sccache is installed as a
-normal executable. Rustup installs the declared Rust toolchain for the patched
-host resolver. Iris transports its runtime and the build code separately.
-
-No SDK, caller worktree, private host-tool inventory or build output is baked
-into this image. SDKs and port products are fetched from the configured store
-and retained in the worker's artifact cache. Docker layers cache dependency
-installation across code changes.
-
-Build and publish from the repository root:
+Ubuntu supplies ordinary build tools; uv supplies Python generators and Shellsim
+for guest checks. SDKs and products stay in the canonical store. Build the host
+wheel in Ubuntu 24.04 with Cargo/uv caches mounted, then use cached Docker layers.
+Run the first command inside that environment:
 
 ```sh
+uv run --with maturin maturin build --profile dev --strip --out ports/buildomatic/images/wheels
 docker buildx build --push --platform linux/amd64 \
-  --tag ghcr.io/marin-community/iris-task:buildomatic-ubuntu-v5 \
-  ports/buildomatic/images
+  --tag ghcr.io/marin-community/iris-task:buildomatic-unified-v8 ports/buildomatic/images
 ```
 
-Use the returned image digest for an Iris task. The service config enables
-sccache and supplies the regional storage environment; credentials remain in
-Iris. Match make/Ninja jobs to the task's CPU allocation. Start SDK bootstrap
-with 128 CPUs, 192 GiB RAM and 200 GiB disk at BATCH priority.
+Pin the returned digest in `IrisConfig`. Its `setup_scripts` should install the
+wheel into Iris's Python environment after `uv sync`:
+`uv pip install /opt/buildomatic/wheels/*.whl`. Enable `compiler_cache` for regional
+sccache. Allocate CPUs, RAM and disk for the selected producers at BATCH priority;
+`--jobs` controls compilation within each port.

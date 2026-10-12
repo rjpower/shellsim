@@ -8,7 +8,8 @@ NumPy 2.3.5 builds through upstream Meson with typed Python options. The SDK sup
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build python/numpy --store /path/to/ports-store \
-  --output /path/to/release --check
+  --state build/ports
+uv run --extra buildomatic python -m ports check --state build/ports
 ```
 
 See the [ports authoring guide](../../README.md) for SDK materialization,
