@@ -369,7 +369,7 @@ def test_native_release_loads_without_python_resolver_and_installs_tool(release_
     with pytest.raises(shellsim.PackageInstallError, match="not cached"):
         _NativePackageUniverse.from_release(descriptor, cache_dir=cache, offline=True)
     universe = _NativePackageUniverse.from_release(descriptor, cache_dir=cache)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     assert universe.install(environment, "make>=4.4,<5") == {"make": "4.4.1"}
     assert environment.read_file("/usr/bin/make") == b"guest make 4.4.1"
     (descriptor.parent / "native.zip").unlink()

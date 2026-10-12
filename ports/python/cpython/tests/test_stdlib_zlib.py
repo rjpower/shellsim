@@ -15,7 +15,7 @@ def test_independent_stdlib_zlib_roundtrip_and_errors():
     if bundle is None or extension is None:
         pytest.skip("set fixed SDK 34 runtime and SHELLSIM_STDLIB_ZLIB")
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024)
     runtime.mount(environment)
     root = Path(extension)
     manifest = json.loads((root / "manifest.json").read_text())

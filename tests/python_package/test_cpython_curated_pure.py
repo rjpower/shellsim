@@ -68,7 +68,7 @@ def test_real_curated_pytest_with_uncurated_pure_dependencies():
     runtime = shellsim.CPythonRuntime(os.environ[keys[0]], universe=root, uv=os.environ[keys[2]])
     image = runtime.bundle / "rootfs/usr/bin/python3.wasm"
     image_before = hashlib.sha256(image.read_bytes()).hexdigest()
-    env = shellsim.Environment(cpu=10_000_000_000, memory=1024**3, disk=256 * 1024**2)
+    env = shellsim.Context().Environment(cpu=10_000_000_000, memory=1024**3, disk=256 * 1024**2)
     runtime.mount(env)
     runtime.install_pypi(env, "pytest==8.4.1")
     dependencies = {"pluggy", "iniconfig", "packaging", "pygments"}
@@ -109,7 +109,7 @@ def test_public_curated_pure_rejection_preserves_guest(tmp_path, failure):
         assert "pytest-9.1.1" in (root / "pure-simple/pytest/index.html").read_text()
         request = "pytest==9.1.1"
     runtime = shellsim.CPythonRuntime(os.environ[keys[0]], universe=root, uv=os.environ[keys[2]])
-    env = shellsim.Environment(cpu=10_000_000_000, memory=1024**3, disk=256 * 1024**2)
+    env = shellsim.Context().Environment(cpu=10_000_000_000, memory=1024**3, disk=256 * 1024**2)
     runtime.mount(env)
     env.write_file("/sentinel", b"unchanged")
     with pytest.raises(shellsim.PackageInstallError):

@@ -67,12 +67,12 @@ def marked_wasm(abi: str = ABI) -> bytes:
 def test_dynamic_bundle_requires_explicit_universe(tmp_path: Path) -> None:
     runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
     with pytest.raises(shellsim.PackageInstallError, match="local universe"):
-        runtime.install_pypi(shellsim.Environment(), "numpy==2.3.5")
+        runtime.install_pypi(shellsim.Context().Environment(), "numpy==2.3.5")
 
 
 def test_dynamic_mount_selects_real_venv_launchers(tmp_path: Path) -> None:
     runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     runtime.mount(environment)
     assert environment.read_file("/work/.venv/pyvenv.cfg").startswith(b"home = /usr/bin\n")
     assert environment.run("readlink /usr/bin/python3; readlink /work/.venv/bin/python").stdout == (
@@ -90,21 +90,21 @@ def test_dynamic_mount_selects_real_venv_launchers(tmp_path: Path) -> None:
 
 def test_mount_preserves_custom_path_and_failed_mount_environment(tmp_path: Path) -> None:
     runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.run("export PATH=/custom/bin:/usr/bin:/bin")
     runtime.mount(environment)
     assert environment.run('printf \'%s\\n\' "$PATH" "$VIRTUAL_ENV"').stdout == (
         b"/work/.venv/bin:/custom/bin:/usr/bin:/bin\n/work/.venv\n"
     )
 
-    empty_path = shellsim.Environment()
+    empty_path = shellsim.Context().Environment()
     empty_path.run("export PATH=''")
     runtime.mount(empty_path)
     assert empty_path.run("printf '%s\\n' \"$PATH\"").stdout == b"/work/.venv/bin:\n"
     runtime.mount(empty_path)
     assert empty_path.run("printf '%s\\n' \"$PATH\"").stdout == b"/work/.venv/bin:\n"
 
-    conflicting = shellsim.Environment()
+    conflicting = shellsim.Context().Environment()
     conflicting.run("export PATH=/custom/bin:/usr/bin:/bin")
     conflicting.write_file("/usr/bin/python", b"custom launcher")
     with pytest.raises(shellsim.SimulationError, match="conflicts"):
@@ -118,7 +118,7 @@ def test_mount_preserves_custom_path_and_failed_mount_environment(tmp_path: Path
 
 def test_dynamic_mount_rolls_back_launcher_conflict(tmp_path: Path) -> None:
     runtime = shellsim.CPythonRuntime(make_bundle(tmp_path / "bundle"))
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.write_file("/usr/bin/python", b"custom launcher")
     with pytest.raises(shellsim.SimulationError, match="conflicts"):
         runtime.mount(environment)
@@ -327,7 +327,7 @@ def live_universe() -> tuple[shellsim.CPythonRuntime, shellsim.Environment]:
     if not all((bundle, catalog, uv)):
         pytest.skip("set SHELLSIM_DYNAMIC_V2_BUNDLE, SHELLSIM_CPYTHON_UNIVERSE, and SHELLSIM_PATCHED_UV")
     runtime = shellsim.CPythonRuntime(bundle, universe=catalog, uv=uv)
-    environment = shellsim.Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
     runtime.mount(environment)
     return runtime, environment
 
@@ -464,7 +464,7 @@ def delivery_catalog(tmp_path):
 
 def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(delivery_catalog):
     path, cache = delivery_catalog
-    environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
+    environment = shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages=["app"])
     site = "/work/.venv/lib/python3.13/site-packages/"
     assert environment.read_file("/usr/share/base/value.txt") == b"42"
     assert environment.read_file(site + "base.py") == b"VALUE = 42\n"
@@ -476,13 +476,13 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
     assert environment.read_file(site + "speed.py") == b"VALUE = 42\n"
     assert environment.run("test ! -e " + site + "host_only.py").returncode == 0
     environment.write_file("/private", b"first guest")
-    second = shellsim.Environment(pypi_packages=["app[fast_mode]"], pypi_catalog=path, cache_dir=cache, offline=True)
+    second = shellsim.Context(pypi_catalog=path, cache_dir=cache, offline=True).Environment(pypi_packages=["app[fast_mode]"])
     assert second.read_file(site + "app.py") == b"VALUE = 42\n"
     assert second.run("test ! -e /private").returncode == 0
     path.write_text("{}")
     with pytest.raises(shellsim.PackageInstallError):
-        shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
-    third = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache, offline=True)
+        shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages=["app"])
+    third = shellsim.Context(pypi_catalog=path, cache_dir=cache, offline=True).Environment(pypi_packages=["app"])
     assert third.read_file(site + "app.py") == b"VALUE = 42\n"
 
 
@@ -525,6 +525,7 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
             }
             for name, reference in (
                 ("clang", "native/example"),
+                ("clang++", "native/example"),
                 ("llvm-ar", "native/example"),
                 ("wasm-ld", "native/runtime"),
                 ("make", "native/make"),
@@ -551,14 +552,12 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
     if not trusted_precompiled:
         companion.unlink()
     cache = tmp_path / "cache"
-    first = shellsim.Environment(
-        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
-    )
+    first = shellsim.Context(pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled).Environment(tools=["cc", "make", "clang++", "clang++"])
     assert first.read_file("/usr/bin/make") == tool.read_bytes()
     assert first.run("make /missing-target").returncode == 0
     assert first.read_file("/usr/bin/llvm-ar") == tool.read_bytes()
     assert first.read_file("/usr/bin/wasm-ld") == tool.read_bytes()
-    assert first.run("cc && wasm-ld && ar").returncode == 0
+    assert first.run("cc && clang++ && wasm-ld && ar").returncode == 0
     assert first.read_file("/usr/share/example/value.txt") == b"42"
     assert first.read_file("/usr/include/development.h") == b"#define ANSWER 739\n"
     assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
@@ -572,12 +571,10 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
     tool.unlink()
     script.unlink()
     files.unlink()
-    second = shellsim.Environment(
-        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
-    )
+    second = shellsim.Context(pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled).Environment(tools=["clang++", "make", "cc"])
     assert second.read_file("/usr/share/example/value.txt") == b"42"
-    assert second.run("cc && wasm-ld && ar && make /missing-target").returncode == 0
-    ordinary = shellsim.Environment()
+    assert second.run("cc && clang++ && wasm-ld && ar && make /missing-target").returncode == 0
+    ordinary = shellsim.Context().Environment()
     ordinary.write_file("/usr/bin/make", b"guest-owned command", mode=0o755)
     saved = Catalog(path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled)
     with pytest.raises(shellsim.PackageInstallError):
@@ -588,7 +585,7 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
 
 def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog):
     path, cache = delivery_catalog
-    environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
+    environment = shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages=["app"])
     before = environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py")
     with pytest.raises(shellsim.PackageInstallError):
         environment.install_pypi("base<1")
@@ -626,9 +623,7 @@ def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path,
                 archive.writestr(member, b"untrusted" if member.filename.endswith("shellsim-precompiled.json") else data)
         document["packages"][-1]["size"] = wheel.stat().st_size
     path.write_text(json.dumps(document))
-    environment = shellsim.Environment(
-        pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
-    )
+    environment = shellsim.Context(pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled).Environment(pypi_packages="native")
     site = "/work/.venv/lib/python3.13/site-packages/"
     assert environment.read_file(site + "native.so") == raw
     assert environment.run("find / -name '*.cwasm' -o -name shellsim-precompiled.json").stdout == b""
@@ -640,7 +635,74 @@ def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path,
                 archive.writestr(member, data)
         document["packages"][-1]["size"] = wheel.stat().st_size
         path.write_text(json.dumps(document))
-        trusted = shellsim.Environment(
-            pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=True,
-        )
+        trusted = shellsim.Context(pypi_catalog=path, cache_dir=cache, trusted_precompiled=True).Environment(pypi_packages="native")
         assert trusted.read_file(site + "native.so") == raw
+
+
+def test_context_reuses_frozen_installation_without_host_assets(delivery_catalog):
+    """Warm creation must work after all trusted setup inputs disappear."""
+    import shutil
+
+    path, cache = delivery_catalog
+    context = shellsim.Context(pypi_catalog=path, cache_dir=cache)
+    first = context.Environment(pypi_packages=["app", "base>=1"])
+    installed = "/work/.venv/lib/python3.13/site-packages/base.py"
+    first.write_file(installed, b"private change")
+    first.run("export PRIVATE=first; cd /tmp")
+    path.write_text("{}")
+    changed_selection = context.Environment(pypi_packages="base")
+    assert changed_selection.read_file(installed) == b"VALUE = 42\n"
+    shutil.rmtree(cache)
+    second = context.Environment(pypi_packages=["BASE >= 1", "app", "app"], cpu=200_000_000)
+    assert second.read_file(installed) == b"VALUE = 42\n"
+    assert second.run("printf '%s:%s' \"${PRIVATE-unset}\" \"$PWD\"").stdout == b"unset:/"
+    assert first.read_file(installed) == b"private change"
+    with pytest.raises(shellsim.PackageInstallError):
+        shellsim.Context(pypi_catalog=path, cache_dir=cache)
+    del context
+    assert second.read_file(installed) == b"VALUE = 42\n"
+
+
+def test_context_concurrent_preparation_returns_isolated_guests(delivery_catalog):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    path, cache = delivery_catalog
+    context = shellsim.Context(pypi_catalog=path, cache_dir=cache)
+    ready = Barrier(4)
+
+    def create(index):
+        ready.wait()
+        environment = context.Environment(pypi_packages="app")
+        environment.write_file("/work/private", str(index))
+        return environment
+
+    with ThreadPoolExecutor(max_workers=4) as workers:
+        environments = list(workers.map(create, range(4)))
+    for index, environment in enumerate(environments):
+        assert environment.read_file("/work/private") == str(index).encode()
+        assert environment.read_file("/usr/share/base/value.txt") == b"42"
+    assert context.Environment(pypi_packages="app").run("test ! -e /work/private").returncode == 0
+
+
+def test_context_offline_miss_can_retry_after_assets_are_cached(delivery_catalog):
+    path, cache = delivery_catalog
+    shellsim.Context(pypi_catalog=path, cache_dir=cache)
+    offline = shellsim.Context(pypi_catalog=path, cache_dir=cache, offline=True)
+    with pytest.raises(shellsim.PackageInstallError):
+        offline.Environment(pypi_packages="app")
+    shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages="app")
+    assert offline.Environment(pypi_packages="app").read_file("/usr/share/base/value.txt") == b"42"
+
+
+def test_context_retention_budget_does_not_invalidate_live_guests(delivery_catalog):
+    import shutil
+
+    path, cache = delivery_catalog
+    shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages="app")
+    context = shellsim.Context(pypi_catalog=path, cache_dir=cache, offline=True, prepared_cache_bytes=0)
+    environment = context.Environment(pypi_packages="app")
+    shutil.rmtree(cache)
+    with pytest.raises(shellsim.PackageInstallError):
+        context.Environment(pypi_packages="app")
+    assert environment.read_file("/usr/share/base/value.txt") == b"42"

@@ -87,6 +87,8 @@ fn guest_replacement_cannot_select_native_companions_or_host_registration() {
         .write("/", "/app.cwasm", &companion, 0o755)
         .unwrap();
     assert_eq!(environment.run_script_capture("/app").0.exit_status, 23);
+    environment.vfs.append("/", "/app", b"\xff", 0o755).unwrap();
+    assert_eq!(environment.run_script_capture("/app").0.exit_status, 126);
     let replacement = wat::parse_str(
         r#"(module
             (import "wasi_snapshot_preview1" "proc_exit" (func $exit (param i32)))

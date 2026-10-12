@@ -88,7 +88,7 @@ def test_sealed_provider_rasterizes_real_font_in_guest(tmp_path):
         env=target_environment(Path(sdk)),
         check=True,
     )
-    guest = shellsim.Environment(cpu=1_000_000_000, memory=256 * 1024**2)
+    guest = shellsim.Context().Environment(cpu=1_000_000_000, memory=256 * 1024**2)
     guest.write_file("/font.wasm", executable.read_bytes(), mode=0o755)
     guest.write_file("/font.ttf", (ROOT / "tests/fixtures/fonts/DejaVuSans.ttf").read_bytes())
     result = guest.run("/font.wasm")

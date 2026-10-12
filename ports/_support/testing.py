@@ -41,10 +41,10 @@ def mount_guest(
     disk: int = 128 * 1024**2,
 ) -> Guest:
     """Mount the public CPython runtime and resolve declared package requirements."""
-    from shellsim import CPythonRuntime, Environment
+    from shellsim import Context, CPythonRuntime
 
     runtime = CPythonRuntime(bundle, universe=universe, uv=uv)
-    environment = Environment(cpu=cpu, memory=memory, disk=disk)
+    environment = Context().Environment(cpu=cpu, memory=memory, disk=disk)
     runtime.mount(environment)
     guest = Guest(runtime, environment, environment.read_file("/usr/bin/python3.wasm"))
     if requirements:

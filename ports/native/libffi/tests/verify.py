@@ -87,7 +87,7 @@ def run_probe(main: Path, provider: Path):
     """Execute the two compiled images inside shellsim's virtual filesystem."""
     import shellsim
 
-    environment = shellsim.Environment(cpu=500_000_000, memory=256 * 1024**2, disk=32 * 1024**2)
+    environment = shellsim.Context().Environment(cpu=500_000_000, memory=256 * 1024**2, disk=32 * 1024**2)
     environment.mkdir("/lib", parents=True)
     environment.write_file("/lib/libffi_probe.so", provider.read_bytes())
     environment.write_file("/probe", main.read_bytes(), mode=0o755)

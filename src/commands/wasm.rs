@@ -59,7 +59,7 @@ use engine::{configure_command_engine, ASYNC_STACK_BYTES};
 
 pub use precompiled::{
     precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
-    PrecompiledWasmOutcome, WasmCompilationKind,
+    register_trusted_precompiled_wasm_file, PrecompiledWasmOutcome, WasmCompilationKind,
 };
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
@@ -113,7 +113,7 @@ const ERRNO_RANGE: i32 = 68;
 type CompilationFlights = BTreeMap<[u8; 32], Weak<Mutex<()>>>;
 
 struct CachedModule {
-    source: Vec<u8>,
+    source: Arc<Vec<u8>>,
     compilation: CachedCompilation,
     bytes: usize,
     admission: Option<ExecutableAdmission>,
@@ -121,7 +121,7 @@ struct CachedModule {
 
 enum CachedCompilation {
     Ready(Module),
-    Precompiled(Arc<[u8]>),
+    Precompiled(precompiled::Companion),
 }
 
 #[derive(Clone)]
@@ -135,13 +135,30 @@ struct ModuleCache {
     bytes: usize,
 }
 
+// Retained Arc buffers cannot be mutated or freed behind a cache entry. Equal bytes from a
+// different installation still share compiled code, then adopt its buffer for later fast hits.
+fn same_module_source(cached: &[u8], incoming: &[u8]) -> bool {
+    std::ptr::eq(cached, incoming) || cached == incoming
+}
+
 impl ModuleCache {
-    fn get(&mut self, source: &[u8]) -> Option<Module> {
+    fn get(&mut self, source: &Arc<Vec<u8>>) -> Option<Module> {
         let index = self
             .entries
             .iter()
-            .position(|entry| entry.source == source)?;
-        let entry = self.entries.remove(index).expect("index from cache");
+            .position(|entry| same_module_source(entry.source.as_slice(), source))?;
+        let mut entry = self.entries.remove(index).expect("index from cache");
+        // A truncated VFS buffer may retain more allocation than its visible contents.
+        let bytes = entry
+            .bytes
+            .saturating_sub(entry.source.capacity())
+            .saturating_add(source.capacity());
+        let total = self.bytes.saturating_sub(entry.bytes).saturating_add(bytes);
+        if total <= MAX_CACHED_MODULE_BYTES {
+            entry.source = source.clone();
+            entry.bytes = bytes;
+            self.bytes = total;
+        }
         let module = match &entry.compilation {
             CachedCompilation::Ready(module) => Some(module.clone()),
             CachedCompilation::Precompiled(_) => None,
@@ -150,30 +167,41 @@ impl ModuleCache {
         module
     }
 
-    fn insert(&mut self, source: &[u8], module: Module) {
+    fn insert(&mut self, source: &Arc<Vec<u8>>, module: Module) {
         let image = module.image_range();
         let bytes = source
-            .len()
+            .capacity()
             .saturating_add((image.end as usize).saturating_sub(image.start as usize));
         self.insert_entry(source, CachedCompilation::Ready(module), bytes);
     }
 
-    fn pending(&self, source: &[u8]) -> Option<Arc<[u8]>> {
+    fn pending(&self, source: &[u8]) -> Option<precompiled::Companion> {
         self.entries
             .iter()
             .find_map(|entry| match &entry.compilation {
-                CachedCompilation::Precompiled(bytes) if entry.source == source => {
+                CachedCompilation::Precompiled(bytes)
+                    if same_module_source(entry.source.as_slice(), source) =>
+                {
                     Some(bytes.clone())
                 }
                 _ => None,
             })
     }
 
-    fn insert_entry(&mut self, source: &[u8], compilation: CachedCompilation, bytes: usize) {
+    fn insert_entry(
+        &mut self,
+        source: &Arc<Vec<u8>>,
+        compilation: CachedCompilation,
+        bytes: usize,
+    ) {
         if bytes > MAX_CACHED_MODULE_BYTES {
             return;
         }
-        if let Some(index) = self.entries.iter().position(|entry| entry.source == source) {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|entry| same_module_source(entry.source.as_slice(), source))
+        {
             let old = self.entries.remove(index).expect("matching cache entry");
             self.bytes -= old.bytes;
         }
@@ -187,7 +215,7 @@ impl ModuleCache {
             self.bytes -= old.bytes;
         }
         self.entries.push_back(CachedModule {
-            source: source.to_vec(),
+            source: source.clone(),
             compilation,
             bytes,
             admission: None,
@@ -220,7 +248,7 @@ fn executable_admission(source: &[u8]) -> Result<ExecutableAdmission, Error> {
         .expect("module cache lock")
         .entries
         .iter()
-        .find(|entry| entry.source == source)
+        .find(|entry| same_module_source(entry.source.as_slice(), source))
         .and_then(|entry| entry.admission.clone())
     {
         return Ok(admission);
@@ -242,7 +270,7 @@ fn retain_executable_admission(source: &[u8], admission: ExecutableAdmission) {
     let Some(index) = cache
         .entries
         .iter()
-        .position(|entry| entry.source == source)
+        .position(|entry| same_module_source(entry.source.as_slice(), source))
     else {
         return;
     };
@@ -265,7 +293,7 @@ fn retain_executable_admission(source: &[u8], admission: ExecutableAdmission) {
     cache.entries.push_back(entry);
 }
 
-fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
+fn compiled_command_module(source: &Arc<Vec<u8>>) -> Result<Module, Error> {
     let cache = command_module_cache();
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
         return Ok(module);
@@ -273,7 +301,7 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
     threads::reject_raw_waits(source)?;
     // Deduplicate only the same source. A cold tool must not block unrelated LRU hits.
     static FLIGHTS: OnceLock<Mutex<CompilationFlights>> = OnceLock::new();
-    let digest: [u8; 32] = Sha256::digest(source).into();
+    let digest: [u8; 32] = Sha256::digest(source.as_slice()).into();
     let flight = {
         let mut flights = FLIGHTS
             .get_or_init(Mutex::default)
@@ -295,9 +323,9 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
         return Ok(module);
     }
     let pending = cache.lock().expect("module cache lock").pending(source);
-    let module = match precompiled::load(pending.as_deref()) {
+    let module = match precompiled::load(pending.as_ref()) {
         Some(module) => module,
-        None => Module::new(command_engine(), source)?,
+        None => Module::new(command_engine(), source.as_slice())?,
     };
     cache
         .lock()
@@ -309,11 +337,14 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
 /// Rewrite only an admitted main executable. Side-library compilation uses the
 /// original source and must not pass through the main thread-profile checks.
 fn compiled_executable_module(
-    source: &[u8],
+    source: &Arc<Vec<u8>>,
     profile: Option<&threads::Profile>,
 ) -> Result<Module, Error> {
     let rewritten = executable_compilation_source(source, profile)?;
-    compiled_command_module(rewritten.as_deref().unwrap_or(source))
+    match rewritten {
+        Some(rewritten) => compiled_command_module(&Arc::new(rewritten)),
+        None => compiled_command_module(source),
+    }
 }
 
 /// Native companions and JIT compilation must use the same deferred-start cache key.
@@ -1148,21 +1179,10 @@ fn fd_filestat_set_size(mut caller: Caller<'_, Host>, fd: i32, size: u64) -> Res
     };
     let mut machine = caller.data_mut().machine.get();
     let system = &mut ActiveSystem::new(&mut machine);
-    let old_size = match system.metadata_fd(fd) {
-        Ok(info) => info.size,
-        Err(error) => return Ok(syscall_errno(&error)),
-    };
-    let growth = (size as u64).saturating_sub(old_size);
-    if !system.charge_cpu(growth.saturating_add(1)) {
-        return Err(exhausted());
-    }
-    if !system.reserve_memory(growth) {
-        return Err(exhausted());
-    }
     let resized = system.resize_file(fd, size);
-    system.release_memory(growth);
     Ok(match resized {
         Ok(()) => ERRNO_SUCCESS,
+        Err(SyscallError::ResourceExhausted) => return Err(exhausted()),
         Err(error) => syscall_errno(&error),
     })
 }
@@ -1843,6 +1863,7 @@ fn fd_write(
                         .mark_signal_termination(pid, crate::process::Signal::Pipe);
                     return Err(Error::new(GuestExit(141)));
                 }
+                Err(SyscallError::ResourceExhausted) => return Err(exhausted()),
                 Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
             }
         }
@@ -2812,7 +2833,7 @@ pub(super) fn validate_imports(
 /// Failures return an exit status and a diagnostic without a trailing newline.
 fn start_guest(interp: &mut Interp, launch: Launch<'_>) -> Result<Guest, (i32, String)> {
     let path = launch.path;
-    let wasm = match interp.vfs.read_limited("/", path, MAX_WASM_BYTES) {
+    let wasm = match interp.vfs.read_shared_limited("/", path, MAX_WASM_BYTES) {
         Ok(wasm) => wasm,
         Err(VfsError::TooLarge { .. }) => {
             return Err((126, format!("{path}: wasm module exceeds size limit")));
@@ -3631,6 +3652,67 @@ mod tests {
     }
 
     #[test]
+    fn private_source_cache_adoption_preserves_guest_mutation_budget() {
+        use crate::resources::Limits;
+        use crate::syscalls::{OpenFile, System};
+
+        // A local cache avoids unrelated process-global LRU activity affecting this scenario.
+        let source = wat::parse_str(format!(
+            "(module (memory 1) (data (i32.const 0) \"{}\") (func (export \"_start\")))",
+            "x".repeat(2048)
+        ))
+        .unwrap();
+        let module = Module::new(command_engine(), &source).unwrap();
+        let mut usages = Vec::new();
+        for adopt_other in [false, true] {
+            let mut cache = ModuleCache::default();
+            let mut machine = Interp::with_limits(Limits {
+                memory: 1024,
+                ..Limits::default()
+            });
+            machine.vfs.write("/", "/app", &source, 0o755).unwrap();
+            let retained = machine
+                .vfs
+                .read_shared_limited("/", "/app", MAX_WASM_BYTES)
+                .unwrap();
+            cache.insert(&retained, module.clone());
+            drop(retained);
+            if adopt_other {
+                let mut other = crate::vfs::Vfs::new();
+                other.write("/", "/app", &source, 0o755).unwrap();
+                let equivalent = other
+                    .read_shared_limited("/", "/app", MAX_WASM_BYTES)
+                    .unwrap();
+                assert!(Module::same(&module, &cache.get(&equivalent).unwrap()));
+            }
+            let mut system = ActiveSystem::new(&mut machine);
+            let fd = system
+                .open_file(
+                    "/",
+                    "/app",
+                    OpenFile {
+                        readable: true,
+                        writable: true,
+                        create: false,
+                        exclusive: false,
+                        truncate: false,
+                        append: false,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(system.write(fd, b"!"), Ok(IoPoll::Ready(1))));
+            assert_eq!(machine.vfs.read("/", "/app").unwrap()[0], b'!');
+            usages.push(
+                machine
+                    .resources
+                    .outcome(0, machine.vfs.disk_used(), machine.vfs.disk_peak())
+                    .usage,
+            );
+        }
+        assert_eq!(usages[0], usages[1]);
+    }
+
+    #[test]
     fn cache_reuses_exact_module_bytes_and_evicts_oldest_entry() {
         let mut cache = ModuleCache::default();
         let sources = (0..=MAX_CACHED_MODULES)
@@ -3638,16 +3720,29 @@ mod tests {
                 wat::parse_str(format!(
                     "(module (func (export \"_start\") (drop (i32.const {number}))))"
                 ))
+                .map(Arc::new)
                 .unwrap()
             })
             .collect::<Vec<_>>();
-        let first = Module::new(command_engine(), &sources[0]).unwrap();
+        let first = Module::new(command_engine(), sources[0].as_slice()).unwrap();
         cache.insert(&sources[0], first.clone());
         assert!(Module::same(&first, &cache.get(&sources[0]).unwrap()));
+        let mut equivalent = Arc::new(sources[0].as_ref().clone());
+        assert!(Module::same(&first, &cache.get(&equivalent).unwrap()));
+        // Adoption is the warm lookup invariant; byte equality alone would retain the scan.
+        assert!(Arc::ptr_eq(
+            &cache.entries.back().unwrap().source,
+            &equivalent
+        ));
+        Arc::make_mut(&mut equivalent).push(0xff);
+        assert!(cache.get(&equivalent).is_none());
         assert!(cache.get(&sources[1]).is_none());
 
         for source in sources.iter().skip(1) {
-            cache.insert(source, Module::new(command_engine(), source).unwrap());
+            cache.insert(
+                source,
+                Module::new(command_engine(), source.as_slice()).unwrap(),
+            );
         }
         assert_eq!(cache.entries.len(), MAX_CACHED_MODULES);
         assert!(cache.get(&sources[0]).is_none());

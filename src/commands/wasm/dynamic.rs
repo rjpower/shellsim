@@ -434,7 +434,7 @@ fn compile_library(
             .machine
             .get()
             .vfs
-            .read_limited("/", path, abi.library_limit().min(MAX_WASM_BYTES))
+            .read_shared_limited("/", path, abi.library_limit().min(MAX_WASM_BYTES))
             .map_err(|error| Error::msg(error.to_string()))?;
         let layout = layout(&source, abi)?;
         let module = compiled_command_module(&source)?;

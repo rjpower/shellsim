@@ -33,7 +33,7 @@ def test_container_host_can_stage_outside_workspace() -> None:
 
 
 def test_installed_c_toolchain_compiles_inside_guest() -> None:
-    guest = shellsim.Environment(limits=LIMITS)
+    guest = shellsim.Context().Environment(limits=LIMITS)
     shellsim_c_toolchain.install_c_toolchain(guest)
     guest.write_file("/work/hello.c", SOURCE)
 
@@ -117,14 +117,14 @@ def test_package_manifest_rejects_non_boolean_toolchain_requirement(tmp_path: Pa
 
 
 def test_installation_respects_guest_disk_limit() -> None:
-    guest = shellsim.Environment(limits=shellsim.Limits(cpu=50_000_000_000, disk=1024 * 1024))
+    guest = shellsim.Context().Environment(limits=shellsim.Limits(cpu=50_000_000_000, disk=1024 * 1024))
     with pytest.raises(shellsim.SimulationError):
         shellsim_c_toolchain.install_c_toolchain(guest)
 
 
 @pytest.mark.parametrize("path", ["/tcc", "/wasi-sysroot"])
 def test_installation_does_not_overwrite_existing_guest_files(path: str) -> None:
-    guest = shellsim.Environment(limits=LIMITS)
+    guest = shellsim.Context().Environment(limits=LIMITS)
     guest.write_file(path, b"original")
     with pytest.raises(shellsim.SimulationError):
         shellsim_c_toolchain.install_c_toolchain(guest)

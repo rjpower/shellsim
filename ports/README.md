@@ -18,7 +18,7 @@ additional variants. Progress logs go to stderr; command results are JSON on std
 Builds emit assets once; export writes a catalog and optional Simple HTML.
 `--backend iris --store <S3/GCS-prefix>` allocates a BATCH pool on cache misses
 and stops it on exit; `--iris-service` selects an existing pool instead.
-`Environment(pypi_packages=["scipy"], pypi_catalog="<catalog URL>")` fetches its
+`Context(pypi_catalog="<catalog URL>").Environment(pypi_packages=["scipy"])` fetches its
 selected wheels, native providers and interpreter without patched uv.
 
 A port's `recipe.json` declares its source pin, exact dependencies, exports and

@@ -35,7 +35,7 @@ def c_task_environment(c_build_mode: str) -> shellsim.Environment:
     if c_build_mode == "native-packages" and catalog is None:
         pytest.skip("set SHELLSIM_NATIVE_CATALOG to the verified GNU make and C compiler catalog")
     runtime = shellsim.CPythonRuntime(os.environ[keys[0]], universe=os.environ[keys[1]], uv=os.environ[keys[2]])
-    environment = shellsim.Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
+    environment = shellsim.Context().Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
     runtime.mount(environment)
     runtime.install_pypi(environment, "pytest==8.4.1")
     if c_build_mode == "native-packages":

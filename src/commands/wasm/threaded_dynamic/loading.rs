@@ -112,7 +112,7 @@ fn compile(
             .machine
             .get()
             .vfs
-            .read_limited("/", path, MAX_SOURCE_BYTES)
+            .read_shared_limited("/", path, MAX_SOURCE_BYTES)
             .map_err(|error| Error::msg(error.to_string()))?;
         threads::reject_raw_waits(&source)?;
         let layout = layout::parse(&source)?;
@@ -146,7 +146,12 @@ fn compile(
                 .saturating_add((length as u64).saturating_mul(8))
                 .saturating_add(65536),
         )?;
-        Ok((module, layout, Sha256::digest(&source).into(), store_cost))
+        Ok((
+            module,
+            layout,
+            Sha256::digest(source.as_slice()).into(),
+            store_cost,
+        ))
     })();
     caller
         .data()
@@ -284,9 +289,9 @@ impl Graph {
                     .machine
                     .get()
                     .vfs
-                    .read_limited("/", &path, MAX_SOURCE_BYTES)
+                    .read_shared_limited("/", &path, MAX_SOURCE_BYTES)
                     .map_err(|error| Error::msg(error.to_string()))?;
-                let digest: [u8; 32] = Sha256::digest(source).into();
+                let digest: [u8; 32] = Sha256::digest(source.as_slice()).into();
                 if digest != expected {
                     return Err(Error::msg("threaded dynamic source identity changed"));
                 }

@@ -82,7 +82,9 @@ def main() -> None:
         if args.doom or args.wad:
             parser.error("choose --catalog or --doom with --wad")
         qualify(
-            lambda limits: shellsim.Environment(tools=["doom"], pypi_catalog=args.catalog, limits=limits).to_container()
+            lambda limits: shellsim.Context(pypi_catalog=args.catalog)
+            .Environment(tools=["doom"], limits=limits)
+            .to_container()
         )
         return
     if args.doom is None or args.wad is None:

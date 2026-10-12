@@ -149,9 +149,12 @@ def test_successful_acceptance_does_not_publish_asset_cache(
         cpu: int = 0
 
     class FakeEnvironment:
-        @staticmethod
-        def from_release(_descriptor: Path, *, cache_dir: Path, **_kwargs: object) -> FakeEnvironment:
+        def __init__(self, *, cache_dir: Path | None = None):
+            self.cache_dir = cache_dir
+
+        def from_release(self, _descriptor: Path, **_kwargs: object) -> FakeEnvironment:
             nonlocal cache
+            cache_dir = self.cache_dir
             cache = cache_dir
             assert _kwargs["pypi"] == ["example==1.0"]
             if installation_kind == "pypi+native":
@@ -166,7 +169,7 @@ def test_successful_acceptance_does_not_publish_asset_cache(
         def run(self, _command: str) -> SimpleNamespace:
             return SimpleNamespace(stdout=b"ok\n", stderr=b"", returncode=0, stop_reason=None, usage=Usage())
 
-    monkeypatch.setitem(sys.modules, "shellsim", SimpleNamespace(Environment=FakeEnvironment))
+    monkeypatch.setitem(sys.modules, "shellsim", SimpleNamespace(Context=FakeEnvironment))
     output = tmp_path / "proof"
     result = accept_port(AcceptanceRequest(port, descriptor, output, installation_kind))
     assert written["/work/input.txt"] == b"fixture input"

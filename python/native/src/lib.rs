@@ -9,7 +9,7 @@ use std::any::Any;
 use std::collections::BTreeSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use base64::engine::general_purpose::STANDARD;
@@ -78,6 +78,65 @@ struct MetadataStart {
 #[pyclass(module = "shellsim._native")]
 struct NativeEnvironment {
     environment: Mutex<shellsim::Environment>,
+}
+
+/// Installed files and launcher settings, without an executing machine's state.
+#[pyclass(module = "shellsim._native")]
+struct NativeImage {
+    tree: Arc<shellsim::vfs::FrozenTree>,
+    path: Option<String>,
+    virtual_env: Option<String>,
+}
+
+#[pymethods]
+impl NativeImage {
+    #[getter]
+    fn retained_bytes(&self) -> u64 {
+        self.tree.retained_bytes()
+    }
+
+    /// Start a fresh machine on the shared installed tree, with private resource counters.
+    #[pyo3(signature = (cpu, memory, disk, output, real_time=false))]
+    fn environment(
+        &self,
+        py: Python<'_>,
+        cpu: u64,
+        memory: u64,
+        disk: u64,
+        output: u64,
+        real_time: bool,
+    ) -> PyResult<NativeEnvironment> {
+        py.detach(|| {
+            host_worker(|| {
+                let vfs = shellsim::vfs::Vfs::from_base(self.tree.clone(), disk)
+                    .map_err(|error| error.to_string())?;
+                let mut environment = shellsim::Environment::with_limits_and_clock(
+                    Limits {
+                        cpu,
+                        memory,
+                        disk,
+                        output,
+                    },
+                    if real_time {
+                        ClockMode::RealTime
+                    } else {
+                        ClockMode::Virtual
+                    },
+                );
+                environment.vfs = vfs;
+                for (name, value) in [("PATH", &self.path), ("VIRTUAL_ENV", &self.virtual_env)] {
+                    if let Some(value) = value {
+                        environment.set_var(name, value.clone());
+                        environment.export(name);
+                    }
+                }
+                Ok(NativeEnvironment {
+                    environment: Mutex::new(environment),
+                })
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
 }
 
 /// In-process host control for a machine granted the virtual tool endpoint.
@@ -488,6 +547,21 @@ impl NativeEnvironment {
             session.environment.net.enable_host_tools();
             Ok(NativeContainer {
                 session: Mutex::new(session),
+            })
+        })
+        .map_err(SimulationError::new_err)
+    }
+
+    /// Freeze trusted installation state for reuse by independently booted environments.
+    fn freeze(&self, py: Python<'_>) -> PyResult<NativeImage> {
+        py.detach(|| {
+            host_worker(|| {
+                let environment = self.lock_environment()?;
+                Ok(NativeImage {
+                    tree: environment.vfs.clone().freeze(),
+                    path: environment.get_var("PATH"),
+                    virtual_env: environment.get_var("VIRTUAL_ENV"),
+                })
             })
         })
         .map_err(SimulationError::new_err)
@@ -970,14 +1044,53 @@ fn compilation_kind(executable: bool) -> WasmCompilationKind {
     }
 }
 
+/// Register a host-owned companion, reusing admitted modules before reading native bytes.
+/// The caller guarantees the same trusted source association as the bytes-based entry point,
+/// and keeps file contents immutable while cached modules or live instances may use the mapping.
+#[pyfunction]
+#[pyo3(signature = (source, companion_path, executable=false))]
+fn register_trusted_precompiled_wasm_file(
+    py: Python<'_>,
+    source: Vec<u8>,
+    companion_path: String,
+    executable: bool,
+) -> PyResult<&'static str> {
+    let outcome = py
+        .detach(|| {
+            host_worker(|| {
+                let kind = compilation_kind(executable);
+                // SAFETY: this host-only adapter accepts the caller's explicitly trusted companion
+                // associated with these exact source bytes; guest paths never reach this API.
+                unsafe {
+                    shellsim::commands::register_trusted_precompiled_wasm_file(
+                        &source,
+                        Path::new(&companion_path),
+                        kind,
+                    )
+                }
+                .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)?;
+    Ok(match outcome {
+        PrecompiledWasmOutcome::Registered => "registered",
+        PrecompiledWasmOutcome::Incompatible => "incompatible",
+    })
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
+    module.add_class::<NativeImage>()?;
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
     module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
     module.add_function(wrap_pyfunction!(precompiled_wasm_build_id, module)?)?;
     module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;
+    module.add_function(wrap_pyfunction!(
+        register_trusted_precompiled_wasm_file,
+        module
+    )?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     module.add(
         "PackageConflictError",

@@ -59,7 +59,7 @@ def run_probe(runtime, artifact, consumer, memory):
     import shellsim
 
     fixed = shellsim.CPythonRuntime(runtime)
-    environment = shellsim.Environment(cpu=2_000_000_000, memory=memory, disk=128 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=2_000_000_000, memory=memory, disk=128 * 1024 * 1024)
     fixed.mount(environment)
     before = environment.read_file("/usr/bin/python3.wasm")
     environment.mkdir("/lib", parents=True)

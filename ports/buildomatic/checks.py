@@ -79,7 +79,7 @@ def stage_asset(store: DeliveryStore, item: dict, root: Path) -> None:
 
 
 def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Path) -> dict:
-    from shellsim import Environment
+    from shellsim import Context
     from shellsim._pypi_catalog import Catalog, unpack_files
     from shellsim.pypi import _mount_package_tree
 
@@ -130,22 +130,18 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
             for wheel in records["package:" + edge.recipe]["delivery"]["wheels"]
         ]
         if own.get("delivery", {}).get("wheels"):
-            environment = Environment(
-                pypi_packages=[requirement, *test_packages],
-                pypi_catalog=location,
-                cache_dir=cache / "guest",
-                trusted_precompiled=True,
-                **kwargs,
-            )
+            environment = Context(
+                pypi_catalog=location, cache_dir=cache / "guest", trusted_precompiled=True
+            ).Environment(pypi_packages=[requirement, *test_packages], **kwargs)
         else:
             from shellsim.cpython import CPythonRuntime
 
-            environment = Environment(
-                **(kwargs or {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2})
+            environment = Context().Environment(
+                **kwargs or {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2}
             )
             CPythonRuntime.from_catalog(installer).mount(environment)
     else:
-        environment = Environment(**kwargs)
+        environment = Context().Environment(**kwargs)
     staging = work / "guest"
     staging.mkdir()
     if not runtime or not own.get("delivery", {}).get("wheels"):

@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from shellsim import CPythonRuntime, Environment
+from shellsim import Context, CPythonRuntime
 
 
 def main():
@@ -13,7 +13,7 @@ def main():
     parser.add_argument("--uv", type=Path, required=True)
     args = parser.parse_args()
     runtime = CPythonRuntime(args.bundle, universe=args.universe, uv=args.uv)
-    environment = Environment(cpu=10_000_000_000, memory=1024**3, disk=128 * 1024**2)
+    environment = Context().Environment(cpu=10_000_000_000, memory=1024**3, disk=128 * 1024**2)
     runtime.mount(environment)
     runtime.install_pypi(environment, "magiccube==0.3.0")
     environment.write_file(

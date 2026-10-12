@@ -1,16 +1,23 @@
 //! In-memory virtual filesystem.
 //!
-//! The VFS is the single source of truth for all simulated file state. It is a flat
-//! `BTreeMap<path, Node>` keyed by clean absolute paths ("/" is the root). This keeps
-//! directory listing, rename, copy and snapshotting trivial at the scale of an RL task
-//! (thousands of files), while still supporting unix permissions, ownership and symlinks.
+//! The VFS is the single source of truth for all simulated file state. It combines an
+//! immutable installed tree and a private overlay keyed by clean absolute paths. Tombstones
+//! hide deleted installed nodes, and shared file buffers copy only on content mutation.
+//! Directory traversal merges both layers in path order.
 //! Node identities are allocated monotonically and survive rename, open-unlink and snapshots;
 //! copying or replacing a node allocates a new identity independently of its pathname.
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 pub type Mode = u32;
+
+/// Content work whose first mutation may detach an installed or snapshot-shared buffer.
+pub(crate) enum FileMutation {
+    Write,
+    Resize(usize),
+}
 
 /// Native program image stored by identity rather than pretending to contain machine bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,7 +93,7 @@ impl NativeProgram {
 
 #[derive(Clone, Debug)]
 pub enum NodeKind {
-    File(Vec<u8>),
+    File(Arc<Vec<u8>>),
     Dir,
     Symlink(String),
     NativeExecutable(NativeProgram),
@@ -118,7 +125,7 @@ impl Node {
     fn file(inode: u64, data: Vec<u8>, mode: Mode, mtime: u64) -> Self {
         Node {
             inode,
-            kind: NodeKind::File(data),
+            kind: NodeKind::File(Arc::new(data)),
             mode,
             uid: 0,
             gid: 0,
@@ -188,9 +195,49 @@ impl std::fmt::Display for VfsError {
 
 pub type Result<T> = std::result::Result<T, VfsError>;
 
+/// Immutable installed filesystem shared by independent execution environments.
+pub struct FrozenTree {
+    nodes: BTreeMap<String, Node>,
+    baseline_dirs: BTreeSet<String>,
+    baseline_native: BTreeMap<String, NativeProgram>,
+    next_inode: u64,
+    disk_used: u64,
+}
+
+impl FrozenTree {
+    /// Logical usage charged to every environment using this installation.
+    pub fn disk_used(&self) -> u64 {
+        self.disk_used
+    }
+
+    /// Conservative retained size for the installation cache, including node metadata.
+    pub fn retained_bytes(&self) -> u64 {
+        self.nodes.iter().fold(0u64, |total, (path, node)| {
+            let payload = match &node.kind {
+                NodeKind::File(data) => data.capacity(),
+                NodeKind::Symlink(target) => target.capacity(),
+                NodeKind::Dir | NodeKind::NativeExecutable(_) => 0,
+            };
+            total
+                .saturating_add(NODE_OVERHEAD)
+                .saturating_add(path.capacity() as u64)
+                .saturating_add(payload as u64)
+        })
+    }
+}
+
+#[derive(Clone)]
+enum OverlayEntry {
+    Present(Node),
+    Deleted,
+}
+
 #[derive(Clone)]
 pub struct Vfs {
-    nodes: BTreeMap<String, Node>,
+    base: Arc<FrozenTree>,
+    overlay: BTreeMap<String, OverlayEntry>,
+    /// Visible nodes, so callers can prepay directory scans before traversing the merged tree.
+    node_count: usize,
     /// Unlinked files retained by open descriptions until their last close.
     orphaned: BTreeMap<u64, Node>,
     next_orphan: u64,
@@ -291,6 +338,104 @@ pub fn basename(path: &str) -> &str {
 }
 
 impl Vfs {
+    /// Bytes copied before a guest mutation, excluding growth already charged by its caller.
+    /// Base nodes require copying even when their payload has only one Arc owner: copy-up
+    /// introduces the second owner, and the installed tree must remain immutable.
+    pub(crate) fn file_cow_bytes(
+        &self,
+        cwd: &str,
+        path: &str,
+        mutation: FileMutation,
+    ) -> Result<u64> {
+        let target = self.write_target(cwd, path)?;
+        let Some(node) = self.raw_get(&target) else {
+            return Ok(0);
+        };
+        let shared = !self.overlay.contains_key(&target);
+        Ok(cow_copy_bytes(node, shared, mutation))
+    }
+
+    pub(crate) fn orphan_cow_bytes(&self, id: u64, mutation: FileMutation) -> Result<u64> {
+        Ok(cow_copy_bytes(self.orphan_metadata(id)?, false, mutation))
+    }
+    /// Consume installed filesystem state, excluding open descriptions and execution counters.
+    pub fn freeze(self) -> Arc<FrozenTree> {
+        let disk_used = self
+            .measured_usage()
+            .saturating_sub(self.orphaned.values().fold(0u64, |total, node| {
+                total
+                    .saturating_add(NODE_OVERHEAD)
+                    .saturating_add(node_payload_len(node))
+            }));
+        let nodes = self
+            .all_paths()
+            .map(|(path, node)| (path.clone(), node.clone()))
+            .collect();
+        Arc::new(FrozenTree {
+            nodes,
+            baseline_dirs: self.baseline_dirs,
+            baseline_native: self.baseline_native,
+            next_inode: self.next_inode,
+            disk_used,
+        })
+    }
+
+    /// Start a private writable view, charging the installed logical usage against its quota.
+    pub fn from_base(base: Arc<FrozenTree>, disk_limit: u64) -> Result<Self> {
+        if base.disk_used > disk_limit {
+            return Err(VfsError::NoSpace);
+        }
+        Ok(Self {
+            overlay: BTreeMap::new(),
+            node_count: base.nodes.len(),
+            orphaned: BTreeMap::new(),
+            next_orphan: 1,
+            next_inode: base.next_inode,
+            mutation_time_ms: 0,
+            disk_limit,
+            baseline_dirs: base.baseline_dirs.clone(),
+            baseline_native: base.baseline_native.clone(),
+            disk_used: base.disk_used,
+            disk_peak: base.disk_used,
+            read_bytes: Cell::new(0),
+            base,
+        })
+    }
+
+    fn contains_node(&self, path: &str) -> bool {
+        self.raw_get(path).is_some()
+    }
+
+    fn node_mut(&mut self, path: &str) -> Option<&mut Node> {
+        if !self.overlay.contains_key(path) {
+            let node = self.base.nodes.get(path)?.clone();
+            self.overlay
+                .insert(path.to_string(), OverlayEntry::Present(node));
+        }
+        match self.overlay.get_mut(path) {
+            Some(OverlayEntry::Present(node)) => Some(node),
+            _ => None,
+        }
+    }
+
+    fn insert_node(&mut self, path: String, node: Node) {
+        if !self.contains_node(&path) {
+            self.node_count = self.node_count.saturating_add(1);
+        }
+        self.overlay.insert(path, OverlayEntry::Present(node));
+    }
+
+    fn remove_node(&mut self, path: &str) -> Option<Node> {
+        let node = self.raw_get(path)?.clone();
+        self.node_count = self.node_count.saturating_sub(1);
+        if self.base.nodes.contains_key(path) {
+            self.overlay.insert(path.to_string(), OverlayEntry::Deleted);
+        } else {
+            self.overlay.remove(path);
+        }
+        Some(node)
+    }
+
     pub fn new() -> Self {
         Self::with_disk_limit(u64::MAX)
     }
@@ -298,9 +443,17 @@ impl Vfs {
     pub fn with_disk_limit(disk_limit: u64) -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert("/".to_string(), Node::dir(1, 0o755, 0));
-        let disk_used = logical_usage(&nodes);
+        let disk_used = logical_usage(nodes.iter());
         Vfs {
-            nodes,
+            base: Arc::new(FrozenTree {
+                nodes,
+                baseline_dirs: BTreeSet::new(),
+                baseline_native: BTreeMap::new(),
+                next_inode: 2,
+                disk_used,
+            }),
+            overlay: BTreeMap::new(),
+            node_count: 1,
             orphaned: BTreeMap::new(),
             next_orphan: 1,
             next_inode: 2,
@@ -363,8 +516,7 @@ impl Vfs {
         for path in paths {
             let path = normalize(path);
             let inode = self.allocate_inode().expect("base image inode capacity");
-            self.nodes
-                .insert(path.clone(), Node::dir(inode, 0o755, self.mutation_time_ms));
+            self.insert_node(path.clone(), Node::dir(inode, 0o755, self.mutation_time_ms));
             self.baseline_dirs.insert(path);
         }
         self.refresh_usage();
@@ -410,8 +562,7 @@ impl Vfs {
 
     fn projected_usage_after_replacement(&self, path: &str, replacement_usage: u64) -> Result<u64> {
         let previous = self
-            .nodes
-            .get(path)
+            .raw_get(path)
             .map_or(0, |node| self.node_usage(path, node));
         let used = self
             .disk_used
@@ -441,7 +592,7 @@ impl Vfs {
                 format!("{current}/{component}")
             };
             let real = self.realpath(&next, true).unwrap_or(next);
-            match self.nodes.get(&real) {
+            match self.raw_get(&real) {
                 Some(Node {
                     kind: NodeKind::Dir,
                     ..
@@ -466,8 +617,7 @@ impl Vfs {
         self.check_inode_capacity(additions.len())?;
         for path in additions {
             let inode = self.allocate_inode()?;
-            self.nodes
-                .insert(path, Node::dir(inode, 0o755, self.mutation_time_ms));
+            self.insert_node(path, Node::dir(inode, 0o755, self.mutation_time_ms));
         }
         Ok(())
     }
@@ -478,7 +628,7 @@ impl Vfs {
             .iter()
             .filter(|path| {
                 matches!(
-                    self.nodes.get(path.as_str()),
+                    self.raw_get(path.as_str()),
                     Some(Node {
                         kind: NodeKind::Dir,
                         ..
@@ -491,7 +641,7 @@ impl Vfs {
             .iter()
             .filter(|(path, program)| {
                 matches!(
-                    self.nodes.get(path.as_str()),
+                    self.raw_get(path.as_str()),
                     Some(Node {
                         kind: NodeKind::NativeExecutable(actual),
                         ..
@@ -499,7 +649,7 @@ impl Vfs {
                 )
             })
             .count() as u64;
-        logical_usage(&self.nodes)
+        logical_usage(self.all_paths())
             .saturating_sub(present_baseline_dirs.saturating_mul(NODE_OVERHEAD))
             .saturating_sub(present_baseline_native.saturating_mul(NODE_OVERHEAD))
             .saturating_add(self.orphaned.values().fold(0_u64, |total, node| {
@@ -510,7 +660,11 @@ impl Vfs {
     // ---- low level ----
 
     pub fn raw_get(&self, abs: &str) -> Option<&Node> {
-        self.nodes.get(abs)
+        match self.overlay.get(abs) {
+            Some(OverlayEntry::Present(node)) => Some(node),
+            Some(OverlayEntry::Deleted) => None,
+            None => self.base.nodes.get(abs),
+        }
     }
 
     /// Resolve symlinks along a normalized absolute path, returning the final real path.
@@ -534,7 +688,7 @@ impl Vfs {
         } else {
             format!("{real_parent}/{name}")
         };
-        match self.nodes.get(&candidate) {
+        match self.raw_get(&candidate) {
             Some(Node {
                 kind: NodeKind::Symlink(target),
                 ..
@@ -549,14 +703,14 @@ impl Vfs {
     pub fn exists(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         self.realpath(&abs, true)
-            .map(|p| self.nodes.contains_key(&p))
+            .map(|p| self.contains_node(&p))
             .unwrap_or(false)
     }
 
     pub fn lexists(&self, cwd: &str, path: &str) -> bool {
         let abs = resolve_against(cwd, path);
         self.realpath(&abs, false)
-            .map(|p| self.nodes.contains_key(&p))
+            .map(|p| self.contains_node(&p))
             .unwrap_or(false)
     }
 
@@ -564,7 +718,7 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, true) {
             Ok(p) => matches!(
-                self.nodes.get(&p),
+                self.raw_get(&p),
                 Some(Node {
                     kind: NodeKind::Dir,
                     ..
@@ -578,7 +732,7 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, true) {
             Ok(p) => matches!(
-                self.nodes.get(&p),
+                self.raw_get(&p),
                 Some(Node {
                     kind: NodeKind::File(_) | NodeKind::NativeExecutable(_),
                     ..
@@ -592,7 +746,7 @@ impl Vfs {
     pub fn file_len(&self, cwd: &str, path: &str) -> Result<usize> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::File(data),
                 ..
@@ -613,7 +767,7 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         match self.realpath(&abs, false) {
             Ok(p) => matches!(
-                self.nodes.get(&p),
+                self.raw_get(&p),
                 Some(Node {
                     kind: NodeKind::Symlink(_),
                     ..
@@ -628,14 +782,14 @@ impl Vfs {
     pub fn read(&self, cwd: &str, path: &str) -> Result<Vec<u8>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::File(d),
                 ..
             }) => {
                 self.read_bytes
                     .set(self.read_bytes.get().saturating_add(d.len() as u64));
-                Ok(d.clone())
+                Ok(d.as_ref().clone())
             }
             Some(Node {
                 kind: NodeKind::Dir,
@@ -653,9 +807,17 @@ impl Vfs {
 
     /// Read a file as exact bytes only when it is within `limit`.
     pub fn read_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>> {
+        self.read_shared_limited(cwd, path, limit)
+            .map(Arc::unwrap_or_clone)
+    }
+
+    /// Retain installed bytes within `limit`, counting the same logical read as an owned read.
+    /// Private file bytes are copied: external cache retention must not affect their guest
+    /// copy-on-write costs. Unchanged installed buffers remain shareable through metadata edits.
+    pub fn read_shared_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Arc<Vec<u8>>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::File(data),
                 ..
@@ -668,7 +830,14 @@ impl Vfs {
                 }
                 self.read_bytes
                     .set(self.read_bytes.get().saturating_add(data.len() as u64));
-                Ok(data.clone())
+                let installed = self.base.nodes.get(&real).is_some_and(|node| {
+                    matches!(&node.kind, NodeKind::File(base_data) if Arc::ptr_eq(base_data, data))
+                });
+                if installed {
+                    Ok(data.clone())
+                } else {
+                    Ok(Arc::new(data.as_ref().clone()))
+                }
             }
             Some(Node {
                 kind: NodeKind::Dir,
@@ -698,7 +867,7 @@ impl Vfs {
     ) -> Result<Vec<u8>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::File(data),
                 ..
@@ -731,7 +900,7 @@ impl Vfs {
     pub fn read_string_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<String> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::File(data),
                 ..
@@ -777,7 +946,7 @@ impl Vfs {
     ) -> Result<bool> {
         for parent in std::path::Path::new(path).ancestors().skip(1) {
             let parent = parent.to_str().expect("VFS paths are UTF-8");
-            if let Some(node) = self.nodes.get(parent) {
+            if let Some(node) = self.raw_get(parent) {
                 if !matches!(node.kind, NodeKind::Dir) {
                     return Err(VfsError::Invalid(format!(
                         "package destination has a non-directory ancestor: {path}"
@@ -790,13 +959,13 @@ impl Vfs {
                 "package destination follows a link: {path}"
             )));
         }
-        let Some(node) = self.nodes.get(path) else {
+        let Some(node) = self.raw_get(path) else {
             return Ok(false);
         };
         match (&node.kind, contents) {
             (NodeKind::Dir, None) => Ok(true),
             (NodeKind::File(existing), Some(incoming))
-                if existing == incoming && node.mode & mode & 0o555 == mode & 0o555 =>
+                if existing.as_slice() == incoming && node.mode & mode & 0o555 == mode & 0o555 =>
             {
                 Ok(true)
             }
@@ -816,8 +985,7 @@ impl Vfs {
     pub(crate) fn metadata_ref(&self, cwd: &str, path: &str, follow: bool) -> Result<&Node> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, follow)?;
-        self.nodes
-            .get(&real)
+        self.raw_get(&real)
             .ok_or_else(|| VfsError::NotFound(path.to_string()))
     }
 
@@ -825,7 +993,7 @@ impl Vfs {
     pub fn list_dir(&self, cwd: &str, path: &str) -> Result<Vec<String>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -839,7 +1007,7 @@ impl Vfs {
             format!("{real}/")
         };
         let mut out = Vec::new();
-        for key in self.nodes.keys() {
+        for key in self.all_paths().map(|(path, _)| path) {
             if let Some(rest) = key.strip_prefix(&prefix) {
                 if !rest.is_empty() && !rest.contains('/') {
                     out.push(rest.to_string());
@@ -858,7 +1026,7 @@ impl Vfs {
             format!("{abs_dir}/")
         };
         let mut out = Vec::new();
-        for key in self.nodes.keys() {
+        for key in self.all_paths().map(|(path, _)| path) {
             if key == abs_dir || key.starts_with(&prefix) {
                 out.push(key.clone());
             }
@@ -869,7 +1037,7 @@ impl Vfs {
     pub fn read_link(&self, cwd: &str, path: &str) -> Result<String> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, false)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::Symlink(t),
                 ..
@@ -899,7 +1067,7 @@ impl Vfs {
     fn require_parent_dir(&self, abs: &str) -> Result<()> {
         let parent = parent_of(abs).unwrap_or_else(|| "/".to_string());
         let real_parent = self.realpath(&parent, true)?;
-        match self.nodes.get(&real_parent) {
+        match self.raw_get(&real_parent) {
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -928,7 +1096,7 @@ impl Vfs {
         let target = self.write_target(cwd, path)?;
         self.require_parent_dir(&target)?;
         if matches!(
-            self.nodes.get(&target),
+            self.raw_get(&target),
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -938,18 +1106,19 @@ impl Vfs {
         }
         let replacement_usage = NODE_OVERHEAD.saturating_add(data.len() as u64);
         let used = self.projected_usage_after_replacement(&target, replacement_usage)?;
-        match self.nodes.get_mut(&target) {
+        let mutation_time_ms = self.mutation_time_ms;
+        match self.node_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
                 mtime,
                 ..
             }) => {
-                *d = data.to_vec();
-                *mtime = self.mutation_time_ms;
+                *d = Arc::new(data.to_vec());
+                *mtime = mutation_time_ms;
             }
             _ => {
                 let inode = self.allocate_inode()?;
-                self.nodes.insert(
+                self.insert_node(
                     target,
                     Node::file(inode, data.to_vec(), mode, self.mutation_time_ms),
                 );
@@ -962,7 +1131,7 @@ impl Vfs {
     pub fn append(&mut self, cwd: &str, path: &str, data: &[u8], mode: Mode) -> Result<()> {
         let target = self.write_target(cwd, path)?;
         self.require_parent_dir(&target)?;
-        let added = match self.nodes.get(&target) {
+        let added = match self.raw_get(&target) {
             Some(Node {
                 kind: NodeKind::File(_),
                 ..
@@ -978,18 +1147,19 @@ impl Vfs {
             None => NODE_OVERHEAD.saturating_add(data.len() as u64),
         };
         let used = self.usage_after_adding(added)?;
-        match self.nodes.get_mut(&target) {
+        let mutation_time_ms = self.mutation_time_ms;
+        match self.node_mut(&target) {
             Some(Node {
                 kind: NodeKind::File(d),
                 mtime,
                 ..
             }) => {
-                d.extend_from_slice(data);
-                *mtime = self.mutation_time_ms;
+                Arc::make_mut(d).extend_from_slice(data);
+                *mtime = mutation_time_ms;
             }
             _ => {
                 let inode = self.allocate_inode()?;
-                self.nodes.insert(
+                self.insert_node(
                     target,
                     Node::file(inode, data.to_vec(), mode, self.mutation_time_ms),
                 );
@@ -1015,7 +1185,7 @@ impl Vfs {
         let end = offset
             .checked_add(data.len())
             .ok_or_else(|| VfsError::Invalid(path.to_string()))?;
-        let existing_len = match self.nodes.get(&target) {
+        let existing_len = match self.raw_get(&target) {
             Some(Node {
                 kind: NodeKind::File(bytes),
                 ..
@@ -1029,15 +1199,16 @@ impl Vfs {
         };
         let growth = end.saturating_sub(existing_len) as u64;
         let used = self.usage_after_adding(growth)?;
-        let node = self.nodes.get_mut(&target).expect("file was checked above");
+        let mutation_time_ms = self.mutation_time_ms;
+        let node = self.node_mut(&target).expect("file was checked above");
         let NodeKind::File(bytes) = &mut node.kind else {
             unreachable!("file was checked above")
         };
         if end > bytes.len() {
-            bytes.resize(end, 0);
+            Arc::make_mut(bytes).resize(end, 0);
         }
-        bytes[offset..end].copy_from_slice(data);
-        node.mtime = self.mutation_time_ms;
+        Arc::make_mut(bytes)[offset..end].copy_from_slice(data);
+        node.mtime = mutation_time_ms;
         self.record_usage(used);
         Ok(())
     }
@@ -1049,28 +1220,26 @@ impl Vfs {
         let used = self
             .usage_after_adding(size.saturating_sub(old_size) as u64)?
             .saturating_sub(old_size.saturating_sub(size) as u64);
-        let node = self
-            .nodes
-            .get_mut(&target)
-            .expect("existing file was checked");
+        let mutation_time_ms = self.mutation_time_ms;
+        let node = self.node_mut(&target).expect("existing file was checked");
         let NodeKind::File(bytes) = &mut node.kind else {
             unreachable!("regular file was checked");
         };
-        bytes.resize(size, 0);
-        node.mtime = self.mutation_time_ms;
+        resize_buffer(bytes, size);
+        node.mtime = mutation_time_ms;
         self.record_usage(used);
         Ok(())
     }
 
     pub fn mkdir(&mut self, cwd: &str, path: &str) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        if self.nodes.contains_key(&target) {
+        if self.contains_node(&target) {
             return Err(VfsError::Exists(path.to_string()));
         }
         self.require_parent_dir(&target)?;
         let node = Node::dir(self.allocate_inode()?, 0o755, self.mutation_time_ms);
         let used = self.usage_after_adding(self.node_usage(&target, &node))?;
-        self.nodes.insert(target, node);
+        self.insert_node(target, node);
         self.record_usage(used);
         Ok(())
     }
@@ -1094,13 +1263,13 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, false)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
             }) => Err(VfsError::IsADir(path.to_string())),
             Some(_) => {
-                self.nodes.remove(&real);
+                self.remove_node(&real);
                 self.refresh_usage();
                 Ok(())
             }
@@ -1115,14 +1284,14 @@ impl Vfs {
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, false)?;
         if !matches!(
-            self.nodes.get(&real).map(|node| &node.kind),
+            self.raw_get(&real).map(|node| &node.kind),
             Some(NodeKind::File(_))
         ) {
             return Err(VfsError::NotFound(path.to_string()));
         }
         let id = self.next_orphan;
         self.next_orphan = id.checked_add(1).ok_or(VfsError::NoSpace)?;
-        let node = self.nodes.remove(&real).expect("file was checked");
+        let node = self.remove_node(&real).expect("file was checked");
         self.orphaned.insert(id, node);
         self.refresh_usage();
         Ok(id)
@@ -1176,9 +1345,9 @@ impl Vfs {
             return Err(VfsError::NoSpace);
         }
         if end > bytes.len() {
-            bytes.resize(end, 0);
+            Arc::make_mut(bytes).resize(end, 0);
         }
-        bytes[offset..end].copy_from_slice(data);
+        Arc::make_mut(bytes)[offset..end].copy_from_slice(data);
         node.mtime = self.mutation_time_ms;
         self.record_usage(self.disk_used.saturating_add(growth));
         Ok(())
@@ -1197,7 +1366,7 @@ impl Vfs {
         let NodeKind::File(bytes) = &mut node.kind else {
             unreachable!("orphan is always a file");
         };
-        bytes.resize(size, 0);
+        resize_buffer(bytes, size);
         node.mtime = self.mutation_time_ms;
         self.record_usage(used);
         Ok(())
@@ -1224,11 +1393,11 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, false)?;
-        if !self.nodes.contains_key(&real) {
+        if !self.contains_node(&real) {
             return Err(VfsError::NotFound(path.to_string()));
         }
         for k in self.walk(&real) {
-            self.nodes.remove(&k);
+            self.remove_node(&k);
         }
         self.refresh_usage();
         Ok(())
@@ -1238,7 +1407,7 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
-        match self.nodes.get(&real) {
+        match self.raw_get(&real) {
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -1246,7 +1415,7 @@ impl Vfs {
                 if !self.list_dir(cwd, path)?.is_empty() {
                     return Err(VfsError::NotEmpty(path.to_string()));
                 }
-                self.nodes.remove(&real);
+                self.remove_node(&real);
                 self.refresh_usage();
                 Ok(())
             }
@@ -1259,13 +1428,13 @@ impl Vfs {
         let from_abs = resolve_against(cwd, from);
         reject_pseudo_mutation(&from_abs)?;
         let from_real = self.realpath(&from_abs, false)?;
-        if !self.nodes.contains_key(&from_real) {
+        if !self.contains_node(&from_real) {
             return Err(VfsError::NotFound(from.to_string()));
         }
         let mut to_target = self.write_target(cwd, to)?;
         // moving into an existing directory
         if matches!(
-            self.nodes.get(&to_target),
+            self.raw_get(&to_target),
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -1283,12 +1452,12 @@ impl Vfs {
         // counting, so the usage change is the per-node difference.
         let mut delta: i128 = 0;
         for k in &subtree {
-            let node = &self.nodes[k];
+            let node = self.raw_get(k).unwrap();
             let newk = format!("{to_target}{}", &k[from_real.len()..]);
             check_path_limits(&newk)?;
             delta += i128::from(self.node_usage(&newk, node));
             delta -= i128::from(self.node_usage(k, node));
-            if let Some(replaced) = self.nodes.get(&newk) {
+            if let Some(replaced) = self.raw_get(&newk) {
                 if !subtree.contains(&newk) {
                     delta -= i128::from(self.node_usage(&newk, replaced));
                 }
@@ -1296,10 +1465,10 @@ impl Vfs {
         }
         let used = self.usage_after_delta(delta)?;
         for k in subtree {
-            let node = self.nodes.remove(&k).unwrap();
+            let node = self.remove_node(&k).unwrap();
             let suffix = &k[from_real.len()..];
             let newk = format!("{to_target}{suffix}");
-            self.nodes.insert(newk, node);
+            self.insert_node(newk, node);
         }
         self.record_usage(used);
         Ok(())
@@ -1321,12 +1490,52 @@ impl Vfs {
             };
             let used =
                 self.projected_usage_after_replacement(&target, self.node_usage(&target, &node))?;
-            self.nodes.insert(target, node);
+            self.insert_node(target, node);
             self.record_usage(used);
             return Ok(());
         }
-        let data = self.read(cwd, from)?;
-        self.write(cwd, to, &data, source.mode)
+        let NodeKind::File(data) = source.kind else {
+            // Keep the existing public error behavior for non-regular operands.
+            self.read(cwd, from)?;
+            unreachable!("read only accepts regular files")
+        };
+        let target = self.write_target(cwd, to)?;
+        self.require_parent_dir(&target)?;
+        if matches!(
+            self.raw_get(&target).map(|node| &node.kind),
+            Some(NodeKind::Dir)
+        ) {
+            return Err(VfsError::IsADir(to.to_string()));
+        }
+        let used = self.projected_usage_after_replacement(
+            &target,
+            NODE_OVERHEAD.saturating_add(data.len() as u64),
+        )?;
+        self.read_bytes
+            .set(self.read_bytes.get().saturating_add(data.len() as u64));
+        let mutation_time_ms = self.mutation_time_ms;
+        match self.node_mut(&target) {
+            Some(Node {
+                kind: NodeKind::File(contents),
+                mtime,
+                ..
+            }) => {
+                *contents = data;
+                *mtime = mutation_time_ms;
+            }
+            _ => {
+                let mut node = Node::file(
+                    self.allocate_inode()?,
+                    Vec::new(),
+                    source.mode,
+                    mutation_time_ms,
+                );
+                node.kind = NodeKind::File(data);
+                self.insert_node(target, node);
+            }
+        }
+        self.record_usage(used);
+        Ok(())
     }
 
     /// Copy a subtree within the VFS, optionally retaining each node's virtual modification time.
@@ -1352,7 +1561,7 @@ impl Vfs {
         }
         let mut to_target = self.write_target(cwd, to)?;
         if matches!(
-            self.nodes.get(&to_target),
+            self.raw_get(&to_target),
             Some(Node {
                 kind: NodeKind::Dir,
                 ..
@@ -1368,25 +1577,25 @@ impl Vfs {
         let subtree = self.walk(&from_real);
         let mut delta: i128 = 0;
         for k in &subtree {
-            let node = &self.nodes[k];
+            let node = self.raw_get(k).unwrap();
             let newk = format!("{to_target}{}", &k[from_real.len()..]);
             check_path_limits(&newk)?;
             delta += i128::from(self.node_usage(&newk, node));
-            if let Some(replaced) = self.nodes.get(&newk) {
+            if let Some(replaced) = self.raw_get(&newk) {
                 delta -= i128::from(self.node_usage(&newk, replaced));
             }
         }
         let used = self.usage_after_delta(delta)?;
         self.check_inode_capacity(subtree.len())?;
         for k in subtree {
-            let mut node = self.nodes.get(&k).unwrap().clone();
+            let mut node = self.raw_get(&k).unwrap().clone();
             node.inode = self.allocate_inode()?;
             if !preserve {
                 node.mtime = self.mutation_time_ms;
             }
             let suffix = &k[from_real.len()..];
             let newk = format!("{to_target}{suffix}");
-            self.nodes.insert(newk, node);
+            self.insert_node(newk, node);
         }
         self.record_usage(used);
         Ok(())
@@ -1394,7 +1603,7 @@ impl Vfs {
 
     pub fn symlink(&mut self, cwd: &str, target: &str, linkpath: &str) -> Result<()> {
         let link_target = self.write_target(cwd, linkpath)?;
-        if self.nodes.contains_key(&link_target) {
+        if self.contains_node(&link_target) {
             return Err(VfsError::Exists(linkpath.to_string()));
         }
         self.require_parent_dir(&link_target)?;
@@ -1407,21 +1616,21 @@ impl Vfs {
             mtime: self.mutation_time_ms,
         };
         let used = self.usage_after_adding(self.node_usage(&link_target, &node))?;
-        self.nodes.insert(link_target, node);
+        self.insert_node(link_target, node);
         self.record_usage(used);
         Ok(())
     }
 
     pub fn touch(&mut self, cwd: &str, path: &str, mtime: u64) -> Result<()> {
         let target = self.write_target(cwd, path)?;
-        if let Some(node) = self.nodes.get_mut(&target) {
+        if let Some(node) = self.node_mut(&target) {
             node.mtime = mtime;
             return Ok(());
         }
         self.require_parent_dir(&target)?;
         let node = Node::file(self.allocate_inode()?, Vec::new(), 0o644, mtime);
         let used = self.usage_after_adding(self.node_usage(&target, &node))?;
-        self.nodes.insert(target, node);
+        self.insert_node(target, node);
         self.record_usage(used);
         Ok(())
     }
@@ -1430,8 +1639,7 @@ impl Vfs {
         let abs = resolve_against(cwd, path);
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
-        self.nodes
-            .get_mut(&real)
+        self.node_mut(&real)
             .map(|n| n.mode = mode & 0o7777)
             .ok_or_else(|| VfsError::NotFound(path.to_string()))
     }
@@ -1447,8 +1655,7 @@ impl Vfs {
         reject_pseudo_mutation(&abs)?;
         let real = self.realpath(&abs, true)?;
         let n = self
-            .nodes
-            .get_mut(&real)
+            .node_mut(&real)
             .ok_or_else(|| VfsError::NotFound(path.to_string()))?;
         if let Some(u) = uid {
             n.uid = u;
@@ -1460,7 +1667,7 @@ impl Vfs {
     }
 
     pub fn set_mtime(&mut self, abs_real: &str, mtime: u64) {
-        if let Some(n) = self.nodes.get_mut(abs_real) {
+        if let Some(n) = self.node_mut(abs_real) {
             n.mtime = mtime;
         }
     }
@@ -1473,7 +1680,7 @@ impl Vfs {
         reject_pseudo_mutation(&norm)?;
         check_path_limits(&norm)?;
         if matches!(
-            self.nodes.get(&norm).map(|node| &node.kind),
+            self.raw_get(&norm).map(|node| &node.kind),
             Some(NodeKind::Dir)
         ) {
             return Err(VfsError::IsADir(norm));
@@ -1483,8 +1690,7 @@ impl Vfs {
             None => Vec::new(),
         };
         let previous = self
-            .nodes
-            .get(&norm)
+            .raw_get(&norm)
             .map_or(0, |node| self.node_usage(&norm, node));
         let file_usage = NODE_OVERHEAD.saturating_add(data.len() as u64);
         let used = self
@@ -1498,8 +1704,7 @@ impl Vfs {
         self.check_inode_capacity(additions.len().saturating_add(1))?;
         self.insert_directories(additions)?;
         let inode = self.allocate_inode()?;
-        self.nodes
-            .insert(norm, Node::file(inode, data, mode, self.mutation_time_ms));
+        self.insert_node(norm, Node::file(inode, data, mode, self.mutation_time_ms));
         self.record_usage(used);
         Ok(())
     }
@@ -1508,7 +1713,7 @@ impl Vfs {
     pub(crate) fn seed_native_executable(&mut self, abs: &str, program: NativeProgram) {
         let norm = normalize(abs);
         let inode = self.allocate_inode().expect("base image inode capacity");
-        self.nodes.insert(
+        self.insert_node(
             norm.clone(),
             Node {
                 inode,
@@ -1527,30 +1732,74 @@ impl Vfs {
         let norm = normalize(abs);
         reject_pseudo_mutation(&norm)?;
         self.mkdir_all("/", &norm)?;
-        if let Some(n) = self.nodes.get_mut(&norm) {
+        if let Some(n) = self.node_mut(&norm) {
             n.mode = mode;
         }
         Ok(())
     }
 
     pub fn all_paths(&self) -> impl Iterator<Item = (&String, &Node)> {
-        self.nodes.iter()
+        let mut base = self.base.nodes.iter().peekable();
+        let mut overlay = self.overlay.iter().peekable();
+        std::iter::from_fn(move || loop {
+            match (base.peek(), overlay.peek()) {
+                (Some((base_path, _)), Some((overlay_path, _))) if base_path < overlay_path => {
+                    return base.next();
+                }
+                (Some((base_path, _)), Some((overlay_path, _))) if base_path == overlay_path => {
+                    base.next();
+                }
+                (Some(_), None) => return base.next(),
+                (None, None) => return None,
+                _ => {}
+            }
+            if let Some((path, OverlayEntry::Present(node))) = overlay.next() {
+                return Some((path, node));
+            }
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.nodes.len()
+        self.node_count
     }
 
     pub fn is_empty(&self) -> bool {
-        self.nodes.len() <= 1
+        self.node_count <= 1
     }
 }
 
 const NODE_OVERHEAD: u64 = 256;
 
-fn logical_usage(nodes: &BTreeMap<String, Node>) -> u64 {
+fn cow_copy_bytes(node: &Node, installed: bool, mutation: FileMutation) -> u64 {
+    let NodeKind::File(bytes) = &node.kind else {
+        return 0;
+    };
+    if !installed && Arc::strong_count(bytes) == 1 {
+        return 0;
+    }
+    match mutation {
+        FileMutation::Write => bytes.len() as u64,
+        FileMutation::Resize(size) if size == bytes.len() => 0,
+        FileMutation::Resize(size) => size.min(bytes.len()) as u64,
+    }
+}
+
+/// Truncation never clones bytes that the operation is about to discard.
+fn resize_buffer(bytes: &mut Arc<Vec<u8>>, size: usize) {
+    if size == bytes.len() {
+        return;
+    }
+    if size == 0 {
+        *bytes = Arc::new(Vec::new());
+    } else if size < bytes.len() && Arc::strong_count(bytes) > 1 {
+        *bytes = Arc::new(bytes[..size].to_vec());
+    } else {
+        Arc::make_mut(bytes).resize(size, 0);
+    }
+}
+
+fn logical_usage<'a>(nodes: impl Iterator<Item = (&'a String, &'a Node)>) -> u64 {
     nodes
-        .iter()
         .filter(|(path, _)| path.as_str() != "/")
         .fold(0u64, |total, (_, node)| {
             let payload = match &node.kind {
@@ -1572,6 +1821,87 @@ fn node_payload_len(node: &Node) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frozen_overlays_isolate_content_metadata_and_recreated_subtrees() {
+        let mut installation = Vfs::new();
+        installation
+            .put_file("/tree/old", b"base".to_vec(), 0o644)
+            .unwrap();
+        installation
+            .put_file("/z", b"last".to_vec(), 0o644)
+            .unwrap();
+        let base = installation.freeze();
+        let mut first = Vfs::from_base(base.clone(), u64::MAX).unwrap();
+        let second = Vfs::from_base(base, u64::MAX).unwrap();
+        first.copy_file("/", "/tree/old", "/copied").unwrap();
+        first.write_at("/", "/copied", 0, b"X").unwrap();
+        assert_eq!(first.read("/", "/tree/old").unwrap(), b"base");
+        assert_eq!(first.read("/", "/copied").unwrap(), b"Xase");
+        first.remove_file("/", "/copied").unwrap();
+        first.append("/", "/tree/old", b" private", 0o644).unwrap();
+        first.chmod("/", "/tree/old", 0o600).unwrap();
+        assert_eq!(second.read("/", "/tree/old").unwrap(), b"base");
+        assert_eq!(second.metadata("/", "/tree/old", true).unwrap().mode, 0o644);
+        first.remove_all("/", "/tree").unwrap();
+        first.put_file("/tree/new", b"new".to_vec(), 0o644).unwrap();
+        first.put_file("/a", vec![], 0o644).unwrap();
+        assert_eq!(first.list_dir("/", "/tree").unwrap(), vec!["new"]);
+        assert_eq!(first.walk("/"), vec!["/", "/a", "/tree", "/tree/new", "/z"]);
+        assert_eq!(
+            first
+                .all_paths()
+                .map(|(path, _)| path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/", "/a", "/tree", "/tree/new", "/z"]
+        );
+        assert_eq!(second.list_dir("/", "/tree").unwrap(), vec!["old"]);
+        let refrozen = Vfs::from_base(first.freeze(), u64::MAX).unwrap();
+        assert!(!refrozen.exists("/", "/tree/old"));
+        assert_eq!(refrozen.read("/", "/tree/new").unwrap(), b"new");
+    }
+
+    #[test]
+    fn frozen_overlay_rename_and_open_unlink_preserve_quota_and_identity() {
+        let mut installation = Vfs::new();
+        installation
+            .put_file("/tree/file", b"abc".to_vec(), 0o644)
+            .unwrap();
+        let inode = installation
+            .metadata("/", "/tree/file", true)
+            .unwrap()
+            .inode;
+        let base = installation.freeze();
+        let quota = base.disk_used();
+        assert!(matches!(
+            Vfs::from_base(base.clone(), quota - 1),
+            Err(VfsError::NoSpace)
+        ));
+        let mut first = Vfs::from_base(base.clone(), quota).unwrap();
+        let second = Vfs::from_base(base, quota).unwrap();
+        first.rename("/", "/tree", "/moved").unwrap();
+        assert!(!first.exists("/", "/tree/file"));
+        assert_eq!(
+            first.metadata("/", "/moved/file", true).unwrap().inode,
+            inode
+        );
+        let orphan = first.unlink_open_file("/", "/moved/file").unwrap();
+        assert_eq!(first.disk_used(), quota);
+        assert!(matches!(
+            first.write_orphan_at(orphan, 3, b"d"),
+            Err(VfsError::NoSpace)
+        ));
+        first.write_orphan_at(orphan, 0, b"X").unwrap();
+        assert_eq!(first.read_orphan_range(orphan, 0, 10).unwrap(), b"Xbc");
+        assert_eq!(second.read("/", "/tree/file").unwrap(), b"abc");
+        first.retain_orphans(&BTreeSet::new());
+        first.write("/", "/moved/file", b"new", 0o644).unwrap();
+        assert_ne!(
+            first.metadata("/", "/moved/file", true).unwrap().inode,
+            inode
+        );
+        assert_eq!(first.disk_used(), quota);
+    }
+
     #[test]
     fn inode_identity_tracks_nodes_across_mutation_clone_and_unlink() {
         let mut vfs = Vfs::new();
@@ -1692,6 +2022,9 @@ mod tests {
     fn disk_quota_is_atomic_and_delete_releases_space() {
         // The implicit root is free; the file node and three payload bytes are charged.
         let mut v = Vfs::with_disk_limit(NODE_OVERHEAD + 3);
+        v.seed_dirs(["/builtin"]);
+        v.seed_native_executable("/builtin/true", NativeProgram::True);
+        let mut v = Vfs::from_base(v.freeze(), NODE_OVERHEAD + 3).unwrap();
         v.write("/", "/a", b"123", 0o644).unwrap();
         assert_eq!(v.disk_used(), NODE_OVERHEAD + 3);
 

@@ -48,7 +48,7 @@ def provider_metadata(bundle: Path, manifest: dict, name: str, version: str) -> 
 
 def test_bundle_integrity_checked_before_mount(bundle: Path) -> None:
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     (bundle / "rootfs/usr/bin/python3.wasm").write_bytes(b"tampered")
     with pytest.raises(ValueError, match="integrity"):
         runtime.mount(environment)
@@ -120,7 +120,7 @@ def test_local_wheel_staging(bundle: Path, tmp_path: Path, native: bool) -> None
         archive.writestr("example-1.0.dist-info/WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
         if native:
             archive.writestr("example.so", b"native")
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     runtime = shellsim.CPythonRuntime(bundle)
     if native:
         with pytest.raises(shellsim.PackageInstallError):
@@ -149,7 +149,7 @@ def test_pypi_resolves_for_guest_and_does_not_substitute_modules(bundle: Path, m
 
     monkeypatch.setattr(shellsim.cpython.subprocess, "run", install)
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     runtime.install_pypi(environment, "numpy==2.5.3")
     assert environment.read_file(runtime.site_packages + "/numpy.py") == b"answer = 42\n"
 
@@ -159,7 +159,7 @@ def test_source_built_guest() -> None:
     if path is None:
         pytest.skip("set SHELLSIM_CPYTHON_BUNDLE to a source-built CPython WASI bundle")
     runtime = shellsim.CPythonRuntime(path)
-    environment = shellsim.Environment(cpu=2_000_000_000, memory=256 * 1024 * 1024, disk=64 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=2_000_000_000, memory=256 * 1024 * 1024, disk=64 * 1024 * 1024)
     runtime.mount(environment)
     result = runtime.run(environment, ["-c", "import json, sys; print(sys.platform); print(json.dumps([1, 2]))"])
     assert result.returncode == 0, result.stderr
@@ -192,7 +192,7 @@ def test_native_provider_seeds_resolution(bundle: Path, monkeypatch: pytest.Monk
 
     monkeypatch.setattr(shellsim.cpython.subprocess, "run", resolve)
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     runtime.install_pypi(environment, "pycosat==0.6.6")
     assert b"Version: 0.6.6\n" in environment.read_file(runtime.site_packages + "/pycosat-0.6.6.dist-info/METADATA")
 
@@ -214,7 +214,7 @@ def test_native_provider_rejects_missing_or_unlinked_modules(
     monkeypatch.setattr(shellsim.cpython.subprocess, "run", forbidden)
     runtime = shellsim.CPythonRuntime(bundle)
     with pytest.raises(shellsim.PackageInstallError, match="invalid builtin native provider"):
-        runtime.install_pypi(shellsim.Environment(), "numpy")
+        runtime.install_pypi(shellsim.Context().Environment(), "numpy")
 
 
 def test_native_distribution_can_have_multiple_qualified_builtin_modules(
@@ -244,6 +244,6 @@ def test_native_distribution_can_have_multiple_qualified_builtin_modules(
 
     monkeypatch.setattr(shellsim.cpython.subprocess, "run", resolve)
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     runtime.install_pypi(environment, "numpy==2.3.5")
     assert b"Version: 2.3.5\n" in environment.read_file(runtime.site_packages + "/numpy-2.3.5.dist-info/METADATA")

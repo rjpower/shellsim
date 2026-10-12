@@ -38,7 +38,7 @@ def test_direct_python_source_avoids_shell_quoting_and_preserves_argv_stdin() ->
 
 
 def test_environment_direct_python_reuses_vfs_and_cumulative_resources() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.write_file("/work/helper.py", "answer = 42\n")
     environment.run("cd /work")
 
@@ -90,7 +90,7 @@ def test_direct_python_rejects_binary_stdin_and_obeys_resource_limits() -> None:
 
 
 def test_direct_python_validates_arguments() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
 
     with pytest.raises(TypeError, match="source must be str"):
         environment.run_python(b"print(1)")  # type: ignore[arg-type]
@@ -101,7 +101,7 @@ def test_direct_python_validates_arguments() -> None:
 
 
 def test_environment_preserves_state_and_vfs_bytes() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.mkdir("/work/package")
     environment.write_file("/work/package/data", b"\x00\xffvalue")
 
@@ -115,7 +115,7 @@ def test_environment_preserves_state_and_vfs_bytes() -> None:
 
 @pytest.mark.parametrize("operation", ("new-file", "updated-file", "directory", "parents", "mount"))
 def test_host_vfs_mutations_use_current_virtual_time(operation: str, tmp_path: Path) -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.write_file("/reference", b"before")
     if operation == "updated-file":
         environment.write_file("/node", b"before")
@@ -141,7 +141,7 @@ def test_host_vfs_mutations_use_current_virtual_time(operation: str, tmp_path: P
 
 
 def test_multiple_shell_sessions_share_files_but_not_shell_state() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     first = environment.create_shell()
     second = environment.create_shell()
     assert first.pid != second.pid
@@ -159,15 +159,13 @@ def test_multiple_shell_sessions_share_files_but_not_shell_state() -> None:
 
 
 def test_environment_configures_static_http_routes() -> None:
-    environment = shellsim.Environment(
-        http={
+    environment = shellsim.Context().Environment(http={
             "https://api.test/items": shellsim.HttpResponse(
                 status=201,
                 headers={"Content-Type": "application/json"},
                 body='{"id":7}',
             )
-        }
-    )
+        })
 
     result = environment.run("curl -i -X POST https://api.test/items")
 
@@ -187,14 +185,12 @@ def test_environment_configures_static_http_routes() -> None:
 
 
 def test_static_http_routes_back_python_urllib() -> None:
-    environment = shellsim.Environment(
-        http={
+    environment = shellsim.Context().Environment(http={
             "https://api.test/items": shellsim.HttpResponse(
                 headers={"Content-Type": "application/json"},
                 body='{"items":[]}',
             )
-        }
-    )
+        })
 
     result = environment.run_python(
         "from urllib.request import urlopen\n"
@@ -208,7 +204,7 @@ def test_static_http_routes_back_python_urllib() -> None:
 
 
 def test_http_routes_support_methods_globs_and_validation() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.route_http(
         "https://api.test/items/*",
         shellsim.HttpResponse(body=b"created"),
@@ -236,7 +232,7 @@ def test_fidelity_telemetry_exposes_unsupported_and_partial_commands() -> None:
 
 
 def test_exhaustion_is_terminal_and_reuse_is_observable() -> None:
-    environment = shellsim.Environment(cpu=200)
+    environment = shellsim.Context().Environment(cpu=200)
     exhausted = environment.run("while true; do :; done")
     reused = environment.run("printf unreachable")
 
@@ -251,11 +247,11 @@ def test_exhaustion_is_terminal_and_reuse_is_observable() -> None:
 
 def test_invalid_limits_are_rejected_before_native_conversion() -> None:
     with pytest.raises(TypeError, match="cpu must be int"):
-        shellsim.Environment(cpu=True)
+        shellsim.Context().Environment(cpu=True)
     with pytest.raises(ValueError, match="cpu must be between"):
-        shellsim.Environment(cpu=-1)
+        shellsim.Context().Environment(cpu=-1)
     with pytest.raises(ValueError, match="cannot be combined"):
-        shellsim.Environment(shellsim.Limits(), cpu=1)
+        shellsim.Context().Environment(shellsim.Limits(), cpu=1)
 
 
 def test_mount_reports_skips_and_runs_python_from_trusted_tree(tmp_path) -> None:
@@ -263,7 +259,7 @@ def test_mount_reports_skips_and_runs_python_from_trusted_tree(tmp_path) -> None
     (tmp_path / ".venv" / "config").write_text("secret")
     (tmp_path / "helper.py").write_text("answer = 42\n")
     (tmp_path / "main.py").write_text("from helper import answer\nprint(answer)\n")
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
 
     report = environment.mount(tmp_path)
     result = environment.run("cd /work; python3.14 main.py")
@@ -281,7 +277,7 @@ def test_failed_mount_rolls_back_all_files(tmp_path) -> None:
         (tmp_path / "link.txt").symlink_to("kept.txt")
     except OSError as error:
         pytest.skip(f"symlink creation unavailable: {error}")
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
 
     with pytest.raises(shellsim.SimulationError, match="refusing host symlink"):
         environment.mount(tmp_path)
@@ -290,7 +286,7 @@ def test_failed_mount_rolls_back_all_files(tmp_path) -> None:
 
 
 def test_deep_python_source_is_contained_by_the_worker_stack() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     source = "value = " + "(" * 300 + "1" + ")" * 300 + "\n"
     environment.write_file("/work/deep.py", source)
 
@@ -325,7 +321,7 @@ def test_run_releases_the_python_interpreter_lock() -> None:
 
 
 def test_environment_can_run_from_a_python_worker_thread() -> None:
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     results = []
 
     thread = threading.Thread(target=lambda: results.append(environment.run("printf worker")))

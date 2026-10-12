@@ -29,7 +29,7 @@ def test_invalid_setup_request_fails_before_release_fetch(monkeypatch: pytest.Mo
 
     monkeypatch.setattr(shellsim.CPythonRuntime, "from_release", unexpected_fetch)
     with pytest.raises((TypeError, ValueError)):
-        shellsim.Environment.from_release("missing-release.json", **setup_args)
+        shellsim.Context().from_release("missing-release.json", **setup_args)
 
 
 def test_project_venv_is_rejected_before_release_fetch(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -42,7 +42,7 @@ def test_project_venv_is_rejected_before_release_fetch(tmp_path: Path, monkeypat
 
     monkeypatch.setattr(shellsim.CPythonRuntime, "from_release", unexpected_fetch)
     with pytest.raises(ValueError, match="overlap"):
-        shellsim.Environment.from_release("missing-release.json", project=project)
+        shellsim.Context().from_release("missing-release.json", project=project)
 
 
 def _descriptor() -> Path:
@@ -53,7 +53,7 @@ def _descriptor() -> Path:
 
 
 def test_release_factory_defaults_run_guest_python(tmp_path: Path) -> None:
-    env = shellsim.Environment.from_release(_descriptor(), pypi="packaging==26.3", cache_dir=tmp_path / "cache")
+    env = shellsim.Context(cache_dir=tmp_path / "cache").from_release(_descriptor(), pypi="packaging==26.3")
     result = env.run("python -c 'import packaging; print(packaging.__version__)'")
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"26.3\n"
@@ -61,14 +61,7 @@ def test_release_factory_defaults_run_guest_python(tmp_path: Path) -> None:
 
 def test_release_factory_installs_python_and_native_tools(tmp_path: Path) -> None:
     project = Path(__file__).resolve().parents[1] / "fixtures/native_make"
-    env = shellsim.Environment.from_release(
-        _descriptor(),
-        pypi=["pytest==8.4.1", "numpy==2.3.5"],
-        tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
-        project=project,
-        cache_dir=tmp_path / "cache",
-        limits=shellsim.Limits(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2),
-    )
+    env = shellsim.Context(cache_dir=tmp_path / "cache").from_release(_descriptor(), pypi=["pytest==8.4.1", "numpy==2.3.5"], tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"], project=project, limits=shellsim.Limits(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2))
     assert env.read_file("/work/Makefile") == (project / "Makefile").read_bytes()
     result = env.run("python -c 'import pytest, numpy; print(pytest.__version__, numpy.arange(4).sum())'")
     assert result.returncode == 0, result.stderr
@@ -120,13 +113,7 @@ def test_release_factory_installs_selected_uv_lock(tmp_path: Path) -> None:
     )
     assert locked.returncode == 0, locked.stderr
 
-    env = shellsim.Environment.from_release(
-        descriptor,
-        lock=project / "uv.lock",
-        project=project,
-        cache_dir=tmp_path / "cache",
-        limits=shellsim.Limits(cpu=4_000_000_000, memory=512 * 1024**2, disk=256 * 1024**2),
-    )
+    env = shellsim.Context(cache_dir=tmp_path / "cache").from_release(descriptor, lock=project / "uv.lock", project=project, limits=shellsim.Limits(cpu=4_000_000_000, memory=512 * 1024**2, disk=256 * 1024**2))
     assert env.read_file("/work/pyproject.toml") == (project / "pyproject.toml").read_bytes()
     result = env.run("python -c 'import packaging; print(packaging.__version__)'")
     assert result.returncode == 0, result.stderr

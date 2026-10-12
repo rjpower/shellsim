@@ -271,7 +271,9 @@ def test_installed_guest_compiler_and_make_from_catalog():
     catalog = os.environ.get("SHELLSIM_GUEST_CATALOG")
     if not catalog:
         pytest.skip("set SHELLSIM_GUEST_CATALOG to an exported guest LLVM and make catalog")
-    environment = shellsim.Environment(
+    environment = shellsim.Context(
+        pypi_catalog=catalog, trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1"
+    ).Environment(
         tools=[
             "clang",
             "clang++",
@@ -286,9 +288,6 @@ def test_installed_guest_compiler_and_make_from_catalog():
             "llvm-nm",
             "make",
         ],
-        pypi_catalog=catalog,
-        # Opt in only when this catalog and its native-code companions are trusted.
-        trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1",
         cpu=500_000_000_000,
         memory=8 * 1024**3,
         disk=384 * 1024**2,

@@ -175,9 +175,9 @@ class Catalog:
         if self.trusted_precompiled and "precompiled" in record:
             from . import _native
 
-            _native.register_trusted_precompiled_wasm(
+            _native.register_trusted_precompiled_wasm_file(
                 source.read_bytes(),
-                self.asset(record["precompiled"]).read_bytes(),
+                str(self.asset(record["precompiled"])),
                 executable=executable,
             )
 

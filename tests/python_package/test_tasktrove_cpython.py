@@ -67,7 +67,7 @@ def test_original_task_verifier_accepts_solution_and_rejects_wrong_output(
     task_runtime: tuple[shellsim.CPythonRuntime, Path], task: str, candidate: str
 ) -> None:
     runtime, fixtures = task_runtime
-    environment = shellsim.Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
+    environment = shellsim.Context().Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
     runtime.mount(environment)
     runtime.install_pypi(environment, "pytest==8.4.1")
     environment.mount(fixtures / task / "tests", "/tests")

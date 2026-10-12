@@ -21,7 +21,7 @@ def test_cpython_subprocess_and_pipe_roundtrip_in_guest(tmp_path: Path) -> None:
         pytest.skip("set SHELLSIM_PROCESS_CPYTHON_BUNDLE to a process enabled CPython bundle")
 
     runtime = shellsim.CPythonRuntime(bundle)
-    environment = shellsim.Environment(cpu=20_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=20_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
     runtime.mount(environment)
     manifest = json.loads((Path(bundle) / "manifest.json").read_text())
     sdk = Path(manifest["source_bundle"]) / "wasi-sdk-34.0-x86_64-linux"

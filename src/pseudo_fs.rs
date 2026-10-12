@@ -269,8 +269,8 @@ pub fn metadata(
 ) -> Option<crate::vfs::Result<Node>> {
     lookup(env, cwd, path, follow).map(|node| {
         let (kind, mode) = match node {
-            PseudoNode::File(data) => (NodeKind::File(data), 0o444),
-            PseudoNode::Device => (NodeKind::File(Vec::new()), 0o666),
+            PseudoNode::File(data) => (NodeKind::File(data.into()), 0o444),
+            PseudoNode::Device => (NodeKind::File(Vec::new().into()), 0o666),
             PseudoNode::Directory(_) => (NodeKind::Dir, 0o555),
             PseudoNode::Symlink(target) => (NodeKind::Symlink(target), 0o777),
             PseudoNode::Error(error) => return Err(error),

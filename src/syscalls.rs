@@ -687,12 +687,38 @@ impl System for ActiveSystem<'_> {
         if !file.writable {
             return Err(SyscallError::Permission);
         }
-        self.interp.sync_vfs_time();
-        match file.orphan {
-            Some(id) => self.interp.vfs.resize_orphan(id, size)?,
-            None => self.interp.vfs.resize_file("/", &file.path, size)?,
+        let (old_size, copied) = match file.orphan {
+            Some(id) => (
+                self.interp.vfs.orphan_len(id)?,
+                self.interp
+                    .vfs
+                    .orphan_cow_bytes(id, crate::vfs::FileMutation::Resize(size))?,
+            ),
+            None => (
+                self.interp.vfs.file_len("/", &file.path)?,
+                self.interp.vfs.file_cow_bytes(
+                    "/",
+                    &file.path,
+                    crate::vfs::FileMutation::Resize(size),
+                )?,
+            ),
+        };
+        let allocation = copied.saturating_add(size.saturating_sub(old_size) as u64);
+        if !self
+            .interp
+            .resources
+            .charge_cpu(allocation.saturating_add(1))
+            || !self.interp.resources.reserve_memory(allocation)
+        {
+            return Err(SyscallError::ResourceExhausted);
         }
-        Ok(())
+        self.interp.sync_vfs_time();
+        let result = match file.orphan {
+            Some(id) => self.interp.vfs.resize_orphan(id, size),
+            None => self.interp.vfs.resize_file("/", &file.path, size),
+        };
+        self.interp.resources.release_memory(allocation);
+        result.map_err(Into::into)
     }
 
     fn file_state(&self, fd: Fd) -> Result<FileState, SyscallError> {
@@ -1506,6 +1532,109 @@ fn seek(interp: &mut Interp, fd: Fd, delta: i64, whence: u32) -> Result<u64, Sys
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn frozen_file_mutation_prepays_copy_before_changing_shared_content() {
+        use crate::resources::{Limits, StopReason};
+        for (name, orphan, resize, memory, cpu, reason) in [
+            (
+                "named append",
+                false,
+                false,
+                1024,
+                u64::MAX,
+                StopReason::MemoryExhausted,
+            ),
+            (
+                "orphan shrink",
+                true,
+                true,
+                u64::MAX,
+                1024,
+                StopReason::CpuExhausted,
+            ),
+        ] {
+            let mut interp = Interp::with_limits(Limits {
+                memory,
+                cpu,
+                ..Limits::default()
+            });
+            interp
+                .vfs
+                .put_file("/work/shared", vec![b'x'; 4096], 0o644)
+                .unwrap();
+            let base = interp.vfs.freeze();
+            interp.vfs = crate::vfs::Vfs::from_base(base.clone(), u64::MAX).unwrap();
+            let sibling = crate::vfs::Vfs::from_base(base, u64::MAX).unwrap();
+            let mut system = ActiveSystem::new(&mut interp);
+            let fd = system
+                .open_file(
+                    "/",
+                    "/work/shared",
+                    OpenFile {
+                        readable: true,
+                        writable: true,
+                        create: false,
+                        exclusive: false,
+                        truncate: false,
+                        append: true,
+                    },
+                )
+                .unwrap();
+            if orphan {
+                system.unlink("/", "/work/shared").unwrap();
+            }
+            let result = if resize {
+                system.resize_file(fd, 2048)
+            } else {
+                system.write(fd, b"y").map(|_| ())
+            };
+            assert!(
+                matches!(result, Err(SyscallError::ResourceExhausted)),
+                "{name}"
+            );
+            assert_eq!(system.metadata_fd(fd).unwrap().size, 4096);
+            assert_eq!(interp.resources.stop_reason(), Some(reason));
+            assert_eq!(sibling.read("/", "/work/shared").unwrap(), vec![b'x'; 4096]);
+        }
+    }
+
+    #[test]
+    fn frozen_file_truncation_charges_only_the_retained_prefix() {
+        let mut interp = Interp::with_limits(crate::resources::Limits {
+            memory: 1024,
+            cpu: 200,
+            ..crate::resources::Limits::default()
+        });
+        interp
+            .vfs
+            .put_file("/work/shared", vec![b'x'; 4096], 0o644)
+            .unwrap();
+        let base = interp.vfs.freeze();
+        interp.vfs = crate::vfs::Vfs::from_base(base.clone(), u64::MAX).unwrap();
+        let sibling = crate::vfs::Vfs::from_base(base, u64::MAX).unwrap();
+        let mut system = ActiveSystem::new(&mut interp);
+        let fd = system
+            .open_file(
+                "/",
+                "/work/shared",
+                OpenFile {
+                    readable: true,
+                    writable: true,
+                    create: false,
+                    exclusive: false,
+                    truncate: false,
+                    append: false,
+                },
+            )
+            .unwrap();
+        system.resize_file(fd, 4096).unwrap();
+        system.resize_file(fd, 100).unwrap();
+        assert_eq!(system.metadata_fd(fd).unwrap().size, 100);
+        system.resize_file(fd, 0).unwrap();
+        assert_eq!(system.metadata_fd(fd).unwrap().size, 0);
+        assert_eq!(sibling.read("/", "/work/shared").unwrap(), vec![b'x'; 4096]);
+    }
 
     #[test]
     fn file_lock_prepays_the_bounded_arena_scan() {
