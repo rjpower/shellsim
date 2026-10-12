@@ -3652,6 +3652,67 @@ mod tests {
     }
 
     #[test]
+    fn private_source_cache_adoption_preserves_guest_mutation_budget() {
+        use crate::resources::Limits;
+        use crate::syscalls::{OpenFile, System};
+
+        // A local cache avoids unrelated process-global LRU activity affecting this scenario.
+        let source = wat::parse_str(format!(
+            "(module (memory 1) (data (i32.const 0) \"{}\") (func (export \"_start\")))",
+            "x".repeat(2048)
+        ))
+        .unwrap();
+        let module = Module::new(command_engine(), &source).unwrap();
+        let mut usages = Vec::new();
+        for adopt_other in [false, true] {
+            let mut cache = ModuleCache::default();
+            let mut machine = Interp::with_limits(Limits {
+                memory: 1024,
+                ..Limits::default()
+            });
+            machine.vfs.write("/", "/app", &source, 0o755).unwrap();
+            let retained = machine
+                .vfs
+                .read_shared_limited("/", "/app", MAX_WASM_BYTES)
+                .unwrap();
+            cache.insert(&retained, module.clone());
+            drop(retained);
+            if adopt_other {
+                let mut other = crate::vfs::Vfs::new();
+                other.write("/", "/app", &source, 0o755).unwrap();
+                let equivalent = other
+                    .read_shared_limited("/", "/app", MAX_WASM_BYTES)
+                    .unwrap();
+                assert!(Module::same(&module, &cache.get(&equivalent).unwrap()));
+            }
+            let mut system = ActiveSystem::new(&mut machine);
+            let fd = system
+                .open_file(
+                    "/",
+                    "/app",
+                    OpenFile {
+                        readable: true,
+                        writable: true,
+                        create: false,
+                        exclusive: false,
+                        truncate: false,
+                        append: false,
+                    },
+                )
+                .unwrap();
+            assert!(matches!(system.write(fd, b"!"), Ok(IoPoll::Ready(1))));
+            assert_eq!(machine.vfs.read("/", "/app").unwrap()[0], b'!');
+            usages.push(
+                machine
+                    .resources
+                    .outcome(0, machine.vfs.disk_used(), machine.vfs.disk_peak())
+                    .usage,
+            );
+        }
+        assert_eq!(usages[0], usages[1]);
+    }
+
+    #[test]
     fn cache_reuses_exact_module_bytes_and_evicts_oldest_entry() {
         let mut cache = ModuleCache::default();
         let sources = (0..=MAX_CACHED_MODULES)

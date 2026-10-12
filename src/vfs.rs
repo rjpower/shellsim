@@ -808,11 +808,12 @@ impl Vfs {
     /// Read a file as exact bytes only when it is within `limit`.
     pub fn read_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>> {
         self.read_shared_limited(cwd, path, limit)
-            .map(|data| data.as_ref().clone())
+            .map(Arc::unwrap_or_clone)
     }
 
-    /// Retain immutable file bytes within `limit`, counting the same logical read as an owned
-    /// read. Later VFS mutations detach this buffer, so consumers may safely cache its identity.
+    /// Retain installed bytes within `limit`, counting the same logical read as an owned read.
+    /// Private file bytes are copied: external cache retention must not affect their guest
+    /// copy-on-write costs. Unchanged installed buffers remain shareable through metadata edits.
     pub fn read_shared_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Arc<Vec<u8>>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
@@ -829,7 +830,14 @@ impl Vfs {
                 }
                 self.read_bytes
                     .set(self.read_bytes.get().saturating_add(data.len() as u64));
-                Ok(data.clone())
+                let installed = self.base.nodes.get(&real).is_some_and(|node| {
+                    matches!(&node.kind, NodeKind::File(base_data) if Arc::ptr_eq(base_data, data))
+                });
+                if installed {
+                    Ok(data.clone())
+                } else {
+                    Ok(Arc::new(data.as_ref().clone()))
+                }
             }
             Some(Node {
                 kind: NodeKind::Dir,
