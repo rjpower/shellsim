@@ -1,0 +1,56 @@
+{
+  "name": "httpx",
+  "version": "0.28.1",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/2a/39/e50c7c3a983047577ee07d2a9e53faf5a69493943ec3f6a384bdc792deb2/httpx-0.28.1-py3-none-any.whl",
+    "filename": "httpx-0.28.1-py3-none-any.whl",
+    "sha256": "d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad"
+  },
+  "requires_dist": [
+    "anyio",
+    "certifi",
+    "httpcore==1.*",
+    "idna",
+    "brotli; (platform_python_implementation == 'CPython') and extra == 'brotli'",
+    "brotlicffi; (platform_python_implementation != 'CPython') and extra == 'brotli'",
+    "click==8.*; extra == 'cli'",
+    "pygments==2.*; extra == 'cli'",
+    "rich<14,>=10; extra == 'cli'",
+    "h2<5,>=3; extra == 'http2'",
+    "socksio==1.*; extra == 'socks'",
+    "zstandard>=0.18.0; extra == 'zstd'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/anyio",
+      "version": "4.15.1"
+    },
+    {
+      "port": "python/certifi",
+      "version": "2026.7.22"
+    },
+    {
+      "port": "python/httpcore",
+      "version": "1.0.9"
+    },
+    {
+      "port": "python/idna",
+      "version": "3.20"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "requires_python": ">=3.8"
+}

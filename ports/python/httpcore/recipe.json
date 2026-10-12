@@ -1,0 +1,42 @@
+{
+  "name": "httpcore",
+  "version": "1.0.9",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/7e/f5/f66802a942d491edb555dd61e3a9961140fd64c90bce1eafd741609d334d/httpcore-1.0.9-py3-none-any.whl",
+    "filename": "httpcore-1.0.9-py3-none-any.whl",
+    "sha256": "2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55"
+  },
+  "requires_dist": [
+    "certifi",
+    "h11>=0.16",
+    "anyio<5.0,>=4.0; extra == 'asyncio'",
+    "h2<5,>=3; extra == 'http2'",
+    "socksio==1.*; extra == 'socks'",
+    "trio<1.0,>=0.22.0; extra == 'trio'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/certifi",
+      "version": "2026.7.22"
+    },
+    {
+      "port": "python/h11",
+      "version": "0.16.0"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "requires_python": ">=3.8"
+}

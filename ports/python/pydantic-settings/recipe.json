@@ -1,0 +1,55 @@
+{
+  "name": "pydantic-settings",
+  "version": "2.15.0",
+  "role": "target-library",
+  "kind": "pure-wheel",
+  "build_system": "pure-wheel",
+  "source": {
+    "url": "https://files.pythonhosted.org/packages/30/a4/2bffa9f8e804325a09867f0e9d30795c80ea9f8d62560bd1b6ad6220eb2f/pydantic_settings-2.15.0-py3-none-any.whl",
+    "filename": "pydantic_settings-2.15.0-py3-none-any.whl",
+    "sha256": "0ba092c291c94baceb5eff768aa0d56400a457585bc0175925a5a5510303da42"
+  },
+  "requires_dist": [
+    "pydantic>=2.7.0",
+    "python-dotenv>=0.21.0",
+    "typing-inspection>=0.4.0",
+    "boto3>=1.35.0; extra == 'aws-secrets-manager'",
+    "azure-identity>=1.16.0; extra == 'azure-key-vault'",
+    "azure-keyvault-secrets>=4.8.0; extra == 'azure-key-vault'",
+    "google-cloud-secret-manager>=2.23.1; extra == 'gcp-secret-manager'",
+    "tomli>=2.0.1; extra == 'toml'",
+    "pyyaml>=6.0.1; extra == 'yaml'"
+  ],
+  "runtime_dependencies": [
+    {
+      "port": "python/pydantic",
+      "version": "2.14.0"
+    },
+    {
+      "port": "python/python-dotenv",
+      "version": "1.2.4"
+    },
+    {
+      "port": "python/typing-inspection",
+      "version": "0.4.4"
+    }
+  ],
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/operations.py",
+      "files": [
+        {
+          "source": "tests/fixtures/settings.env",
+          "destination": "settings.env"
+        }
+      ]
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "requires_python": ">=3.10"
+}
