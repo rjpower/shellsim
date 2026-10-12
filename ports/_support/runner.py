@@ -34,34 +34,14 @@ class GraphBuild:
 def build_graph(
     ports: Path, requests: Sequence[str], sdk_context, store: Path, *, offline=False, jobs=None, default_sdk="default"
 ) -> GraphBuild:
-    """Use the shared workflow, materializing results only for this directory-returning API."""
-    from ports.buildomatic.artifacts import install, register, upload
+    """Materialize shared-workflow results; SDK context is only for release/acceptance helpers."""
+    from ports.buildomatic.artifacts import install
     from ports.buildomatic.backends.local import LocalBackend
     from ports.buildomatic.nodes import Operation
     from ports.buildomatic.remote_store import StorageStore
-    from ports.buildomatic.workflow import compile_plan, run
+    from ports.buildomatic.workflow import run
 
     canonical = StorageStore(str((store / "store").resolve()))
-    compiled = compile_plan(ports, requests, default_sdk)
-    for node in compiled.nodes:
-        if node.producer and sdk_context is not None:
-            product = {
-                "compiler": sdk_context.llvm,
-                "platform": sdk_context.sysroot,
-                "tooling": sdk_context.sdk,
-                "cpython": sdk_context.cpython_manifest,
-            }.get(node.producer["name"])
-            if product is not None:
-                register(
-                    canonical,
-                    node.record_key,
-                    {
-                        "reference": node.port.reference,
-                        "artifact": upload(canonical, product.root, store / "archives"),
-                        "receipt": product.contents,
-                        "receipt_id": product.sha256,
-                    },
-                )
     result = run(
         ports,
         requests,

@@ -37,6 +37,8 @@ placement or unrelated inputs added to a product key without affecting its outpu
 record or declared input that can decide reuse and the concrete unnecessary work. Runtime
 dependencies and checks explicitly requested by the caller still need to run or be available;
 required integrity checks are allowed. Do not propose TTLs or broader fingerprinting by default.
+Report cache-format revisions repeated in key calculations and asset paths, or independent
+completion records for the same output. Require one cache policy that owns identity and reuse.
 
 ### `ml-overloaded-function` — one function owns unrelated jobs
 

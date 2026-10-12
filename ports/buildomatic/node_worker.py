@@ -13,8 +13,8 @@ from ports._support.native_adapters import CompilerCacheLauncher
 from ports._support.node_build import produce_port
 from ports._support.sdk import SDKProduct, _produce, installed_seed, producer_work
 from ports._support.sdk_products import Receipt
-from ports._support.store import identity
-from ports.buildomatic.artifacts import install, register, resolve, upload, write_reference
+from ports.buildomatic.artifacts import install, upload, write_reference
+from ports.buildomatic.cache import BuildCache
 from ports.buildomatic.delivery import DeliveryStore
 from ports.buildomatic.delivery_products import publish_product, publish_runtime
 from ports.buildomatic.nodes import Node, Operation, decode
@@ -34,8 +34,10 @@ def launcher() -> CompilerCacheLauncher | None:
 
 
 def input_records(node: Node, store: StorageStore) -> dict:
+    cache = BuildCache(store)
+
     def read(item):
-        record = resolve(store, "node/" + item.key)
+        record = cache.get(item.key)
         if record is None:
             raise ValueError("missing declared input: " + item.reference)
         return item.name, record
@@ -127,31 +129,23 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
 
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
-    if product.get("delivery_key") == node.key or (
-        node.port.recipe["build_system"] == "pure-wheel" and "delivery" in product
-    ):
-        return product
     root = install(store, product["artifact"], cache / "artifacts")
     return {
         **product,
         "delivery_key": node.key,
-        "delivery": publish_product(
-            node.port, root, product["build_key"], DeliveryStore(store.prefix), record_key=node.key
-        ),
+        "delivery": publish_product(node.port, root, product["build_key"], DeliveryStore(store.prefix), key=node.key),
     }
 
 
 def runtime(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
     root = install(store, product["artifact"], cache / "artifacts")
-    raw_key = identity(
-        {"operation": "runtime", "format_version": 1, "inputs": {item.name: item.key for item in node.inputs}}
-    )
-    return {"runtime": publish_runtime(root, raw_key, DeliveryStore(store.prefix), record_key=node.key)}
+    return {"runtime": publish_runtime(root, node.inputs[0].key, DeliveryStore(store.prefix), key=node.key)}
 
 
 def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -> dict:
-    if node.operation is not Operation.CHECK and (cached := resolve(store, node.record_key)) is not None:
+    products = BuildCache(store)
+    if node.operation is not Operation.CHECK and (cached := products.get(node.key)) is not None:
         return cached
     if (expected := specification.get("wasmtime_build_id")) is not None:
         from shellsim import _native
@@ -172,7 +166,7 @@ def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -
         from ports.buildomatic.checks import execute_check
 
         result = execute_check(node, records, store, cache, specification)
-    register(store, node.record_key, result)
+    products.put(node.key, result)
     return result
 
 

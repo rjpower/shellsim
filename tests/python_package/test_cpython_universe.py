@@ -412,13 +412,16 @@ def test_conflict_preserves_existing_files_and_skips_extension(live_universe) ->
 
 @pytest.fixture
 def delivery_catalog(tmp_path):
+    from ports.buildomatic.cache import runtime_delivery_key
     from ports.buildomatic.delivery import DeliveryStore, catalog
     from ports.buildomatic.delivery_products import publish_runtime, wheel_metadata
     from dataclasses import asdict
 
     store = tmp_path / "delivery"
     store.mkdir()
-    runtime = publish_runtime(make_bundle(tmp_path / "bundle"), "runtime-key", DeliveryStore(store))
+    runtime = publish_runtime(
+        make_bundle(tmp_path / "bundle"), "runtime-key", DeliveryStore(store), key=runtime_delivery_key("runtime-key")
+    )
     runtime["native_dependencies"] = []
     packages = []
     definitions = {

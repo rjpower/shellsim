@@ -10,14 +10,15 @@ import io
 import json
 import tempfile
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from packaging.utils import canonicalize_name
 
 from ports._support.graph import Port
-from ports._support.store import identity, relative_path
+from ports._support.store import relative_path
+from ports.buildomatic.cache import asset_path, compiler_identity, file_bundle_key, runtime_archive_key
 
 if TYPE_CHECKING:
     from ports.buildomatic.delivery import DeliveryStore
@@ -42,7 +43,7 @@ def _companion(source: Path, relative: str, store: DeliveryStore, *, executable:
                 return None
             target.write_bytes(companion)
             store.emit(target, relative)
-    size = (store.local / relative).stat().st_size if store.local is not None else store.fs.size(store.key(relative))
+    size = store.size(relative)
     return {"path": relative, "size": size} if size <= _MAX_ASSET else None
 
 
@@ -147,21 +148,15 @@ def wheel_metadata(path: Path, relative: str) -> Wheel:
     )
 
 
-def publish_product(
-    port: Port, root: Path, build_key: str, store: DeliveryStore, *, record_key: str | None = None
-) -> dict:
-    """Emit a product's wheels/providers once, then publish their metadata record."""
-    record_key = record_key or delivery_key(build_key, port=port)
-    if (record := store.record(record_key)) is not None:
-        return record
+def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore, *, key: str) -> dict:
+    """Emit installable assets; the worker commits their completed node record."""
     record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": [], "assets": []}
-    asset_key = relative_path(record_key)
     for wheel in sorted((root / "wheels").glob("*.whl")):
-        relative = (
-            f"assets/{build_key}/wheels/{wheel.name}"
-            if compiler_identity(port) is None
-            else f"assets/delivery-v5/{asset_key}/{wheel.name}"
-        )
+        relative = asset_path(build_key if compiler_identity(port) is None else key, "wheels/" + wheel.name)
+        if store.exists(relative):
+            metadata = replace(wheel_metadata(wheel, relative), size=store.size(relative))
+            record["wheels"].append(asdict(metadata))
+            continue
         with tempfile.TemporaryDirectory(prefix=".wheel-", dir=root.parent) as temporary:
             delivered = Path(temporary) / wheel.name
             _delivery_wheel(wheel, delivered)
@@ -181,7 +176,7 @@ def publish_product(
         for kind, destination in (("shared_libraries", "/lib/"), ("tools", "/usr/bin/")):
             for path in exports.get(kind, []):
                 source = root / "native" / relative_path(path)
-                relative = f"assets/{build_key}/native/{path}"
+                relative = asset_path(build_key, "native/" + path)
                 with source.open("rb") as handle:
                     header = handle.read(4)
                     wasm = header == b"\0asm"
@@ -193,7 +188,7 @@ def publish_product(
                 companion = (
                     _companion(
                         source,
-                        f"assets/delivery-v5/{asset_key}/native/{path}.cwasm",
+                        asset_path(key, f"native/{path}.cwasm"),
                         store,
                         executable=kind == "tools",
                         scratch=root.parent,
@@ -236,28 +231,25 @@ def publish_product(
         empty = directories if usage == "development" else {}
         if not files and not empty:
             continue
-        relative = f"assets/delivery-v5/{relative_path(build_key)}/{usage}-files.zip"
-        with tempfile.TemporaryDirectory(prefix=".files-", dir=root.parent) as temporary:
-            archive = Path(temporary) / "files.zip"
-            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-                for destination, source in sorted(files.items()):
-                    output.write(source, destination)
-                for directory in sorted(empty):
-                    output.writestr(prefix.removeprefix("/") + "/" + relative_path(directory) + "/", b"")
-            size = archive.stat().st_size
-            store.emit(archive, relative)
+        relative = asset_path(file_bundle_key(build_key), f"{usage}-files.zip")
+        if not store.exists(relative):
+            with tempfile.TemporaryDirectory(prefix=".files-", dir=root.parent) as temporary:
+                archive = Path(temporary) / "files.zip"
+                with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
+                    for destination, source in sorted(files.items()):
+                        output.write(source, destination)
+                    for directory in sorted(empty):
+                        output.writestr(prefix.removeprefix("/") + "/" + relative_path(directory) + "/", b"")
+                store.emit(archive, relative)
+        size = store.size(relative)
         record["assets"].append({"path": relative, "size": size, "kind": "archive", "usage": usage})
-    store.write("records/" + relative_path(record_key) + ".json", _json(record))
     return record
 
 
-def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key: str | None = None) -> dict:
+def publish_runtime(bundle: Path, product_key: str, store: DeliveryStore, *, key: str) -> dict:
     """Emit the interpreter once, independently of package additions."""
-    record_key = record_key or runtime_delivery_key(key)
-    if (record := store.record("runtime/" + record_key)) is not None:
-        return record["runtime"]
     manifest = json.loads((bundle / "manifest.json").read_text())
-    relative = f"assets/{key}/runtime.zip"
+    relative = asset_path(runtime_archive_key(product_key), "runtime.zip")
     if not store.exists(relative):
         with tempfile.TemporaryDirectory(prefix=".runtime-", dir=bundle.parent) as temporary:
             archive = Path(temporary) / "runtime.zip"
@@ -265,15 +257,11 @@ def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key:
                 for path in [bundle / "manifest.json", *sorted((bundle / "rootfs").rglob("*"))]:
                     if path.is_file():
                         output.write(path, "runtime/" + path.relative_to(bundle).as_posix())
-            size = archive.stat().st_size
             store.emit(archive, relative)
-    else:
-        size = (
-            (store.local / relative).stat().st_size if store.local is not None else store.fs.size(store.key(relative))
-        )
+    size = store.size(relative)
     companion = _companion(
         bundle / "rootfs/usr/bin/python3.wasm",
-        f"assets/delivery-v5/{relative_path(record_key)}/python3.cwasm",
+        asset_path(key, "python3.cwasm"),
         store,
         executable=True,
         scratch=bundle.parent,
@@ -286,39 +274,4 @@ def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key:
         "runtime_target": manifest["recipe"]["target"],
         **({"precompiled": companion} if companion is not None else {}),
     }
-    store.write("records/runtime/" + relative_path(record_key) + ".json", _json({"runtime": runtime}))
     return runtime
-
-
-def compiler_identity(port: Port | None = None) -> str | None:
-    """Key Wasmtime products on their compiler, keeping pure/data delivery independent."""
-    if port is not None and port.recipe["build_system"] in {"pure-wheel", "source-tree", "llvm-guest-sdk"}:
-        return None
-    from shellsim import _native
-
-    return _native.precompiled_wasm_build_id()
-
-
-def delivery_key(product_key: str, *, port: Port | None = None) -> str:
-    compiler = compiler_identity(port)
-    return identity(
-        {
-            "operation": "delivery",
-            "product": product_key,
-            "format_version": 5,
-            **({"wasmtime": compiler} if compiler is not None else {}),
-        }
-    )
-
-
-def runtime_delivery_key(product_key: str) -> str:
-    from shellsim import _native
-
-    return identity(
-        {
-            "operation": "runtime",
-            "product": product_key,
-            "format_version": 3,
-            "wasmtime": _native.precompiled_wasm_build_id(),
-        }
-    )

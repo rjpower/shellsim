@@ -18,7 +18,7 @@ from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.node_build import _admit_recipe
 from ports._support.producer_policy import policy
 from ports._support.sdk import SDKDefinition, definition
-from ports._support.store import file_hash, identity
+from ports._support.store import file_hash
 from ports.api import implementation
 from ports.buildomatic import (
     Action,
@@ -30,12 +30,11 @@ from ports.buildomatic import (
     NodeState,
     capture_tree,
 )
-from ports.buildomatic.artifacts import register, resolve, write_reference
+from ports.buildomatic.artifacts import write_reference
+from ports.buildomatic.cache import BuildCache, compiler_identity, delivery_key, node_key, runtime_delivery_key
 from ports.buildomatic.delivery import delivery_graph
-from ports.buildomatic.delivery_products import compiler_identity, delivery_key, runtime_delivery_key
 from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
-from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 from ports.buildomatic.transport import PRODUCT_SYSTEMS, _stage_code, code_files
 
 logger = logging.getLogger(__name__)
@@ -106,13 +105,11 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             Input(name, products[name].port.reference, builds[products[name].port.reference].key)
             for name in descriptor.dependencies
         )
-        key = identity(
-            {
-                "operation": "build",
-                "policy": policy(descriptor.port.recipe),
-                "implementation": implementation(descriptor.port),
-                "inputs": {item.name: item.key for item in inputs},
-            }
+        key = node_key(
+            "build",
+            policy=policy(descriptor.port.recipe),
+            implementation=implementation(descriptor.port),
+            inputs={item.name: item.key for item in inputs},
         )
         node = Node(
             descriptor.port.reference,
@@ -171,17 +168,15 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             )
             for name in roles
         )
-        key = identity(
-            {
-                "operation": "build",
-                "recipe": build_recipe(port),
-                "local_inputs": _admit_recipe(port),
-                "implementation": implementation(port),
-                "inputs": {item.name: item.key for item in inputs},
-                "patch_driver": file_hash(Path(__file__).resolve().parents[1] / "_support/build.py")
-                if port.recipe.get("patches")
-                else None,
-            }
+        key = node_key(
+            "build",
+            recipe=build_recipe(port),
+            local_inputs=_admit_recipe(port),
+            implementation=implementation(port),
+            inputs={item.name: item.key for item in inputs},
+            patch_driver=file_hash(Path(__file__).resolve().parents[1] / "_support/build.py")
+            if port.recipe.get("patches")
+            else None,
         )
         node = Node(port.reference, Operation.BUILD, key, port, tuple(inputs))
         builds[node.reference] = node
@@ -242,31 +237,27 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
                         for name in ("compiler", "platform", "tooling")
                     ),
                 )
-                probe_key = identity(
-                    {
-                        "operation": "probe",
-                        "command": file_hash(Path(__file__).resolve().parents[1] / "_support/acceptance.py"),
-                        "sdk_binding": file_hash(Path(__file__).resolve().parents[1] / "_support/sdk_products.py"),
-                        "implementation": file_hash(Path(__file__).with_name("checks.py")),
-                        "test": test,
-                        "source": file_hash(port.directory / test["source"]),
-                        "inputs": {item.name: item.key for item in probe_inputs},
-                    }
+                probe_key = node_key(
+                    "probe",
+                    command=file_hash(Path(__file__).resolve().parents[1] / "_support/acceptance.py"),
+                    sdk_binding=file_hash(Path(__file__).resolve().parents[1] / "_support/sdk_products.py"),
+                    implementation=file_hash(Path(__file__).with_name("checks.py")),
+                    test=test,
+                    source=file_hash(port.directory / test["source"]),
+                    inputs={item.name: item.key for item in probe_inputs},
                 )
                 probe = Node(
                     port.reference + ":probe-" + str(index), Operation.PROBE, probe_key, port, probe_inputs, test=test
                 )
                 nodes.append(probe)
             test_inputs = tuple(inputs) + ((Input("probe", probe.reference, probe.key),) if probe else ())
-            key = identity(
-                {
-                    "operation": "check",
-                    "implementation": file_hash(Path(__file__).with_name("checks.py")),
-                    "test": test,
-                    "source": file_hash(port.directory / test.get("script", test.get("source"))),
-                    "limits": port.recipe.get("test_limits", {}),
-                    "inputs": {item.name: item.key for item in test_inputs},
-                }
+            key = node_key(
+                "check",
+                implementation=file_hash(Path(__file__).with_name("checks.py")),
+                test=test,
+                source=file_hash(port.directory / test.get("script", test.get("source"))),
+                limits=port.recipe.get("test_limits", {}),
+                inputs={item.name: item.key for item in test_inputs},
             )
             node = Node(port.reference + ":check-" + str(index), Operation.CHECK, key, port, test_inputs, test=test)
             nodes.append(node)
@@ -287,93 +278,9 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
 
 def records_for(plan: Plan, store: StorageStore) -> dict[str, dict | None]:
     with ThreadPoolExecutor(max_workers=16) as executor:
-        values = executor.map(lambda node: resolve(store, node.record_key), plan.nodes)
+        cache = BuildCache(store)
+        values = executor.map(lambda node: cache.get(node.key), plan.nodes)
         return {node.reference: value for node, value in zip(plan.nodes, values, strict=True)}
-
-
-def normalize_cached(
-    plan: Plan, store: StorageStore, records: dict[str, dict | None] | None = None
-) -> dict[str, dict | None]:
-    """Admit qualified existing output references once, without moving their bytes."""
-    records = records_for(plan, store) if records is None else records
-    missing_builds = any(records[node.reference] is None for node in plan.nodes if node.operation is Operation.BUILD)
-    old_sdk = resolve(store, "sdk/" + plan.sdk.name) if plan.sdk and missing_builds else None
-    compatible_roles = set()
-    if old_sdk:
-        current = sdk_inputs(plan.ports, plan.sdk.name)
-        for descriptor in plan.sdk.products:
-            role = descriptor.name
-            recorded = old_sdk["inputs"]["producers"][role]
-            selected = current["producers"][role]
-            if all(name in compatible_roles for name in descriptor.dependencies) and sdk_inputs_match(
-                {"definition": {}, "producers": {role: recorded}}, {"definition": {}, "producers": {role: selected}}
-            ):
-                compatible_roles.add(role)
-    legacy_keys = {}
-    for port in plan.graph.ports:
-        system = port.recipe["build_system"]
-        if system in PRODUCT_SYSTEMS:
-            if not old_sdk:
-                continue
-            role = {
-                "llvm-host": "compiler",
-                "wasi-sysroot": "platform",
-                "sdk-tooling": "tooling",
-                "cpython-threaded": "cpython",
-                "uv-host": "resolver",
-            }[system]
-            if role in compatible_roles and role in old_sdk["products"]:
-                legacy_keys[port.reference] = old_sdk["products"][role]["receipt_id"]
-            continue
-        if (
-            system not in {"pure-wheel", "host-wheel", "source-tree"}
-            and not {"compiler", "platform", "tooling"} <= compatible_roles
-        ):
-            continue
-        if any(edge.recipe not in legacy_keys for edge in port.dependencies):
-            continue
-        inputs = {
-            "recipe": port.digest,
-            "local_inputs": _admit_recipe(port),
-            "implementation": implementation(port),
-            "driver": {
-                name: file_hash(Path(__file__).resolve().parents[1] / name)
-                for name in (["_support/build.py"] if port.recipe.get("patches") else [])
-            },
-            "sdk": old_sdk["identity"]
-            if old_sdk
-            and {"compiler", "platform", "tooling"} <= compatible_roles
-            and system not in {"pure-wheel", "host-wheel", "source-tree"}
-            else None,
-            "dependencies": {edge.recipe: legacy_keys[edge.recipe] for edge in port.dependencies},
-        }
-        if system in {"python-extension", "python-meson", "python-pep517", "python-rust"}:
-            if not old_sdk or "cpython" not in compatible_roles or "cpython" not in old_sdk["products"]:
-                continue
-            inputs["python"] = old_sdk["products"]["cpython"]["receipt_id"]
-        legacy_keys[port.reference] = identity(inputs)
-    for node in plan.nodes:
-        if records[node.reference] is not None:
-            continue
-        record = None
-        if node.producer and old_sdk and node.producer["name"] in compatible_roles:
-            record = old_sdk["products"].get(node.producer["name"])
-            if record:
-                record = {**record, "reference": node.port.reference, "build_key": node.key}
-        elif node.operation is Operation.BUILD and node.port.reference in legacy_keys:
-            record = resolve(store, "port/" + legacy_keys[node.port.reference])
-        elif node.operation is Operation.DELIVERY:
-            product = records[node.inputs[0].reference]
-            if product and (
-                product.get("delivery_key") == node.key
-                or node.port.recipe["build_system"] == "pure-wheel"
-                and "delivery" in product
-            ):
-                record = {**product, "delivery_key": node.key}
-        if record:
-            register(store, node.record_key, record)
-            records[node.reference] = record
-    return records
 
 
 def prepare(
@@ -555,7 +462,7 @@ def run(
         len(compiled.nodes),
         store.prefix,
     )
-    known = normalize_cached(compiled, store)
+    known = records_for(compiled, store)
     roots = {
         Operation.BUILD: compiled.build_roots,
         Operation.DELIVERY: compiled.delivery_roots,
