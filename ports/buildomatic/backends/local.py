@@ -60,7 +60,11 @@ class LocalBackend:
         coordinator = self.builds[build_id]
         journal = json.loads(self.store.read_journal(coordinator.journal_key).data)
         tails = {}
-        for attempt in list(journal["attempts"].values())[-4:]:
+        attempts = list(journal["attempts"].values())
+        failed = {action for action, node in journal["nodes"].items() if node["state"] == "failed"}
+        if failed:
+            attempts = [attempt for attempt in attempts if attempt["action_id"] in failed]
+        for attempt in attempts[-4:]:
             tails[attempt["id"]] = (
                 coordinator.workers[attempt["worker"]].read_log(attempt["id"]).decode(errors="replace")
             )

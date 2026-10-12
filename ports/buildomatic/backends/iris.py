@@ -10,7 +10,7 @@ Outputs are cache objects; publication is a separate caller workflow. The servic
 automatically acknowledges worker results after terminal refs and available
 diagnostic tails are durable. Caller acknowledgement records consumption without deleting
 those journals. At most 4096 accepted builds and worker replacements are retained
-per service; GetLogs returns the newest 64 tails with at most 64 KiB total bytes.
+per service; GetLogs retains failure tails or the newest 64 tails, bounded to 64 KiB.
 
 Iris timeouts lease each task attempt, rather than an eternal service. Restarting
 the coordinator resets its lease within its bounded retry policy. Get and blob
@@ -449,14 +449,19 @@ class CoordinatorService:
         raise ConditionalWriteError("control intent remained contended")
 
     def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
-        """Return newest 64 attempt tails, bounded to 64 KiB of log bytes."""
-        request_id = self.get(build_id).request_id
+        """Return failed attempts when present, otherwise the newest bounded tails."""
+        outcome = self.get(build_id)
+        request_id = outcome.request_id
         found = self._store.read_journal(f"{self._base}/diagnostics/{request_id}.json")
         if found is None:
             return ()
         result = []
         remaining = 65536
-        for record in reversed(json.loads(found.data)[-64:]):
+        records = json.loads(found.data)
+        failed = {node.action_id for node in outcome.nodes if node.state.value == "failed"}
+        if failed:
+            records = [record for record in records if record["action_id"] in failed]
+        for record in reversed(records[-64:]):
             tail = self._store.read_journal(f"{self._base}/logs/{record['attempt_id']}")
             data = b"" if tail is None else tail.data[-min(16384, remaining) :] if remaining else b""
             remaining -= len(data)

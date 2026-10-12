@@ -871,15 +871,29 @@ def test_runtime_archive_preserves_nested_modules_for_child_workers(tmp_path, mo
 def test_get_logs_retains_bounded_newest_tails(service_parts):
     store, workers = service_parts
     service = CoordinatorService(store, "test", workers)
-    build_id = service.submit(request())
-    records = [{"attempt_id": f"a{i}", "action_id": "a", "worker_id": "worker-0"} for i in range(70)]
-    store.write_journal(f"iris/test/diagnostics/{request_id(request())}.json", json.dumps(records).encode(), None)
+    specification = replace(request(), actions=tuple(replace(action, max_attempts=1) for action in request().actions))
+    build_id = service.submit(specification)
+    records = [
+        {"attempt_id": f"a{i}", "action_id": "a" if i == 0 else "b", "worker_id": "worker-0"}
+        for i in range(70)
+    ]
+    store.write_journal(f"iris/test/diagnostics/{request_id(specification)}.json", json.dumps(records).encode(), None)
     for record in records:
         store.write_journal(f"iris/test/logs/{record['attempt_id']}", b"x" * 16384, None)
     logs = service.get_logs(build_id)
     assert len(logs) == 64
     assert logs[-1]["attempt_id"] == "a69"
     assert sum(len(log["tail"]) for log in logs) == 65536
+    service.tick_once()
+    for worker in workers.values():
+        for attempt in worker.submitted:
+            worker.reports[attempt.id] = WorkerReport(
+                WorkerState.COMPLETED,
+                AttemptResult(attempt.id, AttemptState.FAILED if attempt.action.id == "a" else AttemptState.SUCCEEDED, worker.bundle),
+            )
+    service.tick_once()
+    logs = service.get_logs(build_id)
+    assert [(log["attempt_id"], log["tail"]) for log in logs] == [("a0", "x" * 16384)]
 
 
 def test_service_retries_index_cas_without_losing_request(service_parts, monkeypatch):

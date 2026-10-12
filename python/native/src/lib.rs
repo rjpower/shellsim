@@ -466,8 +466,17 @@ impl NativeEnvironment {
     fn new(cpu: u64, memory: u64, disk: u64, output: u64, real_time: bool) -> Self {
         Self {
             environment: Mutex::new(shellsim::Environment::with_limits_and_clock(
-                Limits { cpu, memory, disk, output },
-                if real_time { ClockMode::RealTime } else { ClockMode::Virtual },
+                Limits {
+                    cpu,
+                    memory,
+                    disk,
+                    output,
+                },
+                if real_time {
+                    ClockMode::RealTime
+                } else {
+                    ClockMode::Virtual
+                },
             )),
         }
     }
@@ -477,8 +486,11 @@ impl NativeEnvironment {
             let environment = self.lock_environment()?;
             let mut session = HarnessSession::from_environment(environment.clone());
             session.environment.net.enable_host_tools();
-            Ok(NativeContainer { session: Mutex::new(session) })
-        }).map_err(SimulationError::new_err)
+            Ok(NativeContainer {
+                session: Mutex::new(session),
+            })
+        })
+        .map_err(SimulationError::new_err)
     }
 
     /// Execute one shell action and return JSON metadata plus byte-preserving output streams.

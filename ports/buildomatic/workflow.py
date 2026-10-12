@@ -373,6 +373,8 @@ def normalize_cached(
             product = records[node.inputs[0].reference]
             if product and (
                 product.get("delivery_key") == node.key
+                or node.port.recipe["build_system"] == "pure-wheel"
+                and "delivery" in product
                 or "delivery_key" not in product
                 and compatible_packaging()
                 and "delivery" in product

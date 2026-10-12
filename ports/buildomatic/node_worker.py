@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ports._support.graph import _read
@@ -32,13 +33,14 @@ def launcher() -> CompilerCacheLauncher | None:
 
 
 def input_records(node: Node, store: StorageStore) -> dict:
-    records = {}
-    for item in node.inputs:
+    def read(item):
         record = resolve(store, "node/" + item.key)
         if record is None:
             raise ValueError("missing declared input: " + item.reference)
-        records[item.name] = record
-    return records
+        return item.name, record
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        return dict(pool.map(read, node.inputs))
 
 
 def receipt(record: dict, store: StorageStore, cache: Path) -> Receipt:

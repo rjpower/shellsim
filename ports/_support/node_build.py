@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
+import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -18,6 +20,21 @@ from ports._support.python_adapters import CPythonBuildContext
 from ports._support.sdk_products import MaterializedSDK
 from ports._support.store import extract, fetch, file_hash, identity, relative_path
 from ports.api import BuildContext, build_port
+
+logger = logging.getLogger(__name__)
+
+
+def _run_builder(context: BuildContext):
+    try:
+        return build_port(context)
+    except subprocess.CalledProcessError:
+        if context.native is not None:
+            path = context.native.build / "build.log"
+            if path.is_file():
+                with path.open("rb") as log:
+                    log.seek(max(0, path.stat().st_size - 8192))
+                    logger.error("%s build log:\n%s", context.port.reference, log.read().decode(errors="replace"))
+        raise
 
 
 def _native_target(sdk_context: MaterializedSDK):
@@ -182,7 +199,7 @@ def produce_port(
             source = extract(source, slot.work / "source", subdirectory=recipe["source"]["subdirectory"])
             for patch in recipe.get("patches", []):
                 apply_patch(source, _local_file(port, patch["file"]), patch["sha256"])
-        build_port(
+        _run_builder(
             BuildContext(
                 port,
                 source,
@@ -275,7 +292,7 @@ def produce_port(
                     "runtime": python.runtime_manifest_sha256,
                 },
             )
-        output = build_port(
+        output = _run_builder(
             BuildContext(
                 port,
                 source,

@@ -8,6 +8,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 
@@ -91,8 +92,9 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     assets = cache / "delivery"
     assets.mkdir(exist_ok=True)
     delivery = DeliveryStore(store.prefix)
-    for item in [*packages, *native, *files, *([runtime] if runtime else [])]:
-        stage_asset(delivery, item, assets)
+    items = [*packages, *native, *files, *([runtime] if runtime else [])]
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda item: stage_asset(delivery, item, assets), items))
     test = node.test
     limits = _test_limits(node.port.recipe)
     kwargs = {"limits": limits} if limits is not None else {}
@@ -121,9 +123,15 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
         )
         extras = _test_extras(node.port.recipe)
         requirement = node.port.name + ("[" + ",".join(extras) + "]" if extras else "")
+        test_packages = [
+            wheel["name"]
+            for edge in node.port.dependencies
+            if edge.kind == "test"
+            for wheel in records["package:" + edge.recipe]["delivery"]["wheels"]
+        ]
         if own.get("delivery", {}).get("wheels"):
             environment = Environment(
-                pypi_packages=[requirement], pypi_catalog=location, cache_dir=cache / "guest", **kwargs
+                pypi_packages=[requirement, *test_packages], pypi_catalog=location, cache_dir=cache / "guest", **kwargs
             )
         else:
             from shellsim._pypi_catalog import Catalog
@@ -160,7 +168,13 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
         path = staging / "work" / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
-    _mount_package_tree(environment, staging, "/", normalize_modes=True)
+    _mount_package_tree(
+        environment,
+        staging,
+        "/",
+        normalize_modes=True,
+        replace_builtin_tools=[item["destination"] for item in native if item["kind"] == "tools"],
+    )
     command = {"python": "python ", "shell": "sh ", "native": ""}[test["kind"]] + shlex.quote(guest)
     result = environment.run(" ".join([command, *(shlex.quote(arg) for arg in test.get("args", []))]))
     if result.returncode or result.stop_reason:
