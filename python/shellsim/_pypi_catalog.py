@@ -70,11 +70,12 @@ class Catalog:
         if len(data) > _MAX_CATALOG:
             raise PackageInstallError("catalog exceeds its metadata limit")
         self.data = json.loads(data)
-        if self.data.get("schema_version") != 2 or "runtime" not in self.data:
-            raise PackageInstallError("catalog needs delivery schema 2 and a runtime asset")
-        self.runtime = self.data["runtime"]
-        self.version = self.runtime["python_version"]
-        self.abi = self.runtime["abi"]
+        if self.data.get("schema_version") != 2:
+            raise PackageInstallError("catalog needs delivery schema 2")
+        self.runtime = self.data.get("runtime")
+        self.version = self.runtime["python_version"] if self.runtime else None
+        self.abi = self.runtime["abi"] if self.runtime else self.data.get("abi")
+        self.ports = {port["reference"]: port for port in self.data.get("ports", [])}
         self.packages = {}
         for package in self.data["packages"]:
             name = canonicalize_name(package["name"])
@@ -98,7 +99,7 @@ class Catalog:
             "platform_system": "WASI",
             "platform_version": "",
             "python_full_version": self.version,
-            "python_version": ".".join(self.version.split(".")[:2]),
+            "python_version": ".".join(self.version.split(".")[:2]) if self.version else "",
             "sys_platform": "wasi",
             "extra": "",
         }
@@ -136,6 +137,8 @@ class Catalog:
         return path
 
     def bundle(self) -> Path:
+        if self.runtime is None:
+            raise PackageInstallError("catalog has no Python runtime")
         archive = self.asset(self.runtime)
         key = _relative(self.runtime["path"]).parts[-2]
         target = self.cache / "runtimes" / key
@@ -152,6 +155,8 @@ class Catalog:
         return target / "runtime"
 
     def resolve(self, requirements: str | Sequence[str]) -> list[dict]:
+        if self.runtime is None:
+            raise PackageInstallError("catalog has no Python runtime")
         if isinstance(requirements, str):
             requirements = (requirements,)
         if not isinstance(requirements, Sequence) or isinstance(requirements, bytes):
@@ -248,18 +253,85 @@ class Catalog:
                 unpack_wheel(path, site)
             create_entry_points(site)
             _stage_console_scripts(site, staging, runtime.venv)
-            for provider in providers:
-                if provider["name"] in environment._catalog_native:
-                    continue
-                source = self.asset(provider)
-                _verify_wasm(source.read_bytes(), self.abi)
-                destination = staging / _relative(provider["destination"].removeprefix("/"))
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(source, destination)
-                destination.chmod(0o755 if provider["kind"] == "tools" else 0o644)
+            assets = self.assets_for([*packages, *providers])
+            stage_catalog_items(self, environment, providers, assets, staging)
             _mount_package_tree(environment, staging, "/", normalize_modes=True)
         environment._catalog_packages.update(package["name"] for package in packages)
         environment._catalog_native.update(provider["name"] for provider in providers)
+        environment._catalog_assets.update(item["path"] for item in assets)
+
+    def assets_for(self, records: Sequence[dict]) -> list[dict]:
+        selected = {record["port"] for record in records if "port" in record}
+        pending = list(selected)
+        while pending:
+            for reference in self.ports.get(pending.pop(), {}).get("dependencies", []):
+                if reference not in selected:
+                    selected.add(reference)
+                    pending.append(reference)
+        return [item for item in self.data.get("assets", []) if item["port"] in selected]
+
+    def install_tools(self, environment: Environment, tools: str | Sequence[str]) -> None:
+        if isinstance(tools, str):
+            tools = (tools,)
+        if not isinstance(tools, Sequence) or isinstance(tools, bytes) or not 1 <= len(tools) <= 128:
+            raise ValueError("tools must contain 1..128 catalog tool names")
+        for name in tools:
+            if name not in self.providers or self.providers[name]["kind"] != "tools":
+                raise PackageInstallError("tool is absent from the curated catalog: " + str(name))
+        providers = self.native_closure(set(tools))
+        assets = self.assets_for(providers)
+        with tempfile.TemporaryDirectory(prefix=".tools-", dir=self.cache) as temporary:
+            staging = Path(temporary)
+            stage_catalog_items(self, environment, providers, assets, staging)
+            _mount_package_tree(environment, staging, "/", normalize_modes=True)
+        environment._catalog_native.update(provider["name"] for provider in providers)
+        environment._catalog_assets.update(item["path"] for item in assets)
+
+
+def stage_catalog_items(
+    catalog: Catalog, environment: Environment, providers: Sequence[dict], assets: Sequence[dict], staging: Path
+) -> None:
+    for item in [
+        *(provider for provider in providers if provider["name"] not in environment._catalog_native),
+        *(asset for asset in assets if asset["path"] not in environment._catalog_assets),
+    ]:
+        source = catalog.asset(item)
+        if item["kind"] == "archive":
+            unpack_files(source, staging)
+            continue
+        if item["kind"] in {"tools", "shared_libraries"}:
+            _verify_wasm(source.read_bytes(), catalog.abi)
+        destination = staging / _relative(item["destination"].removeprefix("/"))
+        if destination.exists():
+            if destination.is_file() and destination.read_bytes() == source.read_bytes():
+                continue
+            raise PackageInstallError("catalog installation paths conflict: " + item["destination"])
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+        destination.chmod(0o755 if item["kind"] == "tools" else 0o644)
+
+
+def unpack_files(path: Path, staging: Path) -> None:
+    """Stage a declared file bundle within guest paths, including conflict checks."""
+    with zipfile.ZipFile(path) as archive:
+        members = archive.infolist()
+        if len(members) > _MAX_FILES or sum(member.file_size for member in members) > _MAX_UNPACKED:
+            raise PackageInstallError("catalog files exceed their staging limit")
+        for member in members:
+            target = staging / _relative(member.filename.rstrip("/"))
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if (member.external_attr >> 16) & 0o170000 not in {0, 0o100000}:
+                raise PackageInstallError("catalog files must be regular files")
+            data = archive.read(member)
+            if target.exists():
+                if target.is_file() and target.read_bytes() == data:
+                    continue
+                raise PackageInstallError("catalog installation paths conflict: " + member.filename)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            target.chmod(0o755 if member.external_attr >> 16 & 0o111 else 0o644)
 
 
 def unpack_wheel(path: Path, site: Path) -> None:

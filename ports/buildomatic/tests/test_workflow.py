@@ -112,6 +112,30 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
     assert {node["reference"] for node in exported["ports"]} == {app.reference, runtime.reference}
 
 
+def test_check_dependencies_build_only_when_checks_are_requested(tmp_path):
+    ports, state = tmp_path / "ports", tmp_path / "state"
+    for name in ("app", "checker"):
+        _wheel_port(ports, state / "execution/cache/ports", name, [])
+    path = ports / "python/app/recipe.json"
+    value = json.loads(path.read_text())
+    value["test_dependencies"] = [{"port": "python/checker", "version": "1"}]
+    value["tests"] = [{"kind": "python", "script": "probe.py"}]
+    path.write_text(json.dumps(value))
+    (path.parent / "probe.py").write_text("print(42)\n")
+    store = StorageStore(str(tmp_path / "canonical"))
+    backend = LocalBackend(store, state / "execution")
+    built = run(ports, ["python/app"], store, state, backend, offline=True)
+    checker = next(
+        node for node in built.plan.nodes if node.port.name == "checker" and node.operation is Operation.BUILD
+    )
+    assert checker.reference not in built.records
+    checked = run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
+    assert checked.records[checker.reference]["reference"] == checker.reference
+    check = next(node for node in checked.plan.nodes if node.operation is Operation.CHECK)
+    assert checked.records[check.reference]["stdout"] == "42\n"
+    assert {item["name"] for item in json.loads((state / "graph.json").read_text())["packages"]} == {"app"}
+
+
 def test_progress_reports_active_work_and_remote_failure(tmp_path, monkeypatch, caplog):
     ports = tmp_path / "ports"
     _wheel_port(ports, tmp_path / "sources", "example", [])

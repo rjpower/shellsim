@@ -81,16 +81,17 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     from shellsim import Environment
     from shellsim.pypi import _mount_package_tree
 
-    packages, native = [], []
+    packages, native, files = [], [], []
     for name, record in records.items():
         if name.startswith("package:"):
             packages.extend(record["delivery"]["wheels"])
             native.extend(record["delivery"]["native"])
+            files.extend(record["delivery"].get("assets", []))
     runtime = records.get("runtime", {}).get("runtime")
     assets = cache / "delivery"
     assets.mkdir(exist_ok=True)
     delivery = DeliveryStore(store.prefix)
-    for item in [*packages, *native, *([runtime] if runtime else [])]:
+    for item in [*packages, *native, *files, *([runtime] if runtime else [])]:
         stage_asset(delivery, item, assets)
     test = node.test
     limits = _test_limits(node.port.recipe)
@@ -142,6 +143,10 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(assets / item["path"], path)
             path.chmod(0o755 if item["kind"] == "tools" else 0o644)
+    for item in files:
+        from shellsim._pypi_catalog import unpack_files
+
+        unpack_files(assets / item["path"], staging)
     guest = "/work/check" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[test["kind"]]
     if test["kind"] == "native":
         body = (install(store, records["probe"]["artifact"], cache / "artifacts") / "check.wasm").read_bytes()

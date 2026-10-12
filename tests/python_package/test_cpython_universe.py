@@ -431,9 +431,12 @@ def delivery_catalog(tmp_path):
         with zipfile.ZipFile(wheel, "w") as output:
             output.writestr(name + ".py", "VALUE = 42\n")
             info = name + "-1.0.dist-info/"
-            output.writestr(info + "METADATA", f"Name: {name}\nVersion: 1.0\nRequires-Python: >=3.13\n" +
-                "".join("Requires-Dist: " + requirement + "\n" for requirement in requirements) +
-                "".join("Provides-Extra: " + extra + "\n" for extra in extras))
+            output.writestr(
+                info + "METADATA",
+                f"Name: {name}\nVersion: 1.0\nRequires-Python: >=3.13\n"
+                + "".join("Requires-Dist: " + requirement + "\n" for requirement in requirements)
+                + "".join("Provides-Extra: " + extra + "\n" for extra in extras),
+            )
             output.writestr(info + "WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
             if name == "app":
                 output.writestr(info + "entry_points.txt", "[console_scripts]\napp-command = app:main\n")
@@ -469,6 +472,61 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
         shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
     third = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache, offline=True)
     assert third.read_file(site + "app.py") == b"VALUE = 42\n"
+
+
+def test_catalog_tools_install_data_closure_without_python(tmp_path):
+    from ports.buildomatic.delivery import catalog
+
+    tool = tmp_path / "example.wasm"
+    tool.write_bytes(
+        bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b") + marked_wasm()[8:]
+    )
+    files = tmp_path / "files.zip"
+    with zipfile.ZipFile(files, "w") as archive:
+        archive.writestr("usr/share/example/value.txt", "42")
+        archive.writestr("usr/include/example.h", "#define VALUE 42\n")
+    graph = {
+        "abi": ABI,
+        "packages": [],
+        "native": [
+            {
+                "name": "example",
+                "path": tool.name,
+                "size": tool.stat().st_size,
+                "kind": "tools",
+                "destination": "/usr/bin/example",
+                "abi": ABI,
+                "native_dependencies": [],
+                "port": "native/example",
+            }
+        ],
+        "assets": [
+            {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/data"},
+            {"path": "not-published.zip", "size": 1, "kind": "archive", "port": "native/unselected"},
+        ],
+        "ports": [
+            {"reference": "native/example", "dependencies": ["native/data"]},
+            {"reference": "native/data", "dependencies": []},
+        ],
+    }
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(catalog(graph, tmp_path.as_uri())))
+    cache = tmp_path / "cache"
+    first = shellsim.Environment(tools=["example"], pypi_catalog=path, cache_dir=cache)
+    assert first.run("example").returncode == 0
+    assert first.read_file("/usr/share/example/value.txt") == b"42"
+    assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
+    assert first.run("test ! -e /usr/bin/python3.wasm").returncode == 0
+    container = first.to_container()
+    assert container.run("example; cat /usr/share/example/value.txt").stdout == b"42"
+    container.write_file("/usr/share/example/value.txt", b"container change")
+    assert first.read_file("/usr/share/example/value.txt") == b"42"
+    first.write_file("/usr/share/example/value.txt", b"guest change")
+    tool.unlink()
+    files.unlink()
+    second = shellsim.Environment(tools="example", pypi_catalog=path, cache_dir=cache, offline=True)
+    assert second.read_file("/usr/share/example/value.txt") == b"42"
+    assert second.run("example").returncode == 0
 
 
 def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog):

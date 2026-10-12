@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from packaging.utils import canonicalize_name
 
 from ports._support.graph import Port
-from ports._support.store import file_hash, identity, relative_path
+from ports._support.store import identity, relative_path
 
 if TYPE_CHECKING:
     from ports.buildomatic.delivery import DeliveryStore
@@ -75,17 +75,22 @@ def publish_product(
     """Emit a product's wheels/providers once, then publish their metadata record."""
     if (record := store.record(record_key or build_key)) is not None:
         return record
-    record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": []}
+    record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": [], "assets": []}
     for wheel in sorted((root / "wheels").glob("*.whl")):
         relative = f"assets/{build_key}/{wheel.name}"
         metadata = wheel_metadata(wheel, relative)
         store.emit(wheel, relative)
         record["wheels"].append(asdict(metadata))
+    payload = root / "payload"
+    exports = port.recipe.get("exports", {})
+    directories = {}
     if (root / "native/artifact.json").exists():
         from ports._support.wasm_metadata import needed_libraries
 
         manifest = json.loads((root / "native/artifact.json").read_text())
         exports = manifest["inputs"]["recipe"]["exports"]
+        directories = manifest["inputs"]["recipe"].get("empty_directories", {})
+        payload = root / "native"
         for kind, destination in (("shared_libraries", "/lib/"), ("tools", "/usr/bin/")):
             for path in exports.get(kind, []):
                 source = root / "native" / relative_path(path)
@@ -104,6 +109,33 @@ def publish_product(
                         "native_dependencies": needed_libraries(source),
                     }
                 )
+    files = {}
+    for kind, paths in exports.items():
+        if kind in {"shared_libraries", "tools"}:
+            continue
+        for path in paths:
+            source = payload / relative_path(path)
+            destination = port.recipe.get("install", {}).get("destinations", {}).get(path)
+            if destination is None:
+                destination = (
+                    f"/usr/share/licenses/{port.name}/" + source.name if kind == "licenses" else "/usr/" + path
+                )
+            destination = relative_path(destination.removeprefix("/"))
+            if destination in files and files[destination] != source:
+                raise ValueError("asset installation paths conflict: " + destination)
+            files[destination] = source
+    if files or directories:
+        relative = f"assets/{build_key}/files.zip"
+        with tempfile.TemporaryDirectory(prefix=".files-", dir=root.parent) as temporary:
+            archive = Path(temporary) / "files.zip"
+            with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
+                for destination, source in sorted(files.items()):
+                    output.write(source, destination)
+                for directory in sorted(directories):
+                    output.writestr("usr/" + relative_path(directory) + "/", b"")
+            size = archive.stat().st_size
+            store.emit(archive, relative)
+        record["assets"].append({"path": relative, "size": size, "kind": "archive"})
     store.write("records/" + relative_path(record_key or build_key) + ".json", _json(record))
     return record
 
@@ -139,4 +171,4 @@ def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key:
 
 
 def delivery_key(product_key: str) -> str:
-    return identity({"operation": "delivery", "product": product_key, "implementation": file_hash(Path(__file__))})
+    return identity({"operation": "delivery", "product": product_key, "format_version": 3})

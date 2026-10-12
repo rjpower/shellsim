@@ -7,7 +7,8 @@ The native probe checks SHA-256 through both the direct and EVP interfaces.
 
 This configuration disables assembly, sockets, dynamic providers, engines,
 async operations, console prompts and mmap-backed secure memory. Thread support
-uses the guest pthread runtime, as required by CPython's `_ssl` extension.
+uses the guest pthread runtime, as required by CPython's `_ssl` extension; the
+optional internal thread pool is disabled.
 Entropy uses WASI getentropy, which remains within the simulator's random
 source. The archives support in-process crypto operations; they do not
 provide host networking, host devices or protected host memory.

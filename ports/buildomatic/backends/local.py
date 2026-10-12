@@ -36,7 +36,10 @@ class LocalBackend:
                 self.store,
                 self.root / ("worker-" + str(slot)),
                 self.limits,
-                environment={"BUILDOMATIC_CACHE": str((self.root / "cache").resolve())},
+                environment={
+                    "BUILDOMATIC_CACHE": str((self.root / "cache").resolve()),
+                    "SHELLSIM_WASMTIME_CACHE_DIR": str((self.root / "wasmtime").resolve()),
+                },
             )
             for slot in range(self.slots)
         }

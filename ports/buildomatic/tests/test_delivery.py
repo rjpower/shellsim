@@ -131,6 +131,9 @@ def test_guest_tools_are_emitted_as_executables(tmp_path):
     root = tmp_path / "product"
     (root / "native/bin").mkdir(parents=True)
     (root / "native/bin/make").write_bytes(b"\x00asm\x01\x00\x00\x00")
+    notice = root / "native/share/licenses/make/COPYING"
+    notice.parent.mkdir(parents=True)
+    notice.write_text("fixture license")
     (root / "native/artifact.json").write_text(json.dumps({"inputs": {"recipe": port.recipe}}))
     store = DeliveryStore(tmp_path / "canonical")
     record = publish_product(port, root, "make-key", store)

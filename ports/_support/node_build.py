@@ -298,8 +298,15 @@ def produce_port(
         if (output.staging_prefix / "wheels").exists():
             shutil.copytree(output.staging_prefix / "wheels", slot.result / "wheels")
         if recipe.get("exports") or recipe.get("export_directories"):
+            # Data follows delivery edges; the ABI envelope covers native providers.
+            linked_recipe = {
+                **recipe,
+                "runtime_dependencies": [
+                    item for item in recipe.get("runtime_dependencies", []) if item["port"] in native
+                ],
+            }
             seal_native_install(
-                recipe,
+                linked_recipe,
                 port.directory,
                 output.staging_prefix,
                 slot.result / "native",

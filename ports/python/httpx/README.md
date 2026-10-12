@@ -6,6 +6,4 @@ and `ASGITransport` with the existing FastAPI and sniffio check dependencies.
 Immediate coroutines avoid a socket-backed event loop; serving and suspended
 operations are outside these probes.
 
-HTTPcore's standalone guest probe requires a CPython SSL provider, which this
-checkout does not supply. HTTPX's mock probe passes with its declared closure.
-The wheels are unchanged.
+HTTPcore declares the CPython SSL provider. Wheels retain upstream metadata.

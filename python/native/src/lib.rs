@@ -462,15 +462,23 @@ fn serialize_result(result: serde_json::Value) -> PyResult<String> {
 #[pymethods]
 impl NativeEnvironment {
     #[new]
-    fn new(cpu: u64, memory: u64, disk: u64, output: u64) -> Self {
+    #[pyo3(signature = (cpu, memory, disk, output, real_time=false))]
+    fn new(cpu: u64, memory: u64, disk: u64, output: u64, real_time: bool) -> Self {
         Self {
-            environment: Mutex::new(shellsim::Environment::with_limits(Limits {
-                cpu,
-                memory,
-                disk,
-                output,
-            })),
+            environment: Mutex::new(shellsim::Environment::with_limits_and_clock(
+                Limits { cpu, memory, disk, output },
+                if real_time { ClockMode::RealTime } else { ClockMode::Virtual },
+            )),
         }
+    }
+
+    fn to_container(&self, py: Python<'_>) -> PyResult<NativeContainer> {
+        py.detach(|| -> Result<NativeContainer, String> {
+            let environment = self.lock_environment()?;
+            let mut session = HarnessSession::from_environment(environment.clone());
+            session.environment.net.enable_host_tools();
+            Ok(NativeContainer { session: Mutex::new(session) })
+        }).map_err(SimulationError::new_err)
     }
 
     /// Execute one shell action and return JSON metadata plus byte-preserving output streams.

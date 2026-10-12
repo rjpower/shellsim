@@ -61,7 +61,9 @@ class Result:
 
 def build_recipe(port: Port) -> dict:
     return {
-        key: value for key, value in port.recipe.items() if key not in {"tests", "test_limits", "runtime_dependencies"}
+        key: value
+        for key, value in port.recipe.items()
+        if key not in {"tests", "test_limits", "test_dependencies", "runtime_dependencies"}
     }
 
 
@@ -131,7 +133,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         pending = [
             (edge.recipe, runtime_edges or edge.kind == "build")
             for edge in port.dependencies
-            if runtime_edges or edge.kind != "runtime"
+            if edge.kind != "test" and (runtime_edges or edge.kind != "runtime")
         ]
         while pending:
             reference, include_runtime = pending.pop()
@@ -142,7 +144,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             pending.extend(
                 (edge.recipe, include_runtime or edge.kind == "build")
                 for edge in selected[reference].dependencies
-                if include_runtime or edge.kind != "runtime"
+                if edge.kind != "test" and (include_runtime or edge.kind != "runtime")
             )
         return found
 
@@ -189,8 +191,11 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         node = Node(port.reference, Operation.BUILD, key, port, tuple(inputs))
         builds[node.reference] = node
         nodes.append(node)
+    guest_ports = {port.reference for port in guest_graph(graph).ports}
+    test_ports = {edge.recipe for port in graph.ports for edge in port.dependencies if edge.kind == "test"}
+    delivery_ports = guest_graph(Graph((*graph.roots, *sorted(test_ports)), graph.ports))
     deliveries = {}
-    for port in guest_graph(graph).ports:
+    for port in delivery_ports.ports:
         if port.role in {"host-tool", "target-platform"} or port.reference in descriptors:
             continue
         product = builds[port.reference]
@@ -209,7 +214,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         key = identity(
             {
                 "operation": "runtime",
-                "implementation": file_hash(Path(__file__).with_name("delivery_products.py")),
+                "format_version": 1,
                 "inputs": {item.name: item.key for item in inputs},
             }
         )
@@ -217,12 +222,16 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         nodes.append(runtime_node)
     check_roots = []
     for port in graph.ports:
-        if port.reference not in deliveries:
+        if port.reference not in deliveries or port.reference not in guest_ports:
             continue
+        tested = {edge.recipe for edge in port.dependencies if edge.kind == "test"}
+        check_ports = {port.reference, *ancestors(port, runtime_edges=True), *tested}
+        for reference in tested:
+            check_ports.update(ancestors(selected[reference], runtime_edges=True))
         inputs = [
             Input("package:" + ref, node.reference, node.key)
             for ref, node in deliveries.items()
-            if ref in {port.reference, *ancestors(port, runtime_edges=True)} or ref in runtime_ports
+            if ref in check_ports or ref in runtime_ports
         ]
         if runtime_node:
             inputs.append(Input("runtime", runtime_node.reference, runtime_node.key))
@@ -277,10 +286,11 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         ports.resolve(),
         graph,
         tuple(nodes),
-        tuple(n.reference for n in deliveries.values())
+        tuple(n.reference for ref, n in deliveries.items() if ref in guest_ports)
         + ((runtime_node.reference,) if runtime_node else ())
         + tuple(ref for ref in graph.roots if ref not in deliveries),
-        tuple(n.reference for n in deliveries.values()) + ((runtime_node.reference,) if runtime_node else ()),
+        tuple(n.reference for ref, n in deliveries.items() if ref in guest_ports)
+        + ((runtime_node.reference,) if runtime_node else ()),
         tuple(check_roots),
         sdk,
     )
@@ -575,7 +585,7 @@ def run(
         jobs=jobs,
         max_workers=max_workers,
         offline=offline,
-        allow_build=operation is Operation.BUILD,
+        allow_build=operation is not Operation.DELIVERY,
         records=known,
     )
     logger.info("Planned %d nodes, %d actions", len(compiled.nodes), len(request.actions) if request else 0)

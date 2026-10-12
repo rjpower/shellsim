@@ -128,7 +128,7 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
 
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
-    if product.get("delivery_key") == node.key:
+    if product.get("delivery_key") == node.key or node.port.recipe["build_system"] == "pure-wheel":
         return product
     root = install(store, product["artifact"], cache / "artifacts")
     return {

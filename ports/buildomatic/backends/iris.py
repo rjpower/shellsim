@@ -718,7 +718,7 @@ def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = No
 
 def _worker_environment(config: IrisConfig) -> dict[str, str]:
     if not config.compiler_cache:
-        return {}
+        return {"SHELLSIM_WASMTIME_CACHE_DIR": "/app/.buildomatic/wasmtime"}
     from rigging.filesystem.cluster_config import StoreType, data_buckets, marin_temp_bucket
     from rigging.filesystem.s3_compat import configure_coreweave_s3, fsspec_s3_conf, s3_endpoint
 
@@ -740,6 +740,7 @@ def _worker_environment(config: IrisConfig) -> dict[str, str]:
     if binary is None:
         raise RuntimeError("compiler cache requires sccache in the worker task image")
     return {
+        "SHELLSIM_WASMTIME_CACHE_DIR": "/app/.buildomatic/wasmtime",
         **compiler_cache_environment(path, environ),
         "SCCACHE_SERVER_UDS": "/app/.buildomatic/sccache.sock",
         "SCCACHE_IDLE_TIMEOUT": "0",
@@ -1284,7 +1285,7 @@ def _run_worker(config: IrisConfig, worker_id: str) -> None:
     os.environ.update(env)
     # sccache uses one worker-local server, keeping cloud credentials outside
     # the sanitized action environment owned by WorkerExecutor.
-    if env:
+    if config.compiler_cache:
         os.environ.pop("SCCACHE_SERVER_PORT", None)
         Path(env["SCCACHE_SERVER_UDS"]).parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["sccache", "--start-server"], check=True, stdout=subprocess.DEVNULL)

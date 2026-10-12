@@ -56,6 +56,7 @@ def build(ctx: BuildContext) -> NativeBuildOutput:
             "no-shared",
             "no-asm",
             "threads",
+            "no-thread-pool",
             "no-apps",
             "no-tests",
             "no-sock",
