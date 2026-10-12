@@ -8,7 +8,7 @@ Run the first command inside that environment:
 ```sh
 uv run --with maturin maturin build --profile dev --strip --out ports/buildomatic/images/wheels
 docker buildx build --push --platform linux/amd64 \
-  --tag ghcr.io/marin-community/iris-task:buildomatic-unified-v8 ports/buildomatic/images
+  --tag ghcr.io/marin-community/iris-task:buildomatic-container-v9 ports/buildomatic/images
 ```
 
 Pin the returned digest in `IrisConfig`. Its `setup_scripts` should install the

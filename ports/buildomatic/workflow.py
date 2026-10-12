@@ -33,7 +33,7 @@ from ports.buildomatic import (
 from ports.buildomatic.artifacts import register, resolve, write_reference
 from ports.buildomatic.delivery import DeliveryStore, delivery_graph
 from ports.buildomatic.delivery_products import delivery_key
-from ports.buildomatic.legacy import compatible_driver, compatible_packaging
+from ports.buildomatic.legacy import compatible_packaging
 from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
@@ -175,10 +175,6 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         key = identity(
             {
                 "operation": "build",
-                "adapter_driver": file_hash(Path(__file__).resolve().parents[1] / "_support/node_build.py"),
-                "sdk_binding": file_hash(Path(__file__).resolve().parents[1] / "_support/sdk_products.py")
-                if port.recipe["build_system"] not in {"pure-wheel", "host-wheel", "source-tree"}
-                else None,
                 "recipe": build_recipe(port),
                 "local_inputs": _admit_recipe(port),
                 "implementation": implementation(port),
@@ -371,7 +367,7 @@ def normalize_cached(
             record = old_sdk["products"].get(node.producer["name"])
             if record:
                 record = {**record, "reference": node.port.reference, "build_key": node.key}
-        elif node.operation is Operation.BUILD and node.port.reference in legacy_keys and compatible_driver(node.port):
+        elif node.operation is Operation.BUILD and node.port.reference in legacy_keys:
             record = resolve(store, "port/" + legacy_keys[node.port.reference])
         elif node.operation is Operation.DELIVERY:
             product = records[node.inputs[0].reference]

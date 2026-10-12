@@ -88,7 +88,7 @@ _BUILD_ID = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
 _MAX_BUILDS = 4096
 DEFAULT_TASK_IMAGE = (
-    "ghcr.io/marin-community/iris-task@sha256:958fa4a2013916163a3b84338e158a6feb285bdc06de3ada9c14caabe46ab69b"
+    "ghcr.io/marin-community/iris-task@sha256:925b9deb6e1022b5a57742faa0d8ad8bc45036576b5bd028924c33bdfe570c68"
 )
 
 
