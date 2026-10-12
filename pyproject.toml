@@ -26,7 +26,7 @@ classifiers = [
 keywords = ["agents", "containers", "reinforcement-learning", "sandbox", "simulation", "testing"]
 
 [project.optional-dependencies]
-c = ["shellsim-c-toolchain==0.1.33"]
+c = ["shellsim-c-toolchain==0.1.34"]
 pypi = ["uv>=0.12,<1", "tomli>=2; python_version < '3.11'"]
 buildomatic = [
     "marin-rigging==0.2.165.dev38153482028; python_version >= '3.12'",
