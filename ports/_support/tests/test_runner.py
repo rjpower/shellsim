@@ -257,7 +257,7 @@ def test_publish_stdlib_runtime_provider_closes_pillow_dependencies(tmp_path):
     providers = universe.provider_closure({"libfreetype.so"})
     assert "libz.so" in providers
     assert providers["libz.so"].read_bytes() == (runtime.bundle / "rootfs/lib/libz.so").read_bytes()
-    environment = shellsim.Environment.from_release(release, pypi=["pillow==12.3.0"], cache_dir=tmp_path / "cache")
+    environment = shellsim.Context(cache_dir=tmp_path / "cache").from_release(release, pypi=["pillow==12.3.0"])
     environment.write_file(
         "/work/raster.py", b"from PIL import ImageFont\nassert sum(ImageFont.load_default(size=24).getmask('A')) > 0\n"
     )

@@ -692,7 +692,7 @@ impl HarnessSession {
                     WorkspaceSnapshotEntry::File {
                         path: relative.to_string(),
                         mode: node.mode,
-                        data_base64: STANDARD.encode(data),
+                        data_base64: STANDARD.encode(data.as_slice()),
                     }
                 }
                 NodeKind::Symlink(_) | NodeKind::NativeExecutable(_) => {
@@ -1301,7 +1301,7 @@ impl HarnessSession {
         };
         Ok(HarnessResult::File(FileResult {
             path,
-            data_base64: STANDARD.encode(data),
+            data_base64: STANDARD.encode(data.as_slice()),
             mode: node.mode,
         }))
     }
@@ -1611,7 +1611,7 @@ fn workspace_node(node: &Node) -> WorkspaceNode {
     match &node.kind {
         NodeKind::File(data) => WorkspaceNode::File {
             mode: node.mode,
-            data_base64: STANDARD.encode(data),
+            data_base64: STANDARD.encode(data.as_slice()),
         },
         NodeKind::Dir => WorkspaceNode::Directory { mode: node.mode },
         NodeKind::Symlink(target) => WorkspaceNode::Symlink {

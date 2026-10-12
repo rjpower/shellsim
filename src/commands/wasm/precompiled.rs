@@ -4,6 +4,9 @@
 //! them with source bytes and deserialize them. Guests use ordinary admission, metering,
 //! instantiation, and the bounded module cache; no guest path loads native code.
 
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use wasmtime::{Error, Module};
 
 use super::{
@@ -28,6 +31,12 @@ pub enum PrecompiledWasmOutcome {
     Registered,
     /// The companion exceeds cache bounds and ordinary JIT remains available.
     Incompatible,
+}
+
+#[derive(Clone)]
+pub(super) enum Companion {
+    Bytes(Arc<[u8]>),
+    File(PathBuf),
 }
 
 /// Compile binary Wasm on the host using the command engine and return a native companion.
@@ -66,6 +75,39 @@ pub fn precompiled_wasm_build_id() -> &'static str {
     compilation_cache::BUILD_ID
 }
 
+/// Check retained compilation before a host adapter reads a large companion file.
+/// A missing executable admission profile is a miss; this lookup never admits new source.
+fn precompiled_wasm_registered(source: &[u8], kind: WasmCompilationKind) -> Result<bool, Error> {
+    check_source(source)?;
+    let admission = match kind {
+        WasmCompilationKind::Module => None,
+        WasmCompilationKind::Executable => {
+            let cache = command_module_cache().lock().expect("module cache lock");
+            let Some(admission) = cache
+                .entries
+                .iter()
+                .find(|entry| entry.source == source)
+                .and_then(|entry| entry.admission.clone())
+            else {
+                return Ok(false);
+            };
+            Some(admission)
+        }
+    };
+    let rewritten = admission
+        .as_ref()
+        .map(|admission| executable_compilation_source(source, admission.profile.as_ref()))
+        .transpose()?
+        .flatten();
+    let compilation_source = rewritten.as_deref().unwrap_or(source);
+    Ok(command_module_cache()
+        .lock()
+        .expect("module cache lock")
+        .entries
+        .iter()
+        .any(|entry| entry.source == compilation_source))
+}
+
 /// Register a trusted host companion for the exact source used by subsequent guest compilation.
 ///
 /// Deserialization and compatibility checks happen on the first compilation cache miss, outside
@@ -85,8 +127,41 @@ pub unsafe fn register_trusted_precompiled_wasm(
     companion: &[u8],
     kind: WasmCompilationKind,
 ) -> Result<PrecompiledWasmOutcome, Error> {
+    register(source, kind, companion.len(), || {
+        Companion::Bytes(companion.into())
+    })
+}
+
+/// Retain a trusted companion path and map it only when its module is first used.
+///
+/// # Safety
+/// The host must control the file and keep its contents unchanged for the lifetime of all
+/// cached modules and live instances using it, which can span the host process lifetime.
+/// Its bytes must have the exact trusted source/kind association of the bytes-based API.
+#[allow(unsafe_code)]
+pub unsafe fn register_trusted_precompiled_wasm_file(
+    source: &[u8],
+    companion: &Path,
+    kind: WasmCompilationKind,
+) -> Result<PrecompiledWasmOutcome, Error> {
+    if precompiled_wasm_registered(source, kind)? {
+        return Ok(PrecompiledWasmOutcome::Registered);
+    }
+    let size = usize::try_from(std::fs::metadata(companion)?.len())
+        .map_err(|_| Error::msg("companion exceeds cache bounds"))?;
+    register(source, kind, size, || {
+        Companion::File(companion.to_path_buf())
+    })
+}
+
+fn register(
+    source: &[u8],
+    kind: WasmCompilationKind,
+    companion_size: usize,
+    companion: impl FnOnce() -> Companion,
+) -> Result<PrecompiledWasmOutcome, Error> {
     check_source(source)?;
-    if companion.len() > MAX_CACHED_MODULE_BYTES {
+    if companion_size > MAX_CACHED_MODULE_BYTES {
         return Ok(PrecompiledWasmOutcome::Incompatible);
     }
     let admission = match kind {
@@ -102,7 +177,7 @@ pub unsafe fn register_trusted_precompiled_wasm(
         .transpose()?
         .flatten();
     let compilation_source = rewritten.as_deref().unwrap_or(source);
-    let bytes = compilation_source.len().saturating_add(companion.len());
+    let bytes = compilation_source.len().saturating_add(companion_size);
     if bytes > MAX_CACHED_MODULE_BYTES {
         return Ok(PrecompiledWasmOutcome::Incompatible);
     }
@@ -114,7 +189,7 @@ pub unsafe fn register_trusted_precompiled_wasm(
     {
         cache.insert_entry(
             compilation_source,
-            CachedCompilation::Precompiled(companion.into()),
+            CachedCompilation::Precompiled(companion()),
             bytes,
         );
     }
@@ -126,10 +201,14 @@ pub unsafe fn register_trusted_precompiled_wasm(
 }
 
 #[allow(unsafe_code)]
-pub(super) fn load(companion: Option<&[u8]>) -> Option<Module> {
+pub(super) fn load(companion: Option<&Companion>) -> Option<Module> {
     // SAFETY: only the unsafe trusted-host registration API can create pending companions.
+    // File registration requires immutable contents throughout the mapped module's lifetime.
     // Guest resource charges and source admission precede this lookup. Incompatibility falls back.
-    companion.and_then(|bytes| unsafe { Module::deserialize(command_engine(), bytes).ok() })
+    companion.and_then(|companion| match companion {
+        Companion::Bytes(bytes) => unsafe { Module::deserialize(command_engine(), bytes).ok() },
+        Companion::File(path) => unsafe { Module::deserialize_file(command_engine(), path).ok() },
+    })
 }
 
 fn check_source(source: &[u8]) -> Result<(), Error> {
@@ -171,16 +250,27 @@ mod tests {
             wat::parse_str("(module (func (export \"answer\") (result i32) (i32.const 739)))")
                 .unwrap();
         let bytes = precompile_wasm(&source, WasmCompilationKind::Module).unwrap();
-        // SAFETY: bytes came directly from our host compiler.
+        let path = std::env::temp_dir().join(format!(
+            "shellsim-context-companion-{}.cwasm",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        // SAFETY: the file contains only our host compiler's output and remains unchanged.
         assert_eq!(
             unsafe {
-                register_trusted_precompiled_wasm(&source, &bytes, WasmCompilationKind::Module)
+                register_trusted_precompiled_wasm_file(&source, &path, WasmCompilationKind::Module)
             }
             .unwrap(),
             PrecompiledWasmOutcome::Registered
         );
         let module = super::super::compiled_command_module(&source).unwrap();
         assert_eq!(module.serialize().unwrap(), bytes);
+        std::fs::remove_file(&path).unwrap();
+        // SAFETY: this module is already loaded; repeated setup must not reopen its file.
+        unsafe {
+            register_trusted_precompiled_wasm_file(&source, &path, WasmCompilationKind::Module)
+        }
+        .unwrap();
         let mut store = Store::new(command_engine(), ());
         store.set_fuel(1000).unwrap();
         let instance = Instance::new(&mut store, &module, &[]).unwrap();

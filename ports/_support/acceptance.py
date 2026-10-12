@@ -336,7 +336,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
         )
 
     request.output.mkdir(parents=True)
-    from shellsim import Environment
+    from shellsim import Context
 
     from ports._support.native_catalog import installation
 
@@ -393,7 +393,7 @@ def accept_port(request: AcceptanceRequest) -> tuple[AcceptanceResult, ...]:
             if request.install_kind == "pypi+native":
                 setup["pypi"] = [python_spec]
             kwargs = {"limits": limits} if limits is not None else {}
-            env = Environment.from_release(descriptor, cache_dir=Path(cache_dir), **setup, **kwargs)
+            env = Context(cache_dir=Path(cache_dir)).from_release(descriptor, **setup, **kwargs)
             guest_path = "/work/shellsim-acceptance" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[kind]
             env.write_file(
                 guest_path,

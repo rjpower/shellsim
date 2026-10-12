@@ -1,7 +1,7 @@
 # Native graph publication
 
 Guest native artifacts publish through the existing `native.zip` release asset.
-`Environment.from_release(descriptor, tools=["package>=1"])` resolves and mounts
+`Context().from_release(descriptor, tools=["package>=1"])` resolves and mounts
 verified exports atomically. Host tools and target-platform products stay outside
 both guest catalogs and acceptance.
 

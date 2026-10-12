@@ -2345,11 +2345,24 @@ impl Environment {
                 file.cursor
             };
             let cursor = usize::try_from(position).map_err(|_| SyscallError::InvalidArgument)?;
+            let copied = match file.orphan {
+                Some(id) => self
+                    .vfs
+                    .orphan_cow_bytes(id, crate::vfs::FileMutation::Write)?,
+                None => {
+                    self.vfs
+                        .file_cow_bytes("/", &file.path, crate::vfs::FileMutation::Write)?
+                }
+            };
+            if !self.resources.charge_cpu(copied) || !self.resources.reserve_memory(copied) {
+                return Err(SyscallError::ResourceExhausted);
+            }
             self.sync_vfs_time();
             let result = match file.orphan {
                 Some(id) => self.vfs.write_orphan_at(id, cursor, bytes),
                 None => self.vfs.write_at("/", &file.path, cursor, bytes),
             };
+            self.resources.release_memory(copied);
             if let Err(error) = result {
                 if file.remove_on_first_write_error && cursor == 0 {
                     let _ = self.vfs.remove_file("/", &file.path);

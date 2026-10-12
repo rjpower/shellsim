@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from typing import Mapping, Optional, Union
 
-from ._api import Environment, HttpResponse, Limits, RunResult
+from ._api import Context, HttpResponse, Limits, RunResult
 
 
 def run(
@@ -22,11 +22,8 @@ def run(
 ) -> RunResult:
     """Execute Python source in a fresh, resource-bounded shellsim environment."""
 
-    return Environment(
-        limits,
-        cpu=cpu,
-        memory=memory,
-        disk=disk,
-        output=output,
-        http=http,
-    ).run_python(source, argv, stdin)
+    return (
+        Context()
+        .Environment(limits, cpu=cpu, memory=memory, disk=disk, output=output, http=http)
+        .run_python(source, argv, stdin)
+    )

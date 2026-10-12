@@ -98,7 +98,7 @@ def test_python_and_native_files_share_atomic_conflict_policy(
     record["destinations"] = {"tool": destination}
     other = add("new-file", tool=False)
     other["destinations"] = {"tool": "/usr/local/share/new-file"}
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     runtime.mount(env)
     native = universe()
     if python_first:
@@ -143,12 +143,12 @@ def test_native_tool_replaces_only_original_builtin(catalog):
     add, universe, _ = catalog
     record = add("guest-make", payload=b"#!/bin/sh\nprintf installed")
     record["destinations"] = {"tool": "/usr/bin/make"}
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     universe().install(env, "guest-make")
     assert env.run("/usr/bin/make").stdout == b"installed"
     universe().install(env, "guest-make")
     assert env.run("/usr/bin/make").stdout == b"installed"
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     env.write_file("/usr/bin/make", "owned command", mode=0o755)
     with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "guest-make")
@@ -161,7 +161,7 @@ def test_wheel_executable_mode_comes_from_metadata(wheel_runtime, host_umask):
         member = zipfile.ZipInfo("executable.py")
         member.external_attr = 0o100755 << 16
         archive.writestr(member, "print(42)")
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     runtime.mount(env)
     runtime.install_wheel(env, wheel)
     assert env.run("test -x /usr/lib/python3.13/site-packages/executable.py").returncode == 0
@@ -172,7 +172,7 @@ def test_python_package_disk_failure_preserves_simulation_error(wheel_runtime):
     runtime, wheel = wheel_runtime
     with zipfile.ZipFile(wheel, "a") as archive:
         archive.writestr("oversized.py", b"x" * 200_000)
-    env = shellsim.Environment(disk=100_000)
+    env = shellsim.Context().Environment(disk=100_000)
     runtime.mount(env)
     with pytest.raises(shellsim.SimulationError):
         runtime.install_wheel(env, wheel)
@@ -183,7 +183,7 @@ def test_single_string_range_and_recipe_alias(catalog):
     add, universe, _ = catalog
     add("alias", "1", recipe_name="upstream")
     add("alias", "2", recipe_name="upstream")
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     assert universe().install(env, "alias>=1,<2") == {"alias": "1"}
     assert env.read_file("/usr/local/bin/alias") == b"alias1"
     assert env.run("test -x /usr/local/bin/alias").returncode == 0
@@ -197,7 +197,7 @@ def test_system_library_exports_require_canonical_install_paths(catalog, destina
     add, universe, _ = catalog
     record = add("module")
     record["destinations"] = {"tool": destination}
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     if destination == "/usr/lib/python3.13/lib-dynload/zlib.so":
         universe().install(env, "module")
         assert env.read_file(destination) == b"module1"
@@ -231,7 +231,7 @@ def test_global_constraints_backtrack(catalog):
     value = json.loads(path.read_text())
     value["packages"][-1]["artifact_sha256"] = manifest["artifact_sha256"]
     path.write_text(json.dumps(value))
-    assert _NativePackageUniverse(path).install(shellsim.Environment(), "consumer") == {
+    assert _NativePackageUniverse(path).install(shellsim.Context().Environment(), "consumer") == {
         "consumer": "1",
         "provider": "1",
     }
@@ -244,7 +244,7 @@ def test_wrong_identity_has_no_vfs_effect(catalog, field, value):
     add, universe, _ = catalog
     record = add("tool")
     record[field] = value
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     env.write_file("/sentinel", b"unchanged")
     with pytest.raises(ValueError):
         universe().install(env, "tool")
@@ -257,14 +257,14 @@ def test_corrupt_file_rejected(catalog):
     add("tool")
     (root / "tool-1/tool").write_bytes(b"corrupt")
     with pytest.raises(ValueError):
-        universe().install(shellsim.Environment(), "tool")
+        universe().install(shellsim.Context().Environment(), "tool")
 
 
 def test_omitted_native_dependency_rejected(catalog):
     add, universe, _ = catalog
     add("tool", pinned=[{"port": "provider", "version": "1", "hash": "0" * 64}])
     with pytest.raises(ValueError):
-        universe().install(shellsim.Environment(), "tool")
+        universe().install(shellsim.Context().Environment(), "tool")
 
 
 @pytest.mark.parametrize("spec", ["tool @ https://example.com/tool", "tool[extra]", 'tool; python_version>"3"'])
@@ -272,7 +272,7 @@ def test_unsupported_requirement_rejected(catalog, spec):
     add, universe, _ = catalog
     add("tool")
     with pytest.raises(ValueError):
-        universe().install(shellsim.Environment(), spec)
+        universe().install(shellsim.Context().Environment(), spec)
 
 
 def test_directory_chain_is_bounded(catalog, monkeypatch):
@@ -286,7 +286,7 @@ def test_directory_chain_is_bounded(catalog, monkeypatch):
         path.mkdir()
     monkeypatch.setattr(native, "_MAX_FILES", 5)
     with pytest.raises(ValueError):
-        universe().install(shellsim.Environment(), "tool")
+        universe().install(shellsim.Context().Environment(), "tool")
 
 
 def test_conflicting_exports_rejected_before_mount(catalog):
@@ -294,7 +294,7 @@ def test_conflicting_exports_rejected_before_mount(catalog):
     add("one")
     two = add("two")
     two["destinations"] = {"tool": "/usr/local/bin/one"}
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, ["one", "two"])
     assert env.run("test ! -e /usr/local/bin/one").returncode == 0
@@ -309,13 +309,13 @@ def test_dependency_hash_mismatch_rejected(catalog):
         pinned=[{"port": "provider", "version": "1", "hash": "0" * 64}],
     )
     with pytest.raises(ValueError):
-        universe().install(shellsim.Environment(), "consumer")
+        universe().install(shellsim.Context().Environment(), "consumer")
 
 
 def test_disk_failure_is_atomic(catalog):
     add, universe, _ = catalog
     add("tool", payload=b"x" * (1024 * 1024))
-    env = shellsim.Environment(disk=64 * 1024)
+    env = shellsim.Context().Environment(disk=64 * 1024)
     env.write_file("/sentinel", b"unchanged")
     with pytest.raises(shellsim.SimulationError):
         universe().install(env, "tool")
@@ -332,7 +332,7 @@ def test_sequential_provider_replacement_rejected_across_universes(catalog):
         dependencies=[{"requirement": "provider==1", "kind": "build-tool"}],
         pinned=[{"port": "provider", "version": "1", "hash": provider["artifact_sha256"]}],
     )
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     assert universe().install(env, "consumer") == {"consumer": "1", "provider": "1"}
     with pytest.raises(ValueError):
         _NativePackageUniverse(root / "catalog.json").install(env, "provider==2")
@@ -353,7 +353,7 @@ def test_sequential_destination_conflict_rejected(catalog):
     add("one")
     two = add("two")
     two["destinations"] = {"tool": "/usr/local/bin/one"}
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     universe().install(env, "one")
     with pytest.raises(shellsim.PackageInstallError):
         universe().install(env, "two")
@@ -364,7 +364,7 @@ def test_failed_mount_does_not_record_installed_version(catalog):
     add, universe, _ = catalog
     add("tool", "1")
     add("tool", "2", payload=b"x" * (1024 * 1024))
-    env = shellsim.Environment(disk=64 * 1024)
+    env = shellsim.Context().Environment(disk=64 * 1024)
     with pytest.raises(shellsim.SimulationError):
         universe().install(env, "tool==2")
     assert universe().install(env, "tool==1") == {"tool": "1"}
@@ -373,7 +373,7 @@ def test_failed_mount_does_not_record_installed_version(catalog):
 def test_modified_installed_export_is_not_silently_skipped(catalog):
     add, universe, _ = catalog
     add("tool")
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     universe().install(env, "tool")
     env.write_file("/usr/local/bin/tool", b"modified")
     with pytest.raises(shellsim.PackageInstallError):
@@ -384,7 +384,7 @@ def test_modified_installed_export_is_not_silently_skipped(catalog):
 def test_missing_installed_export_is_not_silently_skipped(catalog):
     add, universe, _ = catalog
     add("tool")
-    env = shellsim.Environment()
+    env = shellsim.Context().Environment()
     universe().install(env, "tool")
     env.run("rm /usr/local/bin/tool").check_returncode()
     with pytest.raises(shellsim.SimulationError):

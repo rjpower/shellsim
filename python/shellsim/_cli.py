@@ -9,7 +9,7 @@ import urllib.error
 from collections.abc import Sequence
 from typing import Any, Optional
 
-from ._api import Environment, Limits, RunResult, SimulationError
+from ._api import Context, Environment, Limits, RunResult, SimulationError
 from .display_host import DisplayHost
 from .package import Package
 
@@ -166,11 +166,8 @@ def _run_package(arguments: Sequence[str]) -> int:
 def _prepare_environment(options: argparse.Namespace, stdout: Any, stderr: Any) -> tuple[Optional[Environment], int]:
     """Create a simulated machine, import an optional host snapshot, and enter `/work`."""
 
-    environment = Environment(
-        cpu=options.cpu,
-        memory=options.memory,
-        disk=options.disk,
-        output=options.output,
+    environment = Context().Environment(
+        cpu=options.cpu, memory=options.memory, disk=options.disk, output=options.output
     )
     try:
         if options.root is not None:

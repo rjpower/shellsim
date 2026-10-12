@@ -57,7 +57,7 @@ def _live_runtime() -> tuple[shellsim.CPythonRuntime, shellsim.Environment]:
     if not all((bundle, catalog, uv)):
         pytest.skip("set SHELLSIM_DYNAMIC_V2_BUNDLE, SHELLSIM_CPYTHON_UNIVERSE, and SHELLSIM_PATCHED_UV")
     runtime = shellsim.CPythonRuntime(bundle, universe=catalog, uv=uv)
-    environment = shellsim.Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
     runtime.mount(environment)
     return runtime, environment
 

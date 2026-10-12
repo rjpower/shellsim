@@ -179,7 +179,9 @@ def test_uv_range_selection_installs_each_version_in_a_guest(tmp_path: Path) -> 
     output = compose(Path(bundle_path), [first, second], tmp_path / "merged")
     runtime = shellsim.CPythonRuntime(bundle_path, universe=output, uv=uv)
     for requirement, expected in (("catalogselection>=1,<2", b"1\n"), ("catalogselection>=2,<3", b"2\n")):
-        environment = shellsim.Environment(cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+        environment = shellsim.Context().Environment(
+            cpu=4_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024
+        )
         runtime.mount(environment)
         runtime.install_pypi(environment, requirement)
         result = runtime.run(environment, ["-c", "import catalogselection; print(catalogselection.value)"])

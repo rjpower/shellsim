@@ -305,13 +305,19 @@ impl PyFilesystem for Interp {
 
 impl Interp {
     fn append_python_file(&mut self, path: &str, contents: &[u8]) -> PyResult<usize> {
-        reserve_memory(self, contents.len())?;
-        charge_cpu(self, contents.len())?;
         let path = resolve_against(&self.cwd, path);
-        self.sync_vfs_time();
-        self.vfs
-            .append("/", &path, contents, 0o644)
+        let copied = self
+            .vfs
+            .file_cow_bytes("/", &path, crate::vfs::FileMutation::Write)
             .map_err(map_vfs_error)?;
+        let copied = usize::try_from(copied).unwrap_or(usize::MAX);
+        charge_cpu(self, contents.len().saturating_add(copied))?;
+        reserve_memory(self, contents.len())?;
+        reserve_memory(self, copied)?;
+        self.sync_vfs_time();
+        let appended = self.vfs.append("/", &path, contents, 0o644);
+        self.resources.release_memory(copied as u64);
+        appended.map_err(map_vfs_error)?;
         self.vfs.file_len("/", &path).map_err(map_vfs_error)
     }
 }

@@ -53,16 +53,16 @@ it does not change the Python cohort or uv resolver. Request guest tools and
 Python packages together when preparing an environment:
 
 ```python
-from shellsim import Environment
+from shellsim import Context
 
-env = Environment.from_release(
+env = Context().from_release(
     "/path/to/release-output/release.json",
     pypi=["pytest==8.4.1", "numpy==2.3.5"],
     tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
 )
 ```
 
-The native archive is optional. With tools requested, `offline=True` requires
+The native archive is optional. With tools requested, `Context(offline=True)` requires
 its verified cache entry. Old descriptors without a native section continue to
 load their Python cohort; requesting native tools from one reports the missing
 asset.
@@ -78,19 +78,19 @@ published descriptor still needs an independently recorded archive and resolver
 hash. No default descriptor or release URL is currently shipped.
 
 ```python
-from shellsim import Environment
+from shellsim import Context
 
-env = Environment.from_release("/path/to/release-output/release.json", pypi="numpy==2.3.5")
+env = Context().from_release("/path/to/release-output/release.json", pypi="numpy==2.3.5")
 ```
 
-`Environment.from_release` reads the explicitly trusted local descriptor,
+`Context.from_release` reads the explicitly trusted local descriptor,
 verifies the runtime and catalogs, then mounts CPython and installs the
 requested packages. It returns only after setup succeeds. Its default limits
-are 4 billion CPU units, 512 MiB memory, 256 MiB disk and 4 MiB output;
+are 4 billion CPU units, 1 GiB memory, 256 MiB disk and 4 MiB output;
 pass `limits=Limits(...)` to override them. Supply `project="/host/task"` to
 mount source at `/work` before package setup. For `uv.lock`, also pass the lock
 path, with optional `extras` and `groups`; a lock without a project is rejected.
-`offline=True` requires cached release assets, while package resolution can
+`Context(offline=True)` requires cached release assets, while package resolution can
 still contact the configured index for uncatalogued pure dependencies.
 
 The lower-level `CPythonRuntime.from_release` remains available for explicit

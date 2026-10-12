@@ -87,7 +87,7 @@ The Python API exposes fresh and persistent environments:
 ```python
 import shellsim
 
-environment = shellsim.Environment(cpu=100_000)
+environment = shellsim.Context().Environment(cpu=100_000)
 environment.write_file("/work/main.py", "print(6 * 7)\n")
 result = environment.run("python3.14 /work/main.py")
 assert result.returncode == 0
@@ -109,7 +109,7 @@ Static HTTP fixtures use the same isolated environment. They do not enable socke
 host-network access:
 
 ```python
-environment = shellsim.Environment(http={
+environment = shellsim.Context().Environment(http={
     "https://api.test/items/*": shellsim.HttpResponse(
         status=200,
         headers={"Content-Type": "application/json"},
@@ -131,14 +131,14 @@ Python source can bypass shell parsing and quoting while using the same isolated
 result = shellsim.python.run("print(sum(range(10)))", argv=["example"])
 result.check_returncode()
 
-environment = shellsim.Environment()
+environment = shellsim.Context().Environment()
 result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
 ```
 
 To stage a trusted PyPI distribution and its dependencies, install `shellsim[pypi]`:
 
 ```python
-environment = shellsim.Environment()
+environment = shellsim.Context().Environment()
 environment.install_pypi("roman==4.2")
 result = environment.run_python("import roman; print(roman.toRoman(42))")
 print(result.stdout)  # b'XLII\n'
@@ -151,16 +151,16 @@ environment's working directory. Resolution failures and native wheels raise
 For compiled packages, use an exported [ports catalog](ports/buildomatic/README.md):
 
 ```python
-environment = shellsim.Environment(
-    pypi_packages=["scipy"], pypi_catalog="http://localhost:8080/export/catalog.json",
-)
+context = shellsim.Context(pypi_catalog="http://localhost:8080/export/catalog.json")
+environment = context.Environment(pypi_packages=["scipy"])
 result = environment.run_python("from scipy.special import factorial; print(factorial(5))")
 ```
 
 This mounts upstream CPython 3.13.7 WASI and downloads only the selected wheels,
-native dependencies, and interpreter, caching them between environments. Set
-`SHELLSIM_PYPI_CATALOG` to omit `pypi_catalog`; `cache_dir` and `offline=True` control
-cache use. No patched uv is needed. Each guest has a private filesystem;
+native dependencies, and interpreter. Context fixes the catalog snapshot and
+`cache_dir`, `offline`, and `trusted_precompiled` policy. Identical selections reuse
+an immutable installation with a private filesystem for each guest. Create a new
+Context to see catalog updates. No patched uv is needed;
 `install_pypi` can add catalog packages later. See [CPython WASI ports](ports/README.md)
 for capability limits and the explicit `CPythonRuntime` API.
 

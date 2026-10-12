@@ -48,7 +48,7 @@ def test_numerical_and_fortran_abi_in_guest():
         pytest.skip("set SHELLSIM_SCIPY_NATIVE_PROBE to the verified OpenBLAS probe.wasm")
     import shellsim
 
-    environment = shellsim.Environment(cpu=100_000_000, memory=128 * 1024 * 1024, disk=8 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=100_000_000, memory=128 * 1024 * 1024, disk=8 * 1024 * 1024)
     environment.write_file("/probe", Path(probe).read_bytes(), mode=0o755)
     result = environment.run("SHELLSIM_OPENBLAS_ABI=123 /probe")
     assert result.returncode == 0, result.stderr

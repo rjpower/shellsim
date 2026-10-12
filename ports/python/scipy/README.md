@@ -34,10 +34,10 @@ whose image has the recipe-declared 256 MiB linear-memory ceiling.
 Run `ports export --url-prefix <store-http-url>`, then install through the public package interface:
 
 ```python
-from shellsim import Environment, Limits
+from shellsim import Context, Limits
 
-env = Environment(
-    pypi_catalog="build/ports/export/catalog.json",
+context = Context(pypi_catalog="build/ports/export/catalog.json")
+env = context.Environment(
     pypi_packages=["scipy==1.18.0"],
     limits=Limits(cpu=100_000_000_000, memory=4 * 1024**3, disk=768 * 1024**2),
 )

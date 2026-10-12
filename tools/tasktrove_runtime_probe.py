@@ -357,10 +357,11 @@ def main() -> int:
         raise SystemExit(f"no selected tasks found below {source}")
 
     try:
-        from shellsim import Environment, Limits
+        from shellsim import Context, Limits
     except ImportError as error:
         raise SystemExit("install the local shellsim Python package before running this probe") from error
 
+    context = Context()
     results = []
     for index, task in enumerate(tasks, 1):
         if not options.quiet:
@@ -368,7 +369,7 @@ def main() -> int:
         results.append(
             replay(
                 task,
-                Environment,
+                context.Environment,
                 Limits,
                 options.memory_mib,
                 options.cpu,

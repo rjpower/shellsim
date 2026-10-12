@@ -4,7 +4,7 @@ import shlex
 from pathlib import Path
 
 import pytest
-from shellsim import Environment, SimulationError
+from shellsim import Context, Environment, SimulationError
 
 from tools.tasktrove_runtime_probe import apply_docker_layout, docker_layout
 
@@ -20,7 +20,7 @@ def test_apply_docker_layout_overlays_declared_destinations_and_modes(tmp_path: 
         "COPY --from=builder data/ /app/generated\n"
         "RUN apt-get update \\\n  && chmod +x /usr/local/bin/script.sh\nWORKDIR /app/relative\n"
     )
-    simulated = Environment()
+    simulated = Context().Environment()
 
     layout = docker_layout(task)
     apply_docker_layout(simulated, task, layout)

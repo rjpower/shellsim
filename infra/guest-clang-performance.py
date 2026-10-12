@@ -31,10 +31,9 @@ def main() -> None:
     args = parser.parse_args()
     records = []
     started = time.perf_counter()
-    env = shellsim.Environment.from_release(
+    env = shellsim.Context(cache_dir=args.cache.resolve()).from_release(
         args.release.resolve(),
         tools=["clang==23.1.0rc3", "zlib==1.3.1", "make==4.4.1"],
-        cache_dir=args.cache.resolve(),
         limits=shellsim.Limits(cpu=500_000_000_000, memory=8 * 1024**3, disk=805_306_368),
     )
     setup_seconds = time.perf_counter() - started

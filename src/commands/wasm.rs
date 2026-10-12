@@ -59,7 +59,7 @@ use engine::{configure_command_engine, ASYNC_STACK_BYTES};
 
 pub use precompiled::{
     precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
-    PrecompiledWasmOutcome, WasmCompilationKind,
+    register_trusted_precompiled_wasm_file, PrecompiledWasmOutcome, WasmCompilationKind,
 };
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
@@ -121,7 +121,7 @@ struct CachedModule {
 
 enum CachedCompilation {
     Ready(Module),
-    Precompiled(Arc<[u8]>),
+    Precompiled(precompiled::Companion),
 }
 
 #[derive(Clone)]
@@ -158,7 +158,7 @@ impl ModuleCache {
         self.insert_entry(source, CachedCompilation::Ready(module), bytes);
     }
 
-    fn pending(&self, source: &[u8]) -> Option<Arc<[u8]>> {
+    fn pending(&self, source: &[u8]) -> Option<precompiled::Companion> {
         self.entries
             .iter()
             .find_map(|entry| match &entry.compilation {
@@ -295,7 +295,7 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
         return Ok(module);
     }
     let pending = cache.lock().expect("module cache lock").pending(source);
-    let module = match precompiled::load(pending.as_deref()) {
+    let module = match precompiled::load(pending.as_ref()) {
         Some(module) => module,
         None => Module::new(command_engine(), source)?,
     };
@@ -1148,21 +1148,10 @@ fn fd_filestat_set_size(mut caller: Caller<'_, Host>, fd: i32, size: u64) -> Res
     };
     let mut machine = caller.data_mut().machine.get();
     let system = &mut ActiveSystem::new(&mut machine);
-    let old_size = match system.metadata_fd(fd) {
-        Ok(info) => info.size,
-        Err(error) => return Ok(syscall_errno(&error)),
-    };
-    let growth = (size as u64).saturating_sub(old_size);
-    if !system.charge_cpu(growth.saturating_add(1)) {
-        return Err(exhausted());
-    }
-    if !system.reserve_memory(growth) {
-        return Err(exhausted());
-    }
     let resized = system.resize_file(fd, size);
-    system.release_memory(growth);
     Ok(match resized {
         Ok(()) => ERRNO_SUCCESS,
+        Err(SyscallError::ResourceExhausted) => return Err(exhausted()),
         Err(error) => syscall_errno(&error),
     })
 }
@@ -1843,6 +1832,7 @@ fn fd_write(
                         .mark_signal_termination(pid, crate::process::Signal::Pipe);
                     return Err(Error::new(GuestExit(141)));
                 }
+                Err(SyscallError::ResourceExhausted) => return Err(exhausted()),
                 Err(error) => return Ok(StreamCall::Done(syscall_errno(&error))),
             }
         }

@@ -24,7 +24,7 @@ def test_calibforge_candidate_and_original_pytest_in_guest() -> None:
     task = Path(tasks) / "calibforge-fb1e75441a94.parquet"
     assert task.is_dir(), f"local CalibForge task archive is unavailable: {task}"
     runtime = shellsim.CPythonRuntime(bundle, universe=universe, uv=uv, venv="/app/.venv")
-    environment = shellsim.Environment(cpu=20_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=20_000_000_000, memory=512 * 1024 * 1024, disk=128 * 1024 * 1024)
     runtime.mount(environment)
     environment.mount(task / "environment/files", "/app/data")
     environment.mount(task / "tests", "/tests")

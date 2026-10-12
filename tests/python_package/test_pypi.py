@@ -46,7 +46,7 @@ def test_install_pypi_stages_pure_wheel_and_runs_it(monkeypatch: pytest.MonkeyPa
         return _fake_install(command, tag="py3-none-any")
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.install_pypi("example==1.0")
 
     result = environment.run_python("from example import answer\nprint(answer)")
@@ -68,7 +68,7 @@ def test_install_pypi_uses_only_matching_bundled_numpy(
         return result
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     if accepted:
         environment.install_pypi("example")
         assert environment.run_python("import example; print(example.answer)").stdout == b"42\n"
@@ -88,7 +88,7 @@ def test_install_pypi_rejects_native_artifacts_before_staging(
         "run",
         lambda command, **kwargs: _fake_install(command, tag=tag, native=native),
     )
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.write_file("/work/kept.py", "value = 1\n")
 
     with pytest.raises(shellsim.PackageInstallError, match="cannot stage incompatible distributions"):
@@ -105,7 +105,7 @@ def test_install_pypi_reports_resolution_failure(monkeypatch: pytest.MonkeyPatch
         "run",
         lambda command, **kwargs: subprocess.CompletedProcess(command, 1, "", "No matching distribution"),
     )
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
 
     with pytest.raises(shellsim.PackageInstallError, match="No matching distribution"):
         environment.install_pypi("example")
@@ -121,7 +121,7 @@ def test_install_pypi_preserves_existing_vfs_files(monkeypatch: pytest.MonkeyPat
         "run",
         lambda command, **kwargs: _fake_install(command, tag="py3-none-any"),
     )
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.mkdir("/usr/lib/python3.14/site-packages", parents=True)
     environment.write_file("/usr/lib/python3.14/site-packages/example.py", "answer = 7\n")
 
@@ -145,7 +145,7 @@ def test_default_install_normalizes_modes_and_uses_atomic_mount(monkeypatch):
         return result
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
 
     def forbidden_preflight(path):
         raise AssertionError("package installer must check conflicts inside its atomic mount")
@@ -165,7 +165,7 @@ def test_default_install_preserves_resource_error(monkeypatch):
         return result
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment(disk=100_000)
+    environment = shellsim.Context().Environment(disk=100_000)
     with pytest.raises(shellsim.SimulationError):
         environment.install_pypi("example")
     assert environment.run("test ! -e /usr/lib/python3.14/site-packages/example.py").returncode == 0
@@ -177,7 +177,7 @@ def test_install_pypi_accepts_exact_bundled_distribution_alone(monkeypatch: pyte
         return subprocess.CompletedProcess(command, 0, "", "")
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     environment.install_pypi("numpy==2.5.3")
 
     result = environment.run_python("import numpy; print(numpy.__version__)")
@@ -198,7 +198,7 @@ def test_install_pypi_rejects_bundled_record_outside_its_files(
         return result
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     with pytest.raises(shellsim.PackageInstallError, match="RECORD"):
         environment.install_pypi("example")
     with pytest.raises(shellsim.SimulationError, match="No such file"):
@@ -215,6 +215,6 @@ def test_install_pypi_rejects_bundled_import_name_collisions(monkeypatch: pytest
         return result
 
     monkeypatch.setattr(shellsim.pypi.subprocess, "run", install)
-    environment = shellsim.Environment()
+    environment = shellsim.Context().Environment()
     with pytest.raises(shellsim.PackageInstallError, match="conflict with bundled modules"):
         environment.install_pypi("example")

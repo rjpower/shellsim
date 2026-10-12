@@ -67,7 +67,7 @@ def _artifact(
 
 
 def test_published_runtime_closure_installs_commands_and_rejects_edge_tamper(tmp_path):
-    from shellsim import Environment
+    from shellsim import Context
     from shellsim.native_packages import _NativePackageUniverse
 
     provider, provider_result = _artifact(tmp_path, "provider", target="wasm32-wasip1")
@@ -80,7 +80,7 @@ def test_published_runtime_closure_installs_commands_and_rejects_edge_tamper(tmp
         consumer.reference: consumer_result,
     }
     catalog = publish_native_catalog(graph, results, tmp_path / "catalog")
-    env = Environment()
+    env = Context().Environment()
     assert _NativePackageUniverse(catalog).install(env, "consumer-tool") == {"consumer-tool": "1", "provider": "1"}
     result = env.run("consumer; provider")
     assert result.returncode == 0
@@ -90,7 +90,7 @@ def test_published_runtime_closure_installs_commands_and_rejects_edge_tamper(tmp
     record = next(item for item in value["packages"] if item["name"] == "consumer-tool")
     record["dependencies"][0]["linked"] = True
     catalog.write_text(json.dumps(value))
-    fresh = Environment()
+    fresh = Context().Environment()
     fresh.write_file("/work/sentinel", b"preserved")
     with pytest.raises(ValueError):
         _NativePackageUniverse(catalog).install(fresh, "consumer-tool")
@@ -120,13 +120,13 @@ def test_linked_provider_cannot_cross_target_triples(tmp_path):
 
 
 def test_public_install_preserves_and_restores_empty_sdk_directory(tmp_path):
-    from shellsim import Environment
+    from shellsim import Context
     from shellsim.native_packages import _NativePackageUniverse
 
     port, result = _artifact(tmp_path, "sdk", directories={"wasi-sysroot/include/c++/v1": 0o755})
     catalog = publish_native_catalog(Graph((port.reference,), (port,)), {port.reference: result}, tmp_path / "catalog")
     universe = _NativePackageUniverse(catalog)
-    env = Environment()
+    env = Context().Environment()
     universe.install(env, "sdk")
     directory = "/usr/local/wasi-sysroot/include/c++/v1"
     assert env.run("test -d " + directory).returncode == 0
