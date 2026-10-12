@@ -16,6 +16,8 @@ uv run --extra buildomatic python -m ports check
 `build --all` selects every default recipe; pass explicit roots for a subset or
 additional variants. Progress logs go to stderr; command results are JSON on stdout.
 Builds emit assets once; export writes a catalog and optional Simple HTML.
+`--backend iris --store <S3/GCS-prefix>` allocates a BATCH pool on cache misses
+and stops it on exit; `--iris-service` selects an existing pool instead.
 `Environment(pypi_packages=["scipy"], pypi_catalog="<catalog URL>")` fetches its
 selected wheels, native providers and interpreter without patched uv.
 

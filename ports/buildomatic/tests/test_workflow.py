@@ -13,6 +13,7 @@ from ports.__main__ import main
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
 from ports.buildomatic.artifacts import register
+from ports.buildomatic.backends.iris import AutomaticIrisBackend, IrisConfig
 from ports.buildomatic.backends.local import LocalBackend
 from ports.buildomatic.delivery_products import delivery_key
 from ports.buildomatic.nodes import Operation
@@ -43,6 +44,9 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
         guarded.setattr(LocalBackend, "submit", reject)
         main(["build", "--all", *arguments])
         main(["export", *arguments, "--url-prefix", "https://ports.example"])
+        guarded.setattr("iris.cli.connect.open_iris_client", reject)
+        with AutomaticIrisBackend(IrisConfig("cached"), store, ports.parent) as automatic:
+            run(ports, ["python/app"], store, state, automatic, offline=True)
     recipe_path.write_text(json.dumps({**recipe, "features": {"changed": True}}))
     _wheel_port(ports, source, "independent", [])
     process = subprocess.run(

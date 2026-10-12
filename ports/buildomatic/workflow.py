@@ -67,6 +67,7 @@ def build_recipe(port: Port) -> dict:
 
 def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default") -> Plan:
     """Expand build and runtime producers without fetching installed products."""
+    ports = ports.resolve()
     initial = plan(ports, requests, default_sdk=sdk_name)
     sdk = (
         definition(ports, initial, sdk_name)

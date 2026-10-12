@@ -9,6 +9,7 @@ import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +24,12 @@ def main(arguments: Sequence[str] | None = None) -> None:
     common.add_argument("--store", help="canonical local directory or S3/GCS prefix")
     common.add_argument("--sdk")
     common.add_argument("--backend", choices=("local", "iris"), default="local")
-    common.add_argument("--iris-service", type=Path)
-    common.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
+    common.add_argument("--iris-service", type=Path, help="use an existing pool instead of launching one")
+    common.add_argument("--worker-cpus", type=int, help="CPUs per new Iris worker (default: 64)")
+    common.add_argument("--worker-memory-gb", type=int, help="RAM per new Iris worker (default: 32 GiB)")
+    common.add_argument("--worker-disk-gb", type=int, help="disk per new Iris worker (default: 100 GiB)")
+    common.add_argument("--iris-image", help="image for new Iris workers (default: published Buildomatic image)")
+    common.add_argument("--jobs", type=int, help="compiler parallelism (default: execution worker CPUs)")
     common.add_argument("--max-workers", type=int, default=1)
     common.add_argument("--offline", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -47,8 +52,15 @@ def main(arguments: Sequence[str] | None = None) -> None:
         parser.error("choose --all or explicit recipes")
     if args.command == "build" and not args.all and not args.recipes:
         parser.error("specify recipes or --all")
-    if args.jobs < 1 or not 1 <= args.max_workers <= 32:
+    if (args.jobs is not None and args.jobs < 1) or not 1 <= args.max_workers <= 32:
         parser.error("jobs must be positive; max-workers requires 1..32")
+    worker_options = (args.worker_cpus, args.worker_memory_gb, args.worker_disk_gb, args.iris_image)
+    if any(value is not None for value in worker_options) and (args.backend != "iris" or args.iris_service):
+        parser.error("worker resource and image options require a new Iris pool")
+    if any(value is not None and value < 1 for value in worker_options[:3]):
+        parser.error("worker resources must be positive")
+    if args.iris_service and args.backend != "iris":
+        parser.error("--iris-service requires --backend iris")
     saved = (
         json.loads((args.state / "results.json").read_text())
         if args.command != "build" and not args.recipes and (args.state / "results.json").is_file()
@@ -70,9 +82,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     from ports.buildomatic.remote_store import StorageStore
     from ports.buildomatic.workflow import run
 
-    connection = (
-        json.loads((args.iris_service or args.state / "service.json").read_text()) if args.backend == "iris" else None
-    )
+    connection = json.loads(args.iris_service.read_text()) if args.iris_service else None
     prefix = (
         args.store
         or saved.get("prefix")
@@ -83,20 +93,49 @@ def main(arguments: Sequence[str] | None = None) -> None:
         )
     )
     store = StorageStore(prefix)
+    worker_cpus = args.worker_cpus or 64
+    jobs = args.jobs or (worker_cpus if args.backend == "iris" else os.cpu_count() or 1)
     if args.backend == "iris":
-        from ports.buildomatic.backends.iris import backend_context_factory
+        from rigging.filesystem.storage_path import StoragePath
 
-        logger.info("Connecting to Iris worker pool %s", connection["job_id"])
-        context = backend_context_factory(
-            job_id=connection["job_id"],
-            cluster_name=connection["cluster_name"],
-            controller_url=connection["controller_url"],
-            workspace=Path(connection["workspace"]),
-            prefix=connection["prefix"],
-            cache_prefix=connection.get("cache_prefix"),
-        )()
+        from ports.buildomatic.backends.iris import (
+            DEFAULT_TASK_IMAGE,
+            AutomaticIrisBackend,
+            IrisConfig,
+            backend_context_factory,
+        )
+
+        if StoragePath(store.prefix).is_local:
+            parser.error("Iris workers require a cloud --store (S3 or GCS)")
+        if connection:
+            logger.info("Connecting to Iris worker pool %s", connection["job_id"])
+            context = backend_context_factory(
+                job_id=connection["job_id"],
+                cluster_name=connection["cluster_name"],
+                controller_url=connection["controller_url"],
+                workspace=Path(connection["workspace"]),
+                prefix=connection["prefix"],
+                cache_prefix=connection.get("cache_prefix"),
+            )()
+        else:
+            service_id = "ports-" + uuid4().hex[:16]
+            config = IrisConfig(
+                service_id=service_id,
+                prefix=store.prefix.rstrip("/") + "/services/" + service_id,
+                cache_prefix=store.prefix,
+                workers=args.max_workers,
+                worker_cpu=worker_cpus,
+                worker_memory_bytes=(args.worker_memory_gb or 32) * 1024**3,
+                worker_disk_bytes=(args.worker_disk_gb or 100) * 1024**3,
+                worker_output_bytes=(args.worker_disk_gb or 100) * 1024**3,
+                task_image=args.iris_image or DEFAULT_TASK_IMAGE,
+                compiler_cache=True,
+                setup_scripts=("uv sync --no-dev --no-install-project", "uv pip install /opt/buildomatic/wheels/*.whl"),
+            )
+            logger.info("Iris will allocate up to %d workers on cache misses", args.max_workers)
+            context = AutomaticIrisBackend(config, store, args.ports.resolve().parent)
     else:
-        logger.info("Using %d local build workers, %d compiler jobs per port", args.max_workers, args.jobs)
+        logger.info("Using %d local build workers, %d compiler jobs per port", args.max_workers, jobs)
         context = nullcontext(LocalBackend(store, args.state / "execution", slots=args.max_workers))
     with context as backend:
         result = run(
@@ -107,7 +146,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
             backend,
             operation={"build": Operation.BUILD, "export": Operation.DELIVERY, "check": Operation.CHECK}[args.command],
             sdk_name=args.sdk or saved.get("sdk_name", "default"),
-            jobs=args.jobs,
+            jobs=jobs,
             max_workers=args.max_workers,
             offline=args.offline,
         )

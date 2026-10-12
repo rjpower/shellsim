@@ -31,9 +31,10 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import asdict, dataclass
 from importlib.metadata import requires
 from pathlib import Path
@@ -86,6 +87,9 @@ _SERVICE_NAME = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}\Z")
 _BUILD_ID = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
 _MAX_BUILDS = 4096
+DEFAULT_TASK_IMAGE = (
+    "ghcr.io/marin-community/iris-task@sha256:958fa4a2013916163a3b84338e158a6feb285bdc06de3ada9c14caabe46ab69b"
+)
 
 
 @dataclass(frozen=True)
@@ -767,7 +771,11 @@ def _runtime_files() -> dict[str, bytes]:
     # The transported ports driver imports packaging for recipe versions and
     # PEP 517 requirement admission. Install it into the same interpreter used
     # by WorkerExecutor, independently of guest wheels or image user sites.
-    dependencies = {"google-cloud-storage>=2.0", "packaging==26.2"}
+    dependencies = {
+        "google-cloud-storage>=2.0",
+        "packaging==26.2",
+        "marin-finelog==0.2.63.dev38062449553",
+    }
     for package, root in (
         ("iris", Path(iris.client.client.__file__).resolve().parents[1]),
         ("rigging", Path(rigging.filesystem.factory.__file__).resolve().parents[1]),
@@ -1087,6 +1095,109 @@ def discover(client, controller_url: str, job, config: IrisConfig, *, rpc_second
         prefix=config.prefix,
         cache_prefix=config.cache_prefix,
     )
+
+
+@contextmanager
+def _owned_job(client, config: IrisConfig):
+    """Own the predetermined job name even if launch acknowledgement is lost."""
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+    from iris.client.client import get_iris_ctx
+    from iris.cluster.client import resolve_job_user
+    from iris.cluster.types import JobName
+
+    name = "buildomatic-" + config.service_id
+    context = get_iris_ctx()
+    identity = context.job_id.child(name) if context else JobName.root(resolve_job_user(None), name)
+    job = client.job(identity)
+
+    def stop():
+        logger.info("Stopping owned Iris pool %s", identity)
+        try:
+            job.cancel()
+        except ConnectError as error:
+            if error.code != Code.NOT_FOUND:
+                raise
+
+    try:
+        yield launch(client, config)
+    except BaseException:
+        try:
+            stop()
+        except Exception:
+            logger.exception("Failed to stop owned Iris pool %s", identity)
+        raise
+    else:
+        stop()
+
+
+def _await_coordinator(client, job, config: IrisConfig, *, timeout: float) -> IrisBackend:
+    from connectrpc.code import Code
+    from connectrpc.errors import ConnectError
+    from iris.resources.state import TERMINAL_JOB_STATES
+
+    deadline = time.monotonic() + timeout
+    next_report = 0.0
+    while True:
+        try:
+            return discover(client, "https://iris.oa.dev", job, config)
+        except ConnectError as error:
+            if error.code not in {Code.NOT_FOUND, Code.UNAVAILABLE}:
+                raise
+        state = job.state
+        if state in TERMINAL_JOB_STATES:
+            raise RuntimeError(f"Iris coordinator stopped during startup: {state}")
+        now = time.monotonic()
+        if now >= deadline:
+            raise RuntimeError(f"Iris coordinator did not register within {timeout:g} seconds")
+        if now >= next_report:
+            logger.info("Waiting for Iris coordinator %s: %s", job.job_id, state)
+            next_report = now + 10
+        time.sleep(min(1, deadline - now))
+
+
+class AutomaticIrisBackend:
+    """Allocate an invocation-owned pool only when a pruned request is submitted."""
+
+    def __init__(self, config: IrisConfig, store: Store, workspace: Path, *, startup_timeout: float = 600):
+        self.config, self.store, self.workspace = config, store, workspace
+        self.startup_timeout = startup_timeout
+        self._stack = ExitStack()
+        self._backend: IrisBackend | None = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        return self._stack.__exit__(*exception)
+
+    def _connect(self) -> IrisBackend:
+        if self._backend is None:
+            from iris.cli.connect import open_iris_client
+
+            client = self._stack.enter_context(open_iris_client(cluster_name="marin", workspace=self.workspace))
+            job = self._stack.enter_context(_owned_job(client, self.config))
+            self._backend = _await_coordinator(client, job, self.config, timeout=self.startup_timeout)
+            self._stack.callback(self._backend.close)
+        return self._backend
+
+    def upload_bundles(self, source: LocalStore, bundles: Sequence[TreeBundle]) -> TransferCounts:
+        return _upload_bundles(source, bundles, factory=lambda: nullcontext(self.store))
+
+    def submit(self, request: BuildRequest) -> str:
+        return self._connect().submit(request)
+
+    def get(self, build_id: str) -> BuildResult:
+        return self._connect().get(build_id)
+
+    def get_logs(self, build_id: str):
+        return self._connect().get_logs(build_id)
+
+    def cancel(self, build_id: str) -> BuildResult:
+        return self._connect().cancel(build_id)
+
+    def acknowledge(self, build_id: str) -> None:
+        self._connect().acknowledge(build_id)
 
 
 def connection_descriptor(
