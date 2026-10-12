@@ -1,7 +1,8 @@
 # Gymnasium
 
-Stages the official Gymnasium wheel with the existing NumPy, cloudpickle and
-typing-extensions recipes and Farama Notifications. The guest probe checks seeded
-headless CartPole and FrozenLake behavior, termination, and SyncVectorEnv batching
-and automatic resets. Rendering, AsyncVectorEnv and optional engine or training
-extras are not qualified; upstream metadata and extras are preserved.
+Adapts the official Gymnasium wheel to load AsyncVectorEnv only when requested,
+so unavailable process semaphores do not block synchronous environments. The
+guest probe checks seeded headless CartPole and FrozenLake behavior, termination,
+and SyncVectorEnv batching and automatic resets. AsyncVectorEnv requires
+unavailable process semaphores; rendering and optional extras are not qualified.
+Upstream metadata and extras are preserved.
