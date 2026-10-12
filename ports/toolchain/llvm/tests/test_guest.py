@@ -287,6 +287,8 @@ def test_installed_guest_compiler_and_make_from_catalog():
             "make",
         ],
         pypi_catalog=catalog,
+        # Opt in only when this catalog and its native-code companions are trusted.
+        trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1",
         cpu=500_000_000_000,
         memory=8 * 1024**3,
         disk=384 * 1024**2,
