@@ -1,28 +1,26 @@
-"""An opt-in real guest Makefile links two C units against the verified zlib archive."""
+"""Opt-in public Clang and make regressions exercise graph and virtual libc behavior."""
 
 import os
 from pathlib import Path
 
 import pytest
 import shellsim
-from shellsim.native_packages import _NativePackageUniverse
 
 
-def test_native_make_zlib_graph():
-    catalog = os.environ.get("SHELLSIM_NATIVE_CATALOG")
+def test_catalog_make_builds_two_c_units_and_reloads_generated_rules():
+    catalog = os.environ.get("SHELLSIM_GUEST_CATALOG")
     if not catalog:
-        pytest.skip("set SHELLSIM_NATIVE_CATALOG to the verified native artifact catalog")
-    env = shellsim.Context().Environment(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2)
-    selected = _NativePackageUniverse(catalog).install(
-        env, ["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"]
-    )
-    assert selected["zlib-devel"] == "1.3.1"
-    fixture = Path(__file__).resolve().parents[1] / "fixtures/native_make"
-    for name in ("main.c", "codec.c", "Makefile"):
-        env.write_file("/work/" + name, (fixture / name).read_bytes())
-    build = env.run("cd /work && make -j2 && make -q && ./codec.wasm")
+        pytest.skip("set SHELLSIM_GUEST_CATALOG to an exported Clang and make catalog")
+    env = shellsim.Context(
+        pypi_catalog=catalog,
+        trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1",
+    ).Environment(tools=["clang", "make"], cpu=500_000_000_000, memory=8 * 1024**3, disk=768 * 1024**2)
+    env.write_file("/work/main.c", '#include <stdio.h>\nint answer(void);\nint main(void) { printf("guest C %d\\n", answer()); return 0; }\n')
+    env.write_file("/work/answer.c", "int answer(void) { return 42; }\n")
+    env.write_file("/work/Makefile", "all: answer.wasm\nanswer.wasm: main.o answer.o\n\tcc $^ -o $@\n\tchmod +x $@\n%.o: %.c\n\tcc -c $< -o $@\n")
+    build = env.run("cd /work && make -j2 && make -q && ./answer.wasm")
     assert build.returncode == 0, build.stderr
-    assert build.stdout.endswith(b"zlib 1.3.1: roundtrip, CRC32, invalid input passed\n")
+    assert build.stdout.endswith(b"guest C 42\n")
     env.write_file(
         "/work/reload.mk",
         b'include generated.mk\nall:\n\tprintf "reload-$(RELOADED)-$(MAKE_RESTARTS)\\n"\ngenerated.mk:\n\tprintf "RELOADED = yes\\n" > generated.mk\n',

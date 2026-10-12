@@ -53,12 +53,13 @@ it does not change the Python cohort or uv resolver. Request guest tools and
 Python packages together when preparing an environment:
 
 ```python
-from shellsim import Context
+from shellsim import Context, Limits
 
 env = Context().from_release(
     "/path/to/release-output/release.json",
     pypi=["pytest==8.4.1", "numpy==2.3.5"],
-    tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"],
+    tools=["make>=4.4,<5", "clang==23.0.0"],
+    limits=Limits(memory=8 * 1024**3),
 )
 ```
 

@@ -142,25 +142,66 @@ fn null_device_seek_and_tell_report_zero_and_keep_errors() {
 #[test]
 fn inherited_regular_stdin_has_real_stat_and_seek_state() {
     let mut environment = Environment::new();
-    environment.vfs.write("/", "/input", b"abc", 0o644).unwrap();
+    let mut data = vec![0; 28_795_076];
+    data[..4].copy_from_slice(b"IWAD");
+    environment.vfs.write("/", "/input", &data, 0o644).unwrap();
     install(
         &mut environment,
         r#"(module
         (import "wasi_snapshot_preview1" "fd_filestat_get" (func $stat (param i32 i32) (result i32)))
         (import "wasi_snapshot_preview1" "fd_seek" (func $seek (param i32 i64 i32 i32) (result i32)))
         (import "wasi_snapshot_preview1" "fd_tell" (func $tell (param i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_read" (func $read (param i32 i32 i32 i32) (result i32)))
         (memory (export "memory") 1)
         (func (export "_start")
             (if (call $stat (i32.const 0) (i32.const 64)) (then unreachable))
             (if (i32.ne (i32.load8_u (i32.const 80)) (i32.const 4)) (then unreachable))
-            (if (i64.ne (i64.load (i32.const 96)) (i64.const 3)) (then unreachable))
-            (if (call $seek (i32.const 0) (i64.const 2) (i32.const 0) (i32.const 8)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 96)) (i64.const 28795076)) (then unreachable))
+            (if (call $seek (i32.const 0) (i64.const 0) (i32.const 2) (i32.const 8)) (then unreachable))
             (if (call $tell (i32.const 0) (i32.const 8)) (then unreachable))
-            (if (i64.ne (i64.load (i32.const 8)) (i64.const 2)) (then unreachable))))"#,
+            (if (i64.ne (i64.load (i32.const 8)) (i64.const 28795076)) (then unreachable))
+            (if (call $seek (i32.const 0) (i64.const 0) (i32.const 0) (i32.const 8)) (then unreachable))
+            (i32.store (i32.const 0) (i32.const 32))
+            (i32.store (i32.const 4) (i32.const 4))
+            (if (call $read (i32.const 0) (i32.const 0) (i32.const 1) (i32.const 16)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 16)) (i32.const 4)) (then unreachable))
+            (if (i32.ne (i32.load (i32.const 32)) (i32.const 1145132873)) (then unreachable))))"#,
     );
     assert_eq!(
         run(&mut environment, "/app < /input"),
         (0, Vec::new(), Vec::new())
+    );
+}
+
+#[test]
+fn chmod_extension_uses_guest_cwd_and_reports_missing_paths() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/sub").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/sub/file", b"data", 0o644)
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "shellsim" "path_chmod" (func $chmod (param i32 i32 i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 0) "filemissing")
+        (func (export "_start")
+            (if (call $chmod (i32.const 0) (i32.const 4) (i32.const 448)) (then unreachable))
+            (if (i32.ne (call $chmod (i32.const 4) (i32.const 7) (i32.const 448)) (i32.const 44)) (then unreachable))))"#,
+    );
+    assert_eq!(
+        run(&mut environment, "cd /work/sub && /app"),
+        (0, Vec::new(), Vec::new())
+    );
+    assert_eq!(
+        environment
+            .vfs
+            .metadata("/", "/work/sub/file", true)
+            .unwrap()
+            .mode,
+        0o700
     );
 }
 

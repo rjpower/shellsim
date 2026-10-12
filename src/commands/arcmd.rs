@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[test]
-    fn tinycc_elf32_symbols_are_indexed() {
+    fn elf32_symbols_are_indexed() {
         let mut object = vec![0; 52 + 3 * 40 + 2 * 16 + 5];
         object[..7].copy_from_slice(b"\x7fELF\x01\x01\x01");
         object[16..18].copy_from_slice(&1_u16.to_le_bytes());

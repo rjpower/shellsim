@@ -1,4 +1,4 @@
-"""Check one-call release setup and its guest package and tool behavior."""
+"""Check release descriptor setup and public catalog Python/tool integration."""
 
 from __future__ import annotations
 
@@ -59,16 +59,30 @@ def test_release_factory_defaults_run_guest_python(tmp_path: Path) -> None:
     assert result.stdout == b"26.3\n"
 
 
-def test_release_factory_installs_python_and_native_tools(tmp_path: Path) -> None:
-    project = Path(__file__).resolve().parents[1] / "fixtures/native_make"
-    env = shellsim.Context(cache_dir=tmp_path / "cache").from_release(_descriptor(), pypi=["pytest==8.4.1", "numpy==2.3.5"], tools=["make>=4.4,<5", "shellsim-c-toolchain==0.1.30", "zlib-devel==1.3.1"], project=project, limits=shellsim.Limits(cpu=50_000_000_000, memory=1024**3, disk=256 * 1024**2))
-    assert env.read_file("/work/Makefile") == (project / "Makefile").read_bytes()
-    result = env.run("python -c 'import pytest, numpy; print(pytest.__version__, numpy.arange(4).sum())'")
+def test_catalog_installs_python_and_native_tools() -> None:
+    catalog = os.environ.get("SHELLSIM_GUEST_CATALOG")
+    if not catalog:
+        pytest.skip("set SHELLSIM_GUEST_CATALOG to an exported Python, Clang and make catalog")
+    env = shellsim.Context(
+        pypi_catalog=catalog,
+        trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1",
+    ).Environment(
+        pypi_packages=["pytest", "numpy"], tools=["clang", "make"],
+        cpu=500_000_000_000, memory=8 * 1024**3, disk=768 * 1024**2,
+    )
+    result = env.run_python(
+        "import pytest, numpy\n"
+        "with pytest.raises(ValueError):\n"
+        "    numpy.arange(4).reshape(3)\n"
+        "print(numpy.arange(4).sum())"
+    )
     assert result.returncode == 0, result.stderr
-    assert result.stdout == b"8.4.1 6\n"
-    built = env.run("cd /work && make -j2 && make -q && ./codec.wasm")
+    assert result.stdout == b"6\n"
+    env.write_file("/work/main.c", '#include <stdio.h>\nint main(void) { puts("guest C"); return 0; }\n')
+    env.write_file("/work/Makefile", "all: hello.wasm\nhello.wasm: main.c\n\tcc $< -o $@\n\tchmod +x $@\n")
+    built = env.run("cd /work && make -j2 && make -q && ./hello.wasm")
     assert built.returncode == 0, built.stderr
-    assert built.stdout.endswith(b"zlib 1.3.1: roundtrip, CRC32, invalid input passed\n")
+    assert built.stdout.endswith(b"guest C\n")
 
 
 def test_release_factory_installs_selected_uv_lock(tmp_path: Path) -> None:
