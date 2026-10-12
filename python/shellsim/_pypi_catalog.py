@@ -52,10 +52,21 @@ def _read_url(location: str):
 class Catalog:
     """One version per distribution, with explicit CPython/WASI marker values."""
 
-    def __init__(self, location: str | Path, *, cache_dir: Path | None = None, offline: bool = False):
+    def __init__(
+        self,
+        location: str | Path,
+        *,
+        cache_dir: Path | None = None,
+        offline: bool = False,
+        trusted_precompiled: bool = False,
+    ):
+        self.trusted_precompiled = trusted_precompiled
         self.cache = (
             cache_dir or Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "shellsim/ports"
         ).resolve()
+        # An arbitrary catalog must not seed bytes that a later trusted catalog
+        # deserializes. Both policies need sibling roots, never overlapping roots.
+        self.cache /= "trusted-precompiled" if trusted_precompiled else "portable"
         self.cache.mkdir(parents=True, exist_ok=True)
         self.offline = offline
         location = str(location)
@@ -154,6 +165,22 @@ class Catalog:
                 stage.rename(target)
         return target / "runtime"
 
+    def register_precompiled(self, source: Path, record: dict, *, executable: bool) -> None:
+        """Load a host companion only when the caller trusts this catalog's producer bytes.
+
+        Wasmtime incompatibility leaves the raw Wasm compilation path available.
+        The trust opt-in guarantees the exact source/kind association; this is not
+        a native-code verification or a guest filesystem operation.
+        """
+        if self.trusted_precompiled and "precompiled" in record:
+            from . import _native
+
+            _native.register_trusted_precompiled_wasm(
+                source.read_bytes(),
+                self.asset(record["precompiled"]).read_bytes(),
+                executable=executable,
+            )
+
     def resolve(self, requirements: str | Sequence[str]) -> list[dict]:
         if self.runtime is None:
             raise PackageInstallError("catalog has no Python runtime")
@@ -250,7 +277,7 @@ class Catalog:
                 unpacked += inspection.uncompressed_bytes
                 if count > _MAX_FILES or unpacked > _MAX_UNPACKED:
                     raise PackageInstallError("selected wheels exceed their staging limit")
-                unpack_wheel(path, site)
+                unpack_wheel(path, site, trusted_precompiled=self.trusted_precompiled)
             create_entry_points(site)
             _stage_console_scripts(site, staging, runtime.venv)
             assets = self.assets_for([*packages, *providers])
@@ -301,6 +328,7 @@ def stage_catalog_items(
             continue
         if item["kind"] in {"tools", "shared_libraries"}:
             _verify_wasm(source.read_bytes(), catalog.abi)
+            catalog.register_precompiled(source, item, executable=item["kind"] == "tools")
         destination = staging / _relative(item["destination"].removeprefix("/"))
         if destination.exists():
             if destination.is_file() and destination.read_bytes() == source.read_bytes():
@@ -334,11 +362,40 @@ def unpack_files(path: Path, staging: Path) -> None:
             target.chmod(0o755 if member.external_attr >> 16 & 0o111 else 0o644)
 
 
-def unpack_wheel(path: Path, site: Path) -> None:
+def unpack_wheel(path: Path, site: Path, *, trusted_precompiled: bool = False) -> None:
     """Relocate wheel data and reject conflicting installed files."""
     with zipfile.ZipFile(path) as archive:
+        mappings = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-precompiled.json")]
+        if len(mappings) > 1:
+            raise PackageInstallError("wheel contains multiple precompiled mappings")
+        if mappings and trusted_precompiled:
+            from . import _native
+
+            info = archive.getinfo(mappings[0])
+            if info.file_size > _MAX_CATALOG:
+                raise PackageInstallError("wheel precompiled mapping exceeds its metadata limit")
+            mapping = json.loads(archive.read(info))
+            if not isinstance(mapping, dict) or len(mapping) > _MAX_FILES:
+                raise PackageInstallError("invalid wheel precompiled mapping")
+            prefix = mappings[0].removesuffix("shellsim-precompiled.json") + "precompiled/"
+            for source, companion in mapping.items():
+                source = _relative(source).as_posix()
+                companion = _relative(companion).as_posix()
+                if not companion.startswith(prefix) or not companion.endswith(".cwasm") or source.endswith(".cwasm"):
+                    raise PackageInstallError("invalid wheel precompiled member")
+                _native.register_trusted_precompiled_wasm(archive.read(source), archive.read(companion))
         for member in archive.infolist():
             relative = _relative(member.filename.rstrip("/"))
+            if (
+                relative.as_posix() in mappings
+                or relative.name.endswith(".cwasm")
+                or (
+                    relative.parts[0].endswith(".dist-info")
+                    and len(relative.parts) > 1
+                    and relative.parts[1] == "precompiled"
+                )
+            ):
+                continue
             if relative.parts[0].endswith(".data"):
                 if len(relative.parts) < 3:
                     continue

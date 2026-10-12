@@ -332,6 +332,8 @@ def _download(url: str, destination: Path, universe: Universe) -> bytes:
 
 def _native_path(path: str) -> bool:
     lower = path.lower()
+    if lower.endswith(".cwasm"):
+        return False
     return lower.endswith(_NATIVE_SUFFIXES) or ".so." in lower
 
 
@@ -723,4 +725,9 @@ def install(
         files = [path for path in staging.rglob("*") if path.is_file()]
         if len(files) > _MAX_FILES or sum(path.stat().st_size for path in files) > _MAX_TOTAL_BYTES:
             raise PackageInstallError("staged package set exceeds VFS import limits")
+        # Legacy uv installs use raw Wasm; native companions stay host-only even
+        # when a delivery wheel is supplied through a local universe.
+        for path in files:
+            if path.name.endswith(".cwasm") or path.name == "shellsim-precompiled.json":
+                path.unlink()
         _mount_package_tree(environment, staging, "/", normalize_modes=True)

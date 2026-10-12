@@ -474,13 +474,17 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
     assert third.read_file(site + "app.py") == b"VALUE = 42\n"
 
 
-def test_catalog_tools_install_data_closure_without_python(tmp_path):
+@pytest.mark.parametrize("trusted_precompiled", [False, True])
+def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_precompiled):
     from ports.buildomatic.delivery import catalog
+    from shellsim import _native
 
     tool = tmp_path / "example.wasm"
     tool.write_bytes(
         bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b") + marked_wasm()[8:]
     )
+    companion = tmp_path / "example.cwasm"
+    companion.write_bytes(_native.precompile_wasm(tool.read_bytes(), executable=True))
     files = tmp_path / "files.zip"
     with zipfile.ZipFile(files, "w") as archive:
         archive.writestr("usr/share/example/value.txt", "42")
@@ -498,6 +502,7 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path):
                 "abi": ABI,
                 "native_dependencies": [],
                 "port": "native/example",
+                "precompiled": {"path": companion.name, "size": companion.stat().st_size},
             }
         ],
         "assets": [
@@ -511,12 +516,17 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path):
     }
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(catalog(graph, tmp_path.as_uri())))
+    if not trusted_precompiled:
+        companion.unlink()
     cache = tmp_path / "cache"
-    first = shellsim.Environment(tools=["example"], pypi_catalog=path, cache_dir=cache)
+    first = shellsim.Environment(
+        tools=["example"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+    )
     assert first.run("example").returncode == 0
     assert first.read_file("/usr/share/example/value.txt") == b"42"
     assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
     assert first.run("test ! -e /usr/bin/python3.wasm").returncode == 0
+    assert first.run("find / -name '*.cwasm'").stdout == b""
     container = first.to_container()
     assert container.run("example; cat /usr/share/example/value.txt").stdout == b"42"
     container.write_file("/usr/share/example/value.txt", b"container change")
@@ -524,7 +534,9 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path):
     first.write_file("/usr/share/example/value.txt", b"guest change")
     tool.unlink()
     files.unlink()
-    second = shellsim.Environment(tools="example", pypi_catalog=path, cache_dir=cache, offline=True)
+    second = shellsim.Environment(
+        tools="example", pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
+    )
     assert second.read_file("/usr/share/example/value.txt") == b"42"
     assert second.run("example").returncode == 0
 
@@ -536,3 +548,54 @@ def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog
     with pytest.raises(shellsim.PackageInstallError):
         environment.install_pypi("base<1")
     assert environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py") == before
+
+
+@pytest.mark.parametrize("trusted_precompiled", [False, True])
+def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path, trusted_precompiled):
+    from ports.buildomatic.delivery_products import _delivery_wheel, wheel_metadata
+    from dataclasses import asdict
+
+    path, cache = delivery_catalog
+    document = json.loads(path.read_text())
+    raw = marked_wasm()
+    source = tmp_path / "source.whl"
+    wheel = path.parent / "native-1.0-cp313-cp313-wasm32_wasip1.whl"
+    info = "native-1.0.dist-info/"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("native.so", raw)
+        archive.writestr(info + "METADATA", "Name: native\nVersion: 1.0\n")
+        archive.writestr(info + "WHEEL", "Root-Is-Purelib: false\nTag: cp313-cp313-wasm32_wasip1\n")
+        archive.writestr(info + "shellsim-native.json", json.dumps({
+            "schema_version": 1, "name": "native", "version": "1.0", "abi": ABI, "recipe": {},
+            "artifacts": [{"path": "native.so", "sha256": hashlib.sha256(raw).hexdigest(), "native_dependencies": []}],
+        }))
+    _delivery_wheel(source, wheel)
+    document["packages"].append({**asdict(wheel_metadata(wheel, wheel.name)), "url": wheel.as_uri()})
+    if not trusted_precompiled:
+        # An arbitrary catalog can include unparseable mapping bytes. Ignoring
+        # them must still install the portable source without host deserialization.
+        with zipfile.ZipFile(wheel) as archive:
+            members = [(member, archive.read(member)) for member in archive.infolist()]
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for member, data in members:
+                archive.writestr(member, b"untrusted" if member.filename.endswith("shellsim-precompiled.json") else data)
+        document["packages"][-1]["size"] = wheel.stat().st_size
+    path.write_text(json.dumps(document))
+    environment = shellsim.Environment(
+        pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+    )
+    site = "/work/.venv/lib/python3.13/site-packages/"
+    assert environment.read_file(site + "native.so") == raw
+    assert environment.run("find / -name '*.cwasm' -o -name shellsim-precompiled.json").stdout == b""
+    if not trusted_precompiled:
+        # The same asset path later supplied by a trusted producer must not
+        # reuse the arbitrary catalog's cached wheel or mapping.
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for member, data in members:
+                archive.writestr(member, data)
+        document["packages"][-1]["size"] = wheel.stat().st_size
+        path.write_text(json.dumps(document))
+        trusted = shellsim.Environment(
+            pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=True,
+        )
+        assert trusted.read_file(site + "native.so") == raw

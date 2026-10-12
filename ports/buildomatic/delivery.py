@@ -174,16 +174,18 @@ def catalog(graph: dict, url_prefix: str) -> dict:
     if base.scheme in {"http", "https"} and not base.netloc:
         raise ValueError("HTTP URL prefix must include a host")
     value = {**graph, "schema_version": 2}
-    for section in ("packages", "native", "assets"):
-        value[section] = [
-            {**item, "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/")}
-            for item in graph.get(section, [])
-        ]
-    if "runtime" in graph:
-        value["runtime"] = {
-            **graph["runtime"],
-            "url": url_prefix.rstrip("/") + "/" + quote(relative_path(graph["runtime"]["path"]), safe="/"),
+
+    def asset(item):
+        return {
+            **item,
+            "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/"),
+            **({"precompiled": asset(item["precompiled"])} if "precompiled" in item else {}),
         }
+
+    for section in ("packages", "native", "assets"):
+        value[section] = [asset(item) for item in graph.get(section, [])]
+    if "runtime" in graph:
+        value["runtime"] = asset(graph["runtime"])
     return value
 
 
@@ -210,6 +212,8 @@ def export(
             *([graph["runtime"]] if "runtime" in graph else []),
         ]:
             copied += source.promote(item["path"], destination)
+            if "precompiled" in item:
+                copied += source.promote(item["precompiled"]["path"], destination)
     destination.write("catalog.json", _json(value))
     if simple:
         projects = {}

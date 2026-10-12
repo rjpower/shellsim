@@ -190,6 +190,8 @@ class Environment:
     terminates the environment; subsequent calls return the same terminal outcome without work.
     ``pypi_packages`` selects upstream CPython and packages from ``pypi_catalog``
     (or ``SHELLSIM_PYPI_CATALOG``); downloads use ``cache_dir`` and respect ``offline``.
+    ``trusted_precompiled=True`` loads native Wasmtime companions only from catalog
+    and producer bytes trusted by the caller; otherwise companions are ignored.
     """
 
     def __init__(
@@ -207,6 +209,7 @@ class Environment:
         clock: str = "virtual",
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         offline: bool = False,
+        trusted_precompiled: bool = False,
     ) -> None:
         overrides = {"cpu": cpu, "memory": memory, "disk": disk, "output": output}
         if limits is not None and any(value is not None for value in overrides.values()):
@@ -254,7 +257,12 @@ class Environment:
                 from .pypi import PackageInstallError
 
                 raise PackageInstallError("set pypi_catalog or SHELLSIM_PYPI_CATALOG to a ports catalog")
-            catalog = Catalog(location, cache_dir=Path(cache_dir) if cache_dir is not None else None, offline=offline)
+            catalog = Catalog(
+                location,
+                cache_dir=Path(cache_dir) if cache_dir is not None else None,
+                offline=offline,
+                trusted_precompiled=trusted_precompiled,
+            )
             if pypi_packages is not None:
                 catalog.resolve(pypi_packages)
                 runtime = CPythonRuntime.from_catalog(catalog)
