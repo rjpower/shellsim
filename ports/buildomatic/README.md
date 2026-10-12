@@ -23,3 +23,9 @@ periodically; Iris also applies its container limits. Builds emit assets once; e
 assets with `--output <prefix> --copy-assets`. Serve the store with
 `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Environment(pypi_packages=["scipy"], pypi_catalog="<URL>")`; no patched uv is needed.
+
+Delivery keeps portable Wasm and adds ordinary Wasmtime companions for the runtime,
+wheel extensions and native exports. Set `trusted_precompiled=True` on `Environment`
+only for trusted catalog and producer bytes: companions contain native host code.
+Companions load on first use, with raw Wasm fallback; they never enter the guest VFS.
+Python installs omit development bundles; explicitly selected tools include them.

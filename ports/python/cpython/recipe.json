@@ -134,6 +134,104 @@
         "disk": 536870912
       },
       "module": "_ctypes"
+    },
+    "stdlib-sqlite3": {
+      "name": "cpython-stdlib-sqlite3",
+      "kind": "native-library",
+      "role": "target-library",
+      "linkage": "shared",
+      "target_dependencies": [
+        {
+          "port": "native/sqlite",
+          "version": "3.50.4"
+        }
+      ],
+      "exports": {
+        "shared_libraries": [
+          "lib-dynload/_sqlite3.so"
+        ],
+        "licenses": [
+          "licenses/LICENSE"
+        ]
+      },
+      "needed_libraries": [
+        "libsqlite3.so"
+      ],
+      "tests": [
+        {
+          "kind": "python",
+          "script": "tests/graph_sqlite3.py"
+        }
+      ],
+      "test_limits": {
+        "cpu": 10000000000,
+        "memory": 2147483648,
+        "disk": 268435456
+      },
+      "install": {
+        "kind": "runtime",
+        "destinations": {
+          "lib-dynload/_sqlite3.so": "/usr/lib/python3.13/lib-dynload/_sqlite3.so"
+        }
+      },
+      "sdk": "default",
+      "build_system": "python-extension",
+      "output": "stdlib",
+      "module": "_sqlite3"
+    },
+    "stdlib-ssl": {
+      "name": "cpython-stdlib-ssl",
+      "kind": "native-library",
+      "role": "target-library",
+      "linkage": "shared",
+      "target_dependencies": [
+        {
+          "port": "native/openssl",
+          "version": "3.5.9"
+        }
+      ],
+      "exports": {
+        "shared_libraries": [
+          "lib-dynload/_ssl.so"
+        ],
+        "licenses": [
+          "licenses/LICENSE"
+        ]
+      },
+      "needed_libraries": [],
+      "tests": [
+        {
+          "kind": "python",
+          "script": "tests/graph_ssl.py",
+          "files": [
+            {
+              "source": "tests/certdata/pycacert.pem",
+              "destination": "ca.pem"
+            }
+          ]
+        }
+      ],
+      "test_limits": {
+        "cpu": 100000000000,
+        "memory": 2147483648,
+        "disk": 268435456
+      },
+      "install": {
+        "kind": "runtime",
+        "destinations": {
+          "lib-dynload/_ssl.so": "/usr/lib/python3.13/lib-dynload/_ssl.so"
+        }
+      },
+      "sdk": "default",
+      "build_system": "python-extension",
+      "output": "stdlib",
+      "module": "_ssl",
+      "patches": [
+        {
+          "file": "stdlib-ssl-no-sockets.patch",
+          "sha256": "d9438a576c2deacb89a0225a76a2bdbad5485c533c5132a5ff577c2b6f337f98"
+        }
+      ]
     }
   }
 }

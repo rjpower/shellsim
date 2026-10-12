@@ -52,7 +52,10 @@ mod unavailable;
 pub mod util;
 mod wasm;
 pub(crate) use wasm::{is_wasm_executable, WasmProcess};
-pub use wasm::{SessionPoll, SessionResult, WasmSession};
+pub use wasm::{
+    precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
+    PrecompiledWasmOutcome, SessionPoll, SessionResult, WasmCompilationKind, WasmSession,
+};
 pub(crate) mod xargs;
 mod zipcmd;
 

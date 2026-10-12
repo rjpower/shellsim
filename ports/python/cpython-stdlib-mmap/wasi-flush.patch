@@ -1,0 +1,12 @@
+--- a/Modules/mmapmodule.c
++++ b/Modules/mmapmodule.c
+@@ -927,6 +927,9 @@
+         return NULL;
+     }
+     Py_RETURN_NONE;
++#elif defined(__wasi__)
++    PyErr_SetString(PyExc_NotImplementedError, "WASI memory maps cannot be flushed");
++    return NULL;
+ #elif defined(UNIX)
+     /* XXX flags for msync? */
+     if (-1 == msync(self->data + offset, size, MS_SYNC)) {

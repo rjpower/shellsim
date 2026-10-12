@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from ports.__main__ import main
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
-from ports.buildomatic.artifacts import register
+from ports.buildomatic.artifacts import register, resolve
 from ports.buildomatic.backends.iris import AutomaticIrisBackend, IrisConfig
 from ports.buildomatic.backends.local import LocalBackend
 from ports.buildomatic.delivery_products import delivery_key
@@ -41,6 +42,9 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
         raise AssertionError("cache hit dispatched work")
 
     with monkeypatch.context() as guarded:
+        from shellsim import _native
+
+        guarded.setattr(_native, "precompiled_wasm_build_id", lambda: "new-compiler-build")
         guarded.setattr(LocalBackend, "submit", reject)
         main(["build", "--all", *arguments])
         main(["export", *arguments, "--url-prefix", "https://ports.example"])
@@ -110,6 +114,63 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
     run(ports, ["python/app"], store, tmp_path / "export-client", backend, operation=Operation.DELIVERY)
     exported = json.loads((tmp_path / "export-client/graph.json").read_text())
     assert {node["reference"] for node in exported["ports"]} == {app.reference, runtime.reference}
+
+
+@pytest.mark.parametrize("failure", ["publication", "worker-runtime"])
+def test_failed_delivery_preserves_canonical_build(tmp_path, monkeypatch, failure):
+    ports, state = tmp_path / "ports", tmp_path / "state"
+    _wheel_port(ports, state / "execution/cache/ports", "example", [])
+    store = StorageStore(str(tmp_path / "canonical"))
+    backend = LocalBackend(store, state / "execution")
+    blocked = Path(store.prefix) / "assets"
+    if failure == "publication":
+        blocked.write_bytes(b"blocks delivery directories")
+    with monkeypatch.context() as planner:
+        if failure == "worker-runtime":
+            # Supply a mismatched compiler requirement without bootstrapping an SDK fixture.
+            planner.setattr(workflow, "compiler_identity", lambda _port: "mismatched-planner")
+            planner.setattr("ports.buildomatic.delivery_products.compiler_identity", lambda _port: "mismatched-planner")
+        failed = compile_plan(ports, ["python/example"])
+        with pytest.raises(RuntimeError):
+            run(ports, ["python/example"], store, state, backend, offline=True)
+    compiled = compile_plan(ports, ["python/example"])
+    product = next(node for node in compiled.nodes if node.operation is Operation.BUILD)
+    cached = resolve(store, product.record_key)
+    assert cached is not None
+    delivery = next(node for node in failed.nodes if node.operation is Operation.DELIVERY)
+    assert resolve(store, delivery.record_key) is None
+    assert not blocked.is_dir()
+    blocked.unlink(missing_ok=True)
+    # Remove the producer's source/cache; success now depends on its canonical output.
+    shutil.rmtree(state / "execution/cache/ports")
+    completed = run(ports, ["python/example"], store, state, backend, offline=True)
+    assert completed.records[product.reference] == cached
+    graph = json.loads((state / "graph.json").read_text())
+    assert (Path(store.prefix) / graph["packages"][0]["path"]).is_file()
+
+
+def test_check_dependencies_build_only_when_checks_are_requested(tmp_path):
+    ports, state = tmp_path / "ports", tmp_path / "state"
+    for name in ("app", "checker"):
+        _wheel_port(ports, state / "execution/cache/ports", name, [])
+    path = ports / "python/app/recipe.json"
+    value = json.loads(path.read_text())
+    value["test_dependencies"] = [{"port": "python/checker", "version": "1"}]
+    value["tests"] = [{"kind": "python", "script": "probe.py"}]
+    path.write_text(json.dumps(value))
+    (path.parent / "probe.py").write_text("print(42)\n")
+    store = StorageStore(str(tmp_path / "canonical"))
+    backend = LocalBackend(store, state / "execution")
+    built = run(ports, ["python/app"], store, state, backend, offline=True)
+    checker = next(
+        node for node in built.plan.nodes if node.port.name == "checker" and node.operation is Operation.BUILD
+    )
+    assert checker.reference not in built.records
+    checked = run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
+    assert checked.records[checker.reference]["reference"] == checker.reference
+    check = next(node for node in checked.plan.nodes if node.operation is Operation.CHECK)
+    assert checked.records[check.reference]["stdout"] == "42\n"
+    assert {item["name"] for item in json.loads((state / "graph.json").read_text())["packages"]} == {"app"}
 
 
 def test_progress_reports_active_work_and_remote_failure(tmp_path, monkeypatch, caplog):

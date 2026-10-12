@@ -19,6 +19,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::Serialize;
+use shellsim::commands::{PrecompiledWasmOutcome, WasmCompilationKind};
 use shellsim::display::KeyEvent;
 use shellsim::harness::{HarnessOperation, HarnessRequest, HarnessSession};
 use shellsim::net::NetworkRequest;
@@ -461,15 +462,35 @@ fn serialize_result(result: serde_json::Value) -> PyResult<String> {
 #[pymethods]
 impl NativeEnvironment {
     #[new]
-    fn new(cpu: u64, memory: u64, disk: u64, output: u64) -> Self {
+    #[pyo3(signature = (cpu, memory, disk, output, real_time=false))]
+    fn new(cpu: u64, memory: u64, disk: u64, output: u64, real_time: bool) -> Self {
         Self {
-            environment: Mutex::new(shellsim::Environment::with_limits(Limits {
-                cpu,
-                memory,
-                disk,
-                output,
-            })),
+            environment: Mutex::new(shellsim::Environment::with_limits_and_clock(
+                Limits {
+                    cpu,
+                    memory,
+                    disk,
+                    output,
+                },
+                if real_time {
+                    ClockMode::RealTime
+                } else {
+                    ClockMode::Virtual
+                },
+            )),
         }
+    }
+
+    fn to_container(&self, py: Python<'_>) -> PyResult<NativeContainer> {
+        py.detach(|| -> Result<NativeContainer, String> {
+            let environment = self.lock_environment()?;
+            let mut session = HarnessSession::from_environment(environment.clone());
+            session.environment.net.enable_host_tools();
+            Ok(NativeContainer {
+                session: Mutex::new(session),
+            })
+        })
+        .map_err(SimulationError::new_err)
     }
 
     /// Execute one shell action and return JSON metadata plus byte-preserving output streams.
@@ -847,13 +868,20 @@ where
     F: FnOnce(&mut State) -> Result<T, String> + Send,
 {
     let environment = &mut **guard;
+    host_worker(move || operation(environment))
+}
+
+/// Contain compilation and other host operations under the adapter's usual stack/panic boundary.
+fn host_worker<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, String> + Send,
+{
     thread::scope(|scope| {
         let worker = thread::Builder::new()
             .name("shellsim-python".to_string())
             .stack_size(ACTION_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                catch_unwind(AssertUnwindSafe(|| operation(environment)))
-            })
+            .spawn_scoped(scope, move || catch_unwind(AssertUnwindSafe(operation)))
             .map_err(|error| format!("could not start shellsim worker: {error}"))?;
         match worker.join() {
             Ok(Ok(result)) => result,
@@ -881,11 +909,75 @@ fn is_bundled_python_module(name: &str) -> bool {
     shellsim::python::is_bundled_python_module(name)
 }
 
+/// Compile host-provided binary Wasm without running it. Retain the result as trusted native code.
+#[pyfunction]
+#[pyo3(signature = (source, executable=false))]
+fn precompile_wasm(py: Python<'_>, source: Vec<u8>, executable: bool) -> PyResult<Py<PyBytes>> {
+    let bytes = py
+        .detach(|| {
+            host_worker(|| {
+                shellsim::commands::precompile_wasm(&source, compilation_kind(executable))
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)?;
+    Ok(PyBytes::new(py, &bytes).unbind())
+}
+
+/// Identify the patched Wasmtime producer for immutable delivery records.
+#[pyfunction]
+fn precompiled_wasm_build_id() -> &'static str {
+    shellsim::commands::precompiled_wasm_build_id()
+}
+
+/// Load only trusted, untouched compiler output for this exact source and executable kind.
+/// Never pass guest files or untrusted code: compatibility checks do not authenticate a companion.
+#[pyfunction]
+#[pyo3(signature = (source, companion, executable=false))]
+fn register_trusted_precompiled_wasm(
+    py: Python<'_>,
+    source: Vec<u8>,
+    companion: Vec<u8>,
+    executable: bool,
+) -> PyResult<&'static str> {
+    let outcome = py
+        .detach(|| {
+            host_worker(|| {
+                // SAFETY: the embedding caller guarantees trusted, untouched compiler output
+                // for this exact source and compilation kind. This host API is unavailable to guests.
+                unsafe {
+                    shellsim::commands::register_trusted_precompiled_wasm(
+                        &source,
+                        &companion,
+                        compilation_kind(executable),
+                    )
+                }
+                .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)?;
+    Ok(match outcome {
+        PrecompiledWasmOutcome::Registered => "registered",
+        PrecompiledWasmOutcome::Incompatible => "incompatible",
+    })
+}
+
+fn compilation_kind(executable: bool) -> WasmCompilationKind {
+    if executable {
+        WasmCompilationKind::Executable
+    } else {
+        WasmCompilationKind::Module
+    }
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
+    module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
+    module.add_function(wrap_pyfunction!(precompiled_wasm_build_id, module)?)?;
+    module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     module.add(
         "PackageConflictError",

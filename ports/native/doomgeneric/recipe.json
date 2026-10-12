@@ -1,0 +1,45 @@
+{
+  "name": "doomgeneric",
+  "version": "0.0.0+dcb7a8dbc7a1",
+  "kind": "native-tool",
+  "role": "guest-tool",
+  "linkage": "static",
+  "sdk": "default",
+  "build_system": "cmake",
+  "source": {
+    "url": "https://codeload.github.com/ozkl/doomgeneric/tar.gz/dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284",
+    "sha256": "1bd3f7f26220494159a38d71f2847ec81b58d6bbd7c7c8d81b08993018001148",
+    "subdirectory": "doomgeneric-dcb7a8dbc7a16ce3dda29382ac9aae9d77d21284"
+  },
+  "patches": [
+    {
+      "file": "wasi.patch",
+      "sha256": "62bbf3e8017a319af6218ae7beae11324c4e312a28b1b6f4fc5584a4af6a643c"
+    }
+  ],
+  "target_dependencies": [],
+  "runtime_dependencies": [
+    {
+      "port": "native/freedoom",
+      "version": "0.13.0"
+    }
+  ],
+  "exports": {
+    "tools": [
+      "bin/doom"
+    ],
+    "licenses": [
+      "share/licenses/doomgeneric/LICENSE"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "LICENSE",
+      "destination": "share/licenses/doomgeneric/LICENSE"
+    }
+  ],
+  "install": {
+    "kind": "build-tool"
+  },
+  "tests": []
+}

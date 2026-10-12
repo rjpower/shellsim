@@ -1,0 +1,17 @@
+--- a/Modules/_ssl.c
++++ b/Modules/_ssl.c
+@@ -871,7 +871,14 @@
+ #endif
+     SSL_set_app_data(self->ssl, self);
+     if (sock) {
++#ifdef OPENSSL_NO_SOCK
++        Py_DECREF(self);
++        PyErr_SetString(PyExc_NotImplementedError,
++                        "OpenSSL socket BIOs are unavailable on this target");
++        return NULL;
++#else
+         SSL_set_fd(self->ssl, Py_SAFE_DOWNCAST(sock->sock_fd, SOCKET_T, int));
++#endif
+     } else {
+         /* BIOs are reference counted and SSL_set_bio borrows our reference.
+          * To prevent a double free in memory_bio_dealloc() we need to take an

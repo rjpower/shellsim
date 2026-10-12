@@ -12,12 +12,21 @@ def test_sdk_interface_changes_keep_products_but_producer_changes_do_not():
 
     current = {
         "definition": {"target": "wasm32-wasip1-threads"},
-        "producers": {"compiler": {"policy": {"version": "23"}, "implementation": {"builder": "compiler-code"}}},
+        "producers": {
+            "compiler": {
+                "policy": {"version": "23"},
+                "implementation": {"builder": "dispatcher", "toolchain/llvm/compiler.py": "compiler-code"},
+            }
+        },
     }
     recorded = deepcopy(current)
     recorded["producers"]["compiler"]["implementation"]["_support/build_context.py"] = "old-interface"
+    recorded["producers"]["compiler"]["implementation"]["builder"] = "old-dispatcher"
     assert sdk_inputs_match(recorded, current)
-    for field, value in [("policy", {"version": "24"}), ("implementation", {"builder": "changed-compiler"})]:
+    for field, value in [
+        ("policy", {"version": "24"}),
+        ("implementation", {"toolchain/llvm/compiler.py": "changed-compiler"}),
+    ]:
         changed = deepcopy(current)
         changed["producers"]["compiler"][field] = value
         assert not sdk_inputs_match(recorded, changed)

@@ -431,9 +431,12 @@ def delivery_catalog(tmp_path):
         with zipfile.ZipFile(wheel, "w") as output:
             output.writestr(name + ".py", "VALUE = 42\n")
             info = name + "-1.0.dist-info/"
-            output.writestr(info + "METADATA", f"Name: {name}\nVersion: 1.0\nRequires-Python: >=3.13\n" +
-                "".join("Requires-Dist: " + requirement + "\n" for requirement in requirements) +
-                "".join("Provides-Extra: " + extra + "\n" for extra in extras))
+            output.writestr(
+                info + "METADATA",
+                f"Name: {name}\nVersion: 1.0\nRequires-Python: >=3.13\n"
+                + "".join("Requires-Dist: " + requirement + "\n" for requirement in requirements)
+                + "".join("Provides-Extra: " + extra + "\n" for extra in extras),
+            )
             output.writestr(info + "WHEEL", "Root-Is-Purelib: true\nTag: py3-none-any\n")
             if name == "app":
                 output.writestr(info + "entry_points.txt", "[console_scripts]\napp-command = app:main\n")
@@ -441,8 +444,16 @@ def delivery_catalog(tmp_path):
                 output.writestr(info + "RECORD", "app-1.0.data/scripts/app-raw,,\n")
         relative = f"assets/{name}-key/{wheel.name}"
         DeliveryStore(store).emit(wheel, relative)
-        packages.append(asdict(wheel_metadata(wheel, relative)))
-    document = catalog({"packages": packages, "native": [], "runtime": runtime}, store.as_uri())
+        packages.append({**asdict(wheel_metadata(wheel, relative)), "port": "python/" + name})
+    files = store / "data.zip"
+    with zipfile.ZipFile(files, "w") as archive:
+        archive.writestr("usr/share/base/value.txt", "42")
+    document = catalog({"packages": packages, "native": [], "runtime": runtime,
+        "ports": [{"reference": "python/base", "dependencies": ["native/base-data"]}],
+        "assets": [
+            {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/base-data"},
+            {"path": "unneeded-development.zip", "size": 1, "kind": "archive", "usage": "development", "port": "native/base-data"},
+        ]}, store.as_uri())
     path = store / "catalog.json"
     path.write_text(json.dumps(document))
     return path, tmp_path / "cache"
@@ -452,6 +463,7 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
     path, cache = delivery_catalog
     environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
     site = "/work/.venv/lib/python3.13/site-packages/"
+    assert environment.read_file("/usr/share/base/value.txt") == b"42"
     assert environment.read_file(site + "base.py") == b"VALUE = 42\n"
     assert environment.run("test ! -e " + site + "speed.py").returncode == 0
     assert environment.read_file("/work/.venv/bin/app-command").startswith(b"#!/work/.venv/bin/python\n")
@@ -471,6 +483,106 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
     assert third.read_file(site + "app.py") == b"VALUE = 42\n"
 
 
+@pytest.mark.parametrize("trusted_precompiled", [False, True])
+def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_precompiled):
+    from ports.buildomatic.delivery import catalog
+    from shellsim import _native
+    from shellsim._pypi_catalog import Catalog
+
+    tool = tmp_path / "example.wasm"
+    tool.write_bytes(
+        bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b") + marked_wasm()[8:]
+    )
+    companion = tmp_path / "example.cwasm"
+    companion.write_bytes(_native.precompile_wasm(tool.read_bytes(), executable=True))
+    files = tmp_path / "files.zip"
+    with zipfile.ZipFile(files, "w") as archive:
+        archive.writestr("usr/share/example/value.txt", "42")
+        archive.writestr("usr/include/example.h", "#define VALUE 42\n")
+        wrapper = zipfile.ZipInfo("usr/bin/ar")
+        wrapper.external_attr = 0o100755 << 16
+        archive.writestr(wrapper, '#!/bin/sh\nexec /usr/bin/llvm-ar "$@"\n')
+    development = tmp_path / "development.zip"
+    with zipfile.ZipFile(development, "w") as archive:
+        archive.writestr("usr/include/development.h", "#define ANSWER 739\n")
+    graph = {
+        "abi": ABI,
+        "packages": [],
+        "native": [
+            {
+                "name": name,
+                "path": tool.name,
+                "size": tool.stat().st_size,
+                "kind": "tools",
+                "destination": "/usr/bin/" + name,
+                "abi": ABI,
+                "native_dependencies": [],
+                "port": reference,
+                "precompiled": {"path": companion.name, "size": companion.stat().st_size},
+            }
+            for name, reference in (
+                ("clang", "native/example"),
+                ("llvm-ar", "native/example"),
+                ("wasm-ld", "native/runtime"),
+                ("make", "native/make"),
+            )
+        ],
+        "assets": [
+            {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/data"},
+            {"path": development.name, "size": development.stat().st_size, "kind": "archive", "usage": "development", "port": "native/data"},
+            {"path": "not-published.zip", "size": 1, "kind": "archive", "port": "native/unselected"},
+        ],
+        "ports": [
+            {"reference": "native/example", "dependencies": ["native/runtime"]},
+            {"reference": "native/runtime", "dependencies": ["native/data"]},
+            {"reference": "native/make", "dependencies": []},
+            {"reference": "native/data", "dependencies": []},
+        ],
+    }
+    script = tmp_path / "cc"
+    script.write_text('#!/bin/sh\nexec /usr/bin/clang "$@"\n')
+    graph["native"].append({"name": "cc", "path": script.name, "size": script.stat().st_size,
+        "kind": "tools", "destination": "/usr/bin/cc", "abi": ABI, "native_dependencies": [], "port": "native/example"})
+    path = tmp_path / "catalog.json"
+    path.write_text(json.dumps(catalog(graph, tmp_path.as_uri())))
+    if not trusted_precompiled:
+        companion.unlink()
+    cache = tmp_path / "cache"
+    first = shellsim.Environment(
+        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+    )
+    assert first.read_file("/usr/bin/make") == tool.read_bytes()
+    assert first.run("make /missing-target").returncode == 0
+    assert first.read_file("/usr/bin/llvm-ar") == tool.read_bytes()
+    assert first.read_file("/usr/bin/wasm-ld") == tool.read_bytes()
+    assert first.run("cc && wasm-ld && ar").returncode == 0
+    assert first.read_file("/usr/share/example/value.txt") == b"42"
+    assert first.read_file("/usr/include/development.h") == b"#define ANSWER 739\n"
+    assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
+    assert first.run("test ! -e /usr/bin/python3.wasm").returncode == 0
+    assert first.run("find / -name '*.cwasm'").stdout == b""
+    container = first.to_container()
+    assert container.run("clang; cat /usr/share/example/value.txt").stdout == b"42"
+    container.write_file("/usr/share/example/value.txt", b"container change")
+    assert first.read_file("/usr/share/example/value.txt") == b"42"
+    first.write_file("/usr/share/example/value.txt", b"guest change")
+    tool.unlink()
+    script.unlink()
+    files.unlink()
+    second = shellsim.Environment(
+        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
+    )
+    assert second.read_file("/usr/share/example/value.txt") == b"42"
+    assert second.run("cc && wasm-ld && ar && make /missing-target").returncode == 0
+    ordinary = shellsim.Environment()
+    ordinary.write_file("/usr/bin/make", b"guest-owned command", mode=0o755)
+    saved = Catalog(path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled)
+    with pytest.raises(shellsim.PackageInstallError):
+        saved.install_tools(ordinary, ["clang", "make"])
+    assert ordinary.read_file("/usr/bin/make") == b"guest-owned command"
+    assert ordinary.run("test ! -e /usr/bin/wasm-ld && test ! -e /usr/share/example/value.txt").returncode == 0
+
+
 def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog):
     path, cache = delivery_catalog
     environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
@@ -478,3 +590,54 @@ def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog
     with pytest.raises(shellsim.PackageInstallError):
         environment.install_pypi("base<1")
     assert environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py") == before
+
+
+@pytest.mark.parametrize("trusted_precompiled", [False, True])
+def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path, trusted_precompiled):
+    from ports.buildomatic.delivery_products import _delivery_wheel, wheel_metadata
+    from dataclasses import asdict
+
+    path, cache = delivery_catalog
+    document = json.loads(path.read_text())
+    raw = marked_wasm()
+    source = tmp_path / "source.whl"
+    wheel = path.parent / "native-1.0-cp313-cp313-wasm32_wasip1.whl"
+    info = "native-1.0.dist-info/"
+    with zipfile.ZipFile(source, "w") as archive:
+        archive.writestr("native.so", raw)
+        archive.writestr(info + "METADATA", "Name: native\nVersion: 1.0\n")
+        archive.writestr(info + "WHEEL", "Root-Is-Purelib: false\nTag: cp313-cp313-wasm32_wasip1\n")
+        archive.writestr(info + "shellsim-native.json", json.dumps({
+            "schema_version": 1, "name": "native", "version": "1.0", "abi": ABI, "recipe": {},
+            "artifacts": [{"path": "native.so", "sha256": hashlib.sha256(raw).hexdigest(), "native_dependencies": []}],
+        }))
+    _delivery_wheel(source, wheel)
+    document["packages"].append({**asdict(wheel_metadata(wheel, wheel.name)), "url": wheel.as_uri()})
+    if not trusted_precompiled:
+        # An arbitrary catalog can include unparseable mapping bytes. Ignoring
+        # them must still install the portable source without host deserialization.
+        with zipfile.ZipFile(wheel) as archive:
+            members = [(member, archive.read(member)) for member in archive.infolist()]
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for member, data in members:
+                archive.writestr(member, b"untrusted" if member.filename.endswith("shellsim-precompiled.json") else data)
+        document["packages"][-1]["size"] = wheel.stat().st_size
+    path.write_text(json.dumps(document))
+    environment = shellsim.Environment(
+        pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+    )
+    site = "/work/.venv/lib/python3.13/site-packages/"
+    assert environment.read_file(site + "native.so") == raw
+    assert environment.run("find / -name '*.cwasm' -o -name shellsim-precompiled.json").stdout == b""
+    if not trusted_precompiled:
+        # The same asset path later supplied by a trusted producer must not
+        # reuse the arbitrary catalog's cached wheel or mapping.
+        with zipfile.ZipFile(wheel, "w") as archive:
+            for member, data in members:
+                archive.writestr(member, data)
+        document["packages"][-1]["size"] = wheel.stat().st_size
+        path.write_text(json.dumps(document))
+        trusted = shellsim.Environment(
+            pypi_packages="native", pypi_catalog=path, cache_dir=cache, trusted_precompiled=True,
+        )
+        assert trusted.read_file(site + "native.so") == raw

@@ -31,9 +31,8 @@ from ports.buildomatic import (
     capture_tree,
 )
 from ports.buildomatic.artifacts import register, resolve, write_reference
-from ports.buildomatic.delivery import DeliveryStore, delivery_graph
-from ports.buildomatic.delivery_products import delivery_key
-from ports.buildomatic.legacy import compatible_driver, compatible_packaging
+from ports.buildomatic.delivery import delivery_graph
+from ports.buildomatic.delivery_products import compiler_identity, delivery_key, runtime_delivery_key
 from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
@@ -61,7 +60,9 @@ class Result:
 
 def build_recipe(port: Port) -> dict:
     return {
-        key: value for key, value in port.recipe.items() if key not in {"tests", "test_limits", "runtime_dependencies"}
+        key: value
+        for key, value in port.recipe.items()
+        if key not in {"tests", "test_limits", "test_dependencies", "runtime_dependencies"}
     }
 
 
@@ -131,7 +132,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         pending = [
             (edge.recipe, runtime_edges or edge.kind == "build")
             for edge in port.dependencies
-            if runtime_edges or edge.kind != "runtime"
+            if edge.kind != "test" and (runtime_edges or edge.kind != "runtime")
         ]
         while pending:
             reference, include_runtime = pending.pop()
@@ -142,7 +143,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             pending.extend(
                 (edge.recipe, include_runtime or edge.kind == "build")
                 for edge in selected[reference].dependencies
-                if include_runtime or edge.kind != "runtime"
+                if edge.kind != "test" and (include_runtime or edge.kind != "runtime")
             )
         return found
 
@@ -173,10 +174,6 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         key = identity(
             {
                 "operation": "build",
-                "adapter_driver": file_hash(Path(__file__).resolve().parents[1] / "_support/node_build.py"),
-                "sdk_binding": file_hash(Path(__file__).resolve().parents[1] / "_support/sdk_products.py")
-                if port.recipe["build_system"] not in {"pure-wheel", "host-wheel", "source-tree"}
-                else None,
                 "recipe": build_recipe(port),
                 "local_inputs": _admit_recipe(port),
                 "implementation": implementation(port),
@@ -189,13 +186,16 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         node = Node(port.reference, Operation.BUILD, key, port, tuple(inputs))
         builds[node.reference] = node
         nodes.append(node)
+    guest_ports = {port.reference for port in guest_graph(graph).ports}
+    test_ports = {edge.recipe for port in graph.ports for edge in port.dependencies if edge.kind == "test"}
+    delivery_ports = guest_graph(Graph((*graph.roots, *sorted(test_ports)), graph.ports))
     deliveries = {}
-    for port in guest_graph(graph).ports:
+    for port in delivery_ports.ports:
         if port.role in {"host-tool", "target-platform"} or port.reference in descriptors:
             continue
         product = builds[port.reference]
         inputs = (Input("product", product.reference, product.key),)
-        key = delivery_key(product.key)
+        key = delivery_key(product.key, port=port)
         node = Node(port.reference + ":delivery", Operation.DELIVERY, key, port, inputs)
         deliveries[port.reference] = node
         nodes.append(node)
@@ -206,23 +206,21 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
     if runtime:
         product = builds[products[runtime["producer"]].port.reference]
         inputs = (Input("product", product.reference, product.key),)
-        key = identity(
-            {
-                "operation": "runtime",
-                "implementation": file_hash(Path(__file__).with_name("delivery_products.py")),
-                "inputs": {item.name: item.key for item in inputs},
-            }
-        )
+        key = runtime_delivery_key(product.key)
         runtime_node = Node(product.reference + ":delivery", Operation.RUNTIME, key, product.port, inputs)
         nodes.append(runtime_node)
     check_roots = []
     for port in graph.ports:
-        if port.reference not in deliveries:
+        if port.reference not in deliveries or port.reference not in guest_ports:
             continue
+        tested = {edge.recipe for edge in port.dependencies if edge.kind == "test"}
+        check_ports = {port.reference, *ancestors(port, runtime_edges=True), *tested}
+        for reference in tested:
+            check_ports.update(ancestors(selected[reference], runtime_edges=True))
         inputs = [
             Input("package:" + ref, node.reference, node.key)
             for ref, node in deliveries.items()
-            if ref in {port.reference, *ancestors(port, runtime_edges=True)} or ref in runtime_ports
+            if ref in check_ports or ref in runtime_ports
         ]
         if runtime_node:
             inputs.append(Input("runtime", runtime_node.reference, runtime_node.key))
@@ -277,10 +275,11 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         ports.resolve(),
         graph,
         tuple(nodes),
-        tuple(n.reference for n in deliveries.values())
+        tuple(n.reference for ref, n in deliveries.items() if ref in guest_ports)
         + ((runtime_node.reference,) if runtime_node else ())
         + tuple(ref for ref in graph.roots if ref not in deliveries),
-        tuple(n.reference for n in deliveries.values()) + ((runtime_node.reference,) if runtime_node else ()),
+        tuple(n.reference for ref, n in deliveries.items() if ref in guest_ports)
+        + ((runtime_node.reference,) if runtime_node else ()),
         tuple(check_roots),
         sdk,
     )
@@ -361,21 +360,16 @@ def normalize_cached(
             record = old_sdk["products"].get(node.producer["name"])
             if record:
                 record = {**record, "reference": node.port.reference, "build_key": node.key}
-        elif node.operation is Operation.BUILD and node.port.reference in legacy_keys and compatible_driver(node.port):
+        elif node.operation is Operation.BUILD and node.port.reference in legacy_keys:
             record = resolve(store, "port/" + legacy_keys[node.port.reference])
         elif node.operation is Operation.DELIVERY:
             product = records[node.inputs[0].reference]
             if product and (
                 product.get("delivery_key") == node.key
-                or "delivery_key" not in product
-                and compatible_packaging()
+                or node.port.recipe["build_system"] == "pure-wheel"
                 and "delivery" in product
             ):
                 record = {**product, "delivery_key": node.key}
-        elif node.operation is Operation.RUNTIME:
-            product = records[node.inputs[0].reference]
-            if product and compatible_packaging():
-                record = DeliveryStore(store.prefix).record("runtime/" + product["receipt_id"])
         if record:
             register(store, node.record_key, record)
             records[node.reference] = record
@@ -470,6 +464,10 @@ def prepare(
                     "abi": plan.sdk.metadata["abi"] if plan.sdk else None,
                 }
             )
+            if node.operation in {Operation.DELIVERY, Operation.RUNTIME}:
+                compiler = compiler_identity(node.port if node.operation is Operation.DELIVERY else None)
+                if compiler is not None:
+                    spec["wasmtime_build_id"] = compiler
             write_reference(recipe / "node.json", spec)
             bundle = capture_tree(recipe, local)
             bundles.append(bundle)
@@ -575,7 +573,7 @@ def run(
         jobs=jobs,
         max_workers=max_workers,
         offline=offline,
-        allow_build=operation is Operation.BUILD,
+        allow_build=operation is not Operation.DELIVERY,
         records=known,
     )
     logger.info("Planned %d nodes, %d actions", len(compiled.nodes), len(request.actions) if request else 0)

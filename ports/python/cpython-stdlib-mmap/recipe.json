@@ -1,0 +1,54 @@
+{
+  "name": "cpython-stdlib-mmap",
+  "version": "3.13.7",
+  "source": {
+    "url": "https://www.python.org/ftp/python/3.13.7/Python-3.13.7.tar.xz",
+    "sha256": "5462f9099dfd30e238def83c71d91897d8caa5ff6ebc7a50f14d4802cdaaa79a",
+    "subdirectory": "Python-3.13.7"
+  },
+  "role": "target-library",
+  "kind": "native-library",
+  "linkage": "shared",
+  "sdk": "default",
+  "build_system": "python-extension",
+  "output": "stdlib",
+  "module": "mmap",
+  "target_dependencies": [
+    {
+      "port": "native/wasi-mman",
+      "version": "34"
+    }
+  ],
+  "exports": {
+    "shared_libraries": [
+      "lib-dynload/mmap.so"
+    ],
+    "licenses": [
+      "licenses/LICENSE"
+    ]
+  },
+  "needed_libraries": [],
+  "install": {
+    "kind": "runtime",
+    "destinations": {
+      "lib-dynload/mmap.so": "/usr/lib/python3.13/lib-dynload/mmap.so"
+    }
+  },
+  "tests": [
+    {
+      "kind": "python",
+      "script": "tests/probes/anonymous.py"
+    }
+  ],
+  "test_limits": {
+    "cpu": 1000000000000,
+    "memory": 8589934592,
+    "disk": 1073741824
+  },
+  "patches": [
+    {
+      "file": "wasi-flush.patch",
+      "sha256": "4154333c015d927031dc4aee3fed5a178c7595a388768370c75f2e4e69b281c5"
+    }
+  ]
+}

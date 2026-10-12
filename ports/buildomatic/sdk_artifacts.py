@@ -28,9 +28,8 @@ def sdk_inputs(ports: Path, name: str) -> dict:
 def sdk_inputs_match(recorded: dict, current: dict) -> bool:
     """Compare producer inputs without fingerprinting their context records.
 
-    Context objects carry selected paths, recipes and job counts. Their class
-    definitions are orchestration code; source, patches and the producer's
-    actual build implementation remain part of this comparison.
+    Context records and variant dispatchers do not implement compilation.
+    Source, patches and each producer's actual build helpers remain inputs.
     """
 
     def project(value: dict) -> dict:
@@ -42,7 +41,7 @@ def sdk_inputs_match(recorded: dict, current: dict) -> bool:
                     "implementation": {
                         path: digest
                         for path, digest in producer["implementation"].items()
-                        if path != "_support/build_context.py"
+                        if path not in {"_support/build_context.py", "builder"}
                     },
                 }
                 for name, producer in value["producers"].items()

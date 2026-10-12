@@ -1261,6 +1261,92 @@ fn wasi_directory_handles_support_relative_stat_and_cookie_reads() {
 }
 
 #[test]
+fn wasi_path_timestamps_update_scoped_nodes_and_preserve_rejected_changes() {
+    let mut environment = Environment::new();
+    environment.vfs.mkdir_all("/", "/work/data").unwrap();
+    environment
+        .vfs
+        .write("/", "/work/data/a", b"sql", 0o644)
+        .unwrap();
+    environment
+        .vfs
+        .write("/", "/work/a", b"outside", 0o644)
+        .unwrap();
+    let outside_mtime = environment.vfs.raw_get("/work/a").unwrap().mtime;
+    environment
+        .vfs
+        .symlink("/", "a", "/work/data/link")
+        .unwrap();
+    install(
+        &mut environment,
+        r#"(module
+        (import "wasi_snapshot_preview1" "path_open" (func $open (param i32 i32 i32 i32 i32 i64 i64 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "path_filestat_set_times" (func $times (param i32 i32 i32 i32 i64 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "path_filestat_get" (func $stat (param i32 i32 i32 i32 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "clock_time_get" (func $clock (param i32 i64 i32) (result i32)))
+        (import "wasi_snapshot_preview1" "fd_close" (func $close (param i32) (result i32)))
+        (memory (export "memory") 1)
+        (data (i32.const 512) "work/data")
+        (data (i32.const 528) "alinkmissing/dev/null")
+        (func $expect (param $actual i32) (param $expected i32)
+            (if (i32.ne (local.get $actual) (local.get $expected)) (then unreachable)))
+        (func (export "_start") (local $fd i32)
+            (if (call $open (i32.const 4) (i32.const 1) (i32.const 512) (i32.const 9)
+                (i32.const 2) (i64.const -1) (i64.const -1) (i32.const 0) (i32.const 0)) (then unreachable))
+            (local.set $fd (i32.load (i32.const 0)))
+            ;; Explicit nanoseconds are rounded down to the VFS millisecond resolution.
+            (if (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 123456789) (i32.const 4)) (then unreachable))
+            (if (call $stat (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1) (i32.const 64)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 112)) (i64.const 123000000)) (then unreachable))
+            ;; Following the final link changes a; no-follow changes the link itself.
+            (if (call $times (local.get $fd) (i32.const 1) (i32.const 529) (i32.const 4)
+                (i64.const 777000000) (i64.const 777000000) (i32.const 5)) (then unreachable))
+            (if (call $times (local.get $fd) (i32.const 0) (i32.const 529) (i32.const 4)
+                (i64.const 0) (i64.const 456000000) (i32.const 4)) (then unreachable))
+            (if (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 0)) (then unreachable))
+            ;; Unsupported independent atime and malformed requests leave the previous mtime.
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 100000000) (i64.const 900000000) (i32.const 5)) (i32.const 58))
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 2)) (i32.const 58))
+            (call $expect (call $times (local.get $fd) (i32.const 2) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 8)) (i32.const 28))
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 12)) (i32.const 28))
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const -1) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 8)) (i32.const 21))
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const 533) (i32.const 7)
+                (i64.const 0) (i64.const 0) (i32.const 8)) (i32.const 44))
+            (call $expect (call $times (i32.const 4) (i32.const 1) (i32.const 540) (i32.const 9)
+                (i64.const 0) (i64.const 0) (i32.const 8)) (i32.const 63))
+            (if (call $stat (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1) (i32.const 64)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 112)) (i64.const 777000000)) (then unreachable))
+            ;; SQLite's utimes(NULL) sets both timestamps to the same virtual current time.
+            (if (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 10)) (then unreachable))
+            (if (call $clock (i32.const 0) (i64.const 0) (i32.const 32)) (then unreachable))
+            (if (call $stat (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1) (i32.const 64)) (then unreachable))
+            (if (i64.ne (i64.load (i32.const 112))
+                (i64.mul (i64.div_u (i64.load (i32.const 32)) (i64.const 1000000)) (i64.const 1000000))) (then unreachable))
+            (if (call $close (local.get $fd)) (then unreachable))
+            (call $expect (call $times (local.get $fd) (i32.const 1) (i32.const 528) (i32.const 1)
+                (i64.const 0) (i64.const 0) (i32.const 8)) (i32.const 8))))"#,
+    );
+    assert_eq!(run(&mut environment, "/app"), (0, Vec::new(), Vec::new()));
+    assert_eq!(
+        environment.vfs.raw_get("/work/data/link").unwrap().mtime,
+        456
+    );
+    assert_eq!(
+        environment.vfs.raw_get("/work/a").unwrap().mtime,
+        outside_mtime
+    );
+    assert!(!environment.vfs.lexists("/", "/work/data/missing"));
+}
+
+#[test]
 fn wasi_directory_handle_growth_is_bounded() {
     let mut environment = Environment::new();
     install(

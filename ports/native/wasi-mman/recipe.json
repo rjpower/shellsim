@@ -1,0 +1,39 @@
+{
+  "name": "wasi-mman",
+  "version": "34",
+  "role": "target-library",
+  "kind": "native-library",
+  "linkage": "static",
+  "sdk": "default",
+  "build_system": "cmake",
+  "source": {
+    "url": "https://codeload.github.com/WebAssembly/wasi-libc/tar.gz/2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13",
+    "sha256": "f25ccd526235f7b351f9b49451b75fdd8e23250b9ad8fc9f8f2a19f517a4892f",
+    "subdirectory": "wasi-libc-2e6fb9d8ee0cdf9e431fbcabe8af3115de000a13"
+  },
+  "target_dependencies": [],
+  "exports": {
+    "archives": [
+      "lib/libwasi-mman.a"
+    ],
+    "licenses": [
+      "licenses/wasi-libc.txt"
+    ]
+  },
+  "source_exports": [
+    {
+      "source": "LICENSE",
+      "destination": "licenses/wasi-libc.txt"
+    }
+  ],
+  "needed_libraries": [],
+  "tests": [
+    {
+      "kind": "native",
+      "source": "tests/overflow.c",
+      "link_inputs": [
+        "lib/libwasi-mman.a"
+      ]
+    }
+  ]
+}

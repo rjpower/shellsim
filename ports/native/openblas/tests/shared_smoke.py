@@ -2,7 +2,7 @@
 
 import ctypes as c
 
-library = c.CDLL("/usr/local/lib/libopenblas.so")
+library = c.CDLL("/lib/libopenblas.so")
 integer = c.c_int
 real = c.c_double
 pint = c.POINTER(integer)

@@ -1,6 +1,12 @@
 // Small native Wasm fixtures isolate executable linkage from host compilers.
 // Real C consumers are checked separately with pinned SDK artifacts.
-use shellsim::{Environment, Limits};
+use shellsim::{
+    commands::{
+        precompile_wasm, register_trusted_precompiled_wasm, PrecompiledWasmOutcome,
+        WasmCompilationKind,
+    },
+    Environment, Limits,
+};
 
 fn main_module(body: &str, worker: bool, missing: &str) -> Vec<u8> {
     let worker_start = if worker {
@@ -158,10 +164,9 @@ fn linked_environment(main: &[u8], side: &[u8]) -> Environment {
 
 #[test]
 fn executable_binds_functions_data_and_constructor_callbacks_before_main() {
-    let mut environment = linked_environment(
-        &main_module("", false, ""),
-        &side_module("", "(i32.load (global.get $base))", ""),
-    );
+    let main = main_module("", false, "");
+    let side = side_module("", "(i32.load (global.get $base))", "");
+    let mut environment = linked_environment(&main, &side);
     let (outcome, _, stderr) = environment.run_script_capture("/app");
     assert_eq!(
         outcome.exit_status,
@@ -169,6 +174,27 @@ fn executable_binds_functions_data_and_constructor_callbacks_before_main() {
         "{}",
         String::from_utf8_lossy(&stderr)
     );
+    for (source, kind) in [
+        (&main, WasmCompilationKind::Executable),
+        (&side, WasmCompilationKind::Module),
+    ] {
+        let companion = precompile_wasm(source, kind).unwrap();
+        // SAFETY: these companions are untouched host compiler output.
+        assert_eq!(
+            unsafe { register_trusted_precompiled_wasm(source, &companion, kind) }.unwrap(),
+            PrecompiledWasmOutcome::Registered
+        );
+    }
+    let mut environment = linked_environment(&main, &side);
+    let (precompiled, _, stderr) = environment.run_script_capture("/app");
+    assert_eq!(
+        precompiled.exit_status,
+        0,
+        "{}",
+        String::from_utf8_lossy(&stderr)
+    );
+    assert_eq!(precompiled.usage.cpu_used, outcome.usage.cpu_used);
+    assert_eq!(precompiled.usage.memory_peak, outcome.usage.memory_peak);
 }
 
 #[test]

@@ -34,6 +34,41 @@ def build(ctx: BuildContext):
             link_inputs=("lib/libz.so",),
             licenses=("LICENSE",),
         )
+    if ctx.variant == "stdlib-ssl":
+        return python_extension(
+            ctx,
+            module="_ssl",
+            sources=("Modules/_ssl.c",),
+            defines=("Py_BUILD_CORE_MODULE",),
+            cpython_include_directories=("internal",),
+            include_directories=("include",),
+            link_inputs=("lib/libssl.a", "lib/libcrypto.a"),
+            licenses=("LICENSE",),
+        )
+    if ctx.variant == "stdlib-sqlite3":
+        return python_extension(
+            ctx,
+            module="_sqlite3",
+            sources=tuple(
+                "Modules/_sqlite/" + name + ".c"
+                for name in (
+                    "blob",
+                    "connection",
+                    "cursor",
+                    "microprotocols",
+                    "module",
+                    "prepare_protocol",
+                    "row",
+                    "statement",
+                    "util",
+                )
+            ),
+            defines=("Py_BUILD_CORE_MODULE",),
+            cpython_include_directories=("internal",),
+            include_directories=("include",),
+            link_inputs=("lib/libsqlite3.so",),
+            licenses=("LICENSE",),
+        )
     if ctx.variant == "stdlib-ctypes":
         return python_extension(
             ctx,

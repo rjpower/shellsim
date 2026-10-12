@@ -1,11 +1,31 @@
-"""Check guest build boundaries without launching target programs on the host."""
+"""Exercise build wiring on a small native project; qualify installed Wasm opt-in."""
 
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from ports._support.graph import plan
-from ports.toolchain.llvm.guest import _inventory, _refresh_snapshot, _snapshot, _snapshot_tools, validate_guest_abi
+from ports._support.native_adapters import CompilerCacheLauncher
+from ports._support.producer_tools import digest
+from ports.native.dependencies import seal_artifact
+from ports.toolchain.llvm.compiler import configure_and_build
+from ports.toolchain.llvm.guest import (
+    HOST_TOOLS,
+    _inventory,
+    _prepare_guest_locked,
+    _refresh_snapshot,
+    _snapshot,
+    prepare_guest,
+    validate_guest_abi,
+)
 
 PORT = Path(__file__).resolve().parents[1]
 
@@ -118,16 +138,176 @@ def test_verified_library_update_preserves_snapshot_headers(tmp_path):
     assert (destination / "include/header.h").stat().st_mtime_ns == timestamp
 
 
-def test_linker_update_checks_previous_admitted_bytes(tmp_path):
-    source, destination = tmp_path / "source", tmp_path / "retained"
-    source.mkdir()
-    (source / "wasm-ld").write_bytes(b"old linker")
-    previous = _inventory(source)
-    _snapshot_tools(source, destination, previous, previous)
-    (source / "wasm-ld").write_bytes(b"new linker")
-    current = _inventory(source)
-    _snapshot_tools(source, destination, current, previous)
-    assert (destination / "wasm-ld").read_bytes() == b"new linker"
-    (destination / "wasm-ld").write_bytes(b"corrupt linker")
-    with pytest.raises(ValueError):
-        _snapshot_tools(source, destination, current, previous)
+def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_path):
+    cmake, ninja, cc, cxx = (shutil.which(name) for name in ("cmake", "ninja", "cc", "c++"))
+    if not all((cmake, ninja, cc, cxx)):
+        pytest.skip("requires CMake, Ninja and native C/C++ compilers")
+    source = tmp_path / "upstream/llvm"
+    source.mkdir(parents=True)
+    (source / "main.c").write_text("int main(void) { return 17; }\n")
+    (source / "main.cpp").write_text("int main() { return 23; }\n")
+    # Use real CMake launcher semantics without building LLVM or a host SDK.
+    # The fixture changes only the target platform and project size.
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\nproject(cache_probe NONE)\n"
+        "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR native)\n"
+        'set(CMAKE_SYSROOT "")\nset(CMAKE_C_COMPILER_TARGET "")\nset(CMAKE_CXX_COMPILER_TARGET "")\n'
+        'set(CMAKE_C_FLAGS "")\nset(CMAKE_CXX_FLAGS "")\nset(CMAKE_EXE_LINKER_FLAGS "")\n'
+        "enable_language(C CXX)\n"
+        'if(NOT LLVM_ENABLE_PROJECTS STREQUAL "clang;lld")\n'
+        'message(FATAL_ERROR "Selected guest projects were lost during reconfigure")\nendif()\n'
+        "add_executable(clang main.c)\nadd_executable(lld main.cpp)\n"
+        "add_custom_target(llvm-ar DEPENDS clang)\nadd_custom_target(llvm-nm DEPENDS lld)\n"
+        "add_custom_target(llvm-objcopy DEPENDS clang lld)\n"
+    )
+    archive = tmp_path / "source.tar"
+    with tarfile.open(archive, "w") as output:
+        output.add(source.parent, arcname="upstream")
+    host = tmp_path / "host"
+    (host / "bin").mkdir(parents=True)
+    for name in (*HOST_TOOLS, "llvm-strip"):
+        path = host / "bin" / name
+        command = {"clang": cc, "clang++": cxx}.get(name, "/usr/bin/true")
+        path.write_text(f'#!/bin/sh\nexec {shlex.quote(command)} "$@"\n')
+        path.chmod(0o755)
+    (host / "bin/clang").rename(host / "bin/clang-23")
+    (host / "bin/clang").symlink_to("clang-23")
+    compiler = SimpleNamespace(root=host, contents={"artifacts": _inventory(host)}, sha256="admitted compiler")
+    posix = tmp_path / "posix"
+    posix.mkdir()
+    seal_artifact(posix, {"recipe": {"exports": {}}})
+    sysroot, sdk = tmp_path / "sysroot", tmp_path / "sdk"
+    sysroot.mkdir()
+    (sdk / "lib/clang/23").mkdir(parents=True)
+    launcher = tmp_path / "cache-launcher"
+    launcher.write_text(
+        f"#!{sys.executable}\nimport json, os, subprocess, sys\n"
+        "with open(os.environ['SCCACHE_DIR'], 'a') as output:\n"
+        "    output.write(json.dumps({'args': sys.argv[1:], 'environment': "
+        "{k: v for k, v in os.environ.items() if k.startswith('SCCACHE_')}}) + '\\n')\n"
+        "sys.exit(subprocess.call(sys.argv[1:]))\n"
+    )
+    launcher.chmod(0o755)
+    cache_log = tmp_path / "cache.log"
+    work = tmp_path / "work"
+    context = SimpleNamespace(
+        source=archive,
+        build=work / "build",
+        target="wasm32-wasip1-threads",
+        dependencies={"native/shellsim-posix": posix},
+        sysroot=sysroot,
+        sdk=sdk,
+        compiler_prefix=host,
+        host_tools={"cmake": Path(cmake), "ninja": Path(ninja), "python": Path(sys.executable)},
+        compiler_cache=CompilerCacheLauncher(
+            launcher,
+            digest(launcher),
+            (("SCCACHE_DIR", str(cache_log)), ("SCCACHE_BUCKET", "shared"), ("SCCACHE_BASEDIRS", "/shared/inputs")),
+        ),
+    )
+    recipe = dict(plan(PORT.parents[1], ["toolchain/llvm:guest"]).ports[-1].recipe)
+    recipe.update(source={"sha256": digest(archive)}, patches=[])
+    prepared = prepare_guest(context, recipe, compiler, jobs=128)
+    assert not (context.build / "clang").exists()
+    toolchain = work / "guest-toolchain.cmake"
+    timestamp = toolchain.stat().st_mtime_ns
+    prepared = _prepare_guest_locked(context, recipe, compiler, work, 128)
+    assert toolchain.stat().st_mtime_ns == timestamp
+    configure_and_build(
+        prepared.commands,
+        context.build,
+        prepared.state,
+        work / "workspace.json",
+        work / "attempts" / prepared.prefix.name,
+        prepared.environment,
+    )
+    assert subprocess.run([str(context.build / "clang")], check=False).returncode == 17
+    assert subprocess.run([str(context.build / "lld")], check=False).returncode == 23
+    calls = [json.loads(line) for line in cache_log.read_text().splitlines()]
+    assert {Path(call["args"][0]).name for call in calls} >= {"clang", "clang++"}
+    for call in calls:
+        assert call["environment"]["SCCACHE_BUCKET"] == "shared"
+        assert call["environment"]["SCCACHE_CLIENT_SIDE"] == "1"
+        assert call["environment"]["SCCACHE_BASEDIRS"].split(os.pathsep) == [
+            str(work / "source"),
+            str(context.build),
+            str(work / "inputs"),
+            "/shared/inputs",
+        ]
+    # Full LLVM compilation is impractical here; Ninja's argv is the external
+    # parallelism contract, independent of the fixture's number of source files.
+    assert "-j128" in prepared.commands[1]
+    alternate = tmp_path / "alternate-launcher"
+    alternate.symlink_to(launcher)
+    context.compiler_cache = CompilerCacheLauncher(alternate, digest(launcher), (("SCCACHE_BUCKET", "other"),))
+    changed_cache = _prepare_guest_locked(context, recipe, compiler, work, 128)
+    assert changed_cache.prefix == prepared.prefix
+    context.compiler_cache = None
+    uncached = _prepare_guest_locked(context, recipe, compiler, work, 128)
+    assert uncached.prefix == prepared.prefix
+    objects = list((context.build / "CMakeFiles").glob("*.dir/*.o"))
+    assert objects
+    moved = tmp_path / "moved-host"
+    shutil.copytree(host, moved, symlinks=True)
+    context.compiler_prefix = moved
+    compiler.root = moved
+    rebound = prepare_guest(context, recipe, compiler, jobs=128)
+    assert all(path.exists() for path in objects)
+    configure_and_build(
+        rebound.commands,
+        context.build,
+        rebound.state,
+        work / "workspace.json",
+        work / "attempts" / rebound.prefix.name,
+        rebound.environment,
+    )
+    assert subprocess.run([str(context.build / "clang")], check=False).returncode == 17
+    assert subprocess.run([str(context.build / "lld")], check=False).returncode == 23
+
+
+def test_installed_guest_compiler_and_make_from_catalog():
+    import shellsim
+
+    catalog = os.environ.get("SHELLSIM_GUEST_CATALOG")
+    if not catalog:
+        pytest.skip("set SHELLSIM_GUEST_CATALOG to an exported guest LLVM and make catalog")
+    environment = shellsim.Environment(
+        tools=[
+            "clang",
+            "clang++",
+            "lld",
+            "wasm-ld",
+            "cc",
+            "c++",
+            "ar",
+            "ranlib",
+            "llvm-ar",
+            "llvm-ranlib",
+            "llvm-nm",
+            "make",
+        ],
+        pypi_catalog=catalog,
+        # Opt in only when this catalog and its native-code companions are trusted.
+        trusted_precompiled=os.environ.get("SHELLSIM_GUEST_TRUSTED_PRECOMPILED") == "1",
+        cpu=500_000_000_000,
+        memory=8 * 1024**3,
+        disk=384 * 1024**2,
+    )
+    environment.write_file("/work/guest-compiler.sh", (PORT / "tests/guest-compiler.sh").read_bytes())
+    for name in ("runtime_ctors_main.cpp", "runtime_ctors_side.cpp"):
+        environment.write_file("/work/" + name, (PORT / "tests/fixtures" / name).read_bytes())
+    compiled = environment.run("sh /work/guest-compiler.sh")
+    assert compiled.returncode == 0, compiled.stderr
+    assert compiled.stdout.endswith(b"guest compiler acceptance passed\n")
+    environment.write_file(
+        "/work/Makefile",
+        b"all: make-c.wasm make-cpp.wasm\n"
+        b"make-value.o: value.c\n\tcc -c $< -o $@\n"
+        b"make-c.wasm: main.c make-value.o\n\tcc $^ -o $@\n"
+        b"make-cpp.wasm: cpp.cpp\n\tc++ $< -o $@\n",
+    )
+    made = environment.run(
+        "cd /work && make -j2 && make -q && chmod +x make-c.wasm make-cpp.wasm && ./make-c.wasm && ./make-cpp.wasm"
+    )
+    assert made.returncode == 0, made.stderr
+    assert made.stdout.endswith(b"guest C 42\nguest C++ 42\n")

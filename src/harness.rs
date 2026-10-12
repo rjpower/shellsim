@@ -598,6 +598,11 @@ impl HarnessSession {
         let _ = environment.vfs.put_dir("/work", 0o755);
         environment.cwd = "/work".to_string();
         environment.set_var("PWD", "/work");
+        Self::from_environment(environment)
+    }
+
+    /// Start host-driven actions from an installed environment, retaining its budgets and VFS.
+    pub fn from_environment(environment: Environment) -> Self {
         let baseline = environment.vfs.clone();
         Self {
             environment,

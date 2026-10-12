@@ -196,6 +196,12 @@ class CPythonRuntime:
         if environment._cpython_runtime is not None and environment._cpython_runtime is not self:
             raise SimulationError("a different CPython runtime is already mounted")
         self._verify()
+        if self._catalog is not None:
+            self._catalog.register_precompiled(
+                self.bundle / "rootfs" / _EXECUTABLE.lstrip("/"),
+                self._catalog.runtime,
+                executable=True,
+            )
         environment._native.mount_cpython(str(self.bundle / "rootfs"), self.venv)
         environment._cpython_runtime = self
 

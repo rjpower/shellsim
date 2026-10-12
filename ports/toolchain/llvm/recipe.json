@@ -213,7 +213,7 @@
         }
       ],
       "build_limits": {
-        "compile_jobs": 8,
+        "compile_jobs": 64,
         "link_jobs": 1,
         "address_space_bytes_per_process": 12884901888,
         "command_timeout_seconds": 3600
@@ -418,7 +418,8 @@
         ]
       },
       "install": {
-        "kind": "devel"
+        "kind": "devel",
+        "prefix": "/usr/local"
       },
       "empty_directories": {
         "wasi-sysroot/include/c++/v1": 493

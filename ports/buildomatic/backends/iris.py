@@ -10,7 +10,7 @@ Outputs are cache objects; publication is a separate caller workflow. The servic
 automatically acknowledges worker results after terminal refs and available
 diagnostic tails are durable. Caller acknowledgement records consumption without deleting
 those journals. At most 4096 accepted builds and worker replacements are retained
-per service; GetLogs returns the newest 64 tails with at most 64 KiB total bytes.
+per service; GetLogs retains failure tails or the newest 64 tails, bounded to 64 KiB.
 
 Iris timeouts lease each task attempt, rather than an eternal service. Restarting
 the coordinator resets its lease within its bounded retry policy. Get and blob
@@ -88,13 +88,13 @@ _BUILD_ID = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
 _MAX_BUILDS = 4096
 DEFAULT_TASK_IMAGE = (
-    "ghcr.io/marin-community/iris-task@sha256:958fa4a2013916163a3b84338e158a6feb285bdc06de3ada9c14caabe46ab69b"
+    "ghcr.io/marin-community/iris-task@sha256:ac2360afc7248d319969267eb76f499843d0c3c9f5eac905884a996c0972b665"
 )
 
 
 @dataclass(frozen=True)
 class IrisConfig:
-    """Modest CPU service resources; all tasks use BATCH priority.
+    """Configured service resources; all tasks use BATCH priority.
 
     ``setup_scripts`` installs only the caller's required runtime into the task
     image. Empty scripts require an image with Iris and Rigging already present.
@@ -449,14 +449,19 @@ class CoordinatorService:
         raise ConditionalWriteError("control intent remained contended")
 
     def get_logs(self, build_id: str) -> tuple[dict[str, str], ...]:
-        """Return newest 64 attempt tails, bounded to 64 KiB of log bytes."""
-        request_id = self.get(build_id).request_id
+        """Return failed attempts when present, otherwise the newest bounded tails."""
+        outcome = self.get(build_id)
+        request_id = outcome.request_id
         found = self._store.read_journal(f"{self._base}/diagnostics/{request_id}.json")
         if found is None:
             return ()
         result = []
         remaining = 65536
-        for record in reversed(json.loads(found.data)[-64:]):
+        records = json.loads(found.data)
+        failed = {node.action_id for node in outcome.nodes if node.state.value == "failed"}
+        if failed:
+            records = [record for record in records if record["action_id"] in failed]
+        for record in reversed(records[-64:]):
             tail = self._store.read_journal(f"{self._base}/logs/{record['attempt_id']}")
             data = b"" if tail is None else tail.data[-min(16384, remaining) :] if remaining else b""
             remaining -= len(data)
@@ -718,7 +723,7 @@ def compiler_cache_environment(path: str, environ: Mapping[str, str] | None = No
 
 def _worker_environment(config: IrisConfig) -> dict[str, str]:
     if not config.compiler_cache:
-        return {}
+        return {"SHELLSIM_WASMTIME_CACHE_DIR": "/app/.buildomatic/wasmtime"}
     from rigging.filesystem.cluster_config import StoreType, data_buckets, marin_temp_bucket
     from rigging.filesystem.s3_compat import configure_coreweave_s3, fsspec_s3_conf, s3_endpoint
 
@@ -740,6 +745,7 @@ def _worker_environment(config: IrisConfig) -> dict[str, str]:
     if binary is None:
         raise RuntimeError("compiler cache requires sccache in the worker task image")
     return {
+        "SHELLSIM_WASMTIME_CACHE_DIR": "/app/.buildomatic/wasmtime",
         **compiler_cache_environment(path, environ),
         "SCCACHE_SERVER_UDS": "/app/.buildomatic/sccache.sock",
         "SCCACHE_IDLE_TIMEOUT": "0",
@@ -1284,7 +1290,7 @@ def _run_worker(config: IrisConfig, worker_id: str) -> None:
     os.environ.update(env)
     # sccache uses one worker-local server, keeping cloud credentials outside
     # the sanitized action environment owned by WorkerExecutor.
-    if env:
+    if config.compiler_cache:
         os.environ.pop("SCCACHE_SERVER_PORT", None)
         Path(env["SCCACHE_SERVER_UDS"]).parent.mkdir(parents=True, exist_ok=True)
         subprocess.run(["sccache", "--start-server"], check=True, stdout=subprocess.DEVNULL)

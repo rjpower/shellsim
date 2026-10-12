@@ -190,6 +190,8 @@ class Environment:
     terminates the environment; subsequent calls return the same terminal outcome without work.
     ``pypi_packages`` selects upstream CPython and packages from ``pypi_catalog``
     (or ``SHELLSIM_PYPI_CATALOG``); downloads use ``cache_dir`` and respect ``offline``.
+    ``trusted_precompiled=True`` loads native Wasmtime companions only from catalog
+    and producer bytes trusted by the caller; otherwise companions are ignored.
     """
 
     def __init__(
@@ -203,8 +205,11 @@ class Environment:
         http: Optional[Mapping[str, HttpResponse]] = None,
         pypi_packages: Optional[Union[str, Sequence[str]]] = None,
         pypi_catalog: Optional[Union[str, os.PathLike[str]]] = None,
+        tools: Union[str, Sequence[str]] = (),
+        clock: str = "virtual",
         cache_dir: Optional[Union[str, os.PathLike[str]]] = None,
         offline: bool = False,
+        trusted_precompiled: bool = False,
     ) -> None:
         overrides = {"cpu": cpu, "memory": memory, "disk": disk, "output": output}
         if limits is not None and any(value is not None for value in overrides.values()):
@@ -212,7 +217,9 @@ class Environment:
         if limits is not None and not isinstance(limits, Limits):
             raise TypeError("limits must be a shellsim.Limits instance")
         defaults = (
-            {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2} if pypi_packages is not None else {}
+            {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2}
+            if pypi_packages is not None or tools
+            else {}
         )
         resolved = limits or Limits(
             **{
@@ -220,23 +227,28 @@ class Environment:
                 **{name: _validate_limit(name, value) for name, value in overrides.items() if value is not None},
             }
         )
+        if clock not in ("virtual", "real_time"):
+            raise ValueError("clock must be 'virtual' or 'real_time'")
+        self._limits = resolved
         self._native = _native.NativeEnvironment(
             resolved.cpu,
             resolved.memory,
             resolved.disk,
             resolved.output,
+            clock == "real_time",
         )
         self._native_installation = _NativeInstallation({}, {})
         self._native_install_lock = threading.RLock()
         self._cpython_runtime: Optional[CPythonRuntime] = None
         self._catalog_packages: set[str] = set()
         self._catalog_native: set[str] = set()
+        self._catalog_assets: set[str] = set()
         if http is not None:
             if not isinstance(http, Mapping):
                 raise TypeError("http must be a mapping from URL patterns to shellsim.HttpResponse")
             for pattern, response in http.items():
                 self.route_http(pattern, response)
-        if pypi_packages is not None:
+        if pypi_packages is not None or tools:
             from ._pypi_catalog import Catalog
             from .cpython import CPythonRuntime
 
@@ -245,11 +257,25 @@ class Environment:
                 from .pypi import PackageInstallError
 
                 raise PackageInstallError("set pypi_catalog or SHELLSIM_PYPI_CATALOG to a ports catalog")
-            catalog = Catalog(location, cache_dir=Path(cache_dir) if cache_dir is not None else None, offline=offline)
-            catalog.resolve(pypi_packages)
-            runtime = CPythonRuntime.from_catalog(catalog)
-            runtime.mount(self)
-            runtime.install_pypi(self, pypi_packages)
+            catalog = Catalog(
+                location,
+                cache_dir=Path(cache_dir) if cache_dir is not None else None,
+                offline=offline,
+                trusted_precompiled=trusted_precompiled,
+            )
+            if pypi_packages is not None:
+                catalog.resolve(pypi_packages)
+                runtime = CPythonRuntime.from_catalog(catalog)
+                runtime.mount(self)
+                runtime.install_pypi(self, pypi_packages)
+            if tools:
+                catalog.install_tools(self, tools)
+
+    def to_container(self, *, tools: Optional[Mapping[str, ToolHandler]] = None) -> Container:
+        """Copy an installed guest for host-driven actions, frames and explicit tool callbacks."""
+        container = Container(tools={} if tools is None else tools, limits=self._limits)
+        container._native = self._native.to_container()
+        return container
 
     @classmethod
     def from_release(

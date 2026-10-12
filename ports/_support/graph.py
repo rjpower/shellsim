@@ -112,7 +112,11 @@ def _expand_sdk(root: Path, recipe: dict[str, Any], default_sdk: str) -> tuple[d
         raise ValueError("build_profile was replaced by sdk selection")
     adapter = recipe.get("build_system")
     explicit = "sdk" in recipe
-    if recipe.get("role") in {"host-tool", "target-platform"} or adapter in {"pure-wheel", "host-wheel"}:
+    if (
+        recipe.get("role") in {"host-tool", "target-platform"}
+        or adapter in {"pure-wheel", "host-wheel"}
+        or (adapter == "source-tree" and not explicit)
+    ):
         if explicit:
             raise ValueError("SDK selection applies only to target consumers")
         return recipe, None
@@ -187,6 +191,7 @@ def _dependencies(recipe: dict[str, Any], reference: str) -> tuple[Dependency, .
         ("build_dependencies", "build"),
         ("target_dependencies", "target"),
         ("runtime_dependencies", "runtime"),
+        ("test_dependencies", "test"),
         ("platform_dependencies", "platform"),
     ):
         declarations = recipe.get(field, [])
@@ -222,6 +227,7 @@ _VARIANT_FIELDS = frozenset(
         "platform_dependencies",
         "target_dependencies",
         "runtime_dependencies",
+        "test_dependencies",
         "exports",
         "export_directories",
         "install",

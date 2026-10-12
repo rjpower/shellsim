@@ -120,14 +120,15 @@ def delivery_graph(
     graph: Graph, products: dict[str, dict], *, abi: str | None = None, runtime: dict | None = None
 ) -> dict:
     """Select guest records and retain the static recipe dependency edges."""
-    packages, native, nodes = [], [], []
+    packages, native, assets, nodes = [], [], [], []
     selected = guest_graph(graph)
     for port in selected.ports:
         if port.role in {"host-tool", "target-platform"} or port.reference not in products:
             continue
         record = products[port.reference]["delivery"]
-        packages.extend(record["wheels"])
-        native.extend(record["native"])
+        packages.extend({**item, "port": port.reference} for item in record["wheels"])
+        native.extend({**item, "port": port.reference} for item in record["native"])
+        assets.extend({**item, "port": port.reference} for item in record.get("assets", []))
         nodes.append(
             {
                 "reference": port.reference,
@@ -143,6 +144,7 @@ def delivery_graph(
         "ports": nodes,
         "packages": packages,
         "native": native,
+        "assets": assets,
         **(
             {
                 "runtime": {
@@ -172,16 +174,18 @@ def catalog(graph: dict, url_prefix: str) -> dict:
     if base.scheme in {"http", "https"} and not base.netloc:
         raise ValueError("HTTP URL prefix must include a host")
     value = {**graph, "schema_version": 2}
-    for section in ("packages", "native"):
-        value[section] = [
-            {**item, "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/")}
-            for item in graph[section]
-        ]
-    if "runtime" in graph:
-        value["runtime"] = {
-            **graph["runtime"],
-            "url": url_prefix.rstrip("/") + "/" + quote(relative_path(graph["runtime"]["path"]), safe="/"),
+
+    def asset(item):
+        return {
+            **item,
+            "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/"),
+            **({"precompiled": asset(item["precompiled"])} if "precompiled" in item else {}),
         }
+
+    for section in ("packages", "native", "assets"):
+        value[section] = [asset(item) for item in graph.get(section, [])]
+    if "runtime" in graph:
+        value["runtime"] = asset(graph["runtime"])
     return value
 
 
@@ -201,8 +205,15 @@ def export(
     copied = 0
     if copy_assets:
         source = DeliveryStore(json.loads((state / "results.json").read_text())["prefix"])
-        for item in [*graph["packages"], *graph["native"], *([graph["runtime"]] if "runtime" in graph else [])]:
+        for item in [
+            *graph["packages"],
+            *graph["native"],
+            *graph.get("assets", []),
+            *([graph["runtime"]] if "runtime" in graph else []),
+        ]:
             copied += source.promote(item["path"], destination)
+            if "precompiled" in item:
+                copied += source.promote(item["precompiled"]["path"], destination)
     destination.write("catalog.json", _json(value))
     if simple:
         projects = {}

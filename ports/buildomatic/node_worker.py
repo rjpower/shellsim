@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from ports._support.graph import _read
@@ -12,9 +13,10 @@ from ports._support.native_adapters import CompilerCacheLauncher
 from ports._support.node_build import produce_port
 from ports._support.sdk import SDKProduct, _produce, installed_seed, producer_work
 from ports._support.sdk_products import Receipt
+from ports._support.store import identity
 from ports.buildomatic.artifacts import install, register, resolve, upload, write_reference
 from ports.buildomatic.delivery import DeliveryStore
-from ports.buildomatic.delivery_products import delivery_key, publish_product, publish_runtime
+from ports.buildomatic.delivery_products import publish_product, publish_runtime
 from ports.buildomatic.nodes import Node, Operation, decode
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import load_sdk
@@ -32,13 +34,14 @@ def launcher() -> CompilerCacheLauncher | None:
 
 
 def input_records(node: Node, store: StorageStore) -> dict:
-    records = {}
-    for item in node.inputs:
+    def read(item):
         record = resolve(store, "node/" + item.key)
         if record is None:
             raise ValueError("missing declared input: " + item.reference)
-        records[item.name] = record
-    return records
+        return item.name, record
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        return dict(pool.map(read, node.inputs))
 
 
 def receipt(record: dict, store: StorageStore, cache: Path) -> Receipt:
@@ -119,16 +122,14 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
         "reference": node.port.reference,
         "build_key": node.key,
         "artifact": upload(store, root, cache / "archives"),
-        "delivery_key": delivery_key(node.key),
-        "delivery": publish_product(
-            node.port, root, node.key, DeliveryStore(store.prefix), record_key=delivery_key(node.key)
-        ),
     }
 
 
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
-    if product.get("delivery_key") == node.key:
+    if product.get("delivery_key") == node.key or (
+        node.port.recipe["build_system"] == "pure-wheel" and "delivery" in product
+    ):
         return product
     root = install(store, product["artifact"], cache / "artifacts")
     return {
@@ -143,12 +144,23 @@ def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dic
 def runtime(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
     root = install(store, product["artifact"], cache / "artifacts")
-    return {"runtime": publish_runtime(root, node.key, DeliveryStore(store.prefix))}
+    raw_key = identity(
+        {"operation": "runtime", "format_version": 1, "inputs": {item.name: item.key for item in node.inputs}}
+    )
+    return {"runtime": publish_runtime(root, raw_key, DeliveryStore(store.prefix), record_key=node.key)}
 
 
 def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -> dict:
     if node.operation is not Operation.CHECK and (cached := resolve(store, node.record_key)) is not None:
         return cached
+    if (expected := specification.get("wasmtime_build_id")) is not None:
+        from shellsim import _native
+
+        actual = _native.precompiled_wasm_build_id()
+        if actual != expected:
+            raise ValueError(
+                f"worker Wasmtime {actual} differs from planner {expected}; install the matching worker image"
+            )
     records = input_records(node, store)
     if node.operation is Operation.BUILD:
         result = build(node, records, store, cache, specification)

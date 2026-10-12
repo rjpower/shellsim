@@ -23,8 +23,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::task::{Context, Poll, Waker};
 use wasmtime::{
-    AsContextMut, CallHook, Caller, Collector, Config, Engine, Error, Extern, ExternType, Linker,
-    Module, ModuleVersionStrategy, Store, StoreContextMut, StoreLimitsBuilder,
+    AsContextMut, CallHook, Caller, Config, Engine, Error, Extern, ExternType, Linker, Module,
+    Store, StoreContextMut, StoreLimitsBuilder,
 };
 
 use crate::descriptors::{
@@ -49,10 +49,18 @@ mod threaded_dynamic;
 mod threads;
 
 use guest_memory::GuestMemory;
+mod engine;
 mod limits;
 mod posix_exec;
 mod posix_open;
 mod posix_process;
+mod precompiled;
+use engine::{configure_command_engine, ASYNC_STACK_BYTES};
+
+pub use precompiled::{
+    precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
+    PrecompiledWasmOutcome, WasmCompilationKind,
+};
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
 // prepay their conservative host compilation memory reservation.
@@ -65,7 +73,8 @@ const LARGE_TABLE_MEMORY: u64 = 16 * LARGE_TABLE_ELEMENTS as u64 * 16;
 // CPython's static WASI image needs 20 MiB before allocating its interpreter heap.
 const MAX_WASM_MEMORY: usize = 64 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 1024 * 1024;
-const MAX_CACHED_MODULES: usize = 64;
+// SciPy ships over 100 extensions; keep its setup from evicting the interpreter.
+const MAX_CACHED_MODULES: usize = 256;
 const MAX_DIRECTORY_HANDLES: u32 = 64;
 // Reserve path storage and conservative map overhead before allocating directory handles.
 const DIRECTORY_MEMORY: u64 = (MAX_DIRECTORY_HANDLES as u64) * (4096 + 128);
@@ -98,7 +107,6 @@ const SUBSCRIPTION_BYTES: u32 = 48;
 const EVENT_BYTES: u32 = 32;
 /// Fuel a guest may consume between cooperative yields to the scheduler.
 const FUEL_YIELD_INTERVAL: u64 = 100_000;
-const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
 const ERRNO_NOSPC: i32 = 51;
 const ERRNO_RANGE: i32 = 68;
 
@@ -106,9 +114,14 @@ type CompilationFlights = BTreeMap<[u8; 32], Weak<Mutex<()>>>;
 
 struct CachedModule {
     source: Vec<u8>,
-    module: Module,
+    compilation: CachedCompilation,
     bytes: usize,
     admission: Option<ExecutableAdmission>,
+}
+
+enum CachedCompilation {
+    Ready(Module),
+    Precompiled(Arc<[u8]>),
 }
 
 #[derive(Clone)]
@@ -129,9 +142,12 @@ impl ModuleCache {
             .iter()
             .position(|entry| entry.source == source)?;
         let entry = self.entries.remove(index).expect("index from cache");
-        let module = entry.module.clone();
+        let module = match &entry.compilation {
+            CachedCompilation::Ready(module) => Some(module.clone()),
+            CachedCompilation::Precompiled(_) => None,
+        };
         self.entries.push_back(entry);
-        Some(module)
+        module
     }
 
     fn insert(&mut self, source: &[u8], module: Module) {
@@ -139,8 +155,27 @@ impl ModuleCache {
         let bytes = source
             .len()
             .saturating_add((image.end as usize).saturating_sub(image.start as usize));
+        self.insert_entry(source, CachedCompilation::Ready(module), bytes);
+    }
+
+    fn pending(&self, source: &[u8]) -> Option<Arc<[u8]>> {
+        self.entries
+            .iter()
+            .find_map(|entry| match &entry.compilation {
+                CachedCompilation::Precompiled(bytes) if entry.source == source => {
+                    Some(bytes.clone())
+                }
+                _ => None,
+            })
+    }
+
+    fn insert_entry(&mut self, source: &[u8], compilation: CachedCompilation, bytes: usize) {
         if bytes > MAX_CACHED_MODULE_BYTES {
             return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.source == source) {
+            let old = self.entries.remove(index).expect("matching cache entry");
+            self.bytes -= old.bytes;
         }
         while self.entries.len() >= MAX_CACHED_MODULES
             || self.bytes.saturating_add(bytes) > MAX_CACHED_MODULE_BYTES
@@ -153,30 +188,12 @@ impl ModuleCache {
         }
         self.entries.push_back(CachedModule {
             source: source.to_vec(),
-            module,
+            compilation,
             bytes,
             admission: None,
         });
         self.bytes += bytes;
     }
-}
-
-/// Keep compiler settings identical for host caching and runtime compatibility checks.
-fn configure_command_engine(config: &mut Config) {
-    config
-        .consume_fuel(true)
-        .async_stack_size(ASYNC_STACK_BYTES)
-        .wasm_exceptions(true)
-        .wasm_threads(true)
-        .shared_memory(true)
-        .wasm_gc(false)
-        .collector(Collector::DeferredReferenceCounting);
-    config
-        .module_version(ModuleVersionStrategy::Custom(format!(
-            "shellsim-wasmtime-49-{}",
-            compilation_cache::BUILD_ID
-        )))
-        .expect("bounded patched Wasmtime identity");
 }
 
 fn command_engine() -> &'static Engine {
@@ -277,7 +294,11 @@ fn compiled_command_module(source: &[u8]) -> Result<Module, Error> {
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
         return Ok(module);
     }
-    let module = Module::new(command_engine(), source)?;
+    let pending = cache.lock().expect("module cache lock").pending(source);
+    let module = match precompiled::load(pending.as_deref()) {
+        Some(module) => module,
+        None => Module::new(command_engine(), source)?,
+    };
     cache
         .lock()
         .expect("module cache lock")
@@ -291,11 +312,19 @@ fn compiled_executable_module(
     source: &[u8],
     profile: Option<&threads::Profile>,
 ) -> Result<Module, Error> {
-    let rewritten = profile
+    let rewritten = executable_compilation_source(source, profile)?;
+    compiled_command_module(rewritten.as_deref().unwrap_or(source))
+}
+
+/// Native companions and JIT compilation must use the same deferred-start cache key.
+fn executable_compilation_source(
+    source: &[u8],
+    profile: Option<&threads::Profile>,
+) -> Result<Option<Vec<u8>>, Error> {
+    profile
         .filter(|profile| !profile.executable.needed.is_empty())
         .map(|profile| threaded_dynamic::layout::defer_start(source, &profile.executable))
-        .transpose()?;
-    compiled_command_module(rewritten.as_deref().unwrap_or(source))
+        .transpose()
 }
 
 /// Access to the virtual machine for host calls.
@@ -1328,6 +1357,84 @@ fn path_filestat_get(
     }
 }
 
+struct PathTimes {
+    directory: u32,
+    lookup_flags: u32,
+    pointer: u32,
+    length: u32,
+    atime: u64,
+    mtime: u64,
+    time_flags: u32,
+}
+
+/// Update existing VFS nodes at millisecond resolution. Filestat exposes the modeled mtime
+/// for all three timestamps, so access-time requests must be coupled to the same mtime.
+fn path_filestat_set_times(mut caller: Caller<'_, Host>, request: PathTimes) -> Result<i32, Error> {
+    let base = match preopen_base(&caller, request.directory) {
+        Ok(base) => base,
+        Err(error) => return Ok(error),
+    };
+    let flags = request.time_flags;
+    if request.lookup_flags & !1 != 0 || flags & !15 != 0 || flags & 3 == 3 || flags & 12 == 12 {
+        return Ok(ERRNO_INVAL);
+    }
+    let path = match read_path(&mut caller, request.pointer, request.length) {
+        Ok(path) => path,
+        Err(error) => return Ok(error),
+    };
+    let mut machine = caller.data_mut().machine.get();
+    if !machine
+        .resources
+        .charge_cpu((base.len() + path.len() + 1) as u64)
+    {
+        return Err(exhausted());
+    }
+    let absolute = resolve_against(&base, &path);
+    let resolved = match machine
+        .vfs
+        .realpath(&absolute, request.lookup_flags & 1 != 0)
+    {
+        Ok(path) => path,
+        Err(error) => return Ok(vfs_errno(&error)),
+    };
+    if ["/proc", "/dev"].iter().any(|root| {
+        resolved == *root
+            || resolved
+                .strip_prefix(root)
+                .is_some_and(|suffix| suffix.starts_with('/'))
+    }) {
+        return Ok(ERRNO_PERM);
+    }
+    if machine.vfs.raw_get(&resolved).is_none() {
+        return Ok(ERRNO_NOENT);
+    }
+    let now = if flags & 10 != 0 {
+        match ActiveSystem::new(&mut machine).clock_time_ns(ClockId::Realtime) {
+            Ok(now) => now,
+            Err(error) => return Ok(syscall_errno(&error)),
+        }
+    } else {
+        0
+    };
+    let mtime = match flags & 12 {
+        4 => Some(request.mtime),
+        8 => Some(now),
+        _ => None,
+    };
+    let atime = match flags & 3 {
+        1 => Some(request.atime),
+        2 => Some(now),
+        _ => None,
+    };
+    if atime.is_some_and(|atime| mtime.is_none_or(|mtime| atime / 1_000_000 != mtime / 1_000_000)) {
+        return Ok(ERRNO_NOTSUP);
+    }
+    if let Some(mtime) = mtime {
+        machine.vfs.set_mtime(&resolved, mtime / 1_000_000);
+    }
+    Ok(ERRNO_SUCCESS)
+}
+
 /// Encode stable sorted VFS directory entries using preview1 cookies. A short buffer receives
 /// a prefix of the final dirent, as required by libc's readdir retry protocol.
 fn fd_readdir(
@@ -2341,6 +2448,33 @@ fn build_linker(engine: &Engine) -> Linker<Host> {
             "wasi_snapshot_preview1",
             "path_filestat_get",
             path_filestat_get,
+        )
+        .expect("unique WASI import");
+    linker
+        .func_wrap(
+            "wasi_snapshot_preview1",
+            "path_filestat_set_times",
+            |caller: Caller<'_, Host>,
+             directory,
+             lookup_flags,
+             pointer,
+             length,
+             atime,
+             mtime,
+             time_flags| {
+                path_filestat_set_times(
+                    caller,
+                    PathTimes {
+                        directory,
+                        lookup_flags,
+                        pointer,
+                        length,
+                        atime,
+                        mtime,
+                        time_flags,
+                    },
+                )
+            },
         )
         .expect("unique WASI import");
     linker

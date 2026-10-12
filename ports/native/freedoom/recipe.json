@@ -1,0 +1,31 @@
+{
+  "name": "freedoom",
+  "version": "0.13.0",
+  "kind": "native-data",
+  "role": "target-library",
+  "build_system": "source-tree",
+  "source": {
+    "url": "https://github.com/freedoom/freedoom/releases/download/v0.13.0/freedoom-0.13.0.zip",
+    "sha256": "3f9b264f3e3ce503b4fb7f6bdcb1f419d93c7b546f4df3e874dd878db9688f59",
+    "subdirectory": "freedoom-0.13.0"
+  },
+  "exports": {
+    "data": [
+      "share/games/doom/freedoom1.wad"
+    ],
+    "licenses": [
+      "share/licenses/freedoom/COPYING.txt",
+      "share/licenses/freedoom/CREDITS.txt",
+      "share/licenses/freedoom/CREDITS-MUSIC.txt"
+    ]
+  },
+  "install": {
+    "destinations": {
+      "share/games/doom/freedoom1.wad": "/usr/share/games/doom/freedoom1.wad",
+      "share/licenses/freedoom/COPYING.txt": "/usr/share/licenses/freedoom/COPYING.txt",
+      "share/licenses/freedoom/CREDITS.txt": "/usr/share/licenses/freedoom/CREDITS.txt",
+      "share/licenses/freedoom/CREDITS-MUSIC.txt": "/usr/share/licenses/freedoom/CREDITS-MUSIC.txt"
+    }
+  },
+  "tests": []
+}
