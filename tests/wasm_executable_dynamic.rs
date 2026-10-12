@@ -174,16 +174,6 @@ fn executable_binds_functions_data_and_constructor_callbacks_before_main() {
         "{}",
         String::from_utf8_lossy(&stderr)
     );
-    let ordinary = precompile_wasm(&main, WasmCompilationKind::Module).unwrap();
-    // SAFETY: the bytes are genuine compiler output; the executable loader must refuse a
-    // companion that lacks the deferred-start executable compilation kind.
-    assert_eq!(
-        unsafe {
-            register_trusted_precompiled_wasm(&main, &ordinary, WasmCompilationKind::Executable)
-        }
-        .unwrap(),
-        PrecompiledWasmOutcome::SourceMismatch
-    );
     for (source, kind) in [
         (&main, WasmCompilationKind::Executable),
         (&side, WasmCompilationKind::Module),

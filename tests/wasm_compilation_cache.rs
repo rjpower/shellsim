@@ -54,14 +54,6 @@ fn warm_executable_preserves_usage_and_rejects_changed_or_forbidden_bytes() {
     assert_eq!(limited.exit_status, 137);
 
     let changed = wat::parse_str("(module (func (export \"_start\") unreachable))").unwrap();
-    // SAFETY: a genuine companion can safely be checked against different source bytes.
-    assert_eq!(
-        unsafe {
-            register_trusted_precompiled_wasm(&changed, &companion, WasmCompilationKind::Executable)
-        }
-        .unwrap(),
-        PrecompiledWasmOutcome::SourceMismatch
-    );
     assert_eq!(execute(&changed, Limits::default()).0.exit_status, 126);
     let forbidden = wat::parse_str(
         "(module (memory 1 1 shared) (func (export \"_start\") (drop (memory.atomic.wait32 (i32.const 0) (i32.const 0) (i64.const -1)))))"

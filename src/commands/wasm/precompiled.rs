@@ -1,8 +1,8 @@
 //! Host-only native companions for exact Wasm sources.
 //!
-//! Companions carry the original source and compilation kind, then untouched Wasmtime output.
-//! Only an explicitly trusted host caller may deserialize them. Guests use ordinary admission,
-//! metering, instantiation, and the bounded module cache; no guest path loads native code.
+//! Companions are ordinary Wasmtime serialization. Only a trusted host caller may associate
+//! them with source bytes and deserialize them. Guests use ordinary admission, metering,
+//! instantiation, and the bounded module cache; no guest path loads native code.
 
 use wasmtime::{Error, Module};
 
@@ -11,9 +11,6 @@ use super::{
     executable_admission, executable_compilation_source, retain_executable_admission, threads,
     validate_imports, ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
 };
-
-const MAGIC: &[u8; 8] = b"SSCWASM1";
-const HEADER_BYTES: usize = MAGIC.len() + 1 + 8;
 
 /// Select ordinary module compilation or main-executable admission and startup rewriting.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -31,8 +28,6 @@ pub enum PrecompiledWasmOutcome {
     Registered,
     /// The format, runtime identity, target, settings, or cache size bounds are incompatible.
     Incompatible,
-    /// The companion belongs to different source bytes or a different compilation kind.
-    SourceMismatch,
 }
 
 /// Compile binary Wasm on the host using the command engine and return a native companion.
@@ -52,21 +47,22 @@ pub fn precompile_wasm(source: &[u8], kind: WasmCompilationKind) -> Result<Vec<u
             module
         }
     };
-    companion(source, kind, &module.serialize()?)
+    module.serialize()
 }
 
 /// Register a trusted host companion for the exact source used by subsequent guest compilation.
 ///
-/// Incompatibility or a source/kind mismatch leaves the ordinary JIT path available. Invalid
-/// source or failed executable admission returns an error. Registration does not bypass guest
-/// resource charges or instantiate a module. Cache eviction can later require recompilation.
+/// Incompatibility leaves the ordinary JIT path available. Invalid source or failed executable
+/// admission returns an error. Registration does not bypass guest resource charges or instantiate
+/// a module. Cache eviction can later require recompilation.
 ///
 /// # Safety
 ///
-/// `companion` must come from a trusted producer using [`precompile_wasm`]'s envelope and contain
-/// untouched Wasmtime serialization for its recorded source and compilation kind. Output from
-/// other runtime versions is allowed. Never pass guest VFS bytes or untrusted native artifacts.
-/// Source matching and compatibility checks do not authenticate code or make arbitrary input safe.
+/// `companion` must be trusted, untouched Wasmtime serialization compiled from exactly `source`
+/// with `kind`, including executable startup rewriting. [`precompile_wasm`] supplies this output;
+/// other runtime versions are allowed. The caller guarantees this association. Neither raw source
+/// admission nor compatibility checks verify native code. Never pass guest VFS bytes or untrusted
+/// native artifacts.
 #[allow(unsafe_code)]
 pub unsafe fn register_trusted_precompiled_wasm(
     source: &[u8],
@@ -74,19 +70,8 @@ pub unsafe fn register_trusted_precompiled_wasm(
     kind: WasmCompilationKind,
 ) -> Result<PrecompiledWasmOutcome, Error> {
     check_source(source)?;
-    let Some(header) = companion.get(..HEADER_BYTES) else {
+    if companion.len() > MAX_CACHED_MODULE_BYTES {
         return Ok(PrecompiledWasmOutcome::Incompatible);
-    };
-    if !header.starts_with(MAGIC) || companion.len() > MAX_CACHED_MODULE_BYTES {
-        return Ok(PrecompiledWasmOutcome::Incompatible);
-    }
-    let length = u64::from_le_bytes(header[MAGIC.len() + 1..].try_into().expect("header length"));
-    if header[MAGIC.len()] != kind_byte(kind) || length != source.len() as u64 {
-        return Ok(PrecompiledWasmOutcome::SourceMismatch);
-    }
-    let source_end = HEADER_BYTES + source.len();
-    if companion.get(HEADER_BYTES..source_end) != Some(source) {
-        return Ok(PrecompiledWasmOutcome::SourceMismatch);
     }
     let admission = match kind {
         WasmCompilationKind::Module => {
@@ -100,10 +85,9 @@ pub unsafe fn register_trusted_precompiled_wasm(
         .map(|admission| executable_compilation_source(source, admission.profile.as_ref()))
         .transpose()?
         .flatten();
-    // SAFETY: the caller guarantees the payload is untouched, trusted Wasmtime output.
-    // The envelope selects its exact source/kind, and the command engine checks compatibility,
-    // including our patched runtime identity and fuel-resume behavior.
-    let module = match unsafe { Module::deserialize(command_engine(), &companion[source_end..]) } {
+    // SAFETY: the host caller guarantees untouched Wasmtime output compiled for this source/kind.
+    // The command engine checks compatibility, including the patched fuel-resume runtime identity.
+    let module = match unsafe { Module::deserialize(command_engine(), companion) } {
         Ok(module) => module,
         Err(_) => return Ok(PrecompiledWasmOutcome::Incompatible),
     };
@@ -137,33 +121,6 @@ fn check_source(source: &[u8]) -> Result<(), Error> {
         return Err(Error::msg("not a binary Wasm module"));
     }
     Ok(())
-}
-
-fn kind_byte(kind: WasmCompilationKind) -> u8 {
-    match kind {
-        WasmCompilationKind::Module => 0,
-        WasmCompilationKind::Executable => 1,
-    }
-}
-
-fn companion(
-    source: &[u8],
-    kind: WasmCompilationKind,
-    serialized: &[u8],
-) -> Result<Vec<u8>, Error> {
-    let size = HEADER_BYTES
-        .saturating_add(source.len())
-        .saturating_add(serialized.len());
-    if size > MAX_CACHED_MODULE_BYTES {
-        return Err(Error::msg("precompiled companion exceeds cache size limit"));
-    }
-    let mut bytes = Vec::with_capacity(size);
-    bytes.extend_from_slice(MAGIC);
-    bytes.push(kind_byte(kind));
-    bytes.extend_from_slice(&(source.len() as u64).to_le_bytes());
-    bytes.extend_from_slice(source);
-    bytes.extend_from_slice(serialized);
-    Ok(bytes)
 }
 
 fn admit_imports(module: &Module, admission: &ExecutableAdmission) -> Result<(), Error> {
@@ -236,12 +193,7 @@ mod tests {
         let source =
             wat::parse_str("(module (func (export \"_start\") (i32.const 17) drop))").unwrap();
         let module = Module::new(&engine, &source).unwrap();
-        let bytes = companion(
-            &source,
-            WasmCompilationKind::Executable,
-            &module.serialize().unwrap(),
-        )
-        .unwrap();
+        let bytes = module.serialize().unwrap();
         // SAFETY: the native payload is genuine output from a differently configured Wasmtime.
         assert_eq!(
             unsafe {

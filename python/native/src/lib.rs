@@ -904,8 +904,8 @@ fn precompile_wasm(py: Python<'_>, source: Vec<u8>, executable: bool) -> PyResul
     Ok(PyBytes::new(py, &bytes).unbind())
 }
 
-/// Load only untouched companions from an explicitly trusted host catalog. Never pass guest
-/// files or untrusted native code: compatibility/source checks do not authenticate a companion.
+/// Load only trusted, untouched compiler output for this exact source and executable kind.
+/// Never pass guest files or untrusted code: compatibility checks do not authenticate a companion.
 #[pyfunction]
 #[pyo3(signature = (source, companion, executable=false))]
 fn register_trusted_precompiled_wasm(
@@ -917,8 +917,8 @@ fn register_trusted_precompiled_wasm(
     let outcome = py
         .detach(|| {
             host_worker(|| {
-                // SAFETY: this host-only API requires the embedding caller to opt in to loading
-                // untouched compiler output from a trusted catalog. It is not a guest API.
+                // SAFETY: the embedding caller guarantees trusted, untouched compiler output
+                // for this exact source and compilation kind. This host API is unavailable to guests.
                 unsafe {
                     shellsim::commands::register_trusted_precompiled_wasm(
                         &source,
@@ -933,7 +933,6 @@ fn register_trusted_precompiled_wasm(
     Ok(match outcome {
         PrecompiledWasmOutcome::Registered => "registered",
         PrecompiledWasmOutcome::Incompatible => "incompatible",
-        PrecompiledWasmOutcome::SourceMismatch => "source_mismatch",
     })
 }
 
