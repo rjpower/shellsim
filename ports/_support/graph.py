@@ -293,6 +293,20 @@ def canonical_reference(root: Path, value: str) -> str:
     return path + ":" + default if default else path
 
 
+def all_ports(root: Path) -> list[str]:
+    """Select every guest recipe variant; SDK inputs enter through dependencies."""
+    requests = []
+    for category in ("python", "native", "toolchain"):
+        for path in sorted((root / category).glob("*/recipe.json")):
+            reference = path.relative_to(root).as_posix()
+            _, _, document = _document(root, reference)
+            for variant in sorted(document.get("variants") or {"": {}}):
+                recipe = select_variant(document, variant)
+                if recipe.get("role", "target-library") not in {"host-tool", "target-platform"}:
+                    requests.append(reference + (":" + variant if variant else ""))
+    return requests
+
+
 def _read(root: Path, reference: str, default_sdk: str) -> Port:
     path, data, recipe = _document(root, reference)
     recipe = select_variant(recipe, reference.partition(":")[2])

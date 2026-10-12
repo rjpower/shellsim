@@ -14,7 +14,7 @@ uv run --extra buildomatic python -m ports check
 uv run --extra buildomatic python -m ports build --all --backend iris --max-workers 4 --store s3://bucket/ports
 ```
 
-`--all` selects every default recipe; export/check reuse the saved roots.
+`--all` selects every guest recipe variant; export/check reuse the saved roots.
 Iris starts on `cw-us-east-02a` and stops its owned pool on exit. Use
 `--worker-cpus`, `--worker-memory-gb`, `--worker-disk-gb` and `--iris-image` to size it;
 defaults are 64 CPUs, 32 GiB RAM and 100 GiB disk per worker, with sccache enabled.
@@ -27,7 +27,7 @@ assets with `--output <prefix> --copy-assets`. Serve the store with
 `Context(pypi_catalog="<URL>").Environment(pypi_packages=["scipy"])`; no patched uv is needed.
 
 Delivery keeps portable Wasm and adds ordinary Wasmtime companions for the runtime,
-wheel extensions and native exports. Set `trusted_precompiled=True` on `Environment`
+wheel extensions and native exports. Set `trusted_precompiled=True` on `Context`
 only for trusted catalog and producer bytes: companions contain native host code.
 Companions load on first use, with raw Wasm fallback; they never enter the guest VFS.
 Python installs omit development bundles; explicitly selected tools include them.

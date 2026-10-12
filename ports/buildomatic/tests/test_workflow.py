@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ports.__main__ import main
+from ports._support.graph import all_ports
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
 from ports.buildomatic.artifacts import resolve
@@ -26,7 +27,10 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
     ports, state = tmp_path / "ports", tmp_path / "state"
     source = state / "execution/cache/ports"
     recipe_path, recipe = _wheel_port(ports, source, "base", [])
-    _wheel_port(ports, source, "app", ["base"])
+    app_path, app = _wheel_port(ports, source, "app", ["base"])
+    app_path.write_text(
+        json.dumps({**app, "default_variant": "host", "variants": {"host": {"role": "host-tool"}, "guest": {}}})
+    )
     arguments = ["--ports", str(ports), "--state", str(state), "--offline"]
     main(["build", "--all", *arguments])
     graph = json.loads((state / "graph.json").read_text())
@@ -50,7 +54,7 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
         main(["export", *arguments, "--url-prefix", "https://ports.example"])
         guarded.setattr("iris.cli.connect.open_iris_client", reject)
         with AutomaticIrisBackend(IrisConfig("cached"), store, ports.parent) as automatic:
-            run(ports, ["python/app"], store, state, automatic, offline=True)
+            run(ports, ["python/app:guest"], store, state, automatic, offline=True)
     recipe_path.write_text(json.dumps({**recipe, "features": {"changed": True}}))
     _wheel_port(ports, source, "independent", [])
     process = subprocess.run(
@@ -64,6 +68,15 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
     changed = json.loads((state / "graph.json").read_text())
     assert {package["name"] for package in changed["packages"]} == {"base", "app", "independent"}
     assert {item["build_key"] for item in changed["ports"]}.isdisjoint({item["build_key"] for item in graph["ports"]})
+
+
+def test_all_ports_plans_guest_clang_and_sqlite_with_sdk_dependencies():
+    ports = Path(__file__).resolve().parents[2]
+    compiled = compile_plan(ports, all_ports(ports))
+    roots = [port for port in compiled.graph.ports if port.reference in compiled.graph.roots]
+    assert {"clang", "wasi-development", "sqlite3"} <= {port.name for port in roots}
+    assert all(port.role not in {"host-tool", "target-platform"} for port in roots)
+    assert any(port.name == "llvm" and port.role == "host-tool" for port in compiled.graph.ports)
 
 
 def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
