@@ -251,7 +251,7 @@ def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_pat
     assert "-j128" in prepared.commands[1]
 
 
-def test_installed_guest_compiler_and_make_from_catalog(tmp_path):
+def test_installed_guest_compiler_and_make_from_catalog():
     import shellsim
 
     catalog = os.environ.get("SHELLSIM_GUEST_CATALOG")
@@ -273,7 +273,6 @@ def test_installed_guest_compiler_and_make_from_catalog(tmp_path):
             "make",
         ],
         pypi_catalog=catalog,
-        cache_dir=tmp_path / "catalog",
         cpu=500_000_000_000,
         memory=8 * 1024**3,
         disk=384 * 1024**2,
