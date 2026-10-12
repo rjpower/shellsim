@@ -258,6 +258,11 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
                 source=file_hash(port.directory / test.get("script", test.get("source"))),
                 limits=port.recipe.get("test_limits", {}),
                 inputs={item.name: item.key for item in test_inputs},
+                **(
+                    {"fixtures": {item["source"]: file_hash(port.directory / item["source"]) for item in test["files"]}}
+                    if test.get("files")
+                    else {}
+                ),
             )
             node = Node(port.reference + ":check-" + str(index), Operation.CHECK, key, port, test_inputs, test=test)
             nodes.append(node)
@@ -468,9 +473,6 @@ def run(
         Operation.DELIVERY: compiled.delivery_roots,
         Operation.CHECK: compiled.check_roots,
     }[operation]
-    if operation is Operation.CHECK:
-        for reference in roots:
-            known[reference] = None
     request = prepare(
         compiled,
         roots,
