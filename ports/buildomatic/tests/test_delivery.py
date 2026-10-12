@@ -11,6 +11,7 @@ from ports.__main__ import main
 from ports._support import runner
 from ports._support.graph import plan
 from ports._support.tests.test_runner import _wheel_port
+from ports.buildomatic.cache import delivery_key
 from ports.buildomatic.delivery import DeliveryStore, export
 from ports.buildomatic.delivery_products import publish_product
 
@@ -110,12 +111,22 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
             ),
         )
         archive.writestr("native.so", b"\x00asm\x01\x00\x00\x00")
-    record = publish_product(port, root, "native-key", DeliveryStore(store))
+    record = publish_product(port, root, "native-key", DeliveryStore(store), key=delivery_key("native-key", port=port))
     package = record["wheels"][0]
     assert package["name"] == "native" and package["abi"] == "test-abi"
     assert package["requires_dist"] == ['numpy>=2; extra == "fast"']
     assert package["native_dependencies"] == ["libopenblas.so"] and package["extras"] == ["fast"]
     from shellsim import _native
+
+    def reject_compile(*args, **kwargs):
+        raise RuntimeError("compiler unavailable during delivery retry")
+
+    with monkeypatch.context() as retry:
+        retry.setattr(_native, "precompile_wasm", reject_compile)
+        repeated = publish_product(
+            port, root, "native-key", DeliveryStore(store), key=delivery_key("native-key", port=port)
+        )
+        assert repeated == record
 
     with zipfile.ZipFile(store / package["path"]) as delivered:
         if oversized_companion:
@@ -143,7 +154,9 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, d
     (root / "native/artifact.json").write_text(
         json.dumps({"inputs": {"recipe": {"abi": "test", "exports": {"shared_libraries": ["lib/libtest.so"]}}}})
     )
-    record = publish_product(port, root, "provider-key", DeliveryStore(store))
+    record = publish_product(
+        port, root, "provider-key", DeliveryStore(store), key=delivery_key("provider-key", port=port)
+    )
     assert record["native"][0]["destination"] == destination
     assert record["native"][0]["native_dependencies"] == []
     from shellsim import _native
@@ -156,7 +169,9 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, d
         == "registered"
     )
     monkeypatch.setattr(_native, "precompiled_wasm_build_id", lambda: "another-runtime-build")
-    updated = publish_product(port, root, "provider-key", DeliveryStore(store))["native"][0]
+    updated = publish_product(
+        port, root, "provider-key", DeliveryStore(store), key=delivery_key("provider-key", port=port)
+    )["native"][0]
     assert updated["path"] == provider["path"]
     assert updated["precompiled"]["path"] != provider["precompiled"]["path"]
     assert (store / updated["precompiled"]["path"]).is_file()
@@ -177,7 +192,7 @@ def test_guest_tools_are_emitted_as_executables(tmp_path, monkeypatch, oversized
     notice.write_text("fixture license")
     (root / "native/artifact.json").write_text(json.dumps({"inputs": {"recipe": port.recipe}}))
     store = DeliveryStore(tmp_path / "canonical")
-    record = publish_product(port, root, "make-key", store)
+    record = publish_product(port, root, "make-key", store, key=delivery_key("make-key", port=port))
     tool = record["native"][0]
     assert tool["destination"] == "/usr/bin/make" and tool["kind"] == "tools"
     assert (store.local / tool["path"]).read_bytes() == b"\x00asm\x01\x00\x00\x00"
@@ -196,6 +211,23 @@ def test_guest_tools_are_emitted_as_executables(tmp_path, monkeypatch, oversized
         exported = json.loads((output / "catalog.json").read_text())["native"][0]["precompiled"]
         assert (output / exported["path"]).read_bytes() == (store.local / exported["path"]).read_bytes()
         assert exported["url"] == "https://packages.example/" + exported["path"]
+
+    from shellsim import _native
+
+    from ports.buildomatic import cache
+
+    monkeypatch.setattr(_native, "precompiled_wasm_build_id", lambda: "another-runtime")
+    notice.unlink()
+    updated = publish_product(port, root, "make-key", store, key=delivery_key("make-key", port=port))
+    assert updated["assets"] == record["assets"]
+    monkeypatch.setattr(cache, "DELIVERY_REVISION", cache.DELIVERY_REVISION + 1)
+    notice.write_text("updated fixture license")
+    repackaged = publish_product(port, root, "make-key", store, key=delivery_key("make-key", port=port))
+    assert repackaged["assets"][0]["path"] != record["assets"][0]["path"]
+    with zipfile.ZipFile(store.local / repackaged["assets"][0]["path"]) as archive:
+        assert archive.read("usr/share/licenses/make/COPYING") == b"updated fixture license"
+    with zipfile.ZipFile(store.local / record["assets"][0]["path"]) as archive:
+        assert archive.read("usr/share/licenses/make/COPYING") == b"fixture license"
 
 
 @pytest.mark.parametrize("path", ["../secret", "/secret", "a/../secret"])

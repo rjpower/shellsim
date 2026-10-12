@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 
 from ports._support.graph import Dependency, Port
+from ports.buildomatic.cache import record_key
 
 
 class Operation(str, Enum):
@@ -36,7 +37,7 @@ class Node:
 
     @property
     def record_key(self) -> str:
-        return "node/" + self.key
+        return record_key(self.key)
 
     @property
     def action_id(self) -> str:

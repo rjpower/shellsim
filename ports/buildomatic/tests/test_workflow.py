@@ -13,13 +13,13 @@ import pytest
 from ports.__main__ import main
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
-from ports.buildomatic.artifacts import register, resolve
+from ports.buildomatic.artifacts import resolve
 from ports.buildomatic.backends.iris import AutomaticIrisBackend, IrisConfig
 from ports.buildomatic.backends.local import LocalBackend
-from ports.buildomatic.delivery_products import delivery_key
+from ports.buildomatic.cache import BuildCache
 from ports.buildomatic.nodes import Operation
 from ports.buildomatic.remote_store import StorageStore
-from ports.buildomatic.workflow import compile_plan, normalize_cached, prepare, run, wait_for_build
+from ports.buildomatic.workflow import compile_plan, prepare, records_for, run, wait_for_build
 
 
 def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path, monkeypatch):
@@ -78,12 +78,14 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
     compiled = compile_plan(ports, ["python/app"])
     store = StorageStore((tmp_path / "canonical").as_uri())
     app = next(node for node in compiled.nodes if node.port.name == "app" and node.operation is Operation.BUILD)
-    register(
-        store,
-        app.record_key,
+    app_delivery = next(
+        node for node in compiled.nodes if node.port.name == "app" and node.operation is Operation.DELIVERY
+    )
+    BuildCache(store).put(
+        app_delivery.key,
         {
             "reference": app.reference,
-            "delivery_key": delivery_key(app.key),
+            "delivery_key": app_delivery.key,
             "delivery": {"build_key": app.key, "wheels": [], "native": []},
         },
     )
@@ -96,18 +98,20 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
         backend,
         jobs=8,
         max_workers=2,
-        records=normalize_cached(compiled, store),
+        records=records_for(compiled, store),
     )
     runtime = next(node for node in compiled.nodes if node.port.name == "runtime" and node.operation is Operation.BUILD)
     assert runtime.action_id in {action.id for action in request.actions}
     builder = next(node for node in compiled.nodes if node.port.name == "builder" and node.operation is Operation.BUILD)
     assert builder.action_id not in {action.id for action in request.actions}
-    register(
-        store,
-        runtime.record_key,
+    runtime_delivery = next(
+        node for node in compiled.nodes if node.port.name == "runtime" and node.operation is Operation.DELIVERY
+    )
+    BuildCache(store).put(
+        runtime_delivery.key,
         {
             "reference": runtime.reference,
-            "delivery_key": delivery_key(runtime.key),
+            "delivery_key": runtime_delivery.key,
             "delivery": {"build_key": runtime.key, "wheels": [], "native": []},
         },
     )
@@ -129,7 +133,7 @@ def test_failed_delivery_preserves_canonical_build(tmp_path, monkeypatch, failur
         if failure == "worker-runtime":
             # Supply a mismatched compiler requirement without bootstrapping an SDK fixture.
             planner.setattr(workflow, "compiler_identity", lambda _port: "mismatched-planner")
-            planner.setattr("ports.buildomatic.delivery_products.compiler_identity", lambda _port: "mismatched-planner")
+            planner.setattr("ports.buildomatic.cache.compiler_identity", lambda _port: "mismatched-planner")
         failed = compile_plan(ports, ["python/example"])
         with pytest.raises(RuntimeError):
             run(ports, ["python/example"], store, state, backend, offline=True)

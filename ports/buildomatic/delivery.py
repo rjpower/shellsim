@@ -44,15 +44,12 @@ class DeliveryStore:
             else self.fs.exists(self.key(relative))
         )
 
-    def record(self, key: str) -> dict | None:
-        relative = "records/" + relative_path(key) + ".json"
-        try:
-            if self.local is not None:
-                return json.loads((self.local / relative).read_text())
-            with self.fs.open(self.key(relative), "rb") as source:
-                return json.load(source)
-        except FileNotFoundError:
-            return None
+    def size(self, relative: str) -> int:
+        return (
+            (self.local / relative_path(relative)).stat().st_size
+            if self.local is not None
+            else self.fs.size(self.key(relative))
+        )
 
     def write(self, relative: str, value: bytes) -> None:
         if self.local is not None:

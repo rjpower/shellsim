@@ -4,6 +4,8 @@
 execution runs that worker here; Iris dispatches it to a pool. `--store` selects
 a canonical directory or S3/GCS prefix independently of execution. Client state
 (`graph.json`, `results.json`) defaults to `build/ports`. Iris requires Python 3.12 or 3.13.
+`cache.py` owns product identities and completion records; packaging revisions affect derived
+assets without invalidating raw builds. Existing records retain their asset URLs.
 
 ```sh
 uv run --extra buildomatic python -m ports build --all --jobs 128

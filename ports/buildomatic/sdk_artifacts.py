@@ -4,51 +4,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ports._support.graph import Graph
-from ports._support.producer_policy import policy
-from ports._support.sdk import definition, installed_seed
+from ports._support.sdk import installed_seed
 from ports._support.sdk_products import Receipt, Tool, admit_sdk
-from ports.api import implementation
 from ports.buildomatic.artifacts import install, write_reference
 from ports.buildomatic.contracts import Store
-
-
-def sdk_inputs(ports: Path, name: str) -> dict:
-    """Track producer recipes and build code without inspecting host tools."""
-    sdk = definition(ports, Graph((), ()), name)
-    return {
-        "definition": {key: value for key, value in sdk.metadata.items() if key != "runtime"},
-        "producers": {
-            node.name: {"policy": policy(node.port.recipe), "implementation": implementation(node.port)}
-            for node in sdk.products
-        },
-    }
-
-
-def sdk_inputs_match(recorded: dict, current: dict) -> bool:
-    """Compare producer inputs without fingerprinting their context records.
-
-    Context records and variant dispatchers do not implement compilation.
-    Source, patches and each producer's actual build helpers remain inputs.
-    """
-
-    def project(value: dict) -> dict:
-        return {
-            **value,
-            "producers": {
-                name: {
-                    **producer,
-                    "implementation": {
-                        path: digest
-                        for path, digest in producer["implementation"].items()
-                        if path not in {"_support/build_context.py", "builder"}
-                    },
-                }
-                for name, producer in value["producers"].items()
-            },
-        }
-
-    return project(recorded) == project(current)
 
 
 def load_sdk(store: Store, manifest: dict, cache: Path):
