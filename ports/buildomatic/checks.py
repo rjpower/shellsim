@@ -149,7 +149,7 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     staging.mkdir()
     if not runtime or not own.get("delivery", {}).get("wheels"):
         for item in native:
-            installer.register_precompiled(assets / item["path"], item, executable=item["kind"] == "tools")
+            installer.register_precompiled(assets / item["path"], installer.providers[item["name"]], executable=item["kind"] == "tools")
             path = staging / item["destination"].lstrip("/")
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(assets / item["path"], path)

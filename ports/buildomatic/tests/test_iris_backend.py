@@ -873,10 +873,7 @@ def test_get_logs_retains_bounded_newest_tails(service_parts):
     service = CoordinatorService(store, "test", workers)
     specification = replace(request(), actions=tuple(replace(action, max_attempts=1) for action in request().actions))
     build_id = service.submit(specification)
-    records = [
-        {"attempt_id": f"a{i}", "action_id": "a" if i == 0 else "b", "worker_id": "worker-0"}
-        for i in range(70)
-    ]
+    records = [{"attempt_id": f"a{i}", "action_id": "a" if i == 0 else "b", "worker_id": "worker-0"} for i in range(70)]
     store.write_journal(f"iris/test/diagnostics/{request_id(specification)}.json", json.dumps(records).encode(), None)
     for record in records:
         store.write_journal(f"iris/test/logs/{record['attempt_id']}", b"x" * 16384, None)
@@ -889,7 +886,11 @@ def test_get_logs_retains_bounded_newest_tails(service_parts):
         for attempt in worker.submitted:
             worker.reports[attempt.id] = WorkerReport(
                 WorkerState.COMPLETED,
-                AttemptResult(attempt.id, AttemptState.FAILED if attempt.action.id == "a" else AttemptState.SUCCEEDED, worker.bundle),
+                AttemptResult(
+                    attempt.id,
+                    AttemptState.FAILED if attempt.action.id == "a" else AttemptState.SUCCEEDED,
+                    worker.bundle,
+                ),
             )
     service.tick_once()
     logs = service.get_logs(build_id)

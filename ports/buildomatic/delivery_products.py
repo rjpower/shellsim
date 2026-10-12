@@ -30,12 +30,12 @@ def _json(value: dict) -> bytes:
     return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
-def _companion(source: Path, relative: str, store: DeliveryStore, *, executable: bool) -> dict | None:
+def _companion(source: Path, relative: str, store: DeliveryStore, *, executable: bool, scratch: Path) -> dict | None:
     """Publish ordinary Wasmtime output from declared trusted producer bytes."""
     from shellsim import _native
 
     if not store.exists(relative):
-        with tempfile.TemporaryDirectory(prefix=".precompiled-", dir=source.parent) as temporary:
+        with tempfile.TemporaryDirectory(prefix=".precompiled-", dir=scratch) as temporary:
             target = Path(temporary) / "module.cwasm"
             companion = _native.precompile_wasm(source.read_bytes(), executable=executable)
             if len(companion) > _MAX_ASSET:
@@ -184,6 +184,7 @@ def publish_product(
                     f"assets/delivery-v4/{asset_key}/native/{path}.cwasm",
                     store,
                     executable=kind == "tools",
+                    scratch=root.parent,
                 )
                 record["native"].append(
                     {
@@ -255,6 +256,7 @@ def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key:
         f"assets/delivery-v4/{relative_path(record_key)}/python3.cwasm",
         store,
         executable=True,
+        scratch=bundle.parent,
     )
     runtime = {
         "path": relative,
