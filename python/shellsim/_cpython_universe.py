@@ -135,8 +135,8 @@ def _uleb(data: bytes, offset: int) -> tuple[int, int]:
     raise PackageInstallError("invalid core Wasm section length")
 
 
-def _verify_wasm(data: bytes, abi: str) -> None:
-    if len(data) > _MAX_NATIVE_BYTES or not data.startswith(b"\0asm\x01\0\0\0"):
+def _verify_wasm(data: bytes, abi: str, *, max_bytes: int = _MAX_NATIVE_BYTES) -> None:
+    if len(data) > max_bytes or not data.startswith(b"\0asm\x01\0\0\0"):
         raise PackageInstallError("native artifact is not a bounded core Wasm module")
     offset = 8
     markers = []

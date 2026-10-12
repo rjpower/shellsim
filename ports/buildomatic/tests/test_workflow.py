@@ -2,6 +2,7 @@
 
 import json
 import logging
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +13,7 @@ import pytest
 from ports.__main__ import main
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
-from ports.buildomatic.artifacts import register
+from ports.buildomatic.artifacts import register, resolve
 from ports.buildomatic.backends.iris import AutomaticIrisBackend, IrisConfig
 from ports.buildomatic.backends.local import LocalBackend
 from ports.buildomatic.delivery_products import delivery_key
@@ -110,6 +111,28 @@ def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
     run(ports, ["python/app"], store, tmp_path / "export-client", backend, operation=Operation.DELIVERY)
     exported = json.loads((tmp_path / "export-client/graph.json").read_text())
     assert {node["reference"] for node in exported["ports"]} == {app.reference, runtime.reference}
+
+
+def test_failed_delivery_preserves_canonical_build(tmp_path):
+    ports, state = tmp_path / "ports", tmp_path / "state"
+    _wheel_port(ports, state / "execution/cache/ports", "example", [])
+    store = StorageStore(str(tmp_path / "canonical"))
+    backend = LocalBackend(store, state / "execution")
+    blocked = Path(store.prefix) / "assets"
+    blocked.write_bytes(b"blocks delivery directories")
+    with pytest.raises(RuntimeError):
+        run(ports, ["python/example"], store, state, backend, offline=True)
+    compiled = compile_plan(ports, ["python/example"])
+    product = next(node for node in compiled.nodes if node.operation is Operation.BUILD)
+    cached = resolve(store, product.record_key)
+    assert cached is not None
+    blocked.unlink()
+    # Remove the producer's source/cache; success now depends on its canonical output.
+    shutil.rmtree(state / "execution/cache/ports")
+    completed = run(ports, ["python/example"], store, state, backend, offline=True)
+    assert completed.records[product.reference] == cached
+    graph = json.loads((state / "graph.json").read_text())
+    assert (Path(store.prefix) / graph["packages"][0]["path"]).is_file()
 
 
 def test_check_dependencies_build_only_when_checks_are_requested(tmp_path):

@@ -444,8 +444,16 @@ def delivery_catalog(tmp_path):
                 output.writestr(info + "RECORD", "app-1.0.data/scripts/app-raw,,\n")
         relative = f"assets/{name}-key/{wheel.name}"
         DeliveryStore(store).emit(wheel, relative)
-        packages.append(asdict(wheel_metadata(wheel, relative)))
-    document = catalog({"packages": packages, "native": [], "runtime": runtime}, store.as_uri())
+        packages.append({**asdict(wheel_metadata(wheel, relative)), "port": "python/" + name})
+    files = store / "data.zip"
+    with zipfile.ZipFile(files, "w") as archive:
+        archive.writestr("usr/share/base/value.txt", "42")
+    document = catalog({"packages": packages, "native": [], "runtime": runtime,
+        "ports": [{"reference": "python/base", "dependencies": ["native/base-data"]}],
+        "assets": [
+            {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/base-data"},
+            {"path": "unneeded-development.zip", "size": 1, "kind": "archive", "usage": "development", "port": "native/base-data"},
+        ]}, store.as_uri())
     path = store / "catalog.json"
     path.write_text(json.dumps(document))
     return path, tmp_path / "cache"
@@ -455,6 +463,7 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
     path, cache = delivery_catalog
     environment = shellsim.Environment(pypi_packages=["app"], pypi_catalog=path, cache_dir=cache)
     site = "/work/.venv/lib/python3.13/site-packages/"
+    assert environment.read_file("/usr/share/base/value.txt") == b"42"
     assert environment.read_file(site + "base.py") == b"VALUE = 42\n"
     assert environment.run("test ! -e " + site + "speed.py").returncode == 0
     assert environment.read_file("/work/.venv/bin/app-command").startswith(b"#!/work/.venv/bin/python\n")
@@ -493,6 +502,9 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
         wrapper = zipfile.ZipInfo("usr/bin/ar")
         wrapper.external_attr = 0o100755 << 16
         archive.writestr(wrapper, '#!/bin/sh\nexec /usr/bin/llvm-ar "$@"\n')
+    development = tmp_path / "development.zip"
+    with zipfile.ZipFile(development, "w") as archive:
+        archive.writestr("usr/include/development.h", "#define ANSWER 739\n")
     graph = {
         "abi": ABI,
         "packages": [],
@@ -517,6 +529,7 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
         ],
         "assets": [
             {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/data"},
+            {"path": development.name, "size": development.stat().st_size, "kind": "archive", "usage": "development", "port": "native/data"},
             {"path": "not-published.zip", "size": 1, "kind": "archive", "port": "native/unselected"},
         ],
         "ports": [
@@ -526,20 +539,25 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
             {"reference": "native/data", "dependencies": []},
         ],
     }
+    script = tmp_path / "cc"
+    script.write_text('#!/bin/sh\nexec /usr/bin/clang "$@"\n')
+    graph["native"].append({"name": "cc", "path": script.name, "size": script.stat().st_size,
+        "kind": "tools", "destination": "/usr/bin/cc", "abi": ABI, "native_dependencies": [], "port": "native/example"})
     path = tmp_path / "catalog.json"
     path.write_text(json.dumps(catalog(graph, tmp_path.as_uri())))
     if not trusted_precompiled:
         companion.unlink()
     cache = tmp_path / "cache"
     first = shellsim.Environment(
-        tools=["clang", "make"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
     )
     assert first.read_file("/usr/bin/make") == tool.read_bytes()
     assert first.run("make /missing-target").returncode == 0
     assert first.read_file("/usr/bin/llvm-ar") == tool.read_bytes()
     assert first.read_file("/usr/bin/wasm-ld") == tool.read_bytes()
-    assert first.run("clang && wasm-ld && ar").returncode == 0
+    assert first.run("cc && wasm-ld && ar").returncode == 0
     assert first.read_file("/usr/share/example/value.txt") == b"42"
+    assert first.read_file("/usr/include/development.h") == b"#define ANSWER 739\n"
     assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
     assert first.run("test ! -e /usr/bin/python3.wasm").returncode == 0
     assert first.run("find / -name '*.cwasm'").stdout == b""
@@ -549,12 +567,13 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
     assert first.read_file("/usr/share/example/value.txt") == b"42"
     first.write_file("/usr/share/example/value.txt", b"guest change")
     tool.unlink()
+    script.unlink()
     files.unlink()
     second = shellsim.Environment(
-        tools=["clang", "make"], pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
+        tools=["cc", "make"], pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
     )
     assert second.read_file("/usr/share/example/value.txt") == b"42"
-    assert second.run("clang && wasm-ld && ar && make /missing-target").returncode == 0
+    assert second.run("cc && wasm-ld && ar && make /missing-target").returncode == 0
     ordinary = shellsim.Environment()
     ordinary.write_file("/usr/bin/make", b"guest-owned command", mode=0o755)
     saved = Catalog(path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled)

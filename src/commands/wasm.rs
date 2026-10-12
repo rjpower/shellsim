@@ -56,7 +56,8 @@ mod posix_process;
 mod precompiled;
 
 pub use precompiled::{
-    precompile_wasm, register_trusted_precompiled_wasm, PrecompiledWasmOutcome, WasmCompilationKind,
+    precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
+    PrecompiledWasmOutcome, WasmCompilationKind,
 };
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
@@ -172,6 +173,10 @@ impl ModuleCache {
 
 /// Keep compiler settings identical for host caching and runtime compatibility checks.
 fn configure_command_engine(config: &mut Config) {
+    // A worker's host CPU features must not make published companions require that CPU.
+    config
+        .target(env!("SHELLSIM_WASMTIME_TARGET"))
+        .expect("supported host target");
     config
         .consume_fuel(true)
         .async_stack_size(ASYNC_STACK_BYTES)

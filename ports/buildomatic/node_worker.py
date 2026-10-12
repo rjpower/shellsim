@@ -16,7 +16,7 @@ from ports._support.sdk_products import Receipt
 from ports._support.store import identity
 from ports.buildomatic.artifacts import install, register, resolve, upload, write_reference
 from ports.buildomatic.delivery import DeliveryStore
-from ports.buildomatic.delivery_products import delivery_key, publish_product, publish_runtime
+from ports.buildomatic.delivery_products import publish_product, publish_runtime
 from ports.buildomatic.nodes import Node, Operation, decode
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import load_sdk
@@ -122,16 +122,14 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
         "reference": node.port.reference,
         "build_key": node.key,
         "artifact": upload(store, root, cache / "archives"),
-        "delivery_key": delivery_key(node.key),
-        "delivery": publish_product(
-            node.port, root, node.key, DeliveryStore(store.prefix), record_key=delivery_key(node.key)
-        ),
     }
 
 
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
-    if product.get("delivery_key") == node.key or node.port.recipe["build_system"] == "pure-wheel":
+    if product.get("delivery_key") == node.key or (
+        node.port.recipe["build_system"] == "pure-wheel" and "delivery" in product
+    ):
         return product
     root = install(store, product["artifact"], cache / "artifacts")
     return {

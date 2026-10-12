@@ -7,9 +7,9 @@
 use wasmtime::{Error, Module};
 
 use super::{
-    command_engine, command_module_cache, compiled_command_module, compiled_executable_module,
-    executable_admission, executable_compilation_source, retain_executable_admission, threads,
-    validate_imports, ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
+    command_engine, command_module_cache, compilation_cache, executable_admission,
+    executable_compilation_source, retain_executable_admission, threads, validate_imports,
+    ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
 };
 
 /// Select ordinary module compilation or main-executable admission and startup rewriting.
@@ -37,17 +37,30 @@ pub enum PrecompiledWasmOutcome {
 /// The returned bytes contain native code and must remain under trusted host control.
 pub fn precompile_wasm(source: &[u8], kind: WasmCompilationKind) -> Result<Vec<u8>, Error> {
     check_source(source)?;
-    let module = match kind {
-        WasmCompilationKind::Module => compiled_command_module(source)?,
-        WasmCompilationKind::Executable => {
-            let admission = executable_admission(source)?;
-            let module = compiled_executable_module(source, admission.profile.as_ref())?;
-            admit_imports(&module, &admission)?;
-            retain_executable_admission(source, admission);
-            module
+    let admission = match kind {
+        WasmCompilationKind::Module => {
+            threads::reject_raw_waits(source)?;
+            None
         }
+        WasmCompilationKind::Executable => Some(executable_admission(source)?),
     };
+    let rewritten = admission
+        .as_ref()
+        .map(|admission| executable_compilation_source(source, admission.profile.as_ref()))
+        .transpose()?
+        .flatten();
+    let module = Module::new(command_engine(), rewritten.as_deref().unwrap_or(source))?;
+    if let Some(admission) = &admission {
+        admit_imports(&module, admission)?;
+    }
     module.serialize()
+}
+
+/// Identify the patched runtime used to produce native companions.
+///
+/// CPU and configuration incompatibility is handled by Wasmtime when loading the companion.
+pub fn precompiled_wasm_build_id() -> &'static str {
+    compilation_cache::BUILD_ID
 }
 
 /// Register a trusted host companion for the exact source used by subsequent guest compilation.
@@ -85,6 +98,15 @@ pub unsafe fn register_trusted_precompiled_wasm(
         .map(|admission| executable_compilation_source(source, admission.profile.as_ref()))
         .transpose()?
         .flatten();
+    let compilation_source = rewritten.as_deref().unwrap_or(source);
+    if command_module_cache()
+        .lock()
+        .expect("module cache lock")
+        .get(compilation_source)
+        .is_some()
+    {
+        return Ok(PrecompiledWasmOutcome::Registered);
+    }
     // SAFETY: the host caller guarantees untouched Wasmtime output compiled for this source/kind.
     // The command engine checks compatibility, including the patched fuel-resume runtime identity.
     let module = match unsafe { Module::deserialize(command_engine(), companion) } {
@@ -94,7 +116,6 @@ pub unsafe fn register_trusted_precompiled_wasm(
     if let Some(admission) = &admission {
         admit_imports(&module, admission)?;
     }
-    let compilation_source = rewritten.as_deref().unwrap_or(source);
     let image = module.image_range();
     if compilation_source
         .len()
@@ -152,17 +173,6 @@ mod tests {
             wat::parse_str("(module (func (export \"answer\") (result i32) (i32.const 739)))")
                 .unwrap();
         let bytes = precompile_wasm(&source, WasmCompilationKind::Module).unwrap();
-        // Remove only this source's JIT entry so a no-op registration cannot pass the round trip.
-        {
-            let mut cache = command_module_cache().lock().unwrap();
-            let index = cache
-                .entries
-                .iter()
-                .position(|entry| entry.source == source)
-                .unwrap();
-            let entry = cache.entries.remove(index).unwrap();
-            cache.bytes -= entry.bytes;
-        }
         // SAFETY: bytes came directly from our host compiler.
         assert_eq!(
             unsafe {

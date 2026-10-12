@@ -298,9 +298,13 @@ class Catalog:
                     pending.append(reference)
         return selected
 
-    def assets_for(self, records: Sequence[dict]) -> list[dict]:
+    def assets_for(self, records: Sequence[dict], *, development: bool = False) -> list[dict]:
         selected = self.ports_for(records)
-        return [item for item in self.data.get("assets", []) if item["port"] in selected]
+        return [
+            item
+            for item in self.data.get("assets", [])
+            if item["port"] in selected and (development or item.get("usage") != "development")
+        ]
 
     def install_tools(self, environment: Environment, tools: str | Sequence[str]) -> None:
         """Install selected tool ports and their declared closure in one atomic mount."""
@@ -317,7 +321,7 @@ class Catalog:
             item["name"] for item in self.providers.values() if item["kind"] == "tools" and item.get("port") in ports
         )
         providers = self.native_closure(names)
-        assets = self.assets_for(providers)
+        assets = self.assets_for(providers, development=True)
         with tempfile.TemporaryDirectory(prefix=".tools-", dir=self.cache) as temporary:
             staging = Path(temporary)
             stage_catalog_items(self, environment, providers, assets, staging)
@@ -354,8 +358,10 @@ def stage_catalog_items(
             unpack_files(source, staging)
             continue
         if item["kind"] in {"tools", "shared_libraries"}:
-            _verify_wasm(source.read_bytes(), catalog.abi)
-            catalog.register_precompiled(source, item, executable=item["kind"] == "tools")
+            data = source.read_bytes()
+            if item["kind"] == "shared_libraries" or data.startswith(b"\0asm"):
+                _verify_wasm(data, catalog.abi, max_bytes=128 * 1024**2)
+                catalog.register_precompiled(source, item, executable=item["kind"] == "tools")
         destination = staging / _relative(item["destination"].removeprefix("/"))
         if destination.exists():
             if destination.is_file() and destination.read_bytes() == source.read_bytes():

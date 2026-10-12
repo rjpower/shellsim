@@ -89,6 +89,8 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
             packages.extend(record["delivery"]["wheels"])
             native.extend(record["delivery"]["native"])
             files.extend(record["delivery"].get("assets", []))
+    test = node.test
+    files = [item for item in files if item.get("usage") != "development" or test["kind"] == "shell"]
     runtime = records.get("runtime", {}).get("runtime")
     assets = cache / "delivery"
     assets.mkdir(exist_ok=True)
@@ -97,7 +99,6 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     items.extend(item["precompiled"] for item in tuple(items) if "precompiled" in item)
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(pool.map(lambda item: stage_asset(delivery, item, assets), items))
-    test = node.test
     limits = _test_limits(node.port.recipe)
     kwargs = {"limits": limits} if limits is not None else {}
     graph = {"packages": packages, "native": native, "abi": node.port.recipe.get("abi")}
@@ -149,7 +150,9 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     staging.mkdir()
     if not runtime or not own.get("delivery", {}).get("wheels"):
         for item in native:
-            installer.register_precompiled(assets / item["path"], installer.providers[item["name"]], executable=item["kind"] == "tools")
+            installer.register_precompiled(
+                assets / item["path"], installer.providers[item["name"]], executable=item["kind"] == "tools"
+            )
             path = staging / item["destination"].lstrip("/")
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(assets / item["path"], path)

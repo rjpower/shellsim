@@ -16,11 +16,16 @@ fn source_files(directory: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn main() {
+    println!(
+        "cargo:rustc-env=SHELLSIM_WASMTIME_TARGET={}",
+        std::env::var("TARGET").expect("Cargo target triple")
+    );
     let mut files = vec![
         PathBuf::from("Cargo.lock"),
         PathBuf::from("Cargo.toml"),
         PathBuf::from("python/native/Cargo.lock"),
         PathBuf::from("rust-toolchain.toml"),
+        PathBuf::from("src/commands/wasm.rs"),
     ];
     source_files(Path::new("vendor/wasmtime"), &mut files);
     files.sort();

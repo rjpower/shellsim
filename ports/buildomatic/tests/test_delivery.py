@@ -129,7 +129,7 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
 
 
 @pytest.mark.parametrize("destination", ["/lib/libtest.so", "/usr/lib/python3.13/lib-dynload/libtest.so"])
-def test_native_providers_are_emitted_with_destinations(tmp_path, destination):
+def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, destination):
     from dataclasses import replace
 
     ports, store = tmp_path / "ports", tmp_path / "store"
@@ -154,6 +154,11 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, destination):
         )
         == "registered"
     )
+    monkeypatch.setattr(_native, "precompiled_wasm_build_id", lambda: "another-runtime-build")
+    updated = publish_product(port, root, "provider-key", DeliveryStore(store))["native"][0]
+    assert updated["path"] == provider["path"]
+    assert updated["precompiled"]["path"] != provider["precompiled"]["path"]
+    assert (store / updated["precompiled"]["path"]).is_file()
 
 
 @pytest.mark.parametrize("oversized_companion", [False, True])

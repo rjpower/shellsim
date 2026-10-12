@@ -88,13 +88,13 @@ _BUILD_ID = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL = frozenset(("succeeded", "failed", "cancelled"))
 _MAX_BUILDS = 4096
 DEFAULT_TASK_IMAGE = (
-    "ghcr.io/marin-community/iris-task@sha256:925b9deb6e1022b5a57742faa0d8ad8bc45036576b5bd028924c33bdfe570c68"
+    "ghcr.io/marin-community/iris-task@sha256:2d016338361d995358ddf1c666eb456537f9eb3ea43560280160f18fb0e8f213"
 )
 
 
 @dataclass(frozen=True)
 class IrisConfig:
-    """Modest CPU service resources; all tasks use BATCH priority.
+    """Configured service resources; all tasks use BATCH priority.
 
     ``setup_scripts`` installs only the caller's required runtime into the task
     image. Empty scripts require an image with Iris and Rigging already present.

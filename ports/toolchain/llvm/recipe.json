@@ -418,7 +418,8 @@
         ]
       },
       "install": {
-        "kind": "devel"
+        "kind": "devel",
+        "prefix": "/usr/local"
       },
       "empty_directories": {
         "wasi-sysroot/include/c++/v1": 493

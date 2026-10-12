@@ -924,6 +924,12 @@ fn precompile_wasm(py: Python<'_>, source: Vec<u8>, executable: bool) -> PyResul
     Ok(PyBytes::new(py, &bytes).unbind())
 }
 
+/// Identify the patched Wasmtime producer for immutable delivery records.
+#[pyfunction]
+fn precompiled_wasm_build_id() -> &'static str {
+    shellsim::commands::precompiled_wasm_build_id()
+}
+
 /// Load only trusted, untouched compiler output for this exact source and executable kind.
 /// Never pass guest files or untrusted code: compatibility checks do not authenticate a companion.
 #[pyfunction]
@@ -970,6 +976,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
     module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
+    module.add_function(wrap_pyfunction!(precompiled_wasm_build_id, module)?)?;
     module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     module.add(

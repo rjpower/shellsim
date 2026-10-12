@@ -31,9 +31,8 @@ from ports.buildomatic import (
     capture_tree,
 )
 from ports.buildomatic.artifacts import register, resolve, write_reference
-from ports.buildomatic.delivery import DeliveryStore, delivery_graph
-from ports.buildomatic.delivery_products import delivery_key
-from ports.buildomatic.legacy import compatible_packaging
+from ports.buildomatic.delivery import delivery_graph
+from ports.buildomatic.delivery_products import delivery_key, runtime_delivery_key
 from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
@@ -207,13 +206,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
     if runtime:
         product = builds[products[runtime["producer"]].port.reference]
         inputs = (Input("product", product.reference, product.key),)
-        key = identity(
-            {
-                "operation": "runtime",
-                "format_version": 2,
-                "inputs": {item.name: item.key for item in inputs},
-            }
-        )
+        key = runtime_delivery_key(product.key)
         runtime_node = Node(product.reference + ":delivery", Operation.RUNTIME, key, product.port, inputs)
         nodes.append(runtime_node)
     check_roots = []
@@ -375,15 +368,8 @@ def normalize_cached(
                 product.get("delivery_key") == node.key
                 or node.port.recipe["build_system"] == "pure-wheel"
                 and "delivery" in product
-                or "delivery_key" not in product
-                and compatible_packaging()
-                and "delivery" in product
             ):
                 record = {**product, "delivery_key": node.key}
-        elif node.operation is Operation.RUNTIME:
-            product = records[node.inputs[0].reference]
-            if product and compatible_packaging():
-                record = DeliveryStore(store.prefix).record("runtime/" + product["receipt_id"])
         if record:
             register(store, node.record_key, record)
             records[node.reference] = record
