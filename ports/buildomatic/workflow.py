@@ -210,7 +210,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
         key = identity(
             {
                 "operation": "runtime",
-                "format_version": 1,
+                "format_version": 2,
                 "inputs": {item.name: item.key for item in inputs},
             }
         )

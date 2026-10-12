@@ -80,6 +80,7 @@ def stage_asset(store: DeliveryStore, item: dict, root: Path) -> None:
 
 def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Path) -> dict:
     from shellsim import Environment
+    from shellsim._pypi_catalog import Catalog, unpack_files
     from shellsim.pypi import _mount_package_tree
 
     packages, native, files = [], [], []
@@ -93,26 +94,24 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     assets.mkdir(exist_ok=True)
     delivery = DeliveryStore(store.prefix)
     items = [*packages, *native, *files, *([runtime] if runtime else [])]
+    items.extend(item["precompiled"] for item in tuple(items) if "precompiled" in item)
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(pool.map(lambda item: stage_asset(delivery, item, assets), items))
     test = node.test
     limits = _test_limits(node.port.recipe)
     kwargs = {"limits": limits} if limits is not None else {}
+    graph = {"packages": packages, "native": native, "abi": node.port.recipe.get("abi")}
     if runtime:
-        graph = {
-            "packages": packages,
-            "native": native,
-            "runtime": {
-                **runtime,
-                "native_dependencies": [
-                    item["name"]
-                    for item in native
-                    if item["destination"].startswith("/usr/lib/python3.13/lib-dynload/")
-                ],
-            },
+        graph["runtime"] = {
+            **runtime,
+            "native_dependencies": [
+                item["name"] for item in native if item["destination"].startswith("/usr/lib/python3.13/lib-dynload/")
+            ],
         }
-        location = work / "catalog.json"
-        write_reference(location, catalog(graph, assets.as_uri()))
+    location = work / "catalog.json"
+    write_reference(location, catalog(graph, assets.as_uri()))
+    installer = Catalog(location, cache_dir=cache / "guest", trusted_precompiled=True)
+    if runtime:
         own = next(
             (
                 record
@@ -131,29 +130,31 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
         ]
         if own.get("delivery", {}).get("wheels"):
             environment = Environment(
-                pypi_packages=[requirement, *test_packages], pypi_catalog=location, cache_dir=cache / "guest", **kwargs
+                pypi_packages=[requirement, *test_packages],
+                pypi_catalog=location,
+                cache_dir=cache / "guest",
+                trusted_precompiled=True,
+                **kwargs,
             )
         else:
-            from shellsim._pypi_catalog import Catalog
             from shellsim.cpython import CPythonRuntime
 
             environment = Environment(
                 **(kwargs or {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2})
             )
-            CPythonRuntime.from_catalog(Catalog(location, cache_dir=cache / "guest")).mount(environment)
+            CPythonRuntime.from_catalog(installer).mount(environment)
     else:
         environment = Environment(**kwargs)
     staging = work / "guest"
     staging.mkdir()
     if not runtime or not own.get("delivery", {}).get("wheels"):
         for item in native:
+            installer.register_precompiled(assets / item["path"], item, executable=item["kind"] == "tools")
             path = staging / item["destination"].lstrip("/")
             path.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(assets / item["path"], path)
             path.chmod(0o755 if item["kind"] == "tools" else 0o644)
     for item in files:
-        from shellsim._pypi_catalog import unpack_files
-
         unpack_files(assets / item["path"], staging)
     guest = "/work/check" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[test["kind"]]
     if test["kind"] == "native":

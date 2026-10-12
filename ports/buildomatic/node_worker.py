@@ -13,6 +13,7 @@ from ports._support.native_adapters import CompilerCacheLauncher
 from ports._support.node_build import produce_port
 from ports._support.sdk import SDKProduct, _produce, installed_seed, producer_work
 from ports._support.sdk_products import Receipt
+from ports._support.store import identity
 from ports.buildomatic.artifacts import install, register, resolve, upload, write_reference
 from ports.buildomatic.delivery import DeliveryStore
 from ports.buildomatic.delivery_products import delivery_key, publish_product, publish_runtime
@@ -145,7 +146,10 @@ def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dic
 def runtime(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
     root = install(store, product["artifact"], cache / "artifacts")
-    return {"runtime": publish_runtime(root, node.key, DeliveryStore(store.prefix))}
+    raw_key = identity(
+        {"operation": "runtime", "format_version": 1, "inputs": {item.name: item.key for item in node.inputs}}
+    )
+    return {"runtime": publish_runtime(root, raw_key, DeliveryStore(store.prefix), record_key=node.key)}
 
 
 def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -> dict:
