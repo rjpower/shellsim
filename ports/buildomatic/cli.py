@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 
 def main(arguments: Sequence[str] | None = None) -> None:
@@ -25,23 +28,41 @@ def main(arguments: Sequence[str] | None = None) -> None:
     common.add_argument("--max-workers", type=int, default=1)
     common.add_argument("--offline", action="store_true")
     commands = parser.add_subparsers(dest="command", required=True)
+    parser.set_defaults(all=False)
     for name in ("build", "export", "check"):
         command = commands.add_parser(name, parents=[common])
-        command.add_argument("recipes", nargs="+") if name == "build" else command.add_argument("recipes", nargs="*")
+        command.add_argument("recipes", nargs="*")
+        if name == "build":
+            command.add_argument("--all", action="store_true", help="build every default recipe in the ports tree")
         if name == "export":
             command.add_argument("--url-prefix", required=True)
             command.add_argument("--output", help="catalog directory or store prefix")
             command.add_argument("--copy-assets", action="store_true")
             command.add_argument("--simple", action="store_true")
     args = parser.parse_args(arguments)
+    from rigging.log_setup import configure_logging
+
+    configure_logging()
+    if args.all and args.recipes:
+        parser.error("choose --all or explicit recipes")
+    if args.command == "build" and not args.all and not args.recipes:
+        parser.error("specify recipes or --all")
     if args.jobs < 1 or not 1 <= args.max_workers <= 32:
         parser.error("jobs must be positive; max-workers requires 1..32")
     saved = (
         json.loads((args.state / "results.json").read_text())
-        if not args.recipes and (args.state / "results.json").is_file()
+        if args.command != "build" and not args.recipes and (args.state / "results.json").is_file()
         else {}
     )
-    requests = args.recipes or saved.get("roots", [])
+    requests = (
+        [
+            path.relative_to(args.ports).as_posix()
+            for category in ("python", "native", "toolchain")
+            for path in sorted((args.ports / category).glob("*/recipe.json"))
+        ]
+        if args.all
+        else args.recipes or saved.get("roots", [])
+    )
     if not requests:
         parser.error("specify recipes or build them first")
     from ports.buildomatic.backends.local import LocalBackend
@@ -65,6 +86,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
     if args.backend == "iris":
         from ports.buildomatic.backends.iris import backend_context_factory
 
+        logger.info("Connecting to Iris worker pool %s", connection["job_id"])
         context = backend_context_factory(
             job_id=connection["job_id"],
             cluster_name=connection["cluster_name"],
@@ -74,6 +96,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
             cache_prefix=connection.get("cache_prefix"),
         )()
     else:
+        logger.info("Using %d local build workers, %d compiler jobs per port", args.max_workers, args.jobs)
         context = nullcontext(LocalBackend(store, args.state / "execution", slots=args.max_workers))
     with context as backend:
         result = run(

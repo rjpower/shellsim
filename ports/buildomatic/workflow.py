@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 import shutil
 import tempfile
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,7 +20,16 @@ from ports._support.producer_policy import policy
 from ports._support.sdk import SDKDefinition, definition
 from ports._support.store import file_hash, identity
 from ports.api import implementation
-from ports.buildomatic import Action, BuildRequest, BuildState, InputMount, LocalStore, capture_tree
+from ports.buildomatic import (
+    Action,
+    BuildRequest,
+    BuildResult,
+    BuildState,
+    InputMount,
+    LocalStore,
+    NodeState,
+    capture_tree,
+)
 from ports.buildomatic.artifacts import register, resolve, write_reference
 from ports.buildomatic.delivery import DeliveryStore, delivery_graph
 from ports.buildomatic.delivery_products import delivery_key
@@ -27,6 +38,8 @@ from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
 from ports.buildomatic.transport import PRODUCT_SYSTEMS, _stage_code, code_files
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -403,6 +416,7 @@ def prepare(
         visit(root)
     if not missing:
         return None
+    logger.info("Preparing %d actions and uploading their code and recipe inputs", len(missing))
     local = LocalStore(state / "transport")
     state.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="prepare-", dir=state) as temporary:
@@ -477,6 +491,50 @@ def prepare(
     return BuildRequest(uuid4().hex, tuple(actions), max_workers)
 
 
+def wait_for_build(backend, build_id: str, nodes: Sequence[Node]) -> BuildResult:
+    """Report observed node transitions and cancel this submission on interruption."""
+    labels = {node.action_id: node.operation.value + " " + node.reference.replace("/recipe.json", "") for node in nodes}
+    observed = {}
+    next_report = time.monotonic() + 10
+    terminal = {BuildState.SUCCEEDED, BuildState.FAILED, BuildState.CANCELLED}
+    try:
+        while True:
+            outcome = backend.get(build_id)
+            for node in outcome.nodes:
+                if observed.get(node.action_id) == node.state:
+                    continue
+                observed[node.action_id] = node.state
+                label = labels[node.action_id]
+                if node.state is NodeState.RUNNING:
+                    logger.info("Starting %s", label)
+                elif node.state is NodeState.SUCCEEDED:
+                    logger.info("Finished %s", label)
+                elif node.state is NodeState.FAILED:
+                    logger.error("Failed %s: %s", label, node.error)
+                elif node.state is NodeState.CANCELLED:
+                    logger.info("Cancelled %s", label)
+            now = time.monotonic()
+            if now >= next_report or outcome.state in terminal:
+                counts = Counter(node.state for node in outcome.nodes)
+                logger.info(
+                    "Progress: %d/%d finished, %d running, %d pending, %d failed, %d blocked",
+                    counts[NodeState.SUCCEEDED],
+                    len(outcome.nodes),
+                    counts[NodeState.RUNNING],
+                    counts[NodeState.PENDING],
+                    counts[NodeState.FAILED],
+                    counts[NodeState.BLOCKED],
+                )
+                next_report = now + 10
+            if outcome.state in terminal:
+                return outcome
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        logger.info("Cancelling submitted build %s", build_id)
+        backend.cancel(build_id)
+        raise
+
+
 def run(
     ports: Path,
     requests: Sequence[str],
@@ -490,7 +548,14 @@ def run(
     max_workers: int = 1,
     offline: bool = False,
 ) -> Result:
+    logger.info("Reading graph for %d roots from %s", len(requests), ports)
     compiled = compile_plan(ports, requests, sdk_name)
+    logger.info(
+        "Graph: %d recipes, %d nodes; checking cached products in %s",
+        len(compiled.graph.ports),
+        len(compiled.nodes),
+        store.prefix,
+    )
     known = normalize_cached(compiled, store)
     roots = {
         Operation.BUILD: compiled.build_roots,
@@ -512,21 +577,16 @@ def run(
         allow_build=operation is Operation.BUILD,
         records=known,
     )
-    print(
-        f"buildomatic: {len(compiled.nodes)} planned nodes, {len(request.actions) if request else 0} actions",
-        flush=True,
-    )
+    logger.info("Planned %d nodes, %d actions", len(compiled.nodes), len(request.actions) if request else 0)
     if request:
         build = backend.submit(request)
-        while (outcome := backend.get(build)).state not in {
-            BuildState.SUCCEEDED,
-            BuildState.FAILED,
-            BuildState.CANCELLED,
-        }:
-            time.sleep(0.2)
+        logger.info("Submitted %s: %d actions, up to %d workers", build, len(request.actions), request.max_workers)
+        outcome = wait_for_build(backend, build, compiled.nodes)
         if outcome.state is not BuildState.SUCCEEDED:
-            raise RuntimeError(str(outcome) + "\n" + str(backend.get_logs(build)))
+            raise RuntimeError(f"{operation.value} {outcome.state.value}\n{backend.get_logs(build)}")
         backend.acknowledge(build)
+    else:
+        logger.info("All requested outputs are cached; no work dispatched")
     if request:
         refreshed = records_for(
             Plan(
@@ -572,4 +632,5 @@ def run(
             "products": products,
         },
     )
+    logger.info("Saved graph.json and results.json in %s", state)
     return Result(compiled, records)

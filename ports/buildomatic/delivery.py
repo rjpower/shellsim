@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import html
 import json
+import logging
 import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,8 @@ from urllib.parse import quote, urlsplit
 
 from ports._support.graph import Graph, guest_graph
 from ports._support.store import relative_path
+
+logger = logging.getLogger(__name__)
 
 
 class DeliveryStore:
@@ -187,6 +190,12 @@ def export(
 ) -> dict:
     """Write metadata and optionally promote new assets into the output store."""
     graph = json.loads((state / "graph.json").read_text())
+    logger.info(
+        "Exporting metadata for %d packages and %d native exports to %s",
+        len(graph["packages"]),
+        len(graph["native"]),
+        output,
+    )
     value = catalog(graph, url_prefix)
     destination = DeliveryStore(output)
     copied = 0
