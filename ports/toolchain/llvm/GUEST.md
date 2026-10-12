@@ -28,9 +28,10 @@ wrappers for the corresponding LLVM commands.
 platform sysroot and POSIX archive. It reuses the receipt's native `llvm-tblgen`,
 `llvm-min-tblgen` and `clang-tblgen`; it does not build another host LLVM.
 The locked persistent Ninja workspace retains source, dependency snapshots,
-logs and interrupted objects. Each retained source is checked against the
-pinned archive and exact patches before a build. Changed inputs require a
-new workspace when source, generators or headers change. Verified library
+logs and interrupted objects. The graph admits the archive and host compiler
+once; the guest producer uses their receipts without rehashing host executables
+or rescanning the archive on each retry. Patches check their pinned input bytes.
+Source or generator changes require a new workspace. Verified library
 updates replace archives at stable paths and let Ninja relink existing objects.
 Installed commands are stripped with the admitted host `llvm-strip`, preserving
 the main TLS classification in `dylink.0` and the `shellsim.abi` section.
@@ -42,11 +43,12 @@ Default configs select modern Wasm exception instructions, matching the SDK
 libraries and runtime. The pinned source is 46 commits after the upstream
 `llvmorg-23.1.0-rc3` tag and self-reports `23.1.0-rc3`; the provider version is
 `23.1.0rc3`.
-Completed command products are immutable and verified before
-being copied into the graph's private staging directory.
+Completed commands are verified before staging.
 
-The producer honors the requested compilation job count, up to eight jobs,
-and uses one link job. Build commands have
+The producer honors any positive compilation job count, defaults to 64,
+and uses one link job. An admitted compiler cache supplies both CMake compiler
+launchers and its explicit environment. `SCCACHE_BASEDIRS` includes retained
+source, build and dependency paths plus any configured roots. Build commands have
 a one-hour timeout and a 12 GiB address-space limit per process. The guest
 compiler executable reserves a 16 MiB C stack, starts with 128 MiB of linear
 memory and permits growth to 256 MiB, subject to Shellsim's memory budget.
@@ -70,3 +72,11 @@ mapping uses LLVM's existing file-read fallback.
 The development artifact preserves the SDK's empty `include/c++/v1` directory.
 Upstream Clang uses that directory to discover the libc++ version before adding
 the target's `eh/c++/v1` or `noeh/c++/v1` header directory.
+
+To qualify installed tools and development data, export a catalog containing
+`toolchain/llvm:guest` and `native/make`, then run:
+
+```sh
+SHELLSIM_GUEST_CATALOG=/path/to/catalog.json uv run --no-sync pytest \
+  ports/toolchain/llvm/tests/test_guest.py -k installed_guest
+```

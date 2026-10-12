@@ -7,6 +7,7 @@ Generated commands never launch a host process when installed in a guest.
 
 import fcntl
 import json
+import os
 import shlex
 import shutil
 import tarfile
@@ -14,7 +15,12 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from ports._support.build import apply_patch, check_build_scripts
-from ports._support.native_adapters import NativeBuildCommand, NativeBuildOutput
+from ports._support.native_adapters import (
+    NativeBuildCommand,
+    NativeBuildOutput,
+    compiler_cache_identity,
+    write_build_file,
+)
 from ports._support.producer_tools import digest, run
 from ports._support.wasm_metadata import number, string
 from ports.native.dependencies import verify_artifact
@@ -22,7 +28,6 @@ from ports.toolchain.llvm.compiler import (
     configure_and_build,
     identity_hash,
     update_workspace_patches,
-    verify_product,
     verify_source,
     write_workspace,
 )
@@ -32,6 +37,14 @@ PORT = Path(__file__).resolve().parent
 TARGETS = ("clang", "lld", "llvm-ar", "llvm-nm", "llvm-objcopy")
 GENERATORS = ("llvm-tblgen", "llvm-min-tblgen", "clang-tblgen")
 HOST_TOOLS = ("clang", "clang++", "wasm-ld", "llvm-ar", "llvm-ranlib", *GENERATORS)
+
+
+def _compiler_tool_hashes(compiler, names):
+    """Use the graph-admitted receipt, resolving LLVM's executable aliases."""
+    root = compiler.root.resolve()
+    return {
+        name: compiler.contents["artifacts"][str((root / "bin" / name).resolve().relative_to(root))] for name in names
+    }
 
 
 def validate_guest_abi(path):
@@ -166,9 +179,8 @@ def workspace_compatibility(recipe, compiler, sysroot, sdk, dependencies, host_t
         "source": recipe["source"],
         "patches": recipe["patches"],
         "target": target,
-        "compiler_tools": {name: digest(compiler.root / "bin" / name) for name in HOST_TOOLS if name != "wasm-ld"},
+        "compiler_tools": _compiler_tool_hashes(compiler, (name for name in HOST_TOOLS if name != "wasm-ld")),
         "headers": {name: _inventory(root, ("include",)) for name, root in roots.items()},
-        "host_tools": {name: digest(host_tools[name]) for name in ("cmake", "ninja")},
     }
 
 
@@ -199,14 +211,12 @@ def _snapshot_tools(source, destination, inventory, previous):
     for name, expected in inventory.items():
         output = destination / name
         if output.exists() and previous[name] != expected:
-            if name != "wasm-ld" or digest(output) != previous[name]:
+            if name != "wasm-ld":
                 raise ValueError("guest LLVM retained host tool differs: " + name)
             shutil.copyfile(source / name, output)
         elif not output.exists():
             shutil.copyfile(source / name, output)
             output.chmod(0o755)
-        if digest(output) != expected:
-            raise ValueError("guest LLVM retained host tool differs: " + name)
 
 
 def _refresh_snapshot(source, destination, inventory, previous, directories=()):
@@ -245,12 +255,7 @@ def _update_dependency_headers(context, recipe, workspace, state, compatibility,
         raise ValueError("guest header update requires a completed configuration")
     if digest(context.build / "CMakeCache.txt") != state["configuration_sha256"]:
         raise ValueError("guest LLVM configuration differs")
-    if digest(context.source) != recipe["source"]["sha256"]:
-        raise ValueError("guest LLVM source archive differs")
     source_hash = verify_source(context.source, workspace / "source", recipe, PORT)
-    for name, expected in state["inputs"]["compiler_tools"].items():
-        if digest(workspace / "inputs/compiler" / name) != expected:
-            raise ValueError("guest previous compiler snapshot differs: " + name)
     previous = state["inputs"]["snapshots"]
     for name in previous:
         if name != "posix" and _inventory(workspace / "inputs" / name) != previous[name]:
@@ -329,7 +334,7 @@ def _validate_guest_layout(recipe):
 
 @dataclass(frozen=True)
 class GuestBuildPreparation:
-    """Verified source/configuration and dry-run evidence, never a published product."""
+    """Admitted source and build plan, never a published product."""
 
     source: Path
     source_sha256: str
@@ -337,6 +342,7 @@ class GuestBuildPreparation:
     identity: dict
     prefix: Path
     state: dict
+    environment: dict[str, str]
 
 
 def prepare_guest(context, recipe, compiler, *, jobs=None) -> GuestBuildPreparation:
@@ -352,14 +358,13 @@ def prepare_guest(context, recipe, compiler, *, jobs=None) -> GuestBuildPreparat
         plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
         attempts = workspace / "attempts" / plan.prefix.name
         attempts.mkdir(parents=True, exist_ok=True)
-        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
         configure_and_build(
             plan.commands,
             context.build,
             plan.state,
             workspace / "workspace.json",
             attempts,
-            environment,
+            plan.environment,
             prepare_only=True,
         )
         return plan
@@ -412,14 +417,10 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
     requested_jobs = recipe["build_limits"]["compile_jobs"] if jobs is None else jobs
-    if not isinstance(requested_jobs, int) or not 1 <= requested_jobs <= 16:
-        raise ValueError("guest LLVM compile jobs must be between one and sixteen")
-    compile_jobs = min(requested_jobs, recipe["build_limits"]["compile_jobs"])
+    if not isinstance(requested_jobs, int) or requested_jobs < 1:
+        raise ValueError("guest LLVM compile jobs must be positive")
     if context.target != "wasm32-wasip1-threads":
         raise ValueError("guest compiler requires the admitted threaded WASI platform")
-    if digest(context.source) != recipe["source"]["sha256"]:
-        raise ValueError("guest compiler source archive differs")
-    verify_product(compiler.root, compiler.contents["identity"])
     for name in GENERATORS:
         if "bin/" + name not in compiler.contents["artifacts"]:
             raise ValueError("host compiler receipt lacks native generator: " + name)
@@ -430,19 +431,26 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
         "sysroot": (context.sysroot, _inventory(context.sysroot)),
         "resources": (context.sdk / "lib/clang/23", _inventory(context.sdk / "lib/clang/23")),
     }
-    tools = {
-        name: {"path": str(context.host_tools[name]), "sha256": digest(context.host_tools[name])}
-        for name in ("cmake", "ninja")
-    }
-    compiler_tools = {name: digest(compiler.root / "bin" / name) for name in HOST_TOOLS}
+    tools = {name: {"path": str(context.host_tools[name])} for name in ("cmake", "ninja")}
+    compiler_tools = _compiler_tool_hashes(compiler, HOST_TOOLS)
+    cache = None
+    environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
+    if context.compiler_cache is not None:
+        cache = compiler_cache_identity(context.compiler_cache)
+        roots = [str(workspace / "source"), str(context.build), str(workspace / "inputs")]
+        if cache["environment"].get("SCCACHE_BASEDIRS"):
+            roots.append(cache["environment"]["SCCACHE_BASEDIRS"])
+        cache["environment"]["SCCACHE_BASEDIRS"] = os.pathsep.join(roots)
+        environment.update(cache["environment"])
     inputs = {
         "recipe": recipe,
         "host_compiler": compiler.sha256,
         "compiler_tools": compiler_tools,
-        "packaging_tools": {"llvm-strip": digest(compiler.root / "bin/llvm-strip")},
+        "packaging_tools": _compiler_tool_hashes(compiler, ("llvm-strip",)),
         "posix": posix_receipt["artifact_sha256"],
         "snapshots": {name: inventory for name, (_, inventory) in snapshots.items()},
         "host_tools": tools,
+        "compiler_cache": cache,
     }
     compatibility = workspace_compatibility(
         recipe, compiler, context.sysroot, context.sdk, context.dependencies, context.host_tools, context.target
@@ -519,17 +527,19 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
             apply_patch(roots[0], PORT / patch["file"], patch["sha256"])
         roots[0].rename(source)
         preparing.rmdir()
-    source_hash = updated_source_hash or verify_source(context.source, source, recipe, PORT)
+    # The graph admits the archive before invoking this producer. Retained
+    # sources belong to the locked workspace; only input transitions reverify it.
+    source_hash = updated_source_hash or identity_hash({"source": recipe["source"], "patches": recipe["patches"]})
     journal = workspace / "patch-update.json"
     if journal.exists():
         if json.loads(journal.read_text())["new"] != compatibility:
             raise ValueError("pending guest LLVM patch update differs")
         journal.unlink()
-    commands = _commands(context, workspace, source, compile_jobs)
+    commands = _commands(context, workspace, source, requested_jobs)
     identity = {**inputs, "commands": commands}
     key = identity_hash(identity)
     prefix = workspace / "products" / key
-    return GuestBuildPreparation(source, source_hash, commands, identity, prefix, state)
+    return GuestBuildPreparation(source, source_hash, commands, identity, prefix, state, environment)
 
 
 def _build_guest_locked(context, recipe, compiler, workspace, jobs):
@@ -547,8 +557,7 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     if not prefix.exists():
         attempts = workspace / "attempts" / key
         attempts.mkdir(parents=True, exist_ok=True)
-        environment = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "SOURCE_DATE_EPOCH": "1756857600"}
-        configure_and_build(commands, context.build, state, receipt, attempts, environment)
+        configure_and_build(commands, context.build, state, receipt, attempts, plan.environment)
         state.pop("pending_final_outputs", None)
         write_workspace(receipt, state)
         staging = prefix.with_name(key + ".preparing")
@@ -635,7 +644,8 @@ def _commands(context, workspace, source, jobs):
         if '"' in str(path) or ";" in str(path):
             raise ValueError("unsupported CMake input path")
         lines.append(f'set({name} "{path}")')
-    toolchain.write_text("\n".join(lines) + "\n")
+    write_build_file(toolchain, "\n".join(lines) + "\n")
+    launcher = str(context.compiler_cache.path) if context.compiler_cache is not None else ""
     configure = [
         str(context.host_tools["cmake"]),
         "-G",
@@ -650,6 +660,8 @@ def _commands(context, workspace, source, jobs):
         "-DCMAKE_SKIP_RPATH=ON",
         "-DCMAKE_C_COMPILER=" + str(compiler / "clang"),
         "-DCMAKE_CXX_COMPILER=" + str(compiler / "clang++"),
+        "-DCMAKE_C_COMPILER_LAUNCHER=" + launcher,
+        "-DCMAKE_CXX_COMPILER_LAUNCHER=" + launcher,
         "-DCMAKE_C_COMPILER_TARGET=wasm32-wasip1-threads",
         "-DCMAKE_CXX_COMPILER_TARGET=wasm32-wasip1-threads",
         "-DCMAKE_AR=" + str(compiler / "llvm-ar"),
