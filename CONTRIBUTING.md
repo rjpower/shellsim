@@ -81,19 +81,16 @@ Before requesting review, run all safe tests through the same entrypoint as CI:
 make test
 ```
 
-Release 0.1.35 provides Linux and macOS wheels and a source distribution. Windows wheel builds
-are disabled while guest executable permission handling on Windows remains unresolved. Existing
-Windows artifacts remain available in their original releases.
+Release 0.1.35 provides Linux x86-64/ARM64 and ARM macOS wheels, plus a source distribution.
+Intel macOS and Windows wheels are not built.
 
 Changes to the Python package should also build and test the installed artifact rather than import
 from the source tree:
 
 ```sh
 uv build
-uv build --project toolchain --out-dir dist
-uv venv /tmp/shellsim-wheel-test
-uv pip install --python /tmp/shellsim-wheel-test/bin/python dist/shellsim-*.whl dist/shellsim_c_toolchain-*.whl pytest
-/tmp/shellsim-wheel-test/bin/python -m pytest tests/python_package
+uv pip install --reinstall dist/shellsim-*.whl pytest
+uv run --no-sync pytest tests/python_package
 ```
 
 The safe suite is the full shellsim suite because it is local, deterministic, and does not require

@@ -163,6 +163,11 @@ def test_loader_rejects_tampered_or_undeclared_payload(source_tree: Path) -> Non
             _rewrite_package(blob, manifest_change=lambda manifest: manifest.update(working_directory="/work/missing"))
         )
 
+    with pytest.raises(ValueError):
+        shellsim.Package.from_bytes(
+            _rewrite_package(blob, manifest_change=lambda manifest: manifest.update(requires_c_toolchain=True))
+        )
+
     too_many_members = bytearray(blob)
     directory_end = too_many_members.rfind(b"PK\x05\x06")
     struct.pack_into("<HH", too_many_members, directory_end + 8, 10_002, 10_002)
@@ -210,102 +215,17 @@ def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Pa
         shellsim.Package.build_from_zip(bytes(oversized), spec=SPEC)
 
 
-def test_url_package_compiles_c_source_inside_guest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
-    from shellsim._cli import main
-
-    toolchain = Path(__file__).resolve().parents[1] / "fixtures" / "tinycc" / "tcc-shellsim-package.tar.gz"
-    (tmp_path / "tcc.tar.gz").write_bytes(toolchain.read_bytes())
-    (tmp_path / "hello.c").write_text(
-        "struct iovec { const char *buf; unsigned len; };\n"
-        "void *memset(void *pointer, int value, unsigned size) {\n"
-        "    unsigned char *bytes = pointer;\n"
-        "    for (unsigned index = 0; index < size; ++index) bytes[index] = value;\n"
-        "    return pointer;\n"
-        "}\n"
-        "extern int write_guest(int, const struct iovec *, unsigned, unsigned *)\n"
-        '    __asm__("wasi_snapshot_preview1.fd_write");\n'
-        "void _start(void) {\n"
-        '    static const char message[] = "compiled in guest\\n";\n'
-        "    struct iovec io = {message, sizeof(message) - 1};\n"
-        "    unsigned written = 0;\n"
-        "    write_guest(1, &io, 1, &written);\n"
-        "}\n"
-    )
-    (tmp_path / "build.sh").write_bytes(
-        b"mkdir -p /work/tcc\n"
-        b"tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
-        b"chmod +x /work/tcc/tcc-shellsim.wasm\n"
-        b"/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/hello.wasm /work/hello.c\n"
-        b"chmod +x /work/hello.wasm\n"
-        b"/work/hello.wasm\n"
-    )
-    limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
-    package = shellsim.Package.build_from_directory(
-        tmp_path,
-        spec=shellsim.PackageSpec(name="c-build", version="1", entrypoint=("sh", "/work/build.sh"), limits=limits),
-    )
-    monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
-
-    assert (
-        main(
-            [
-                "run",
-                "https://example.com/c-build.shl",
-                "--sha256",
-                package.sha256,
-                "--cpu",
-                "10g",
-                "--memory",
-                "128m",
-                "--disk",
-                "128m",
-            ]
-        )
-        == 0
-    )
-    assert capsys.readouterr().out == "compiled in guest\n"
-
-
-def test_package_entrypoint_builds_and_runs_interactive_wasm(
+def test_package_entrypoint_runs_interactive_wasm(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    toolchain = Path(__file__).resolve().parents[1] / "fixtures" / "tinycc" / "tcc-shellsim-package.tar.gz"
-    (tmp_path / "tcc.tar.gz").write_bytes(toolchain.read_bytes())
-    (tmp_path / "display.c").write_text(
-        "void *memset(void *pointer, int value, unsigned size) {\n"
-        "    unsigned char *bytes = pointer;\n"
-        "    for (unsigned index = 0; index < size; ++index) bytes[index] = value;\n"
-        "    return pointer;\n"
-        "}\n"
-        'extern int display_open(unsigned, unsigned, unsigned) __asm__("shellsim.display_open");\n'
-        'extern int display_present(unsigned, const void *, unsigned, unsigned) __asm__("shellsim.display_present");\n'
-        'extern int input_poll_key(unsigned, void *) __asm__("shellsim.input_poll_key");\n'
-        'extern int display_close(unsigned) __asm__("shellsim.display_close");\n'
-        'extern void exit_guest(int) __asm__("wasi_snapshot_preview1.proc_exit");\n'
-        "struct key_event { unsigned code; unsigned pressed; };\n"
-        "void _start(void) {\n"
-        "    unsigned char pixels[8] = {0};\n"
-        "    struct key_event event = {0};\n"
-        "    int handle = display_open(2, 1, 1);\n"
-        "    if (handle <= 0 || display_present(handle, pixels, 8, 8)) exit_guest(1);\n"
-        "    if (input_poll_key(handle, &event) || event.code != 27 || !event.pressed) exit_guest(2);\n"
-        "    pixels[0] = 255;\n"
-        "    if (display_present(handle, pixels, 8, 8) || display_close(handle)) exit_guest(3);\n"
-        "    exit_guest(0);\n"
-        "}\n"
-    )
-    (tmp_path / "run.sh").write_bytes(
-        b"mkdir -p /work/tcc\n"
-        b"tar -xzf /work/tcc.tar.gz -C /work/tcc\n"
-        b"chmod +x /work/tcc/tcc-shellsim.wasm\n"
-        b"/work/tcc/tcc-shellsim.wasm -nostdlib -o /work/display.wasm /work/display.c\n"
-        b"chmod +x /work/display.wasm\n"
-        b"/work/display.wasm\n"
-    )
-    limits = shellsim.Limits(cpu=10_000_000_000, memory=128 * 1024 * 1024, disk=128 * 1024 * 1024)
+    fixture = Path(__file__).resolve().parents[1] / "fixtures/wasm/interactive_package.wasm"
+    executable = tmp_path / "display.wasm"
+    executable.write_bytes(fixture.read_bytes())
+    executable.chmod(0o755)
+    limits = shellsim.Limits(cpu=20_000_000, memory=64 * 1024**2, disk=64 * 1024**2)
     package = shellsim.Package.build_from_directory(
         tmp_path,
-        spec=shellsim.PackageSpec(name="interactive", version="1", entrypoint=("sh", "/work/run.sh"), limits=limits),
+        spec=shellsim.PackageSpec(name="interactive", version="1", entrypoint=("/work/display.wasm",), limits=limits),
     )
     container = shellsim.Package.from_bytes(package.to_bytes()).instantiate(tools={}, limits=limits)
     with container.start_entrypoint() as action:

@@ -350,3 +350,17 @@ def test_check_returncode_raises_package_exception() -> None:
 
     with pytest.raises(shellsim.SimulationError, match="status 1"):
         result.check_returncode()
+
+
+def test_container_host_can_stage_outside_workspace() -> None:
+    guest = shellsim.Container(tools={})
+    guest.mkdir("/opt/toolchain/include")
+    guest.write_file("/opt/toolchain/include/example.h", b"#define VALUE 42\n")
+
+    assert guest.read_file("/opt/toolchain/include/example.h") == b"#define VALUE 42\n"
+    assert guest.run("cat /opt/toolchain/include/example.h").stdout == b"#define VALUE 42\n"
+    with pytest.raises(shellsim.SimulationError):
+        guest.write_file("/", b"not a file")
+    assert guest.run("pwd").stdout == b"/work\n"
+    with pytest.raises(shellsim.SimulationError):
+        guest.write_file("/proc/blocked", b"not a host write")
