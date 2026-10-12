@@ -10,6 +10,7 @@ import json
 import os
 import shlex
 import shutil
+import subprocess
 import tarfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -205,20 +206,6 @@ def _snapshot(source, destination, inventory, directories=()):
         raise ValueError("guest LLVM dependency changed during snapshot")
 
 
-def _snapshot_tools(source, destination, inventory, previous):
-    """Retain stable admitted tool paths across equivalent host publications."""
-    destination.mkdir(parents=True, exist_ok=True)
-    for name, expected in inventory.items():
-        output = destination / name
-        if output.exists() and previous[name] != expected:
-            if name != "wasm-ld":
-                raise ValueError("guest LLVM retained host tool differs: " + name)
-            shutil.copyfile(source / name, output)
-        elif not output.exists():
-            shutil.copyfile(source / name, output)
-            output.chmod(0o755)
-
-
 def _refresh_snapshot(source, destination, inventory, previous, directories=()):
     """Replace verified link inputs at stable paths while retaining compiled objects."""
     if not destination.exists() or previous == inventory:
@@ -412,6 +399,42 @@ def _invalidate_final_outputs(build, recipe, state, receipt, changed):
         path.unlink(missing_ok=True)
 
 
+def _reset_changed_compiler_configuration(build, commands, state, receipt):
+    """Reconfigure moved compiler bindings without CMake's lossy automatic retry.
+
+    CMake clears its cache when a compiler path changes, then retries without
+    the original command-line toolchain and project options. Keep Ninja objects
+    but discard configuration metadata before supplying those options again.
+    An interrupted configure follows the same recovery path.
+    """
+    cache = build / "CMakeCache.txt"
+    phase = state.get("phase", "ready")
+    if phase not in {"ready", "configuring", "building"}:
+        raise ValueError("unknown compiler workspace phase: " + phase)
+    if phase == "ready" and state.get("configuration_sha256"):
+        if not cache.exists() or digest(cache) != state["configuration_sha256"]:
+            raise ValueError("compiler workspace configuration differs")
+    bindings = {
+        argument.removeprefix("-D").split("=", 1)[0]: argument.split("=", 1)[1]
+        for argument in commands[0]
+        if argument.startswith(("-DCMAKE_C_COMPILER=", "-DCMAKE_CXX_COMPILER="))
+    }
+    cached = {}
+    if cache.exists():
+        for line in cache.read_text().splitlines():
+            name, separator, value = line.partition("=")
+            if separator and name.split(":", 1)[0] in bindings:
+                cached[name.split(":", 1)[0]] = value
+    if phase != "configuring" and (not cache.exists() or cached == bindings):
+        return
+    state["phase"] = "configuring"
+    write_workspace(receipt, state)
+    cache.unlink(missing_ok=True)
+    for directory in (build / "CMakeFiles").glob("[0-9]*"):
+        for metadata in (*directory.glob("CMake*Compiler.cmake"), directory / "CMakeSystem.cmake"):
+            metadata.unlink(missing_ok=True)
+
+
 def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     check_build_scripts(recipe, PORT)
     _validate_guest_layout(recipe)
@@ -503,7 +526,6 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
         )
     state["inputs"] = inputs
     write_workspace(receipt, state)
-    _snapshot_tools(compiler.root / "bin", workspace / "inputs/compiler", compiler_tools, previous_tools)
     source = workspace / "source"
     if not source.exists():
         preparing = workspace / "source.preparing"
@@ -534,6 +556,7 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     # Compiler caching changes execution, not the admitted product inputs.
     if cache is not None:
         commands = _commands(context, workspace, source, requested_jobs, cache=cache)
+    _reset_changed_compiler_configuration(context.build, commands, state, receipt)
     return GuestBuildPreparation(source, commands, identity, prefix, state, environment)
 
 
@@ -551,7 +574,13 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     if not prefix.exists():
         attempts = workspace / "attempts" / key
         attempts.mkdir(parents=True, exist_ok=True)
-        configure_and_build(commands, context.build, state, receipt, attempts, plan.environment)
+        try:
+            configure_and_build(commands, context.build, state, receipt, attempts, plan.environment)
+        except subprocess.CalledProcessError as error:
+            log = max(attempts.glob("*.log"), key=lambda path: path.stat().st_mtime_ns)
+            with log.open("rb") as output:
+                output.seek(max(0, log.stat().st_size - 8192))
+                raise RuntimeError(output.read().decode(errors="replace")) from error
         state.pop("pending_final_outputs", None)
         write_workspace(receipt, state)
         staging = prefix.with_name(key + ".preparing")
@@ -589,7 +618,7 @@ def _commands(context, workspace, source, jobs, *, cache=None):
     posix = workspace / "inputs/posix"
     sysroot = workspace / "inputs/sysroot"
     resources = workspace / "inputs/resources"
-    compiler = workspace / "inputs/compiler"
+    compiler = context.compiler_prefix / "bin"
     flags = [
         "-pthread",
         "-resource-dir=" + str(resources),
@@ -662,6 +691,7 @@ def _commands(context, workspace, source, jobs, *, cache=None):
         "-DCMAKE_SYSROOT=" + str(sysroot),
         "-DCMAKE_MAKE_PROGRAM=" + str(context.host_tools["ninja"]),
         "-DCMAKE_BUILD_TYPE=Release",
+        "-DPython3_EXECUTABLE=" + str(context.host_tools["python"]),
         "-DUNIX=1",
         "-DLLVM_ENABLE_PROJECTS=clang;lld",
         "-DLLVM_TARGETS_TO_BUILD=WebAssembly",

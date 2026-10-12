@@ -23,7 +23,6 @@ from ports.toolchain.llvm.guest import (
     _prepare_guest_locked,
     _refresh_snapshot,
     _snapshot,
-    _snapshot_tools,
     prepare_guest,
     validate_guest_abi,
 )
@@ -139,21 +138,6 @@ def test_verified_library_update_preserves_snapshot_headers(tmp_path):
     assert (destination / "include/header.h").stat().st_mtime_ns == timestamp
 
 
-def test_admitted_linker_update_preserves_other_compiler_tools(tmp_path):
-    source, destination = tmp_path / "source", tmp_path / "retained"
-    source.mkdir()
-    (source / "wasm-ld").write_bytes(b"old linker")
-    (source / "clang").write_bytes(b"same compiler")
-    previous = _inventory(source)
-    _snapshot_tools(source, destination, previous, previous)
-    timestamp = (destination / "clang").stat().st_mtime_ns
-    (source / "wasm-ld").write_bytes(b"new linker")
-    current = _inventory(source)
-    _snapshot_tools(source, destination, current, previous)
-    assert (destination / "wasm-ld").read_bytes() == b"new linker"
-    assert (destination / "clang").stat().st_mtime_ns == timestamp
-
-
 def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_path):
     cmake, ninja, cc, cxx = (shutil.which(name) for name in ("cmake", "ninja", "cc", "c++"))
     if not all((cmake, ninja, cc, cxx)):
@@ -169,7 +153,10 @@ def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_pat
         "set(CMAKE_SYSTEM_NAME Linux)\nset(CMAKE_SYSTEM_PROCESSOR native)\n"
         'set(CMAKE_SYSROOT "")\nset(CMAKE_C_COMPILER_TARGET "")\nset(CMAKE_CXX_COMPILER_TARGET "")\n'
         'set(CMAKE_C_FLAGS "")\nset(CMAKE_CXX_FLAGS "")\nset(CMAKE_EXE_LINKER_FLAGS "")\n'
-        "enable_language(C CXX)\nadd_executable(clang main.c)\nadd_executable(lld main.cpp)\n"
+        "enable_language(C CXX)\n"
+        'if(NOT LLVM_ENABLE_PROJECTS STREQUAL "clang;lld")\n'
+        'message(FATAL_ERROR "Selected guest projects were lost during reconfigure")\nendif()\n'
+        "add_executable(clang main.c)\nadd_executable(lld main.cpp)\n"
         "add_custom_target(llvm-ar DEPENDS clang)\nadd_custom_target(llvm-nm DEPENDS lld)\n"
         "add_custom_target(llvm-objcopy DEPENDS clang lld)\n"
     )
@@ -210,7 +197,8 @@ def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_pat
         dependencies={"native/shellsim-posix": posix},
         sysroot=sysroot,
         sdk=sdk,
-        host_tools={"cmake": Path(cmake), "ninja": Path(ninja)},
+        compiler_prefix=host,
+        host_tools={"cmake": Path(cmake), "ninja": Path(ninja), "python": Path(sys.executable)},
         compiler_cache=CompilerCacheLauncher(
             launcher,
             digest(launcher),
@@ -257,6 +245,24 @@ def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_pat
     context.compiler_cache = None
     uncached = _prepare_guest_locked(context, recipe, compiler, work, 128)
     assert uncached.prefix == prepared.prefix
+    objects = list((context.build / "CMakeFiles").glob("*.dir/*.o"))
+    assert objects
+    moved = tmp_path / "moved-host"
+    shutil.copytree(host, moved, symlinks=True)
+    context.compiler_prefix = moved
+    compiler.root = moved
+    rebound = prepare_guest(context, recipe, compiler, jobs=128)
+    assert all(path.exists() for path in objects)
+    configure_and_build(
+        rebound.commands,
+        context.build,
+        rebound.state,
+        work / "workspace.json",
+        work / "attempts" / rebound.prefix.name,
+        rebound.environment,
+    )
+    assert subprocess.run([str(context.build / "clang")], check=False).returncode == 17
+    assert subprocess.run([str(context.build / "lld")], check=False).returncode == 23
 
 
 def test_installed_guest_compiler_and_make_from_catalog():
