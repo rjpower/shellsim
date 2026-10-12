@@ -287,7 +287,8 @@ class Catalog:
         environment._catalog_native.update(provider["name"] for provider in providers)
         environment._catalog_assets.update(item["path"] for item in assets)
 
-    def assets_for(self, records: Sequence[dict]) -> list[dict]:
+    def ports_for(self, records: Sequence[dict]) -> set[str]:
+        """Follow the catalog's declared target/runtime port dependencies."""
         selected = {record["port"] for record in records if "port" in record}
         pending = list(selected)
         while pending:
@@ -295,9 +296,14 @@ class Catalog:
                 if reference not in selected:
                     selected.add(reference)
                     pending.append(reference)
+        return selected
+
+    def assets_for(self, records: Sequence[dict]) -> list[dict]:
+        selected = self.ports_for(records)
         return [item for item in self.data.get("assets", []) if item["port"] in selected]
 
     def install_tools(self, environment: Environment, tools: str | Sequence[str]) -> None:
+        """Install selected tool ports and their declared closure in one atomic mount."""
         if isinstance(tools, str):
             tools = (tools,)
         if not isinstance(tools, Sequence) or isinstance(tools, bytes) or not 1 <= len(tools) <= 128:
@@ -305,12 +311,33 @@ class Catalog:
         for name in tools:
             if name not in self.providers or self.providers[name]["kind"] != "tools":
                 raise PackageInstallError("tool is absent from the curated catalog: " + str(name))
-        providers = self.native_closure(set(tools))
+        names = set(tools)
+        ports = self.ports_for(self.native_closure(names))
+        names.update(
+            item["name"] for item in self.providers.values() if item["kind"] == "tools" and item.get("port") in ports
+        )
+        providers = self.native_closure(names)
         assets = self.assets_for(providers)
         with tempfile.TemporaryDirectory(prefix=".tools-", dir=self.cache) as temporary:
             staging = Path(temporary)
             stage_catalog_items(self, environment, providers, assets, staging)
-            _mount_package_tree(environment, staging, "/", normalize_modes=True)
+            replacements = {item["destination"] for item in providers if item["kind"] == "tools"}
+            commands = staging / "usr/bin"
+            if commands.is_dir():
+                replacements.update(
+                    "/usr/bin/" + path.name
+                    for path in commands.iterdir()
+                    if path.is_file() and path.stat().st_mode & 0o111
+                )
+            # The mount policy admits only original base-image commands at these
+            # destinations; an ordinary guest file still causes an atomic conflict.
+            _mount_package_tree(
+                environment,
+                staging,
+                "/",
+                normalize_modes=True,
+                replace_builtin_tools=sorted(replacements),
+            )
         environment._catalog_native.update(provider["name"] for provider in providers)
         environment._catalog_assets.update(item["path"] for item in assets)
 

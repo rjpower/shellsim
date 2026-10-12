@@ -478,6 +478,7 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
 def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_precompiled):
     from ports.buildomatic.delivery import catalog
     from shellsim import _native
+    from shellsim._pypi_catalog import Catalog
 
     tool = tmp_path / "example.wasm"
     tool.write_bytes(
@@ -489,28 +490,39 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
     with zipfile.ZipFile(files, "w") as archive:
         archive.writestr("usr/share/example/value.txt", "42")
         archive.writestr("usr/include/example.h", "#define VALUE 42\n")
+        wrapper = zipfile.ZipInfo("usr/bin/ar")
+        wrapper.external_attr = 0o100755 << 16
+        archive.writestr(wrapper, '#!/bin/sh\nexec /usr/bin/llvm-ar "$@"\n')
     graph = {
         "abi": ABI,
         "packages": [],
         "native": [
             {
-                "name": "example",
+                "name": name,
                 "path": tool.name,
                 "size": tool.stat().st_size,
                 "kind": "tools",
-                "destination": "/usr/bin/example",
+                "destination": "/usr/bin/" + name,
                 "abi": ABI,
                 "native_dependencies": [],
-                "port": "native/example",
+                "port": reference,
                 "precompiled": {"path": companion.name, "size": companion.stat().st_size},
             }
+            for name, reference in (
+                ("clang", "native/example"),
+                ("llvm-ar", "native/example"),
+                ("wasm-ld", "native/runtime"),
+                ("make", "native/make"),
+            )
         ],
         "assets": [
             {"path": files.name, "size": files.stat().st_size, "kind": "archive", "port": "native/data"},
             {"path": "not-published.zip", "size": 1, "kind": "archive", "port": "native/unselected"},
         ],
         "ports": [
-            {"reference": "native/example", "dependencies": ["native/data"]},
+            {"reference": "native/example", "dependencies": ["native/runtime"]},
+            {"reference": "native/runtime", "dependencies": ["native/data"]},
+            {"reference": "native/make", "dependencies": []},
             {"reference": "native/data", "dependencies": []},
         ],
     }
@@ -520,25 +532,36 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
         companion.unlink()
     cache = tmp_path / "cache"
     first = shellsim.Environment(
-        tools=["example"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
+        tools=["clang", "make"], pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled,
     )
-    assert first.run("example").returncode == 0
+    assert first.read_file("/usr/bin/make") == tool.read_bytes()
+    assert first.run("make /missing-target").returncode == 0
+    assert first.read_file("/usr/bin/llvm-ar") == tool.read_bytes()
+    assert first.read_file("/usr/bin/wasm-ld") == tool.read_bytes()
+    assert first.run("clang && wasm-ld && ar").returncode == 0
     assert first.read_file("/usr/share/example/value.txt") == b"42"
     assert first.read_file("/usr/include/example.h") == b"#define VALUE 42\n"
     assert first.run("test ! -e /usr/bin/python3.wasm").returncode == 0
     assert first.run("find / -name '*.cwasm'").stdout == b""
     container = first.to_container()
-    assert container.run("example; cat /usr/share/example/value.txt").stdout == b"42"
+    assert container.run("clang; cat /usr/share/example/value.txt").stdout == b"42"
     container.write_file("/usr/share/example/value.txt", b"container change")
     assert first.read_file("/usr/share/example/value.txt") == b"42"
     first.write_file("/usr/share/example/value.txt", b"guest change")
     tool.unlink()
     files.unlink()
     second = shellsim.Environment(
-        tools="example", pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
+        tools=["clang", "make"], pypi_catalog=path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled,
     )
     assert second.read_file("/usr/share/example/value.txt") == b"42"
-    assert second.run("example").returncode == 0
+    assert second.run("clang && wasm-ld && ar && make /missing-target").returncode == 0
+    ordinary = shellsim.Environment()
+    ordinary.write_file("/usr/bin/make", b"guest-owned command", mode=0o755)
+    saved = Catalog(path, cache_dir=cache, offline=True, trusted_precompiled=trusted_precompiled)
+    with pytest.raises(shellsim.PackageInstallError):
+        saved.install_tools(ordinary, ["clang", "make"])
+    assert ordinary.read_file("/usr/bin/make") == b"guest-owned command"
+    assert ordinary.run("test ! -e /usr/bin/wasm-ld && test ! -e /usr/share/example/value.txt").returncode == 0
 
 
 def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog):
