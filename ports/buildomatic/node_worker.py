@@ -165,6 +165,9 @@ def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -
 
 
 def main() -> None:
+    from rigging.log_setup import configure_logging
+
+    configure_logging()
     specification = json.loads((Path(os.environ["BUILD_INPUT_recipe"]) / "node.json").read_text())
     node = decode(specification, Path(__file__).resolve().parents[1])
     store = StorageStore(specification["prefix"])

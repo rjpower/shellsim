@@ -6,13 +6,15 @@ capability boundaries. See [Buildomatic](buildomatic/README.md) for local/Iris
 execution, canonical stores, incremental export and the storage proxy.
 
 ```sh
-uv run --extra buildomatic python -m ports build python/scipy
+uv run --extra buildomatic python -m ports build --all
 uv run --extra buildomatic python -m ports export --url-prefix http://127.0.0.1:8080 --simple
 uv run --extra buildomatic python -m ports check
 ```
 
 `--store` accepts a directory or S3/GCS prefix; client state defaults to
 `build/ports`. SDK producers and runtime providers are graph dependencies.
+`build --all` selects every default recipe; pass explicit roots for a subset or
+additional variants. Progress logs go to stderr; command results are JSON on stdout.
 Builds emit assets once; export writes a catalog and optional Simple HTML.
 `Environment(pypi_packages=["scipy"], pypi_catalog="<catalog URL>")` fetches its
 selected wheels, native providers and interpreter without patched uv.

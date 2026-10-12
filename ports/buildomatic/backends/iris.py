@@ -847,6 +847,7 @@ def launch(client, config: IrisConfig, *, environment=None):
     from iris.rpc import job_pb2
     from rigging.timing import Duration
 
+    logger.info("Starting Iris coordinator on %s for %d build workers", config.target_cluster, config.workers)
     files = {**_runtime_files(), **_source_files()}
     return client.submit(
         _entrypoint("coordinator", config, files=files),
@@ -958,6 +959,7 @@ class IrisBackend:
         self._actor = _CapabilityRPC(address, capability.token, self._name, self._rpc_seconds)
 
     def submit(self, request: BuildRequest) -> str:
+        logger.info("Submitting %d actions to Iris, up to %d workers", len(request.actions), request.max_workers)
         return self._actor.call("Submit", request)
 
     def sign_blob(self, request: BlobAccessRequest) -> SignedBlobAccess:
@@ -1225,6 +1227,12 @@ def _run_coordinator(config: IrisConfig) -> None:
     store = RemoteStore(config.cache_prefix or config.prefix, journal_prefix=config.prefix)
 
     def submit_worker(name):
+        logger.info(
+            "Starting Iris worker %s: %s CPUs, %.1f GiB RAM",
+            name,
+            config.worker_cpu,
+            config.worker_memory_bytes / 1024**3,
+        )
         try:
             job = ctx.client.submit(
                 _entrypoint("worker", config, worker_id=name, files=files),
@@ -1311,6 +1319,9 @@ def _run_coordinator(config: IrisConfig) -> None:
 
 def main() -> None:
     """Run only explicitly selected in-cluster actor roles."""
+    from rigging.log_setup import configure_logging
+
+    configure_logging()
     role, serialized = sys.argv[1:3]
     values = json.loads(serialized)
     values["setup_scripts"] = tuple(values["setup_scripts"])

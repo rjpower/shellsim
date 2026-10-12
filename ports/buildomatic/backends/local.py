@@ -50,6 +50,9 @@ class LocalBackend:
     def get(self, build_id: str):
         return self.builds[build_id].tick()
 
+    def cancel(self, build_id: str):
+        return self.builds[build_id].cancel()
+
     def get_logs(self, build_id: str) -> dict:
         coordinator = self.builds[build_id]
         journal = json.loads(self.store.read_journal(coordinator.journal_key).data)
