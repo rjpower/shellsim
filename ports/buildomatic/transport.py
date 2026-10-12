@@ -108,6 +108,8 @@ def code_files(
                         break
     if "_support/producer_migration.py" in files:
         add("_support/producer-migration-v1.json", shared / "_support/producer-migration-v1.json", shared)
+    if "python/cpython/threaded.py" in files:
+        add("toolchain/wasi_process/recipe.json", ports / "toolchain/wasi_process/recipe.json", ports)
     return dict(sorted(files.items()))
 
 
