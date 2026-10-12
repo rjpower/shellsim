@@ -146,7 +146,9 @@ fn resolve(
             return Err(SyscallError::ResourceExhausted);
         }
         let validation: Result<(), SyscallError> = (|| {
-            let bytes = interp.vfs.read_limited("/", &executable, MAX_WASM_BYTES)?;
+            let bytes = interp
+                .vfs
+                .read_shared_limited("/", &executable, MAX_WASM_BYTES)?;
             let admission =
                 executable_admission(&bytes).map_err(|_| SyscallError::ExecutableFormat)?;
             let profile = &admission.profile;

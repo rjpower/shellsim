@@ -807,6 +807,13 @@ impl Vfs {
 
     /// Read a file as exact bytes only when it is within `limit`.
     pub fn read_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>> {
+        self.read_shared_limited(cwd, path, limit)
+            .map(|data| data.as_ref().clone())
+    }
+
+    /// Retain immutable file bytes within `limit`, counting the same logical read as an owned
+    /// read. Later VFS mutations detach this buffer, so consumers may safely cache its identity.
+    pub fn read_shared_limited(&self, cwd: &str, path: &str, limit: usize) -> Result<Arc<Vec<u8>>> {
         let abs = resolve_against(cwd, path);
         let real = self.realpath(&abs, true)?;
         match self.raw_get(&real) {
@@ -822,7 +829,7 @@ impl Vfs {
                 }
                 self.read_bytes
                     .set(self.read_bytes.get().saturating_add(data.len() as u64));
-                Ok(data.as_ref().clone())
+                Ok(data.clone())
             }
             Some(Node {
                 kind: NodeKind::Dir,

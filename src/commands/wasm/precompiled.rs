@@ -86,7 +86,7 @@ fn precompiled_wasm_registered(source: &[u8], kind: WasmCompilationKind) -> Resu
             let Some(admission) = cache
                 .entries
                 .iter()
-                .find(|entry| entry.source == source)
+                .find(|entry| super::same_module_source(entry.source.as_slice(), source))
                 .and_then(|entry| entry.admission.clone())
             else {
                 return Ok(false);
@@ -105,7 +105,7 @@ fn precompiled_wasm_registered(source: &[u8], kind: WasmCompilationKind) -> Resu
         .expect("module cache lock")
         .entries
         .iter()
-        .any(|entry| entry.source == compilation_source))
+        .any(|entry| super::same_module_source(entry.source.as_slice(), compilation_source)))
 }
 
 /// Register a trusted host companion for the exact source used by subsequent guest compilation.
@@ -185,10 +185,10 @@ fn register(
     if !cache
         .entries
         .iter()
-        .any(|entry| entry.source == compilation_source)
+        .any(|entry| super::same_module_source(entry.source.as_slice(), compilation_source))
     {
         cache.insert_entry(
-            compilation_source,
+            &Arc::new(compilation_source.to_vec()),
             CachedCompilation::Precompiled(companion()),
             bytes,
         );
@@ -263,7 +263,7 @@ mod tests {
             .unwrap(),
             PrecompiledWasmOutcome::Registered
         );
-        let module = super::super::compiled_command_module(&source).unwrap();
+        let module = super::super::compiled_command_module(&Arc::new(source.clone())).unwrap();
         assert_eq!(module.serialize().unwrap(), bytes);
         std::fs::remove_file(&path).unwrap();
         // SAFETY: this module is already loaded; repeated setup must not reopen its file.
