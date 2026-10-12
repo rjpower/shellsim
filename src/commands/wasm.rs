@@ -53,6 +53,11 @@ mod limits;
 mod posix_exec;
 mod posix_open;
 mod posix_process;
+mod precompiled;
+
+pub use precompiled::{
+    precompile_wasm, register_trusted_precompiled_wasm, PrecompiledWasmOutcome, WasmCompilationKind,
+};
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
 // prepay their conservative host compilation memory reservation.
@@ -141,6 +146,10 @@ impl ModuleCache {
             .saturating_add((image.end as usize).saturating_sub(image.start as usize));
         if bytes > MAX_CACHED_MODULE_BYTES {
             return;
+        }
+        if let Some(index) = self.entries.iter().position(|entry| entry.source == source) {
+            let old = self.entries.remove(index).expect("matching cache entry");
+            self.bytes -= old.bytes;
         }
         while self.entries.len() >= MAX_CACHED_MODULES
             || self.bytes.saturating_add(bytes) > MAX_CACHED_MODULE_BYTES
@@ -291,11 +300,19 @@ fn compiled_executable_module(
     source: &[u8],
     profile: Option<&threads::Profile>,
 ) -> Result<Module, Error> {
-    let rewritten = profile
+    let rewritten = executable_compilation_source(source, profile)?;
+    compiled_command_module(rewritten.as_deref().unwrap_or(source))
+}
+
+/// Native companions and JIT compilation must use the same deferred-start cache key.
+fn executable_compilation_source(
+    source: &[u8],
+    profile: Option<&threads::Profile>,
+) -> Result<Option<Vec<u8>>, Error> {
+    profile
         .filter(|profile| !profile.executable.needed.is_empty())
         .map(|profile| threaded_dynamic::layout::defer_start(source, &profile.executable))
-        .transpose()?;
-    compiled_command_module(rewritten.as_deref().unwrap_or(source))
+        .transpose()
 }
 
 /// Access to the virtual machine for host calls.

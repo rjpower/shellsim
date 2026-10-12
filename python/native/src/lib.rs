@@ -19,6 +19,7 @@ use pyo3::exceptions::PyException;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use serde::Serialize;
+use shellsim::commands::{PrecompiledWasmOutcome, WasmCompilationKind};
 use shellsim::display::KeyEvent;
 use shellsim::harness::{HarnessOperation, HarnessRequest, HarnessSession};
 use shellsim::net::NetworkRequest;
@@ -847,13 +848,20 @@ where
     F: FnOnce(&mut State) -> Result<T, String> + Send,
 {
     let environment = &mut **guard;
+    host_worker(move || operation(environment))
+}
+
+/// Contain compilation and other host operations under the adapter's usual stack/panic boundary.
+fn host_worker<T, F>(operation: F) -> Result<T, String>
+where
+    T: Send,
+    F: FnOnce() -> Result<T, String> + Send,
+{
     thread::scope(|scope| {
         let worker = thread::Builder::new()
             .name("shellsim-python".to_string())
             .stack_size(ACTION_STACK_BYTES)
-            .spawn_scoped(scope, move || {
-                catch_unwind(AssertUnwindSafe(|| operation(environment)))
-            })
+            .spawn_scoped(scope, move || catch_unwind(AssertUnwindSafe(operation)))
             .map_err(|error| format!("could not start shellsim worker: {error}"))?;
         match worker.join() {
             Ok(Ok(result)) => result,
@@ -881,11 +889,69 @@ fn is_bundled_python_module(name: &str) -> bool {
     shellsim::python::is_bundled_python_module(name)
 }
 
+/// Compile host-provided binary Wasm without running it. Retain the result as trusted native code.
+#[pyfunction]
+#[pyo3(signature = (source, executable=false))]
+fn precompile_wasm(py: Python<'_>, source: Vec<u8>, executable: bool) -> PyResult<Py<PyBytes>> {
+    let bytes = py
+        .detach(|| {
+            host_worker(|| {
+                shellsim::commands::precompile_wasm(&source, compilation_kind(executable))
+                    .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)?;
+    Ok(PyBytes::new(py, &bytes).unbind())
+}
+
+/// Load only untouched companions from an explicitly trusted host catalog. Never pass guest
+/// files or untrusted native code: compatibility/source checks do not authenticate a companion.
+#[pyfunction]
+#[pyo3(signature = (source, companion, executable=false))]
+fn register_trusted_precompiled_wasm(
+    py: Python<'_>,
+    source: Vec<u8>,
+    companion: Vec<u8>,
+    executable: bool,
+) -> PyResult<&'static str> {
+    let outcome = py
+        .detach(|| {
+            host_worker(|| {
+                // SAFETY: this host-only API requires the embedding caller to opt in to loading
+                // untouched compiler output from a trusted catalog. It is not a guest API.
+                unsafe {
+                    shellsim::commands::register_trusted_precompiled_wasm(
+                        &source,
+                        &companion,
+                        compilation_kind(executable),
+                    )
+                }
+                .map_err(|error| error.to_string())
+            })
+        })
+        .map_err(SimulationError::new_err)?;
+    Ok(match outcome {
+        PrecompiledWasmOutcome::Registered => "registered",
+        PrecompiledWasmOutcome::Incompatible => "incompatible",
+        PrecompiledWasmOutcome::SourceMismatch => "source_mismatch",
+    })
+}
+
+fn compilation_kind(executable: bool) -> WasmCompilationKind {
+    if executable {
+        WasmCompilationKind::Executable
+    } else {
+        WasmCompilationKind::Module
+    }
+}
+
 #[pymodule]
 fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
+    module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
+    module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;
     module.add("SimulationError", module.py().get_type::<SimulationError>())?;
     module.add(
         "PackageConflictError",

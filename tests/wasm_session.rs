@@ -1,7 +1,10 @@
 //! A host-driven session proves that a Wasm guest can pause after a frame and accept live input.
 
 use shellsim::{
-    commands::{SessionPoll, WasmSession},
+    commands::{
+        precompile_wasm, register_trusted_precompiled_wasm, SessionPoll, WasmCompilationKind,
+        WasmSession,
+    },
     display::KeyEvent,
     Environment, Limits,
 };
@@ -99,11 +102,18 @@ fn host_can_stop_a_guest_at_a_frame_boundary_and_recover_the_environment() {
 #[test]
 fn cpu_bound_guest_stops_at_the_virtual_fuel_limit() {
     let mut environment = Environment::with_limits(Limits {
-        cpu: 10_000,
+        cpu: 50_000,
         ..Limits::default()
     });
     let guest =
         wat::parse_str(r#"(module (func (export "_start") (loop $spin (br $spin))))"#).unwrap();
+    let companion = precompile_wasm(&guest, WasmCompilationKind::Executable).unwrap();
+    // SAFETY: this is the untouched output of host compilation. The larger CPU budget forces
+    // several fuel resumes, which must continue to charge through the patched runtime hook.
+    unsafe {
+        register_trusted_precompiled_wasm(&guest, &companion, WasmCompilationKind::Executable)
+    }
+    .unwrap();
     environment
         .vfs
         .write("/", "/spin.wasm", &guest, 0o755)
