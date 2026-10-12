@@ -25,6 +25,11 @@
     {
       "port": "python/h11",
       "version": "0.16.0"
+    },
+    {
+      "port": "python/cpython-stdlib-ssl",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-ssl"
     }
   ],
   "tests": [

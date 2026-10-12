@@ -1,0 +1,81 @@
+{
+  "version": "3.50.4",
+  "source": {
+    "url": "https://www.sqlite.org/2025/sqlite-autoconf-3500400.tar.gz",
+    "sha256": "a3db587a1b92ee5ddac2f66b3edb41b26f9c867275782d46c3a088977d6a5b18",
+    "subdirectory": "sqlite-autoconf-3500400"
+  },
+  "default_variant": "library",
+  "variants": {
+    "library": {
+      "name": "sqlite",
+      "kind": "native-library",
+      "role": "target-library",
+      "linkage": "shared",
+      "soname": "libsqlite3.so",
+      "sdk": "default",
+      "build_system": "cmake",
+      "target_dependencies": [],
+      "exports": {
+        "shared_libraries": [
+          "lib/libsqlite3.so"
+        ],
+        "archives": [
+          "lib/libsqlite3.a"
+        ]
+      },
+      "export_directories": {
+        "headers": [
+          "include"
+        ]
+      },
+      "needed_libraries": [],
+      "tests": [
+        {
+          "kind": "native",
+          "source": "tests/transactions.c",
+          "link_inputs": [
+            "lib/libsqlite3.so"
+          ]
+        }
+      ]
+    },
+    "cli": {
+      "name": "sqlite3",
+      "kind": "native-tool",
+      "role": "guest-tool",
+      "linkage": "shared",
+      "sdk": "default",
+      "build_system": "cmake",
+      "target_dependencies": [
+        {
+          "port": "native/sqlite",
+          "version": "3.50.4"
+        }
+      ],
+      "exports": {
+        "tools": [
+          "bin/sqlite3"
+        ]
+      },
+      "needed_libraries": [
+        "libsqlite3.so"
+      ],
+      "install": {
+        "kind": "build-tool"
+      },
+      "tests": [
+        {
+          "kind": "shell",
+          "script": "tests/graph_cli.sh",
+          "files": [
+            {
+              "source": "tests/transactions.sql",
+              "destination": "transactions.sql"
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

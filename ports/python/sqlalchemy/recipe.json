@@ -49,6 +49,11 @@
     {
       "port": "python/typing-extensions",
       "version": "4.16.0"
+    },
+    {
+      "port": "python/cpython-stdlib-sqlite3",
+      "version": "3.13.7",
+      "recipe": "python/cpython:stdlib-sqlite3"
     }
   ],
   "tests": [

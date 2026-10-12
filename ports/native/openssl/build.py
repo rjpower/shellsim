@@ -55,7 +55,7 @@ def build(ctx: BuildContext) -> NativeBuildOutput:
             "--libdir=lib",
             "no-shared",
             "no-asm",
-            "no-threads",
+            "threads",
             "no-apps",
             "no-tests",
             "no-sock",
