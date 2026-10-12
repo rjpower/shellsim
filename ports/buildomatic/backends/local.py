@@ -12,7 +12,7 @@ from ports.buildomatic.artifacts import resolve
 from ports.buildomatic.contracts import Store
 from ports.buildomatic.transfers import upload_bundles
 
-_DEFAULT_LIMITS = ResourceLimits()
+_DEFAULT_LIMITS = ResourceLimits(memory_bytes=16 * 1024**3)
 
 
 class LocalBackend:

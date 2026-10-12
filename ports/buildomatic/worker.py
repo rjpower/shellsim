@@ -124,7 +124,7 @@ def _startup_log(stream, path: Path, maximum: int) -> None:
 class WorkerExecutor:
     """Execute trusted host argv on Linux, with 1..32 durable concurrent slots.
 
-    Resource rlimits bound each process; the supervisor monitors aggregate disk
+    Resource rlimits bound CPU and file size; the supervisor monitors group RAM and disk
     and log growth. Polling resumes durable preparation/publication work. Input mounts
     share a total expanded byte/entry allowance. There is no shell by default.
     The root is private to this worker identity and must survive client restart.

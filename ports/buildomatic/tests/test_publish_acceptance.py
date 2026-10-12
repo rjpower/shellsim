@@ -15,11 +15,18 @@ from ports.buildomatic.workflow import run
 @pytest.fixture
 def acceptance_graph(tmp_path):
     ports, state = tmp_path / "ports", tmp_path / "state"
-    for name, source in [("good", "print(42)\n"), ("bad", "assert False\n")]:
+    for name, source in [("good", "print(open('/work/nested/input.txt').read())\n"), ("bad", "assert False\n")]:
         path, recipe = _wheel_port(ports, state / "execution/cache/ports", name, [])
-        recipe["tests"] = [{"kind": "python", "script": "probe.py"}]
+        recipe["tests"] = [
+            {
+                "kind": "python",
+                "script": "probe.py",
+                "files": [{"source": "input.txt", "destination": "nested/input.txt"}],
+            }
+        ]
         path.write_text(json.dumps(recipe))
         (path.parent / "probe.py").write_text(source)
+        (path.parent / "input.txt").write_text("42")
     store = StorageStore(str(tmp_path / "canonical"))
     backend = LocalBackend(store, state / "execution")
     built = run(ports, ["python/good", "python/bad"], store, state, backend, offline=True)
@@ -43,3 +50,10 @@ def test_selected_guest_rechecks_changed_source_without_building(acceptance_grap
     assert repeat.records[check.reference]["stdout"] == "43\n"
     first_build = next(node for node in first.plan.nodes if node.operation is Operation.BUILD)
     assert repeat.records[first_build.reference] == first.records[first_build.reference]
+    outside = ports.parent / "outside.txt"
+    outside.write_text("host-only input")
+    fixture = ports / "python/good/input.txt"
+    fixture.unlink()
+    fixture.symlink_to(outside)
+    with pytest.raises(ValueError):
+        run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)

@@ -79,6 +79,7 @@ def stage_asset(store: DeliveryStore, item: dict, root: Path) -> None:
 
 def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Path) -> dict:
     from shellsim import Environment
+    from shellsim.pypi import _mount_package_tree
 
     packages, native = [], []
     for name, record in records.items():
@@ -131,28 +132,30 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
                 **(kwargs or {"cpu": 10_000_000_000, "memory": 2 * 1024**3, "disk": 512 * 1024**2})
             )
             CPythonRuntime.from_catalog(Catalog(location, cache_dir=cache / "guest")).mount(environment)
-            for item in native:
-                environment.write_file(
-                    item["destination"],
-                    (assets / item["path"]).read_bytes(),
-                    mode=0o755 if item["kind"] == "tools" else 0o644,
-                )
     else:
         environment = Environment(**kwargs)
+    staging = work / "guest"
+    staging.mkdir()
+    if not runtime or not own.get("delivery", {}).get("wheels"):
         for item in native:
-            environment.write_file(
-                item["destination"],
-                (assets / item["path"]).read_bytes(),
-                mode=0o755 if item["kind"] == "tools" else 0o644,
-            )
+            path = staging / item["destination"].lstrip("/")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(assets / item["path"], path)
+            path.chmod(0o755 if item["kind"] == "tools" else 0o644)
     guest = "/work/check" + {"python": ".py", "shell": ".sh", "native": ".wasm"}[test["kind"]]
     if test["kind"] == "native":
         body = (install(store, records["probe"]["artifact"], cache / "artifacts") / "check.wasm").read_bytes()
     else:
         _, body = _source(node.port, test["script"])
-    environment.write_file(guest, body, mode=0o755 if test["kind"] == "native" else 0o644)
+    path = staging / guest.lstrip("/")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(body)
+    path.chmod(0o755 if test["kind"] == "native" else 0o644)
     for name, body in _fixtures(node.port, test.get("files", [])).items():
-        environment.write_file("/work/" + name, body)
+        path = staging / "work" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+    _mount_package_tree(environment, staging, "/", normalize_modes=True)
     command = {"python": "python ", "shell": "sh ", "native": ""}[test["kind"]] + shlex.quote(guest)
     result = environment.run(" ".join([command, *(shlex.quote(arg) for arg in test.get("args", []))]))
     if result.returncode or result.stop_reason:

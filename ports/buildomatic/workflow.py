@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Sequence
 from uuid import uuid4
 
+from ports._support.acceptance import _fixtures, _source
 from ports._support.graph import Graph, Port, guest_graph, plan
 from ports._support.node_build import _admit_recipe
 from ports._support.producer_policy import policy
@@ -426,11 +427,12 @@ def prepare(
                 files[str(product.recipe_path.relative_to(ports))] = product.recipe_path
         for node in missing.values():
             if node.test:
+                _fixtures(node.port, node.test.get("files", []))
                 for name in [
                     node.test.get("script", node.test.get("source")),
                     *(item["source"] for item in node.test.get("files", [])),
                 ]:
-                    path = node.port.directory / name
+                    path, _ = _source(node.port, name)
                     files[str(path.relative_to(ports))] = path
         _stage_code(files, code)
         for module in Path(__file__).parent.rglob("*.py"):

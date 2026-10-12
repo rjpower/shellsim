@@ -33,6 +33,22 @@ def kill_group(pid: int) -> None:
         pass
 
 
+def group_memory(pid: int) -> int:
+    """Count resident pages for the owned process group, not reserved addresses."""
+    pages = 0
+    with os.scandir("/proc") as processes:
+        for process in processes:
+            if not process.name.isdecimal():
+                continue
+            try:
+                fields = Path(process.path, "stat").read_text().rsplit(")", 1)[1].split()
+            except FileNotFoundError:
+                continue
+            if int(fields[2]) == pid:
+                pages += int(fields[21])
+    return pages * os.sysconf("SC_PAGE_SIZE")
+
+
 def wait_group(pid: int) -> None:
     """Wait for killed descendants as well as the direct child before sealing."""
     while True:

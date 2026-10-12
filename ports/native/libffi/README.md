@@ -8,7 +8,8 @@ The canonical libffi 3.5.2 builder combines upstream common code with the pinned
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build native/libffi --store /path/to/ports-store \
-  --output /path/to/release --check
+  --state build/ports
+uv run --extra buildomatic python -m ports check --state build/ports
 ```
 
 See the [ports authoring guide](../../README.md) for SDK materialization,

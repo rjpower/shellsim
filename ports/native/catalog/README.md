@@ -1,8 +1,7 @@
 # Native catalogs
 
-The common ports driver publishes native catalogs from selected verified artifacts.
-Request native packages or guest tools with `python -m ports`, `--store`, and a
-fresh `--output`. The catalog records exact toolchain and compiled dependency
+Run `ports build <native-package>`, then `ports export --url-prefix <store-http-url>`.
+Use `--store` for products and `--state` for client metadata. The catalog records exact toolchain and compiled dependency
 relationships. The public installer resolves supported package constraints,
 verifies inventory and ABI, then mounts files atomically.
 

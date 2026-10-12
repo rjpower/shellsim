@@ -13,7 +13,8 @@ uv run --extra buildomatic python -m ports check
 
 Use `--backend iris --iris-service service.json` for a running pool. SDK producers
 are graph dependencies. `--max-workers` controls port concurrency; `--jobs` controls
-compilation within a port. Builds emit assets once; export can promote missing
+compilation within a port. The trusted local supervisor checks resident RAM
+periodically; Iris also applies its container limits. Builds emit assets once; export can promote missing
 assets with `--output <prefix> --copy-assets`. Serve the store with
 `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Environment(pypi_packages=["scipy"], pypi_catalog="<URL>")`; no patched uv is needed.

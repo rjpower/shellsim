@@ -23,7 +23,7 @@ retain the existing explicit errors from the platform implementation.
 The port-local native check exercises descriptor I/O and invalid descriptors,
 exclusive temporary files, process CWD/relative paths shared with a worker,
 and a spawned shell child's exit status. It is run
-through the graph release and public environment setup path with `--check`.
+through the shared graph and public environment setup path with `ports check`.
 
 The threaded CWD implementation owns the complete libc symbol group, including
 its scheduler lock. Explicit provider archives precede default libc extraction;

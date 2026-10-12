@@ -18,7 +18,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         "--state", type=Path, default=Path("build/ports"), help="graph.json, results.json and client state"
     )
     common.add_argument("--store", help="canonical local directory or S3/GCS prefix")
-    common.add_argument("--sdk", default="default")
+    common.add_argument("--sdk")
     common.add_argument("--backend", choices=("local", "iris"), default="local")
     common.add_argument("--iris-service", type=Path)
     common.add_argument("--jobs", type=int, default=os.cpu_count() or 1)
@@ -83,7 +83,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
             args.state,
             backend,
             operation={"build": Operation.BUILD, "export": Operation.DELIVERY, "check": Operation.CHECK}[args.command],
-            sdk_name=saved.get("sdk_name", args.sdk),
+            sdk_name=args.sdk or saved.get("sdk_name", "default"),
             jobs=args.jobs,
             max_workers=args.max_workers,
             offline=args.offline,

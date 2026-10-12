@@ -9,7 +9,8 @@ installs the guest SDK headers, libraries and compiler resources.
 ```sh
 uv run --no-project --python /path/to/installed-shellsim/bin/python \
   python -m ports build toolchain/llvm:guest --store /path/to/ports-store \
-  --output /path/to/release --check
+  --state build/ports
+uv run --extra buildomatic python -m ports check --state build/ports
 ```
 
 The canonical `build(ctx)` selects the producer using the resolved static variant.

@@ -18,13 +18,12 @@ import sys
 import time
 from pathlib import Path
 
-from ports.buildomatic._process import kill_group, process_token, tree_usage, wait_group
+from ports.buildomatic._process import group_memory, kill_group, process_token, tree_usage, wait_group
 from ports.buildomatic.contracts import encode
 from ports.buildomatic.store import atomic_write, read_bounded
 
 
 def set_limits(limits: dict) -> None:
-    resource.setrlimit(resource.RLIMIT_AS, (limits["memory_bytes"], limits["memory_bytes"]))
     resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"]))
     resource.setrlimit(resource.RLIMIT_FSIZE, (limits["output_bytes"], limits["output_bytes"]))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -110,6 +109,9 @@ def run(directory: Path) -> None:
                         result["error"] = "action timed out"
                         break
                     if now >= next_usage_check:
+                        if group_memory(process.pid) > limits["memory_bytes"]:
+                            result["error"] = "action memory exceeds byte bound"
+                            break
                         try:
                             tree_usage(workspace, limits["max_files"], limits["output_bytes"], skip_inputs=True)
                         except ValueError as error:

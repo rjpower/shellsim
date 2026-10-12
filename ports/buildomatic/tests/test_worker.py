@@ -277,6 +277,7 @@ def test_terminal_status_published_between_read_and_lock_check(
         ("print('x' * 1000)", ResourceLimits(log_bytes=32)),
         ("import pathlib; pathlib.Path('huge').write_bytes(b'x' * 4096)", ResourceLimits(output_bytes=1024)),
         ("import pathlib; [pathlib.Path(str(i)).touch() for i in range(10)]", ResourceLimits(max_files=5)),
+        ("import time; data = bytearray(64 * 1024**2); time.sleep(30)", ResourceLimits(memory_bytes=32 * 1024**2)),
     ],
 )
 def test_log_disk_and_entry_bounds(worker, store, code, limits):
@@ -284,6 +285,13 @@ def test_log_disk_and_entry_bounds(worker, store, code, limits):
     item = attempt(code)
     bounded.submit(item)
     assert complete(bounded, item).state == AttemptState.FAILED
+
+
+def test_sparse_virtual_mapping_does_not_consume_worker_ram(worker):
+    bounded = WorkerExecutor(worker.store, worker.root, ResourceLimits(memory_bytes=64 * 1024**2))
+    item = attempt("import mmap; mapping = mmap.mmap(-1, 16 * 1024**3); mapping[0] = 42")
+    bounded.submit(item)
+    assert complete(bounded, item).state == AttemptState.SUCCEEDED
 
 
 def test_supervisor_drains_log_without_scanning_each_poll(tmp_path, monkeypatch):

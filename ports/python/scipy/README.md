@@ -28,18 +28,17 @@ packaging requires an actual OpenBLAS dependency reference.
 
 ## Build and use
 
-Build `python/scipy` with the [graph command](../../README.md#build-and-check-a-port-graph)
-and `--check` to run its declared guest probes. Select a threaded CPython cohort
+Build `python/scipy` with the [graph command](../../README.md), then `ports check` to run its declared guest probes. Select a threaded CPython cohort
 whose image has the recipe-declared 256 MiB linear-memory ceiling.
 
-Install the resulting release through the public package interface:
+Run `ports export --url-prefix <store-http-url>`, then install through the public package interface:
 
 ```python
 from shellsim import Environment, Limits
 
-env = Environment.from_release(
-    "release/release.json",
-    pypi=["scipy==1.18.0"],
+env = Environment(
+    pypi_catalog="build/ports/export/catalog.json",
+    pypi_packages=["scipy==1.18.0"],
     limits=Limits(cpu=100_000_000_000, memory=4 * 1024**3, disk=768 * 1024**2),
 )
 result = env.run_python(
