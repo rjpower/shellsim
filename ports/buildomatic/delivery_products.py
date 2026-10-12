@@ -151,13 +151,17 @@ def publish_product(
     port: Port, root: Path, build_key: str, store: DeliveryStore, *, record_key: str | None = None
 ) -> dict:
     """Emit a product's wheels/providers once, then publish their metadata record."""
-    record_key = record_key or delivery_key(build_key)
+    record_key = record_key or delivery_key(build_key, port=port)
     if (record := store.record(record_key)) is not None:
         return record
     record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": [], "assets": []}
     asset_key = relative_path(record_key)
     for wheel in sorted((root / "wheels").glob("*.whl")):
-        relative = f"assets/delivery-v5/{asset_key}/{wheel.name}"
+        relative = (
+            f"assets/{build_key}/wheels/{wheel.name}"
+            if compiler_identity(port) is None
+            else f"assets/delivery-v5/{asset_key}/{wheel.name}"
+        )
         with tempfile.TemporaryDirectory(prefix=".wheel-", dir=root.parent) as temporary:
             delivered = Path(temporary) / wheel.name
             _delivery_wheel(wheel, delivered)
@@ -232,7 +236,7 @@ def publish_product(
         empty = directories if usage == "development" else {}
         if not files and not empty:
             continue
-        relative = f"assets/delivery-v5/{asset_key}/{usage}-files.zip"
+        relative = f"assets/delivery-v5/{relative_path(build_key)}/{usage}-files.zip"
         with tempfile.TemporaryDirectory(prefix=".files-", dir=root.parent) as temporary:
             archive = Path(temporary) / "files.zip"
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
@@ -286,15 +290,23 @@ def publish_runtime(bundle: Path, key: str, store: DeliveryStore, *, record_key:
     return runtime
 
 
-def delivery_key(product_key: str) -> str:
+def compiler_identity(port: Port | None = None) -> str | None:
+    """Key Wasmtime products on their compiler, keeping pure/data delivery independent."""
+    if port is not None and port.recipe["build_system"] in {"pure-wheel", "source-tree", "llvm-guest-sdk"}:
+        return None
     from shellsim import _native
 
+    return _native.precompiled_wasm_build_id()
+
+
+def delivery_key(product_key: str, *, port: Port | None = None) -> str:
+    compiler = compiler_identity(port)
     return identity(
         {
             "operation": "delivery",
             "product": product_key,
             "format_version": 5,
-            "wasmtime": _native.precompiled_wasm_build_id(),
+            **({"wasmtime": compiler} if compiler is not None else {}),
         }
     )
 

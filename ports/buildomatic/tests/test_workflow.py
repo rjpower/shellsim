@@ -42,6 +42,9 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
         raise AssertionError("cache hit dispatched work")
 
     with monkeypatch.context() as guarded:
+        from shellsim import _native
+
+        guarded.setattr(_native, "precompiled_wasm_build_id", lambda: "new-compiler-build")
         guarded.setattr(LocalBackend, "submit", reject)
         main(["build", "--all", *arguments])
         main(["export", *arguments, "--url-prefix", "https://ports.example"])
@@ -122,17 +125,20 @@ def test_failed_delivery_preserves_canonical_build(tmp_path, monkeypatch, failur
     blocked = Path(store.prefix) / "assets"
     if failure == "publication":
         blocked.write_bytes(b"blocks delivery directories")
-    from shellsim import _native
-
     with monkeypatch.context() as planner:
         if failure == "worker-runtime":
-            planner.setattr(_native, "precompiled_wasm_build_id", lambda: "mismatched-planner")
+            # Supply a mismatched compiler requirement without bootstrapping an SDK fixture.
+            planner.setattr(workflow, "compiler_identity", lambda _port: "mismatched-planner")
+            planner.setattr("ports.buildomatic.delivery_products.compiler_identity", lambda _port: "mismatched-planner")
+        failed = compile_plan(ports, ["python/example"])
         with pytest.raises(RuntimeError):
             run(ports, ["python/example"], store, state, backend, offline=True)
     compiled = compile_plan(ports, ["python/example"])
     product = next(node for node in compiled.nodes if node.operation is Operation.BUILD)
     cached = resolve(store, product.record_key)
     assert cached is not None
+    delivery = next(node for node in failed.nodes if node.operation is Operation.DELIVERY)
+    assert resolve(store, delivery.record_key) is None
     assert not blocked.is_dir()
     blocked.unlink(missing_ok=True)
     # Remove the producer's source/cache; success now depends on its canonical output.

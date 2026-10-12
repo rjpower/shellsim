@@ -2,6 +2,7 @@
 
 import json
 import zipfile
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,7 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store / "execution/cache/ports", "native", [])
     port = plan(ports, ["python/native"]).ports[-1]
+    port = replace(port, recipe={**port.recipe, "build_system": "python-setuptools"})
     root = tmp_path / "product"
     (root / "wheels").mkdir(parents=True)
     wheel = root / "wheels/native-1-cp313-cp313-wasm32_wasip1.whl"
@@ -130,11 +132,10 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
 
 @pytest.mark.parametrize("destination", ["/lib/libtest.so", "/usr/lib/python3.13/lib-dynload/libtest.so"])
 def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, destination):
-    from dataclasses import replace
-
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store / "execution/cache/ports", "provider", [])
     port = plan(ports, ["python/provider"]).ports[-1]
+    port = replace(port, recipe={**port.recipe, "build_system": "cmake"})
     port = replace(port, recipe={**port.recipe, "install": {"destinations": {"lib/libtest.so": destination}}})
     root = tmp_path / "product"
     (root / "native/lib").mkdir(parents=True)
@@ -228,8 +229,6 @@ def test_interrupted_local_promotion_can_retry(tmp_path):
 
 
 def test_guest_catalog_omits_host_and_platform_roots(built):
-    from dataclasses import replace
-
     from ports._support.graph import Graph
     from ports.buildomatic.delivery import delivery_graph
 

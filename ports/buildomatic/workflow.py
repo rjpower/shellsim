@@ -32,7 +32,7 @@ from ports.buildomatic import (
 )
 from ports.buildomatic.artifacts import register, resolve, write_reference
 from ports.buildomatic.delivery import delivery_graph
-from ports.buildomatic.delivery_products import delivery_key, runtime_delivery_key
+from ports.buildomatic.delivery_products import compiler_identity, delivery_key, runtime_delivery_key
 from ports.buildomatic.nodes import Input, Node, Operation
 from ports.buildomatic.remote_store import StorageStore
 from ports.buildomatic.sdk_artifacts import sdk_inputs, sdk_inputs_match
@@ -195,7 +195,7 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             continue
         product = builds[port.reference]
         inputs = (Input("product", product.reference, product.key),)
-        key = delivery_key(product.key)
+        key = delivery_key(product.key, port=port)
         node = Node(port.reference + ":delivery", Operation.DELIVERY, key, port, inputs)
         deliveries[port.reference] = node
         nodes.append(node)
@@ -465,9 +465,9 @@ def prepare(
                 }
             )
             if node.operation in {Operation.DELIVERY, Operation.RUNTIME}:
-                from shellsim import _native
-
-                spec["wasmtime_build_id"] = _native.precompiled_wasm_build_id()
+                compiler = compiler_identity(node.port if node.operation is Operation.DELIVERY else None)
+                if compiler is not None:
+                    spec["wasmtime_build_id"] = compiler
             write_reference(recipe / "node.json", spec)
             bundle = capture_tree(recipe, local)
             bundles.append(bundle)
