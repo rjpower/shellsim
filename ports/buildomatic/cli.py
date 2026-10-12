@@ -43,6 +43,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
             command.add_argument("--url-prefix", required=True)
             command.add_argument("--output", help="catalog directory or store prefix")
             command.add_argument("--copy-assets", action="store_true")
+            command.add_argument("--asset-output", help="shared assets prefix when catalogs use a separate output")
             command.add_argument("--simple", action="store_true")
     args = parser.parse_args(arguments)
     from rigging.log_setup import configure_logging
@@ -154,6 +155,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
                     args.output or args.state / "export",
                     args.url_prefix,
                     copy_assets=args.copy_assets,
+                    asset_output=args.asset_output,
                     simple=args.simple,
                 )
             )

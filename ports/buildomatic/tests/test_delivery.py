@@ -72,8 +72,11 @@ def test_product_records_avoid_reopening_wheels(built, monkeypatch):
 def test_promotion_copies_only_new_packages(built, tmp_path):
     ports, state, _ = built
     output = tmp_path / "published"
-    first = export(state, output, "https://packages.example", copy_assets=True)
+    snapshot = output / "releases/first"
+    first = export(state, snapshot, "https://packages.example", copy_assets=True, asset_output=output)
     assert first["assets_copied"] == 2
+    assert not (output / "catalog.json").exists()
+    assert (snapshot / "catalog.json").is_file()
     repeat = export(state, output, "https://packages.example", copy_assets=True)
     assert repeat["assets_copied"] == 0
     _wheel_port(ports, state / "execution/cache/ports", "extra", [])

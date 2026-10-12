@@ -22,8 +22,8 @@ defaults are 64 CPUs, 32 GiB RAM and 100 GiB disk per worker, with sccache enabl
 SDK producers are graph dependencies. `--max-workers` controls port concurrency; `--jobs` controls
 compilation within a port. The trusted local supervisor checks resident RAM
 periodically; Iris also applies its container limits. Builds emit assets once; export can promote missing
-assets with `--output <prefix> --copy-assets`. Serve the store with
-`s3_proxy.py --prefix <prefix>` and pass the catalog URL to
+assets with `--output <prefix> --copy-assets`; `--asset-output <shared-prefix>` separates snapshot
+catalogs from shared assets. Serve the store with `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Context(pypi_catalog="<URL>").Environment(pypi_packages=["scipy"])`; no patched uv is needed.
 
 Delivery keeps portable Wasm and adds ordinary Wasmtime companions for the runtime,
