@@ -249,6 +249,14 @@ def test_guest_build_uses_cache_for_c_and_cxx_with_requested_parallelism(tmp_pat
     # Full LLVM compilation is impractical here; Ninja's argv is the external
     # parallelism contract, independent of the fixture's number of source files.
     assert "-j128" in prepared.commands[1]
+    alternate = tmp_path / "alternate-launcher"
+    alternate.symlink_to(launcher)
+    context.compiler_cache = CompilerCacheLauncher(alternate, digest(launcher), (("SCCACHE_BUCKET", "other"),))
+    changed_cache = _prepare_guest_locked(context, recipe, compiler, work, 128)
+    assert changed_cache.prefix == prepared.prefix
+    context.compiler_cache = None
+    uncached = _prepare_guest_locked(context, recipe, compiler, work, 128)
+    assert uncached.prefix == prepared.prefix
 
 
 def test_installed_guest_compiler_and_make_from_catalog():

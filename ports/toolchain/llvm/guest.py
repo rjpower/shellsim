@@ -337,7 +337,6 @@ class GuestBuildPreparation:
     """Admitted source and build plan, never a published product."""
 
     source: Path
-    source_sha256: str
     commands: list[list[str]]
     identity: dict
     prefix: Path
@@ -450,7 +449,6 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
         "posix": posix_receipt["artifact_sha256"],
         "snapshots": {name: inventory for name, (_, inventory) in snapshots.items()},
         "host_tools": tools,
-        "compiler_cache": cache,
     }
     compatibility = workspace_compatibility(
         recipe, compiler, context.sysroot, context.sdk, context.dependencies, context.host_tools, context.target
@@ -459,7 +457,6 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     state = {"schema_version": 1, "compatibility": compatibility, "inputs": inputs}
     previous = inputs["snapshots"]
     previous_tools = compiler_tools
-    updated_source_hash = None
     if receipt.exists():
         state = json.loads(receipt.read_text())
         pending_headers = workspace / "header-update.json"
@@ -473,11 +470,9 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
             pending_headers.unlink()
         if state["compatibility"] != compatibility:
             if state["compatibility"]["patches"] == compatibility["patches"]:
-                updated_source_hash = _update_dependency_headers(
-                    context, recipe, workspace, state, compatibility, snapshots
-                )
+                _update_dependency_headers(context, recipe, workspace, state, compatibility, snapshots)
             else:
-                updated_source_hash = update_workspace_patches(
+                update_workspace_patches(
                     context.source,
                     workspace / "source",
                     recipe,
@@ -527,9 +522,6 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
             apply_patch(roots[0], PORT / patch["file"], patch["sha256"])
         roots[0].rename(source)
         preparing.rmdir()
-    # The graph admits the archive before invoking this producer. Retained
-    # sources belong to the locked workspace; only input transitions reverify it.
-    source_hash = updated_source_hash or identity_hash({"source": recipe["source"], "patches": recipe["patches"]})
     journal = workspace / "patch-update.json"
     if journal.exists():
         if json.loads(journal.read_text())["new"] != compatibility:
@@ -539,14 +531,16 @@ def _prepare_guest_locked(context, recipe, compiler, workspace, jobs):
     identity = {**inputs, "commands": commands}
     key = identity_hash(identity)
     prefix = workspace / "products" / key
-    return GuestBuildPreparation(source, source_hash, commands, identity, prefix, state, environment)
+    # Compiler caching changes execution, not the admitted product inputs.
+    if cache is not None:
+        commands = _commands(context, workspace, source, requested_jobs, cache=cache)
+    return GuestBuildPreparation(source, commands, identity, prefix, state, environment)
 
 
 def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     plan = _prepare_guest_locked(context, recipe, compiler, workspace, jobs)
-    source, source_hash, commands, identity, prefix, state = (
+    source, commands, identity, prefix, state = (
         plan.source,
-        plan.source_sha256,
         plan.commands,
         plan.identity,
         plan.prefix,
@@ -567,7 +561,6 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
         manifest = {
             "schema_version": 1,
             "identity": identity,
-            "source_tree_sha256": source_hash,
             "patch_updates": state.get("patch_updates", []),
             "dependency_header_updates": state.get("dependency_header_updates", []),
             "artifacts": _inventory(staging),
@@ -592,7 +585,7 @@ def _build_guest_locked(context, recipe, compiler, workspace, jobs):
     )
 
 
-def _commands(context, workspace, source, jobs):
+def _commands(context, workspace, source, jobs, *, cache=None):
     posix = workspace / "inputs/posix"
     sysroot = workspace / "inputs/sysroot"
     resources = workspace / "inputs/resources"
@@ -645,7 +638,7 @@ def _commands(context, workspace, source, jobs):
             raise ValueError("unsupported CMake input path")
         lines.append(f'set({name} "{path}")')
     write_build_file(toolchain, "\n".join(lines) + "\n")
-    launcher = str(context.compiler_cache.path) if context.compiler_cache is not None else ""
+    launcher = cache["path"] if cache is not None else ""
     configure = [
         str(context.host_tools["cmake"]),
         "-G",
