@@ -1,5 +1,5 @@
 FROM ghcr.io/astral-sh/uv:0.12.3 AS uv
-FROM ubuntu:24.04
+FROM ubuntu:24.04 AS tools
 
 LABEL org.opencontainers.image.description="Buildomatic Iris worker with ordinary Ubuntu build tools"
 
@@ -23,12 +23,23 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && uv pip install --python /opt/buildomatic/venv/bin/python \
       packaging meson meson-python==0.16.0 cython numpy==2.3.5 \
       pybind11 setuptools setuptools-scm==8.3.1 wheel
-COPY wheels/ /opt/buildomatic/wheels/
-RUN uv pip install --python /opt/buildomatic/venv/bin/python /opt/buildomatic/wheels/*.whl
-
 ENV PATH="/opt/buildomatic/venv/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 ENV CARGO_TARGET_DIR=/app/.buildomatic/cargo-build
 ENV RUSTUP_HOME=/root/.rustup
 ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
+
+FROM tools AS runtime-build
+WORKDIR /source
+COPY . .
+RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/root/.cargo/git \
+    --mount=type=cache,target=/app/.buildomatic/cargo-build \
+    uv run --no-project --with maturin maturin build --release --locked --out /wheels
+
+FROM tools
+COPY --from=runtime-build /wheels/ /opt/buildomatic/wheels/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --python /opt/buildomatic/venv/bin/python /opt/buildomatic/wheels/*.whl
 CMD ["python"]
