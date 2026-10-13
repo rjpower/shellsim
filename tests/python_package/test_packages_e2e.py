@@ -18,7 +18,7 @@ GUEST_SOURCE = Path(__file__).resolve().parents[1] / "fixtures" / "host_tools"
 SPEC = shellsim.PackageSpec(
     name="arithmetic-grader",
     version="0.1.0",
-    entrypoint=("python3.14", "/work/app/grader.py"),
+    entrypoint=("bash", "/work/app/grader.sh"),
     required_tools=("workspace.read_file", "conversation.list", "grade.submit"),
 )
 
@@ -28,7 +28,7 @@ def source_tree(tmp_path: Path) -> Path:
     root = tmp_path / "grader"
     app = root / "app"
     app.mkdir(parents=True)
-    for name in ("grader.py", "host_tools.py"):
+    for name in ("grader.sh",):
         (app / name).write_bytes((GUEST_SOURCE / name).read_bytes())
     (app / "empty").mkdir()
     return root
@@ -76,7 +76,7 @@ def test_directory_zip_container_and_blob_url_round_trip(source_tree: Path) -> N
     assert staged.run("printf ready").stdout == b"ready"
     from_container = shellsim.Package.build_from_container(staged, spec=SPEC)
     assert from_container.to_bytes() == built.to_bytes()
-    assert staged.read_file("/work/app/grader.py") == (source_tree / "app/grader.py").read_bytes()
+    assert staged.read_file("/work/app/grader.sh") == (source_tree / "app/grader.sh").read_bytes()
 
     blob = built.to_bytes()
     fetched = shellsim.Package.from_url(
@@ -92,14 +92,9 @@ def test_directory_zip_container_and_blob_url_round_trip(source_tree: Path) -> N
     assert first.run_entrypoint().stdout == b"1.0\n"
     assert second.run_entrypoint().stdout == b"1.0\n"
     assert first_scores == second_scores == [1.0]
-    unlisted = (
-        "from host_tools import ToolClient\n"
-        "try:\n"
-        "    ToolClient().call('not.declared', {})\n"
-        "except RuntimeError as error:\n"
-        "    print(str(error))\n"
-    )
-    assert first.run(f"cd /work/app && python3.14 -c {shlex.quote(unlisted)}").stdout == b"unknown tool\n"
+    unlisted = json.dumps({"tool": "not.declared", "arguments": {}})
+    result = first.run(f"curl -s -X POST -d {shlex.quote(unlisted)} http://host.shellsim/tools")
+    assert json.loads(result.stdout) == {"error": "unknown tool"}
     first.write_file("/work/app/new.txt", b"private")
     with pytest.raises(shellsim.SimulationError):
         second.read_file("/work/app/new.txt")
@@ -149,9 +144,9 @@ def _rewrite_package(blob: bytes, extra: dict[str, bytes] | None = None, manifes
 
 def test_loader_rejects_tampered_or_undeclared_payload(source_tree: Path) -> None:
     blob = shellsim.Package.build_from_directory(source_tree, spec=SPEC).to_bytes()
-    changed = b"x" * len((source_tree / "app/grader.py").read_bytes())
+    changed = b"x" * len((source_tree / "app/grader.sh").read_bytes())
     with pytest.raises(ValueError, match="digest mismatch"):
-        shellsim.Package.from_bytes(_rewrite_package(blob, extra={"rootfs/app/grader.py": changed}))
+        shellsim.Package.from_bytes(_rewrite_package(blob, extra={"rootfs/app/grader.sh": changed}))
     with pytest.raises(ValueError, match="undeclared"):
         shellsim.Package.from_bytes(_rewrite_package(blob, extra={"rootfs/extra": b"hidden"}))
     with pytest.raises(ValueError, match="workspace path"):
@@ -176,7 +171,7 @@ def test_loader_rejects_tampered_or_undeclared_payload(source_tree: Path) -> Non
 
 
 def test_builder_rejects_source_links_duplicates_and_large_files(source_tree: Path) -> None:
-    (source_tree / "link").symlink_to("app/grader.py")
+    (source_tree / "link").symlink_to("app/grader.sh")
     with pytest.raises(ValueError, match="unsupported source entry"):
         shellsim.Package.build_from_directory(source_tree, spec=SPEC)
     (source_tree / "link").unlink()

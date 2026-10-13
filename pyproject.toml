@@ -64,7 +64,6 @@ include = [
     "python/**/*.py",
     "ports/*.py",
     "ports/**/*.py",
-    "tests/python/test_*.py",
     "tests/python_package/**/*.py",
     "tests/tooling/**/*.py",
     "tests/fixtures/wasm/**/*.py",

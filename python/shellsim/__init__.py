@@ -8,7 +8,6 @@ from importlib import import_module
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from . import python as python
     from ._api import (
         Action,
         ActionPoll,
@@ -58,7 +57,6 @@ __all__ = [
     "ToolError",
     "Usage",
     "run",
-    "python",
 ]
 
 _MODULES = {
@@ -74,8 +72,8 @@ def __getattr__(name: str):
     """Preserve public exports while deferring the execution dependency."""
     if name not in __all__:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module = import_module("." + ("python" if name == "python" else _MODULES.get(name, "_api")), __name__)
-    value = module if name == "python" else getattr(module, name)
+    module = import_module("." + _MODULES.get(name, "_api"), __name__)
+    value = getattr(module, name)
     globals()[name] = value
     return value
 

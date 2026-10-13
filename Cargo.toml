@@ -24,10 +24,6 @@ include = [
 name = "shellsim"
 path = "src/main.rs"
 
-[[bin]]
-name = "shellsim-python"
-path = "src/bin/shellsim-python.rs"
-
 [lib]
 name = "shellsim"
 path = "src/lib.rs"
@@ -51,9 +47,7 @@ wasmparser = "0.258.0"
 async-trait = "0.1.92"
 num-bigint = "0.4"
 num-traits = "0.2"
-libm = "0.2"
 stacker = "0.1"
-unicode-normalization = "0.1"
 
 # Process-level syscall sandbox (Linux only): a startup seccomp filter that denies
 # network/exec/fork so no Python-level trick can reach the real OS for those. shellsim
@@ -65,8 +59,6 @@ libc = "0.2"
 
 [features]
 default = []
-# Retained as an empty compatibility feature. Python is now always the minimal `-c` shim.
-python = []
 
 [build-dependencies]
 sha2 = "0.10"

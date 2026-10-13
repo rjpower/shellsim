@@ -43,7 +43,8 @@ def make_catalog(root: Path, **updates: object) -> Path:
 def make_bundle(root: Path) -> Path:
     binary = root / "rootfs/usr/bin/python3.wasm"
     binary.parent.mkdir(parents=True)
-    binary.write_bytes(b"\0asm\x01\0\0\0")
+    # (module (func (export "_start"))) distinguishes guest dispatch from a Python fallback.
+    binary.write_bytes(bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b"))
     binary.chmod(0o755)
     (root / "manifest.json").write_text(
         json.dumps(
@@ -78,7 +79,8 @@ def test_dynamic_mount_selects_real_venv_launchers(tmp_path: Path) -> None:
     assert environment.run("readlink /usr/bin/python3; readlink /work/.venv/bin/python").stdout == (
         b"/usr/bin/python3.wasm\n/usr/bin/python3.wasm\n"
     )
-    assert environment.run("python3.14 -c 'print(42)'").stdout == b"42\n"
+    result = environment.run("python3.13 -c 'raise RuntimeError(\"not interpreted by shellsim\")'")
+    assert (result.returncode, result.stdout, result.stderr) == (0, b"", b"")
     assert environment.run('printf \'%s\\n\' "$PATH" "$VIRTUAL_ENV"').stdout == (
         b"/work/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n/work/.venv\n"
     )

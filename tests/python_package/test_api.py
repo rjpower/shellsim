@@ -23,70 +23,16 @@ def test_fresh_run_returns_bytes_and_structured_usage() -> None:
     assert result.cost_model_version == 2
 
 
-def test_direct_python_source_avoids_shell_quoting_and_preserves_argv_stdin() -> None:
-    result = shellsim.python.run(
-        'import sys\nprint(sys.argv)\nprint(input())\nprint(sys.stdin.read())\nprint("\'\\"$()")',
-        argv=["one", "two words"],
-        stdin=b"input\nrest",
-    )
-
-    assert result.returncode == 0
-    assert result.stdout == b"['-c', 'one', 'two words']\ninput\nrest\n'\"$()\n"
-    assert result.commands == ("python3.14",)
-    assert result.partial_commands == ("python3.14",)
-    assert result.invocations[0].argv[:2] == ("python3.14", "-c")
 
 
-def test_environment_direct_python_reuses_vfs_and_cumulative_resources() -> None:
-    environment = shellsim.Context().Environment()
-    environment.write_file("/work/helper.py", "answer = 42\n")
-    environment.run("cd /work")
-
-    first = environment.run_python("from helper import answer\nprint(answer)")
-    second = environment.run_python("print('again')")
-
-    assert first.stdout == b"42\n"
-    assert second.stdout == b"again\n"
-    assert second.usage.cpu_used > first.usage.cpu_used
 
 
-def test_direct_python_uses_the_modeled_process_scheduler() -> None:
-    result = shellsim.python.run(
-        'import subprocess\nprint(subprocess.run(["printf", "child"], capture_output=True).stdout)'
-    )
-
-    assert result.returncode == 0
-    assert result.stdout == b"b'child'\n"
-    # Like execvp, PATH lookup does not rewrite the child's argv[0].
-    assert [invocation.argv[0] for invocation in result.invocations] == [
-        "python3.14",
-        "printf",
-    ]
 
 
-def test_direct_python_input_raises_catchable_eof() -> None:
-    result = shellsim.python.run('try:\n    input()\nexcept EOFError:\n    print("caught")')
-
-    assert result.returncode == 0
-    assert result.stdout == b"caught\n"
 
 
-def test_direct_python_stdin_is_utf8_text_and_iterable() -> None:
-    source = "import sys\nprint(sys.stdin.read(1))\nfor line in sys.stdin:\n    print(repr(line))"
-    result = shellsim.python.run(source, stdin="éa\nb\n".encode())
-
-    assert result.returncode == 0
-    assert result.stdout == "é\n'a\\n'\n'b\\n'\n".encode()
 
 
-def test_direct_python_rejects_binary_stdin_and_obeys_resource_limits() -> None:
-    invalid = shellsim.python.run("import sys\nsys.stdin.read()", stdin=b"\xff")
-    exhausted = shellsim.python.run("while True:\n    pass", cpu=100)
-
-    assert invalid.returncode != 0
-    assert b"standard input is not valid UTF-8" in invalid.stderr
-    assert exhausted.returncode == 137
-    assert exhausted.stop_reason == "cpu_exhausted"
 
 
 def test_direct_python_validates_arguments() -> None:
@@ -98,6 +44,10 @@ def test_direct_python_validates_arguments() -> None:
         environment.run_python("print(1)", "not-an-argv")
     with pytest.raises(TypeError, match="argv must be a sequence of str"):
         environment.run_python("print(1)", ["ok", 1])  # type: ignore[list-item]
+    with pytest.raises(shellsim.SimulationError):
+        environment.run_python("open('/work/unexpected', 'w').write('host fallback')")
+    assert environment.run("python3 -c 'print(1)'").returncode == 127
+    assert environment.run("test -e /work/unexpected").returncode != 0
 
 
 def test_environment_preserves_state_and_vfs_bytes() -> None:
@@ -184,23 +134,6 @@ def test_environment_configures_static_http_routes() -> None:
     )
 
 
-def test_static_http_routes_back_python_urllib() -> None:
-    environment = shellsim.Context().Environment(http={
-            "https://api.test/items": shellsim.HttpResponse(
-                headers={"Content-Type": "application/json"},
-                body='{"items":[]}',
-            )
-        })
-
-    result = environment.run_python(
-        "from urllib.request import urlopen\n"
-        "with urlopen('https://api.test/items') as response:\n"
-        "    print(response.status, response.getheader('content-type'), response.read())\n"
-    )
-
-    assert result.returncode == 0
-    assert result.stdout == b"200 application/json b'{\"items\":[]}'\n"
-    assert result.network_requests[0].matched
 
 
 def test_http_routes_support_methods_globs_and_validation() -> None:
@@ -254,15 +187,15 @@ def test_invalid_limits_are_rejected_before_native_conversion() -> None:
         shellsim.Context().Environment(shellsim.Limits(), cpu=1)
 
 
-def test_mount_reports_skips_and_runs_python_from_trusted_tree(tmp_path) -> None:
+def test_mount_reports_skips_and_runs_shell_from_trusted_tree(tmp_path) -> None:
     (tmp_path / ".venv").mkdir()
     (tmp_path / ".venv" / "config").write_text("secret")
-    (tmp_path / "helper.py").write_text("answer = 42\n")
-    (tmp_path / "main.py").write_text("from helper import answer\nprint(answer)\n")
+    (tmp_path / "helper.sh").write_text("answer=42\n")
+    (tmp_path / "main.sh").write_text('source /work/helper.sh; printf "%s\\n" "$answer"\n')
     environment = shellsim.Context().Environment()
 
     report = environment.mount(tmp_path)
-    result = environment.run("cd /work; python3.14 main.py")
+    result = environment.run("cd /work; bash main.sh")
 
     assert report.files == 2
     assert report.skipped_directories == (".venv",)
@@ -285,15 +218,6 @@ def test_failed_mount_rolls_back_all_files(tmp_path) -> None:
         environment.read_file("/work/kept.txt")
 
 
-def test_deep_python_source_is_contained_by_the_worker_stack() -> None:
-    environment = shellsim.Context().Environment()
-    source = "value = " + "(" * 300 + "1" + ")" * 300 + "\n"
-    environment.write_file("/work/deep.py", source)
-
-    result = environment.run("python3.14 /work/deep.py")
-
-    assert result.returncode != 0
-    assert result.stderr
 
 
 def test_run_releases_the_python_interpreter_lock() -> None:
@@ -311,7 +235,7 @@ def test_run_releases_the_python_interpreter_lock() -> None:
     assert started.wait(timeout=1)
     before = counter[0]
     try:
-        result = shellsim.run("python3.14 -c 'for value in range(20000): value * value'")
+        result = shellsim.run("i=0; while [ $i -lt 20000 ]; do i=$((i + 1)); done", cpu=100_000_000)
     finally:
         stopped.set()
         thread.join(timeout=1)

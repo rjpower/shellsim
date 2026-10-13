@@ -18,16 +18,11 @@ fn handle(session: &mut HarnessSession, operation: HarnessOperation) -> Value {
 }
 
 fn start_call(session: &mut HarnessSession, command_prefix: &str) -> u64 {
-    let guest = r#"import json
-from urllib.request import Request, urlopen
-request = Request("http://host.shellsim/tools", data=json.dumps({"tool": "workspace.read_file", "arguments": {"path": "/work/answer.txt"}}).encode(), headers={"Content-Type": "application/json"})
-with urlopen(request) as response:
-    print(json.loads(response.read().decode())["result"]["text"])
-"#;
+    let guest = r#"curl -s -X POST -H 'Content-Type: application/json' --data '{"tool":"workspace.read_file","arguments":{"path":"/work/answer.txt"}}' http://host.shellsim/tools | jq -r .result.text"#;
     let started = handle(
         session,
         HarnessOperation::StartExecute {
-            source: format!("{command_prefix}python3.14 -c '{guest}'"),
+            source: format!("{command_prefix}{guest}"),
             stdin_base64: String::new(),
             stdin_closed: true,
         },
@@ -51,7 +46,7 @@ fn poll(session: &mut HarnessSession, action_id: u64) -> Value {
 }
 
 #[test]
-fn python_guest_calls_host_tool_without_host_network() {
+fn guest_calls_host_tool_without_host_network() {
     let mut session =
         HarnessSession::with_clock_and_host_tools(Limits::default(), ClockMode::Virtual);
     let action_id = start_call(&mut session, "");
@@ -184,15 +179,15 @@ fn ungranted_guest_cannot_call_host_tools() {
     let result = handle(
         &mut session,
         HarnessOperation::Execute {
-            source: "python3.14 -c 'from urllib.request import Request, urlopen; from urllib.error import URLError;\ntry:\n    urlopen(Request(\"http://host.shellsim/tools\", data=b\"{}\"))\nexcept URLError:\n    print(\"ungranted\")'".into(),
+            source: "curl -fsS -X POST --data '{}' http://host.shellsim/tools".into(),
             stdin_base64: String::new(),
         },
     );
-    assert_eq!(result["result"]["outcome"]["exit_status"], 0);
+    assert_ne!(result["result"]["outcome"]["exit_status"], 0);
     assert_eq!(
         STANDARD
             .decode(result["result"]["stdout_base64"].as_str().unwrap())
             .unwrap(),
-        b"ungranted\n"
+        b""
     );
 }

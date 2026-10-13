@@ -1879,35 +1879,6 @@ impl Interp {
         if let Some(status) = self.termination_status() {
             return (self.outcome(status), out, err);
         }
-        // A no-argument `python` command transfers the foreground session to the minimal REPL.
-        // Keep feeding later actions to it until `exit()`/`quit()` returns control to the shell.
-        if let Some(mut repl) = self.python_repl.take() {
-            let cpu_before = self.resources.cpu_used();
-            let disk_before = self.vfs.disk_used();
-            let output_remaining = self.resources.output_remaining();
-            let (code, stay) =
-                crate::python::run_repl_line(self, &mut repl, src, &mut out, &mut err);
-            if stay && !self.resources.is_stopped() {
-                self.python_repl = Some(repl);
-            }
-            let produced = out.len().saturating_add(err.len()) as u64;
-            if produced > output_remaining {
-                let allowed_out = out.len().min(output_remaining as usize);
-                out.truncate(allowed_out);
-                let remaining = output_remaining.saturating_sub(allowed_out as u64) as usize;
-                err.truncate(err.len().min(remaining));
-            }
-            let _ = self.resources.charge_output(produced);
-            self.cmd_trace.record("python:repl");
-            self.resources.record_command(
-                "python:repl",
-                cpu_before,
-                disk_before,
-                self.vfs.disk_used(),
-            );
-            self.last_status = code;
-            return (self.outcome(code), out, err);
-        }
         let code = match self.parse_shell_action(src) {
             Ok(ast) => crate::exec::exec(self, &ast, stdin, &mut out, &mut err),
             Err((status, diagnostic)) => {

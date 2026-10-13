@@ -1,7 +1,6 @@
 use shellsim::clock::{DEFAULT_EPOCH_UTC_NS, NANOS_PER_MILLISECOND, NANOS_PER_SECOND};
 use shellsim::resources::Limits;
 use shellsim::Environment;
-use std::process::Command;
 
 fn run(environment: &mut Environment, source: &str) -> (i32, String, String) {
     let (outcome, stdout, stderr) = environment.run_script_capture(source);
@@ -72,24 +71,14 @@ fn caught_signal_during_foreground_child_retries_the_child_wait() {
 }
 
 #[test]
-fn cpu_bound_python_processes_yield_between_bytecode_quanta() {
+fn cpu_bound_shell_processes_yield_between_command_quanta() {
     let mut environment = Environment::with_limits(Limits {
         cpu: 100_000_000,
         memory: 256 * 1024 * 1024,
         ..Limits::default()
     });
-    let source = r#"python3 -c "def run(value):
-    i = 0
-    while i < 100:
-        open('/trace', 'a').write(value)
-        i += 1
-run('a')" &
-python3 -c "def run(value):
-    i = 0
-    while i < 100:
-        open('/trace', 'a').write(value)
-        i += 1
-run('b')" &
+    let source = r#"(i=0; while [ "$i" -lt 100 ]; do printf a >> /trace; i=$((i + 1)); done) &
+(i=0; while [ "$i" -lt 100 ]; do printf b >> /trace; i=$((i + 1)); done) &
 wait"#;
     assert_eq!(
         run(&mut environment, source),
@@ -204,154 +193,6 @@ fn nested_timeout_uses_the_earliest_monotonic_deadline() {
 }
 
 #[test]
-fn python_time_observes_the_same_wall_and_monotonic_clocks() {
-    let mut environment = Environment::new();
-    let source = r#"import time
-print(time.time_ns())
-print(time.monotonic_ns())
-time.sleep(0.0015)
-print(time.time_ns())
-print(time.monotonic_ns())"#;
-    assert_eq!(
-        run(&mut environment, &format!("python3.14 -c '{}'", source)),
-        (
-            0,
-            "1735689600000000000\n0\n1735689600001500000\n1500000\n".into(),
-            String::new(),
-        )
-    );
-}
-
-#[test]
-fn python_sleeps_suspend_their_process_on_the_shared_scheduler() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import time\ndef sleeper():\n    time.sleep(2)\n    print(\"two\")\nsleeper()' & python3.14 -c 'import time\ndef sleeper():\n    time.sleep(1)\n    print(\"one\")\nsleeper()' & wait",
-        ),
-        (0, "one\ntwo\n".into(), String::new())
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-    assert_eq!(environment.clock.slept_ns(), 3 * NANOS_PER_SECOND);
-}
-
-#[test]
-fn python_popen_waits_suspend_on_their_own_children() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sleep\", \"2\"])\nprint(\"two\", process.wait(), time.monotonic())' & python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sleep\", \"1\"])\nprint(\"one\", process.wait(), time.monotonic())' & wait",
-        ),
-        (
-            0,
-            "one 0 1.0\ntwo 0 2.0\n".into(),
-            String::new()
-        )
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-    assert_eq!(environment.clock.slept_ns(), 3 * NANOS_PER_SECOND);
-}
-
-#[test]
-fn python_communicate_retries_on_duplex_child_activity() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import subprocess\nimport time\ndata = b\"x\" * 100000\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 2; cat\"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)\nstdout, stderr = process.communicate(data)\nprint(\"cat\", process.returncode, len(stdout), stdout == data, time.monotonic())' & python3.14 -c 'import time\ntime.sleep(1)\nprint(\"one\")' & wait",
-        ),
-        (
-            0,
-            "one\ncat 0 100000 True 2.0\n".into(),
-            String::new()
-        )
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-}
-
-#[test]
-fn python_pipe_streams_suspend_on_exact_descriptor_readiness() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 2; printf read\"], stdout=subprocess.PIPE)\nprint(process.stdout.read(), process.wait(), time.monotonic())' & python3.14 -c 'import subprocess\nimport time\ndata = b\"x\" * 100000\nprocess = subprocess.Popen([\"sh\", \"-c\", \"sleep 1; cat >/dev/null\"], stdin=subprocess.PIPE)\nwritten = process.stdin.write(data)\nprocess.stdin.close()\nprint(\"wrote\", written, process.wait(), time.monotonic())' & wait",
-        ),
-        (
-            0,
-            "wrote 100000 0 1.0\nb'read' 0 2.0\n".into(),
-            String::new()
-        )
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-}
-
-#[test]
-fn python_subprocess_deadlines_race_child_progress_cooperatively() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import subprocess\nimport time\nfrom subprocess import TimeoutExpired\nprocess = subprocess.Popen([\"sleep\", \"10\"], stdin=subprocess.PIPE, stdout=subprocess.PIPE)\ntry:\n    process.communicate(b\"x\" * 100000, timeout=2)\nexcept TimeoutExpired:\n    print(\"timeout\", process.poll(), time.monotonic())\nprocess.kill()\nstdout, stderr = process.communicate()\nprint(\"done\", process.returncode, stdout, time.monotonic())' & python3.14 -c 'import time\ntime.sleep(1)\nprint(\"one\")' & wait",
-        ),
-        (
-            0,
-            "one\ntimeout None 2.0\ndone -9 b'' 2.0\n".into(),
-            String::new()
-        )
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-    assert_eq!(environment.clock.pending_len(), 0);
-}
-
-#[test]
-fn python_wait_deadlines_cancel_on_completion_and_fire_on_timeout() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "python3.14 -c 'import subprocess\nimport time\nprocess = subprocess.Popen([\"sleep\", \"1\"])\nprint(\"fast\", process.wait(timeout=10), time.monotonic())' & python3.14 -c 'import subprocess\nimport time\nfrom subprocess import TimeoutExpired\nprocess = subprocess.Popen([\"sleep\", \"10\"])\ntry:\n    process.wait(timeout=2)\nexcept TimeoutExpired:\n    print(\"slow\", process.poll(), time.monotonic())\nprocess.kill()\nprint(process.wait(), time.monotonic())' & wait",
-        ),
-        (
-            0,
-            "fast 0 1.0\nslow None 2.0\n-9 2.0\n".into(),
-            String::new()
-        )
-    );
-    assert_eq!(environment.clock.monotonic_ns(), 2 * NANOS_PER_SECOND);
-    assert_eq!(environment.clock.pending_len(), 0);
-}
-
-#[test]
-fn timeout_terminates_a_scheduler_blocked_python_process() {
-    let mut environment = Environment::new();
-    assert_eq!(
-        run(
-            &mut environment,
-            "timeout 1 python3.14 -c 'import time; time.sleep(10); print(\"late\")'; echo status:$?",
-        ),
-        (0, "status:124\n".into(), String::new())
-    );
-    assert_eq!(environment.clock.monotonic_ns(), NANOS_PER_SECOND);
-    assert_eq!(environment.clock.pending_len(), 0);
-}
-
-#[test]
-fn process_time_is_cpu_fuel_and_does_not_advance_monotonic_time() {
-    let mut environment = Environment::new();
-    let (_, stdout, stderr) = run(
-        &mut environment,
-        "python3.14 -c 'import time; print(time.process_time_ns() > 0)'",
-    );
-    assert_eq!(stdout, "True\n");
-    assert!(stderr.is_empty());
-    assert_eq!(environment.clock.monotonic_ns(), 0);
-    assert!(environment.resources.process_time_ns() > 0);
-}
-
-#[test]
 fn deterministic_identifiers_do_not_consume_time() {
     let mut environment = Environment::new();
     assert_eq!(
@@ -387,29 +228,6 @@ fn wall_clock_adjustment_does_not_move_monotonic_time() {
         "2025-01-01 01:00:00\n"
     );
     assert_eq!(environment.clock.monotonic_ns(), 0);
-}
-
-#[test]
-fn python_time_clock_contract_matches_cpython() {
-    let source = r#"import time
-wall = time.time()
-wall_ns = time.time_ns()
-mono = time.monotonic_ns()
-cpu = time.process_time_ns()
-time.sleep(0.000001)
-print(wall > 0, wall_ns > 0, time.monotonic_ns() >= mono, time.perf_counter() >= 0, time.process_time_ns() >= cpu)"#;
-    let mut environment = Environment::new();
-    let simulated = run(&mut environment, &format!("python3.14 -c '{}'", source));
-    assert_eq!(
-        simulated,
-        (0, "True True True True True\n".into(), String::new(),)
-    );
-
-    if let Ok(reference) = Command::new("python3.14").arg("-c").arg(source).output() {
-        assert_eq!(simulated.0, reference.status.code().unwrap_or(1));
-        assert_eq!(simulated.1.as_bytes(), reference.stdout);
-        assert_eq!(simulated.2.as_bytes(), reference.stderr);
-    }
 }
 
 #[test]

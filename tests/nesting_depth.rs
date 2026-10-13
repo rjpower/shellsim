@@ -29,18 +29,8 @@ fn run_on_small_stack(source: String) -> (i32, String, String) {
 
 #[test]
 fn ordinary_script_fits_the_small_test_stack() {
-    let (status, stdout, _) = run_on_small_stack("echo ok; python3 -c 'print(1)'".into());
+    let (status, stdout, _) = run_on_small_stack("echo ok; printf '1\\n'".into());
     assert_eq!((status, stdout.as_str()), (0, "ok\n1\n"));
-}
-
-fn python(source: &str) -> String {
-    format!("python3 -c '{}'", source.replace('\'', "'\\''"))
-}
-
-fn deep_list_python(tail: &str) -> String {
-    python(&format!(
-        "x = []\nfor _ in range({DEEP}):\n    x = [x]\n{tail}"
-    ))
 }
 
 /// Inputs nested past every limit, with the stderr fragment that names the explicit failure.
@@ -106,52 +96,6 @@ fn rejected_cases() -> Vec<(&'static str, String, &'static str)> {
             format!("awk 'BEGIN {{ print {}1 }}'", "1+".repeat(DEEP)),
             "nested too deeply",
         ),
-        (
-            "python unary chain",
-            python(&format!("x = {}1", "-".repeat(DEEP))),
-            "nesting limit exceeded",
-        ),
-        (
-            "python not chain",
-            python(&format!("x = {}1", "not ".repeat(DEEP))),
-            "nesting limit exceeded",
-        ),
-        (
-            "python power chain",
-            python(&format!("x = {}1", "1 ** ".repeat(DEEP))),
-            "nesting limit exceeded",
-        ),
-        (
-            "python + chain",
-            python(&format!("x = {}1", "1 + ".repeat(DEEP))),
-            "nesting limit exceeded",
-        ),
-        (
-            "python call chain",
-            python(&format!("f = lambda: f\nx = f{}", "()".repeat(DEEP))),
-            "nesting limit exceeded",
-        ),
-        (
-            "python elif chain",
-            python(&format!(
-                "x = 1\nif x == 0: pass\n{}",
-                "elif x == 0: pass\n".repeat(DEEP)
-            )),
-            "nesting limit exceeded",
-        ),
-        ("python repr", deep_list_python("repr(x)"), "RecursionError"),
-        (
-            "python f-string",
-            deep_list_python("f\"{x}\""),
-            "RecursionError",
-        ),
-        (
-            "python str of dict",
-            python(&format!(
-                "x = {{}}\nfor _ in range({DEEP}):\n    x = {{1: x}}\nstr(x)"
-            )),
-            "RecursionError",
-        ),
     ]
 }
 
@@ -165,14 +109,6 @@ fn deep_nesting_fails_explicitly_on_a_small_stack() {
             "{name}: expected {expected:?} in stderr {stderr:?}"
         );
     }
-}
-
-#[test]
-fn deep_repr_raises_a_catchable_recursion_error() {
-    let source =
-        deep_list_python("try:\n    repr(x)\nexcept RecursionError:\n    print(\"caught\")");
-    let (status, stdout, stderr) = run_on_small_stack(source);
-    assert_eq!((status, stdout.as_str()), (0, "caught\n"), "{stderr}");
 }
 
 /// Nesting just inside the limits still works when the stack is small, so the limits are not a
@@ -189,12 +125,6 @@ fn nesting_within_limits_succeeds_on_a_small_stack() {
         (
             format!("awk 'BEGIN {{ print {}1 }}'", "1+".repeat(900)),
             "901\n",
-        ),
-        (python(&format!("print({}1)", "1 + ".repeat(900))), "901\n"),
-        (python(&format!("print({}1)", "-".repeat(200))), "1\n"),
-        (
-            python("x = []\nfor _ in range(200):\n    x = [x]\nprint(len(repr(x)))"),
-            "402\n",
         ),
     ];
     for (source, expected) in cases {

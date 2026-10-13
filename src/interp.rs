@@ -140,8 +140,6 @@ pub struct Environment {
     pub(crate) pipe_reservations: BTreeMap<crate::descriptors::PipeId, u64>,
     /// Complete process-local contexts keyed by logical PID, with one active context.
     pub process: ProcessStates,
-    /// Parent-side endpoints retained for live subprocess handles.
-    pub(crate) live_children: BTreeMap<ProcessId, crate::process::LiveChild>,
     next_temp_id: u64,
     /// Bounded trace of external command names executed.
     pub cmd_trace: crate::telemetry::BoundedTextLog,
@@ -149,8 +147,6 @@ pub struct Environment {
     pub unsupported: crate::telemetry::BoundedTextLog,
     /// Bounded ordered command occurrences, including suspended invocations.
     pub invocations: InvocationLog,
-    /// Packages recorded by lightweight package-manager compatibility commands.
-    pub packages: std::collections::BTreeSet<String>,
     /// Terminal bytes produced by detached children after their originating action returned.
     pub(crate) pending_stdout: Vec<u8>,
     pub(crate) pending_stderr: Vec<u8>,
@@ -237,10 +233,6 @@ pub struct ProcessState {
     /// persistent input stream + cursor for `read` inside `while read…; done < file`
     pub input_stream: Vec<u8>,
     pub input_pos: usize,
-    /// A foreground Python REPL, when `python` was invoked without a program. Keeping this in
-    /// process state lets an agent enter Python in one shell action and continue it in later
-    /// actions without giving the shim access to host stdin.
-    pub python_repl: Option<crate::python::ReplState>,
     /// Unix-style descriptor map inherited by logical children.
     pub(crate) fds: FdTable,
     /// Resumable program image retained across scheduler activations.
@@ -465,7 +457,6 @@ impl ProcessState {
             uid: self.uid,
             input_stream: self.input_stream.clone(),
             input_pos: self.input_pos,
-            python_repl: None,
             fds,
             program: None,
             pending_signals: std::collections::BTreeSet::new(),
@@ -858,7 +849,6 @@ impl Environment {
                 uid: 0,
                 input_stream: Vec::new(),
                 input_pos: 0,
-                python_repl: None,
                 fds,
                 program: None,
                 pending_signals: std::collections::BTreeSet::new(),
@@ -877,12 +867,10 @@ impl Environment {
                 expansion_reserved: 0,
                 detached_output: false,
             }),
-            live_children: BTreeMap::new(),
             next_temp_id: 0,
             cmd_trace: crate::telemetry::BoundedTextLog::default(),
             unsupported: crate::telemetry::BoundedTextLog::default(),
             invocations: InvocationLog::default(),
-            packages: std::collections::BTreeSet::new(),
             pending_stdout: Vec::new(),
             pending_stderr: Vec::new(),
         };
@@ -1568,26 +1556,6 @@ impl Environment {
         )
     }
 
-    /// Create a parent-managed live child for a language-level process handle.
-    pub(crate) fn start_live_child(
-        &mut self,
-        command: &str,
-        new_shell: bool,
-        new_session: bool,
-    ) -> Result<ProcessId, String> {
-        self.create_child(
-            command,
-            new_shell,
-            false,
-            false,
-            if new_session {
-                crate::process::ChildPlacement::NewSession
-            } else {
-                crate::process::ChildPlacement::Inherit
-            },
-        )
-    }
-
     fn create_child(
         &mut self,
         command: &str,
@@ -1834,6 +1802,7 @@ impl Environment {
     }
 
     /// Resolve a descriptor belonging to a retained process without activating it.
+    #[cfg(test)]
     pub(crate) fn process_description(
         &self,
         pid: ProcessId,
@@ -1924,7 +1893,7 @@ impl Environment {
         if parent_retained {
             let _ = self.send_signal(parent_pid, Signal::Child);
         }
-        if !parent_retained && !self.live_children.contains_key(&pid) {
+        if !parent_retained {
             self.processes.reap(pid);
             let _ = self.scheduler.reap(pid);
         }
@@ -2414,15 +2383,6 @@ impl Environment {
             .map_err(|error| format!("unable to block process on descriptor: {error:?}"))
     }
 
-    /// Record a package name installed by a compatibility command.
-    pub fn install_package(&mut self, import_name: &str) {
-        let name = import_name.trim();
-        if name.is_empty() {
-            return;
-        }
-        self.packages.insert(name.to_string());
-    }
-
     /// Make the wall-clock/VFS boundary explicit immediately before a filesystem effect.
     pub fn sync_vfs_time(&mut self) {
         self.vfs.set_mutation_time(self.clock.unix_ms());
@@ -2848,11 +2808,6 @@ impl Environment {
     /// Whether this persistent shell can accept another action.
     pub fn is_terminated(&self) -> bool {
         self.resources.is_stopped() || self.exiting.is_some()
-    }
-
-    /// Whether subsequent session actions are currently interpreted by the minimal Python REPL.
-    pub fn in_python_repl(&self) -> bool {
-        self.python_repl.is_some()
     }
 
     /// Sticky terminal status after `exit`, `set -e`, or resource exhaustion.

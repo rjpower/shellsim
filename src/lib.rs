@@ -8,7 +8,6 @@
 //!   * [`resources`] — CPU, memory, disk/output limits and structured outcomes
 //!   * [`shell`] / [`expand`] / [`exec`] — bash-subset parser, word expansion, executor
 //!   * [`commands`] — native coreutils + builtins
-//!   * [`python`] — metered Python 3.14 source-to-bytecode compatibility engine
 
 // Unsafe code is confined to audited host-side seccomp and trusted Wasmtime deserialization.
 #![deny(unsafe_code)]
@@ -34,7 +33,6 @@ pub mod process;
 pub mod profile;
 mod program;
 pub mod pseudo_fs;
-pub mod python;
 pub mod realtime;
 pub mod resources;
 pub mod sandbox;

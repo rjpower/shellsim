@@ -134,8 +134,6 @@ fn run_system_from_legacy(
 /// Result of starting a command from a resumable shell continuation.
 pub(crate) enum CommandPoll {
     Ready(i32),
-    /// A command consumed one bounded work quantum and remains runnable.
-    Yielded(CommandResume),
     /// A resumed command completed with buffered output for normal descriptor flushing.
     ReadyOutput {
         command: String,
@@ -173,17 +171,6 @@ pub(crate) enum CommandResume {
         remaining: std::collections::VecDeque<ChildCommand>,
         status: i32,
         stop_on_error: bool,
-    },
-    Python {
-        command: String,
-        continuation: Box<crate::python::PythonContinuation>,
-    },
-    /// `python -`/bare `python`: draining fd 0 to EOF to obtain the program source before it can
-    /// be compiled and started as a [`CommandResume::Python`] continuation.
-    PythonSource {
-        argv: Vec<String>,
-        buffer: Vec<u8>,
-        reserved: u64,
     },
 }
 
@@ -705,36 +692,6 @@ pub(crate) fn resume(interp: &mut Interp, continuation: CommandResume) -> Comman
                 },
             ),
         },
-        CommandResume::Python {
-            command,
-            mut continuation,
-        } => match continuation.poll(interp) {
-            crate::python::PythonPoll::Ready(status) => {
-                let (stdout, stderr) = (*continuation).into_output();
-                CommandPoll::ReadyOutput {
-                    command,
-                    status,
-                    stdout,
-                    stderr,
-                }
-            }
-            crate::python::PythonPoll::Runnable => CommandPoll::Yielded(CommandResume::Python {
-                command,
-                continuation,
-            }),
-            crate::python::PythonPoll::Blocked(reason) => CommandPoll::Blocked(
-                reason,
-                CommandResume::Python {
-                    command,
-                    continuation,
-                },
-            ),
-        },
-        CommandResume::PythonSource {
-            argv,
-            buffer,
-            reserved,
-        } => proc::resume_python_source(interp, argv, buffer, reserved),
     };
     finish_ready_invocation(interp, &result);
     result
@@ -927,7 +884,7 @@ fn dispatch(
         interp
             .resources
             .record_command(cmd, cpu_before, disk_before, interp.vfs.disk_used());
-        if !matches!(result, CommandPoll::Switched(_) | CommandPoll::Yielded(_)) {
+        if !matches!(result, CommandPoll::Switched(_)) {
             if let Some(reason) = interp.resources.stop_reason() {
                 result = CommandPoll::Ready(reason.exit_status());
             }
@@ -1003,8 +960,7 @@ fn dispatch(
 fn finish_ready_invocation(interp: &mut Interp, result: &CommandPoll) {
     let status = match result {
         CommandPoll::Ready(status) | CommandPoll::ReadyOutput { status, .. } => *status,
-        CommandPoll::Yielded(_)
-        | CommandPoll::Blocked(_, _)
+        CommandPoll::Blocked(_, _)
         | CommandPoll::Switched(_)
         | CommandPoll::Inline(_)
         | CommandPoll::InlineSource(_) => return,

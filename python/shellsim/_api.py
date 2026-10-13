@@ -534,8 +534,8 @@ class Environment:
     ) -> RunResult:
         """Execute Python source directly in this environment.
 
-        An explicitly mounted CPython bundle runs this source through its real WASI interpreter.
-        Otherwise the shellsim Python VM runs it. Filesystem and resource state persist.
+        Select CPython with ``Context.Environment(pypi_packages=())`` or mount a
+        CPython release first. Filesystem and resource state persist.
         """
 
         if not isinstance(source, str):
@@ -546,14 +546,9 @@ class Environment:
         if not all(isinstance(argument, str) for argument in arguments):
             raise TypeError("argv must be a sequence of str")
         input_bytes = _as_bytes("stdin", stdin)
-        if self._cpython_runtime is not None:
-            return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
-        metadata, stdout, stderr = self._native.run_python(
-            source,
-            arguments,
-            input_bytes,
-        )
-        return _decode_result(metadata, stdout, stderr)
+        if self._cpython_runtime is None:
+            raise SimulationError("select CPython with Context.Environment(pypi_packages=())")
+        return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
 
     def write_file(
         self,
@@ -640,17 +635,10 @@ class Environment:
         )
 
     def install_pypi(self, requirement: Union[str, Sequence[str]]) -> None:
-        """Install packages for the mounted CPython or the default shellsim Python VM.
-
-        The default VM path resolves with host uv and can build source distributions
-        on the host. A mounted dynamic CPython uses its explicit WASI universe.
-        """
-        if self._cpython_runtime is not None:
-            self._cpython_runtime.install_pypi(self, requirement)
-            return
-        from .pypi import install_pypi
-
-        install_pypi(self, requirement)
+        """Install packages into the mounted CPython WASI runtime."""
+        if self._cpython_runtime is None:
+            raise SimulationError("select CPython with Context.Environment(pypi_packages=())")
+        self._cpython_runtime.install_pypi(self, requirement)
 
     def install_lock(
         self,

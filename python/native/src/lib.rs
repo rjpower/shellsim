@@ -630,31 +630,6 @@ impl NativeEnvironment {
         ))
     }
 
-    /// Execute Python source directly without passing it through the shell parser.
-    fn run_python(
-        &self,
-        py: Python<'_>,
-        source: String,
-        argv: Vec<String>,
-        stdin: Vec<u8>,
-    ) -> PyResult<(String, Py<PyBytes>, Py<PyBytes>)> {
-        let (metadata, stdout, stderr) = py
-            .detach(|| {
-                let mut environment = self.lock_environment()?;
-                on_worker(&mut environment, move |environment| {
-                    Ok(run_python_action(environment, source, argv, stdin))
-                })
-            })
-            .map_err(SimulationError::new_err)?;
-        let metadata = serde_json::to_string(&metadata)
-            .map_err(|error| SimulationError::new_err(error.to_string()))?;
-        Ok((
-            metadata,
-            PyBytes::new(py, &stdout).unbind(),
-            PyBytes::new(py, &stderr).unbind(),
-        ))
-    }
-
     /// Write one byte string into the simulated filesystem.
     fn write_file(&self, py: Python<'_>, path: String, data: Vec<u8>, mode: u32) -> PyResult<()> {
         py.detach(|| {
@@ -853,28 +828,6 @@ fn run_action(
     (metadata_finish(environment, outcome, start), stdout, stderr)
 }
 
-fn run_python_action(
-    environment: &mut shellsim::Environment,
-    source: String,
-    arguments: Vec<String>,
-    stdin: Vec<u8>,
-) -> (RunMetadata, Vec<u8>, Vec<u8>) {
-    let start = metadata_start(environment);
-    let mut argv = vec!["python3.14".to_string(), "-c".to_string(), source];
-    argv.extend(arguments);
-    let mut stdout = Vec::new();
-    let mut stderr = Vec::new();
-    let status = shellsim::exec::exec(
-        environment,
-        &shellsim::shell::Node::ArgvCommand(argv),
-        stdin,
-        &mut stdout,
-        &mut stderr,
-    );
-    let outcome = environment.outcome(status);
-    (metadata_finish(environment, outcome, start), stdout, stderr)
-}
-
 fn metadata_start(environment: &shellsim::Environment) -> MetadataStart {
     MetadataStart {
         command: environment.cmd_trace.len(),
@@ -977,12 +930,6 @@ fn panic_suffix(payload: &(dyn Any + Send)) -> String {
     }
 }
 
-/// Query the fixed Python module registry without running guest code.
-#[pyfunction]
-fn is_bundled_python_module(name: &str) -> bool {
-    shellsim::python::is_bundled_python_module(name)
-}
-
 /// Compile host-provided binary Wasm without running it. Retain the result as trusted native code.
 #[pyfunction]
 #[pyo3(signature = (source, executable=false))]
@@ -1083,7 +1030,6 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeEnvironment>()?;
     module.add_class::<NativeImage>()?;
     module.add_class::<NativeContainer>()?;
-    module.add_function(wrap_pyfunction!(is_bundled_python_module, module)?)?;
     module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
     module.add_function(wrap_pyfunction!(precompiled_wasm_build_id, module)?)?;
     module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;

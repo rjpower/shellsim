@@ -91,24 +91,6 @@ impl Environment {
             deadline.saturating_sub(anchor.elapsed_virtual_ns()),
         ))
     }
-
-    /// Wait for virtual time to reach `deadline` from code that cannot yield to the scheduler.
-    /// Virtual machines jump the clock; real-time machines sleep the host thread first.
-    pub(crate) fn wait_for_time(&mut self, deadline: u64) -> Result<(), String> {
-        if let Some(anchor) = self.real_time {
-            let now = anchor.elapsed_virtual_ns();
-            if deadline > now {
-                std::thread::sleep(Duration::from_nanos(deadline - now));
-            }
-            self.sync_host_time()?;
-        }
-        if deadline > self.clock.monotonic_ns() {
-            self.clock
-                .advance_to(deadline)
-                .map_err(|error| error.to_string())?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]

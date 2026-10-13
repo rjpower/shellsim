@@ -352,8 +352,6 @@ pub(crate) fn try_exec_script(
     // `#!` line.
     let mut argv = if data.starts_with(b"\0asm") {
         vec![path.to_string()]
-    } else if first == b"#!shellsim-python" {
-        vec!["/usr/bin/python3.14".to_string()]
     } else if first.starts_with(b"#!") {
         let Ok(line) = std::str::from_utf8(first) else {
             ewln(err, &format!("{path}: unsupported script interpreter"));
@@ -435,7 +433,7 @@ pub const KNOWN_COMMANDS: &[&str] = &[
     "envsubst",
     "export",
     "python3",
-    "python3.14",
+    "python3.13",
     "python",
     "jq",
     "base64",

@@ -261,7 +261,7 @@ fn interactive_shell(mut machine: MachineOptions, args: &[String]) -> ! {
 
     loop {
         // Python prints its own trailing `>>> ` prompt as part of each foreground action.
-        if show_prompt && !env.in_python_repl() {
+        if show_prompt {
             let _ = write!(stdout, "shellsim:{}$ ", env.cwd);
             let _ = stdout.flush();
         }

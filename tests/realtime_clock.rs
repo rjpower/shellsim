@@ -42,19 +42,6 @@ fn real_time_shell_sleep_waits_for_physical_time() {
 }
 
 #[test]
-fn real_time_python_sleep_waits_for_physical_time() {
-    let mut environment = real_time();
-    let started = Instant::now();
-    let (outcome, stdout, stderr) = environment
-        .run_script_capture("python3 -c 'import time; time.sleep(0.05); print(\"done\")'");
-    assert_eq!(
-        (outcome.exit_status, stdout, stderr),
-        (0, b"done\n".to_vec(), Vec::new())
-    );
-    assert!(started.elapsed() >= NAP);
-}
-
-#[test]
 fn real_time_clock_reads_follow_physical_time() {
     let mut environment = real_time();
     std::thread::sleep(NAP);

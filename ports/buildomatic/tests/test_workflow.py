@@ -174,10 +174,10 @@ def test_check_dependencies_build_only_when_checks_are_requested(tmp_path, monke
     value = json.loads(path.read_text())
     value["test_dependencies"] = [{"port": "python/checker", "version": "1"}]
     value["tests"] = [
-        {"kind": "python", "script": "probe.py", "files": [{"source": "input.txt", "destination": "input.txt"}]}
+        {"kind": "shell", "script": "probe.sh", "files": [{"source": "input.txt", "destination": "input.txt"}]}
     ]
     path.write_text(json.dumps(value))
-    (path.parent / "probe.py").write_text('print(int(open("/work/input.txt").read()))\n')
+    (path.parent / "probe.sh").write_text("cat /work/input.txt\n")
     (path.parent / "input.txt").write_text("42\n")
     store = StorageStore(str(tmp_path / "canonical"))
     backend = LocalBackend(store, state / "execution")
@@ -198,7 +198,7 @@ def test_check_dependencies_build_only_when_checks_are_requested(tmp_path, monke
     with monkeypatch.context() as guarded:
         guarded.setattr(LocalBackend, "submit", reject)
         run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
-    (path.parent / "probe.py").write_text('print(int(open("/work/input.txt").read()) + 1)\n')
+    (path.parent / "probe.sh").write_text('value=$(cat /work/input.txt); printf "%s\\n" "$((value + 1))"\n')
     updated = run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
     assert updated.records[check.reference]["stdout"] == "43\n"
     (path.parent / "input.txt").write_text("43\n")

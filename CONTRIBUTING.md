@@ -5,7 +5,7 @@ compatibility gap, or strengthen a safety boundary. Please open an issue before 
 or a speculative refactor.
 
 Read [docs/implementation.md](docs/implementation.md) before adding a command or machine capability,
-and [docs/python.md](docs/python.md) before changing the Python runtime or native modules.
+and [docs/python.md](docs/python.md) before changing CPython integration or Python ports.
 
 This workflow adapts the contribution discipline used by
 [Marin](https://github.com/marin-community/marin/blob/main/docs/dev-guide/contributing.md) and its
@@ -40,8 +40,7 @@ make lint
 
 It checks Rust and Python formatting, runs clippy over every target and feature with warnings
 denied, builds rustdoc with warnings denied, and rejects staged or unstaged whitespace errors.
-The Python checks cover repository tooling, the PyPI package, and portable Python source suites,
-but not corpus inputs or simulated stdlib sources. Apply safe formatting fixes with:
+The Python checks cover repository tooling, the PyPI package and ports. Apply safe formatting fixes with:
 
 ```sh
 make format
@@ -72,7 +71,7 @@ interfaces; reserve unit tests for behavior difficult to exercise or diagnose th
 Run the narrowest useful test while editing:
 
 ```sh
-cargo test --test python stdlib_differential
+cargo test --test wasm_wasi
 ```
 
 Before requesting review, run all safe tests through the same entrypoint as CI:
@@ -105,26 +104,16 @@ not a checklist of layers to cover:
 2. Put command behavior in the plainly named module under `tests/commands/`. These modules share
    one integration-test crate to avoid compiling and linking one harness per command. Put
    cross-command shell behavior in the relevant top-level integration suite.
-3. Put Python behavior that needs Rust-side setup or observations in the plainly named module
-   under `tests/python/`. These modules share the `tests/python.rs` integration-test crate.
-4. Put portable Python semantics in a `tests/python/test_*.py` source suite. Register each suite
-   explicitly in `tests/python/source_suites.rs` so shellsim always runs it and CPython 3.14 checks
-   it when available.
-5. Put large differential and reduced real-task inputs under `tests/python/corpus/`.
-6. Put portable NumPy and SciPy semantics in a per-area `tests/python/numpy/test_*.py` or
-   `tests/python/scipy/test_*.py` pytest suite and register it in
-   `tests/python/scientific_suites.rs`. Each expectation must hold under the releases pinned in
-   `tests/python/scientific-requirements.txt`: compare computed values with a tolerance, and check
-   exception and warning types rather than message text. `infra/scientific-reference.py` builds
-   that environment, runs the suites, and prints the `SHELLSIM_SCIENTIFIC_PYTHON` export that
-   makes `cargo test` repeat the check.
+3. Put CPython/WASI integration regressions under `tests/python_package/`. Use a source-built
+   runtime bundle for guest execution; keep package-specific build and guest checks in the
+   corresponding ports recipe.
 
 Cover relevant malformed input, limits, and unsupported behavior when the change can break those
 boundaries. Reuse existing cases rather than multiplying coverage at each layer. Compare
 compatibility surfaces with CPython or coreutils where practical.
 
 Tests for the installed Python package live under `tests/python_package/`. Tests for repository
-Python tools live under `tests/tooling/`; neither belongs in the simulated Python source suites.
+Python tools live under `tests/tooling/`.
 
 Never make a test depend on host wall time, locale, network state, filesystem contents, or hash-map
 iteration order.
