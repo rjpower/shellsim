@@ -1,14 +1,13 @@
 # Buildomatic worker image
 
 Ubuntu supplies ordinary build tools; uv supplies Python generators and Shellsim
-for guest checks. SDKs and products stay in the canonical store. Build the host
-wheel in Ubuntu 24.04 with Cargo/uv caches mounted, then use cached Docker layers.
-Run the first command inside that environment:
+for guest checks. SDKs and products stay in the canonical store. Build from the
+repository root; the image builds its Shellsim wheel with cached Cargo and uv inputs.
 
 ```sh
-CARGO_PROFILE_DEV_OPT_LEVEL=1 uv run --with maturin maturin build --profile dev --strip --out ports/buildomatic/images/wheels
 docker buildx build --push --platform linux/amd64 \
-  --tag ghcr.io/marin-community/iris-task:buildomatic-0.1.35-ports ports/buildomatic/images
+  --tag ghcr.io/marin-community/iris-task:buildomatic \
+  --file ports/buildomatic/images/Dockerfile .
 ```
 
 Pin the returned digest in `IrisConfig`. Its `setup_scripts` should install the

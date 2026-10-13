@@ -1,0 +1,8 @@
+.git
+.venv
+.worktrees
+build
+target
+scratch
+**/__pycache__
+ports/buildomatic/images/wheels
