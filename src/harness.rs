@@ -706,7 +706,7 @@ impl HarnessSession {
 
     /// Clone the complete deterministic machine state for a branching evaluation.
     ///
-    /// Unlike a workspace checkpoint, a fork includes shell and Python state, descriptors and
+    /// Unlike a workspace checkpoint, a fork includes process state, descriptors and
     /// pipe contents, logical processes, scheduler queues, timers, virtual-network fixtures,
     /// telemetry, and resource counters. The estimate is checked before the host allocation;
     /// each returned session subsequently owns and enforces an independent copy of its limits.
@@ -1021,14 +1021,6 @@ impl HarnessSession {
 
         if let Some(status) = self.environment.termination_status() {
             action.complete(&self.environment, status);
-        } else if self.environment.in_python_repl() {
-            let (outcome, stdout, stderr) = self
-                .environment
-                .run_script_capture_with_stdin(source, stdin);
-            action.stdout = stdout;
-            action.stderr = stderr;
-            action.complete(&self.environment, outcome.exit_status);
-            action.outcome = Some(outcome);
         } else {
             match self.environment.parse_shell_action(source) {
                 Ok(node) => {
@@ -1824,17 +1816,7 @@ mod tests {
     }
 
     #[test]
-    fn session_forks_deep_clone_python_heaps_and_reject_large_workspaces() {
-        let mut original = HarnessSession::new(Limits::default());
-        original.environment.run_script_capture("python");
-        original.environment.run_script_capture("items = [1]");
-        let mut branch = original.fork().unwrap();
-        branch.environment.run_script_capture("items.append(2)");
-        let (_, original_out, _) = original.environment.run_script_capture("print(items)");
-        let (_, branch_out, _) = branch.environment.run_script_capture("print(items)");
-        assert_eq!(String::from_utf8_lossy(&original_out), "[1]\n>>> ");
-        assert_eq!(String::from_utf8_lossy(&branch_out), "[1, 2]\n>>> ");
-
+    fn session_forks_reject_large_workspaces() {
         let mut oversized = HarnessSession::new(Limits::default());
         oversized
             .environment

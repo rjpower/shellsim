@@ -64,18 +64,13 @@ Pull requests run a small reviewed gold corpus. Larger frozen corpora may run in
 Live source discovery must remain separate from gating CI. Promote candidates only after their
 fixtures, dependencies, license, and expected behavior have been reviewed.
 
-The current Python baseline remains the 100-case TaskTrove differential corpus under
-`tests/python/corpus/tasktrove`. All 100 cases are expected to match checked CPython 3.14 output.
-The compatibility runner adds reviewed suites without replacing that unchanged-source test:
+The stock environment has no Python installation. CPython task acceptance uses a mounted WASI
+runtime through `tests/python_package/test_tasktrove_cpython.py`. Shell compatibility suites include:
 
-- `micropython-basics` freezes 100 unchanged language tests with checked CPython output;
-- `python-derived` supplies small readable contracts for language composition and commonly used
-  APIs, including exact frontiers for support work;
 - `oils-spec` freezes 50 shell-specification case bodies with upstream provenance;
 - `posix-derived` supplies compact standards-oriented probes for common behavior underrepresented
   in the imported suite.
 - `whole-programs` runs maintained shell probes and configure paths while keeping broad ShellSpec
   and Modernish composition frontiers explicit.
 
-These suites measure compatibility breadth. They do not confer POSIX certification or complete
-CPython compatibility.
+These suites measure shell compatibility breadth; they do not confer POSIX certification.

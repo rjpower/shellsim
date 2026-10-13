@@ -39,11 +39,8 @@ shellsim's Rust codebase. See `CONTRIBUTING.md` for the human-facing workflow.
   exact accounting. Resource limits are safety and scheduling controls, not a profiler.
 - Prefer regression tests through an existing public or simulated interface. Add unit tests only
   for behavior that would be difficult to exercise or diagnose through a regression test.
-- Treat CPython, NumPy, SciPy and other reference libraries as behavioral references, never as
-  code to port. Implement a small public subset in shellsim's own structure: one frozen module
-  per public module, over a private native module only for elementwise or inner-loop work. Match
-  what an ordinary program relies on (values within tolerance, shapes, dtypes, exception and
-  warning types), not internal layout, error text, rounding order or random streams.
+- Run Python and native extensions through the CPython WASI ports runtime. Add packages through
+  the ports graph; do not introduce another interpreter or reimplement upstream libraries.
 
 ## Validation workflow
 
@@ -51,7 +48,7 @@ Run a narrow test while iterating, for example:
 
 ```sh
 cargo test --test time_virtualization
-cargo test python::parser
+cargo test --test wasm_wasi
 ```
 
 Before handing off a code change, run the same repository gates used by CI:

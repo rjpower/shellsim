@@ -15,17 +15,17 @@ from ports.buildomatic.workflow import run
 @pytest.fixture
 def acceptance_graph(tmp_path):
     ports, state = tmp_path / "ports", tmp_path / "state"
-    for name, source in [("good", "print(open('/work/nested/input.txt').read())\n"), ("bad", "assert False\n")]:
+    for name, source in [("good", "cat /work/nested/input.txt; printf '\\n'\n"), ("bad", "false\n")]:
         path, recipe = _wheel_port(ports, state / "execution/cache/ports", name, [])
         recipe["tests"] = [
             {
-                "kind": "python",
-                "script": "probe.py",
+                "kind": "shell",
+                "script": "probe.sh",
                 "files": [{"source": "input.txt", "destination": "nested/input.txt"}],
             }
         ]
         path.write_text(json.dumps(recipe))
-        (path.parent / "probe.py").write_text(source)
+        (path.parent / "probe.sh").write_text(source)
         (path.parent / "input.txt").write_text("42")
     store = StorageStore(str(tmp_path / "canonical"))
     backend = LocalBackend(store, state / "execution")
@@ -44,7 +44,7 @@ def test_failed_guest_retains_completed_sibling(acceptance_graph):
 def test_selected_guest_rechecks_changed_source_without_building(acceptance_graph):
     ports, state, store, backend, built = acceptance_graph
     first = run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)
-    (ports / "python/good/probe.py").write_text("print(43)\n")
+    (ports / "python/good/probe.sh").write_text("printf '43\\n'\n")
     repeat = run(ports, ["python/good"], store, state, backend, operation=Operation.CHECK)
     check = next(node for node in repeat.plan.nodes if node.operation is Operation.CHECK)
     assert repeat.records[check.reference]["stdout"] == "43\n"

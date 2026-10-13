@@ -25,13 +25,12 @@ Shellsim knows the generic envelope and suspension mechanism, not `Grader`, `Cha
 
 ## Package format and lifecycle
 
-Use a `.shl` ZIP archive as an immutable **workspace template**, not a serialized running machine. Version 1 maps `rootfs/<relative-path>` to `/work/<relative-path>`; it does not replace shellsim's built-in `/usr`, Python stdlib, process table, clock, environment, network routes, or resource counters. This matches the harness's existing `/work` file boundary and avoids pretending that a live Python or Wasm stack is portable. A snapshot of an existing `Container` is allowed only when no action, tool call, or non-shell process is live. Each instantiation creates a fresh machine, stages the validated files, installs its own host tool registry, and starts with fresh limits and usage.
+Use a `.shl` ZIP archive as an immutable **workspace template**, not a serialized running machine. Version 1 maps `rootfs/<relative-path>` to `/work/<relative-path>`; it does not replace shellsim's built-in `/usr`, process table, clock, environment, network routes, or resource counters. Packages do not include a Python installation automatically. A snapshot of an existing `Container` is allowed only when no action, tool call, or non-shell process is live. Each instantiation creates a fresh machine, stages the validated files, installs its own host tool registry, and starts with fresh limits and usage.
 
 ```text
 arithmetic-grader-0.1.0.shl
   shl.json
-  rootfs/app/grader.py
-  rootfs/app/host_tools.py
+  rootfs/app/grader.sh
   rootfs/app/private/expected.json
 ```
 
@@ -42,14 +41,14 @@ arithmetic-grader-0.1.0.shl
   "format": 1,
   "name": "arithmetic-grader",
   "version": "0.1.0",
-  "entrypoint": ["python3.14", "/work/app/grader.py"],
+  "entrypoint": ["bash", "/work/app/grader.sh"],
   "working_directory": "/work",
   "requested_clock": "virtual",
   "required_tools": ["workspace.read_file", "conversation.list", "grade.submit"],
   "limits": {"cpu": 1000000, "memory": 16777216, "disk": 16777216, "output": 65536},
   "entries": [
     {"type": "directory", "path": "app", "mode": 493},
-    {"type": "file", "path": "app/grader.py", "mode": 420, "size": 812, "sha256": "..."}
+    {"type": "file", "path": "app/grader.sh", "mode": 420, "size": 812, "sha256": "..."}
   ]
 }
 ```
@@ -64,7 +63,7 @@ The Python API makes the validated `Package` object the reusable template:
 spec = shellsim.PackageSpec(
     name="arithmetic-grader",
     version="0.1.0",
-    entrypoint=("python3.14", "/work/app/grader.py"),
+    entrypoint=("bash", "/work/app/grader.sh"),
     required_tools=("workspace.read_file", "conversation.list", "grade.submit"),
     limits=shellsim.Limits(),
 )
@@ -141,23 +140,20 @@ The host result is one JSON object under `result`:
 
 An error is `{"error":"denied"}`. The guest wrapper raises on that value. File bytes are base64 because JSON cannot carry arbitrary bytes. The host validates tool-specific arguments and results; the core validates the generic envelope, result shape, body size, and bounded pending count. No tool name appears in shellsim core. The protocol intentionally has no tool listing: package requirements are checked by the host before launch, and the guest calls only names it knows.
 
-The package can include this complete wrapper as source in `rootfs/app/host_tools.py`:
+A CPython environment can stage this wrapper as source in `/work/app/host_tools.py`:
 
 ```python
 import json
-from urllib.request import Request, urlopen
+import subprocess
 
 
 class ToolClient:
     def call(self, name, arguments):
-        request = Request(
+        reply = json.loads(subprocess.check_output([
+            "curl", "-s", "-X", "POST", "-H", "Content-Type: application/json",
+            "-d", json.dumps({"tool": name, "arguments": arguments}),
             "http://host.shellsim/tools",
-            data=json.dumps({"tool": name, "arguments": arguments}).encode(),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urlopen(request) as response:
-            reply = json.loads(response.read().decode())
+        ]))
         if "error" in reply:
             raise RuntimeError(reply["error"])
         return reply["result"]
@@ -165,7 +161,7 @@ class ToolClient:
 
 `tests/fixtures/host_tools/host_tools.py` is the executable copy. A package author can define `Container.read_file` with `client.call("workspace.read_file", ...)`, populate `ChatContext.conversation` from `conversation.list`, and call `Grader().grade(ctx)`. The bootstrap can submit its score with `grade.submit`. These classes are package code; they do not constrain other `.shl` applications.
 
-The current Python VM can suspend HTTP calls made from ordinary scheduler-dispatched functions and methods, including this grader. It cannot suspend a tool call made inside a synchronous native callback or VM frame such as `__init__`, `__call__`, `__getitem__`, generator iteration, `sorted(key=...)`, or an imported module's top-level code. Such calls fail explicitly with `RuntimeError: host tools require scheduler-dispatched Python`. Package authors must keep tool calls in ordinary dispatched code until the VM supports continuations through those contexts. This is a VM limitation, not a requirement of the wire protocol.
+CPython uses its process port to call guest `curl`; direct Python sockets are unsupported.
 
 ## Python host API
 
@@ -191,7 +187,8 @@ def submit_grade(arguments):
     scores.append(arguments["score"])
     return {"accepted": True}
 
-container = shellsim.Container(tools={
+ctx = shellsim.Context(pypi_catalog="https://shellsim.rjp.io/ports/catalog.json")
+container = ctx.Environment(pypi_packages=()).to_container(tools={
     "workspace.read_file": read_file,
     "conversation.list": list_conversation,
     "grade.submit": submit_grade,
@@ -199,7 +196,7 @@ container = shellsim.Container(tools={
 package_root = Path("unpacked-grader/rootfs/app")
 container.write_file("/work/app/host_tools.py", (package_root / "host_tools.py").read_bytes())
 container.write_file("/work/app/grader.py", (package_root / "grader.py").read_bytes())
-result = container.run("python3.14 /work/app/grader.py")
+result = container.run("python3.13 /work/app/grader.py")
 assert result.returncode == 0
 ```
 
@@ -210,7 +207,7 @@ The `Container` owns a native `HarnessSession` in the same Python process. Its `
 The lower-level `HarnessSession` protocol remains available to Rust hosts and to `shellsim serve`, but it is an implementation boundary beneath the Python SDK. The Python SDK's native adapter calls typed `HarnessOperation` variants in-process; it does not launch the CLI. Embedded Rust hosts can construct `HarnessSession::with_clock_and_host_tools(...)` and dispatch themselves. CLI hosts can opt in at startup with `shellsim serve --host-tools`.
 
 ```json
-{"op":"start_execute","source":"python3.14 /work/grader.py"}
+{"op":"start_execute","source":"bash /work/grader.sh"}
 {"op":"poll_action","action_id":0,"work_quanta":100000}
 ```
 
@@ -247,7 +244,10 @@ sequenceDiagram
     Guest-->>Host: action completes; read_action_output
 ```
 
-The system layer handles HTTP for Python `urllib.request`, shell `curl`, and shell `wget`. `System::http_request` returns either `Ready(HttpResponse)` or `Blocked(request_id)`. Python and shell commands suspend using the same `WaitReason::HostHttp` and retry the pending operation when woken. `VirtualNet` recognizes the retry, returns the stored response, and never invokes an effectful tool twice. When a host reply is pending, virtual time does not jump to a timeout deadline before the host has a chance to respond. No Python-only callback or real socket is involved. A synchronous `execute` cannot service callbacks, so granted sessions use `start_execute` and `poll_action`. There is no Wasm HTTP API in this slice.
+The system layer handles HTTP through guest `curl` and `wget`. A blocked request suspends
+the command and resumes it when the host replies; `VirtualNet` consumes the response once.
+A synchronous `execute` cannot service callbacks, so granted sessions use `start_execute`
+and `poll_action`. No real socket is involved.
 
 ```mermaid
 stateDiagram-v2
@@ -268,7 +268,9 @@ Each `Container` has its own registry and machine. Other machines with the same 
 
 ## What exists and what remains
 
-The transport and Python-hosted end-to-end test exist now. `tests/python_package/test_host_tools_e2e.py` uses the public `shellsim.Container(tools=...)` API, stages package-owned source, runs `Grader().grade(ctx)` inside shellsim, and exercises the same virtual route from `curl` and `wget`. It does not launch or speak to the CLI. Run it with `uv run --with pytest pytest -q tests/python_package/test_host_tools_e2e.py`; `uv` builds the checked-out Python extension. `tests/host_tools.rs` covers one-shot delivery, cancellation, and an ungranted route.
+`tests/python_package/test_host_tools_e2e.py` exercises registered tools through a guest
+shell grader, `curl` and `wget`. `tests/host_tools.rs` covers one-shot delivery, cancellation
+and an ungranted route.
 
 The `.shl` builder, loader, manifest validator, host-side URL fetcher, and atomic quiescent workspace snapshot exist in this slice. Docker rollout capture and application-specific tool policy are not part of the package format; a host can bind a captured rollout view to its handlers. A useful next integration is to run the same grader package against captured shellsim and Docker rollouts with identical tool names and schemas.
 

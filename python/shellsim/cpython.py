@@ -60,7 +60,7 @@ def _requirements(value: Union[str, Sequence[str]]) -> tuple[str, ...]:
 
 
 class CPythonRuntime:
-    """A CPython 3.13.7 bundle, separate from shellsim's Python VM.
+    """A CPython 3.13.7 WASI bundle executed inside shellsim.
 
     The bundle is a trusted host build directory containing ``manifest.json``
     and ``rootfs``. Keep that directory unchanged while mounting it.

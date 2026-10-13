@@ -104,7 +104,7 @@ copy has no write-back path.
    compatibility.
 
 New commands live under `src/commands/`. Machine capabilities belong on `Environment` behind a
-small typed interface. Python runtime and module changes follow [python.md](python.md).
+small typed interface. Python execution uses the CPython WASI port; see [python.md](python.md).
 
 ## Repository map
 
@@ -120,7 +120,7 @@ src/expand.rs          shell expansion
 src/exec.rs            cooperative shell execution
 src/commands/          modeled command implementations
 src/commands/git/      Git porcelain subset over the VFS (see docs/git.md)
-src/python/            Python source runtime and selected modules
+ports/python/          CPython/WASI and third-party package recipes
 src/harness.rs         persistent agent-session protocol
 src/host_ingest.rs     trusted startup-only project import
 tests/                 integration, differential, and resource tests

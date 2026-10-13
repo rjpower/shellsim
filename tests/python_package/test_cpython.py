@@ -159,11 +159,42 @@ def test_source_built_guest() -> None:
     if path is None:
         pytest.skip("set SHELLSIM_CPYTHON_BUNDLE to a source-built CPython WASI bundle")
     runtime = shellsim.CPythonRuntime(path)
-    environment = shellsim.Context().Environment(cpu=2_000_000_000, memory=256 * 1024 * 1024, disk=64 * 1024 * 1024)
+    environment = shellsim.Context().Environment(cpu=10_000_000_000, memory=2 * 1024**3, disk=512 * 1024**2)
     runtime.mount(environment)
     result = runtime.run(environment, ["-c", "import json, sys; print(sys.platform); print(json.dumps([1, 2]))"])
     assert result.returncode == 0, result.stderr
     assert result.stdout == b"wasi\n[1, 2]\n"
+    environment.write_file("/work/helper.py", "answer = 42\n")
+    environment.run("cd /work")
+    environment.route_http("https://api.test/items", shellsim.HttpResponse(body=b"fixture"))
+    first = environment.run_python(
+        "import sys, subprocess\nfrom helper import answer\n"
+        "print(answer, sys.argv[1])\nprint(sys.stdin.read())\n"
+        "print(subprocess.check_output(['curl', '-s', 'https://api.test/items']).decode())\n",
+        argv=["'\"$()"],
+        stdin=b"input\nrest",
+    )
+    assert first.returncode == 0, first.stderr
+    assert first.stdout == b"42 '\"$()\ninput\nrest\nfixture\n"
+    second = environment.run_python("print('again')")
+    assert second.stdout == b"again\n"
+    assert second.usage.cpu_used > first.usage.cpu_used
+    assert first.network_requests[0].matched
+    submissions = []
+    container = environment.to_container(
+        tools={
+            "conversation.list": lambda arguments: {"messages": ["What is 6 * 7?"]},
+            "workspace.read_file": lambda arguments: {"data_base64": "NDIK"},
+            "grade.submit": lambda arguments: submissions.append(arguments["score"]) or {"accepted": True},
+        }
+    )
+    fixtures = Path(__file__).resolve().parents[1] / "fixtures/host_tools"
+    for name in ("host_tools.py", "grader.py"):
+        container.write_file(f"/work/{name}", (fixtures / name).read_bytes())
+    graded = container.run("python /work/grader.py")
+    assert graded.returncode == 0, graded.stderr
+    assert graded.stdout == b"1.0\n"
+    assert submissions == [1.0]
 
 
 def test_native_provider_seeds_resolution(bundle: Path, monkeypatch: pytest.MonkeyPatch) -> None:

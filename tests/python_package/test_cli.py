@@ -128,10 +128,10 @@ def test_limit_suffixes_match_the_rust_cli() -> None:
 
 
 def test_run_fetches_package_and_executes_guest_entrypoint(tmp_path: Path, monkeypatch, capsys) -> None:
-    (tmp_path / "app.py").write_text("print('package guest')\n")
+    (tmp_path / "app.sh").write_text("printf 'package guest\\n'\n")
     package = Package.build_from_directory(
         tmp_path,
-        spec=PackageSpec(name="cli-demo", version="1", entrypoint=("python3.14", "/work/app.py")),
+        spec=PackageSpec(name="cli-demo", version="1", entrypoint=("bash", "/work/app.sh")),
     )
     monkeypatch.setattr("shellsim.package._fetch_https", lambda url: (package.to_bytes(),))
 
@@ -149,9 +149,9 @@ def test_run_rejects_plain_http_without_a_custom_fetcher(capsys) -> None:
 
 
 def test_run_loads_local_package(tmp_path: Path) -> None:
-    (tmp_path / "app.py").write_text("print('local package')\n")
+    (tmp_path / "app.sh").write_text("printf 'local package\\n'\n")
     package = Package.build_from_directory(
-        tmp_path, spec=PackageSpec(name="local", version="1", entrypoint=("python3.14", "/work/app.py"))
+        tmp_path, spec=PackageSpec(name="local", version="1", entrypoint=("bash", "/work/app.sh"))
     )
     source = tmp_path.parent / "local.shl"
     source.write_bytes(package.to_bytes())

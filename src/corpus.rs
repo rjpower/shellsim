@@ -512,13 +512,13 @@ fn run_case(base: &Path, profile: EnvironmentProfile, case: CorpusCase) -> CaseR
             format!("bash {}", quote_shell(entrypoint))
         }
         (ProgramKind::Python, Some(entrypoint), None) => {
-            format!("python3.14 {}", quote_shell(entrypoint))
+            format!("python3 {}", quote_shell(entrypoint))
         }
         (ProgramKind::Shell, None, Some(code)) => {
             format!("bash -c {} shellsim-corpus", quote_shell(code))
         }
         (ProgramKind::Python, None, Some(code)) => {
-            format!("python3.14 -c {}", quote_shell(code))
+            format!("python3 -c {}", quote_shell(code))
         }
         _ => unreachable!("manifest validation enforces executable case shape"),
     };

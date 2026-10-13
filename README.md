@@ -26,15 +26,11 @@ The current environment includes:
 - common filesystem, text, archive, Git, Make, process, and system commands;
 - deterministic virtual time, network fixtures, `/proc`, `/dev`, processes, descriptors, and
   bounded pipes;
-- a mostly complete Python language runtime with a deliberately selected standard-library and
-  third-party module surface.
+- upstream CPython and third-party packages supplied by the WASI ports catalog.
 
-Python is source-compatible where supported, not ABI-compatible with CPython. Native extensions,
-network package installation, and arbitrary host machine code are outside the simulation
-boundary. A limited Wasm-hosted C toolchain can be supplied as a virtual executable. The simulated
-`pip` and `uv` paths can activate packages already bundled with
-shellsim; they reject other packages instead of fetching them. See
-[Python in shellsim](docs/python.md) for the current contract.
+Python runs as a fuel-metered Wasm executable. The catalog supplies extensions built for its
+CPython/WASI ABI; package preparation happens on the host before execution. Shell-only machines
+have no Python installation. See [Python in shellsim](docs/python.md).
 
 `git` provides a porcelain subset backed by the virtual filesystem: staging, commits, history,
 diffs, branches, tags, merges, stashes, and search, with output that matches real Git where an
@@ -58,7 +54,7 @@ Install the Python package and console command:
 ```sh
 python -m pip install shellsim
 shellsim -c 'printf "b\na\n" | sort'
-shellsim --root ./project -c 'python3.14 test.py'
+shellsim --root ./project -c 'ls /work'
 ```
 
 For C/C++ builds, select the Clang port with `ctx.Environment(tools=["clang"], memory=8 * 1024**3)`.
@@ -73,7 +69,6 @@ To build the Rust binaries from source:
 cargo build --release
 ./target/release/shellsim -c 'echo hello'
 ./target/release/shellsim eval --cpu 100k --memory 8m -c 'make test'
-./target/release/shellsim-python ./project/main.py -- arg1
 ```
 
 Limits accept `k`, `m`, and `g` binary suffixes. `eval` emits a structured result containing the
@@ -87,8 +82,8 @@ The Python API exposes fresh and persistent environments:
 import shellsim
 
 environment = shellsim.Context().Environment(cpu=100_000)
-environment.write_file("/work/main.py", "print(6 * 7)\n")
-result = environment.run("python3.14 /work/main.py")
+environment.write_file("/work/answer.txt", "42\n")
+result = environment.run("cat /work/answer.txt")
 assert result.returncode == 0
 assert result.stdout == b"42\n"
 ```
@@ -117,42 +112,16 @@ environment = shellsim.Context().Environment(http={
 })
 result = environment.run("curl -s https://api.test/items/1")
 
-result = environment.run_python("""
-from urllib.request import urlopen
-print(urlopen('https://api.test/items/1').read())
-""")
 assert result.network_requests[0].matched
 ```
 
-Python source can bypass shell parsing and quoting while using the same isolated runtime:
+Run Python and compiled packages using an exported [ports catalog](ports/buildomatic/README.md):
 
 ```python
-result = shellsim.python.run("print(sum(range(10)))", argv=["example"])
-result.check_returncode()
-
-environment = shellsim.Context().Environment()
-result = environment.run_python("print('persistent VFS, fresh Python interpreter')")
-```
-
-To stage a trusted PyPI distribution and its dependencies, install `shellsim[pypi]`:
-
-```python
-environment = shellsim.Context().Environment()
-environment.install_pypi("roman==4.2")
-result = environment.run_python("import roman; print(roman.toRoman(42))")
-print(result.stdout)  # b'XLII\n'
-```
-
-Shellsim copies compatible pure Python packages into virtual site-packages without changing the
-environment's working directory. Resolution failures and native wheels raise
-`shellsim.PackageInstallError`; source distributions may run build code on the host.
-
-For compiled packages, use an exported [ports catalog](ports/buildomatic/README.md):
-
-```python
-context = shellsim.Context(pypi_catalog="http://localhost:8080/export/catalog.json")
+context = shellsim.Context(pypi_catalog="https://shellsim.rjp.io/ports/catalog.json")
 environment = context.Environment(pypi_packages=["scipy"])
 result = environment.run_python("from scipy.special import factorial; print(factorial(5))")
+result.check_returncode()
 ```
 
 This mounts upstream CPython 3.13.7 WASI and downloads only the selected wheels,
@@ -160,7 +129,9 @@ native dependencies, and interpreter. Context fixes the catalog snapshot and
 `cache_dir`, `offline`, and `trusted_precompiled` policy. Identical selections reuse
 an immutable installation with a private filesystem for each guest. Create a new
 Context to see catalog updates. No patched uv is needed;
-`install_pypi` can add catalog packages later. See [CPython WASI ports](ports/README.md)
+`pypi_packages=()` selects CPython without extra packages; `install_pypi` can add catalog
+packages later. Each Python invocation starts a fresh interpreter on the persistent VFS.
+See [CPython WASI ports](ports/README.md)
 for capability limits and the explicit `CPythonRuntime` API.
 
 ## Clock modes

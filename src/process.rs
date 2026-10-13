@@ -7,8 +7,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::descriptors::FdTable;
-
 /// PID assigned to a simulated process.
 pub type ProcessId = u32;
 
@@ -230,38 +228,6 @@ impl ControllingTerminal {
         self.foreground_group = process_group;
         Ok(())
     }
-}
-
-/// Parent-owned descriptor endpoints and collected state for one live child handle.
-///
-/// The handle is machine state rather than Python heap state so native facades can refer to it by
-/// PID without exposing descriptor arena identities to simulated code.
-#[derive(Clone)]
-pub(crate) struct LiveChild {
-    pub owner: ProcessId,
-    pub endpoints: FdTable,
-    pub status: Option<i32>,
-    pub stdout: Vec<u8>,
-    pub stderr: Vec<u8>,
-    pub communicated: bool,
-    /// Input retained across timed-out `communicate` calls.
-    pub communicate_input: Option<Vec<u8>>,
-    /// First byte not yet accepted by the child stdin pipe.
-    pub communicate_offset: usize,
-    /// Bytes retained while a direct Python stdin write is suspended by pipe backpressure.
-    pub pending_stdin_write: Option<Vec<u8>>,
-    /// First byte of `pending_stdin_write` not yet accepted by the pipe.
-    pub pending_stdin_offset: usize,
-    /// Virtual deadline retained across retries of `Popen.wait(timeout=...)`.
-    pub wait_event: Option<crate::clock::EventId>,
-    /// Virtual deadline retained across retries of `Popen.communicate(timeout=...)`.
-    pub communicate_event: Option<crate::clock::EventId>,
-    pub stdin_pipe: bool,
-    pub stdout_pipe: bool,
-    pub stderr_pipe: bool,
-    pub stdout_inherit: bool,
-    pub stderr_inherit: bool,
-    pub terminating_signal: Option<Signal>,
 }
 
 /// Machine-wide allocator and process record store.

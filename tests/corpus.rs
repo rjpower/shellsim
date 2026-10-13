@@ -22,14 +22,14 @@ fn run_frozen_corpus(name: &str) -> corpus::CorpusReport {
 }
 
 #[test]
-fn stock_manifest_runs_shell_python_and_explicit_skip_cases() {
+fn stock_manifest_runs_shell_and_explicit_skip_cases() {
     let root = fixture_root();
     let manifest = std::fs::read(root.join("manifest.json")).expect("manifest fixture");
     let report = corpus::run_manifest_bytes(&root, &manifest).expect("valid corpus");
 
-    assert_eq!(report.total, 3);
+    assert_eq!(report.total, 2);
     assert_eq!(report.expectation_failures, 0);
-    assert_eq!(report.classes.get(&ResultClass::Pass), Some(&2));
+    assert_eq!(report.classes.get(&ResultClass::Pass), Some(&1));
     assert_eq!(report.classes.get(&ResultClass::Skipped), Some(&1));
 }
 
@@ -65,9 +65,9 @@ fn corpus_cli_emits_a_machine_readable_report() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON report");
     assert_eq!(report["version"], 1);
     assert_eq!(report["profile"], "stock_agent_v1");
-    assert_eq!(report["total"], 3);
+    assert_eq!(report["total"], 2);
     assert_eq!(report["expectation_failures"], 0);
-    assert_eq!(report["classes"]["pass"], 2);
+    assert_eq!(report["classes"]["pass"], 1);
     assert_eq!(report["classes"]["skipped"], 1);
 }
 
@@ -132,11 +132,9 @@ fn a_profile_that_does_not_fit_is_a_setup_failure() {
 }
 
 #[test]
-fn imported_shell_and_python_corpora_match_checked_behavior() {
+fn imported_shell_corpora_match_checked_behavior() {
     for (name, minimum_cases) in [
         ("oils-spec", 50),
-        ("micropython-basics", 50),
-        ("python-derived", 30),
         ("posix-derived", 8),
         ("whole-programs", 19),
     ] {
@@ -193,7 +191,7 @@ fn an_expected_unknown_command_can_be_part_of_a_pass_case() {
 }
 
 #[test]
-fn command_cases_can_use_a_modeled_module_entrypoint() {
+fn command_cases_accept_arguments() {
     let root = fixture_root();
     let manifest = br#"{
         "version": 1,
@@ -201,8 +199,8 @@ fn command_cases_can_use_a_modeled_module_entrypoint() {
         "cases": [{
             "id": "module-entrypoint",
             "kind": "command",
-            "entrypoint": "python3.14",
-            "args": ["-c", "print('module command')"],
+            "entrypoint": "printf",
+            "args": ["module command\n"],
             "expect": {
                 "disposition": "pass",
                 "stdout_base64": "bW9kdWxlIGNvbW1hbmQK",
@@ -223,14 +221,14 @@ fn derived_cases_support_inline_programs_fixtures_and_readable_io() {
         "version": 1,
         "profile": "stock_agent_v1",
         "cases": [{
-            "id": "inline-python",
-            "kind": "python",
-            "code": "from helper import decorate\nprint(decorate(input()))",
-            "covers": ["python.import.local", "python.io.stdio"],
+            "id": "inline-shell",
+            "kind": "shell",
+            "code": "source /work/helper.sh; read value; decorate \"$value\"",
+            "covers": ["shell.source.local", "shell.io.stdio"],
             "stdin": "world\n",
             "fixtures": [{
-                "contents": "def decorate(value):\n    return f'<{value}>'\n",
-                "destination": "/work/helper.py"
+                "contents": "decorate() { printf '<%s>\\n' \"$1\"; }\n",
+                "destination": "/work/helper.sh"
             }],
             "expect": {
                 "disposition": "pass",
@@ -246,8 +244,8 @@ fn derived_cases_support_inline_programs_fixtures_and_readable_io() {
         "{:?}",
         report.cases[0].detail
     );
-    assert_eq!(report.coverage["python.import.local"].passing, 1);
-    assert_eq!(report.coverage["python.io.stdio"].passing, 1);
+    assert_eq!(report.coverage["shell.source.local"].passing, 1);
+    assert_eq!(report.coverage["shell.io.stdio"].passing, 1);
 }
 
 #[test]

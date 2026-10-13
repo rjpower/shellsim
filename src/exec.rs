@@ -1761,13 +1761,6 @@ impl ShellContinuation {
                             stderr_offset: 0,
                         });
                     }
-                    crate::commands::CommandPoll::Yielded(continuation) => {
-                        self.frames.push(ShellFrame::ResumeCommand {
-                            variables,
-                            continuation,
-                        });
-                        self.yielded = true;
-                    }
                     crate::commands::CommandPoll::Switched(continuation) => {
                         self.retain_switched_command(variables, continuation);
                     }
@@ -1875,14 +1868,6 @@ impl ShellContinuation {
                             stdout_offset: 0,
                             stderr_offset: 0,
                         });
-                    }
-                    crate::commands::CommandPoll::Yielded(continuation) => {
-                        debug_assert!(stdout.is_empty() && stderr.is_empty());
-                        self.frames.push(ShellFrame::ResumeCommand {
-                            variables,
-                            continuation,
-                        });
-                        self.yielded = true;
                     }
                     crate::commands::CommandPoll::Switched(continuation) => {
                         debug_assert!(stdout.is_empty() && stderr.is_empty());
@@ -2520,14 +2505,6 @@ impl ShellContinuation {
                         stderr_offset: 0,
                     });
                 }
-                crate::commands::CommandPoll::Yielded(continuation) => {
-                    debug_assert!(stdout.is_empty() && stderr.is_empty());
-                    self.frames.push(ShellFrame::ResumeCommand {
-                        variables,
-                        continuation,
-                    });
-                    self.yielded = true;
-                }
                 crate::commands::CommandPoll::Switched(continuation) => {
                     debug_assert!(stdout.is_empty() && stderr.is_empty());
                     self.retain_switched_command(variables, continuation);
@@ -3096,177 +3073,6 @@ fn dispatch_available(interp: &mut Interp, advance_time: bool) -> Result<bool, S
             return Ok(false);
         }
         handle_ready_events(interp)?;
-    }
-}
-
-/// Run at most one continuation quantum outside the active caller, then restore that caller.
-///
-/// Python live-process methods use this as a nested cooperative scheduling boundary. The Python
-/// VM remains on the Rust stack while its logical process is temporarily blocked, so the caller
-/// itself must never be polled by this function. Other runnable logical processes retain FIFO
-/// ordering, and virtual time advances only up to `advance_until`.
-pub(crate) fn drive_scheduler_step(
-    interp: &mut Interp,
-    target: crate::process::ProcessId,
-    advance_until: Option<u64>,
-) -> Result<bool, String> {
-    if matches!(
-        interp.processes.get(target).map(|record| record.status),
-        Some(crate::process::ProcessStatus::Exited(_))
-    ) {
-        return Ok(true);
-    }
-    let caller = interp.process.pid;
-    interp
-        .scheduler
-        .block_current(crate::scheduler::WaitReason::Child(target))
-        .map_err(|error| format!("unable to suspend process {caller}: {error:?}"))?;
-
-    let scheduled = match interp
-        .scheduler
-        .dispatch()
-        .map_err(|error| format!("{error:?}"))?
-    {
-        Some(pid) => Some(pid),
-        None => {
-            let Some(next) = interp.clock.next_deadline_ns() else {
-                restore_nested_caller(interp, caller)?;
-                return Err("all child processes are blocked without a pending event".to_string());
-            };
-            if advance_until.is_some_and(|limit| next > limit) {
-                interp.wait_for_time(advance_until.expect("limit was checked"))?;
-                restore_nested_caller(interp, caller)?;
-                return Ok(false);
-            }
-            interp.wait_for_time(next)?;
-            handle_ready_events(interp)?;
-            interp
-                .scheduler
-                .dispatch()
-                .map_err(|error| format!("{error:?}"))?
-        }
-    };
-
-    if let Some(pid) = scheduled {
-        interp.process.activate(pid)?;
-        poll_active_nested_process(interp)?;
-    }
-    restore_nested_caller(interp, caller)?;
-    Ok(matches!(
-        interp.processes.get(target).map(|record| record.status),
-        Some(crate::process::ProcessStatus::Exited(_))
-    ))
-}
-
-fn poll_active_nested_process(interp: &mut Interp) -> Result<(), String> {
-    wake_due_events(interp)?;
-    let owner = interp.process.pid;
-    if let Some(delivery) = interp.take_signal_delivery() {
-        match delivery {
-            crate::interp::SignalDelivery::Terminate(signal) => {
-                interp.processes.mark_signal_termination(owner, signal);
-                let status = 128 + signal.number();
-                if let Some(mut program) = interp.process.program.take() {
-                    program.release_owned_memory(interp);
-                }
-                interp.invocations.finish_process(
-                    owner,
-                    status,
-                    interp.resources.cpu_used(),
-                    interp.vfs.disk_used(),
-                );
-                interp.finish_child(owner, status);
-                return Ok(());
-            }
-            crate::interp::SignalDelivery::Stop(signal) => {
-                interp.stop_active_process(signal)?;
-                return Ok(());
-            }
-            crate::interp::SignalDelivery::Handler(body) => {
-                let mut continuation = interp
-                    .process
-                    .program
-                    .take()
-                    .ok_or_else(|| format!("scheduled process {owner} has no program"))?;
-                continuation.inject_signal_handler(interp, body)?;
-                interp.process.program = Some(continuation);
-            }
-        }
-    }
-    let mut continuation = interp
-        .process
-        .program
-        .take()
-        .ok_or_else(|| format!("scheduled process {owner} has no program"))?;
-    match continuation.poll(interp, SHELL_POLL_QUANTUM) {
-        ShellPoll::Pending => {
-            interp.process.set_program(owner, Some(continuation))?;
-            interp
-                .scheduler
-                .yield_current()
-                .map_err(|error| format!("{error:?}"))?;
-        }
-        ShellPoll::Switched => {
-            interp.process.set_program(owner, Some(continuation))?;
-        }
-        ShellPoll::Replaced => continuation.release_owned_memory(interp),
-        ShellPoll::Blocked(reason) => {
-            interp.process.set_program(owner, Some(continuation))?;
-            interp
-                .scheduler
-                .block_current(reason)
-                .map_err(|error| format!("{error:?}"))?;
-        }
-        ShellPoll::Ready(status) => {
-            interp.invocations.finish_process(
-                owner,
-                status,
-                interp.resources.cpu_used(),
-                interp.vfs.disk_used(),
-            );
-            interp.finish_child(owner, status);
-        }
-    }
-    Ok(())
-}
-
-fn restore_nested_caller(
-    interp: &mut Interp,
-    caller: crate::process::ProcessId,
-) -> Result<(), String> {
-    if interp.scheduler.current() == Some(caller) {
-        interp.process.activate(caller)?;
-        return Ok(());
-    }
-    if interp.scheduler.current().is_some() {
-        interp
-            .scheduler
-            .yield_current()
-            .map_err(|error| format!("{error:?}"))?;
-    }
-    if matches!(
-        interp.scheduler.state(caller),
-        Some(crate::scheduler::TaskState::Blocked(_))
-    ) {
-        interp
-            .scheduler
-            .wake(caller)
-            .map_err(|error| format!("{error:?}"))?;
-    }
-    loop {
-        let pid = interp
-            .scheduler
-            .dispatch()
-            .map_err(|error| format!("{error:?}"))?
-            .ok_or_else(|| "nested scheduler lost its caller".to_string())?;
-        if pid == caller {
-            interp.process.activate(caller)?;
-            return Ok(());
-        }
-        interp
-            .scheduler
-            .yield_current()
-            .map_err(|error| format!("{error:?}"))?;
     }
 }
 

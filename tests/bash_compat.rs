@@ -619,30 +619,6 @@ fn native_command_adapters_launch_scheduled_children() {
 }
 
 #[test]
-fn python_repl_persists_and_returns_to_shell() {
-    let mut env = Environment::new();
-    let (_, entered, _) = env.run_script_capture("python");
-    assert!(String::from_utf8_lossy(&entered).ends_with(">>> "));
-    assert!(env.in_python_repl());
-
-    let (_, assigned, _) = env.run_script_capture("x = 4");
-    assert_eq!(String::from_utf8_lossy(&assigned), ">>> ");
-    let (_, evaluated, _) = env.run_script_capture("x + 3");
-    assert_eq!(String::from_utf8_lossy(&evaluated), "7\n>>> ");
-    // Echo uses the full repr protocol: a user `__repr__` and a dict view.
-    env.run_script_capture("class P:\n    def __repr__(self):\n        return 'P!'\n");
-    let (_, custom, _) = env.run_script_capture("P()");
-    assert_eq!(String::from_utf8_lossy(&custom), "P!\n>>> ");
-    let (_, view, _) = env.run_script_capture("{'a': 1}.keys()");
-    assert_eq!(String::from_utf8_lossy(&view), "dict_keys(['a'])\n>>> ");
-
-    env.run_script_capture("exit()");
-    assert!(!env.in_python_repl());
-    let (_, shell_out, _) = env.run_script_capture("echo shell");
-    assert_eq!(String::from_utf8_lossy(&shell_out), "shell\n");
-}
-
-#[test]
 fn empty_double_quoted_word_is_one_empty_field() {
     // Only an empty quoted array or `"$@"` expansion disappears; `""` and `"$empty"` remain.
     assert_eq!(
