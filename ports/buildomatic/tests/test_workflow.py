@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 
 from ports.__main__ import main
+from ports._support.graph import all_ports
 from ports._support.tests.test_runner import _wheel_port
 from ports.buildomatic import BuildResult, BuildState, NodeResult, NodeState, workflow
 from ports.buildomatic.artifacts import resolve
@@ -26,7 +27,10 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
     ports, state = tmp_path / "ports", tmp_path / "state"
     source = state / "execution/cache/ports"
     recipe_path, recipe = _wheel_port(ports, source, "base", [])
-    _wheel_port(ports, source, "app", ["base"])
+    app_path, app = _wheel_port(ports, source, "app", ["base"])
+    app_path.write_text(
+        json.dumps({**app, "default_variant": "host", "variants": {"host": {"role": "host-tool"}, "guest": {}}})
+    )
     arguments = ["--ports", str(ports), "--state", str(state), "--offline"]
     main(["build", "--all", *arguments])
     graph = json.loads((state / "graph.json").read_text())
@@ -50,7 +54,7 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
         main(["export", *arguments, "--url-prefix", "https://ports.example"])
         guarded.setattr("iris.cli.connect.open_iris_client", reject)
         with AutomaticIrisBackend(IrisConfig("cached"), store, ports.parent) as automatic:
-            run(ports, ["python/app"], store, state, automatic, offline=True)
+            run(ports, ["python/app:guest"], store, state, automatic, offline=True)
     recipe_path.write_text(json.dumps({**recipe, "features": {"changed": True}}))
     _wheel_port(ports, source, "independent", [])
     process = subprocess.run(
@@ -64,6 +68,15 @@ def test_shared_cli_build_exports_incrementally_and_rebuilds_dependents(tmp_path
     changed = json.loads((state / "graph.json").read_text())
     assert {package["name"] for package in changed["packages"]} == {"base", "app", "independent"}
     assert {item["build_key"] for item in changed["ports"]}.isdisjoint({item["build_key"] for item in graph["ports"]})
+
+
+def test_all_ports_plans_guest_clang_and_sqlite_with_sdk_dependencies():
+    ports = Path(__file__).resolve().parents[2]
+    compiled = compile_plan(ports, all_ports(ports))
+    roots = [port for port in compiled.graph.ports if port.reference in compiled.graph.roots]
+    assert {"clang", "wasi-development", "sqlite3"} <= {port.name for port in roots}
+    assert all(port.role not in {"host-tool", "target-platform"} for port in roots)
+    assert any(port.name == "llvm" and port.role == "host-tool" for port in compiled.graph.ports)
 
 
 def test_cached_consumer_prunes_build_tool_but_keeps_runtime_outputs(tmp_path):
@@ -153,16 +166,19 @@ def test_failed_delivery_preserves_canonical_build(tmp_path, monkeypatch, failur
     assert (Path(store.prefix) / graph["packages"][0]["path"]).is_file()
 
 
-def test_check_dependencies_build_only_when_checks_are_requested(tmp_path):
+def test_check_dependencies_build_only_when_checks_are_requested(tmp_path, monkeypatch):
     ports, state = tmp_path / "ports", tmp_path / "state"
     for name in ("app", "checker"):
         _wheel_port(ports, state / "execution/cache/ports", name, [])
     path = ports / "python/app/recipe.json"
     value = json.loads(path.read_text())
     value["test_dependencies"] = [{"port": "python/checker", "version": "1"}]
-    value["tests"] = [{"kind": "python", "script": "probe.py"}]
+    value["tests"] = [
+        {"kind": "python", "script": "probe.py", "files": [{"source": "input.txt", "destination": "input.txt"}]}
+    ]
     path.write_text(json.dumps(value))
-    (path.parent / "probe.py").write_text("print(42)\n")
+    (path.parent / "probe.py").write_text('print(int(open("/work/input.txt").read()))\n')
+    (path.parent / "input.txt").write_text("42\n")
     store = StorageStore(str(tmp_path / "canonical"))
     backend = LocalBackend(store, state / "execution")
     built = run(ports, ["python/app"], store, state, backend, offline=True)
@@ -175,6 +191,19 @@ def test_check_dependencies_build_only_when_checks_are_requested(tmp_path):
     check = next(node for node in checked.plan.nodes if node.operation is Operation.CHECK)
     assert checked.records[check.reference]["stdout"] == "42\n"
     assert {item["name"] for item in json.loads((state / "graph.json").read_text())["packages"]} == {"app"}
+
+    def reject(*args, **kwargs):
+        raise AssertionError("cached check dispatched work")
+
+    with monkeypatch.context() as guarded:
+        guarded.setattr(LocalBackend, "submit", reject)
+        run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
+    (path.parent / "probe.py").write_text('print(int(open("/work/input.txt").read()) + 1)\n')
+    updated = run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
+    assert updated.records[check.reference]["stdout"] == "43\n"
+    (path.parent / "input.txt").write_text("43\n")
+    updated = run(ports, ["python/app"], store, state, backend, operation=Operation.CHECK, offline=True)
+    assert updated.records[check.reference]["stdout"] == "44\n"
 
 
 def test_progress_reports_active_work_and_remote_failure(tmp_path, monkeypatch, caplog):

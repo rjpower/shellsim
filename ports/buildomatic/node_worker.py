@@ -145,7 +145,7 @@ def runtime(node: Node, records: dict, store: StorageStore, cache: Path) -> dict
 
 def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -> dict:
     products = BuildCache(store)
-    if node.operation is not Operation.CHECK and (cached := products.get(node.key)) is not None:
+    if (cached := products.get(node.key)) is not None:
         return cached
     if (expected := specification.get("wasmtime_build_id")) is not None:
         from shellsim import _native

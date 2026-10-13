@@ -38,14 +38,17 @@ def main(arguments: Sequence[str] | None = None) -> None:
         command = commands.add_parser(name, parents=[common])
         command.add_argument("recipes", nargs="*")
         if name == "build":
-            command.add_argument("--all", action="store_true", help="build every default recipe in the ports tree")
+            command.add_argument("--all", action="store_true", help="build every guest port, including recipe variants")
         if name == "export":
             command.add_argument("--url-prefix", required=True)
             command.add_argument("--output", help="catalog directory or store prefix")
             command.add_argument("--copy-assets", action="store_true")
+            command.add_argument("--asset-output", help="shared assets prefix when catalogs use a separate output")
             command.add_argument("--simple", action="store_true")
     args = parser.parse_args(arguments)
     from rigging.log_setup import configure_logging
+
+    from ports._support.graph import all_ports
 
     configure_logging()
     if args.all and args.recipes:
@@ -66,15 +69,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
         if args.command != "build" and not args.recipes and (args.state / "results.json").is_file()
         else {}
     )
-    requests = (
-        [
-            path.relative_to(args.ports).as_posix()
-            for category in ("python", "native", "toolchain")
-            for path in sorted((args.ports / category).glob("*/recipe.json"))
-        ]
-        if args.all
-        else args.recipes or saved.get("roots", [])
-    )
+    requests = all_ports(args.ports) if args.all else args.recipes or saved.get("roots", [])
     if not requests:
         parser.error("specify recipes or build them first")
     from ports.buildomatic.backends.local import LocalBackend
@@ -160,6 +155,7 @@ def main(arguments: Sequence[str] | None = None) -> None:
                     args.output or args.state / "export",
                     args.url_prefix,
                     copy_assets=args.copy_assets,
+                    asset_output=args.asset_output,
                     simple=args.simple,
                 )
             )

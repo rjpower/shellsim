@@ -187,7 +187,13 @@ def catalog(graph: dict, url_prefix: str) -> dict:
 
 
 def export(
-    state: Path, output: str | Path, url_prefix: str, *, copy_assets: bool = False, simple: bool = False
+    state: Path,
+    output: str | Path,
+    url_prefix: str,
+    *,
+    copy_assets: bool = False,
+    simple: bool = False,
+    asset_output: str | Path | None = None,
 ) -> dict:
     """Write metadata and optionally promote new assets into the output store."""
     graph = json.loads((state / "graph.json").read_text())
@@ -202,16 +208,16 @@ def export(
     copied = 0
     if copy_assets:
         source = DeliveryStore(json.loads((state / "results.json").read_text())["prefix"])
+        assets = DeliveryStore(asset_output) if asset_output is not None else destination
         for item in [
             *graph["packages"],
             *graph["native"],
             *graph.get("assets", []),
             *([graph["runtime"]] if "runtime" in graph else []),
         ]:
-            copied += source.promote(item["path"], destination)
+            copied += source.promote(item["path"], assets)
             if "precompiled" in item:
-                copied += source.promote(item["precompiled"]["path"], destination)
-    destination.write("catalog.json", _json(value))
+                copied += source.promote(item["precompiled"]["path"], assets)
     if simple:
         projects = {}
         for package in value["packages"]:
@@ -240,4 +246,5 @@ def export(
             futures = [executor.submit(destination.write, path, content) for path, content in pages]
             for future in futures:
                 future.result()
+    destination.write("catalog.json", _json(value))
     return {"packages": len(value["packages"]), "native": len(value["native"]), "assets_copied": copied}

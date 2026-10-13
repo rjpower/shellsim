@@ -13,8 +13,9 @@ uv run --extra buildomatic python -m ports check
 
 `--store` accepts a directory or S3/GCS prefix; client state defaults to
 `build/ports`. SDK producers and runtime providers are graph dependencies.
-`build --all` selects every default recipe; pass explicit roots for a subset or
-additional variants. Progress logs go to stderr; command results are JSON on stdout.
+`build --all` selects every guest recipe variant, including Clang and SQLite's CLI;
+build SDKs enter through dependencies. Pass explicit roots for a subset.
+Progress logs go to stderr; command results are JSON on stdout.
 Builds emit assets once; export writes a catalog and optional Simple HTML.
 `--backend iris --store <S3/GCS-prefix>` allocates a BATCH pool on cache misses
 and stops it on exit; `--iris-service` selects an existing pool instead.
