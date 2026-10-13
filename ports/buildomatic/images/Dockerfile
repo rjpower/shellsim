@@ -17,12 +17,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
 
 # Runtime/code transport installs Iris into its own environment. Generators
 # and the native CPython build helper are reusable image dependencies.
+ENV UV_PYTHON_INSTALL_DIR=/opt/buildomatic/python
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv python install 3.13 \
     && uv venv --python 3.13 /opt/buildomatic/venv \
     && uv pip install --python /opt/buildomatic/venv/bin/python \
       packaging meson meson-python==0.16.0 cython numpy==2.3.5 \
-      pybind11 setuptools setuptools-scm==8.3.1 wheel
+      pybind11 setuptools setuptools-scm==8.3.1 wheel \
+      marin-rigging==0.2.165.dev38153482028
 ENV PATH="/opt/buildomatic/venv/bin:/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
 ENV CARGO_TARGET_DIR=/app/.buildomatic/cargo-build
 ENV RUSTUP_HOME=/root/.rustup
@@ -40,6 +42,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 
 FROM tools
 COPY --from=runtime-build /wheels/ /opt/buildomatic/wheels/
+COPY --chmod=0444 ports/buildomatic/s3_proxy.py /opt/buildomatic/s3_proxy.py
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --python /opt/buildomatic/venv/bin/python /opt/buildomatic/wheels/*.whl
 CMD ["python"]
