@@ -379,7 +379,7 @@ def prepare(
             if node.operation in {Operation.DELIVERY, Operation.RUNTIME}:
                 compiler = compiler_identity(node.port if node.operation is Operation.DELIVERY else None)
                 if compiler is not None:
-                    spec["wasmtime_build_id"] = compiler
+                    spec["compiler"] = compiler
             write_reference(recipe / "node.json", spec)
             bundle = capture_tree(recipe, local)
             bundles.append(bundle)

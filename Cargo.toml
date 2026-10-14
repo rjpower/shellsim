@@ -60,9 +60,6 @@ libc = "0.2"
 [features]
 default = []
 
-[build-dependencies]
-sha2 = "0.10"
-
 [dev-dependencies]
 wat = "1"
 

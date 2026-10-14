@@ -52,10 +52,9 @@ fn main() -> Result<(), Error> {
         }
         _ => return Err(Error::msg("unsupported metadata mode")),
     }
-    config.module_version(ModuleVersionStrategy::Custom(format!(
-        "shellsim-wasmtime-49-{}",
-        env!("SHELLSIM_WASMTIME_BUILD_ID")
-    )))?;
+    config.module_version(ModuleVersionStrategy::Custom(
+        shellsim::commands::precompiled_wasm_build_id().into(),
+    ))?;
     let engine = Engine::new(&config)?;
     let read_started = Instant::now();
     let source = std::fs::read(source_path)?;

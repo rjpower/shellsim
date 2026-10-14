@@ -8,7 +8,6 @@
 use std::path::{Path, PathBuf};
 use wasmtime::{Cache, CacheConfig, Error};
 
-pub(super) const BUILD_ID: &str = env!("SHELLSIM_WASMTIME_BUILD_ID");
 const DEFAULT_CACHE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 /// Configure the process-wide cache once, before any command engine is created.
@@ -136,10 +135,11 @@ mod tests {
     fn fresh_engine_reuses_artifact_and_invalidates_changed_runtime_identity() {
         let scratch = Scratch::new();
         let source = wat::parse_str("(module (func (export \"_start\")))").unwrap();
-        let (first, cache) = engine(&scratch.0, BUILD_ID);
+        let compatibility = super::super::engine::compilation_compatibility_id();
+        let (first, cache) = engine(&scratch.0, compatibility);
         Module::new(&first, &source).unwrap();
         assert_eq!(cache.cache_misses(), 1);
-        let (second, cache) = engine(&scratch.0, BUILD_ID);
+        let (second, cache) = engine(&scratch.0, compatibility);
         Module::new(&second, &source).unwrap();
         assert_eq!(cache.cache_hits(), 1);
         assert_eq!(cache.cache_misses(), 0);

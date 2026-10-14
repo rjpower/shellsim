@@ -10,9 +10,9 @@ use std::sync::Arc;
 use wasmtime::{Error, Module};
 
 use super::{
-    command_engine, command_module_cache, compilation_cache, executable_admission,
-    executable_compilation_source, retain_executable_admission, threads, validate_imports,
-    CachedCompilation, ExecutableAdmission, MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
+    command_engine, command_module_cache, executable_admission, executable_compilation_source,
+    retain_executable_admission, threads, validate_imports, CachedCompilation, ExecutableAdmission,
+    MAX_CACHED_MODULE_BYTES, MAX_WASM_BYTES,
 };
 
 /// Select ordinary module compilation or main-executable admission and startup rewriting.
@@ -68,11 +68,17 @@ pub fn precompile_wasm(source: &[u8], kind: WasmCompilationKind) -> Result<Vec<u
     module.serialize()
 }
 
-/// Identify the patched runtime used to produce native companions.
+/// Identify the serialized-runtime ABI used to produce native companions.
 ///
-/// CPU and configuration incompatibility is handled by Wasmtime when loading the companion.
+/// This remains stable across shellsim releases with the same ABI. CPU and configuration
+/// incompatibility is handled by Wasmtime when loading the companion.
 pub fn precompiled_wasm_build_id() -> &'static str {
-    compilation_cache::BUILD_ID
+    super::engine::compilation_compatibility_id()
+}
+
+/// Host target triple used for baseline native companions and catalog selection.
+pub fn precompiled_wasm_target() -> &'static str {
+    env!("SHELLSIM_WASMTIME_TARGET")
 }
 
 /// Check retained compilation before a host adapter reads a large companion file.
@@ -293,6 +299,7 @@ mod tests {
             wat::parse_str("(module (func (export \"_start\") (i32.const 17) drop))").unwrap();
         let module = Module::new(&engine, &source).unwrap();
         let bytes = module.serialize().unwrap();
+        assert!(load(Some(&Companion::Bytes(bytes.clone().into()))).is_none());
         // SAFETY: the native payload is genuine output from a differently configured Wasmtime.
         assert_eq!(
             unsafe {
@@ -307,5 +314,14 @@ mod tests {
             .write("/", "/foreign", &source, 0o755)
             .unwrap();
         assert_eq!(environment.run_script_capture("/foreign").0.exit_status, 0);
+
+        // Matching ABI identities must not bypass Wasmtime's engine compatibility checks:
+        // an unmetered companion cannot run inside the fuel-metered command engine.
+        let mut config = Config::new();
+        super::super::configure_command_engine(&mut config);
+        config.consume_fuel(false);
+        let engine = Engine::new(&config).unwrap();
+        let bytes = Module::new(&engine, &source).unwrap().serialize().unwrap();
+        assert!(load(Some(&Companion::Bytes(bytes.into()))).is_none());
     }
 }

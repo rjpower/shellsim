@@ -28,6 +28,8 @@ from packaging.version import Version
 
 from ._cpython_release import _extract
 from ._cpython_universe import _inside, _inspect_wheel, _relative, _stage_console_scripts, _verify_wasm
+from ._startup import logger as startup_logger
+from ._startup import phase
 from .pypi import PackageInstallError, _mount_package_tree
 
 if TYPE_CHECKING:
@@ -130,12 +132,13 @@ class Catalog:
         with path.with_name(path.name + ".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if path.is_file():
+                startup_logger.info("asset: disk cache hit name=%s", path.name)
                 return path
             if self.offline:
                 raise PackageInstallError("selected asset is not cached for offline use: " + path.name)
             from ._catalog_cache import staged_file
 
-            with staged_file(path) as temporary:
+            with phase("asset.download", asset=path.name, bytes=size), staged_file(path) as temporary:
                 with _read_url(record["url"]) as source, temporary.open("wb") as output:
                     total = 0
                     while chunk := source.read(1024**2):
@@ -157,13 +160,40 @@ class Catalog:
         with target.with_suffix(".lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             if (target / "runtime").is_dir():
+                startup_logger.info("runtime: extracted cache hit")
                 return target / "runtime"
             with tempfile.TemporaryDirectory(prefix=".runtime-", dir=target.parent) as temporary:
                 stage = Path(temporary) / "unpacked"
                 stage.mkdir()
-                _extract(archive, stage, allowed_roots=frozenset({"runtime"}))
+                with phase("runtime.extract"):
+                    _extract(archive, stage, allowed_roots=frozenset({"runtime"}))
                 stage.rename(target)
         return target / "runtime"
+
+    def matching_companions(self, record: dict) -> list[dict]:
+        """Select host-native assets before downloading any bytes from the catalog."""
+        if not self.trusted_precompiled:
+            return []
+        from . import _native
+
+        return [
+            item
+            for item in record.get("companions", [])
+            if item["target"] == _native.precompiled_wasm_target()
+            and item["build_id"] == _native.precompiled_wasm_build_id()
+        ]
+
+    def _register_companion(self, source: bytes, companion: dict, *, executable: bool = False) -> None:
+        from . import _native
+
+        name = Path(companion["path"]).name
+        with phase("precompiled.register", asset=name):
+            outcome = _native.register_trusted_precompiled_wasm_file(
+                source,
+                str(self.asset(companion)),
+                executable=executable,
+            )
+        startup_logger.info("precompiled: %s asset=%s (compatibility checked on first use)", outcome, name)
 
     def register_precompiled(self, source: Path, record: dict, *, executable: bool) -> None:
         """Load a host companion only when the caller trusts this catalog's producer bytes.
@@ -172,14 +202,29 @@ class Catalog:
         The trust opt-in guarantees the exact source/kind association; this is not
         a native-code verification or a guest filesystem operation.
         """
-        if self.trusted_precompiled and "precompiled" in record:
-            from . import _native
+        companions = self.matching_companions(record)
+        if len(companions) > 1:
+            raise PackageInstallError("multiple matching native companions")
+        if companions:
+            self._register_companion(source.read_bytes(), companions[0], executable=executable)
 
-            _native.register_trusted_precompiled_wasm_file(
-                source.read_bytes(),
-                str(self.asset(record["precompiled"])),
-                executable=executable,
-            )
+    def register_wheel_companions(self, wheel: Path, record: dict) -> None:
+        """Associate trusted sidecars only with extensions declared in the inspected wheel."""
+        companions = self.matching_companions(record)
+        if not companions:
+            return
+        with zipfile.ZipFile(wheel) as archive:
+            manifests = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-native.json")]
+            if len(manifests) != 1:
+                raise PackageInstallError("native companions need one wheel native manifest")
+            declared = {item["path"] for item in json.loads(archive.read(manifests[0]))["artifacts"]}
+            selected = set()
+            for companion in companions:
+                source = _relative(companion["source"]).as_posix()
+                if source not in declared or source in selected:
+                    raise PackageInstallError("invalid or duplicate wheel companion source")
+                selected.add(source)
+                self._register_companion(archive.read(source), companion)
 
     def resolve(self, requirements: str | Sequence[str]) -> list[dict]:
         if self.runtime is None:
@@ -265,24 +310,28 @@ class Catalog:
                 if package["name"] in environment._catalog_packages:
                     continue
                 path = self.asset(package)
-                inspection = _inspect_wheel(
-                    path,
-                    name=package["name"],
-                    version=package["version"],
-                    abi=self.abi,
-                    curated=True,
-                    verify_digests=False,
-                )
-                count += inspection.file_count
-                unpacked += inspection.uncompressed_bytes
-                if count > _MAX_FILES or unpacked > _MAX_UNPACKED:
-                    raise PackageInstallError("selected wheels exceed their staging limit")
-                unpack_wheel(path, site, trusted_precompiled=self.trusted_precompiled)
+                with phase("wheel.prepare", package=package["name"]):
+                    inspection = _inspect_wheel(
+                        path,
+                        name=package["name"],
+                        version=package["version"],
+                        abi=self.abi,
+                        curated=True,
+                        verify_digests=False,
+                    )
+                    count += inspection.file_count
+                    unpacked += inspection.uncompressed_bytes
+                    if count > _MAX_FILES or unpacked > _MAX_UNPACKED:
+                        raise PackageInstallError("selected wheels exceed their staging limit")
+                    self.register_wheel_companions(path, package)
+                    unpack_wheel(path, site)
             create_entry_points(site)
             _stage_console_scripts(site, staging, runtime.venv)
             assets = self.assets_for([*packages, *providers])
-            stage_catalog_items(self, environment, providers, assets, staging)
-            _mount_package_tree(environment, staging, "/", normalize_modes=True)
+            with phase("native.stage", providers=len(providers), assets=len(assets)):
+                stage_catalog_items(self, environment, providers, assets, staging)
+            with phase("packages.mount"):
+                _mount_package_tree(environment, staging, "/", normalize_modes=True)
         environment._catalog_packages.update(package["name"] for package in packages)
         environment._catalog_native.update(provider["name"] for provider in providers)
         environment._catalog_assets.update(item["path"] for item in assets)
@@ -395,28 +444,10 @@ def unpack_files(path: Path, staging: Path) -> None:
             target.chmod(0o755 if member.external_attr >> 16 & 0o111 else 0o644)
 
 
-def unpack_wheel(path: Path, site: Path, *, trusted_precompiled: bool = False) -> None:
+def unpack_wheel(path: Path, site: Path) -> None:
     """Relocate wheel data and reject conflicting installed files."""
     with zipfile.ZipFile(path) as archive:
         mappings = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-precompiled.json")]
-        if len(mappings) > 1:
-            raise PackageInstallError("wheel contains multiple precompiled mappings")
-        if mappings and trusted_precompiled:
-            from . import _native
-
-            info = archive.getinfo(mappings[0])
-            if info.file_size > _MAX_CATALOG:
-                raise PackageInstallError("wheel precompiled mapping exceeds its metadata limit")
-            mapping = json.loads(archive.read(info))
-            if not isinstance(mapping, dict) or len(mapping) > _MAX_FILES:
-                raise PackageInstallError("invalid wheel precompiled mapping")
-            prefix = mappings[0].removesuffix("shellsim-precompiled.json") + "precompiled/"
-            for source, companion in mapping.items():
-                source = _relative(source).as_posix()
-                companion = _relative(companion).as_posix()
-                if not companion.startswith(prefix) or not companion.endswith(".cwasm") or source.endswith(".cwasm"):
-                    raise PackageInstallError("invalid wheel precompiled member")
-                _native.register_trusted_precompiled_wasm(archive.read(source), archive.read(companion))
         for member in archive.infolist():
             relative = _relative(member.filename.rstrip("/"))
             if (

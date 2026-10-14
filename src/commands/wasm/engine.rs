@@ -3,9 +3,24 @@
 use std::sync::OnceLock;
 use wasmtime::{Collector, Config, Engine, ModuleVersionStrategy};
 
-use super::compilation_cache;
-
 pub(super) const ASYNC_STACK_BYTES: usize = 2 * 1024 * 1024;
+
+// Bump only when our Wasmtime patches break serialized metadata, generated-code/runtime
+// calling conventions, or VM layouts. Wasmtime checks target, ISA and engine settings itself.
+// Package metadata and compatible source, dependency or toolchain changes are not ABI revisions.
+const PATCHED_RUNTIME_ABI: u32 = 1;
+
+/// Identify load compatibility independently of the shellsim release or build machine.
+/// Keep Wasmtime's own serialization version so an upstream ABI change still invalidates it.
+pub(super) fn compilation_compatibility_id() -> &'static str {
+    static ID: OnceLock<String> = OnceLock::new();
+    ID.get_or_init(|| {
+        format!(
+            "shellsim-wasmtime-{}-abi{PATCHED_RUNTIME_ABI}",
+            ModuleVersionStrategy::WasmtimeVersion.as_str()
+        )
+    })
+}
 
 pub(super) fn configure_command_engine(config: &mut Config) {
     config
@@ -17,10 +32,9 @@ pub(super) fn configure_command_engine(config: &mut Config) {
         .wasm_gc(false)
         .collector(Collector::DeferredReferenceCounting);
     config
-        .module_version(ModuleVersionStrategy::Custom(format!(
-            "shellsim-wasmtime-49-{}",
-            compilation_cache::BUILD_ID
-        )))
+        .module_version(ModuleVersionStrategy::Custom(
+            compilation_compatibility_id().into(),
+        ))
         .expect("bounded patched Wasmtime identity");
 }
 

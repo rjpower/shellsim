@@ -11,10 +11,10 @@ from pathlib import Path
 import pytest
 import shellsim
 from shellsim._cpython_universe import (
+    _MAX_TOTAL_BYTES,
     Universe,
     _add_wheel_to_set,
     _inspect_wheel,
-    _MAX_TOTAL_BYTES,
     _stage_console_scripts,
     _stage_provider,
     _verify_file,
@@ -414,10 +414,11 @@ def test_conflict_preserves_existing_files_and_skips_extension(live_universe) ->
 
 @pytest.fixture
 def delivery_catalog(tmp_path):
+    from dataclasses import asdict
+
     from ports.buildomatic.cache import runtime_delivery_key
     from ports.buildomatic.delivery import DeliveryStore, catalog
     from ports.buildomatic.delivery_products import publish_runtime, wheel_metadata
-    from dataclasses import asdict
 
     store = tmp_path / "delivery"
     store.mkdir()
@@ -490,9 +491,10 @@ def test_environment_catalog_installs_wasi_markers_extras_and_entry_points(deliv
 
 @pytest.mark.parametrize("trusted_precompiled", [False, True])
 def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_precompiled):
-    from ports.buildomatic.delivery import catalog
     from shellsim import _native
     from shellsim._pypi_catalog import Catalog
+
+    from ports.buildomatic.delivery import catalog
 
     tool = tmp_path / "example.wasm"
     tool.write_bytes(
@@ -523,7 +525,8 @@ def test_catalog_tools_install_data_closure_without_python(tmp_path, trusted_pre
                 "abi": ABI,
                 "native_dependencies": [],
                 "port": reference,
-                "precompiled": {"path": companion.name, "size": companion.stat().st_size},
+                "companions": [{"path": companion.name, "size": companion.stat().st_size,
+                    "target": _native.precompiled_wasm_target(), "build_id": _native.precompiled_wasm_build_id()}],
             }
             for name, reference in (
                 ("clang", "native/example"),
@@ -594,18 +597,19 @@ def test_catalog_constraint_rejection_preserves_installed_guest(delivery_catalog
     assert environment.read_file("/work/.venv/lib/python3.13/site-packages/app.py") == before
 
 
-@pytest.mark.parametrize("trusted_precompiled", [False, True])
-def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path, trusted_precompiled):
-    from ports.buildomatic.delivery_products import _delivery_wheel, wheel_metadata
+@pytest.mark.parametrize(("trusted_precompiled", "mismatch"), [(False, None), (True, None), (True, "target"), (True, "build_id")])
+def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, trusted_precompiled, mismatch):
     from dataclasses import asdict
+    from shellsim import _native
+
+    from ports.buildomatic.delivery_products import wheel_metadata
 
     path, cache = delivery_catalog
     document = json.loads(path.read_text())
     raw = marked_wasm()
-    source = tmp_path / "source.whl"
     wheel = path.parent / "native-1.0-cp313-cp313-wasm32_wasip1.whl"
     info = "native-1.0.dist-info/"
-    with zipfile.ZipFile(source, "w") as archive:
+    with zipfile.ZipFile(wheel, "w") as archive:
         archive.writestr("native.so", raw)
         archive.writestr(info + "METADATA", "Name: native\nVersion: 1.0\n")
         archive.writestr(info + "WHEEL", "Root-Is-Purelib: false\nTag: cp313-cp313-wasm32_wasip1\n")
@@ -613,37 +617,30 @@ def test_catalog_wheel_companions_stay_outside_guest(delivery_catalog, tmp_path,
             "schema_version": 1, "name": "native", "version": "1.0", "abi": ABI, "recipe": {},
             "artifacts": [{"path": "native.so", "sha256": hashlib.sha256(raw).hexdigest(), "native_dependencies": []}],
         }))
-    _delivery_wheel(source, wheel)
-    document["packages"].append({**asdict(wheel_metadata(wheel, wheel.name)), "url": wheel.as_uri()})
-    if not trusted_precompiled:
-        # An arbitrary catalog can include unparseable mapping bytes. Ignoring
-        # them must still install the portable source without host deserialization.
-        with zipfile.ZipFile(wheel) as archive:
-            members = [(member, archive.read(member)) for member in archive.infolist()]
-        with zipfile.ZipFile(wheel, "w") as archive:
-            for member, data in members:
-                archive.writestr(member, b"untrusted" if member.filename.endswith("shellsim-precompiled.json") else data)
-        document["packages"][-1]["size"] = wheel.stat().st_size
+    companion = path.parent / "native.cwasm"
+    companion.write_bytes(_native.precompile_wasm(raw))
+    variant = {"path": companion.name, "url": companion.as_uri(), "size": companion.stat().st_size,
+        "source": "native.so", "target": _native.precompiled_wasm_target(), "build_id": _native.precompiled_wasm_build_id()}
+    if mismatch:
+        variant[mismatch] = "another-" + variant[mismatch]
+    if not trusted_precompiled or mismatch:
+        companion.unlink()
+    document["packages"].append({**asdict(wheel_metadata(wheel, wheel.name)), "url": wheel.as_uri(), "companions": [variant]})
     path.write_text(json.dumps(document))
     environment = shellsim.Context(pypi_catalog=path, cache_dir=cache, trusted_precompiled=trusted_precompiled).Environment(pypi_packages="native")
     site = "/work/.venv/lib/python3.13/site-packages/"
     assert environment.read_file(site + "native.so") == raw
     assert environment.run("find / -name '*.cwasm' -o -name shellsim-precompiled.json").stdout == b""
-    if not trusted_precompiled:
-        # The same asset path later supplied by a trusted producer must not
-        # reuse the arbitrary catalog's cached wheel or mapping.
-        with zipfile.ZipFile(wheel, "w") as archive:
-            for member, data in members:
-                archive.writestr(member, data)
-        document["packages"][-1]["size"] = wheel.stat().st_size
-        path.write_text(json.dumps(document))
-        trusted = shellsim.Context(pypi_catalog=path, cache_dir=cache, trusted_precompiled=True).Environment(pypi_packages="native")
-        assert trusted.read_file(site + "native.so") == raw
+    downloaded = list(cache.rglob("native.cwasm"))
+    assert bool(downloaded) == (trusted_precompiled and mismatch is None)
 
 
-def test_context_reuses_frozen_installation_without_host_assets(delivery_catalog):
+def test_context_reuses_frozen_installation_without_host_assets(delivery_catalog, caplog):
     """Warm creation must work after all trusted setup inputs disappear."""
+    import logging
     import shutil
+
+    caplog.set_level(logging.INFO, logger="shellsim.startup")
 
     path, cache = delivery_catalog
     context = shellsim.Context(pypi_catalog=path, cache_dir=cache)
@@ -657,7 +654,10 @@ def test_context_reuses_frozen_installation_without_host_assets(delivery_catalog
     shutil.rmtree(cache)
     second = context.Environment(pypi_packages=["BASE >= 1", "app", "app"], cpu=200_000_000)
     assert second.read_file(installed) == b"VALUE = 42\n"
-    assert second.run("printf '%s:%s' \"${PRIVATE-unset}\" \"$PWD\"").stdout == b"unset:/"
+    result = second.run("printf '%s:%s' \"${PRIVATE-unset}\" \"$PWD\"")
+    assert result.stdout == b"unset:/"
+    assert result.stderr == b""
+    assert any(record.name == "shellsim.startup" for record in caplog.records)
     assert first.read_file(installed) == b"private change"
     with pytest.raises(shellsim.PackageInstallError):
         shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages="app")

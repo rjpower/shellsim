@@ -58,8 +58,9 @@ mod precompiled;
 use engine::{configure_command_engine, ASYNC_STACK_BYTES};
 
 pub use precompiled::{
-    precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
-    register_trusted_precompiled_wasm_file, PrecompiledWasmOutcome, WasmCompilationKind,
+    precompile_wasm, precompiled_wasm_build_id, precompiled_wasm_target,
+    register_trusted_precompiled_wasm, register_trusted_precompiled_wasm_file,
+    PrecompiledWasmOutcome, WasmCompilationKind,
 };
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images

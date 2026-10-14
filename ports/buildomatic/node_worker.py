@@ -147,10 +147,10 @@ def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -
     products = BuildCache(store)
     if (cached := products.get(node.key)) is not None:
         return cached
-    if (expected := specification.get("wasmtime_build_id")) is not None:
-        from shellsim import _native
+    if (expected := specification.get("compiler")) is not None:
+        from ports.buildomatic.cache import compiler_identity
 
-        actual = _native.precompiled_wasm_build_id()
+        actual = compiler_identity()
         if actual != expected:
             raise ValueError(
                 f"worker Wasmtime {actual} differs from planner {expected}; install the matching worker image"

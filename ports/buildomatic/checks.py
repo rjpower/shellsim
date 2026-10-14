@@ -95,10 +95,6 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     assets = cache / "delivery"
     assets.mkdir(exist_ok=True)
     delivery = DeliveryStore(store.prefix)
-    items = [*packages, *native, *files, *([runtime] if runtime else [])]
-    items.extend(item["precompiled"] for item in tuple(items) if "precompiled" in item)
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        list(pool.map(lambda item: stage_asset(delivery, item, assets), items))
     limits = _test_limits(node.port.recipe)
     kwargs = {"limits": limits} if limits is not None else {}
     graph = {"packages": packages, "native": native, "abi": node.port.recipe.get("abi")}
@@ -112,6 +108,10 @@ def check(node: Node, records: dict, store: StorageStore, cache: Path, work: Pat
     location = work / "catalog.json"
     write_reference(location, catalog(graph, assets.as_uri()))
     installer = Catalog(location, cache_dir=cache / "guest", trusted_precompiled=True)
+    items = [*packages, *native, *files, *([runtime] if runtime else [])]
+    items.extend(companion for item in tuple(items) for companion in installer.matching_companions(item))
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(lambda item: stage_asset(delivery, item, assets), items))
     if runtime:
         own = next(
             (

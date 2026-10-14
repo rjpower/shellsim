@@ -1,7 +1,7 @@
 """Product identities, asset addresses and completed-node records.
 
 Packaging revisions change derived products without invalidating raw builds.
-Only Wasmtime-dependent products include the compiler identity. Completion
+Only Wasmtime-dependent products include the serialization ABI identity. Completion
 records retain their existing addresses so this cleanup reuses cached builds.
 """
 
@@ -29,13 +29,13 @@ def asset_path(key: str, name: str) -> str:
     return f"assets/{relative_path(key)}/{relative_path(name)}"
 
 
-def compiler_identity(port: Port | None = None) -> str | None:
-    """Pure wheels and data remain reusable across Wasmtime builds."""
+def compiler_identity(port: Port | None = None) -> dict[str, str] | None:
+    """Key native companions on load compatibility; pure wheels and data have no ABI key."""
     if port is not None and port.recipe["build_system"] in {"pure-wheel", "source-tree", "llvm-guest-sdk"}:
         return None
     from shellsim import _native
 
-    return _native.precompiled_wasm_build_id()
+    return {"build_id": _native.precompiled_wasm_build_id(), "target": _native.precompiled_wasm_target()}
 
 
 def delivery_key(product_key: str, *, port: Port) -> str:
