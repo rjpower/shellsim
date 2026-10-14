@@ -7,7 +7,7 @@ has no embedded Python interpreter or bundled substitutes for NumPy and SciPy.
 ```python
 import shellsim
 
-ctx = shellsim.Context(pypi_catalog="https://shellsim.rjp.io/ports/catalog.json")
+ctx = shellsim.Context()
 env = ctx.Environment(pypi_packages=["numpy"])
 result = env.run_python("import numpy as np; print(np.arange(6).sum())")
 result.check_returncode()

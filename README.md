@@ -118,15 +118,16 @@ assert result.network_requests[0].matched
 Run Python and compiled packages using an exported [ports catalog](ports/buildomatic/README.md):
 
 ```python
-context = shellsim.Context(pypi_catalog="https://shellsim.rjp.io/ports/catalog.json")
+context = shellsim.Context()
 environment = context.Environment(pypi_packages=["scipy"])
 result = environment.run_python("from scipy.special import factorial; print(factorial(5))")
 result.check_returncode()
 ```
 
 This mounts upstream CPython 3.13.7 WASI and downloads only the selected wheels,
-native dependencies, and interpreter. Context fixes the catalog snapshot and
-`cache_dir`, `offline`, and `trusted_precompiled` policy. Identical selections reuse
+native dependencies, and interpreter. Context reads `DEFAULT_PYPI_CATALOG` on
+the first port request; pass `pypi_catalog` to override it. Cache, offline and
+precompiled trust policy belong to the Context. Identical selections reuse
 an immutable installation with a private filesystem for each guest. Create a new
 Context to see catalog updates. No patched uv is needed;
 `pypi_packages=()` selects CPython without extra packages; `install_pypi` can add catalog

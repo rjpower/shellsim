@@ -7,6 +7,8 @@ metadata validators without installing a platform-specific native adapter.
 from importlib import import_module
 from typing import TYPE_CHECKING
 
+DEFAULT_PYPI_CATALOG = "https://shellsim.rjp.io/ports/catalog.json"
+
 if TYPE_CHECKING:
     from ._api import (
         Action,
@@ -39,6 +41,7 @@ __all__ = [
     "CommandUsage",
     "Container",
     "Context",
+    "DEFAULT_PYPI_CATALOG",
     "CPythonRuntime",
     "DisplayFrame",
     "DisplayHost",

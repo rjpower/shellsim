@@ -660,9 +660,26 @@ def test_context_reuses_frozen_installation_without_host_assets(delivery_catalog
     assert second.run("printf '%s:%s' \"${PRIVATE-unset}\" \"$PWD\"").stdout == b"unset:/"
     assert first.read_file(installed) == b"private change"
     with pytest.raises(shellsim.PackageInstallError):
-        shellsim.Context(pypi_catalog=path, cache_dir=cache)
+        shellsim.Context(pypi_catalog=path, cache_dir=cache).Environment(pypi_packages="app")
     del context
     assert second.read_file(installed) == b"VALUE = 42\n"
+
+
+def test_context_default_catalog_is_loaded_only_for_ports(delivery_catalog, monkeypatch):
+    from shellsim import _api
+
+    path, cache = delivery_catalog
+    monkeypatch.setattr(_api, "DEFAULT_PYPI_CATALOG", path)
+    context = shellsim.Context(cache_dir=cache)
+    original = path.read_bytes()
+    path.unlink()
+    assert context.Environment().run("echo shell").stdout == b"shell\n"
+    path.write_bytes(original)
+    python = context.Environment(pypi_packages=())
+    assert python.run("readlink /usr/bin/python3").stdout == b"/usr/bin/python3.wasm\n"
+    with pytest.raises(shellsim.SimulationError):
+        python.read_file("/usr/share/base/value.txt")
+    assert context.Environment(pypi_packages="app").read_file("/usr/share/base/value.txt") == b"42"
 
 
 def test_context_concurrent_preparation_returns_isolated_guests(delivery_catalog):
