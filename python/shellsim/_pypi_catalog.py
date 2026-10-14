@@ -188,8 +188,8 @@ class Catalog:
             requirements = (requirements,)
         if not isinstance(requirements, Sequence) or isinstance(requirements, bytes):
             raise TypeError("pypi_packages must be package specs or a sequence of specs")
-        if not 1 <= len(requirements) <= 256:
-            raise ValueError("pypi_packages needs 1..256 package specs")
+        if len(requirements) > 256:
+            raise ValueError("pypi_packages accepts at most 256 package specs")
         pending = deque()
         for text in requirements:
             if not isinstance(text, str):

@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
-from . import _native
+from . import DEFAULT_PYPI_CATALOG, _native
 
 if TYPE_CHECKING:
     from .cpython import CPythonRuntime
@@ -199,7 +199,8 @@ class _PreparedInstallation:
 class Context:
     """Fix installation policy and share immutable installed files between machines.
 
-    A context reads its catalog once. Create another context to observe updates.
+    Read the catalog on the first package or tool request, using DEFAULT_PYPI_CATALOG
+    unless overridden. Create another context to observe updates.
     The byte-bounded preparation cache does not limit bases held by live machines.
     """
 
@@ -220,16 +221,20 @@ class Context:
         self._pending: dict[tuple, Future[_PreparedInstallation]] = {}
         self._lock = threading.Lock()
         self._catalog = None
-        location = pypi_catalog
-        if location is not None:
-            from ._pypi_catalog import Catalog
+        self._catalog_location = DEFAULT_PYPI_CATALOG if pypi_catalog is None else pypi_catalog
+        self._trusted_precompiled = trusted_precompiled
 
-            self._catalog = Catalog(
-                location,
-                cache_dir=self._cache_dir,
-                offline=offline,
-                trusted_precompiled=trusted_precompiled,
-            )
+    def _ensure_catalog(self) -> None:
+        from ._pypi_catalog import Catalog
+
+        with self._lock:
+            if self._catalog is None:
+                self._catalog = Catalog(
+                    self._catalog_location,
+                    cache_dir=self._cache_dir,
+                    offline=self._offline,
+                    trusted_precompiled=self._trusted_precompiled,
+                )
 
     def Environment(
         self,
@@ -263,10 +268,8 @@ class Context:
             raise ValueError("clock must be 'virtual' or 'real_time'")
         if http is not None and not isinstance(http, Mapping):
             raise TypeError("http must be a mapping from URL patterns to shellsim.HttpResponse")
-        if selected and self._catalog is None:
-            from .pypi import PackageInstallError
-
-            raise PackageInstallError("set pypi_catalog on Context to a ports catalog")
+        if selected:
+            self._ensure_catalog()
         prepared = self._installation(key)
         native = prepared.image.environment(
             resolved.cpu,
