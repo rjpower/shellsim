@@ -262,7 +262,7 @@ pub(super) struct Record {
     pub(super) tls: [u32; super::threads::MAX_THREADS],
     pub(super) dependencies: Vec<u32>,
     pub(super) global: std::sync::atomic::AtomicBool,
-    layout: layout::Layout,
+    layout: Arc<layout::Layout>,
     function_slots: BTreeMap<String, u32>,
     store_cost: u64,
 }

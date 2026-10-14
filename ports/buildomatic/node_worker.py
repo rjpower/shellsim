@@ -14,6 +14,7 @@ from ports._support.node_build import produce_port
 from ports._support.sdk import SDKProduct, _produce, installed_seed, producer_work
 from ports._support.sdk_products import Receipt
 from ports.buildomatic.artifacts import install, upload, write_reference
+from ports.buildomatic.bytecode import BytecodeCompiler
 from ports.buildomatic.cache import BuildCache
 from ports.buildomatic.delivery import DeliveryStore
 from ports.buildomatic.delivery_products import publish_product, publish_runtime
@@ -130,10 +131,16 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
     root = install(store, product["artifact"], cache / "artifacts")
+    bytecode = None
+    if "bytecode_runtime" in records:
+        runtime = records["bytecode_runtime"]
+        bytecode = BytecodeCompiler(install(store, runtime["artifact"], cache / "artifacts"), runtime["build_key"])
     return {
         **product,
         "delivery_key": node.key,
-        "delivery": publish_product(node.port, root, product["build_key"], DeliveryStore(store.prefix), key=node.key),
+        "delivery": publish_product(
+            node.port, root, product["build_key"], DeliveryStore(store.prefix), key=node.key, bytecode=bytecode
+        ),
     }
 
 

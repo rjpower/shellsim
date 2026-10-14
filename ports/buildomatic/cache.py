@@ -13,8 +13,8 @@ from ports.buildomatic.artifacts import register, resolve
 from ports.buildomatic.contracts import Store
 
 # Change when packaging changes its output or installation semantics.
-DELIVERY_REVISION = 5
-RUNTIME_REVISION = 3
+DELIVERY_REVISION = 6
+RUNTIME_REVISION = 4
 
 
 def node_key(operation: str, **inputs) -> str:
@@ -38,14 +38,22 @@ def compiler_identity(port: Port | None = None) -> dict[str, str] | None:
     return {"build_id": _native.precompiled_wasm_build_id(), "target": _native.precompiled_wasm_target()}
 
 
-def delivery_key(product_key: str, *, port: Port) -> str:
+def delivery_key(product_key: str, *, port: Port, bytecode_runtime: str | None = None) -> str:
     compiler = compiler_identity(port)
     return node_key(
         "delivery",
         product=product_key,
         format_version=DELIVERY_REVISION,
+        bytecode_runtime=bytecode_runtime,
         **({"wasmtime": compiler} if compiler is not None else {}),
     )
+
+
+def wheel_asset_key(product_key: str, bytecode_runtime: str | None) -> str:
+    """Bytecode is portable across hosts but specific to the declared CPython producer."""
+    if bytecode_runtime is None:
+        return product_key
+    return node_key("wheel", product=product_key, bytecode_runtime=bytecode_runtime, format_version=DELIVERY_REVISION)
 
 
 def file_bundle_key(product_key: str) -> str:

@@ -694,11 +694,13 @@ impl NativeEnvironment {
                 environment.sync_vfs_time();
                 let before = environment.vfs.clone();
                 let result = (|| {
-                    shellsim::host_ingest::mount_host_tree_report(
+                    shellsim::host_ingest::mount_package_tree(
                         environment,
                         Path::new(&host_root),
                         "/",
-                    )?;
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?;
                     configure_cpython_vfs(environment, venv)
                 })();
                 if result.is_err() {

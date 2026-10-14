@@ -43,6 +43,9 @@ release versions, lockfiles and source-only refactors do not change this identit
 
 Concurrent same-source misses share a compilation lock; unrelated process-local cache hits
 keep their own access.
+The bounded module cache also retains successful raw-instruction admission, threaded
+side-module layouts and content hashes for exact immutable source bytes. Changed VFS bytes
+require fresh checks; guest CPU charges and memory reservations remain unchanged.
 Native disk-cache hits still run admission once in each process. Repeated executable launches
 can reuse the positive admission profile only from an exact original-byte LRU entry; side-module
 and rewritten-startup entries do not supply an executable profile.

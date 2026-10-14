@@ -195,6 +195,20 @@ fn executable_binds_functions_data_and_constructor_callbacks_before_main() {
     );
     assert_eq!(precompiled.usage.cpu_used, outcome.usage.cpu_used);
     assert_eq!(precompiled.usage.memory_peak, outcome.usage.memory_peak);
+
+    // Replacing an admitted side module must not reuse its successful raw-wait scan.
+    let changed = side_module(
+        "",
+        "(i32.load (global.get $base))",
+        "(drop (memory.atomic.notify (i32.const 0) (i32.const 1)))",
+    );
+    environment
+        .vfs
+        .write("/", "/lib/root.so", &changed, 0o644)
+        .unwrap();
+    let (rejected, _, stderr) = environment.run_script_capture("/app");
+    assert_ne!(rejected.exit_status, 0);
+    assert!(String::from_utf8_lossy(&stderr).contains("raw atomic wait/notify"));
 }
 
 #[test]

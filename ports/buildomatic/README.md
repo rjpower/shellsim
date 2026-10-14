@@ -26,8 +26,11 @@ assets with `--output <prefix> --copy-assets`; `--asset-output <shared-prefix>` 
 catalogs from shared assets. Serve the store with `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Context(pypi_catalog="<URL>").Environment(pypi_packages=["scipy"])`; no patched uv is needed.
 
-Delivery publishes portable wheels and runtime archives unchanged, with separate
-Wasmtime companions for the runtime, wheel extensions and native exports. Each
+Delivery adds checked-hash `.pyc` files to wheels and the stdlib using the declared
+WASI CPython producer, with source files retained and wheel RECORDs updated. Bytecode
+delivery keys include that producer; cache hits prune its build-only prerequisites.
+Portable Wasm remains unchanged, with separate Wasmtime companions for the runtime,
+wheel extensions and native exports. Each
 `companions` entry identifies its host `target`, runtime `build_id` and asset path;
 wheel entries also name their source member. Delivery keys include that target and ABI,
 while portable asset paths remain independent of both. Workers compile baseline code for

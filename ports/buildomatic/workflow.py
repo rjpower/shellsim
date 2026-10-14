@@ -190,7 +190,15 @@ def compile_plan(ports: Path, requests: Sequence[str], sdk_name: str = "default"
             continue
         product = builds[port.reference]
         inputs = (Input("product", product.reference, product.key),)
-        key = delivery_key(product.key, port=port)
+        bytecode_runtime = None
+        if (
+            runtime
+            and port.recipe.get("output") != "stdlib"
+            and (port.recipe["build_system"] == "pure-wheel" or port.recipe["build_system"].startswith("python-"))
+        ):
+            bytecode_runtime = builds[products[runtime["producer"]].port.reference]
+            inputs += (Input("bytecode_runtime", bytecode_runtime.reference, bytecode_runtime.key),)
+        key = delivery_key(product.key, port=port, bytecode_runtime=bytecode_runtime.key if bytecode_runtime else None)
         node = Node(port.reference + ":delivery", Operation.DELIVERY, key, port, inputs)
         deliveries[port.reference] = node
         nodes.append(node)

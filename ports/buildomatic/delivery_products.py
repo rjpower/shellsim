@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import base64
+import csv
 import email
+import hashlib
+import io
 import json
 import tempfile
 import zipfile
@@ -14,7 +18,8 @@ from packaging.utils import canonicalize_name
 
 from ports._support.graph import Port
 from ports._support.store import relative_path
-from ports.buildomatic.cache import asset_path, compiler_identity, file_bundle_key, runtime_archive_key
+from ports.buildomatic.bytecode import BytecodeCompiler, compile_sources
+from ports.buildomatic.cache import asset_path, compiler_identity, file_bundle_key, runtime_archive_key, wheel_asset_key
 
 if TYPE_CHECKING:
     from ports.buildomatic.delivery import DeliveryStore
@@ -106,13 +111,46 @@ def wheel_metadata(path: Path, relative: str) -> Wheel:
     )
 
 
-def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore, *, key: str) -> dict:
+def _bytecode_wheel(source: Path, destination: Path, bundle: Path) -> None:
+    """Keep portable members, add reproducible bytecode and reseal RECORD."""
+    with zipfile.ZipFile(source) as archive:
+        files = {relative_path(name): archive.read(name) for name in archive.namelist() if not name.endswith("/")}
+        modes = {member.filename: member.external_attr for member in archive.infolist()}
+    info = next(name.removesuffix("METADATA") for name in files if name.endswith(".dist-info/METADATA"))
+    for name in (info + "RECORD", info + "RECORD.jws", info + "RECORD.p7s"):
+        files.pop(name, None)
+    files.update(compile_sources(bundle, {name: data for name, data in files.items() if name.endswith(".py")}))
+    record = io.StringIO(newline="")
+    rows = csv.writer(record, lineterminator="\n")
+    for name, data in sorted(files.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+        rows.writerow((name, "sha256=" + digest, len(data)))
+    rows.writerow((info + "RECORD", "", ""))
+    files[info + "RECORD"] = record.getvalue().encode()
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in sorted(files.items()):
+            member = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = modes.get(name, 0o644 << 16)
+            archive.writestr(member, data)
+
+
+def publish_product(
+    port: Port, root: Path, build_key: str, store: DeliveryStore, *, key: str, bytecode: BytecodeCompiler | None = None
+) -> dict:
     """Emit installable assets; the worker commits their completed node record."""
     record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": [], "assets": []}
     for wheel in sorted((root / "wheels").glob("*.whl")):
-        relative = asset_path(build_key, "wheels/" + wheel.name)
-        store.emit(wheel, relative)
-        metadata = asdict(wheel_metadata(wheel, relative))
+        relative = asset_path(wheel_asset_key(build_key, bytecode.key if bytecode else None), "wheels/" + wheel.name)
+        if not store.exists(relative):
+            if bytecode is None:
+                store.emit(wheel, relative)
+            else:
+                with tempfile.TemporaryDirectory(prefix=".bytecode-wheel-", dir=root.parent) as temporary:
+                    prepared = Path(temporary) / wheel.name
+                    _bytecode_wheel(wheel, prepared, bytecode.bundle)
+                    store.emit(prepared, relative)
+        metadata = {**asdict(wheel_metadata(wheel, relative)), "size": store.size(relative)}
         companions = _wheel_companions(wheel, key, store, root.parent)
         record["wheels"].append({**metadata, **({"companions": companions} if companions else {})})
     payload = root / "payload"
@@ -205,9 +243,29 @@ def publish_runtime(bundle: Path, product_key: str, store: DeliveryStore, *, key
     if not store.exists(relative):
         with tempfile.TemporaryDirectory(prefix=".runtime-", dir=bundle.parent) as temporary:
             archive = Path(temporary) / "runtime.zip"
+            bytecode = compile_sources(
+                bundle,
+                {
+                    path.relative_to(bundle / "rootfs").as_posix(): path.read_bytes()
+                    for path in sorted((bundle / "rootfs").rglob("*.py"))
+                },
+            )
+            manifest = {
+                **manifest,
+                "files": {
+                    **manifest["files"],
+                    **{"/" + name: hashlib.sha256(data).hexdigest() for name, data in bytecode.items()},
+                },
+            }
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-                for path in [bundle / "manifest.json", *sorted((bundle / "rootfs").rglob("*"))]:
-                    if path.is_file():
+                metadata = {"manifest.json": json.dumps(manifest, sort_keys=True).encode()}
+                metadata.update({"rootfs/" + name: data for name, data in bytecode.items()})
+                for name, data in sorted(metadata.items()):
+                    member = zipfile.ZipInfo("runtime/" + name, (1980, 1, 1, 0, 0, 0))
+                    member.external_attr = 0o644 << 16
+                    output.writestr(member, data, compress_type=zipfile.ZIP_DEFLATED)
+                for path in sorted((bundle / "rootfs").rglob("*")):
+                    if path.is_file() and path.relative_to(bundle / "rootfs").as_posix() not in bytecode:
                         output.write(path, "runtime/" + path.relative_to(bundle).as_posix())
             store.emit(archive, relative)
     size = store.size(relative)
