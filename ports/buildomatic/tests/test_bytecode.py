@@ -37,6 +37,9 @@ def test_delivered_wheel_loads_bytecode_and_invalidates_changed_source(tmp_path,
     port = plan(ports, ["python/example"]).ports[-1]
     (root / "wheels").mkdir(parents=True)
     source = ports / "python/example/example-1-py3-none-any.whl"
+    # Exceed a WASI write's transfer bound, as SymPy's generated modules do.
+    with zipfile.ZipFile(source, "a") as archive:
+        archive.writestr("large.py", "VALUE = " + repr("x" * (2 * 1024**2)) + "\n")
     (root / "wheels" / source.name).write_bytes(source.read_bytes())
     store = DeliveryStore(tmp_path / "store")
     compiler = BytecodeCompiler(runtime_bundle, "test-runtime")
@@ -65,11 +68,13 @@ def test_delivered_wheel_loads_bytecode_and_invalidates_changed_source(tmp_path,
 import sys
 
 def reject_source_compile(event, args):
-    if event == 'compile' and args[1].endswith('/example.py'):
+    if event == 'compile' and args[1].endswith(('/example.py', '/large.py')):
         raise AssertionError('import recompiled delivered source')
 sys.addaudithook(reject_source_compile)
 import example
 assert example.VALUE == 42
+import large
+assert large.VALUE == 'x' * (2 * 1024**2)
 """)
     assert result.returncode == 0, result.stderr
     environment.write_file(runtime.site_packages + "/example.py", "VALUE = 43\n")

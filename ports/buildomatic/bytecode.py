@@ -39,21 +39,29 @@ def compile_sources(bundle: Path, sources: dict[str, bytes]) -> dict[str, bytes]
     environment.write_file("/work/sources.json", json.dumps(sorted(sources)))
     result = environment.run_python("""
 import json
-import py_compile
+import importlib.util
+import os
+from importlib._bootstrap_external import _code_to_hash_pyc
 
 with open('/work/sources.json') as stream:
     sources = json.load(stream)
 compiled, skipped = [], []
 for name in sources:
     path = '/work/bytecode/' + name
+    with open(path, 'rb') as stream:
+        source = stream.read()
     try:
-        output = py_compile.compile(path, dfile='/' + name, doraise=True,
-            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
-    except py_compile.PyCompileError as error:
-        if not isinstance(error.exc_value, SyntaxError):
-            raise
+        code = compile(source, '/' + name, 'exec', dont_inherit=True)
+    except SyntaxError:
         skipped.append(name)
     else:
+        output = importlib.util.cache_from_source(path)
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        # py_compile uses one os.write, but WASI permits short writes. Buffered
+        # output completes large files; this isolated build needs no atomic rename.
+        bytecode = _code_to_hash_pyc(code, importlib.util.source_hash(source), checked=True)
+        with open(output, 'wb') as stream:
+            stream.write(bytecode)
         compiled.append(output.removeprefix('/work/bytecode/'))
 print(json.dumps({'compiled': compiled, 'skipped': skipped}))
 """)
