@@ -208,16 +208,12 @@ class Catalog:
         if companions:
             self._register_companion(source.read_bytes(), companions[0], executable=executable)
 
-    def register_wheel_companions(self, wheel: Path, record: dict) -> None:
+    def register_wheel_companions(self, wheel: Path, record: dict, declared: set[str]) -> None:
         """Associate trusted sidecars only with extensions declared in the inspected wheel."""
         companions = self.matching_companions(record)
         if not companions:
             return
         with zipfile.ZipFile(wheel) as archive:
-            manifests = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-native.json")]
-            if len(manifests) != 1:
-                raise PackageInstallError("native companions need one wheel native manifest")
-            declared = {item["path"] for item in json.loads(archive.read(manifests[0]))["artifacts"]}
             selected = set()
             for companion in companions:
                 source = _relative(companion["source"]).as_posix()
@@ -323,7 +319,7 @@ class Catalog:
                     unpacked += inspection.uncompressed_bytes
                     if count > _MAX_FILES or unpacked > _MAX_UNPACKED:
                         raise PackageInstallError("selected wheels exceed their staging limit")
-                    self.register_wheel_companions(path, package)
+                    self.register_wheel_companions(path, package, set(inspection.artifacts))
                     unpack_wheel(path, site)
             create_entry_points(site)
             _stage_console_scripts(site, staging, runtime.venv)
@@ -447,18 +443,9 @@ def unpack_files(path: Path, staging: Path) -> None:
 def unpack_wheel(path: Path, site: Path) -> None:
     """Relocate wheel data and reject conflicting installed files."""
     with zipfile.ZipFile(path) as archive:
-        mappings = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-precompiled.json")]
         for member in archive.infolist():
             relative = _relative(member.filename.rstrip("/"))
-            if (
-                relative.as_posix() in mappings
-                or relative.name.endswith(".cwasm")
-                or (
-                    relative.parts[0].endswith(".dist-info")
-                    and len(relative.parts) > 1
-                    and relative.parts[1] == "precompiled"
-                )
-            ):
+            if relative.name.endswith(".cwasm"):
                 continue
             if relative.parts[0].endswith(".data"):
                 if len(relative.parts) < 3:

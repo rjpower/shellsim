@@ -153,7 +153,7 @@ def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -
         actual = compiler_identity()
         if actual != expected:
             raise ValueError(
-                f"worker Wasmtime {actual} differs from planner {expected}; install the matching worker image"
+                f"worker companion target/ABI {actual} differs from planner {expected}; use a matching worker image"
             )
     records = input_records(node, store)
     if node.operation is Operation.BUILD:

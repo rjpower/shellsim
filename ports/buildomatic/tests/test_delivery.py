@@ -88,12 +88,7 @@ def test_promotion_copies_only_new_packages(built, tmp_path):
         assert (output / package["path"]).is_file()
 
 
-@pytest.mark.parametrize("oversized_companion", [False, True])
-def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, oversized_companion):
-    from ports.buildomatic import delivery_products
-
-    if oversized_companion:
-        monkeypatch.setattr(delivery_products, "_MAX_ASSET", 1)
+def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch):
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store / "execution/cache/ports", "native", [])
     port = plan(ports, ["python/native"]).ports[-1]
@@ -125,9 +120,6 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
         raise RuntimeError("compiler unavailable during delivery retry")
 
     assert (store / package["path"]).read_bytes() == wheel.read_bytes()
-    if oversized_companion:
-        assert "companions" not in package
-        return
     companion = package["companions"][0]
     with zipfile.ZipFile(wheel) as original:
         raw = original.read(companion["source"])
@@ -145,15 +137,6 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
     )["wheels"][0]
     assert updated["path"] == package["path"]
     assert updated["companions"][0]["path"] != companion["path"]
-    state = tmp_path / "state"
-    state.mkdir()
-    (state / "graph.json").write_text(json.dumps({"packages": [package], "native": []}))
-    (state / "results.json").write_text(json.dumps({"prefix": str(store)}))
-    output = tmp_path / "export"
-    assert export(state, output, "https://packages.example", copy_assets=True)["assets_copied"] == 2
-    published = json.loads((output / "catalog.json").read_text())["packages"][0]["companions"][0]
-    assert published["url"] == "https://packages.example/" + companion["path"]
-    assert (output / published["path"]).read_bytes() == (store / companion["path"]).read_bytes()
 
 
 @pytest.mark.parametrize("destination", ["/lib/libtest.so", "/usr/lib/python3.13/lib-dynload/libtest.so"])

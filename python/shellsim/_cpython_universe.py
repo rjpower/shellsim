@@ -728,6 +728,6 @@ def install(
         # Legacy uv installs use raw Wasm; native companions stay host-only even
         # when a delivery wheel is supplied through a local universe.
         for path in files:
-            if path.name.endswith(".cwasm") or path.name == "shellsim-precompiled.json":
+            if path.name.endswith(".cwasm"):
                 path.unlink()
         _mount_package_tree(environment, staging, "/", normalize_modes=True)
