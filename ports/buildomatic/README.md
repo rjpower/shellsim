@@ -26,8 +26,16 @@ assets with `--output <prefix> --copy-assets`; `--asset-output <shared-prefix>` 
 catalogs from shared assets. Serve the store with `s3_proxy.py --prefix <prefix>` and pass the catalog URL to
 `Context(pypi_catalog="<URL>").Environment(pypi_packages=["scipy"])`; no patched uv is needed.
 
-Delivery keeps portable Wasm and adds ordinary Wasmtime companions for the runtime,
-wheel extensions and native exports. Set `trusted_precompiled=True` on `Context`
-only for trusted catalog and producer bytes: companions contain native host code.
-Companions load on first use, with raw Wasm fallback; they never enter the guest VFS.
+Delivery adds checked-hash `.pyc` files to wheels and the stdlib using the declared
+WASI CPython producer, with source files retained and wheel RECORDs updated. Bytecode
+delivery keys include that producer; cache hits prune its build-only prerequisites.
+Portable Wasm remains unchanged, with separate Wasmtime companions for the runtime,
+wheel extensions and native exports. Each
+`companions` entry identifies its host `target`, runtime `build_id` and asset path;
+wheel entries also name their source member. Delivery keys include that target and ABI,
+while portable asset paths remain independent of both. Workers compile baseline code for
+their own host triple and must match the planner's target and ABI.
+Set `trusted_precompiled=True` on `Context` only for trusted catalog and producer bytes:
+companions contain native host code. Setup downloads matching variants for the selected
+packages; they load on first use, with raw Wasm fallback, and never enter the guest VFS.
 Python installs omit development bundles; explicitly selected tools include them.

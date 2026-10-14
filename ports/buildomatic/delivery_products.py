@@ -10,7 +10,7 @@ import io
 import json
 import tempfile
 import zipfile
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,17 +18,13 @@ from packaging.utils import canonicalize_name
 
 from ports._support.graph import Port
 from ports._support.store import relative_path
-from ports.buildomatic.cache import asset_path, compiler_identity, file_bundle_key, runtime_archive_key
+from ports.buildomatic.bytecode import BytecodeCompiler, compile_sources
+from ports.buildomatic.cache import asset_path, compiler_identity, file_bundle_key, runtime_archive_key, wheel_asset_key
 
 if TYPE_CHECKING:
     from ports.buildomatic.delivery import DeliveryStore
 
 _MAX_ASSET = 512 * 1024**2
-_MAX_WHEEL_CONTENTS = 1024**3
-
-
-def _json(value: dict) -> bytes:
-    return (json.dumps(value, sort_keys=True, indent=2) + "\n").encode()
 
 
 def _companion(source: Path, relative: str, store: DeliveryStore, *, executable: bool, scratch: Path) -> dict | None:
@@ -44,62 +40,29 @@ def _companion(source: Path, relative: str, store: DeliveryStore, *, executable:
             target.write_bytes(companion)
             store.emit(target, relative)
     size = store.size(relative)
-    return {"path": relative, "size": size} if size <= _MAX_ASSET else None
+    return {**compiler_identity(), "path": relative, "size": size} if size <= _MAX_ASSET else None
 
 
-def _delivery_wheel(source: Path, destination: Path) -> None:
-    """Add companions for the wheel's declared extensions and update standard RECORD."""
+def _wheel_companions(source: Path, key: str, store: DeliveryStore, scratch: Path) -> list[dict]:
+    """Publish per-module companions without changing the portable wheel or its RECORD."""
     with zipfile.ZipFile(source) as archive:
         manifests = [name for name in archive.namelist() if name.endswith(".dist-info/shellsim-native.json")]
         if not manifests:
-            destination.hardlink_to(source)
-            return
+            return []
         if len(manifests) != 1:
             raise ValueError("wheel must contain one native manifest")
-        from shellsim import _native
-
-        dist = manifests[0].removesuffix("shellsim-native.json")
-        mapping, additions = {}, {}
-        unpacked = sum(member.file_size for member in archive.infolist())
+        companions = []
         for entry in json.loads(archive.read(manifests[0]))["artifacts"]:
             path = relative_path(entry["path"])
-            companion = dist + "precompiled/" + path + ".cwasm"
-            mapping[path] = companion
-            data = _native.precompile_wasm(archive.read(path))
-            unpacked += len(data)
-            if unpacked > _MAX_WHEEL_CONTENTS:
-                destination.hardlink_to(source)
-                return
-            additions[companion] = data
-        additions[dist + "shellsim-precompiled.json"] = _json(mapping)
-        unpacked += len(additions[dist + "shellsim-precompiled.json"])
-        record = dist + "RECORD"
-        rows = []
-        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-            for member in archive.infolist():
-                if member.filename == record:
-                    continue
-                if member.filename in additions:
-                    raise ValueError("wheel already contains precompiled delivery members")
-                data = archive.read(member)
-                output.writestr(member, data)
-                if not member.is_dir():
-                    rows.append(_record_row(member.filename, data))
-            for name, data in additions.items():
-                output.writestr(name, data)
-                rows.append(_record_row(name, data))
-            text = io.StringIO()
-            csv.writer(text, lineterminator="\n").writerows([*rows, [record, "", ""]])
-            record_bytes = text.getvalue().encode()
-            output.writestr(record, record_bytes)
-        if destination.stat().st_size > _MAX_ASSET or unpacked + len(record_bytes) > _MAX_WHEEL_CONTENTS:
-            destination.unlink()
-            destination.hardlink_to(source)
-
-
-def _record_row(name: str, data: bytes) -> list[str]:
-    digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).rstrip(b"=").decode()
-    return [name, "sha256=" + digest, str(len(data))]
+            relative = asset_path(key, f"wheels/{source.name}/{path}.cwasm")
+            with tempfile.TemporaryDirectory(prefix=".wheel-module-", dir=scratch) as temporary:
+                module = Path(temporary) / "module.wasm"
+                if not store.exists(relative):
+                    module.write_bytes(archive.read(path))
+                companion = _companion(module, relative, store, executable=False, scratch=scratch)
+            if companion is not None:
+                companions.append({**companion, "source": path})
+        return companions
 
 
 @dataclass(frozen=True)
@@ -148,21 +111,58 @@ def wheel_metadata(path: Path, relative: str) -> Wheel:
     )
 
 
-def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore, *, key: str) -> dict:
+def _bytecode_wheel(source: Path, destination: Path, bundle: Path) -> None:
+    """Keep portable members, add reproducible bytecode and reseal RECORD."""
+    with zipfile.ZipFile(source) as archive:
+        files = {relative_path(name): archive.read(name) for name in archive.namelist() if not name.endswith("/")}
+        modes = {member.filename: member.external_attr for member in archive.infolist()}
+    info = next(name.removesuffix("METADATA") for name in files if name.endswith(".dist-info/METADATA"))
+    for name in (info + "RECORD", info + "RECORD.jws", info + "RECORD.p7s"):
+        files.pop(name, None)
+    sources = {}
+    for name, data in files.items():
+        parts = Path(name).parts
+        if not name.endswith(".py") or parts[0] == "bin":
+            continue
+        # Wheel scripts execute as source; a cache directory in scripts would
+        # also be mistaken for an executable during installation.
+        if len(parts) > 2 and parts[0].endswith(".data") and parts[1] == "scripts":
+            continue
+        sources[name] = data
+    files.update(compile_sources(bundle, sources))
+    record = io.StringIO(newline="")
+    rows = csv.writer(record, lineterminator="\n")
+    for name, data in sorted(files.items()):
+        digest = base64.urlsafe_b64encode(hashlib.sha256(data).digest()).decode().rstrip("=")
+        rows.writerow((name, "sha256=" + digest, len(data)))
+    rows.writerow((info + "RECORD", "", ""))
+    files[info + "RECORD"] = record.getvalue().encode()
+    with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, data in sorted(files.items()):
+            member = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            member.compress_type = zipfile.ZIP_DEFLATED
+            member.external_attr = modes.get(name, 0o644 << 16)
+            archive.writestr(member, data)
+
+
+def publish_product(
+    port: Port, root: Path, build_key: str, store: DeliveryStore, *, key: str, bytecode: BytecodeCompiler | None = None
+) -> dict:
     """Emit installable assets; the worker commits their completed node record."""
     record = {"reference": port.reference, "build_key": build_key, "wheels": [], "native": [], "assets": []}
     for wheel in sorted((root / "wheels").glob("*.whl")):
-        relative = asset_path(build_key if compiler_identity(port) is None else key, "wheels/" + wheel.name)
-        if store.exists(relative):
-            metadata = replace(wheel_metadata(wheel, relative), size=store.size(relative))
-            record["wheels"].append(asdict(metadata))
-            continue
-        with tempfile.TemporaryDirectory(prefix=".wheel-", dir=root.parent) as temporary:
-            delivered = Path(temporary) / wheel.name
-            _delivery_wheel(wheel, delivered)
-            metadata = wheel_metadata(delivered, relative)
-            store.emit(delivered, relative)
-            record["wheels"].append(asdict(metadata))
+        relative = asset_path(wheel_asset_key(build_key, bytecode.key if bytecode else None), "wheels/" + wheel.name)
+        if not store.exists(relative):
+            if bytecode is None:
+                store.emit(wheel, relative)
+            else:
+                with tempfile.TemporaryDirectory(prefix=".bytecode-wheel-", dir=root.parent) as temporary:
+                    prepared = Path(temporary) / wheel.name
+                    _bytecode_wheel(wheel, prepared, bytecode.bundle)
+                    store.emit(prepared, relative)
+        metadata = {**asdict(wheel_metadata(wheel, relative)), "size": store.size(relative)}
+        companions = _wheel_companions(wheel, key, store, root.parent)
+        record["wheels"].append({**metadata, **({"companions": companions} if companions else {})})
     payload = root / "payload"
     exports = port.recipe.get("exports", {})
     directories = {}
@@ -207,7 +207,7 @@ def publish_product(port: Port, root: Path, build_key: str, store: DeliveryStore
                         .get(path, destination + source.name),
                         "abi": manifest["inputs"]["recipe"].get("abi"),
                         "native_dependencies": needed_libraries(source) if wasm else [],
-                        **({"precompiled": companion} if companion is not None else {}),
+                        **({"companions": [companion]} if companion is not None else {}),
                     }
                 )
     prefix = "/" + relative_path(port.recipe.get("install", {}).get("prefix", "/usr").removeprefix("/"))
@@ -253,9 +253,29 @@ def publish_runtime(bundle: Path, product_key: str, store: DeliveryStore, *, key
     if not store.exists(relative):
         with tempfile.TemporaryDirectory(prefix=".runtime-", dir=bundle.parent) as temporary:
             archive = Path(temporary) / "runtime.zip"
+            bytecode = compile_sources(
+                bundle,
+                {
+                    path.relative_to(bundle / "rootfs").as_posix(): path.read_bytes()
+                    for path in sorted((bundle / "rootfs").rglob("*.py"))
+                },
+            )
+            manifest = {
+                **manifest,
+                "files": {
+                    **manifest["files"],
+                    **{"/" + name: hashlib.sha256(data).hexdigest() for name, data in bytecode.items()},
+                },
+            }
             with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as output:
-                for path in [bundle / "manifest.json", *sorted((bundle / "rootfs").rglob("*"))]:
-                    if path.is_file():
+                metadata = {"manifest.json": json.dumps(manifest, sort_keys=True).encode()}
+                metadata.update({"rootfs/" + name: data for name, data in bytecode.items()})
+                for name, data in sorted(metadata.items()):
+                    member = zipfile.ZipInfo("runtime/" + name, (1980, 1, 1, 0, 0, 0))
+                    member.external_attr = 0o644 << 16
+                    output.writestr(member, data, compress_type=zipfile.ZIP_DEFLATED)
+                for path in sorted((bundle / "rootfs").rglob("*")):
+                    if path.is_file() and path.relative_to(bundle / "rootfs").as_posix() not in bytecode:
                         output.write(path, "runtime/" + path.relative_to(bundle).as_posix())
             store.emit(archive, relative)
     size = store.size(relative)
@@ -272,6 +292,6 @@ def publish_runtime(bundle: Path, product_key: str, store: DeliveryStore, *, key
         "abi": manifest["dynamic_abi"],
         "python_version": manifest["recipe"]["version"],
         "runtime_target": manifest["recipe"]["target"],
-        **({"precompiled": companion} if companion is not None else {}),
+        **({"companions": [companion]} if companion is not None else {}),
     }
     return runtime

@@ -2,6 +2,7 @@
 .venv
 .worktrees
 build
+dist
 target
 scratch
 **/__pycache__

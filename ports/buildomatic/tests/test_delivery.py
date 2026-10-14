@@ -88,12 +88,7 @@ def test_promotion_copies_only_new_packages(built, tmp_path):
         assert (output / package["path"]).is_file()
 
 
-@pytest.mark.parametrize("oversized_companion", [False, True])
-def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, oversized_companion):
-    from ports.buildomatic import delivery_products
-
-    if oversized_companion:
-        monkeypatch.setattr(delivery_products, "_MAX_WHEEL_CONTENTS", 1)
+def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch):
     ports, store = tmp_path / "ports", tmp_path / "store"
     _wheel_port(ports, store / "execution/cache/ports", "native", [])
     port = plan(ports, ["python/native"]).ports[-1]
@@ -124,24 +119,24 @@ def test_final_wheel_requirements_and_native_metadata(tmp_path, monkeypatch, ove
     def reject_compile(*args, **kwargs):
         raise RuntimeError("compiler unavailable during delivery retry")
 
+    assert (store / package["path"]).read_bytes() == wheel.read_bytes()
+    companion = package["companions"][0]
+    with zipfile.ZipFile(wheel) as original:
+        raw = original.read(companion["source"])
+    assert _native.register_trusted_precompiled_wasm(raw, (store / companion["path"]).read_bytes()) == "registered"
     with monkeypatch.context() as retry:
         retry.setattr(_native, "precompile_wasm", reject_compile)
         repeated = publish_product(
             port, root, "native-key", DeliveryStore(store), key=delivery_key("native-key", port=port)
         )
         assert repeated == record
-
-    with zipfile.ZipFile(store / package["path"]) as delivered:
-        if oversized_companion:
-            assert delivered.read("native.so") == b"\x00asm\x01\x00\x00\x00"
-            assert "native-1.dist-info/shellsim-precompiled.json" not in delivered.namelist()
-            return
-        mapping = json.loads(delivered.read("native-1.dist-info/shellsim-precompiled.json"))
-        raw = delivered.read("native.so")
-        assert _native.register_trusted_precompiled_wasm(raw, delivered.read(mapping["native.so"])) == "registered"
-        assert mapping["native.so"] in delivered.read("native-1.dist-info/RECORD").decode()
-    with zipfile.ZipFile(wheel) as original:
-        assert "native-1.dist-info/shellsim-precompiled.json" not in original.namelist()
+    other_target = "another-" + _native.precompiled_wasm_target()
+    monkeypatch.setattr(_native, "precompiled_wasm_target", lambda: other_target)
+    updated = publish_product(
+        port, root, "native-key", DeliveryStore(store), key=delivery_key("native-key", port=port)
+    )["wheels"][0]
+    assert updated["path"] == package["path"]
+    assert updated["companions"][0]["path"] != companion["path"]
 
 
 @pytest.mark.parametrize("destination", ["/lib/libtest.so", "/usr/lib/python3.13/lib-dynload/libtest.so"])
@@ -167,7 +162,7 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, d
     provider = record["native"][0]
     assert (
         _native.register_trusted_precompiled_wasm(
-            (store / provider["path"]).read_bytes(), (store / provider["precompiled"]["path"]).read_bytes()
+            (store / provider["path"]).read_bytes(), (store / provider["companions"][0]["path"]).read_bytes()
         )
         == "registered"
     )
@@ -176,8 +171,8 @@ def test_native_providers_are_emitted_with_destinations(tmp_path, monkeypatch, d
         port, root, "provider-key", DeliveryStore(store), key=delivery_key("provider-key", port=port)
     )["native"][0]
     assert updated["path"] == provider["path"]
-    assert updated["precompiled"]["path"] != provider["precompiled"]["path"]
-    assert (store / updated["precompiled"]["path"]).is_file()
+    assert updated["companions"][0]["path"] != provider["companions"][0]["path"]
+    assert (store / updated["companions"][0]["path"]).is_file()
 
 
 @pytest.mark.parametrize("oversized_companion", [False, True])
@@ -189,7 +184,8 @@ def test_guest_tools_are_emitted_as_executables(tmp_path, monkeypatch, oversized
     port = plan(Path(__file__).resolve().parents[2], ["native/make"]).ports[-1]
     root = tmp_path / "product"
     (root / "native/bin").mkdir(parents=True)
-    (root / "native/bin/make").write_bytes(b"\x00asm\x01\x00\x00\x00")
+    executable = bytes.fromhex("0061736d0100000001040160000003020100070a01065f737461727400000a040102000b")
+    (root / "native/bin/make").write_bytes(executable)
     notice = root / "native/share/licenses/make/COPYING"
     notice.parent.mkdir(parents=True)
     notice.write_text("fixture license")
@@ -198,9 +194,9 @@ def test_guest_tools_are_emitted_as_executables(tmp_path, monkeypatch, oversized
     record = publish_product(port, root, "make-key", store, key=delivery_key("make-key", port=port))
     tool = record["native"][0]
     assert tool["destination"] == "/usr/bin/make" and tool["kind"] == "tools"
-    assert (store.local / tool["path"]).read_bytes() == b"\x00asm\x01\x00\x00\x00"
+    assert (store.local / tool["path"]).read_bytes() == executable
     if oversized_companion:
-        assert "precompiled" not in tool
+        assert "companions" not in tool
         assert not list((store.local / "assets").rglob("*.cwasm"))
     state = tmp_path / "state"
     state.mkdir()
@@ -211,9 +207,26 @@ def test_guest_tools_are_emitted_as_executables(tmp_path, monkeypatch, oversized
     assert published["assets_copied"] == (2 if oversized_companion else 3)
     assert export(state, output, "https://packages.example", copy_assets=True)["assets_copied"] == 0
     if not oversized_companion:
-        exported = json.loads((output / "catalog.json").read_text())["native"][0]["precompiled"]
+        exported = json.loads((output / "catalog.json").read_text())["native"][0]["companions"][0]
         assert (output / exported["path"]).read_bytes() == (store.local / exported["path"]).read_bytes()
         assert exported["url"] == "https://packages.example/" + exported["path"]
+
+        from ports.buildomatic.checks import execute_check
+        from ports.buildomatic.nodes import Node, Operation
+        from ports.buildomatic.remote_store import StorageStore
+
+        (tmp_path / "probe.sh").write_text("make && cat /usr/share/licenses/make/COPYING\n")
+        node = Node(
+            "make:check",
+            Operation.CHECK,
+            "check-key",
+            replace(port, directory=tmp_path),
+            test={"kind": "shell", "script": "probe.sh"},
+        )
+        result = execute_check(
+            node, {"package:make": {"delivery": record}}, StorageStore(store.root), tmp_path / "checks", {}
+        )
+        assert result["stdout"] == "fixture license"
 
     from shellsim import _native
 

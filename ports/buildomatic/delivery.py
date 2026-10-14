@@ -176,7 +176,7 @@ def catalog(graph: dict, url_prefix: str) -> dict:
         return {
             **item,
             "url": url_prefix.rstrip("/") + "/" + quote(relative_path(item["path"]), safe="/"),
-            **({"precompiled": asset(item["precompiled"])} if "precompiled" in item else {}),
+            **({"companions": [asset(companion) for companion in item["companions"]]} if "companions" in item else {}),
         }
 
     for section in ("packages", "native", "assets"):
@@ -216,8 +216,8 @@ def export(
             *([graph["runtime"]] if "runtime" in graph else []),
         ]:
             copied += source.promote(item["path"], assets)
-            if "precompiled" in item:
-                copied += source.promote(item["precompiled"]["path"], assets)
+            for companion in item.get("companions", []):
+                copied += source.promote(companion["path"], assets)
     if simple:
         projects = {}
         for package in value["packages"]:

@@ -14,6 +14,7 @@ from ports._support.node_build import produce_port
 from ports._support.sdk import SDKProduct, _produce, installed_seed, producer_work
 from ports._support.sdk_products import Receipt
 from ports.buildomatic.artifacts import install, upload, write_reference
+from ports.buildomatic.bytecode import BytecodeCompiler
 from ports.buildomatic.cache import BuildCache
 from ports.buildomatic.delivery import DeliveryStore
 from ports.buildomatic.delivery_products import publish_product, publish_runtime
@@ -130,10 +131,16 @@ def build(node: Node, records: dict, store: StorageStore, cache: Path, specifica
 def delivery(node: Node, records: dict, store: StorageStore, cache: Path) -> dict:
     product = records["product"]
     root = install(store, product["artifact"], cache / "artifacts")
+    bytecode = None
+    if "bytecode_runtime" in records:
+        runtime = records["bytecode_runtime"]
+        bytecode = BytecodeCompiler(install(store, runtime["artifact"], cache / "artifacts"), runtime["build_key"])
     return {
         **product,
         "delivery_key": node.key,
-        "delivery": publish_product(node.port, root, product["build_key"], DeliveryStore(store.prefix), key=node.key),
+        "delivery": publish_product(
+            node.port, root, product["build_key"], DeliveryStore(store.prefix), key=node.key, bytecode=bytecode
+        ),
     }
 
 
@@ -147,13 +154,13 @@ def execute(node: Node, store: StorageStore, cache: Path, specification: dict) -
     products = BuildCache(store)
     if (cached := products.get(node.key)) is not None:
         return cached
-    if (expected := specification.get("wasmtime_build_id")) is not None:
-        from shellsim import _native
+    if (expected := specification.get("compiler")) is not None:
+        from ports.buildomatic.cache import compiler_identity
 
-        actual = _native.precompiled_wasm_build_id()
+        actual = compiler_identity()
         if actual != expected:
             raise ValueError(
-                f"worker Wasmtime {actual} differs from planner {expected}; install the matching worker image"
+                f"worker companion target/ABI {actual} differs from planner {expected}; use a matching worker image"
             )
     records = input_records(node, store)
     if node.operation is Operation.BUILD:

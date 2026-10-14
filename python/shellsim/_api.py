@@ -15,6 +15,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Tuple, Union
 
 from . import DEFAULT_PYPI_CATALOG, _native
+from ._startup import logger as startup_logger
+from ._startup import phase
 
 if TYPE_CHECKING:
     from .cpython import CPythonRuntime
@@ -229,12 +231,13 @@ class Context:
 
         with self._lock:
             if self._catalog is None:
-                self._catalog = Catalog(
-                    self._catalog_location,
-                    cache_dir=self._cache_dir,
-                    offline=self._offline,
-                    trusted_precompiled=self._trusted_precompiled,
-                )
+                with phase("catalog", offline=self._offline, trusted_precompiled=self._trusted_precompiled):
+                    self._catalog = Catalog(
+                        self._catalog_location,
+                        cache_dir=self._cache_dir,
+                        offline=self._offline,
+                        trusted_precompiled=self._trusted_precompiled,
+                    )
 
     def Environment(
         self,
@@ -271,14 +274,15 @@ class Context:
         if selected:
             self._ensure_catalog()
         prepared = self._installation(key)
-        native = prepared.image.environment(
-            resolved.cpu,
-            resolved.memory,
-            resolved.disk,
-            resolved.output,
-            clock == "real_time",
-        )
-        environment = Environment._from_native(native, resolved, prepared)
+        with phase("environment.create"):
+            native = prepared.image.environment(
+                resolved.cpu,
+                resolved.memory,
+                resolved.disk,
+                resolved.output,
+                clock == "real_time",
+            )
+            environment = Environment._from_native(native, resolved, prepared)
         for pattern, response in (http or {}).items():
             environment.route_http(pattern, response)
         return environment
@@ -287,6 +291,7 @@ class Context:
         with self._lock:
             if key in self._prepared:
                 self._prepared.move_to_end(key)
+                startup_logger.info("installation: memory cache hit")
                 return self._prepared[key]
             future = self._pending.get(key)
             owner = future is None
@@ -294,9 +299,11 @@ class Context:
                 future = Future()
                 self._pending[key] = future
         if not owner:
-            return future.result()
+            with phase("installation.wait"):
+                return future.result()
         try:
-            prepared = self._prepare(key)
+            with phase("installation.prepare", cache="miss"):
+                prepared = self._prepare(key)
             with self._lock:
                 size = prepared.retained_bytes
                 if size <= self._cache_budget:
@@ -326,12 +333,16 @@ class Context:
             from .cpython import CPythonRuntime
 
             self._catalog.resolve(packages)
-            runtime = CPythonRuntime.from_catalog(self._catalog)
-            runtime.mount(environment)
-            runtime.install_pypi(environment, packages)
+            with phase("runtime.load"):
+                runtime = CPythonRuntime.from_catalog(self._catalog)
+            with phase("runtime.mount"):
+                runtime.mount(environment)
+            with phase("packages.install", count=len(packages)):
+                runtime.install_pypi(environment, packages)
         if tools:
             self._catalog.install_tools(environment, tools)
-        image = environment._native.freeze()
+        with phase("installation.freeze"):
+            image = environment._native.freeze()
         installation = environment._native_installation
         runtime = environment._cpython_runtime
         # Count Python host metadata conservatively alongside frozen native bytes.
@@ -551,7 +562,8 @@ class Environment:
         input_bytes = _as_bytes("stdin", stdin)
         if self._cpython_runtime is None:
             raise SimulationError("select CPython with Context.Environment(pypi_packages=())")
-        return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
+        with phase("python.run"):
+            return self._cpython_runtime.run(self, ["-c", source, *arguments], stdin=input_bytes)
 
     def write_file(
         self,

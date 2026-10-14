@@ -4,7 +4,7 @@ use super::{MARKER, MAX_MEMORY_PAGES, MAX_MODULES, MAX_TABLE_ELEMENTS};
 use std::collections::{BTreeMap, BTreeSet};
 use wasmtime::Error;
 
-pub(super) struct Layout {
+pub(in crate::commands::wasm) struct Layout {
     pub(super) memory_size: u32,
     pub(super) memory_align: u32,
     pub(super) table_size: u32,
@@ -20,6 +20,31 @@ pub(super) struct Layout {
     pub(super) element_functions: BTreeMap<u32, u32>,
     pub(super) relative_data: BTreeMap<String, u32>,
     pub(super) forwarded_exports: BTreeSet<String>,
+}
+
+impl Layout {
+    /// Include owned names and conservative B-tree node overhead in the host LRU bound.
+    pub(in crate::commands::wasm) fn cache_bytes(&self) -> usize {
+        let names = self
+            .needed
+            .iter()
+            .chain(&self.runtime_paths)
+            .chain(self.tls_exports.iter())
+            .chain(self.forwarded_exports.iter())
+            .chain(
+                self.weak_imports
+                    .iter()
+                    .flat_map(|(module, name)| [module, name]),
+            )
+            .chain(self.functions.iter().map(|(name, _)| name))
+            .chain(self.relative_data.keys());
+        names
+            .fold(
+                std::mem::size_of::<Self>().saturating_add(4096),
+                |bytes, name| bytes.saturating_add(256).saturating_add(name.capacity()),
+            )
+            .saturating_add(self.element_functions.len().saturating_mul(256))
+    }
 }
 
 struct Cursor<'a>(&'a [u8]);
@@ -68,7 +93,7 @@ impl<'a> Cursor<'a> {
 
 /// The caller scans raw atomics and prepays compilation before this metadata
 /// reaches an instantiated module. Private exception tags cannot join the cohort.
-pub(super) fn parse(source: &[u8]) -> Result<Layout, Error> {
+pub(in crate::commands::wasm) fn parse(source: &[u8]) -> Result<Layout, Error> {
     let mut marker = false;
     let mut metadata = None;
     let mut has_start = false;

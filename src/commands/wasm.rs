@@ -58,8 +58,9 @@ mod precompiled;
 use engine::{configure_command_engine, ASYNC_STACK_BYTES};
 
 pub use precompiled::{
-    precompile_wasm, precompiled_wasm_build_id, register_trusted_precompiled_wasm,
-    register_trusted_precompiled_wasm_file, PrecompiledWasmOutcome, WasmCompilationKind,
+    precompile_wasm, precompiled_wasm_build_id, precompiled_wasm_target,
+    register_trusted_precompiled_wasm, register_trusted_precompiled_wasm_file,
+    PrecompiledWasmOutcome, WasmCompilationKind,
 };
 
 // Stripped guest Clang is 84 MB. Compilation remains CPU-metered and all images
@@ -117,6 +118,8 @@ struct CachedModule {
     compilation: CachedCompilation,
     bytes: usize,
     admission: Option<ExecutableAdmission>,
+    side_layout: Option<Arc<threaded_dynamic::layout::Layout>>,
+    digest: OnceLock<[u8; 32]>,
 }
 
 enum CachedCompilation {
@@ -219,6 +222,8 @@ impl ModuleCache {
             compilation,
             bytes,
             admission: None,
+            side_layout: None,
+            digest: OnceLock::new(),
         });
         self.bytes += bytes;
     }
@@ -293,15 +298,70 @@ fn retain_executable_admission(source: &[u8], admission: ExecutableAdmission) {
     cache.entries.push_back(entry);
 }
 
+/// Reuse a content digest only while the cache retains exactly those immutable bytes.
+fn module_source_digest(source: &[u8]) -> [u8; 32] {
+    let cache = command_module_cache().lock().expect("module cache lock");
+    let digest = || Sha256::digest(source).into();
+    match cache
+        .entries
+        .iter()
+        .find(|entry| same_module_source(&entry.source, source))
+    {
+        Some(entry) => *entry.digest.get_or_init(digest),
+        None => digest(),
+    }
+}
+
+/// Retain bounded, successful side-module metadata alongside the admitted compiled module.
+fn side_module_layout(source: &[u8]) -> Result<Arc<threaded_dynamic::layout::Layout>, Error> {
+    {
+        let cache = command_module_cache().lock().expect("module cache lock");
+        if let Some(layout) = cache.entries.iter().find_map(|entry| {
+            same_module_source(&entry.source, source)
+                .then_some(entry.side_layout.as_ref())
+                .flatten()
+        }) {
+            return Ok(layout.clone());
+        }
+    }
+    let layout = Arc::new(threaded_dynamic::layout::parse(source)?);
+    let metadata_bytes = layout.cache_bytes();
+    let mut cache = command_module_cache().lock().expect("module cache lock");
+    let Some(index) = cache
+        .entries
+        .iter()
+        .position(|entry| same_module_source(&entry.source, source))
+    else {
+        return Ok(layout);
+    };
+    if cache.entries[index].side_layout.is_some()
+        || cache.entries[index].bytes.saturating_add(metadata_bytes) > MAX_CACHED_MODULE_BYTES
+    {
+        return Ok(layout);
+    }
+    let mut entry = cache
+        .entries
+        .remove(index)
+        .expect("matching module cache entry");
+    while cache.bytes.saturating_add(metadata_bytes) > MAX_CACHED_MODULE_BYTES {
+        let old = cache.entries.pop_front().expect("other entry to evict");
+        cache.bytes -= old.bytes;
+    }
+    entry.bytes = entry.bytes.saturating_add(metadata_bytes);
+    entry.side_layout = Some(layout.clone());
+    cache.bytes = cache.bytes.saturating_add(metadata_bytes);
+    cache.entries.push_back(entry);
+    Ok(layout)
+}
+
 fn compiled_command_module(source: &Arc<Vec<u8>>) -> Result<Module, Error> {
     let cache = command_module_cache();
     if let Some(module) = cache.lock().expect("module cache lock").get(source) {
         return Ok(module);
     }
-    threads::reject_raw_waits(source)?;
     // Deduplicate only the same source. A cold tool must not block unrelated LRU hits.
     static FLIGHTS: OnceLock<Mutex<CompilationFlights>> = OnceLock::new();
-    let digest: [u8; 32] = Sha256::digest(source.as_slice()).into();
+    let digest = module_source_digest(source);
     let flight = {
         let mut flights = FLIGHTS
             .get_or_init(Mutex::default)
@@ -323,6 +383,10 @@ fn compiled_command_module(source: &Arc<Vec<u8>>) -> Result<Module, Error> {
         return Ok(module);
     }
     let pending = cache.lock().expect("module cache lock").pending(source);
+    // Trusted registration already admits raw instructions, including on native fallback.
+    if pending.is_none() {
+        threads::reject_raw_waits(source)?;
+    }
     let module = match precompiled::load(pending.as_ref()) {
         Some(module) => module,
         None => Module::new(command_engine(), source.as_slice())?,

@@ -10,10 +10,9 @@ use super::{
 };
 use crate::commands::wasm::{
     compiled_command_module, dynamic::DEFAULT_LIBRARY_DIRECTORIES, fibers,
-    guest_memory::GuestMemory, threads, Host,
+    guest_memory::GuestMemory, module_source_digest, side_module_layout, threads, Host,
 };
 use crate::vfs::{resolve_against, NodeKind, Vfs, VfsError, PATH_MAX};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -33,7 +32,7 @@ struct Pending {
     path: String,
     sha256: [u8; 32],
     module: Module,
-    layout: layout::Layout,
+    layout: Arc<layout::Layout>,
     dependencies: Vec<Reference>,
     store_cost: u64,
 }
@@ -71,7 +70,7 @@ fn compile(
     caller: &mut StoreContextMut<'_, Host>,
     path: &str,
     process: &Process,
-) -> Result<(Module, layout::Layout, [u8; 32], u64), Error> {
+) -> Result<(Module, Arc<layout::Layout>, [u8; 32], u64), Error> {
     process.admit(1)?;
     let length = {
         let machine = caller.data().machine.get();
@@ -114,9 +113,8 @@ fn compile(
             .vfs
             .read_shared_limited("/", path, MAX_SOURCE_BYTES)
             .map_err(|error| Error::msg(error.to_string()))?;
-        threads::reject_raw_waits(&source)?;
-        let layout = layout::parse(&source)?;
         let module = compiled_command_module(&source)?;
+        let layout = side_module_layout(&source)?;
         if module
             .exports()
             .any(|export| super::super::dynamic::canonical_runtime_symbol(export.name()))
@@ -146,12 +144,7 @@ fn compile(
                 .saturating_add((length as u64).saturating_mul(8))
                 .saturating_add(65536),
         )?;
-        Ok((
-            module,
-            layout,
-            Sha256::digest(source.as_slice()).into(),
-            store_cost,
-        ))
+        Ok((module, layout, module_source_digest(&source), store_cost))
     })();
     caller
         .data()
@@ -291,7 +284,7 @@ impl Graph {
                     .vfs
                     .read_shared_limited("/", &path, MAX_SOURCE_BYTES)
                     .map_err(|error| Error::msg(error.to_string()))?;
-                let digest: [u8; 32] = Sha256::digest(source.as_slice()).into();
+                let digest: [u8; 32] = module_source_digest(&source);
                 if digest != expected {
                     return Err(Error::msg("threaded dynamic source identity changed"));
                 }

@@ -24,6 +24,37 @@ with the same package selection share an immutable installation and keep their
 writes private. `cache_dir`, `offline` and `trusted_precompiled` belong to Context;
 create a new Context to use a newer catalog.
 
+Enable host startup timings before creating an environment:
+
+```python
+import logging
+
+logging.basicConfig(format="%(name)s: %(message)s")
+logging.getLogger("shellsim.startup").setLevel(logging.INFO)
+```
+
+Logs cover catalog loading, asset cache hits/downloads, runtime mounting, wheel
+preparation, VFS installation, environment creation and `run_python`. Timings use
+the host clock and stay outside guest stdout/stderr. Parent phases include their
+children; `python.run` includes module loading, interpreter startup and user code.
+It does not separate Wasmtime compilation from guest execution.
+
+uv caches the host shellsim package. Guest downloads live under
+`$XDG_CACHE_HOME/shellsim/ports` (default `~/.cache/shellsim/ports`); Wasmtime keeps
+a separate native compilation cache under the host cache directory's
+`shellsim/wasmtime`. Downloaded Wasm still needs compilation to host machine code
+on a compilation-cache miss. Published native companions require explicit
+`trusted_precompiled=True` and compatibility with the installed runtime. Wheels and
+runtime archives contain portable Wasm. Native `.cwasm` companions are separate catalog
+assets selected by the host target triple and runtime ABI ID. Trusted setup downloads
+only matching companions for the selected packages and tools; deserialization happens
+on first use. A missing variant uses local compilation. Companions use baseline CPU
+features for their triple, and Wasmtime still checks compatibility before loading them.
+A new online Context fetches the catalog and prepares its first installation,
+including unpacking cached wheels. `offline=True` reuses the cached catalog.
+Reusing a Context avoids repeated installation, but every `run_python` starts
+CPython and imports packages again.
+
 Pure Python wheels and native extensions come from the ports catalog. Native
 extensions must match the CPython/WASI ABI. Guest execution has no ambient host
 filesystem or network access. Python sockets and direct `urllib` HTTP are unsupported;

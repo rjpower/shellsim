@@ -34,11 +34,18 @@ paths, guest environment variables, and guest-supplied serialized native code ca
 populate this cache. An unavailable or invalid cache reports a host diagnostic and leaves Wasm
 compilation enabled.
 
-Wasmtime keys artifacts by Wasm content, compiler settings, target ISA, and a custom module
-version. Shellsim's version includes a SHA-256 identity over the patched Wasmtime sources, Cargo
-manifest and lockfiles, and pinned Rust toolchain. This prevents different patched runtimes that
-share upstream version 49.0.0 from reusing incompatible native code. Concurrent same-source
-misses share a compilation lock; unrelated process-local cache hits keep their own access.
+Wasmtime keys cached artifacts by Wasm content, compiler settings, target ISA and a custom
+module version. Native companion compatibility uses Wasmtime's serialization version plus
+the explicit `PATCHED_RUNTIME_ABI` revision in `src/commands/wasm/engine.rs`. Bump that revision only when
+shellsim's patches change serialized metadata, generated-code calling conventions or VM layouts
+incompatibly. Wasmtime separately checks the target, CPU features and engine settings. Shellsim
+release versions, lockfiles and source-only refactors do not change this identity.
+
+Concurrent same-source misses share a compilation lock; unrelated process-local cache hits
+keep their own access.
+The bounded module cache also retains successful raw-instruction admission, threaded
+side-module layouts and content hashes for exact immutable source bytes. Changed VFS bytes
+require fresh checks; guest CPU charges and memory reservations remain unchanged.
 Native disk-cache hits still run admission once in each process. Repeated executable launches
 can reuse the positive admission profile only from an exact original-byte LRU entry; side-module
 and rewritten-startup entries do not supply an executable profile.

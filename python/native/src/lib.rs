@@ -694,11 +694,13 @@ impl NativeEnvironment {
                 environment.sync_vfs_time();
                 let before = environment.vfs.clone();
                 let result = (|| {
-                    shellsim::host_ingest::mount_host_tree_report(
+                    shellsim::host_ingest::mount_package_tree(
                         environment,
                         Path::new(&host_root),
                         "/",
-                    )?;
+                        &[],
+                    )
+                    .map_err(|error| error.to_string())?;
                     configure_cpython_vfs(environment, venv)
                 })();
                 if result.is_err() {
@@ -945,10 +947,16 @@ fn precompile_wasm(py: Python<'_>, source: Vec<u8>, executable: bool) -> PyResul
     Ok(PyBytes::new(py, &bytes).unbind())
 }
 
-/// Identify the patched Wasmtime producer for immutable delivery records.
+/// Identify the serialized-runtime ABI for immutable delivery records, independent of releases.
 #[pyfunction]
 fn precompiled_wasm_build_id() -> &'static str {
     shellsim::commands::precompiled_wasm_build_id()
+}
+
+/// Host target triple for baseline native companions, independent of the guest WASI target.
+#[pyfunction]
+fn precompiled_wasm_target() -> &'static str {
+    shellsim::commands::precompiled_wasm_target()
 }
 
 /// Load only trusted, untouched compiler output for this exact source and executable kind.
@@ -1032,6 +1040,7 @@ fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<NativeContainer>()?;
     module.add_function(wrap_pyfunction!(precompile_wasm, module)?)?;
     module.add_function(wrap_pyfunction!(precompiled_wasm_build_id, module)?)?;
+    module.add_function(wrap_pyfunction!(precompiled_wasm_target, module)?)?;
     module.add_function(wrap_pyfunction!(register_trusted_precompiled_wasm, module)?)?;
     module.add_function(wrap_pyfunction!(
         register_trusted_precompiled_wasm_file,
