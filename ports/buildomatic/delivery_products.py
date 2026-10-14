@@ -119,7 +119,17 @@ def _bytecode_wheel(source: Path, destination: Path, bundle: Path) -> None:
     info = next(name.removesuffix("METADATA") for name in files if name.endswith(".dist-info/METADATA"))
     for name in (info + "RECORD", info + "RECORD.jws", info + "RECORD.p7s"):
         files.pop(name, None)
-    files.update(compile_sources(bundle, {name: data for name, data in files.items() if name.endswith(".py")}))
+    sources = {}
+    for name, data in files.items():
+        parts = Path(name).parts
+        if not name.endswith(".py") or parts[0] == "bin":
+            continue
+        # Wheel scripts execute as source; a cache directory in scripts would
+        # also be mistaken for an executable during installation.
+        if len(parts) > 2 and parts[0].endswith(".data") and parts[1] == "scripts":
+            continue
+        sources[name] = data
+    files.update(compile_sources(bundle, sources))
     record = io.StringIO(newline="")
     rows = csv.writer(record, lineterminator="\n")
     for name, data in sorted(files.items()):

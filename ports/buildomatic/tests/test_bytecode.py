@@ -29,6 +29,7 @@ def runtime_bundle():
 
 def test_delivered_wheel_loads_bytecode_and_invalidates_changed_source(tmp_path, runtime_bundle):
     from shellsim import Context
+    from shellsim._cpython_universe import _stage_console_scripts
     from shellsim._pypi_catalog import unpack_wheel
     from shellsim.cpython import CPythonRuntime
 
@@ -40,6 +41,7 @@ def test_delivered_wheel_loads_bytecode_and_invalidates_changed_source(tmp_path,
     # Exceed a WASI write's transfer bound, as SymPy's generated modules do.
     with zipfile.ZipFile(source, "a") as archive:
         archive.writestr("large.py", "VALUE = " + repr("x" * (2 * 1024**2)) + "\n")
+        archive.writestr("example-1.data/scripts/example.py", "#!/usr/bin/python3\nprint('script works')\n")
     (root / "wheels" / source.name).write_bytes(source.read_bytes())
     store = DeliveryStore(tmp_path / "store")
     compiler = BytecodeCompiler(runtime_bundle, "test-runtime")
@@ -60,6 +62,11 @@ def test_delivered_wheel_loads_bytecode_and_invalidates_changed_source(tmp_path,
     runtime.mount(environment)
     site = tmp_path / "site"
     unpack_wheel(wheel, site)
+    scripts = tmp_path / "scripts"
+    _stage_console_scripts(site, scripts, runtime.venv)
+    launcher = scripts / runtime.venv.lstrip("/") / "bin/example.py"
+    result = environment.run_python(launcher.read_text())
+    assert result.stdout == b"script works\n", result.stderr
     for path in site.rglob("*"):
         if path.is_file():
             environment.mkdir(runtime.site_packages + "/" + path.relative_to(site).parent.as_posix(), parents=True)

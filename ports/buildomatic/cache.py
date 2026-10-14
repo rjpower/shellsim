@@ -15,6 +15,7 @@ from ports.buildomatic.contracts import Store
 # Change when packaging changes its output or installation semantics.
 DELIVERY_REVISION = 6
 RUNTIME_REVISION = 4
+BYTECODE_REVISION = 1
 
 
 def node_key(operation: str, **inputs) -> str:
@@ -45,6 +46,7 @@ def delivery_key(product_key: str, *, port: Port, bytecode_runtime: str | None =
         product=product_key,
         format_version=DELIVERY_REVISION,
         bytecode_runtime=bytecode_runtime,
+        **({"bytecode_format": BYTECODE_REVISION} if bytecode_runtime is not None else {}),
         **({"wasmtime": compiler} if compiler is not None else {}),
     )
 
@@ -53,7 +55,7 @@ def wheel_asset_key(product_key: str, bytecode_runtime: str | None) -> str:
     """Bytecode is portable across hosts but specific to the declared CPython producer."""
     if bytecode_runtime is None:
         return product_key
-    return node_key("wheel", product=product_key, bytecode_runtime=bytecode_runtime, format_version=DELIVERY_REVISION)
+    return node_key("wheel", product=product_key, bytecode_runtime=bytecode_runtime, format_version=BYTECODE_REVISION)
 
 
 def file_bundle_key(product_key: str) -> str:
